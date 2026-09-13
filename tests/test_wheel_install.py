@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 import os
 import subprocess
 import sys
@@ -52,9 +54,14 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
     pytest.importorskip("playwright.sync_api")
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
-        installed = root / "installed"
+        venv = root / "venv"
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(installed), str(wheel)],
+            [sys.executable, "-m", "venv", str(venv)],
+            check=True,
+        )
+        interpreter = venv / "bin" / "python"
+        subprocess.run(
+            [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
             check=True,
             capture_output=True,
             text=True,
@@ -66,6 +73,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 import http.client
                 import json
                 import threading
+                import sys
                 from nyx.models import canonical_digest
                 from nyx.server import create_server
 
@@ -114,44 +122,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 service = create_server(lambda: catalog, port=0)
                 thread = threading.Thread(target=service.serve_forever)
                 thread.start()
+                print(json.dumps({"module": __import__("nyx").__file__, "port": service.server_port}), flush=True)
                 try:
-                    connection = http.client.HTTPConnection("127.0.0.1", service.server_port)
-                    connection.request(
-                        "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{service.server_port}"}
-                    )
-                    response = connection.getresponse()
-                    body = response.read()
-                    connection.close()
-                    assert response.status == 200
-                    assert json.loads(body)["entries"][0]["package_path"] == entry["package_path"]
-
-                    from playwright.sync_api import sync_playwright
-
-                    with sync_playwright() as api:
-                        browser = api.chromium.launch()
-                        page = browser.new_page()
-                        try:
-                            page.goto(f"http://127.0.0.1:{service.server_port}/")
-                            page.locator(".card-title").wait_for(timeout=15000)
-                            assert page.locator(".column-head").all_inner_texts() == ["Fictional"]
-                            assert page.locator(".row-head").all_inner_texts()[:2] == [
-                                "Under Development",
-                                "Queue",
-                            ]
-                            assert page.locator(".card-title").all_inner_texts() == [
-                                "Installed catalog entry"
-                            ]
-                            assert page.locator(
-                                '.card[data-package-path="Fictional/Queue/installed-demo"]'
-                            ).count() == 1
-                            assert page.locator("#board").inner_text().count(
-                                "Installed catalog entry"
-                            ) == 1
-                        finally:
-                            page.close()
-                            browser.close()
-                    import nyx
-                    print(nyx.__file__)
+                    sys.stdin.readline()
                 finally:
                     service.shutdown()
                     thread.join(timeout=5)
@@ -165,15 +138,61 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             for key, value in os.environ.items()
             if key not in {"PYTHONPATH", "PYTHONHOME"}
         }
-        environment["PYTHONPATH"] = str(installed)
-        completed = subprocess.run(
-            [sys.executable, str(probe)],
+        process = subprocess.Popen(
+            [str(interpreter), str(probe)],
             cwd=root,
             env=environment,
-            check=True,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
-        installed_module = Path(completed.stdout.strip())
-        assert installed_module.is_relative_to(installed)
-        assert not installed_module.is_relative_to(REPOSITORY_ROOT)
+        try:
+            assert process.stdout is not None
+            line = process.stdout.readline()
+            assert line, process.stderr.read() if process.stderr is not None else ""
+            details = json.loads(line)
+            installed_module = Path(details["module"])
+            port = int(details["port"])
+            assert installed_module.is_relative_to(venv)
+            assert not installed_module.is_relative_to(REPOSITORY_ROOT)
+
+            connection = http.client.HTTPConnection("127.0.0.1", port)
+            connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{port}"})
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            assert response.status == 200
+            assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/installed-demo"
+
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as api:
+                browser = api.chromium.launch()
+                page = browser.new_page()
+                try:
+                    page.goto(f"http://127.0.0.1:{port}/")
+                    page.locator(".card-title").wait_for(timeout=15000)
+                    assert page.locator(".column-head").all_inner_texts() == ["Fictional"]
+                    assert page.locator(".row-head").all_inner_texts()[:2] == [
+                        "Under Development",
+                        "Queue",
+                    ]
+                    assert page.locator(".card-title").all_inner_texts() == [
+                        "Installed catalog entry"
+                    ]
+                    assert page.locator(
+                        '.card[data-package-path="Fictional/Queue/installed-demo"]'
+                    ).count() == 1
+                    assert page.locator("#board").inner_text().count(
+                        "Installed catalog entry"
+                    ) == 1
+                finally:
+                    page.close()
+                    browser.close()
+        finally:
+            if process.poll() is None:
+                assert process.stdin is not None
+                process.stdin.write("\n")
+                process.stdin.close()
+            process.wait(timeout=10)
