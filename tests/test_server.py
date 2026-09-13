@@ -171,6 +171,30 @@ def test_producer_failures_surface_only_a_safe_category(category):
     assert json.loads(body) == {"error": category}
 
 
+def malformed_provider():
+    return b"not a catalog"
+
+
+def failed_provider():
+    raise RuntimeError("private provider details")
+
+
+@pytest.mark.parametrize(
+    ("provider", "category"),
+    [
+        (malformed_provider, "producer_protocol_error"),
+        (failed_provider, "producer_failed"),
+    ],
+)
+def test_provider_failures_are_normalized_without_leaking_details(provider, category):
+    with RunningServer(provider) as port:
+        status, content_type, body = request(port, "GET", "/api/catalog")
+    assert status == 502
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": category}
+    assert b"private provider details" not in body
+
+
 def test_static_assets_are_served_from_the_fixed_allowlist():
     for path, expected_type in (
         ("/", "text/html; charset=utf-8"),
