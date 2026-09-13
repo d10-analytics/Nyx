@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +29,7 @@ _SAFE_ERRORS = frozenset(
         "producer_failed",
         "producer_output_too_large",
         "producer_protocol_error",
+        "producer_cancelled",
     }
 )
 
@@ -185,11 +188,38 @@ class TrackerServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def get_request(self) -> tuple[Any, Any]:
+        connection, address = super().get_request()
+        with self._connection_lock:
+            self._active_connections.add(connection)
+        return connection, address
+
+    def close_request(self, request: Any) -> None:
+        with self._connection_lock:
+            self._active_connections.discard(request)
+        super().close_request(request)
+
+    def close_active_connections(self) -> None:
+        """Close accepted idle/active sockets during an owned shutdown."""
+        with self._connection_lock:
+            connections = tuple(self._active_connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+
     def __init__(
         self,
         provider: Provider | None = None,
         port: int = 0,
     ) -> None:
+        self._active_connections: set[Any] = set()
+        self._connection_lock = threading.Lock()
         selected_provider = provider if provider is not None else _default_provider
         super().__init__(("127.0.0.1", port), _handler_for(selected_provider))
 
