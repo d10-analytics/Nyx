@@ -1,0 +1,588 @@
+(() => {
+  "use strict";
+
+  const BOARD_ROWS = [
+    ["under_development", "Under Development"],
+    ["queue", "Queue"],
+    ["needs_fixes", "Needs Fixes"],
+    ["awaiting_retrospective", "Awaiting Retrospective"],
+  ];
+  const BOARD_LABELS = new Map(BOARD_ROWS);
+  const OFF_BOARD = "__off_board__";
+  const OFF_BOARD_LABEL = "Reference — off board";
+  const DECLARED_FIELDS = [
+    ["title", "Title"], ["target_project", "Target project"], ["status", "Status"],
+    ["closure", "Closure"], ["sanity_recommendation", "Sanity recommendation"],
+    ["human_sanity_decision", "Human sanity decision"],
+  ];
+  const SAFE_CATEGORIES = [
+    "producer_unavailable", "producer_timeout", "producer_failed",
+    "producer_output_too_large", "producer_protocol_error",
+  ];
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const RAIL_PITCH = 14;
+  const RAIL_INSET = 20;
+  const POLL_INTERVAL = 10000;
+  const CATALOG_ROUTE = "/api/catalog";
+
+  const board = document.querySelector("#board");
+  const detailPanel = document.querySelector("#details");
+  const status = document.querySelector("#status");
+  const filter = document.querySelector("#filter");
+  const refreshButton = document.querySelector("#refresh");
+
+  let displayed = null;
+  let pending = null;
+  let busy = false;
+  let queued = null;
+  let selectedPath = null;
+  let railPlan = new Map();
+  let railColumns = [];
+  let railEdges = [];
+
+  function text(value) {
+    const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
+    return raw.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+
+  function titleOf(entry) {
+    return entry.declared.title || entry.package_path;
+  }
+
+  function columnKeyOf(entry) {
+    return entry.declared.target_project || "";
+  }
+
+  function projectOf(entry) {
+    return entry.declared.target_project || "Unknown project";
+  }
+
+  function indexByPackageId(entries) {
+    const index = new Map();
+    entries.forEach((entry) => {
+      if (!entry.package_id) return;
+      index.set(entry.package_id, index.has(entry.package_id) ? null : entry);
+    });
+    return index;
+  }
+
+  function indexDependents(entries, byId) {
+    const index = new Map();
+    entries.forEach((entry) => {
+      if (byId.get(entry.package_id) !== entry) return;
+      (entry.prerequisites || []).forEach((edge) => {
+        if (!prerequisiteTarget(edge, byId)) return;
+        if (!index.has(edge.target_package_id)) index.set(edge.target_package_id, []);
+        const dependents = index.get(edge.target_package_id);
+        if (!dependents.includes(entry)) dependents.push(entry);
+      });
+    });
+    return index;
+  }
+
+  function prerequisiteTargets(entry) {
+    const seen = new Set();
+    const targets = [];
+    (entry.prerequisites || []).forEach((edge) => {
+      const key = edge.target_package_id || "";
+      if (seen.has(key)) return;
+      seen.add(key);
+      targets.push(edge);
+    });
+    return targets;
+  }
+
+  function depthForColumn(columnEntries, edges) {
+    const ids = new Set(columnEntries.map((entry) => entry.package_id).filter(Boolean));
+    const dependents = new Map([...ids].map((id) => [id, new Set()]));
+    const prerequisites = new Map([...ids].map((id) => [id, new Set()]));
+    // Ordering and arrows share the same globally unambiguous connections.
+    edges.forEach(({ source, dependent }) => {
+      if (!ids.has(source) || !ids.has(dependent)) return;
+      dependents.get(source).add(dependent);
+      prerequisites.get(dependent).add(source);
+    });
+
+    // Collapse strongly connected packages before assigning dependency depth.
+    // Iterative traversals also accommodate chains beyond the browser's call-stack limit.
+    const visited = new Set();
+    const finished = [];
+    ids.forEach((root) => {
+      if (visited.has(root)) return;
+      visited.add(root);
+      const stack = [[root, dependents.get(root).values()]];
+      while (stack.length) {
+        const [id, children] = stack[stack.length - 1];
+        const next = children.next();
+        if (next.done) {
+          finished.push(id);
+          stack.pop();
+        } else if (!visited.has(next.value)) {
+          visited.add(next.value);
+          stack.push([next.value, dependents.get(next.value).values()]);
+        }
+      }
+    });
+    const componentOf = new Map();
+    let componentCount = 0;
+    finished.reverse().forEach((root) => {
+      if (componentOf.has(root)) return;
+      const component = componentCount++;
+      componentOf.set(root, component);
+      const stack = [root];
+      while (stack.length) {
+        prerequisites.get(stack.pop()).forEach((id) => {
+          if (componentOf.has(id)) return;
+          componentOf.set(id, component);
+          stack.push(id);
+        });
+      }
+    });
+
+    const outgoing = Array.from({ length: componentCount }, () => new Set());
+    const indegree = Array(componentCount).fill(0);
+    dependents.forEach((children, source) => {
+      const from = componentOf.get(source);
+      children.forEach((dependent) => {
+        const to = componentOf.get(dependent);
+        if (from === to || outgoing[from].has(to)) return;
+        outgoing[from].add(to);
+        indegree[to] += 1;
+      });
+    });
+    const depth = Array(componentCount).fill(0);
+    const queue = [...outgoing.keys()].filter((component) => indegree[component] === 0);
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const component = queue[cursor];
+      outgoing[component].forEach((dependent) => {
+        depth[dependent] = Math.max(depth[dependent], depth[component] + 1);
+        indegree[dependent] -= 1;
+        if (indegree[dependent] === 0) queue.push(dependent);
+      });
+    }
+    return new Map([...ids].map((id) => [id, depth[componentOf.get(id)]]));
+  }
+
+  function prerequisiteTarget(edge, byId) {
+    if (["missing_target", "duplicate_target", "identity_coverage_incomplete",
+      "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+      "invalid_prerequisite", "self_edge"].includes(edge.reason)) return null;
+    return byId.get(edge.target_package_id) || null;
+  }
+
+  function rowKeyOf(entry) {
+    return BOARD_LABELS.has(entry.lifecycle) ? entry.lifecycle : OFF_BOARD;
+  }
+
+  // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
+  function planEdges(entries, byId) {
+    const seen = new Set();
+    const edges = [];
+    entries.forEach((entry) => {
+      if (byId.get(entry.package_id) !== entry) return;
+      (entry.prerequisites || []).forEach((edge) => {
+        const source = prerequisiteTarget(edge, byId);
+        if (!source || source.package_id === entry.package_id) return;
+        const key = `${source.package_id}>${entry.package_id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        edges.push({
+          source: source.package_id, dependent: entry.package_id,
+          sourceColumn: columnKeyOf(source), dependentColumn: columnKeyOf(entry),
+          row: rowKeyOf(source),
+        });
+      });
+    });
+    edges.sort((a, b) => a.source.localeCompare(b.source) || a.dependent.localeCompare(b.dependent));
+    return edges;
+  }
+
+  function columnsFor(entries) {
+    const columns = new Map();
+    entries.forEach((entry) => {
+      const key = columnKeyOf(entry);
+      if (!columns.has(key)) columns.set(key, projectOf(entry));
+    });
+    return [...columns.entries()].sort((a, b) => {
+      if (a[0] === "" || b[0] === "") return a[0] === b[0] ? 0 : a[0] === "" ? 1 : -1;
+      return a[1].localeCompare(b[1]);
+    });
+  }
+
+  function orderCell(cell, depth) {
+    return [...cell].sort((a, b) => {
+      const depthA = a.package_id ? depth.get(a.package_id) ?? 0 : 0;
+      const depthB = b.package_id ? depth.get(b.package_id) ?? 0 : 0;
+      if (depthA !== depthB) return depthA - depthB;
+      return titleOf(a).localeCompare(titleOf(b));
+    });
+  }
+
+  // Keep cross-project names readable without requiring users to trace a long arrow.
+  function needsHtml(entry, byId) {
+    const parts = prerequisiteTargets(entry).map((edge) => {
+      const target = prerequisiteTarget(edge, byId);
+      if (!target) return '<span class="link unresolved">unresolved target</span>';
+      if (columnKeyOf(target) === columnKeyOf(entry)) return "";
+      return `<span class="link cross">${text(titleOf(target))} ` +
+        `<em>${text(projectOf(target))}</em></span>`;
+    }).filter(Boolean);
+    return parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "";
+  }
+
+  function blocksHtml(entry, dependentsOf) {
+    const parts = (dependentsOf.get(entry.package_id) || [])
+      .filter((dependent) => columnKeyOf(dependent) !== columnKeyOf(entry))
+      .map((dependent) => `<span class="link cross">${text(titleOf(dependent))} ` +
+        `<em>${text(projectOf(dependent))}</em></span>`);
+    return parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "";
+  }
+
+  function searchText(entry) {
+    return [
+      entry.package_path, entry.package_id, entry.lifecycle, entry.program_title, entry.state,
+      ...DECLARED_FIELDS.map(([field]) => entry.declared[field]),
+    ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
+  }
+
+  function cardHtml(entry, byId, dependentsOf) {
+    const selected = selectedPath === entry.package_path;
+    const unblocked = ["no_declared_prerequisites", "satisfied"].includes(
+      entry.direct_prerequisite_state,
+    ) && (entry.prerequisites || []).every((edge) => edge.resolved_state === "satisfied");
+    const idAttribute = entry.package_id
+      ? ` data-package-id="${text(entry.package_id)}"` : "";
+    return `<button class="card${unblocked ? " unblocked" : ""}${selected ? " selected" : ""}" ` +
+      'type="button" ' +
+      `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
+      `${idAttribute} data-search="${text(searchText(entry))}">` +
+      `<span class="card-title">${text(titleOf(entry))}</span>` +
+      `<span class="card-project">${text(entry.declared.target_project || "Unknown project")}</span>` +
+      (unblocked ? '<span class="card-status" title="Direct prerequisites are clear; ' +
+        'this does not indicate implementation approval.">Unblocked</span>' : "") +
+      needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
+  }
+
+  function cellHtml(cell, byId, dependentsOf, gutter) {
+    const padding = gutter ? ` style="padding-left:${gutter}px"` : "";
+    if (!cell.length) return `<div class="cell vacant"${padding}><span class="empty">—</span></div>`;
+    return `<div class="cell"${padding}>` +
+      cell.map((entry) => cardHtml(entry, byId, dependentsOf)).join("") + "</div>";
+  }
+
+  function renderBoard() {
+    const entries = displayed ? displayed.entries : [];
+    const byId = indexByPackageId(entries);
+    const dependentsOf = indexDependents(entries, byId);
+    const columns = columnsFor(entries);
+    railColumns = columns.map(([key]) => key);
+    railPlan = new Map();
+    railEdges = [];
+    if (!entries.length) {
+      board.innerHTML = '<p class="empty board-empty">No packages in the catalog.</p>';
+      return;
+    }
+    railEdges = planEdges(entries, byId);
+    const bands = new Map();
+    railEdges.forEach((edge) => {
+      if (edge.sourceColumn === edge.dependentColumn) return;
+      edge.bandLane = bands.get(edge.row) || 0;
+      bands.set(edge.row, edge.bandLane + 1);
+    });
+    const plans = new Map(columns.map(([key]) => {
+      const columnEntries = entries.filter((entry) => columnKeyOf(entry) === key);
+      const depth = depthForColumn(columnEntries, railEdges);
+      const edges = railEdges.filter((edge) =>
+        edge.sourceColumn === key || edge.dependentColumn === key);
+      // Reserve distinct lanes for local arrows and both ends of cross-project arrows.
+      railPlan.set(key, { edges });
+      return [key, { depth, reserved: edges.length }];
+    }));
+    board.style.setProperty("--column-tracks", columns.map(([key]) => {
+      const reserved = plans.get(key).reserved;
+      const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
+      return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
+    }).join(" "));
+    const rows = [...BOARD_ROWS, [OFF_BOARD, OFF_BOARD_LABEL]];
+    let html = '<h2 class="board-corner" aria-hidden="true"></h2>' +
+      columns.map(([, label]) => `<h2 class="column-head">${text(label)}</h2>`).join("");
+    rows.forEach(([key, label]) => {
+      const rowEntries = key === OFF_BOARD
+        ? entries.filter((entry) => !BOARD_LABELS.has(entry.lifecycle))
+        : entries.filter((entry) => entry.lifecycle === key);
+      if (key === OFF_BOARD && rowEntries.length === 0) return;
+      const cells = columns.map(([columnKey]) => {
+        const { depth, reserved } = plans.get(columnKey);
+        const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
+        return cellHtml(
+          orderCell(rowEntries.filter((entry) => columnKeyOf(entry) === columnKey), depth),
+          byId,
+          dependentsOf,
+          gutter,
+        );
+      }).join("");
+      const band = bands.has(key)
+        ? `<span class="connection-band" aria-hidden="true" ` +
+          `style="height:${bands.get(key) * RAIL_PITCH + RAIL_INSET}px"></span>` : "";
+      html += `<section class="board-row" data-lifecycle="${text(key)}">${band}` +
+        `<h2 class="row-head">${text(label)}</h2>${cells}</section>`;
+    });
+    board.innerHTML = html;
+    applyFilter();
+  }
+
+  function applyFilter() {
+    const query = filter.value.trim().toLowerCase();
+    board.querySelectorAll(".card").forEach((card) => {
+      card.hidden = Boolean(query) && !card.dataset.search.includes(query);
+    });
+    board.querySelectorAll(".cell").forEach((cell) => {
+      const cards = [...cell.querySelectorAll(".card")];
+      cell.classList.toggle("filtered-empty", cards.length > 0 && cards.every((card) => card.hidden));
+    });
+    drawRails();
+  }
+
+  function drawRails() {
+    board.querySelector(".rail-layer")?.remove();
+    if (!displayed || !railEdges.length) return;
+    const heads = [...board.querySelectorAll(".column-head")];
+    const boardRect = board.getBoundingClientRect();
+    const cards = new Map();
+    board.querySelectorAll(".card[data-package-id]").forEach((card) => {
+      if (!card.hidden) cards.set(card.dataset.packageId, card);
+    });
+    const visibleEdges = railEdges.filter((edge) =>
+      cards.has(edge.source) && cards.has(edge.dependent));
+    const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
+    const selectedId = selected?.dataset.packageId;
+    const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
+    const bands = new Map([...board.querySelectorAll(".board-row")].map((row) =>
+      [row.dataset.lifecycle, row.querySelector(".connection-band")]));
+    const laneX = (key, edge) => {
+      const columnLeft = heads[railColumns.indexOf(key)].getBoundingClientRect().left - boardRect.left;
+      return columnLeft + (railPlan.get(key).edges.indexOf(edge) + .5) * RAIL_PITCH;
+    };
+    const port = (id, edge) => {
+      const rect = cards.get(id).getBoundingClientRect();
+      const incident = visibleEdges.filter((item) => item.source === id || item.dependent === id);
+      return {
+        x: rect.left - boardRect.left,
+        y: rect.top - boardRect.top + 12 +
+          (rect.height - 24) * (incident.indexOf(edge) + 1) / (incident.length + 1),
+      };
+    };
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "rail-layer");
+    svg.setAttribute("aria-hidden", "true");
+    const width = Math.max(board.scrollWidth, boardRect.width);
+    const height = Math.max(board.scrollHeight, boardRect.height);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.style.width = `${width}px`;
+    svg.style.height = `${height}px`;
+    svg.innerHTML = '<defs>' + ["normal", "emphasized"].map((kind) =>
+      `<marker id="rail-arrow-${kind}" viewBox="0 0 10 10" refX="10" refY="5" ` +
+      'markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">' +
+      `<path class="arrow-${kind}" d="M0 0L10 5L0 10Z"></path></marker>`).join("") + '</defs>';
+    // Draw emphasized connections last so their crossings remain easy to follow.
+    [...visibleEdges].sort((a, b) => Number(related(a)) - Number(related(b))).forEach((edge) => {
+      const start = port(edge.source, edge);
+      const end = port(edge.dependent, edge);
+      const sourceX = laneX(edge.sourceColumn, edge);
+      const dependentX = laneX(edge.dependentColumn, edge);
+      let route = `M ${start.x - 1} ${start.y} H ${sourceX}`;
+      if (edge.sourceColumn !== edge.dependentColumn) {
+        const bandY = bands.get(edge.row).getBoundingClientRect().top - boardRect.top +
+          RAIL_INSET / 2 + (edge.bandLane + .5) * RAIL_PITCH;
+        route += ` V ${bandY} H ${dependentX}`;
+      }
+      route += ` V ${end.y} H ${end.x - 5}`;
+      const emphasized = selectedId && related(edge);
+      const group = document.createElementNS(SVG_NS, "g");
+      group.setAttribute("class", "connection" +
+        (selectedId ? emphasized ? " emphasized" : " muted" : ""));
+      group.dataset.source = edge.source;
+      group.dataset.dependent = edge.dependent;
+      const halo = document.createElementNS(SVG_NS, "path");
+      halo.setAttribute("class", "rail-halo");
+      halo.setAttribute("d", route);
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("class", "rail");
+      path.setAttribute("d", route);
+      path.setAttribute("marker-end", `url(#rail-arrow-${emphasized ? "emphasized" : "normal"})`);
+      group.append(halo, path);
+      svg.append(group);
+    });
+    board.append(svg);
+  }
+
+  function renderDetails() {
+    const entries = displayed ? displayed.entries : [];
+    const entry = entries.find((item) => item.package_path === selectedPath);
+    if (!entry) {
+      const emptyCatalog = displayed && entries.length === 0;
+      detailPanel.innerHTML = (emptyCatalog
+        ? "<h2>No packages available</h2><p>The catalog contains no package entries.</p>"
+        : "<h2>Select a package</h2><p>Choose a card to inspect its declared values.</p>") +
+        catalogDiagnosticsHtml(displayed);
+      return;
+    }
+    const byId = indexByPackageId(entries);
+    const values = DECLARED_FIELDS.map(([field, label]) =>
+      `<dt>${label}</dt><dd>${text(entry.declared[field])}</dd>`).join("");
+    // Claims remain distinct in the details view even when they share a target.
+    const prerequisites = (entry.prerequisites || []).map((edge) => {
+      const target = prerequisiteTarget(edge, byId);
+      return '<li class="prerequisite-claim">' +
+        `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span> · ` +
+        `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
+        `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
+        `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
+    });
+    const diagnostics = (entry.diagnostics || []).length
+      ? `<ul class="diagnostics">${entry.diagnostics.map((item) =>
+        `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul>`
+      : "<p>No package diagnostics.</p>";
+    detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
+      `<dt>Package path</dt><dd>${text(entry.package_path)}</dd>` +
+      `<dt>Lifecycle</dt><dd>${text(entry.lifecycle)}</dd>` +
+      `<dt>Program</dt><dd>${text(entry.program_title || "Ungrouped")}</dd>` +
+      `<dt>Package ID</dt><dd>${text(entry.package_id)}</dd>${values}</dl>` +
+      "<h3>Direct prerequisites</h3>" +
+      `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.direct_prerequisite_state)}">` +
+      `${text(directPrerequisiteSummary(entry.direct_prerequisite_state, prerequisites.length))}</p>` +
+      (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "") +
+      `<h3>Diagnostics</h3>${diagnostics}` + catalogDiagnosticsHtml(displayed);
+  }
+
+  function directPrerequisiteSummary(state, claimCount) {
+    switch (state) {
+      case "no_declared_prerequisites": return claimCount === 0
+        ? "No direct prerequisites."
+        : "Reported direct prerequisite state: no declared prerequisites.";
+      case "satisfied": return "Reported direct prerequisite state: satisfied.";
+      case "unsatisfied": return "Reported direct prerequisite state: unsatisfied.";
+      case "unknown": return "Direct prerequisite information is unknown.";
+      default: return "Direct prerequisite information unavailable.";
+    }
+  }
+
+  function catalogDiagnosticsHtml(snapshot) {
+    const diagnostics = snapshot?.discovery_diagnostics || [];
+    const contents = diagnostics.length
+      ? `<ul class="diagnostics">${diagnostics.map((item) =>
+        `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul>`
+      : "<p>No catalog diagnostics.</p>";
+    return `<section class="catalog-diagnostics"><h3>Catalog diagnostics</h3>${contents}</section>`;
+  }
+
+  function select(path) {
+    selectedPath = selectedPath === path ? null : path;
+    board.querySelectorAll(".card").forEach((card) => {
+      const selected = card.dataset.packagePath === selectedPath;
+      card.classList.toggle("selected", selected);
+      card.setAttribute("aria-pressed", String(selected));
+    });
+    renderDetails();
+    drawRails();
+  }
+
+  function digestOf(snapshot) {
+    return snapshot && typeof snapshot.catalog_digest === "string" ? snapshot.catalog_digest : "";
+  }
+
+  function loadedStatus(snapshot) {
+    const count = snapshot.entries.length;
+    const discoveryDiagnostics = (snapshot.discovery_diagnostics || []).length;
+    const packageDiagnostics = snapshot.entries.some((entry) => (entry.diagnostics || []).length);
+    return `Loaded ${count} package${count === 1 ? "" : "s"}` +
+      (discoveryDiagnostics ? " · catalog diagnostics available" :
+        packageDiagnostics ? " · select a package to view diagnostics" : "");
+  }
+
+  function setPending(available) {
+    refreshButton.dataset.pending = String(available);
+    refreshButton.classList.toggle("pending", available);
+    refreshButton.textContent = available ? "Apply update" : "Refresh view";
+  }
+
+  function apply(snapshot) {
+    displayed = snapshot;
+    pending = null;
+    setPending(false);
+    if (selectedPath && !snapshot.entries.some((entry) => entry.package_path === selectedPath)) {
+      selectedPath = null;
+    }
+    status.textContent = loadedStatus(snapshot);
+    renderBoard();
+    renderDetails();
+  }
+
+  function safeCategory(error) {
+    return SAFE_CATEGORIES.includes(error.message) ? error.message : "producer_unavailable";
+  }
+
+  function request(kind) {
+    if (busy) {
+      if (kind === "manual") queued = "manual";
+      return;
+    }
+    busy = true;
+    if (kind === "manual") status.textContent = "Refreshing catalog…";
+    fetch(CATALOG_ROUTE, { cache: "no-store" })
+      .then(async (response) => {
+        let payload;
+        try { payload = await response.json(); }
+        catch (_) { throw new Error("producer_protocol_error"); }
+        if (!response.ok || !payload || payload.error) {
+          throw new Error((payload && payload.error) || "producer_protocol_error");
+        }
+        return payload;
+      })
+      .then((snapshot) => {
+        if (kind === "manual" || !displayed) { apply(snapshot); return; }
+        if (digestOf(snapshot) !== digestOf(displayed)) {
+          pending = snapshot;
+          setPending(true);
+        } else {
+          pending = null;
+          setPending(false);
+        }
+        status.textContent = loadedStatus(displayed);
+      })
+      .catch((error) => {
+        status.textContent = `${kind === "poll" ? "Update check failed" : "Refresh failed"}: ` +
+          safeCategory(error);
+      })
+      .finally(() => {
+        busy = false;
+        const next = queued;
+        queued = null;
+        if (next) request(next);
+      });
+  }
+
+  board.addEventListener("click", (event) => {
+    const card = event.target.closest("[data-package-path]");
+    if (card) select(card.dataset.packagePath);
+  });
+  refreshButton.addEventListener("click", () => {
+    if (pending) apply(pending);
+    else request("manual");
+  });
+  filter.addEventListener("input", applyFilter);
+  if (typeof ResizeObserver === "function") {
+    let resizeFrame = null;
+    new ResizeObserver(() => {
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = null;
+        drawRails();
+      });
+    }).observe(board);
+  }
+
+  request("manual");
+  window.setInterval(() => request("poll"), POLL_INTERVAL);
+})();

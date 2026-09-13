@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Catalog viewer</title>
+    <meta name="color-scheme" content="dark light">
+    <script src="/static/theme.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header class="toolbar">
+      <div>
+        <h1>Catalog viewer</h1>
+        <p id="status" role="status">Loading catalog…</p>
+      </div>
+      <div class="controls">
+        <label for="theme">Theme</label>
+        <select id="theme">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark" selected>Dark</option>
+        </select>
+        <label for="filter">Find</label>
+        <input id="filter" type="search" placeholder="Find a package, project, or program…" autocomplete="off">
+        <button id="refresh" type="button">Refresh view</button>
+      </div>
+    </header>
+    <main id="board" aria-live="polite"></main>
+    <aside id="details" class="details" aria-label="Selected package details">
+      <h2>Select a package</h2>
+      <p>Choose a card to inspect its declared values.</p>
+    </aside>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
