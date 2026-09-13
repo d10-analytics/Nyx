@@ -85,11 +85,13 @@ def test_catalog_and_safe_provider_errors_do_not_capture_data_in_nyx():
         anchor = root / "Fictional" / "Queue" / "sample" / "spec.md"
         anchor.parent.mkdir(parents=True)
         anchor.write_text("# Fictional sample\n", encoding="utf-8")
+        repository_before = _snapshot(REPOSITORY_ROOT)
         before = _snapshot(root)
 
         rendered = catalog.scan_catalog(root, version=2)
         assert '"entries"' in rendered
         assert _snapshot(root) == before
+        assert _snapshot(REPOSITORY_ROOT) == repository_before
 
         with pytest.raises(server.CatalogError) as error:
             server._catalog_from_provider(  # noqa: SLF001 - inspect the safe boundary
@@ -97,6 +99,7 @@ def test_catalog_and_safe_provider_errors_do_not_capture_data_in_nyx():
             )
         assert error.value.code == "producer_failed"
         assert _snapshot(root) == before
+        assert _snapshot(REPOSITORY_ROOT) == repository_before
         assert not any(path.name.endswith((".json", ".log", ".png")) for path in root.rglob("*"))
 
 
