@@ -99,3 +99,17 @@ def test_free_lease_removes_stale_record_without_pid_signal():
         with patch.object(runtime, "_paths", return_value=paths):
             assert runtime.stop() == "stopped"
         assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+
+def test_free_lease_retains_unsafe_instance_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        sentinel = Path(temporary) / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        paths.runtime_directory.joinpath("instance.json").symlink_to(sentinel)
+        with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+            runtime.UnhealthyInstanceError
+        ):
+            runtime.stop()
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert paths.runtime_directory.joinpath("instance.json").is_symlink()
