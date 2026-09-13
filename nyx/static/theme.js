@@ -1,7 +1,8 @@
 (() => {
   "use strict";
 
-  const storageKey = "nyx-theme";
+  // Keep this key stable so an existing viewer preference survives migration.
+  const storageKey = "spec-tracker-theme";
   const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
   const normalize = (value) => ["system", "light", "dark"].includes(value) ? value : "dark";
   let preference = "dark";
