@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -37,7 +39,15 @@ def _inspection_paths() -> list[Path]:
     return sorted(set(paths))
 
 
+def _is_own_fixture_bytecode(path: Path) -> bool:
+    bytecode_directory = Path(__file__).resolve().parent / "__pycache__"
+    prefix = f"{Path(__file__).stem}."
+    return path.parent == bytecode_directory and path.name.startswith(prefix) and path.suffix == ".pyc"
+
+
 def _contains_sensitive_marker(path: Path) -> bool:
+    if _is_own_fixture_bytecode(path):
+        return False
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
             for member in archive.infolist():
@@ -101,6 +111,27 @@ def test_catalog_and_safe_provider_errors_do_not_capture_data_in_nyx():
         assert _snapshot(root) == before
         assert _snapshot(REPOSITORY_ROOT) == repository_before
         assert not any(path.name.endswith((".json", ".log", ".png")) for path in root.rglob("*"))
+
+
+def test_bytecode_enabled_import_creates_own_fixture_bytecode_without_failing_scan():
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    subprocess.run(
+        [sys.executable, "-c", "import tests.test_confidentiality"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+    )
+    bytecode = sorted(
+        (REPOSITORY_ROOT / "tests" / "__pycache__").glob("test_confidentiality*.pyc")
+    )
+    assert bytecode
+    assert any(
+        marker in path.read_bytes().decode("utf-8", errors="replace")
+        for path in bytecode
+        for marker in _FICTIONAL_SENTINELS
+    )
+    assert all(not _contains_sensitive_marker(path) for path in bytecode)
 
 
 def test_no_environment_redirects_catalog_state_into_the_checkout():
