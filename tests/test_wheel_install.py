@@ -47,15 +47,14 @@ def test_wheel_contains_every_module_and_frontend_asset():
     assert EXPECTED_ASSETS <= names
 
 
-def test_installed_wheel_serves_static_and_api_behavior_without_checkout_imports():
+def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():
     wheel = _wheel_path()
+    pytest.importorskip("playwright.sync_api")
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
-        venv = root / "venv"
-        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
-        interpreter = venv / "bin" / "python"
+        installed = root / "installed"
         subprocess.run(
-            [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(installed), str(wheel)],
             check=True,
             capture_output=True,
             text=True,
@@ -66,40 +65,56 @@ def test_installed_wheel_serves_static_and_api_behavior_without_checkout_imports
                 """
                 import http.client
                 import json
+                import threading
                 from nyx.models import canonical_digest
                 from nyx.server import create_server
 
+                entry = {
+                    "package_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "package_path": "Fictional/Queue/installed-demo",
+                    "lifecycle": "queue",
+                    "state": "complete",
+                    "declared": {
+                        "title": "Installed catalog entry",
+                        "target_project": "Fictional",
+                        "status": "ready",
+                        "closure": "approved",
+                        "sanity_recommendation": "PROCEED_TO_DESIGN",
+                        "human_sanity_decision": "AFFIRMED",
+                    },
+                    "diagnostics": [],
+                    "relationship": {
+                        "participation": "available",
+                        "claims": [],
+                        "prerequisites": [],
+                        "direct_prerequisite_state": "no_declared_prerequisites",
+                        "program": {
+                            "program_id": None,
+                            "title": None,
+                            "resolution": "not_declared",
+                            "diagnostics": [],
+                        },
+                        "superseded_by": {
+                            "package_id": None,
+                            "resolution": "not_declared",
+                            "diagnostics": [],
+                        },
+                    },
+                    "transitive_diagnostics": [],
+                }
                 catalog = {
                     "schema_version": 2,
                     "identity_coverage": {"state": "complete", "diagnostics": []},
                     "program_coverage": {"state": "complete", "diagnostics": []},
                     "discovery_diagnostics": [],
-                    "entries": [],
+                    "entries": [entry],
                     "programs": [],
                 }
                 catalog["catalog_digest"] = canonical_digest(catalog)
                 service = create_server(lambda: catalog, port=0)
-                import threading
                 thread = threading.Thread(target=service.serve_forever)
                 thread.start()
                 try:
-                    for path, content_type in (
-                        ("/", "text/html; charset=utf-8"),
-                        ("/static/app.js", "text/javascript; charset=utf-8"),
-                        ("/static/theme.js", "text/javascript; charset=utf-8"),
-                        ("/static/style.css", "text/css; charset=utf-8"),
-                    ):
-                        connection = http.client.HTTPConnection("127.0.0.1", service.server_port)
-                        connection.request(
-                            "GET", path, headers={"Host": f"127.0.0.1:{service.server_port}"}
-                        )
-                        response = connection.getresponse()
-                        body = response.read()
-                        connection.close()
-                        assert response.status == 200
-                        assert response.getheader("Content-Type") == content_type
-                        assert body
-
                     connection = http.client.HTTPConnection("127.0.0.1", service.server_port)
                     connection.request(
                         "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{service.server_port}"}
@@ -108,7 +123,33 @@ def test_installed_wheel_serves_static_and_api_behavior_without_checkout_imports
                     body = response.read()
                     connection.close()
                     assert response.status == 200
-                    assert json.loads(body)["entries"] == []
+                    assert json.loads(body)["entries"][0]["package_path"] == entry["package_path"]
+
+                    from playwright.sync_api import sync_playwright
+
+                    with sync_playwright() as api:
+                        browser = api.chromium.launch()
+                        page = browser.new_page()
+                        try:
+                            page.goto(f"http://127.0.0.1:{service.server_port}/")
+                            page.locator(".card-title").wait_for(timeout=15000)
+                            assert page.locator(".column-head").all_inner_texts() == ["Fictional"]
+                            assert page.locator(".row-head").all_inner_texts()[:2] == [
+                                "Under Development",
+                                "Queue",
+                            ]
+                            assert page.locator(".card-title").all_inner_texts() == [
+                                "Installed catalog entry"
+                            ]
+                            assert page.locator(
+                                '.card[data-package-path="Fictional/Queue/installed-demo"]'
+                            ).count() == 1
+                            assert page.locator("#board").inner_text().count(
+                                "Installed catalog entry"
+                            ) == 1
+                        finally:
+                            page.close()
+                            browser.close()
                     import nyx
                     print(nyx.__file__)
                 finally:
@@ -124,8 +165,9 @@ def test_installed_wheel_serves_static_and_api_behavior_without_checkout_imports
             for key, value in os.environ.items()
             if key not in {"PYTHONPATH", "PYTHONHOME"}
         }
+        environment["PYTHONPATH"] = str(installed)
         completed = subprocess.run(
-            [str(interpreter), str(probe)],
+            [sys.executable, str(probe)],
             cwd=root,
             env=environment,
             check=True,
@@ -133,5 +175,5 @@ def test_installed_wheel_serves_static_and_api_behavior_without_checkout_imports
             text=True,
         )
         installed_module = Path(completed.stdout.strip())
-        assert installed_module.is_relative_to(venv)
+        assert installed_module.is_relative_to(installed)
         assert not installed_module.is_relative_to(REPOSITORY_ROOT)
