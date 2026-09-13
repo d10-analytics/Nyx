@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import http.client
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -291,3 +293,167 @@ def test_closed_worker_admission_spawns_no_child():
     with pytest.raises(runtime.WorkerError, match="producer_cancelled"):
         manager.fetch_catalog()
     assert commands == []
+
+
+def test_worker_output_limit_is_enforced_incrementally():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x' * (2**21 + 1)); sys.stdout.flush()",
+        ],
+        timeout=2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+        manager.fetch_catalog()
+    assert time.monotonic() - started < 2
+    assert manager.close(time.monotonic() + 2)
+    assert manager.active_count == 0
+
+
+def test_worker_timeout_has_no_additive_reap_window():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_timeout"):
+        manager.fetch_catalog()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.8
+    assert manager.close(time.monotonic() + 2)
+
+
+def test_separate_processes_serialize_on_the_persistent_operation_lock():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "operation.lock"
+        script = (
+            "import sys,time; from nyx.runtime import _FileLock; "
+            "lock=_FileLock(__import__('pathlib').Path(sys.argv[1]), timeout=2); "
+            "assert lock.acquire(); open(sys.argv[2], 'a').write('acquired\\n'); "
+            "time.sleep(.35); lock.close()"
+        )
+        events = Path(temporary) / "events"
+        started = time.monotonic()
+        first = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(events)])
+        second = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(events)])
+        assert first.wait(timeout=3) == 0
+        assert second.wait(timeout=3) == 0
+        assert time.monotonic() - started >= 0.6
+        assert events.read_text(encoding="utf-8").splitlines() == ["acquired", "acquired"]
+
+
+def test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "lease.lock"
+        script = (
+            "import fcntl,os,subprocess,sys,time; "
+            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); os.fchmod(fd, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.8)'], pass_fds=(fd,)); "
+            "os.close(fd); os._exit(0)"
+        )
+        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
+        assert launcher.wait(timeout=2) == 0
+        probe = runtime._FileLock(lock_path, timeout=0.0)
+        assert not probe.acquire(blocking=False)
+        time.sleep(1)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
+def test_launcher_loss_before_spawn_releases_untransferred_lease():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "lease.lock"
+        script = (
+            "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600); "
+            "os.fchmod(fd,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os._exit(0)"
+        )
+        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
+        assert launcher.wait(timeout=2) == 0
+        probe = runtime._FileLock(lock_path, timeout=0.0)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
+def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        script = (
+            "import os,sys,time; from pathlib import Path; from nyx import runtime,state; "
+            "home=Path(sys.argv[1]); paths=state.StatePaths(home,home/'.config/nyx',home/'.config/nyx/config.json',"
+            "home/'.local/state/nyx',home/'.local/state/nyx/deployment.json',home/'.local/state/nyx/runtime'); "
+            "runtime._paths=lambda create=True: paths; fd=os.open(paths.runtime_directory/'lease.lock',os.O_RDWR|os.O_CREAT,0o600); "
+            "os.fchmod(fd,0o600); import fcntl; fcntl.flock(fd,fcntl.LOCK_EX); "
+            "runtime._Daemon(fd,int((time.monotonic()+5)*10**9)).start()"
+        )
+        crashed = subprocess.Popen([sys.executable, "-c", script, str(paths.account_home)])
+        try:
+            _wait_for_record(paths)
+            crashed.kill()
+            assert crashed.wait(timeout=2) == -9
+            with patch.object(runtime, "_paths", return_value=paths):
+                assert runtime.stop() == "stopped"
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+        finally:
+            if crashed.poll() is None:
+                crashed.kill()
+                crashed.wait()
+
+
+def test_controlled_stop_timeout_retains_daemon_lease_until_child_cleanup():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            daemon.workers = runtime.CatalogWorkerManager(
+                command_factory=lambda: [
+                    sys.executable,
+                    "-c",
+                    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(.5); time.sleep(30)",
+                ],
+                timeout=30,
+            )
+            daemon_thread = threading.Thread(target=daemon.run)
+            daemon_thread.start()
+            instance = _wait_for_record(paths)
+            request_done: list[object] = []
+
+            def request_catalog() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=10)
+                try:
+                    connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"})
+                    request_done.append(connection.getresponse().status)
+                except OSError:
+                    request_done.append(None)
+                finally:
+                    connection.close()
+
+            request_thread = threading.Thread(target=request_catalog)
+            request_thread.start()
+            deadline = time.monotonic() + 2
+            while daemon.workers.active_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert daemon.workers.active_count == 1
+            time.sleep(0.7)
+            response = runtime._send_control(instance, "stop")
+            assert response["status"] == "stopping"
+            assert daemon.shutdown_done.wait(timeout=7)
+            assert daemon.shutdown_result == "timeout"
+            probe = runtime._lease_lock(paths, timeout=0.0)
+            assert not probe.acquire(blocking=False)
+            probe.close()
+            # The child and request are test-owned; release them before allowing
+            # the daemon thread to complete its retained-ownership loop.
+            for child in tuple(daemon.workers._children):
+                child.process.kill()
+            request_thread.join(timeout=3)
+            daemon.shutdown_result = "stopped"
+            if daemon.control is not None:
+                daemon.control.close()
+            daemon_thread.join(timeout=3)
+            assert not daemon_thread.is_alive()
