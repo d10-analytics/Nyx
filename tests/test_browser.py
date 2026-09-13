@@ -785,6 +785,20 @@ def test_dark_is_default_and_explicit_theme_survives_reload_and_system_changes(o
     assert page.locator("html").get_attribute("data-theme") == "dark"
 
 
+def test_established_theme_preference_survives_viewer_migration(open_page):
+    page = open_page(
+        StaticClient(board_payload()),
+        color_scheme="dark",
+        init_script="localStorage.setItem('spec-tracker-theme', 'light');",
+    )
+    selector = page.get_by_label("Theme", exact=True)
+    assert selector.input_value() == "light"
+    assert page.locator("html").get_attribute("data-theme") == "light"
+    page.reload()
+    playwright.expect(selector).to_have_value("light")
+    assert page.locator("html").get_attribute("data-theme") == "light"
+
+
 def test_system_theme_follows_live_changes_and_remembers_system_choice(open_page):
     page = open_page(StaticClient(board_payload()), color_scheme="light")
     selector = page.get_by_label("Theme", exact=True)
@@ -801,7 +815,7 @@ def test_system_theme_follows_live_changes_and_remembers_system_choice(open_page
 
 
 @pytest.mark.parametrize("storage_setup", [
-    "localStorage.setItem('nyx-theme', 'unrecognized');",
+    "localStorage.setItem('spec-tracker-theme', 'unrecognized');",
     """Object.defineProperty(window, 'localStorage', {
       get() { throw new DOMException('Blocked', 'SecurityError'); }
     });""",
@@ -829,7 +843,7 @@ def test_theme_changes_sync_between_tabs(open_page):
         other.get_by_label("Theme", exact=True).select_option("light")
         playwright.expect(page.get_by_label("Theme", exact=True)).to_have_value("light")
         assert page.locator("html").get_attribute("data-theme") == "light"
-        other.evaluate("localStorage.removeItem('nyx-theme')")
+        other.evaluate("localStorage.removeItem('spec-tracker-theme')")
         playwright.expect(page.get_by_label("Theme", exact=True)).to_have_value("dark")
         assert page.locator("html").get_attribute("data-theme") == "dark"
     finally:
