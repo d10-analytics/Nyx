@@ -191,7 +191,9 @@ def _write_instance(paths: state.StatePaths, instance: Instance) -> None:
     try:
         fd, temporary = tempfile.mkstemp(prefix=".instance.json.", dir=paths.runtime_directory)
         os.fchmod(fd, 0o600)
-        os.write(fd, data)
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
         os.fsync(fd)
         os.close(fd)
         os.replace(temporary, _record_path(paths))
@@ -208,7 +210,16 @@ def _write_instance(paths: state.StatePaths, instance: Instance) -> None:
 
 def _remove_stale_instance(paths: state.StatePaths) -> None:
     try:
-        _record_path(paths).unlink()
+        record = _record_path(paths)
+        details = record.lstat()
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o600
+        ):
+            raise UnhealthyInstanceError("Nyx instance record is unsafe")
+        record.unlink()
     except FileNotFoundError:
         pass
     except OSError as error:
@@ -316,7 +327,8 @@ class _Daemon:
                         continue
                     command = request.get("command")
                     if command == "status":
-                        response = {"status": "ready", "instance_id": self.instance.instance_id, "url": URL}
+                        status = "unhealthy" if self.shutdown_result == "timeout" else "ready"
+                        response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
                     elif command == "stop":
                         response = {"status": "stopping", "instance_id": self.instance.instance_id, "url": URL}
                         connection.sendall((json.dumps(response) + "\n").encode())
