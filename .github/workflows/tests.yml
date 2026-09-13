@@ -24,6 +24,7 @@ jobs:
           "$runner_python" -m build --wheel
           wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
           test "$wheel_count" -eq 1
+          "$runner_python" -m pytest tests/test_wheel_install.py -v
           nyx_verify_user=nyx-verify
           nyx_verify_root=/opt/nyx-verify
           cleanup() {
