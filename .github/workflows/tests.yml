@@ -1,0 +1,51 @@
+name: tests
+
+on: [push]
+
+jobs:
+  nyx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Verify package and installed service
+        run: |
+          set -euo pipefail
+          runner_python="$(command -v python)"
+          "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+          "$runner_python" -m pip install --upgrade pip
+          "$runner_python" -m pip install -e '.[test]' build
+          "$runner_python" -m playwright install --with-deps chromium
+          ruff check .
+          "$runner_python" -m pytest tests/ -v
+          "$runner_python" -m build --wheel
+          wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          test "$wheel_count" -eq 1
+          nyx_verify_user=nyx-verify
+          nyx_verify_root=/opt/nyx-verify
+          cleanup() {
+            if id "$nyx_verify_user" >/dev/null 2>&1; then
+              sudo -u "$nyx_verify_user" -H env -u PYTHONPATH -u PYTHONHOME \
+                "$nyx_verify_root/venv/bin/nyx" --stop >/dev/null 2>&1 || true
+              sudo userdel --remove "$nyx_verify_user"
+            fi
+          }
+          trap cleanup EXIT
+          sudo useradd --create-home --shell /bin/bash "$nyx_verify_user"
+          nyx_verify_home="$(getent passwd "$nyx_verify_user" | cut -d: -f6)"
+          sudo install -d --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0700 \
+            "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_home/.local/bin"
+          sudo -u "$nyx_verify_user" -H "$runner_python" -m venv "$nyx_verify_root/venv"
+          sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m pip install \
+            "$GITHUB_WORKSPACE"/dist/*.whl pytest
+          sudo -u "$nyx_verify_user" -H ln -s "$nyx_verify_root/venv/bin/nyx" \
+            "$nyx_verify_home/.local/bin/nyx"
+          sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
+            tests/test_installed_service.py "$nyx_verify_root/exercise/test_installed_service.py"
+          timeout --preserve-status 90s sudo -u "$nyx_verify_user" -H env -u PYTHONPATH -u PYTHONHOME \
+            PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \
+            "$nyx_verify_root/venv/bin/python" -m pytest \
+            "$nyx_verify_root/exercise/test_installed_service.py" -v
