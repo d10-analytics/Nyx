@@ -106,13 +106,16 @@ def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
             }
 
         def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _error(self, code: str) -> None:
             self._send(HTTPStatus.BAD_GATEWAY, _json_bytes({"error": code}), "application/json")

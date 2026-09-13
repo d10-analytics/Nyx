@@ -433,7 +433,7 @@ class _Daemon:
             if completed and self.shutdown_result == "timeout":
                 # Ownership stays with this daemon while direct-child cleanup
                 # or connection shutdown is unresolved.
-                while True:
+                while self.shutdown_result == "timeout":
                     time.sleep(1.0)
             else:
                 try:
