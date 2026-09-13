@@ -41,6 +41,8 @@ def _contains_sensitive_marker(path: Path) -> bool:
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
             for member in archive.infolist():
+                if member.is_dir():
+                    continue
                 if any(marker in member.filename for marker in _FICTIONAL_SENTINELS):
                     return True
                 content = archive.read(member).decode("utf-8", errors="replace")
