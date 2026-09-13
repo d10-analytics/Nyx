@@ -133,7 +133,10 @@ def test_existing_general_parents_are_not_repermissioned():
         config_parent = home / ".config"
         state_parent = home / ".local" / "state"
         config_parent.mkdir(mode=0o755)
-        state_parent.mkdir(parents=True, mode=0o755)
+        (home / ".local").mkdir(mode=0o755)
+        state_parent.mkdir(mode=0o755)
+        os.chmod(home / ".local", 0o755)
+        os.chmod(state_parent, 0o755)
         config_mode = stat.S_IMODE(config_parent.stat().st_mode)
         local_mode = stat.S_IMODE((home / ".local").stat().st_mode)
         state_mode = stat.S_IMODE(state_parent.stat().st_mode)
