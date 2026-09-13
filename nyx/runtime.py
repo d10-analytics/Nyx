@@ -382,6 +382,7 @@ class _Daemon:
                 return self.shutdown_result
             deadline = time.monotonic() + SHUTDOWN_TIMEOUT
             self.stop_requested.set()
+            self.workers.close_admission()
             if self.server is not None:
                 self.server.shutdown()
                 self.server.close_active_connections()

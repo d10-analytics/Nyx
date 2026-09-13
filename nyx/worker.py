@@ -122,12 +122,7 @@ class CatalogWorkerManager:
     def close(self, deadline: float) -> bool:
         """Close admission and reap direct children before the deadline."""
 
-        with self._lock:
-            self._closing = True
-            children = tuple(self._children)
-            for child in children:
-                child.cancelled = True
-                child.process.terminate()
+        self.close_admission()
         while time.monotonic() < deadline:
             with self._lock:
                 remaining = tuple(self._children)
@@ -143,6 +138,16 @@ class CatalogWorkerManager:
                     if child.process.poll() is not None:
                         self._children.remove(child)
         return not self._children
+
+    def close_admission(self) -> None:
+        """Prevent new requests and cancel currently registered children."""
+
+        with self._lock:
+            self._closing = True
+            children = tuple(self._children)
+            for child in children:
+                child.cancelled = True
+                child.process.terminate()
 
 
 if __name__ == "__main__":
