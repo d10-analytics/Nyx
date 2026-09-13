@@ -166,6 +166,8 @@ def _verify_general_directory(path: Path) -> None:
         raise AccountHomeError("Nyx state parent directory is unavailable") from error
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
         raise AccountHomeError("Nyx state parent is not a real directory")
+    if stat.S_IMODE(details.st_mode) & 0o022:
+        raise AccountHomeError("Nyx state parent is writable by another UID")
 
 
 def _ensure_general_directory(path: Path) -> None:
