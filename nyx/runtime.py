@@ -261,6 +261,7 @@ class _Daemon:
         self.paths = _paths(create=True)
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
+        self.shutdown_done = threading.Event()
         self.server: TrackerServer | None = None
         self.control: socket.socket | None = None
         self.instance: Instance | None = None
@@ -389,31 +390,34 @@ class _Daemon:
             pass
 
     def shutdown(self) -> str:
-        with self.shutdown_lock:
-            if self.shutdown_result not in {"running", "timeout"}:
+        try:
+            with self.shutdown_lock:
+                if self.shutdown_result not in {"running", "timeout"}:
+                    return self.shutdown_result
+                deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+                self.stop_requested.set()
+                self.workers.close_admission()
+                if self.server is not None:
+                    self.server.shutdown()
+                    self.server.close_active_connections()
+                    self.server.server_close()
+                workers_ok = self.workers.close(deadline)
+                if self.control_thread is not None:
+                    self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                if not workers_ok or time.monotonic() >= deadline:
+                    self.shutdown_result = "timeout"
+                    return self.shutdown_result
+                try:
+                    if self.control is not None:
+                        self.control.close()
+                    _record_path(self.paths).unlink()
+                except OSError:
+                    self.shutdown_result = "timeout"
+                    return self.shutdown_result
+                self.shutdown_result = "stopped"
                 return self.shutdown_result
-            deadline = time.monotonic() + SHUTDOWN_TIMEOUT
-            self.stop_requested.set()
-            self.workers.close_admission()
-            if self.server is not None:
-                self.server.shutdown()
-                self.server.close_active_connections()
-                self.server.server_close()
-            workers_ok = self.workers.close(deadline)
-            if self.control_thread is not None:
-                self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-            if not workers_ok or time.monotonic() >= deadline:
-                self.shutdown_result = "timeout"
-                return self.shutdown_result
-            try:
-                if self.control is not None:
-                    self.control.close()
-                _record_path(self.paths).unlink()
-            except OSError:
-                self.shutdown_result = "timeout"
-                return self.shutdown_result
-            self.shutdown_result = "stopped"
-            return self.shutdown_result
+        finally:
+            self.shutdown_done.set()
 
     def run(self) -> int:
         completed = False
@@ -424,6 +428,8 @@ class _Daemon:
             self._cleanup_start_failure()
             return 1
         finally:
+            if completed and self.stop_requested.is_set():
+                self.shutdown_done.wait()
             if completed and self.shutdown_result == "timeout":
                 # Ownership stays with this daemon while direct-child cleanup
                 # or connection shutdown is unresolved.

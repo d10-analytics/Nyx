@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import selectors
 import subprocess
 import sys
 import threading
@@ -51,6 +53,13 @@ class _Child:
     cancelled: bool = False
 
 
+@dataclass
+class _Reservation:
+    """Admission reservation held while a direct child is being spawned."""
+
+    completed: bool = False
+
+
 class CatalogWorkerManager:
     """Admit, register, cancel and reap catalog worker children."""
 
@@ -67,57 +76,104 @@ class CatalogWorkerManager:
         self._lock = threading.RLock()
         self._closing = False
         self._children: list[_Child] = []
+        self._reservations: list[_Reservation] = []
 
     @property
     def active_count(self) -> int:
         with self._lock:
-            return len(self._children)
+            return len(self._children) + len(self._reservations)
 
     def fetch_catalog(self) -> bytes:
         """Fetch one catalog, ensuring every spawned child is registered."""
 
+        reservation = _Reservation()
         with self._lock:
             if self._closing:
                 raise WorkerError("producer_cancelled")
-            child = _Child(
-                subprocess.Popen(
-                    self._command_factory(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    close_fds=True,
-                )
+            self._reservations.append(reservation)
+        try:
+            process = subprocess.Popen(
+                self._command_factory(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
             )
+        except BaseException:
+            with self._lock:
+                self._reservations.remove(reservation)
+            raise
+        child = _Child(process)
+        with self._lock:
+            self._reservations.remove(reservation)
+            reservation.completed = True
             self._children.append(child)
             if self._closing:
                 child.cancelled = True
                 child.process.terminate()
 
         try:
-            try:
-                stdout, stderr = child.process.communicate(timeout=self._timeout)
-            except subprocess.TimeoutExpired:
-                with self._lock:
-                    child.cancelled = True
-                child.process.terminate()
-                try:
-                    stdout, stderr = child.process.communicate(timeout=1.0)
-                except subprocess.TimeoutExpired as error:
-                    raise WorkerError("producer_timeout") from error
-                raise WorkerError("producer_timeout")
-            if child.cancelled:
-                raise WorkerError("producer_cancelled")
-            if len(stdout) > MAX_STDOUT_BYTES or len(stderr) > MAX_STDERR_BYTES:
-                raise WorkerError("producer_output_too_large")
-            if child.process.returncode != 0:
-                if child.process.returncode == 4:
-                    raise WorkerError("producer_unavailable")
-                raise WorkerError("producer_failed")
-            return stdout
+            return self._collect(child)
         finally:
             with self._lock:
                 if child in self._children and child.process.poll() is not None:
                     self._children.remove(child)
+
+    def _collect(self, child: _Child) -> bytes:
+        """Read both pipes incrementally under one request deadline."""
+
+        limits = {"stdout": MAX_STDOUT_BYTES, "stderr": MAX_STDERR_BYTES}
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        selector = selectors.DefaultSelector()
+        streams: dict[int, str] = {}
+        for name, stream in (("stdout", child.process.stdout), ("stderr", child.process.stderr)):
+            if stream is not None:
+                stream_fd = stream.fileno()
+                os.set_blocking(stream_fd, False)
+                streams[stream_fd] = name
+                selector.register(stream_fd, selectors.EVENT_READ)
+        deadline = time.monotonic() + self._timeout
+        try:
+            while streams:
+                if child.cancelled:
+                    child.process.terminate()
+                    raise WorkerError("producer_cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    child.cancelled = True
+                    if child.process.poll() is None:
+                        child.process.terminate()
+                    raise WorkerError("producer_timeout")
+                for key, _ in selector.select(remaining):
+                    stream_fd = key.fd
+                    name = streams[stream_fd]
+                    try:
+                        chunk = os.read(stream_fd, 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream_fd)
+                        streams.pop(stream_fd)
+                        continue
+                    captured[name].extend(chunk)
+                    if len(captured[name]) > limits[name]:
+                        child.cancelled = True
+                        if child.process.poll() is None:
+                            child.process.terminate()
+                        raise WorkerError("producer_output_too_large")
+            child.process.wait()
+            if child.cancelled:
+                raise WorkerError("producer_cancelled")
+            if child.process.returncode != 0:
+                if child.process.returncode == 4:
+                    raise WorkerError("producer_unavailable")
+                raise WorkerError("producer_failed")
+            return bytes(captured["stdout"])
+        finally:
+            selector.close()
+            for stream in (child.process.stdout, child.process.stderr):
+                if stream is not None:
+                    stream.close()
 
     def close(self, deadline: float) -> bool:
         """Close admission and reap direct children before the deadline."""
@@ -126,7 +182,8 @@ class CatalogWorkerManager:
         while time.monotonic() < deadline:
             with self._lock:
                 remaining = tuple(self._children)
-            if not remaining:
+                spawning = tuple(self._reservations)
+            if not remaining and not spawning:
                 return True
             for child in remaining:
                 try:
@@ -137,7 +194,8 @@ class CatalogWorkerManager:
                 for child in tuple(self._children):
                     if child.process.poll() is not None:
                         self._children.remove(child)
-        return not self._children
+        with self._lock:
+            return not self._children and not self._reservations
 
     def close_admission(self) -> None:
         """Prevent new requests and cancel currently registered children."""
