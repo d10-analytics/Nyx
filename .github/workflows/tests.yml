@@ -38,17 +38,22 @@ jobs:
           sudo useradd --create-home --shell /bin/bash "$nyx_verify_user"
           nyx_verify_home="$(getent passwd "$nyx_verify_user" | cut -d: -f6)"
           sudo install -d --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0700 \
-            "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_root/wheels" "$nyx_verify_home/.local/bin"
+            "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_root/wheels" \
+            "$nyx_verify_home/.local" "$nyx_verify_home/.local/bin"
           sudo -u "$nyx_verify_user" -H "$runner_python" -m venv "$nyx_verify_root/venv"
+          nyx_verify_wheels=("$GITHUB_WORKSPACE"/dist/*.whl)
+          test "${#nyx_verify_wheels[@]}" -eq 1
+          test -f "${nyx_verify_wheels[0]}"
+          nyx_verify_wheel="$nyx_verify_root/wheels/${nyx_verify_wheels[0]##*/}"
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
-            "$GITHUB_WORKSPACE"/dist/*.whl "$nyx_verify_root/wheels/"
+            "${nyx_verify_wheels[0]}" "$nyx_verify_wheel"
           sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m pip install \
-            "$nyx_verify_root"/wheels/*.whl pytest
+            "$nyx_verify_wheel" pytest
           sudo -u "$nyx_verify_user" -H ln -s "$nyx_verify_root/venv/bin/nyx" \
             "$nyx_verify_home/.local/bin/nyx"
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
             tests/test_installed_service.py "$nyx_verify_root/exercise/test_installed_service.py"
           timeout --preserve-status 90s sudo -u "$nyx_verify_user" -H env -u PYTHONPATH -u PYTHONHOME \
             PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \
-            "$nyx_verify_root/venv/bin/python" -m pytest \
-            "$nyx_verify_root/exercise/test_installed_service.py" -v
+            /bin/bash -c 'cd "$1" && exec "$2" -m pytest test_installed_service.py -v' \
+            nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"
