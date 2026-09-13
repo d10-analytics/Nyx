@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -36,14 +37,35 @@ def _inspection_paths() -> list[Path]:
     return sorted(set(paths))
 
 
+def _contains_sensitive_marker(path: Path) -> bool:
+    if path.suffix == ".whl":
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.infolist():
+                if any(marker in member.filename for marker in _FICTIONAL_SENTINELS):
+                    return True
+                content = archive.read(member).decode("utf-8", errors="replace")
+                if any(marker in content for marker in _FICTIONAL_SENTINELS):
+                    return True
+        return False
+    content = path.read_bytes().decode("utf-8", errors="replace")
+    return any(marker in content for marker in _FICTIONAL_SENTINELS)
+
+
 def test_source_tests_static_wheels_and_ci_artifacts_contain_no_fictional_sensitive_markers():
     inspected = _inspection_paths()
     assert inspected
     for path in inspected:
         if path == Path(__file__).resolve():
             continue
-        content = path.read_bytes().decode("utf-8", errors="replace")
-        assert not any(marker in content for marker in _FICTIONAL_SENTINELS), path
+        assert not _contains_sensitive_marker(path), path
+
+
+def test_compressed_wheel_members_are_inspected_for_sensitive_markers():
+    with TemporaryDirectory() as temporary:
+        wheel = Path(temporary) / "synthetic.whl"
+        with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("nyx/private.txt", _FICTIONAL_SENTINELS[0])
+        assert _contains_sensitive_marker(wheel)
 
 
 def _snapshot(directory: Path) -> dict[str, bytes]:
