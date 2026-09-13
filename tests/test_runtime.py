@@ -480,6 +480,37 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
             assert runtime.stop() == "stopped"
 
 
+def test_actual_launcher_death_before_spawn_releases_lease():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+            paths = state.state_paths()
+        script = (
+            "from nyx import runtime; import os; paths=runtime._paths(create=True); "
+            "lease=runtime._lease_lock(paths,timeout=0); assert lease.acquire(blocking=False); os._exit(0)"
+        )
+        launcher = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        probe = runtime._lease_lock(paths, timeout=0.0)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
 def test_separate_processes_serialize_on_the_persistent_operation_lock():
     with TemporaryDirectory() as temporary:
         lock_path = Path(temporary) / "operation.lock"
