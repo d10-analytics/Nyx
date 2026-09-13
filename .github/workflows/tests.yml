@@ -38,10 +38,12 @@ jobs:
           sudo useradd --create-home --shell /bin/bash "$nyx_verify_user"
           nyx_verify_home="$(getent passwd "$nyx_verify_user" | cut -d: -f6)"
           sudo install -d --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0700 \
-            "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_home/.local/bin"
+            "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_root/wheels" "$nyx_verify_home/.local/bin"
           sudo -u "$nyx_verify_user" -H "$runner_python" -m venv "$nyx_verify_root/venv"
+          sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
+            "$GITHUB_WORKSPACE"/dist/*.whl "$nyx_verify_root/wheels/"
           sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m pip install \
-            "$GITHUB_WORKSPACE"/dist/*.whl pytest
+            "$nyx_verify_root"/wheels/*.whl pytest
           sudo -u "$nyx_verify_user" -H ln -s "$nyx_verify_root/venv/bin/nyx" \
             "$nyx_verify_home/.local/bin/nyx"
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
