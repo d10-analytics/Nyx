@@ -3,6 +3,7 @@ import os
 import stat
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,17 @@ def configure_home(home: Path):
     return patch.object(state, "resolve_account_home", return_value=home), patch.object(
         state, "_current_uid", return_value=os.getuid()
     )
+
+
+def test_account_home_comes_from_uid_record_even_when_environment_differs():
+    with TemporaryDirectory() as temporary:
+        home = isolated_home(Path(temporary))
+        with patch.object(state, "_current_uid", return_value=os.getuid()), patch.object(
+            state.pwd,
+            "getpwuid",
+            return_value=SimpleNamespace(pw_dir=str(home)),
+        ), patch.dict(os.environ, {"HOME": str(Path(temporary) / "wrong")}):
+            assert state.resolve_account_home() == home.resolve()
 
 
 def test_setup_uses_passwd_home_and_persists_canonical_empty_symlink_root():
