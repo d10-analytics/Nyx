@@ -123,6 +123,24 @@ class CatalogTests(TestCase):
             self.assertEqual(V1.splitlines(), calls[0][1])
             self.assertEqual("complete", json.loads(result)["entries"][0]["state"])
 
+    def test_private_callback_receives_nonempty_malformed_v1_capture(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            anchor = package(root, "Queue", "malformed", "Status: approved\nbody\n")
+            calls: list[tuple[Path, list[str]]] = []
+
+            def full_validity(package_path: Path, lines: list[str]) -> bool:
+                calls.append((package_path, lines))
+                return False
+
+            result = catalog.scan_catalog(root, version=1, _full_validity=full_validity)
+
+            self.assertEqual([(anchor, ["Status: approved", "body"])], calls)
+            self.assertEqual(
+                "partial",
+                json.loads(result)["entries"][0]["state"],
+            )
+
     def test_output_bound_is_enforced(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -131,3 +149,50 @@ class CatalogTests(TestCase):
                 ValueError, "exceeds 2 MiB"
             ):
                 catalog.scan_catalog(root, version=1)
+
+    def test_output_bound_is_enforced_for_both_wire_versions(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one", V1)
+            for version in (1, 2):
+                with self.subTest(version=version), patch.object(
+                    catalog, "MAX_OUTPUT_BYTES", 10
+                ), self.assertRaisesRegex(ValueError, "exceeds 2 MiB"):
+                    catalog.scan_catalog(root, version=version)
+
+    def test_catalog_only_does_not_lookup_declared_target_checkout(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = Path(temporary) / "product-checkout"
+            content = V1.replace("/fictional/repo", str(target))
+            package(root, "Queue", "one", content)
+            original_exists = Path.exists
+
+            def guarded_exists(path: Path) -> bool:
+                if path == target:
+                    raise AssertionError("catalog looked up target checkout")
+                return original_exists(path)
+
+            with patch.object(Path, "exists", guarded_exists):
+                value = json.loads(catalog.scan_catalog(root, version=1))
+            self.assertEqual("product-checkout", value["entries"][0]["declared"]["target_project"])
+
+    def test_v2_missing_prerequisite_is_unknown_without_target_payload(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_id = "11111111-1111-4111-8111-111111111111"
+            target_id = "22222222-2222-4222-8222-222222222222"
+            package(
+                root,
+                "Queue",
+                "source",
+                f"# Source\nPackage ID: {source_id}\n"
+                f"Prerequisite: {target_id} | handoff\n",
+            )
+
+            value = json.loads(catalog.scan_catalog(root, version=2))
+            edge = value["entries"][0]["relationship"]["prerequisites"][0]
+            self.assertEqual("missing_target", edge["reason"])
+            self.assertEqual("unknown", edge["resolved_state"])
+            self.assertIsNone(edge["observed_state"])
+            self.assertIsNone(edge["observed_evidence_ref"])
