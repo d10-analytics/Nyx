@@ -82,6 +82,53 @@ def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease
             assert not paths.runtime_directory.joinpath("instance.json").exists()
 
 
+def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        second = Path(temporary) / "second"
+        second.mkdir()
+        before = paths.config_file.read_bytes()
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            _wait_for_record(paths)
+            assert runtime.setup(first).specification_root == first.resolve()
+            with pytest.raises(runtime.ActiveInstanceError):
+                runtime.setup(second)
+            assert paths.config_file.read_bytes() == before
+            assert runtime.stop() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_natural_unhealthy_daemon_keeps_record_and_lease():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            _wait_for_record(paths)
+            assert daemon.control is not None
+            daemon.control.close()
+            with pytest.raises(runtime.UnhealthyInstanceError):
+                runtime.stop()
+            assert paths.runtime_directory.joinpath("instance.json").exists()
+            probe = runtime._lease_lock(paths, timeout=0.0)
+            assert not probe.acquire(blocking=False)
+            probe.close()
+            assert daemon.shutdown() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
 def test_held_lease_excludes_changed_setup_without_mutating_configuration():
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
