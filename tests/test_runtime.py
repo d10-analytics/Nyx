@@ -13,8 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nyx import state
-from nyx import runtime
+from nyx import runtime, state
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:

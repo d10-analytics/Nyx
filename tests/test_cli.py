@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from nyx import cli
-from nyx import runtime
+from nyx import cli, runtime
 
 
 def test_setup_dispatches_to_runtime_and_reports_canonical_root(capsys):
