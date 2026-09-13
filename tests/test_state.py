@@ -109,21 +109,41 @@ def test_state_children_are_private_uid_owned_records_and_no_deployment_record_i
             paths = state.state_paths()
 
         assert stat.S_IMODE(home.stat().st_mode) == original_home_mode
-        for directory in (
-            paths.config_file.parent.parent,
-            paths.config_directory,
-            paths.state_directory.parent.parent,
-            paths.state_directory.parent,
-            paths.state_directory,
-            paths.runtime_directory,
-        ):
+        for directory in (paths.config_directory, paths.state_directory, paths.runtime_directory):
             assert directory.is_dir()
             assert not directory.is_symlink()
             assert stat.S_IMODE(directory.stat().st_mode) == 0o700
             assert directory.stat().st_uid == os.getuid()
+        for directory in (
+            paths.config_file.parent.parent,
+            paths.state_directory.parent.parent,
+            paths.state_directory.parent,
+        ):
+            assert directory.is_dir()
+            assert not directory.is_symlink()
         assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
         assert paths.config_file.stat().st_uid == os.getuid()
         assert not paths.deployment_file.exists()
+
+
+def test_existing_general_parents_are_not_repermissioned():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        config_parent = home / ".config"
+        state_parent = home / ".local" / "state"
+        config_parent.mkdir(mode=0o755)
+        state_parent.mkdir(parents=True, mode=0o755)
+        config_mode = stat.S_IMODE(config_parent.stat().st_mode)
+        local_mode = stat.S_IMODE((home / ".local").stat().st_mode)
+        state_mode = stat.S_IMODE(state_parent.stat().st_mode)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(spec_root)
+        assert stat.S_IMODE(config_parent.stat().st_mode) == config_mode
+        assert stat.S_IMODE((home / ".local").stat().st_mode) == local_mode
+        assert stat.S_IMODE(state_parent.stat().st_mode) == state_mode
 
 
 def test_root_inside_package_or_interpreter_footprint_is_rejected_before_state_creation():
