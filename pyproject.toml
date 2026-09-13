@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest", "playwright"]
+test = ["pytest", "playwright", "ruff"]
 
 [project.scripts]
 nyx = "nyx.cli:main"
