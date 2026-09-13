@@ -1,6 +1,8 @@
 import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from nyx import state
+from nyx.catalog import scan_catalog
 
 
 def isolated_home(root: Path) -> Path:
@@ -77,7 +80,37 @@ def test_setup_accepts_empty_root_and_defers_malformed_children_to_catalog():
         malformed.joinpath("spec.md").write_text("not a valid package", encoding="utf-8")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            assert state.setup(spec_root).specification_root == spec_root.resolve()
+            result = state.setup(spec_root)
+            assert result.specification_root == spec_root.resolve()
+            catalog = json.loads(scan_catalog(result.specification_root, version=1))
+            assert catalog["entries"][0]["diagnostics"][0]["code"] == "invalid_package"
+
+
+def test_valid_inactive_configuration_survives_loading_in_a_new_process():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(spec_root)
+
+        probe = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from nyx import state\n"
+            "state.resolve_account_home = lambda: Path(sys.argv[1])\n"
+            "print(state.load_configuration().specification_root)\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(home)],
+            cwd=Path(__file__).parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        assert completed.stdout.strip() == str(spec_root.resolve())
 
 
 def test_invalid_replacement_preserves_exact_previous_configuration_bytes():
@@ -95,6 +128,41 @@ def test_invalid_replacement_preserves_exact_previous_configuration_bytes():
                 state.setup(missing)
             assert config_file.read_bytes() == before
             assert state.load_configuration().specification_root == first.resolve()
+
+
+def test_atomic_replacement_failure_preserves_previous_configuration_bytes():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            with patch.object(state.os, "replace", side_effect=OSError("injected")), pytest.raises(
+                state.ConfigurationError
+            ):
+                state.setup(second)
+            assert paths.config_file.read_bytes() == before
+            assert state.load_configuration().specification_root == first.resolve()
+            assert list(paths.config_directory.glob(f".{state.CONFIG_FILENAME}.*")) == []
+
+
+def test_preexisting_nyx_directory_symlink_is_rejected_without_writing_through_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        external = root / "external"
+        external.mkdir(mode=0o700)
+        (home / ".config").mkdir(mode=0o755)
+        (home / ".config" / "nyx").symlink_to(external, target_is_directory=True)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch, pytest.raises(state.AccountHomeError):
+            state.setup(spec_root)
+        assert list(external.iterdir()) == []
 
 
 def test_state_children_are_private_uid_owned_records_and_no_deployment_record_is_written():
