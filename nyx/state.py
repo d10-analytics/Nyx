@@ -159,6 +159,25 @@ def _verify_directory(path: Path, uid: int) -> None:
         raise AccountHomeError("Nyx state directory has unsafe ownership or mode")
 
 
+def _verify_general_directory(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except OSError as error:
+        raise AccountHomeError("Nyx state parent directory is unavailable") from error
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise AccountHomeError("Nyx state parent is not a real directory")
+
+
+def _ensure_general_directory(path: Path) -> None:
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise AccountHomeError("cannot create Nyx state parent directory") from error
+    _verify_general_directory(path)
+
+
 def _ensure_directory(path: Path, uid: int) -> None:
     try:
         path.mkdir(mode=0o700)
@@ -192,9 +211,17 @@ def state_paths(*, create: bool = False) -> StatePaths:
         if any(_is_within(path, footprint) for footprint in _installation_footprints()):
             raise AccountHomeError("Nyx state would be inside its installation")
     if create:
-        for path in (config_base, config_directory, home / ".local", home / ".local" / "state",
-                     state_directory, runtime_directory):
+        for path in (config_base, home / ".local", home / ".local" / "state"):
+            _ensure_general_directory(path)
+        for path in (config_directory, state_directory, runtime_directory):
             _ensure_directory(path, uid)
+    else:
+        for path in (config_base, home / ".local", home / ".local" / "state"):
+            if path.exists() or path.is_symlink():
+                _verify_general_directory(path)
+        for path in (config_directory, state_directory, runtime_directory):
+            if path.exists() or path.is_symlink():
+                _verify_directory(path, uid)
     return paths
 
 
