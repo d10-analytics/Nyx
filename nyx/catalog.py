@@ -208,13 +208,16 @@ def _catalog_entry(
     diagnostics: list[dict[str, str]] = []
     if read_diagnostic:
         diagnostics.append(_catalog_diagnostic(read_diagnostic, package_path))
-    elif not lines or not any(line.startswith("# ") for line in lines):
+    elif not lines:
         diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-    elif full_validity is not None:
-        try:
-            if full_validity(anchor.parent, lines):
-                diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-        except (OSError, UnicodeError, ValueError):
+    else:
+        invalid = not any(line.startswith("# ") for line in lines)
+        if full_validity is not None:
+            try:
+                invalid = bool(full_validity(anchor.parent, lines)) or invalid
+            except (OSError, UnicodeError, ValueError):
+                invalid = True
+        if invalid:
             diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
     return {
         "declared": declared,
@@ -292,7 +295,7 @@ def _catalog_scan_root(spec_root: Path) -> list[os.DirEntry[str]]:
         raise ValueError("specification root cannot be read") from error
 
 
-def build_catalog(
+def _build_catalog(
     spec_root: Path,
     full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
@@ -350,6 +353,11 @@ def build_catalog(
     if len(rendered.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:
         raise ValueError("catalog output exceeds 2 MiB")
     return rendered
+
+
+def build_catalog(spec_root: Path) -> str:
+    """Build the standalone v1 catalog without shared validation hooks."""
+    return _build_catalog(spec_root)
 
 
 def _v2_uuid(value: str) -> str | None:
@@ -1147,7 +1155,7 @@ def _v2_render_entry(
     }
 
 
-def build_catalog_v2(
+def _build_catalog_v2(
     spec_root: Path,
     full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
@@ -1317,6 +1325,11 @@ def build_catalog_v2(
     return rendered
 
 
+def build_catalog_v2(spec_root: Path) -> str:
+    """Build the standalone v2 catalog without shared validation hooks."""
+    return _build_catalog_v2(spec_root)
+
+
 def scan_catalog(
     spec_root: Path,
     *,
@@ -1325,7 +1338,7 @@ def scan_catalog(
 ) -> str:
     """Return one catalog version from the dependency-light engine."""
     if version == 1:
-        return build_catalog(spec_root, _full_validity)
+        return _build_catalog(spec_root, _full_validity)
     if version == 2:
-        return build_catalog_v2(spec_root, _full_validity)
+        return _build_catalog_v2(spec_root, _full_validity)
     raise ValueError("unsupported catalog version")
