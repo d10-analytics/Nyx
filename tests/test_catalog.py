@@ -141,6 +141,35 @@ class CatalogTests(TestCase):
                 json.loads(result)["entries"][0]["state"],
             )
 
+    def test_public_builders_do_not_accept_full_validity_hooks(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one", V1)
+            for builder in (catalog.build_catalog, catalog.build_catalog_v2):
+                with self.subTest(builder=builder.__name__), self.assertRaises(TypeError):
+                    builder(root, lambda _path, _lines: False)
+
+    def test_malformed_v1_callback_and_catalog_diagnostic_are_single_pass(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            anchor = package(root, "Queue", "malformed", "Status: approved\nbody\n")
+            calls: list[list[str]] = []
+
+            def full_validity(_package_path: Path, lines: list[str]) -> bool:
+                calls.append(lines)
+                return True
+
+            value = json.loads(
+                catalog.scan_catalog(root, version=1, _full_validity=full_validity)
+            )
+            self.assertEqual([["Status: approved", "body"]], calls)
+            entry = value["entries"][0]
+            self.assertEqual(anchor.as_posix(), (root / entry["package_path"]).as_posix())
+            self.assertEqual(
+                ["invalid_package"],
+                [item["code"] for item in entry["diagnostics"]],
+            )
+
     def test_output_bound_is_enforced(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
