@@ -42,7 +42,11 @@ def _run_nyx(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     assert os.environ.get("HOME") == str(ACCOUNT_HOME)
-    assert shutil.which("nyx") == str(SYMLINK)
+    command_path = subprocess.check_output(
+        ["bash", "-c", "command -v nyx"], cwd=EXERCISE, text=True
+    ).strip()
+    assert command_path == str(SYMLINK)
+    assert shutil.which("nyx") == command_path
     assert (
         subprocess.check_output(["readlink", str(SYMLINK)], text=True).strip()
         == str(VENV_COMMAND)
