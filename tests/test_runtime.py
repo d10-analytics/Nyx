@@ -43,6 +43,22 @@ def _wait_for_record(paths: state.StatePaths) -> runtime.Instance:
     raise AssertionError("daemon did not publish instance record")
 
 
+def _subprocess_environment(home: Path, site_directory: Path) -> dict[str, str]:
+    site_directory.mkdir()
+    (site_directory / "sitecustomize.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "from nyx import state\n"
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["NYX_TEST_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -312,6 +328,21 @@ def test_worker_output_limit_is_enforced_incrementally():
     assert manager.active_count == 0
 
 
+def test_worker_stderr_limit_is_enforced_incrementally():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.buffer.write(b'x' * (2**13 + 1)); sys.stderr.flush()",
+        ],
+        timeout=2,
+    )
+    with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+        manager.fetch_catalog()
+    assert manager.close(time.monotonic() + 2)
+    assert manager.active_count == 0
+
+
 def test_worker_timeout_has_no_additive_reap_window():
     manager = runtime.CatalogWorkerManager(
         command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -323,6 +354,130 @@ def test_worker_timeout_has_no_additive_reap_window():
     elapsed = time.monotonic() - started
     assert elapsed < 0.8
     assert manager.close(time.monotonic() + 2)
+
+
+def test_stop_during_spawn_reaps_child_registered_after_admission_closes():
+    with TemporaryDirectory():
+        entered = threading.Event()
+        release = threading.Event()
+
+        def factory() -> list[str]:
+            entered.set()
+            assert release.wait(timeout=3)
+            return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        manager = runtime.CatalogWorkerManager(command_factory=factory)
+        errors: list[runtime.WorkerError] = []
+
+        def fetch() -> None:
+            try:
+                manager.fetch_catalog()
+            except runtime.WorkerError as error:
+                errors.append(error)
+
+        fetch_thread = threading.Thread(target=fetch)
+        fetch_thread.start()
+        assert entered.wait(timeout=2)
+        close_result: list[bool] = []
+        close_thread = threading.Thread(
+            target=lambda: close_result.append(manager.close(time.monotonic() + 3))
+        )
+        close_thread.start()
+        time.sleep(0.05)
+        release.set()
+        fetch_thread.join(timeout=4)
+        close_thread.join(timeout=4)
+        assert not fetch_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert close_result == [True]
+        assert [error.code for error in errors] == ["producer_cancelled"]
+        assert manager.active_count == 0
+
+
+def test_simultaneous_start_processes_share_one_authenticated_instance():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+        first = second = None
+        try:
+            first = subprocess.Popen(
+                [sys.executable, "-c", "from nyx import runtime; print(runtime.start(), flush=True)"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            second = subprocess.Popen(
+                [sys.executable, "-c", "from nyx import runtime; print(runtime.start(), flush=True)"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            first_stdout, first_stderr = first.communicate(timeout=12)
+            second_stdout, second_stderr = second.communicate(timeout=12)
+            assert first.returncode == 0, first_stderr
+            assert second.returncode == 0, second_stderr
+            assert first_stdout.splitlines() == [runtime.URL]
+            assert second_stdout.splitlines() == [runtime.URL]
+        finally:
+            subprocess.run(
+                [sys.executable, "-c", "from nyx import runtime; runtime.stop()"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+            for process in (first, second):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+
+
+def test_actual_daemon_spawn_retains_lease_after_launcher_death():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+            paths = state.state_paths()
+        script = (
+            "import os,time; from nyx import runtime; paths=runtime._paths(create=True); "
+            "lease=runtime._lease_lock(paths,timeout=0); assert lease.acquire(blocking=False); "
+            "runtime._spawn_daemon(lease.fd,int((time.monotonic()+5)*10**9)); os._exit(0)"
+        )
+        launcher = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        _wait_for_record(paths)
+        probe = runtime._lease_lock(paths, timeout=0.0)
+        assert not probe.acquire(blocking=False)
+        probe.close()
+        with patch.object(runtime, "_paths", return_value=paths):
+            assert runtime.stop() == "stopped"
 
 
 def test_separate_processes_serialize_on_the_persistent_operation_lock():
