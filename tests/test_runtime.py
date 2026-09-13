@@ -82,6 +82,21 @@ def test_held_lease_excludes_changed_setup_without_mutating_configuration():
             assert state.load_configuration(paths).specification_root == first.resolve()
 
 
+def test_held_lease_allows_same_root_setup_without_mutation():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                configuration = runtime.setup(first)
+        finally:
+            lease.close()
+        assert configuration.specification_root == first.resolve()
+        assert paths.config_file.read_bytes() == before
+
+
 def test_free_lease_removes_stale_record_without_pid_signal():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -196,6 +211,29 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
             occupant.close()
 
 
+def test_foreign_control_holder_causes_startup_failure_without_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        occupant.bind(runtime._control_name())
+        occupant.listen(1)
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        result: list[int] = []
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+                thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                thread.start()
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+            assert result == [1]
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+        finally:
+            occupant.close()
+
+
 def test_idle_http_connection_does_not_block_authenticated_stop():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -238,3 +276,18 @@ def test_close_admission_reaps_registered_direct_child():
     assert not thread.is_alive()
     assert [error.code for error in errors] == ["producer_cancelled"]
     assert manager.active_count == 0
+
+
+def test_closed_worker_admission_spawns_no_child():
+    commands: list[list[str]] = []
+
+    def factory() -> list[str]:
+        command = [sys.executable, "-c", "raise SystemExit(0)"]
+        commands.append(command)
+        return command
+
+    manager = runtime.CatalogWorkerManager(command_factory=factory)
+    manager.close_admission()
+    with pytest.raises(runtime.WorkerError, match="producer_cancelled"):
+        manager.fetch_catalog()
+    assert commands == []
