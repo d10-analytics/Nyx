@@ -454,8 +454,12 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
             state.setup(specification_root)
         first = second = None
         try:
+            command = (
+                "from nyx import runtime; print(runtime.start(), flush=True); "
+                "print(runtime._read_instance(runtime._paths()).instance_id, flush=True)"
+            )
             first = subprocess.Popen(
-                [sys.executable, "-c", "from nyx import runtime; print(runtime.start(), flush=True)"],
+                [sys.executable, "-c", command],
                 cwd=Path(__file__).parents[1],
                 env=environment,
                 stdout=subprocess.PIPE,
@@ -463,7 +467,7 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
                 text=True,
             )
             second = subprocess.Popen(
-                [sys.executable, "-c", "from nyx import runtime; print(runtime.start(), flush=True)"],
+                [sys.executable, "-c", command],
                 cwd=Path(__file__).parents[1],
                 env=environment,
                 stdout=subprocess.PIPE,
@@ -474,8 +478,11 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
             second_stdout, second_stderr = second.communicate(timeout=12)
             assert first.returncode == 0, first_stderr
             assert second.returncode == 0, second_stderr
-            assert first_stdout.splitlines() == [runtime.URL]
-            assert second_stdout.splitlines() == [runtime.URL]
+            first_lines = first_stdout.splitlines()
+            second_lines = second_stdout.splitlines()
+            assert first_lines[0] == runtime.URL
+            assert second_lines[0] == runtime.URL
+            assert first_lines[1] == second_lines[1]
         finally:
             subprocess.run(
                 [sys.executable, "-c", "from nyx import runtime; runtime.stop()"],
