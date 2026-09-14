@@ -190,6 +190,25 @@ def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates()
         }
 
 
+def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(spec_root, ["Queue"])
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            preserved = state.setup(spec_root)
+            assert preserved.hidden_stages == ("Queue",)
+            assert paths.config_file.read_bytes() == before
+            cleared = state.setup(spec_root, [])
+
+        assert cleared.hidden_stages == ()
+        assert json.loads(paths.config_file.read_text(encoding="utf-8"))["hidden_stages"] == []
+
+
 def test_post_replace_verification_failure_keeps_new_record_without_claiming_rollback():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
