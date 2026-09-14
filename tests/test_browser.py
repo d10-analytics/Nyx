@@ -39,10 +39,13 @@ def _edge(target_id, name):
 
 
 def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diagnostics=None):
+    stage = path.split("/")[1]
     return {
         "package_id": package_id,
         "package_path": path,
-        "lifecycle": lifecycle,
+        "project": project,
+        "stage": stage,
+        "board_visible": lifecycle in {"under_development", "queue", "needs_fixes", "awaiting_retrospective"},
         "state": "complete",
         "declared": _declared(title, project),
         "diagnostics": [] if diagnostics is None else diagnostics,
@@ -68,7 +71,9 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                        "visible_entry_count": 4, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -403,6 +408,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     first["catalog_digest"] = canonical_digest(first)
     second = json.loads(board_payload())
     second["entries"] = []
+    second["visibility"]["visible_entry_count"] = 0
     second["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": "refreshed catalog discovery failure"}
     ]
@@ -438,6 +444,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
 def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open_page):
     value = json.loads(board_payload())
     value["entries"] = []
+    value["visibility"]["visible_entry_count"] = 0
     discovery_message = '<img src=x onerror="alert(1)"> all package discovery failed'
     value["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": discovery_message}
@@ -603,7 +610,7 @@ def routing_payload():
     value["entries"].extend([
         _entry(far, "Gamma/Done/far", "done", "Far prerequisite", "Gamma",
                prerequisites=[_edge(STEP_ONE, "forward")]),
-        _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", None,
+        _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", "Other",
                prerequisites=[_edge(far, "input")]),
     ])
     # Reverse cross-project edge and a cycle; neither implies a topological order.

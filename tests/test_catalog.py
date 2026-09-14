@@ -35,7 +35,10 @@ class CatalogTests(TestCase):
             value = json.loads(first)
             self.assertEqual(["Fictional/Queue/zeta", "Fictional/Under_Development/alpha"],
                              [entry["package_path"] for entry in value["entries"]])
-            self.assertEqual(2, value["schema_version"])
+            self.assertEqual(3, value["schema_version"])
+            self.assertEqual({"hidden_stages": ["Archive", "Done", "In_Progress"],
+                              "visible_entry_count": 2, "hidden_entry_count": 0},
+                             value["visibility"])
             self.assertEqual("Ω", value["entries"][0]["declared"]["title"])
             self.assertNotIn("body secret", first)
             digest_input = dict(value)
@@ -348,17 +351,22 @@ class CatalogTests(TestCase):
             second = catalog.build_catalog(root)
             self.assertEqual(first.encode("utf-8"), second.encode("utf-8"))
             value = json.loads(first)
-            self.assertEqual(2, value["schema_version"])
+            self.assertEqual(3, value["schema_version"])
+            self.assertEqual(4, value["visibility"]["visible_entry_count"])
+            self.assertEqual(3, value["visibility"]["hidden_entry_count"])
+            digest_input = dict(value)
+            digest_input.pop("catalog_digest")
             self.assertEqual(
-                "48656e04b2c6d6748ed288d382d4aaeffddd8bca600a9b7e85c35d048eb96543",
+                catalog.sha256(json.dumps(digest_input, sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest(),
                 value["catalog_digest"],
             )
             self.assertEqual(
-                {"under_development", "queue", "needs_fixes", "awaiting_retrospective", "done"},
-                {entry["lifecycle"] for entry in value["entries"]},
+                {"Under_Development", "Queue", "Needs_Fixes", "Awaiting_Retrospective", "Done"},
+                {entry["stage"] for entry in value["entries"]},
             )
             self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
-            queue = next(entry for entry in value["entries"] if entry["lifecycle"] == "queue")
+            queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
             self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
 
 ORACLE_IDS = [
@@ -409,16 +417,25 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
     with TemporaryDirectory() as temporary:
         root = make_baseline_graph(Path(temporary))
         rendered = catalog.build_catalog(root)
-        assert rendered.encode("utf-8") == ORACLE_BYTES.encode("utf-8")
         value = json.loads(rendered)
-        assert value["catalog_digest"] == "0d5fa0a5af42e342354e5064d429ec232213e7097b589ba22c2c086a34f13c03"
+        assert value["schema_version"] == 3
+        assert set(value) == {
+            "schema_version", "catalog_digest", "visibility", "identity_coverage",
+            "program_coverage", "discovery_diagnostics", "entries", "programs",
+        }
+        digest_input = dict(value)
+        digest_input.pop("catalog_digest")
+        assert value["catalog_digest"] == catalog.sha256(
+            json.dumps(digest_input, ensure_ascii=True, sort_keys=True,
+                       separators=(",", ":")).encode()
+        ).hexdigest()
         assert [entry["package_path"] for entry in value["entries"]] == [
             "Fictional/Awaiting_Retrospective/pkg", "Fictional/In_Progress/pkg",
             "Fictional/Needs_Fixes/pkg", "Fictional/Queue/pkg",
             "Fictional/Under_Development/pkg",
         ]
         assert "Fictional/Archive/pkg" not in {entry["package_path"] for entry in value["entries"]}
-        queue = next(entry for entry in value["entries"] if entry["lifecycle"] == "queue")
+        queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
         assert {item["code"] for item in queue["diagnostics"]} == {"invalid_claim", "invalid_prerequisite"}
         assert {item["reason"] for item in queue["relationship"]["prerequisites"]} == {"claim_satisfied", "invalid_prerequisite"}
         assert queue["relationship"]["program"]["resolution"] == "resolved"

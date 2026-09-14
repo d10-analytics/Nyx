@@ -83,7 +83,9 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         body = response.read()
         connection.close()
         assert response.status == 200
-        assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/sample"
+        payload = json.loads(body)
+        assert payload["schema_version"] == 3
+        assert payload["entries"][0]["package_path"] == "Fictional/Queue/sample"
 
         reused = _run_nyx()
         assert reused.returncode == 0, reused.stderr
