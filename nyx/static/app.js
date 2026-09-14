@@ -8,6 +8,10 @@
     ["awaiting_retrospective", "Awaiting Retrospective"],
   ];
   const BOARD_LABELS = new Map(BOARD_ROWS);
+  const BOARD_STAGES = new Map([
+    ["Under_Development", "under_development"], ["Queue", "queue"],
+    ["Needs_Fixes", "needs_fixes"], ["Awaiting_Retrospective", "awaiting_retrospective"],
+  ]);
   const OFF_BOARD = "__off_board__";
   const OFF_BOARD_LABEL = "Reference — off board";
   const DECLARED_FIELDS = [
@@ -51,11 +55,11 @@
   }
 
   function columnKeyOf(entry) {
-    return entry.declared.target_project || "";
+    return entry.project || "";
   }
 
   function projectOf(entry) {
-    return entry.declared.target_project || "Unknown project";
+    return entry.project || "Unknown project";
   }
 
   function indexByPackageId(entries) {
@@ -71,7 +75,7 @@
     const index = new Map();
     entries.forEach((entry) => {
       if (byId.get(entry.package_id) !== entry) return;
-      (entry.prerequisites || []).forEach((edge) => {
+      (entry.relationship.prerequisites || []).forEach((edge) => {
         if (!prerequisiteTarget(edge, byId)) return;
         if (!index.has(edge.target_package_id)) index.set(edge.target_package_id, []);
         const dependents = index.get(edge.target_package_id);
@@ -84,7 +88,7 @@
   function prerequisiteTargets(entry) {
     const seen = new Set();
     const targets = [];
-    (entry.prerequisites || []).forEach((edge) => {
+    (entry.relationship.prerequisites || []).forEach((edge) => {
       const key = edge.target_package_id || "";
       if (seen.has(key)) return;
       seen.add(key);
@@ -172,7 +176,8 @@
   }
 
   function rowKeyOf(entry) {
-    return BOARD_LABELS.has(entry.lifecycle) ? entry.lifecycle : OFF_BOARD;
+    return entry.board_visible && BOARD_STAGES.has(entry.stage)
+      ? BOARD_STAGES.get(entry.stage) : OFF_BOARD;
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -181,7 +186,7 @@
     const edges = [];
     entries.forEach((entry) => {
       if (byId.get(entry.package_id) !== entry) return;
-      (entry.prerequisites || []).forEach((edge) => {
+      (entry.relationship.prerequisites || []).forEach((edge) => {
         const source = prerequisiteTarget(edge, byId);
         if (!source || source.package_id === entry.package_id) return;
         const key = `${source.package_id}>${entry.package_id}`;
@@ -241,7 +246,7 @@
 
   function searchText(entry) {
     return [
-      entry.package_path, entry.package_id, entry.lifecycle, entry.program_title, entry.state,
+      entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title, entry.state,
       ...DECLARED_FIELDS.map(([field]) => entry.declared[field]),
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
@@ -249,8 +254,8 @@
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
     const unblocked = ["no_declared_prerequisites", "satisfied"].includes(
-      entry.direct_prerequisite_state,
-    ) && (entry.prerequisites || []).every((edge) => edge.resolved_state === "satisfied");
+      entry.relationship.direct_prerequisite_state,
+    ) && (entry.relationship.prerequisites || []).every((edge) => edge.resolved_state === "satisfied");
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     return `<button class="card${unblocked ? " unblocked" : ""}${selected ? " selected" : ""}" ` +
@@ -309,8 +314,8 @@
       columns.map(([, label]) => `<h2 class="column-head">${text(label)}</h2>`).join("");
     rows.forEach(([key, label]) => {
       const rowEntries = key === OFF_BOARD
-        ? entries.filter((entry) => !BOARD_LABELS.has(entry.lifecycle))
-        : entries.filter((entry) => entry.lifecycle === key);
+        ? entries.filter((entry) => !entry.board_visible)
+        : entries.filter((entry) => BOARD_STAGES.get(entry.stage) === key);
       if (key === OFF_BOARD && rowEntries.length === 0) return;
       const cells = columns.map(([columnKey]) => {
         const { depth, reserved } = plans.get(columnKey);
@@ -432,7 +437,7 @@
     const values = DECLARED_FIELDS.map(([field, label]) =>
       `<dt>${label}</dt><dd>${text(entry.declared[field])}</dd>`).join("");
     // Claims remain distinct in the details view even when they share a target.
-    const prerequisites = (entry.prerequisites || []).map((edge) => {
+    const prerequisites = (entry.relationship.prerequisites || []).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
       return '<li class="prerequisite-claim">' +
         `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span> · ` +
@@ -446,12 +451,12 @@
       : "<p>No package diagnostics.</p>";
     detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
       `<dt>Package path</dt><dd>${text(entry.package_path)}</dd>` +
-      `<dt>Lifecycle</dt><dd>${text(entry.lifecycle)}</dd>` +
-      `<dt>Program</dt><dd>${text(entry.program_title || "Ungrouped")}</dd>` +
+      `<dt>Stage</dt><dd>${text(entry.stage)}</dd>` +
+      `<dt>Program</dt><dd>${text(entry.relationship.program.title || "Ungrouped")}</dd>` +
       `<dt>Package ID</dt><dd>${text(entry.package_id)}</dd>${values}</dl>` +
       "<h3>Direct prerequisites</h3>" +
-      `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.direct_prerequisite_state)}">` +
-      `${text(directPrerequisiteSummary(entry.direct_prerequisite_state, prerequisites.length))}</p>` +
+      `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.relationship.direct_prerequisite_state)}">` +
+      `${text(directPrerequisiteSummary(entry.relationship.direct_prerequisite_state, prerequisites.length))}</p>` +
       (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "") +
       `<h3>Diagnostics</h3>${diagnostics}` + catalogDiagnosticsHtml(displayed);
   }
@@ -490,6 +495,40 @@
 
   function digestOf(snapshot) {
     return snapshot && typeof snapshot.catalog_digest === "string" ? snapshot.catalog_digest : "";
+  }
+
+  function exactKeys(value, expected) {
+    return value && typeof value === "object" && !Array.isArray(value) &&
+      Object.keys(value).sort().join("\u0000") === expected.slice().sort().join("\u0000");
+  }
+
+  function validateSnapshot(snapshot) {
+    const top = ["catalog_digest", "discovery_diagnostics", "entries", "identity_coverage",
+      "program_coverage", "programs", "schema_version", "visibility"];
+    if (!exactKeys(snapshot, top) || snapshot.schema_version !== 3 ||
+        typeof snapshot.catalog_digest !== "string" || !Array.isArray(snapshot.entries) ||
+        !Array.isArray(snapshot.programs)) throw new Error("producer_protocol_error");
+    if (!exactKeys(snapshot.visibility, ["hidden_stages", "visible_entry_count", "hidden_entry_count"]) ||
+        !Array.isArray(snapshot.visibility.hidden_stages) ||
+        !Number.isInteger(snapshot.visibility.visible_entry_count) || snapshot.visibility.visible_entry_count < 0 ||
+        !Number.isInteger(snapshot.visibility.hidden_entry_count) || snapshot.visibility.hidden_entry_count < 0) {
+      throw new Error("producer_protocol_error");
+    }
+    const hidden = new Set(snapshot.visibility.hidden_stages);
+    let visible = 0;
+    snapshot.entries.forEach((entry) => {
+      if (!exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
+        "project", "relationship", "stage", "state", "transitive_diagnostics"]) ||
+          typeof entry.board_visible !== "boolean" || typeof entry.project !== "string" ||
+          typeof entry.stage !== "string" || !entry.package_path.startsWith(`${entry.project}/${entry.stage}/`) ||
+          entry.board_visible === hidden.has(entry.stage)) throw new Error("producer_protocol_error");
+      if (entry.board_visible) visible += 1;
+    });
+    if (visible !== snapshot.visibility.visible_entry_count ||
+        snapshot.visibility.hidden_entry_count < snapshot.entries.length - visible) {
+      throw new Error("producer_protocol_error");
+    }
+    return snapshot;
   }
 
   function loadedStatus(snapshot) {
@@ -538,7 +577,7 @@
         if (!response.ok || !payload || payload.error) {
           throw new Error((payload && payload.error) || "producer_protocol_error");
         }
-        return payload;
+        return validateSnapshot(payload);
       })
       .then((snapshot) => {
         if (kind === "manual" || !displayed) { apply(snapshot); return; }

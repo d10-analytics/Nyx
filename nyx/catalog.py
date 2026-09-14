@@ -24,6 +24,11 @@ CATALOG_LIFECYCLE_DIRECTORIES = {
 CATALOG_BOARD_LIFECYCLES = {
     "under_development", "queue", "needs_fixes", "awaiting_retrospective",
 }
+CATALOG_HIDDEN_STAGES = sorted(
+    directory
+    for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
+    if lifecycle not in CATALOG_BOARD_LIFECYCLES
+)
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
     "unreadable_anchor": "unreadable anchor",
@@ -954,10 +959,15 @@ def _render_entry(
         "superseded_by": rendered_successor,
     }
     diagnostics = _sort_diagnostics(list(record["diagnostics"]))
+    package_path = str(record["package_path"])
+    path_parts = package_path.split("/")
+    project, stage = path_parts[0], path_parts[1]
     return {
         "package_id": record["package_id"],
-        "package_path": record["package_path"],
-        "lifecycle": record["lifecycle"],
+        "package_path": package_path,
+        "project": project,
+        "stage": stage,
+        "board_visible": record["lifecycle"] in CATALOG_BOARD_LIFECYCLES,
         "state": record["state"],
         "declared": record["declared"],
         "diagnostics": diagnostics,
@@ -1116,8 +1126,13 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "catalog_digest": None,
+        "visibility": {
+            "hidden_stages": CATALOG_HIDDEN_STAGES,
+            "visible_entry_count": len(board),
+            "hidden_entry_count": len(records) - len(board),
+        },
         "identity_coverage": {"state": "complete" if identity_complete else "incomplete", "diagnostics": identity_diagnostics},
         "program_coverage": {
             "state": "complete" if program_coverage_complete else "incomplete",
