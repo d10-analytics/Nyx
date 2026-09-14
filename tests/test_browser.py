@@ -194,6 +194,14 @@ def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     assert page.locator("#board .card").count() == 4
 
 
+def test_browser_accepts_explicit_blank_declared_metadata(open_page):
+    value = json.loads(board_payload())
+    value["entries"][0]["declared"]["status"] = ""
+    value["catalog_digest"] = canonical_digest(value)
+    page = open_page(StaticClient(value))
+    assert page.locator("#board .card").count() == 4
+
+
 def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     client = SequenceClient([CatalogError("producer_unavailable"), board_payload()])
     page = open_page(client)
