@@ -1,8 +1,8 @@
 """Secure per-account configuration for Nyx.
 
 This module owns the durable setup record.  Process ownership and lifecycle
-leases are deliberately kept in the runtime layer, so reading or replacing a
-configuration never acquires or assumes a runtime lease.
+leases are deliberately kept in the runtime layer; public replacements are
+delegated there while the private writer remains responsible for durable bytes.
 """
 
 from __future__ import annotations
