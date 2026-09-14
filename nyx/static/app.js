@@ -520,6 +520,11 @@
       !value.includes("/") && !value.includes("\\");
   }
 
+  function declaredText(value) {
+    return value === null || (typeof value === "string" &&
+      (value === "" || safeText(value)));
+  }
+
   function diagnostics(value) {
     protocol(Array.isArray(value));
     value.forEach((item) => {
@@ -645,7 +650,7 @@
         ["complete", "partial"].includes(entry.state));
       protocol(exactKeys(entry.declared, ["closure", "human_sanity_decision", "sanity_recommendation",
         "status", "target_project", "title"]));
-      Object.values(entry.declared).forEach((value) => protocol(value === null || safeText(value)));
+      Object.values(entry.declared).forEach((value) => protocol(declaredText(value)));
       diagnostics(entry.diagnostics);
       relationship(entry.relationship);
       protocol(Array.isArray(entry.transitive_diagnostics) && entry.transitive_diagnostics.length === 0);
