@@ -22,7 +22,7 @@ class StubClient:
         return self.catalog
 
 
-def valid_catalog():
+def raw_catalog():
     value = {
         "schema_version": 2,
         "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -52,8 +52,55 @@ def valid_catalog():
                                                 "resolution": "not_declared", "diagnostics": []}},
             "transitive_diagnostics": [],
         })
+    first, second = value["entries"]
+    program_id = str(UUID(int=3, version=4))
+    first["relationship"] = {
+        "participation": "available",
+        "claims": [
+            {
+                "name": "release",
+                "state": "satisfied",
+                "evidence_ref": "sha256:" + "a" * 64,
+                "diagnostics": [],
+            }
+        ],
+        "prerequisites": [
+            {
+                "target_package_id": second["package_id"],
+                "claim_name": "release",
+                "observed_state": "satisfied",
+                "observed_evidence_ref": "sha256:" + "a" * 64,
+                "resolved_state": "satisfied",
+                "reason": "claim_satisfied",
+            }
+        ],
+        "direct_prerequisite_state": "satisfied",
+        "program": {
+            "program_id": program_id,
+            "title": "Test program",
+            "resolution": "resolved",
+            "diagnostics": [],
+        },
+        "superseded_by": {
+            "package_id": second["package_id"],
+            "resolution": "resolved",
+            "diagnostics": [],
+        },
+    }
+    value["programs"] = [
+        {
+            "program_id": program_id,
+            "title": "Test program",
+            "member_package_ids": [first["package_id"]],
+            "diagnostics": [],
+        }
+    ]
     value["catalog_digest"] = canonical_digest(value)
-    return parse_catalog(value)
+    return value
+
+
+def valid_catalog():
+    return parse_catalog(raw_catalog())
 
 
 class RunningServer:
@@ -100,13 +147,94 @@ def test_catalog_route_accepts_a_callable_provider():
 
     def provider():
         calls.append(True)
-        return valid_catalog()
+        return raw_catalog()
 
     with RunningServer(provider) as port:
         status, _, body = request(port, "GET", "/api/catalog")
     assert status == 200
     assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/first"
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["identity_coverage"].update({"diagnostics": {}}),
+        lambda value: value["entries"][0]["relationship"].update(
+            {
+                "claims": [
+                    {
+                        "name": "release",
+                        "state": "satisfied",
+                        "evidence_ref": None,
+                        "diagnostics": "not-a-list",
+                    }
+                ]
+            }
+        ),
+        lambda value: value["entries"][0]["relationship"].update(
+            {
+                "prerequisites": [
+                    {
+                        "target_package_id": None,
+                        "claim_name": None,
+                        "observed_state": "invalid",
+                        "observed_evidence_ref": None,
+                        "resolved_state": "unknown",
+                        "reason": "invalid_prerequisite",
+                    }
+                ]
+            }
+        ),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(
+            {"observed_evidence_ref": "unsafe"}
+        ),
+        lambda value: value["entries"][0]["relationship"].update(
+            {
+                "superseded_by": {
+                    "package_id": None,
+                    "resolution": "not_declared",
+                    "diagnostics": [{"code": "invalid_package", "message": 1}],
+                }
+            }
+        ),
+        lambda value: value["entries"][0]["relationship"]["program"].update(
+            {"diagnostics": [{"code": "invalid_package", "message": 1}]}
+        ),
+        lambda value: value.update(
+            {
+                "programs": [
+                    {
+                        "program_id": str(UUID(int=3, version=4)),
+                        "title": "Program",
+                        "member_package_ids": ["not-a-uuid"],
+                        "diagnostics": [],
+                    }
+                ]
+            }
+        ),
+    ],
+    ids=[
+        "coverage",
+        "claims",
+        "observed_state",
+        "observed_evidence",
+        "successor_diagnostics",
+        "program_diagnostics",
+        "program_members",
+    ],
+)
+def test_digest_valid_malformed_nested_protocol_fields_return_safe_error(mutate):
+    value = raw_catalog()
+    mutate(value)
+    value["catalog_digest"] = canonical_digest(value)
+
+    with RunningServer(lambda: value) as port:
+        status, content_type, body = request(port, "GET", "/api/catalog")
+
+    assert status == 502
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "producer_protocol_error"}
 
 
 @pytest.mark.parametrize(
