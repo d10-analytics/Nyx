@@ -319,7 +319,10 @@ def _package_path(value: Any) -> str:
         not path
         or path.startswith("/")
         or "\\" in path
-        or any(ord(c) < 32 or ord(c) == 127 for c in path)
+        or any(
+            ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF
+            for c in path
+        )
     ):
         raise ProtocolError("package_path must be a nonempty relative POSIX path")
     parts = PurePosixPath(path).parts
