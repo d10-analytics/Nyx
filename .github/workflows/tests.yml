@@ -57,3 +57,9 @@ jobs:
             PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \
             /bin/bash -c 'cd "$1" && exec "$2" -m pytest test_installed_service.py -v' \
             nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"
+          if git grep -n -i -E 'v2|survives migration|viewer_migration' -- nyx tests; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          "$runner_python" -m pytest tests/test_wheel_install.py -v

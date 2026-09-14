@@ -98,7 +98,7 @@ def test_catalog_and_safe_provider_errors_do_not_capture_data_in_nyx():
         repository_before = _snapshot(REPOSITORY_ROOT)
         before = _snapshot(root)
 
-        rendered = catalog.scan_catalog(root, version=2)
+        rendered = catalog.scan_catalog(root)
         assert '"entries"' in rendered
         assert _snapshot(root) == before
         assert _snapshot(REPOSITORY_ROOT) == repository_before

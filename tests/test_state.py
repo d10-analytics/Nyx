@@ -82,8 +82,9 @@ def test_setup_accepts_empty_root_and_defers_malformed_children_to_catalog():
         with home_patch, uid_patch:
             result = state.setup(spec_root)
             assert result.specification_root == spec_root.resolve()
-            catalog = json.loads(scan_catalog(result.specification_root, version=1))
-            assert catalog["entries"][0]["diagnostics"][0]["code"] == "invalid_package"
+            catalog = json.loads(scan_catalog(result.specification_root))
+            assert catalog["entries"][0]["relationship"]["participation"] == "legacy"
+            assert catalog["entries"][0]["diagnostics"] == []
 
 
 def test_valid_inactive_configuration_survives_loading_in_a_new_process():
