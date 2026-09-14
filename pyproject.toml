@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nyx"
+version = "0.1.0"
+description = "Private catalog viewer"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest", "playwright", "ruff"]
+
+[project.scripts]
+nyx = "nyx.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nyx*"]
+
+[tool.setuptools.package-data]
+nyx = ["static/*.html", "static/*.js", "static/*.css"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

@@ -1,0 +1,699 @@
+"""Behavioral checks for the authenticated process lifecycle."""
+
+from __future__ import annotations
+
+import fcntl
+import http.client
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import pytest
+
+from nyx import runtime, state
+
+
+def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
+    home = root / "home"
+    home.mkdir()
+    spec = root / "spec"
+    spec.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+        state, "_current_uid", return_value=os.getuid()
+    ):
+        state.setup(spec)
+        paths = state.state_paths()
+    return paths, home, spec
+
+
+def _wait_for_record(paths: state.StatePaths) -> runtime.Instance:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            return runtime._read_instance(paths)
+        except runtime.UnhealthyInstanceError:
+            time.sleep(0.02)
+    raise AssertionError("daemon did not publish instance record")
+
+
+def _subprocess_environment(home: Path, site_directory: Path) -> dict[str, str]:
+    site_directory.mkdir()
+    (site_directory / "sitecustomize.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "from nyx import state\n"
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["NYX_TEST_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            instance = _wait_for_record(paths)
+            assert instance.url == "http://127.0.0.1:8765/"
+            assert "pid" not in json.loads(paths.runtime_directory.joinpath("instance.json").read_text())
+            assert runtime._send_control(instance, "status")["url"] == instance.url
+            assert runtime.stop() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            probe = runtime._lease_lock(paths, timeout=0.0)
+            assert probe.acquire(blocking=False)
+            probe.close()
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+
+def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        second = Path(temporary) / "second"
+        second.mkdir()
+        before = paths.config_file.read_bytes()
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            _wait_for_record(paths)
+            assert runtime.setup(first).specification_root == first.resolve()
+            with pytest.raises(runtime.ActiveInstanceError):
+                runtime.setup(second)
+            assert paths.config_file.read_bytes() == before
+            assert runtime.stop() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_natural_unhealthy_daemon_keeps_record_and_lease():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            _wait_for_record(paths)
+            assert daemon.control is not None
+            daemon.control.close()
+            with pytest.raises(runtime.UnhealthyInstanceError):
+                runtime.stop()
+            assert paths.runtime_directory.joinpath("instance.json").exists()
+            probe = runtime._lease_lock(paths, timeout=0.0)
+            assert not probe.acquire(blocking=False)
+            probe.close()
+            assert daemon.shutdown() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_held_lease_excludes_changed_setup_without_mutating_configuration():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        second = Path(temporary) / "second"
+        second.mkdir()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+                runtime.ActiveInstanceError
+            ):
+                runtime.setup(second)
+        finally:
+            lease.close()
+        with patch.object(state, "resolve_account_home", return_value=paths.account_home):
+            assert state.load_configuration(paths).specification_root == first.resolve()
+
+
+def test_held_lease_allows_same_root_setup_without_mutation():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                configuration = runtime.setup(first)
+        finally:
+            lease.close()
+        assert configuration.specification_root == first.resolve()
+        assert paths.config_file.read_bytes() == before
+
+
+def test_free_lease_removes_stale_record_without_pid_signal():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        paths.runtime_directory.joinpath("instance.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "instance_id": "stale",
+                    "url": runtime.URL,
+                    "capability": "stale-capability",
+                    "control": runtime._control_name(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(paths.runtime_directory / "instance.json", 0o600)
+        with patch.object(runtime, "_paths", return_value=paths):
+            assert runtime.stop() == "stopped"
+        assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+
+def test_free_lease_retains_unsafe_instance_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        sentinel = Path(temporary) / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        paths.runtime_directory.joinpath("instance.json").symlink_to(sentinel)
+        with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+            runtime.UnhealthyInstanceError
+        ):
+            runtime.stop()
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert paths.runtime_directory.joinpath("instance.json").is_symlink()
+
+
+def test_wrong_capability_cannot_control_a_ready_instance():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            instance = _wait_for_record(paths)
+            forged = runtime.Instance(
+                instance_id=instance.instance_id,
+                url=instance.url,
+                capability="wrong-capability",
+                control=instance.control,
+            )
+            with pytest.raises(runtime.UnhealthyInstanceError):
+                runtime._send_control(forged, "stop")
+            assert runtime._send_control(instance, "status")["status"] == "ready"
+            assert runtime.stop() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+def test_held_lease_retains_valid_stale_record_without_control_or_signal():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        record.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "instance_id": "stale",
+                    "url": runtime.URL,
+                    "capability": "stale-capability",
+                    "control": runtime._control_name(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(record, 0o600)
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+                runtime.UnhealthyInstanceError
+            ):
+                runtime.stop()
+        finally:
+            lease.close()
+        assert record.exists()
+
+
+def test_fixed_port_occupant_causes_startup_failure_without_fallback():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupant.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        occupant.bind(("127.0.0.1", runtime.PORT))
+        occupant.listen(1)
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        result: list[int] = []
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+                thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                thread.start()
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+            assert result == [1]
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+            assert not list(paths.runtime_directory.glob(".instance.json.*"))
+        finally:
+            occupant.close()
+
+
+def test_foreign_control_holder_causes_startup_failure_without_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        occupant.bind(runtime._control_name())
+        occupant.listen(1)
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        result: list[int] = []
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+                thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                thread.start()
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+            assert result == [1]
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+        finally:
+            occupant.close()
+
+
+def test_idle_http_connection_does_not_block_authenticated_stop():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        idle = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            thread = threading.Thread(target=daemon.run)
+            thread.start()
+            _wait_for_record(paths)
+            idle.connect(("127.0.0.1", runtime.PORT))
+            assert runtime.stop() == "stopped"
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        idle.close()
+
+
+def test_close_admission_reaps_registered_direct_child():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    errors: list[runtime.WorkerError] = []
+
+    def fetch() -> None:
+        try:
+            manager.fetch_catalog()
+        except runtime.WorkerError as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=fetch)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while manager.active_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 1
+    assert manager.close(time.monotonic() + 2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert [error.code for error in errors] == ["producer_cancelled"]
+    assert manager.active_count == 0
+
+
+def test_closed_worker_admission_spawns_no_child():
+    commands: list[list[str]] = []
+
+    def factory() -> list[str]:
+        command = [sys.executable, "-c", "raise SystemExit(0)"]
+        commands.append(command)
+        return command
+
+    manager = runtime.CatalogWorkerManager(command_factory=factory)
+    manager.close_admission()
+    with pytest.raises(runtime.WorkerError, match="producer_cancelled"):
+        manager.fetch_catalog()
+    assert commands == []
+
+
+def test_worker_output_limit_is_enforced_incrementally():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x' * (2**21 + 1)); sys.stdout.flush()",
+        ],
+        timeout=2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+        manager.fetch_catalog()
+    assert time.monotonic() - started < 2
+    assert manager.close(time.monotonic() + 2)
+    assert manager.active_count == 0
+
+
+def test_worker_stderr_limit_is_enforced_incrementally():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.buffer.write(b'x' * (2**13 + 1)); sys.stderr.flush()",
+        ],
+        timeout=2,
+    )
+    with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+        manager.fetch_catalog()
+    assert manager.close(time.monotonic() + 2)
+    assert manager.active_count == 0
+
+
+def test_worker_timeout_has_no_additive_reap_window():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_timeout"):
+        manager.fetch_catalog()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.8
+    assert manager.close(time.monotonic() + 2)
+
+
+def test_stop_during_spawn_reaps_child_registered_after_admission_closes():
+    with TemporaryDirectory():
+        entered = threading.Event()
+        release = threading.Event()
+
+        def factory() -> list[str]:
+            entered.set()
+            assert release.wait(timeout=3)
+            return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        manager = runtime.CatalogWorkerManager(command_factory=factory)
+        errors: list[runtime.WorkerError] = []
+
+        def fetch() -> None:
+            try:
+                manager.fetch_catalog()
+            except runtime.WorkerError as error:
+                errors.append(error)
+
+        fetch_thread = threading.Thread(target=fetch)
+        fetch_thread.start()
+        assert entered.wait(timeout=2)
+        close_result: list[bool] = []
+        close_thread = threading.Thread(
+            target=lambda: close_result.append(manager.close(time.monotonic() + 3))
+        )
+        close_thread.start()
+        time.sleep(0.05)
+        release.set()
+        fetch_thread.join(timeout=4)
+        close_thread.join(timeout=4)
+        assert not fetch_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert close_result == [True]
+        assert [error.code for error in errors] == ["producer_cancelled"]
+        assert manager.active_count == 0
+
+
+def test_simultaneous_start_processes_share_one_authenticated_instance():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+        first = second = None
+        try:
+            command = (
+                "from nyx import runtime; print(runtime.start(), flush=True); "
+                "print(runtime._read_instance(runtime._paths()).instance_id, flush=True)"
+            )
+            first = subprocess.Popen(
+                [sys.executable, "-c", command],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            second = subprocess.Popen(
+                [sys.executable, "-c", command],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            first_stdout, first_stderr = first.communicate(timeout=12)
+            second_stdout, second_stderr = second.communicate(timeout=12)
+            assert first.returncode == 0, first_stderr
+            assert second.returncode == 0, second_stderr
+            first_lines = first_stdout.splitlines()
+            second_lines = second_stdout.splitlines()
+            assert first_lines[0] == runtime.URL
+            assert second_lines[0] == runtime.URL
+            assert first_lines[1] == second_lines[1]
+        finally:
+            subprocess.run(
+                [sys.executable, "-c", "from nyx import runtime; runtime.stop()"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+            for process in (first, second):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+
+
+def test_actual_daemon_spawn_retains_lease_after_launcher_death():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+            paths = state.state_paths()
+        script = (
+            "import os,time; from nyx import runtime; paths=runtime._paths(create=True); "
+            "lease=runtime._lease_lock(paths,timeout=0); assert lease.acquire(blocking=False); "
+            "runtime._spawn_daemon(lease.fd,int((time.monotonic()+5)*10**9)); os._exit(0)"
+        )
+        launcher = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        _wait_for_record(paths)
+        probe = runtime._lease_lock(paths, timeout=0.0)
+        assert not probe.acquire(blocking=False)
+        probe.close()
+        with patch.object(runtime, "_paths", return_value=paths):
+            assert runtime.stop() == "stopped"
+
+
+def test_actual_launcher_death_before_spawn_releases_lease():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+            paths = state.state_paths()
+        script = (
+            "from nyx import runtime; import os; paths=runtime._paths(create=True); "
+            "lease=runtime._lease_lock(paths,timeout=0); assert lease.acquire(blocking=False); os._exit(0)"
+        )
+        launcher = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        probe = runtime._lease_lock(paths, timeout=0.0)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
+def test_separate_processes_serialize_on_the_persistent_operation_lock():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "operation.lock"
+        script = (
+            "import sys,time; from nyx.runtime import _FileLock; "
+            "lock=_FileLock(__import__('pathlib').Path(sys.argv[1]), timeout=2); "
+            "assert lock.acquire(); open(sys.argv[2], 'a').write('acquired\\n'); "
+            "time.sleep(.35); lock.close()"
+        )
+        events = Path(temporary) / "events"
+        started = time.monotonic()
+        first = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(events)])
+        second = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(events)])
+        assert first.wait(timeout=3) == 0
+        assert second.wait(timeout=3) == 0
+        assert time.monotonic() - started >= 0.6
+        assert events.read_text(encoding="utf-8").splitlines() == ["acquired", "acquired"]
+
+
+def test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "lease.lock"
+        script = (
+            "import fcntl,os,subprocess,sys,time; "
+            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); os.fchmod(fd, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.8)'], pass_fds=(fd,)); "
+            "os.close(fd); os._exit(0)"
+        )
+        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
+        assert launcher.wait(timeout=2) == 0
+        probe = runtime._FileLock(lock_path, timeout=0.0)
+        assert not probe.acquire(blocking=False)
+        time.sleep(1)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
+def test_launcher_loss_before_spawn_releases_untransferred_lease():
+    with TemporaryDirectory() as temporary:
+        lock_path = Path(temporary) / "lease.lock"
+        script = (
+            "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600); "
+            "os.fchmod(fd,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os._exit(0)"
+        )
+        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
+        assert launcher.wait(timeout=2) == 0
+        probe = runtime._FileLock(lock_path, timeout=0.0)
+        assert probe.acquire(blocking=False)
+        probe.close()
+
+
+def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        script = (
+            "import os,sys,time; from pathlib import Path; from nyx import runtime,state; "
+            "home=Path(sys.argv[1]); paths=state.StatePaths(home,home/'.config/nyx',home/'.config/nyx/config.json',"
+            "home/'.local/state/nyx',home/'.local/state/nyx/deployment.json',home/'.local/state/nyx/runtime'); "
+            "runtime._paths=lambda create=True: paths; fd=os.open(paths.runtime_directory/'lease.lock',os.O_RDWR|os.O_CREAT,0o600); "
+            "os.fchmod(fd,0o600); import fcntl; fcntl.flock(fd,fcntl.LOCK_EX); "
+            "runtime._Daemon(fd,int((time.monotonic()+5)*10**9)).start()"
+        )
+        crashed = subprocess.Popen([sys.executable, "-c", script, str(paths.account_home)])
+        try:
+            _wait_for_record(paths)
+            crashed.kill()
+            assert crashed.wait(timeout=2) == -9
+            with patch.object(runtime, "_paths", return_value=paths):
+                assert runtime.stop() == "stopped"
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+        finally:
+            if crashed.poll() is None:
+                crashed.kill()
+                crashed.wait()
+
+
+def test_controlled_stop_timeout_retains_daemon_lease_until_child_cleanup():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(lease_fd, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            daemon.workers = runtime.CatalogWorkerManager(
+                command_factory=lambda: [
+                    sys.executable,
+                    "-c",
+                    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(.5); time.sleep(30)",
+                ],
+                timeout=30,
+            )
+            daemon_thread = threading.Thread(target=daemon.run)
+            daemon_thread.start()
+            instance = _wait_for_record(paths)
+            request_done: list[object] = []
+
+            def request_catalog() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=10)
+                try:
+                    connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"})
+                    request_done.append(connection.getresponse().status)
+                except OSError:
+                    request_done.append(None)
+                finally:
+                    connection.close()
+
+            request_thread = threading.Thread(target=request_catalog)
+            request_thread.start()
+            deadline = time.monotonic() + 2
+            while daemon.workers.active_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert daemon.workers.active_count == 1
+            time.sleep(0.7)
+            response = runtime._send_control(instance, "stop")
+            assert response["status"] == "stopping"
+            assert daemon.shutdown_done.wait(timeout=7)
+            assert daemon.shutdown_result == "timeout"
+            probe = runtime._lease_lock(paths, timeout=0.0)
+            assert not probe.acquire(blocking=False)
+            probe.close()
+            # The child and request are test-owned; release them before allowing
+            # the daemon thread to complete its retained-ownership loop.
+            for child in tuple(daemon.workers._children):
+                child.process.kill()
+            request_thread.join(timeout=3)
+            daemon.shutdown_result = "stopped"
+            if daemon.control is not None:
+                daemon.control.close()
+            daemon_thread.join(timeout=3)
+            assert not daemon_thread.is_alive()
