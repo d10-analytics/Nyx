@@ -162,6 +162,61 @@ def test_held_lease_allows_same_root_setup_without_mutation():
         assert paths.config_file.read_bytes() == before
 
 
+def test_held_lease_excludes_changed_hidden_stage_policy_without_mutation():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime.setup(first, ["Queue"])
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+                runtime.ActiveInstanceError
+            ):
+                runtime.setup(first, ["Other"])
+        finally:
+            lease.close()
+        assert paths.config_file.read_bytes() == before
+        assert state.load_configuration(paths).hidden_stages == ("Queue",)
+
+
+def test_held_lease_allows_identical_hidden_stage_policy_without_mutation():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime.setup(first, ["Queue"])
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                configuration = runtime.setup(first, ["Queue", "Queue"])
+        finally:
+            lease.close()
+        assert configuration.hidden_stages == ("Queue",)
+        assert paths.config_file.read_bytes() == before
+
+
+def test_active_schema_one_identity_preserves_legacy_bytes():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        paths.config_file.write_text(
+            json.dumps({"schema_version": 1, "specification_root": str(first.resolve())}) + "\n",
+            encoding="utf-8",
+        )
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                configuration = runtime.setup(first)
+        finally:
+            lease.close()
+        assert configuration.hidden_stages == ()
+        assert paths.config_file.read_bytes() == before
+
+
 def test_free_lease_removes_stale_record_without_pid_signal():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
