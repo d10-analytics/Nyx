@@ -242,6 +242,27 @@ def test_active_schema_one_identity_preserves_legacy_bytes():
         assert paths.config_file.read_bytes() == before
 
 
+def test_active_schema_one_identity_preserves_noncanonical_legacy_bytes():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        legacy = (
+            '{  "specification_root" : "'
+            + str(first.resolve())
+            + '", "schema_version" : 1 }\n\n'
+        ).encode("utf-8")
+        paths.config_file.write_bytes(legacy)
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                configuration = runtime.setup(first)
+        finally:
+            lease.close()
+        assert configuration.hidden_stages == ()
+        assert paths.config_file.read_bytes() == before
+
+
 def test_free_lease_removes_stale_record_without_pid_signal():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
