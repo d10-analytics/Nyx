@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import subprocess
@@ -33,6 +34,26 @@ EXPECTED_ASSETS = {
 }
 
 
+def _prohibited_sequences() -> tuple[bytes, ...]:
+    return (
+        b"".join((b"v", bytes((50,)))),
+        b" ".join((b"survives", b"migration")),
+        b"_".join((b"viewer", b"migration")),
+    )
+
+
+def _assert_packaged_wording_clean(archive: zipfile.ZipFile) -> None:
+    for name in archive.namelist():
+        if not (
+            name.startswith("nyx/")
+            and (name.endswith(".py") or name.startswith("nyx/static/"))
+        ):
+            continue
+        payload = archive.read(name).lower()
+        for sequence in _prohibited_sequences():
+            assert sequence not in payload, f"{name} contains forbidden bytes {sequence!r}"
+
+
 def _wheel_path() -> Path:
     wheels = sorted((REPOSITORY_ROOT / "dist").glob("*.whl"))
     if not wheels:
@@ -47,6 +68,25 @@ def test_wheel_contains_every_module_and_frontend_asset():
         names = set(archive.namelist())
     assert EXPECTED_MODULES <= names
     assert EXPECTED_ASSETS <= names
+
+
+@pytest.mark.parametrize(
+    "sequence", _prohibited_sequences(), ids=lambda sequence: sequence.decode("ascii")
+)
+def test_wheel_audit_rejects_each_prohibited_sequence(sequence: bytes):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("nyx/models.py", b"# " + sequence.upper())
+    stream.seek(0)
+    with zipfile.ZipFile(stream) as archive:
+        with pytest.raises(AssertionError, match="forbidden bytes"):
+            _assert_packaged_wording_clean(archive)
+
+
+def test_built_wheel_python_and_static_members_have_current_terms():
+    wheel = _wheel_path()
+    with zipfile.ZipFile(wheel) as archive:
+        _assert_packaged_wording_clean(archive)
 
 
 def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():

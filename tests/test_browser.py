@@ -785,7 +785,7 @@ def test_dark_is_default_and_explicit_theme_survives_reload_and_system_changes(o
     assert page.locator("html").get_attribute("data-theme") == "dark"
 
 
-def test_established_theme_preference_survives_viewer_migration(open_page):
+def test_established_theme_preference_survives_reload(open_page):
     page = open_page(
         StaticClient(board_payload()),
         color_scheme="dark",
