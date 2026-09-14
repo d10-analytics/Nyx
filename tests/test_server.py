@@ -1,10 +1,12 @@
 import http.client
 import json
 import threading
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
+from nyx import server
 from nyx.models import canonical_digest, parse_catalog
 from nyx.server import CatalogError, create_server
 
@@ -101,6 +103,14 @@ def raw_catalog():
 
 def valid_catalog():
     return parse_catalog(raw_catalog())
+
+
+def test_default_provider_uses_unselected_scanner():
+    payload = json.dumps(raw_catalog(), separators=(",", ":"))
+    with patch.object(server, "scan_catalog", return_value=payload) as scanner:
+        result = server._default_provider()
+    assert result == valid_catalog()
+    scanner.assert_called_once_with(server.Path.cwd())
 
 
 class RunningServer:

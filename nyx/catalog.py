@@ -15,19 +15,13 @@ MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 CATALOG_LIFECYCLE_DIRECTORIES = {
     "Under_Development": "under_development",
     "Queue": "queue",
-    "Needs_Fixes": "needs_fixes",
-    "Awaiting_Retrospective": "awaiting_retrospective",
-}
-CATALOG_V2_LIFECYCLE_DIRECTORIES = {
-    "Under_Development": "under_development",
-    "Queue": "queue",
     "In_Progress": "in_progress",
     "Needs_Fixes": "needs_fixes",
     "Awaiting_Retrospective": "awaiting_retrospective",
     "Done": "done",
     "Archive": "archive",
 }
-CATALOG_V2_BOARD_LIFECYCLES = {
+CATALOG_BOARD_LIFECYCLES = {
     "under_development", "queue", "needs_fixes", "awaiting_retrospective",
 }
 CATALOG_DIAGNOSTIC_MESSAGES = {
@@ -36,8 +30,6 @@ CATALOG_DIAGNOSTIC_MESSAGES = {
     "nonregular_anchor": "nonregular anchor",
     "changed_during_read": "changed during read",
     "discovery_unavailable": "discovery unavailable",
-}
-CATALOG_V2_DIAGNOSTIC_MESSAGES = {
     "invalid_package_id": "invalid package identity",
     "duplicate_package_id": "duplicate package identity",
     "invalid_claim": "invalid claim",
@@ -56,15 +48,16 @@ CATALOG_V2_DIAGNOSTIC_MESSAGES = {
     "relationship_cycle": "relationship cycle detected",
     "transitive_diagnostics_truncated": "transitive diagnostics truncated",
 }
+
 _CANONICAL_UUID = re.compile(
     r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})(?![0-9A-Fa-f])"
 )
-_V2_CLAIM_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
-_V2_PROVENANCE = re.compile(
+_CLAIM_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_PROVENANCE = re.compile(
     r"^(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$"
 )
-_V2_HEADER_FIELD = re.compile(
+_HEADER_FIELD = re.compile(
     r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
 )
 
@@ -81,15 +74,6 @@ def _metadata_value(lines: list[str], label: str) -> str | None:
             return match.group(1)
     return None
 
-def _catalog_empty_declared() -> dict[str, str | None]:
-    return {
-        "closure": None,
-        "human_sanity_decision": None,
-        "sanity_recommendation": None,
-        "status": None,
-        "target_project": None,
-        "title": None,
-    }
 
 def _catalog_relative(path: Path, spec_root: Path) -> str:
     """Return the stable POSIX path exposed by the catalog protocol."""
@@ -157,9 +141,7 @@ def _catalog_fingerprint(path: Path) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _catalog_read_anchor(
-    anchor: Path,
-) -> tuple[bytes | None, str | None]:
+def _catalog_read_anchor(anchor: Path) -> tuple[bytes | None, str | None]:
     """Read an anchor with one retry when its identity changes during the read."""
     last_data: bytes | None = None
     for _ in range(2):
@@ -183,108 +165,6 @@ def _catalog_read_anchor(
     return last_data, "changed_during_read"
 
 
-def _catalog_entry(
-    anchor: Path,
-    lifecycle: str,
-    package_path: str,
-    spec_root: Path,
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
-) -> dict[str, object]:
-    data, read_diagnostic = _catalog_read_anchor(anchor)
-    if data is None:
-        return {
-            "declared": _catalog_empty_declared(),
-            "diagnostics": [_catalog_diagnostic(read_diagnostic or "unreadable_anchor", package_path)],
-            "lifecycle": lifecycle,
-            "package_path": package_path,
-            "state": "partial",
-        }
-    try:
-        lines = data.decode("utf-8").splitlines()
-    except UnicodeDecodeError:
-        lines = []
-        read_diagnostic = read_diagnostic or "invalid_package"
-    declared = _catalog_declared(lines)
-    diagnostics: list[dict[str, str]] = []
-    if read_diagnostic:
-        diagnostics.append(_catalog_diagnostic(read_diagnostic, package_path))
-    elif not lines:
-        diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-    else:
-        invalid = not any(line.startswith("# ") for line in lines)
-        if full_validity is not None:
-            try:
-                invalid = bool(full_validity(anchor.parent, lines)) or invalid
-            except (OSError, UnicodeError, ValueError):
-                invalid = True
-        if invalid:
-            diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-    return {
-        "declared": declared,
-        "diagnostics": diagnostics,
-        "lifecycle": lifecycle,
-        "package_path": package_path,
-        "state": "partial" if diagnostics else "complete",
-    }
-
-
-def _catalog_walk_stage(
-    stage_path: Path,
-    lifecycle: str,
-    spec_root: Path,
-    entries: list[dict[str, object]],
-    diagnostics: list[dict[str, str]],
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
-) -> None:
-    stage_relative = _catalog_relative(stage_path, spec_root)
-    if not _catalog_readable(stage_path, directory=True):
-        diagnostics.append(_catalog_diagnostic("discovery_unavailable", stage_relative))
-        return
-    pending = [stage_path]
-    while pending:
-        current = pending.pop()
-        try:
-            children = sorted(os.scandir(current), key=lambda item: item.name)
-        except OSError:
-            diagnostics.append(
-                _catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root))
-            )
-            continue
-        for child in children:
-            child_path = Path(child.path)
-            if child.name == "spec.md":
-                package_path = _catalog_relative(current, spec_root)
-                if child.is_symlink():
-                    entry = {
-                        "declared": {
-                            "closure": None,
-                            "human_sanity_decision": None,
-                            "sanity_recommendation": None,
-                            "status": None,
-                            "target_project": None,
-                            "title": None,
-                        },
-                        "diagnostics": [_catalog_diagnostic("nonregular_anchor", package_path)],
-                        "lifecycle": lifecycle,
-                        "package_path": package_path,
-                        "state": "partial",
-                    }
-                else:
-                    entry = _catalog_entry(child_path, lifecycle, package_path, spec_root, full_validity)
-                entries.append(entry)
-                continue
-            try:
-                if child.is_dir(follow_symlinks=False) and child.name not in {
-                    "Done",
-                    "In_Progress",
-                }:
-                    pending.append(child_path)
-            except OSError:
-                diagnostics.append(
-                    _catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root))
-                )
-
-
 def _catalog_scan_root(spec_root: Path) -> list[os.DirEntry[str]]:
     """Return root entries while containing permission and scan failures."""
     if not _catalog_readable(spec_root, directory=True):
@@ -295,72 +175,7 @@ def _catalog_scan_root(spec_root: Path) -> list[os.DirEntry[str]]:
         raise ValueError("specification root cannot be read") from error
 
 
-def _build_catalog(
-    spec_root: Path,
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
-) -> str:
-    """Build the deterministic, read-only catalog JSON object."""
-    if not spec_root.exists():
-        raise ValueError(f"specification root does not exist: {spec_root}")
-    if not spec_root.is_dir():
-        raise ValueError(f"specification root is not a directory: {spec_root}")
-    entries: list[dict[str, object]] = []
-    diagnostics: list[dict[str, str]] = []
-    repositories = _catalog_scan_root(spec_root)
-    for repository in repositories:
-        try:
-            if not repository.is_dir(follow_symlinks=False):
-                continue
-        except OSError:
-            continue
-        repository_path = Path(repository.path)
-        for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items():
-            stage_path = repository_path / directory
-            try:
-                stage_mode = stage_path.lstat().st_mode
-            except FileNotFoundError:
-                continue
-            except OSError:
-                diagnostics.append(
-                    _catalog_diagnostic(
-                        "discovery_unavailable", _catalog_relative(stage_path, spec_root)
-                    )
-                )
-                continue
-            if stat.S_ISLNK(stage_mode) or not stat.S_ISDIR(stage_mode):
-                diagnostics.append(
-                    _catalog_diagnostic(
-                        "discovery_unavailable", _catalog_relative(stage_path, spec_root)
-                    )
-                )
-                continue
-            _catalog_walk_stage(
-                stage_path, lifecycle, spec_root, entries, diagnostics, full_validity
-            )
-
-    entries.sort(key=lambda item: str(item["package_path"]))
-    diagnostics.sort(key=lambda item: (item["code"], item["message"]))
-    catalog = {
-        "discovery_diagnostics": diagnostics,
-        "entries": entries,
-        "schema_version": 1,
-    }
-    digest_payload = json.dumps(
-        catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    catalog["catalog_digest"] = sha256(digest_payload).hexdigest()
-    rendered = json.dumps(catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    if len(rendered.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:
-        raise ValueError("catalog output exceeds 2 MiB")
-    return rendered
-
-
-def build_catalog(spec_root: Path) -> str:
-    """Build the standalone v1 catalog without shared validation hooks."""
-    return _build_catalog(spec_root)
-
-
-def _v2_uuid(value: str) -> str | None:
+def _uuid(value: str) -> str | None:
     """Return a canonical lowercase UUIDv4, or None for an unsafe value."""
     if not re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
@@ -374,32 +189,30 @@ def _v2_uuid(value: str) -> str | None:
     return value if parsed.version == 4 and str(parsed) == value else None
 
 
-def _v2_uuid_candidates(value: str) -> set[str]:
+def _uuid_candidates(value: str) -> set[str]:
     """Collect all canonical IDs even when a Package ID scalar is malformed."""
     return {
         token
         for token in _CANONICAL_UUID.findall(value)
-        if _v2_uuid(token) is not None
+        if _uuid(token) is not None
     }
 
 
-def _v2_diagnostic(code: str, package_path: str | None = None) -> dict[str, str]:
-    message = CATALOG_V2_DIAGNOSTIC_MESSAGES.get(
-        code, CATALOG_DIAGNOSTIC_MESSAGES.get(code, "catalog diagnostic")
-    )
+def _diagnostic(code: str, package_path: str | None = None) -> dict[str, str]:
+    message = CATALOG_DIAGNOSTIC_MESSAGES.get(code, "catalog diagnostic")
     if package_path:
         message = f"{message}: {package_path}"
     return {"code": code, "message": message}
 
 
-def _v2_sort_diagnostics(
+def _sort_diagnostics(
     diagnostics: list[dict[str, str]],
 ) -> list[dict[str, str]]:
     """Return diagnostics in the wire contract's canonical order."""
     return sorted(diagnostics, key=lambda item: (item["code"], item["message"]))
 
 
-def _v2_header(data: bytes) -> tuple[list[str], str | None]:
+def _header(data: bytes) -> tuple[list[str], str | None]:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -412,7 +225,7 @@ def _v2_header(data: bytes) -> tuple[list[str], str | None]:
     return lines, None
 
 
-def _v2_parse_header(
+def _parse_header(
     lines: list[str], package_path: str
 ) -> tuple[dict[str, object], set[str], list[dict[str, str]]]:
     """Parse only package-owned header rows and redact submitted invalid values."""
@@ -425,7 +238,7 @@ def _v2_parse_header(
     claim_rows: list[str] = []
     diagnostics: list[dict[str, str]] = []
     for line in lines:
-        match = _V2_HEADER_FIELD.match(line)
+        match = _HEADER_FIELD.match(line)
         if not match:
             continue
         label, value = match.groups()
@@ -439,44 +252,44 @@ def _v2_parse_header(
     package_candidates: set[str] = set()
     package_values = scalar_values["Package ID"]
     for value in package_values:
-        package_candidates.update(_v2_uuid_candidates(value))
+        package_candidates.update(_uuid_candidates(value))
     package_id: str | None = None
     package_identity_valid = len(package_values) == 1
     if not package_values:
         package_identity_valid = False
     elif package_identity_valid:
-        package_id = _v2_uuid(package_values[0].strip())
+        package_id = _uuid(package_values[0].strip())
         package_identity_valid = package_id is not None
     if package_values and not package_identity_valid:
-        diagnostics.append(_v2_diagnostic("invalid_package_id", package_path))
+        diagnostics.append(_diagnostic("invalid_package_id", package_path))
     if len(package_values) > 1:
-        diagnostics.append(_v2_diagnostic("duplicate_package_id", package_path))
+        diagnostics.append(_diagnostic("duplicate_package_id", package_path))
 
     membership: str | None = None
     membership_values = scalar_values["Program Membership"]
     if len(membership_values) == 1:
-        membership = _v2_uuid(membership_values[0].strip())
+        membership = _uuid(membership_values[0].strip())
         if membership is None:
-            diagnostics.append(_v2_diagnostic("invalid_program_membership", package_path))
+            diagnostics.append(_diagnostic("invalid_program_membership", package_path))
     elif membership_values:
-        diagnostics.append(_v2_diagnostic("invalid_program_membership", package_path))
+        diagnostics.append(_diagnostic("invalid_program_membership", package_path))
 
     successor: str | None = None
     successor_values = scalar_values["Superseded By"]
     if len(successor_values) == 1:
-        successor = _v2_uuid(successor_values[0].strip())
+        successor = _uuid(successor_values[0].strip())
         if successor is None or successor == package_id:
             successor = None
-            diagnostics.append(_v2_diagnostic("invalid_superseded_by", package_path))
+            diagnostics.append(_diagnostic("invalid_superseded_by", package_path))
     elif successor_values:
-        diagnostics.append(_v2_diagnostic("invalid_superseded_by", package_path))
+        diagnostics.append(_diagnostic("invalid_superseded_by", package_path))
 
     claims: dict[str, dict[str, object]] = {}
     parsed_prerequisites: list[dict[str, object]] = []
     malformed_prerequisite = False
     for value in claim_rows:
         parts = [part.strip() for part in value.split("|")]
-        name = parts[0] if parts and _V2_CLAIM_NAME.fullmatch(parts[0]) else None
+        name = parts[0] if parts and _CLAIM_NAME.fullmatch(parts[0]) else None
         claim_diagnostic: list[dict[str, str]] = []
         state: str = "unknown"
         evidence_ref: str | None = None
@@ -485,22 +298,22 @@ def _v2_parse_header(
         elif (
             len(parts) == 3
             and parts[1] == "satisfied"
-            and _V2_PROVENANCE.fullmatch(parts[2])
+            and _PROVENANCE.fullmatch(parts[2])
         ):
             state = "satisfied"
             evidence_ref = parts[2]
         elif len(parts) == 3 and len(parts) >= 2 and parts[1] == "satisfied":
-            claim_diagnostic.append(_v2_diagnostic("invalid_provenance", package_path))
+            claim_diagnostic.append(_diagnostic("invalid_provenance", package_path))
         else:
-            claim_diagnostic.append(_v2_diagnostic("invalid_claim", package_path))
+            claim_diagnostic.append(_diagnostic("invalid_claim", package_path))
         if name is None:
-            diagnostics.append(_v2_diagnostic("invalid_claim", package_path))
+            diagnostics.append(_diagnostic("invalid_claim", package_path))
             continue
         if name in claims:
-            diagnostics.append(_v2_diagnostic("duplicate_claim", package_path))
+            diagnostics.append(_diagnostic("duplicate_claim", package_path))
             claims[name]["state"] = "unknown"
             claims[name]["evidence_ref"] = None
-            claims[name]["diagnostics"] = [_v2_diagnostic("duplicate_claim", package_path)]
+            claims[name]["diagnostics"] = [_diagnostic("duplicate_claim", package_path)]
             continue
         if claim_diagnostic:
             diagnostics.extend(claim_diagnostic)
@@ -513,14 +326,14 @@ def _v2_parse_header(
 
     for value in prereq_rows:
         parts = [part.strip() for part in value.split("|")]
-        target_id = _v2_uuid(parts[0]) if parts else None
+        target_id = _uuid(parts[0]) if parts else None
         claim_name = (
-            parts[1] if len(parts) == 2 and _V2_CLAIM_NAME.fullmatch(parts[1]) else None
+            parts[1] if len(parts) == 2 and _CLAIM_NAME.fullmatch(parts[1]) else None
         )
         row_diagnostics: list[dict[str, str]] = []
         if len(parts) != 2 or target_id is None or claim_name is None:
             malformed_prerequisite = True
-            row_diagnostics.append(_v2_diagnostic("invalid_prerequisite", package_path))
+            row_diagnostics.append(_diagnostic("invalid_prerequisite", package_path))
             diagnostics.extend(row_diagnostics)
         parsed_prerequisites.append(
             {
@@ -546,7 +359,7 @@ def _v2_parse_header(
             "title": None,
             "resolution": "unknown" if membership or membership_values else "not_declared",
             "diagnostics": (
-                [_v2_diagnostic("invalid_program_membership", package_path)]
+                [_diagnostic("invalid_program_membership", package_path)]
                 if membership_values and membership is None
                 else []
             ),
@@ -555,7 +368,7 @@ def _v2_parse_header(
             "package_id": successor,
             "resolution": "unknown" if successor or successor_values else "not_declared",
             "diagnostics": (
-                [_v2_diagnostic("invalid_superseded_by", package_path)]
+                [_diagnostic("invalid_superseded_by", package_path)]
                 if successor_values and successor is None
                 else []
             ),
@@ -568,7 +381,7 @@ def _v2_parse_header(
     return relationship, package_candidates, diagnostics
 
 
-def _v2_empty_declared() -> dict[str, str | None]:
+def _empty_declared() -> dict[str, str | None]:
     return {
         "title": None,
         "target_project": None,
@@ -579,30 +392,30 @@ def _v2_empty_declared() -> dict[str, str | None]:
     }
 
 
-_V2_PROGRAM_FIELD = re.compile(
+_PROGRAM_FIELD = re.compile(
     r"^\s*\*{0,2}(Program ID|Program Title)\*{0,2}\s*:\s?(.*?)\s*$"
 )
 
 
-def _v2_program_candidate_ids(value: str) -> set[str]:
-    return _v2_uuid_candidates(value)
+def _program_candidate_ids(value: str) -> set[str]:
+    return _uuid_candidates(value)
 
 
-def _v2_parse_program_descriptor(
+def _parse_program_descriptor(
     lines: list[str], directory_id: str | None, program_path: str
 ) -> tuple[dict[str, object], set[str], list[dict[str, str]]]:
     values: dict[str, list[str]] = {"Program ID": [], "Program Title": []}
     for line in lines:
-        match = _V2_PROGRAM_FIELD.match(line)
+        match = _PROGRAM_FIELD.match(line)
         if match:
             values[match.group(1)].append(match.group(2))
 
     candidates: set[str] = set()
     for value in values["Program ID"]:
-        candidates.update(_v2_program_candidate_ids(value))
+        candidates.update(_program_candidate_ids(value))
     diagnostics: list[dict[str, str]] = []
     has_forbidden_content = any(
-        line.strip() and not _V2_PROGRAM_FIELD.match(line) for line in lines
+        line.strip() and not _PROGRAM_FIELD.match(line) for line in lines
     )
     program_id: str | None = None
     title: str | None = None
@@ -612,7 +425,7 @@ def _v2_parse_program_descriptor(
         and not has_forbidden_content
     )
     if valid:
-        program_id = _v2_uuid(values["Program ID"][0].strip())
+        program_id = _uuid(values["Program ID"][0].strip())
         title_value = values["Program Title"][0]
         if (
             program_id is None
@@ -625,7 +438,7 @@ def _v2_parse_program_descriptor(
         else:
             title = title_value
     if not valid:
-        diagnostics.append(_v2_diagnostic("invalid_package", program_path))
+        diagnostics.append(_diagnostic("invalid_package", program_path))
     return (
         {
             "program_id": program_id,
@@ -640,7 +453,7 @@ def _v2_parse_program_descriptor(
     )
 
 
-def _v2_scan_programs(
+def _scan_programs(
     repository_path: Path,
     spec_root: Path,
     programs: list[dict[str, object]],
@@ -652,15 +465,15 @@ def _v2_scan_programs(
     except FileNotFoundError:
         return
     except OSError:
-        diagnostics.append(_v2_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
+        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
         return
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not _catalog_readable(namespace, directory=True):
-        diagnostics.append(_v2_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
+        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
         return
     try:
         children = sorted(os.scandir(namespace), key=lambda item: item.name)
     except OSError:
-        diagnostics.append(_v2_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
+        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
         return
     for child in children:
         child_path = Path(child.path)
@@ -668,12 +481,12 @@ def _v2_scan_programs(
         # Only a canonical UUID directory owns a program descriptor.  Other
         # Reference/Programs material is unrelated reference content and must
         # not make an otherwise complete program namespace incomplete.
-        directory_id = _v2_uuid(child.name)
+        directory_id = _uuid(child.name)
         if directory_id is None:
             continue
         try:
             if child.is_symlink() or not child.is_dir(follow_symlinks=False):
-                diagnostics.append(_v2_diagnostic("invalid_package", program_path))
+                diagnostics.append(_diagnostic("invalid_package", program_path))
                 continue
         except OSError:
             diagnostics.append(_catalog_diagnostic("discovery_unavailable", program_path))
@@ -699,7 +512,7 @@ def _v2_scan_programs(
         except UnicodeDecodeError:
             diagnostics.append(_catalog_diagnostic("invalid_package", program_path))
             continue
-        parsed, candidates, parsed_diagnostics = _v2_parse_program_descriptor(
+        parsed, candidates, parsed_diagnostics = _parse_program_descriptor(
             lines, directory_id, program_path
         )
         parsed["candidate_ids"] = candidates
@@ -712,7 +525,7 @@ def _v2_scan_programs(
         diagnostics.extend(parsed_diagnostics)
 
 
-def _v2_program_index(
+def _program_index(
     descriptors: list[dict[str, object]],
 ) -> dict[str, list[dict[str, object]]]:
     index: dict[str, list[dict[str, object]]] = {}
@@ -723,7 +536,7 @@ def _v2_program_index(
     return index
 
 
-def _v2_resolve_program(
+def _resolve_program(
     relationship: dict[str, object],
     package_path: str,
     program_index: dict[str, list[dict[str, object]]],
@@ -740,21 +553,21 @@ def _v2_resolve_program(
     candidates = program_index.get(program_id, [])
     if not candidates:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("missing_program_descriptor", package_path)]
+        context["diagnostics"] = [_diagnostic("missing_program_descriptor", package_path)]
     elif len(candidates) > 1:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("duplicate_program_id", package_path)]
+        context["diagnostics"] = [_diagnostic("duplicate_program_id", package_path)]
     else:
         descriptor = candidates[0]
         if descriptor["diagnostics"]:
             context["resolution"] = "unknown"
-            context["diagnostics"] = [_v2_diagnostic("invalid_package", package_path)]
+            context["diagnostics"] = [_diagnostic("invalid_package", package_path)]
         else:
             context["resolution"] = "resolved"
             context["title"] = descriptor["title"]
 
 
-def _v2_resolve_successor(
+def _resolve_successor(
     relationship: dict[str, object],
     package_id: str | None,
     package_path: str,
@@ -774,20 +587,20 @@ def _v2_resolve_successor(
     candidates = index.get(successor_id, [])
     if not candidates:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("missing_successor", package_path)]
+        context["diagnostics"] = [_diagnostic("missing_successor", package_path)]
         return
     if len(candidates) > 1:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("duplicate_package_id", package_path)]
+        context["diagnostics"] = [_diagnostic("duplicate_package_id", package_path)]
         return
     target = candidates[0]
     if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor", "changed_during_read"}:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("invalid_superseded_by", package_path)]
+        context["diagnostics"] = [_diagnostic("invalid_superseded_by", package_path)]
         return
     if target.get("package_id") != successor_id or target.get("relationship") is None:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_v2_diagnostic("invalid_superseded_by", package_path)]
+        context["diagnostics"] = [_diagnostic("invalid_superseded_by", package_path)]
         return
     context["resolution"] = "resolved"
 
@@ -802,10 +615,10 @@ def _v2_resolve_successor(
         next_context = next_relationship.get("superseded_by") if next_relationship else None
         current = next_context.get("package_id") if next_context else None
     if current is not None and current in seen:
-        context["diagnostics"] = [_v2_diagnostic("successor_cycle", package_path)]
+        context["diagnostics"] = [_diagnostic("successor_cycle", package_path)]
 
 
-def _v2_transitive_diagnostics(
+def _transitive_diagnostics(
     record: dict[str, object],
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
@@ -858,7 +671,7 @@ def _v2_transitive_diagnostics(
             continue
         for row in reversed(relationship["prerequisites"]):
             target_id = row["target_package_id"]
-            edge = _v2_edge(current, row, index, identity_complete)
+            edge = _edge(current, row, index, identity_complete)
             edge_reason = str(edge["reason"])
             edge_path = path + ((str(target_id),) if target_id is not None else ())
             if edge_reason not in {"claim_satisfied", "claim_unsatisfied"}:
@@ -884,7 +697,7 @@ def _v2_transitive_diagnostics(
     return ordered
 
 
-def _v2_scan_stage(
+def _scan_stage(
     stage_path: Path,
     lifecycle: str,
     spec_root: Path,
@@ -918,7 +731,7 @@ def _v2_scan_stage(
                             "lifecycle": lifecycle,
                             "data": None,
                             "read_diagnostic": "nonregular_anchor",
-                            "declared": _v2_empty_declared(),
+                            "declared": _empty_declared(),
                             "relationship": None,
                             "candidate_ids": set(),
                             "package_id": None,
@@ -928,15 +741,15 @@ def _v2_scan_stage(
                     )
                 else:
                     data, read_diagnostic = _catalog_read_anchor(child_path)
-                    declared = _v2_empty_declared()
+                    declared = _empty_declared()
                     relationship = None
                     candidates: set[str] = set()
                     diagnostics: list[dict[str, str]] = []
                     if data is not None:
-                        lines, decode_diagnostic = _v2_header(data)
+                        lines, decode_diagnostic = _header(data)
                         if lines:
                             declared = _catalog_declared(lines)
-                            relationship, candidates, diagnostics = _v2_parse_header(lines, package_path)
+                            relationship, candidates, diagnostics = _parse_header(lines, package_path)
                             if full_validity is not None:
                                 try:
                                     if full_validity(child_path.parent, lines):
@@ -978,7 +791,7 @@ def _v2_scan_stage(
                 )
 
 
-def _v2_edge(
+def _edge(
     source: dict[str, object],
     row: dict[str, object],
     index: dict[str, list[dict[str, object]]],
@@ -1057,7 +870,7 @@ def _v2_edge(
     return edge
 
 
-def _v2_render_entry(
+def _render_entry(
     record: dict[str, object],
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
@@ -1083,13 +896,13 @@ def _v2_render_entry(
                 "diagnostics": [],
             },
         }
-    _v2_resolve_program(
+    _resolve_program(
         relationship,
         str(record["package_path"]),
         program_index,
         program_coverage_complete,
     )
-    _v2_resolve_successor(
+    _resolve_successor(
         relationship,
         record.get("package_id"),
         str(record["package_path"]),
@@ -1098,7 +911,7 @@ def _v2_render_entry(
     )
     prerequisites = relationship["prerequisites"]
     rendered_edges = [
-        _v2_edge(record, row, index, identity_complete) for row in prerequisites
+        _edge(record, row, index, identity_complete) for row in prerequisites
     ]
     rendered_edges.sort(
         key=lambda edge: (
@@ -1119,17 +932,17 @@ def _v2_render_entry(
     rendered_claims = []
     for claim in relationship["claims"]:
         rendered_claim = dict(claim)
-        rendered_claim["diagnostics"] = _v2_sort_diagnostics(
+        rendered_claim["diagnostics"] = _sort_diagnostics(
             list(claim["diagnostics"])
         )
         rendered_claims.append(rendered_claim)
     rendered_claims.sort(key=lambda claim: str(claim["name"]))
     rendered_program = dict(relationship["program"])
-    rendered_program["diagnostics"] = _v2_sort_diagnostics(
+    rendered_program["diagnostics"] = _sort_diagnostics(
         list(relationship["program"]["diagnostics"])
     )
     rendered_successor = dict(relationship["superseded_by"])
-    rendered_successor["diagnostics"] = _v2_sort_diagnostics(
+    rendered_successor["diagnostics"] = _sort_diagnostics(
         list(relationship["superseded_by"]["diagnostics"])
     )
     relationship_out = {
@@ -1140,7 +953,7 @@ def _v2_render_entry(
         "program": rendered_program,
         "superseded_by": rendered_successor,
     }
-    diagnostics = _v2_sort_diagnostics(list(record["diagnostics"]))
+    diagnostics = _sort_diagnostics(list(record["diagnostics"]))
     return {
         "package_id": record["package_id"],
         "package_path": record["package_path"],
@@ -1149,17 +962,17 @@ def _v2_render_entry(
         "declared": record["declared"],
         "diagnostics": diagnostics,
         "relationship": relationship_out,
-        "transitive_diagnostics": _v2_transitive_diagnostics(
+        "transitive_diagnostics": _transitive_diagnostics(
             record, index, identity_complete
         ),
     }
 
 
-def _build_catalog_v2(
+def _build_catalog(
     spec_root: Path,
     full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
-    """Build the opt-in v2 relationship catalog from one captured scan."""
+    """Build the relationship catalog from one captured scan."""
     if not spec_root.exists() or not spec_root.is_dir():
         raise ValueError(f"specification root is not a directory: {spec_root}")
     records: list[dict[str, object]] = []
@@ -1173,10 +986,10 @@ def _build_catalog_v2(
         except OSError:
             continue
         repository_path = Path(repository.path)
-        _v2_scan_programs(
+        _scan_programs(
             repository_path, spec_root, program_descriptors, program_diagnostics
         )
-        for directory, lifecycle in CATALOG_V2_LIFECYCLE_DIRECTORIES.items():
+        for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items():
             stage_path = repository_path / directory
             try:
                 mode = stage_path.lstat().st_mode
@@ -1192,7 +1005,7 @@ def _build_catalog_v2(
                     _catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root))
                 )
                 continue
-            _v2_scan_stage(
+            _scan_stage(
                 stage_path,
                 lifecycle,
                 spec_root,
@@ -1209,7 +1022,7 @@ def _build_catalog_v2(
         if len(candidates) > 1:
             for record in candidates:
                 record["diagnostics"].append(
-                    _v2_diagnostic("duplicate_package_id", record["package_path"])
+                    _diagnostic("duplicate_package_id", record["package_path"])
                 )
                 record["state"] = "partial"
     discovery_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
@@ -1222,21 +1035,21 @@ def _build_catalog_v2(
             "invalid_package",
         }:
             identity_diagnostics.append(
-                _v2_diagnostic(record["read_diagnostic"], record["package_path"])
+                _diagnostic(record["read_diagnostic"], record["package_path"])
             )
     identity_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
     identity_complete = not identity_diagnostics
 
-    program_index = _v2_program_index(program_descriptors)
+    program_index = _program_index(program_descriptors)
     for candidate, candidates in program_index.items():
         if len(candidates) > 1:
             for descriptor in candidates:
                 descriptor["diagnostics"].append(
-                    _v2_diagnostic("duplicate_program_id", descriptor["program_path"])
+                    _diagnostic("duplicate_program_id", descriptor["program_path"])
                 )
                 descriptor["state"] = "partial"
             program_diagnostics.extend(
-                _v2_diagnostic("duplicate_program_id", descriptor["program_path"])
+                _diagnostic("duplicate_program_id", descriptor["program_path"])
                 for descriptor in candidates
             )
     program_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
@@ -1250,7 +1063,7 @@ def _build_catalog_v2(
             for descriptor in program_index.get(program_id, []):
                 descriptor.setdefault("member_package_ids", []).append(record.get("package_id"))
 
-    board = [record for record in records if record["lifecycle"] in CATALOG_V2_BOARD_LIFECYCLES]
+    board = [record for record in records if record["lifecycle"] in CATALOG_BOARD_LIFECYCLES]
     referenced_ids = {
         row["target_package_id"]
         for record in board
@@ -1264,7 +1077,7 @@ def _build_catalog_v2(
                 projected.append(record)
     projected.sort(key=lambda record: str(record["package_path"]))
     entries = [
-        _v2_render_entry(
+        _render_entry(
             record,
             index,
             identity_complete,
@@ -1325,20 +1138,15 @@ def _build_catalog_v2(
     return rendered
 
 
-def build_catalog_v2(spec_root: Path) -> str:
-    """Build the standalone v2 catalog without shared validation hooks."""
-    return _build_catalog_v2(spec_root)
+def build_catalog(spec_root: Path) -> str:
+    """Build the deterministic catalog without shared validation hooks."""
+    return _build_catalog(spec_root)
 
 
 def scan_catalog(
     spec_root: Path,
     *,
-    version: int = 2,
     _full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
-    """Return one catalog version from the dependency-light engine."""
-    if version == 1:
-        return _build_catalog(spec_root, _full_validity)
-    if version == 2:
-        return _build_catalog_v2(spec_root, _full_validity)
-    raise ValueError("unsupported catalog version")
+    """Build the deterministic catalog with the private validity hook."""
+    return _build_catalog(spec_root, _full_validity)

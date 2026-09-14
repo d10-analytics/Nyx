@@ -73,7 +73,7 @@ def _catalog_from_provider(provider: Provider) -> Catalog:
 
 def _default_provider() -> Catalog:
     try:
-        return parse_catalog(scan_catalog(Path.cwd(), version=2))
+        return parse_catalog(scan_catalog(Path.cwd()))
     except (OSError, ValueError, ProtocolError, RecursionError):
         raise CatalogError("producer_unavailable") from None
 
