@@ -502,33 +502,163 @@
       Object.keys(value).sort().join("\u0000") === expected.slice().sort().join("\u0000");
   }
 
+  function protocol(condition) {
+    if (!condition) throw new Error("producer_protocol_error");
+  }
+
+  function safeText(value, nullable = false) {
+    return (nullable && value === null) ||
+      (typeof value === "string" && value.length > 0 && value.length <= 1024 &&
+        ![...value].some((character) => {
+          const code = character.codePointAt(0);
+          return code < 32 || code === 127 || (code >= 0xd800 && code <= 0xdfff);
+        }));
+  }
+
+  function component(value) {
+    return safeText(value) && value !== "." && value !== ".." &&
+      !value.includes("/") && !value.includes("\\");
+  }
+
+  function diagnostics(value) {
+    protocol(Array.isArray(value));
+    value.forEach((item) => {
+      protocol(exactKeys(item, ["code", "message"]) && safeText(item.code) && safeText(item.message));
+    });
+    protocol(value.every((item, index) => index === 0 ||
+      `${item.code}\u0000${item.message}` >= `${value[index - 1].code}\u0000${value[index - 1].message}`));
+  }
+
+  function uuid(value, nullable = false) {
+    protocol((nullable && value === null) ||
+      (typeof value === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)));
+  }
+
+  function provenance(value, nullable = false) {
+    protocol((nullable && value === null) ||
+      (typeof value === "string" &&
+        /^(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$/.test(value)));
+  }
+
+  function relationship(value) {
+    protocol(exactKeys(value, ["claims", "direct_prerequisite_state", "participation",
+      "prerequisites", "program", "superseded_by"]));
+    protocol(["available", "legacy", "invalid"].includes(value.participation));
+    protocol(["satisfied", "unsatisfied", "unknown", "no_declared_prerequisites",
+      "relationship_unavailable"].includes(value.direct_prerequisite_state));
+    protocol(Array.isArray(value.claims));
+    value.claims.forEach((claim) => {
+      protocol(exactKeys(claim, ["diagnostics", "evidence_ref", "name", "state"]));
+      protocol(/^[a-z][a-z0-9-]{0,63}$/.test(claim.name));
+      protocol(["satisfied", "unsatisfied", "unknown"].includes(claim.state));
+      provenance(claim.evidence_ref, true);
+      diagnostics(claim.diagnostics);
+    });
+    protocol(value.claims.every((claim, index) => index === 0 || claim.name >= value.claims[index - 1].name));
+    protocol(Array.isArray(value.prerequisites));
+    value.prerequisites.forEach((edge) => {
+      protocol(exactKeys(edge, ["claim_name", "observed_evidence_ref", "observed_state",
+        "reason", "resolved_state", "target_package_id"]));
+      uuid(edge.target_package_id, true);
+      protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
+      protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
+      provenance(edge.observed_evidence_ref, true);
+      protocol(["satisfied", "unsatisfied", "unknown"].includes(edge.resolved_state));
+      protocol(typeof edge.reason === "string" && edge.reason.length > 0);
+    });
+    protocol(exactKeys(value.program, ["diagnostics", "program_id", "resolution", "title"]));
+    uuid(value.program.program_id, true);
+    protocol(["not_declared", "resolved", "unknown"].includes(value.program.resolution));
+    protocol(value.program.title === null || safeText(value.program.title));
+    diagnostics(value.program.diagnostics);
+    protocol(exactKeys(value.superseded_by, ["diagnostics", "package_id", "resolution"]));
+    uuid(value.superseded_by.package_id, true);
+    protocol(["not_declared", "resolved", "unknown"].includes(value.superseded_by.resolution));
+    diagnostics(value.superseded_by.diagnostics);
+  }
+
+  function asciiString(value) {
+    return JSON.stringify(value).replace(/[^\x00-\x7f]/g,
+      (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  }
+
+  function canonicalJson(value) {
+    if (typeof value === "string") return asciiString(value);
+    if (value === null || typeof value === "number" || typeof value === "boolean") {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+    return `{${Object.keys(value).sort().map((key) => `${asciiString(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+
+  async function authenticate(snapshot) {
+    const unsigned = {...snapshot};
+    delete unsigned.catalog_digest;
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(unsigned)));
+    const actual = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    protocol(actual === snapshot.catalog_digest);
+    return snapshot;
+  }
+
   function validateSnapshot(snapshot) {
     const top = ["catalog_digest", "discovery_diagnostics", "entries", "identity_coverage",
       "program_coverage", "programs", "schema_version", "visibility"];
-    if (!exactKeys(snapshot, top) || snapshot.schema_version !== 3 ||
-        typeof snapshot.catalog_digest !== "string" || !Array.isArray(snapshot.entries) ||
-        !Array.isArray(snapshot.programs)) throw new Error("producer_protocol_error");
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 3 &&
+      /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
+      Array.isArray(snapshot.programs));
     if (!exactKeys(snapshot.visibility, ["hidden_stages", "visible_entry_count", "hidden_entry_count"]) ||
         !Array.isArray(snapshot.visibility.hidden_stages) ||
         !Number.isInteger(snapshot.visibility.visible_entry_count) || snapshot.visibility.visible_entry_count < 0 ||
         !Number.isInteger(snapshot.visibility.hidden_entry_count) || snapshot.visibility.hidden_entry_count < 0) {
       throw new Error("producer_protocol_error");
     }
+    snapshot.visibility.hidden_stages.forEach((stage) => protocol(component(stage)));
+    protocol(snapshot.visibility.hidden_stages.every((stage, index) =>
+      index === 0 || stage > snapshot.visibility.hidden_stages[index - 1]));
+    diagnostics(snapshot.discovery_diagnostics);
+    [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
+      protocol(exactKeys(coverage, ["diagnostics", "state"]) && ["complete", "incomplete"].includes(coverage.state));
+      diagnostics(coverage.diagnostics);
+    });
+    snapshot.programs.forEach((program) => {
+      protocol(exactKeys(program, ["diagnostics", "member_package_ids", "program_id", "title"]));
+      uuid(program.program_id);
+      protocol(safeText(program.title));
+      protocol(Array.isArray(program.member_package_ids));
+      program.member_package_ids.forEach((member) => uuid(member));
+      diagnostics(program.diagnostics);
+    });
     const hidden = new Set(snapshot.visibility.hidden_stages);
     let visible = 0;
+    const paths = [];
     snapshot.entries.forEach((entry) => {
-      if (!exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
-        "project", "relationship", "stage", "state", "transitive_diagnostics"]) ||
-          typeof entry.board_visible !== "boolean" || typeof entry.project !== "string" ||
-          typeof entry.stage !== "string" || !entry.package_path.startsWith(`${entry.project}/${entry.stage}/`) ||
-          entry.board_visible === hidden.has(entry.stage)) throw new Error("producer_protocol_error");
+      protocol(exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
+        "project", "relationship", "stage", "state", "transitive_diagnostics"]));
+      uuid(entry.package_id, true);
+      protocol(component(entry.project) && component(entry.stage) && safeText(entry.package_path) &&
+        !(entry.package_path.startsWith("/") || entry.package_path.includes("\\") ||
+          entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
+        (entry.package_path === `${entry.project}/${entry.stage}` ||
+          entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)) &&
+        typeof entry.board_visible === "boolean" && entry.board_visible !== hidden.has(entry.stage) &&
+        ["complete", "partial"].includes(entry.state));
+      protocol(exactKeys(entry.declared, ["closure", "human_sanity_decision", "sanity_recommendation",
+        "status", "target_project", "title"]));
+      Object.values(entry.declared).forEach((value) => protocol(value === null || safeText(value)));
+      diagnostics(entry.diagnostics);
+      relationship(entry.relationship);
+      protocol(Array.isArray(entry.transitive_diagnostics) && entry.transitive_diagnostics.length === 0);
+      paths.push(entry.package_path);
       if (entry.board_visible) visible += 1;
     });
+    protocol(paths.every((path, index) => index === 0 || path > paths[index - 1]) &&
+      new Set(paths).size === paths.length);
     if (visible !== snapshot.visibility.visible_entry_count ||
         snapshot.visibility.hidden_entry_count < snapshot.entries.length - visible) {
       throw new Error("producer_protocol_error");
     }
-    return snapshot;
+    return authenticate(snapshot);
   }
 
   function loadedStatus(snapshot) {

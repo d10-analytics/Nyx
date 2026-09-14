@@ -972,9 +972,7 @@ def _render_entry(
         "declared": record["declared"],
         "diagnostics": diagnostics,
         "relationship": relationship_out,
-        "transitive_diagnostics": _transitive_diagnostics(
-            record, index, identity_complete
-        ),
+        "transitive_diagnostics": [],
     }
 
 

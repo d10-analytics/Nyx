@@ -459,25 +459,8 @@ def _catalog_program(value: Any, name: str) -> str:
 
 
 def _transitive_diagnostics(value: Any, name: str) -> None:
-    if type(value) is not list:
-        raise ProtocolError(f"{name} must be a list")
-    for index, raw in enumerate(value):
-        item_name = f"{name}[{index}]"
-        item = _object(raw, item_name)
-        if set(item) == {"code"}:
-            if item["code"] != "transitive_diagnostics_truncated":
-                raise ProtocolError(f"{item_name} has an invalid shape")
-            continue
-        _keys(item, _TRANSITIVE_DIAGNOSTIC_KEYS, item_name)
-        _uuid4(item["origin_package_id"], f"{item_name}.origin_package_id")
-        code = _string(item["code"], f"{item_name}.code")
-        if code not in DIAGNOSTIC_CODES:
-            raise ProtocolError(f"{item_name}.code is invalid")
-        path_ids = item["path_package_ids"]
-        if type(path_ids) is not list:
-            raise ProtocolError(f"{item_name}.path_package_ids must be a list")
-        for path_index, package_id in enumerate(path_ids):
-            _uuid4(package_id, f"{item_name}.path_package_ids[{path_index}]")
+    if value != []:
+        raise ProtocolError(f"{name} must be the empty reference list")
 
 
 def _edge(value: Any, name: str) -> dict[str, Any]:
@@ -584,7 +567,7 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     _transitive_diagnostics(transitive_value, f"entries[{index}].transitive_diagnostics")
     package_path = _package_path(item["package_path"])
     parts = package_path.split("/")
-    if len(parts) < 3 or project != parts[0] or stage != parts[1]:
+    if len(parts) < 2 or project != parts[0] or stage != parts[1]:
         raise ProtocolError(f"entries[{index}] has inconsistent project/stage path")
     return CatalogEntry(
         package_path=package_path,
