@@ -1,6 +1,7 @@
 import http.client
 import json
 import threading
+from dataclasses import replace
 from unittest.mock import patch
 from uuid import UUID
 
@@ -124,8 +125,11 @@ def test_default_provider_uses_unselected_scanner():
         lambda value: value.update(unknown=True),
         lambda value: value["entries"][0].update(board_visible="true"),
         lambda value: value["entries"][0].update(stage="Done"),
+        lambda value: value["entries"][0].update(
+            transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
+        ),
     ],
-    ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch"],
+    ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
 )
 def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
@@ -140,6 +144,18 @@ def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
     value["catalog_digest"] = "0" * 64
     with pytest.raises(ValueError):
         parse_catalog(value)
+
+
+@pytest.mark.parametrize("alter", [
+    lambda catalog: replace(catalog, schema_version=2),
+    lambda catalog: replace(
+        catalog,
+        entries=(replace(catalog.entries[0], board_visible="yes"), *catalog.entries[1:]),
+    ),
+])
+def test_catalog_object_providers_are_revalidated_as_schema_three(alter):
+    with pytest.raises(CatalogError, match="producer_protocol_error"):
+        server._catalog_from_provider(lambda: alter(valid_catalog()))
 
 
 class RunningServer:

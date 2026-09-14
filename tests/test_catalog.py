@@ -6,6 +6,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from nyx import catalog
+from nyx.models import parse_catalog
 
 V1 = """# Example
 Status: approved
@@ -48,6 +49,17 @@ class CatalogTests(TestCase):
                           separators=(",", ":")).encode()
             ).hexdigest()
             self.assertEqual(expected, value["catalog_digest"])
+
+    def test_stage_root_anchor_round_trips_through_schema_three_parser(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "Fictional" / "Queue"
+            stage.mkdir(parents=True)
+            stage.joinpath("spec.md").write_text(V1, encoding="utf-8")
+            rendered = catalog.scan_catalog(root)
+            value = json.loads(rendered)
+            assert [entry["package_path"] for entry in value["entries"]] == ["Fictional/Queue"]
+            assert parse_catalog(rendered).entries[0].package_path == "Fictional/Queue"
 
     def test_relationships_are_ordered_and_digest_tracks_declared_changes(self) -> None:
         with TemporaryDirectory() as temporary:
