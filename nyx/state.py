@@ -46,7 +46,7 @@ class ConfigurationError(StateError):
     """A persisted configuration is missing, unsafe, or malformed."""
 
 
-class HiddenStageError(StateError):
+class HiddenStageError(ConfigurationError):
     """A hidden-stage name is outside the admitted Unicode component domain."""
 
 
@@ -276,6 +276,8 @@ def _configuration_from_payload(payload: Any) -> Configuration:
     if not isinstance(payload, dict) or "schema_version" not in payload:
         raise ConfigurationError("Nyx configuration schema is invalid")
     schema_version = payload.get("schema_version")
+    if type(schema_version) is not int:
+        raise ConfigurationError("Nyx configuration schema version is unsupported")
     if schema_version == LEGACY_CONFIG_SCHEMA_VERSION:
         if set(payload) != {"schema_version", "specification_root"}:
             raise ConfigurationError("Nyx configuration schema is invalid")
