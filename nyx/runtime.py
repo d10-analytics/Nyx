@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -455,23 +456,44 @@ def _spawn_daemon(lease_fd: int, deadline_ns: int) -> subprocess.Popen[bytes]:
     )
 
 
-def setup(specification_root: str | os.PathLike[str]) -> state.Configuration:
+def setup(
+    specification_root: str | os.PathLike[str],
+    hidden_stages: Iterable[str] | object = state._OMITTED,
+) -> state.Configuration:
     """Persist setup while excluding mutation during any held lifecycle lease."""
 
+    root = state.resolve_specification_root(specification_root)
+    if hidden_stages is state._OMITTED:
+        requested_hidden: tuple[str, ...] | object = state._OMITTED
+    else:
+        requested_hidden = state._validate_hidden_stages(hidden_stages)
     paths = _paths(create=True)
     with _operation_lock(paths):
-        root = state.resolve_specification_root(specification_root)
         lease = _lease_lock(paths, timeout=0.0)
         if not lease.acquire(blocking=False):
             try:
                 current = state.load_configuration(paths)
             except state.StateError as error:
                 raise ActiveInstanceError("active Nyx instance has no usable configuration") from error
-            if current.specification_root != root:
+            effective_hidden = (
+                current.hidden_stages
+                if requested_hidden is state._OMITTED
+                else requested_hidden
+            )
+            if current.specification_root != root or current.hidden_stages != effective_hidden:
                 raise ActiveInstanceError("stop Nyx before changing its specification root")
             return current
         lease.close()
-        return state.save_configuration(root)
+        if paths.config_file.exists() or paths.config_file.is_symlink():
+            current = state.load_configuration(paths)
+            effective_hidden = (
+                current.hidden_stages
+                if requested_hidden is state._OMITTED
+                else requested_hidden
+            )
+        else:
+            effective_hidden = () if requested_hidden is state._OMITTED else requested_hidden
+        return state._save_configuration(paths, root, effective_hidden)
 
 
 def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadline: float) -> Instance:

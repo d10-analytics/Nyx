@@ -13,14 +13,17 @@ import pwd
 import stat
 import sys
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
+LEGACY_CONFIG_SCHEMA_VERSION = 1
 CONFIG_FILENAME = "config.json"
 DEPLOYMENT_FILENAME = "deployment.json"
 RUNTIME_DIRECTORY = "runtime"
+_OMITTED = object()
 
 
 class StateError(RuntimeError):
@@ -43,6 +46,10 @@ class ConfigurationError(StateError):
     """A persisted configuration is missing, unsafe, or malformed."""
 
 
+class HiddenStageError(StateError):
+    """A hidden-stage name is outside the admitted Unicode component domain."""
+
+
 @dataclass(frozen=True)
 class StatePaths:
     """The fixed paths belonging to the current UID's account home."""
@@ -60,10 +67,12 @@ class Configuration:
     """The validated contents of the Nyx setup record."""
 
     specification_root: Path
+    hidden_stages: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_version": CONFIG_SCHEMA_VERSION,
+            "hidden_stages": list(self.hidden_stages),
             "specification_root": str(self.specification_root),
         }
 
@@ -241,10 +250,49 @@ def _verify_record(path: Path, uid: int) -> os.stat_result:
     return details
 
 
+def _validate_hidden_stages(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise HiddenStageError("hidden stages must be a sequence of names")
+    try:
+        names = tuple(values)
+    except (TypeError, ValueError) as error:
+        raise HiddenStageError("hidden stages must be a sequence of names") from error
+    for name in names:
+        if not isinstance(name, str):
+            raise HiddenStageError("hidden stage names must be text")
+        if (
+            not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+            or any(0xD800 <= ord(character) <= 0xDFFF for character in name)
+        ):
+            raise HiddenStageError(f"invalid hidden stage name: {name!r}")
+    return tuple(sorted(set(names)))
+
+
 def _configuration_from_payload(payload: Any) -> Configuration:
-    if not isinstance(payload, dict) or set(payload) != {"schema_version", "specification_root"}:
+    if not isinstance(payload, dict) or "schema_version" not in payload:
         raise ConfigurationError("Nyx configuration schema is invalid")
-    if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version == LEGACY_CONFIG_SCHEMA_VERSION:
+        if set(payload) != {"schema_version", "specification_root"}:
+            raise ConfigurationError("Nyx configuration schema is invalid")
+        hidden_stages: tuple[str, ...] = ()
+    elif schema_version == CONFIG_SCHEMA_VERSION:
+        if set(payload) != {"schema_version", "hidden_stages", "specification_root"}:
+            raise ConfigurationError("Nyx configuration schema is invalid")
+        raw_hidden_stages = payload.get("hidden_stages")
+        if not isinstance(raw_hidden_stages, list):
+            raise ConfigurationError("Nyx configuration hidden stages are invalid")
+        try:
+            hidden_stages = _validate_hidden_stages(raw_hidden_stages)
+        except HiddenStageError as error:
+            raise ConfigurationError("Nyx configuration hidden stages are invalid") from error
+        if raw_hidden_stages != list(hidden_stages):
+            raise ConfigurationError("Nyx configuration hidden stages are not canonical")
+    else:
         raise ConfigurationError("Nyx configuration schema version is unsupported")
     root = payload.get("specification_root")
     if not isinstance(root, str) or not os.path.isabs(root):
@@ -253,7 +301,7 @@ def _configuration_from_payload(payload: Any) -> Configuration:
         canonical = Path(root).resolve(strict=False)
     except (OSError, RuntimeError) as error:
         raise ConfigurationError("Nyx configuration root is invalid") from error
-    return Configuration(canonical)
+    return Configuration(canonical, hidden_stages)
 
 
 def load_configuration(paths: StatePaths | None = None) -> Configuration:
@@ -269,16 +317,18 @@ def load_configuration(paths: StatePaths | None = None) -> Configuration:
     return _configuration_from_payload(payload)
 
 
-def _configuration_bytes(root: Path) -> bytes:
+def _configuration_bytes(root: Path, hidden_stages: tuple[str, ...]) -> bytes:
     return (json.dumps(
-        Configuration(root).as_dict(),
+        Configuration(root, hidden_stages).as_dict(),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
     ) + "\n").encode("utf-8")
 
 
-def _atomic_write_configuration(paths: StatePaths, root: Path) -> None:
+def _atomic_write_configuration(
+    paths: StatePaths, root: Path, hidden_stages: tuple[str, ...]
+) -> None:
     uid = _current_uid()
     temporary_name: str | None = None
     try:
@@ -287,7 +337,7 @@ def _atomic_write_configuration(paths: StatePaths, root: Path) -> None:
         )
         try:
             os.fchmod(fd, 0o600)
-            data = _configuration_bytes(root)
+            data = _configuration_bytes(root, hidden_stages)
             written = 0
             while written < len(data):
                 written += os.write(fd, data[written:])
@@ -312,22 +362,44 @@ def _atomic_write_configuration(paths: StatePaths, root: Path) -> None:
                 pass
 
 
-def save_configuration(specification_root: str | os.PathLike[str]) -> Configuration:
-    """Validate and atomically persist one canonical inactive setup root."""
+def _save_configuration(
+    paths: StatePaths,
+    root: Path,
+    hidden_stages: tuple[str, ...],
+) -> Configuration:
+    """Atomically persist a validated configuration while runtime owns authorization."""
 
     _require_linux()
-    root = resolve_specification_root(specification_root)
-    paths = state_paths(create=True)
     if paths.config_file.exists() or paths.config_file.is_symlink():
         _verify_record(paths.config_file, _current_uid())
-    _atomic_write_configuration(paths, root)
-    return Configuration(root)
+    _atomic_write_configuration(paths, root, hidden_stages)
+    return Configuration(root, hidden_stages)
 
 
-def setup(specification_root: str | os.PathLike[str]) -> Configuration:
-    """Public setup operation; it has no runtime-lease dependency."""
+def save_configuration(
+    specification_root: str | os.PathLike[str],
+    hidden_stages: Iterable[str] | object = _OMITTED,
+) -> Configuration:
+    """Delegate configuration replacement through the runtime authorization gate."""
 
-    return save_configuration(specification_root)
+    from . import runtime
+
+    if hidden_stages is _OMITTED:
+        return runtime.setup(specification_root)
+    return runtime.setup(specification_root, hidden_stages=hidden_stages)
+
+
+def setup(
+    specification_root: str | os.PathLike[str],
+    hidden_stages: Iterable[str] | object = _OMITTED,
+) -> Configuration:
+    """Delegate setup through the runtime authorization gate."""
+
+    from . import runtime
+
+    if hidden_stages is _OMITTED:
+        return runtime.setup(specification_root)
+    return runtime.setup(specification_root, hidden_stages=hidden_stages)
 
 
 __all__ = [
@@ -335,6 +407,8 @@ __all__ = [
     "AccountHomeError",
     "Configuration",
     "ConfigurationError",
+    "HiddenStageError",
+    "LEGACY_CONFIG_SCHEMA_VERSION",
     "SpecificationRootError",
     "StateError",
     "StatePaths",
