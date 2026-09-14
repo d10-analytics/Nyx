@@ -1,8 +1,8 @@
-"""Typed validation for the producer's v2 catalog protocol.
+"""Typed validation for the producer's catalog protocol.
 
 The tracker consumes only the fields it renders: package identity, lifecycle,
 declared values, diagnostics, program membership, and direct prerequisites.
-Every other producer field is accepted as part of the fixed v2 shape and then
+Every other producer field is accepted as part of the fixed shape and then
 discarded, so the wire contract stays strict without carrying unused concepts.
 """
 
