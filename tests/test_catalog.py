@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -224,8 +225,10 @@ class CatalogTests(TestCase):
             "(spec_root: 'Path') -> 'str'",
             str(__import__("inspect").signature(catalog.build_catalog)),
         )
-        self.assertIn("_full_validity", str(__import__("inspect").signature(catalog.scan_catalog)))
-        self.assertNotIn("version", str(__import__("inspect").signature(catalog.scan_catalog)))
+        self.assertEqual(
+            "(spec_root: 'Path', *, _full_validity: 'Callable[[Path, list[str]], bool] | None' = None) -> 'str'",
+            str(inspect.signature(catalog.scan_catalog)),
+        )
 
     def test_public_entry_points_share_the_canonical_builder(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -268,6 +271,30 @@ class CatalogTests(TestCase):
             self.assertGreaterEqual(fingerprints, 4)
             self.assertEqual([(anchor.parent, ["# Heading"])], calls)
 
+    def test_hook_exception_classes_mark_stable_capture_invalid(self) -> None:
+        for error_type in (OSError, UnicodeError, ValueError):
+            with self.subTest(error_type=error_type), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                package(root, "Queue", "one", "# Heading\n## Body\nsecret")
+
+                def hook(_path: Path, _lines: list[str], error_type=error_type) -> bool:
+                    raise error_type("hook failure")
+
+                value = json.loads(catalog.scan_catalog(root, _full_validity=hook))
+                self.assertEqual("partial", value["entries"][0]["state"])
+                self.assertEqual("invalid_package", value["entries"][0]["diagnostics"][0]["code"])
+
+    def test_unexpected_hook_exception_propagates(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one", "# Heading\n## Body\nsecret")
+
+            def hook(_path: Path, _lines: list[str]) -> bool:
+                raise RuntimeError("unexpected hook failure")
+
+            with self.assertRaisesRegex(RuntimeError, "unexpected hook failure"):
+                catalog.scan_catalog(root, _full_validity=hook)
+
     def test_fixed_lifecycle_projection_has_retained_digest_and_wire_bytes(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -304,3 +331,67 @@ class CatalogTests(TestCase):
             self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
             queue = next(entry for entry in value["entries"] if entry["lifecycle"] == "queue")
             self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+
+ORACLE_IDS = [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+    "55555555-5555-4555-8555-555555555555",
+    "66666666-6666-4666-8666-666666666666",
+    "77777777-7777-4777-8777-777777777777",
+]
+ORACLE_PROGRAM_ID = "88888888-8888-4888-8888-888888888888"
+ORACLE_BYTES = "{\"catalog_digest\":\"bc5ff1bf1d4cf128c4d41d48c7d05ff1088e351ed798093fe45fc04f3dcab1fc\",\"discovery_diagnostics\":[],\"entries\":[{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Retro\"},\"diagnostics\":[],\"lifecycle\":\"awaiting_retrospective\",\"package_id\":\"55555555-5555-4555-8555-555555555555\",\"package_path\":\"Fictional/Awaiting_Retrospective/pkg\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Done\"},\"diagnostics\":[],\"lifecycle\":\"done\",\"package_id\":\"66666666-6666-4666-8666-666666666666\",\"package_path\":\"Fictional/Done/pkg\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"name\":\"release\",\"state\":\"satisfied\"}],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[{\"code\":\"successor_cycle\",\"message\":\"successor cycle detected: Fictional/Done/pkg\"}],\"package_id\":\"22222222-2222-4222-8222-222222222222\",\"resolution\":\"resolved\"}},\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Fix\"},\"diagnostics\":[],\"lifecycle\":\"needs_fixes\",\"package_id\":\"44444444-4444-4444-8444-444444444444\",\"package_path\":\"Fictional/Needs_Fixes/pkg\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Queue\"},\"diagnostics\":[{\"code\":\"invalid_claim\",\"message\":\"invalid claim: Fictional/Queue/pkg\"},{\"code\":\"invalid_prerequisite\",\"message\":\"invalid prerequisite: Fictional/Queue/pkg\"}],\"lifecycle\":\"queue\",\"package_id\":\"22222222-2222-4222-8222-222222222222\",\"package_path\":\"Fictional/Queue/pkg\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":null,\"name\":\"release\",\"state\":\"unsatisfied\"}],\"direct_prerequisite_state\":\"unknown\",\"participation\":\"available\",\"prerequisites\":[{\"claim_name\":null,\"observed_evidence_ref\":null,\"observed_state\":null,\"reason\":\"invalid_prerequisite\",\"resolved_state\":\"unknown\",\"target_package_id\":null},{\"claim_name\":\"release\",\"observed_evidence_ref\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"observed_state\":\"satisfied\",\"reason\":\"claim_satisfied\",\"resolved_state\":\"satisfied\",\"target_package_id\":\"66666666-6666-4666-8666-666666666666\"}],\"program\":{\"diagnostics\":[],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"},\"superseded_by\":{\"diagnostics\":[{\"code\":\"successor_cycle\",\"message\":\"successor cycle detected: Fictional/Queue/pkg\"}],\"package_id\":\"66666666-6666-4666-8666-666666666666\",\"resolution\":\"resolved\"}},\"state\":\"partial\",\"transitive_diagnostics\":[{\"code\":\"invalid_prerequisite\",\"origin_package_id\":\"22222222-2222-4222-8222-222222222222\",\"path_package_ids\":[\"22222222-2222-4222-8222-222222222222\"]}]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Under\"},\"diagnostics\":[],\"lifecycle\":\"under_development\",\"package_id\":\"11111111-1111-4111-8111-111111111111\",\"package_path\":\"Fictional/Under_Development/pkg\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"design\",\"state\":\"satisfied\"}],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"state\":\"complete\",\"transitive_diagnostics\":[]}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[{\"diagnostics\":[],\"member_package_ids\":[\"11111111-1111-4111-8111-111111111111\",\"22222222-2222-4222-8222-222222222222\"],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"title\":\"Core\"}],\"schema_version\":2}"
+
+def make_baseline_graph(root: Path) -> Path:
+    repository = root / "Fictional"
+    stages = (
+        "Under_Development", "Queue", "In_Progress", "Needs_Fixes",
+        "Awaiting_Retrospective", "Done", "Archive",
+    )
+    contents = (
+        f"# Under\nPackage ID: {ORACLE_IDS[0]}\nProgram Membership: {ORACLE_PROGRAM_ID}\n"
+        f"Claim: design | satisfied | sha256:{'a' * 64}\n",
+        f"# Queue\nPackage ID: {ORACLE_IDS[1]}\nProgram Membership: {ORACLE_PROGRAM_ID}\n"
+        f"Prerequisite: {ORACLE_IDS[5]} | release\nPrerequisite: malformed\n"
+        f"Superseded By: {ORACLE_IDS[5]}\nClaim: release | unsatisfied\n"
+        "Claim: Bad Name | satisfied\n",
+        f"# Progress\nPackage ID: {ORACLE_IDS[2]}\n",
+        f"# Fix\nPackage ID: {ORACLE_IDS[3]}\n",
+        f"# Retro\nPackage ID: {ORACLE_IDS[4]}\n",
+        f"# Done\nPackage ID: {ORACLE_IDS[5]}\n"
+        f"Claim: release | satisfied | sha256:{'b' * 64}\n"
+        f"Superseded By: {ORACLE_IDS[1]}\n",
+        f"# Archive\nPackage ID: {ORACLE_IDS[6]}\n",
+    )
+    for stage, content in zip(stages, contents, strict=True):
+        package_path = repository / stage / "pkg"
+        package_path.mkdir(parents=True)
+        package_path.joinpath("spec.md").write_text(content, encoding="utf-8")
+    descriptor = repository / "Reference" / "Programs" / ORACLE_PROGRAM_ID
+    descriptor.mkdir(parents=True)
+    descriptor.joinpath("program.md").write_text(
+        f"Program ID: {ORACLE_PROGRAM_ID}\nProgram Title: Core\n", encoding="utf-8"
+    )
+    return root
+
+def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
+    with TemporaryDirectory() as temporary:
+        root = make_baseline_graph(Path(temporary))
+        rendered = catalog.build_catalog(root)
+        assert rendered.encode("utf-8") == ORACLE_BYTES.encode("utf-8")
+        value = json.loads(rendered)
+        assert value["catalog_digest"] == "bc5ff1bf1d4cf128c4d41d48c7d05ff1088e351ed798093fe45fc04f3dcab1fc"
+        assert [entry["package_path"] for entry in value["entries"]] == [
+            "Fictional/Awaiting_Retrospective/pkg", "Fictional/Done/pkg",
+            "Fictional/Needs_Fixes/pkg", "Fictional/Queue/pkg",
+            "Fictional/Under_Development/pkg",
+        ]
+        queue = next(entry for entry in value["entries"] if entry["lifecycle"] == "queue")
+        assert {item["code"] for item in queue["diagnostics"]} == {"invalid_claim", "invalid_prerequisite"}
+        assert {item["reason"] for item in queue["relationship"]["prerequisites"]} == {"claim_satisfied", "invalid_prerequisite"}
+        assert queue["relationship"]["program"]["resolution"] == "resolved"
+        assert queue["relationship"]["superseded_by"]["resolution"] == "resolved"
+        assert queue["relationship"]["superseded_by"]["diagnostics"][0]["code"] == "successor_cycle"
+        assert value["programs"][0]["member_package_ids"] == [ORACLE_IDS[0], ORACLE_IDS[1]]
