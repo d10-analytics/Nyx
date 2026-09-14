@@ -198,6 +198,31 @@ def test_held_lease_allows_identical_hidden_stage_policy_without_mutation():
         assert paths.config_file.read_bytes() == before
 
 
+@pytest.mark.parametrize("alias", [state.setup, state.save_configuration])
+@pytest.mark.parametrize("requested", ["root", "policy"])
+def test_held_lease_rejects_changed_root_or_policy_through_state_aliases(alias, requested):
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        second = Path(temporary) / "second"
+        second.mkdir()
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime.setup(first, ["Queue"])
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            arguments = (second, ["Queue"]) if requested == "root" else (first, ["Other"])
+            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+                runtime.ActiveInstanceError
+            ):
+                alias(*arguments)
+        finally:
+            lease.close()
+        assert paths.config_file.read_bytes() == before
+        assert state.load_configuration(paths).specification_root == first.resolve()
+        assert state.load_configuration(paths).hidden_stages == ("Queue",)
+
+
 def test_active_schema_one_identity_preserves_legacy_bytes():
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
