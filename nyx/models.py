@@ -111,8 +111,14 @@ _EDGE_KEYS = frozenset(
     }
 )
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
+_COVERAGE_KEYS = frozenset({"state", "diagnostics"})
+_CLAIM_KEYS = frozenset({"name", "state", "evidence_ref", "diagnostics"})
+_SUCCESSOR_KEYS = frozenset({"package_id", "resolution", "diagnostics"})
+_CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids", "diagnostics"})
+_TRANSITIVE_DIAGNOSTIC_KEYS = frozenset({"origin_package_id", "code", "path_package_ids"})
 _DIAGNOSTIC_KEYS = frozenset({"code", "message"})
 _STATES = frozenset({"complete", "partial"})
+_COVERAGE_STATES = frozenset({"complete", "incomplete"})
 _OBSERVED_STATES = frozenset({"satisfied", "unsatisfied", "unknown"})
 _DIRECT_PREREQUISITE_STATES = _OBSERVED_STATES | {
     "no_declared_prerequisites", "relationship_unavailable"
@@ -135,6 +141,9 @@ _EDGE_REASONS = frozenset(
     }
 )
 _CLAIM_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_PROVENANCE = re.compile(
+    r"(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})"
+)
 
 
 class ProtocolError(ValueError):
@@ -311,11 +320,105 @@ def _claim_name(value: Any, name: str, *, nullable: bool = False) -> str | None:
     return value
 
 
+def _provenance(value: Any, name: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if type(value) is not str or _PROVENANCE.fullmatch(value) is None:
+        raise ProtocolError(f"{name} must be a valid provenance reference")
+    return value
+
+
+def _coverage(value: Any, name: str) -> None:
+    item = _object(value, name)
+    _keys(item, _COVERAGE_KEYS, name)
+    state = _string(item["state"], f"{name}.state")
+    if state not in _COVERAGE_STATES:
+        raise ProtocolError(f"{name}.state is invalid")
+    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
+
+
+def _claims(value: Any, name: str) -> None:
+    if type(value) is not list:
+        raise ProtocolError(f"{name} must be a list")
+    names: list[str] = []
+    for index, raw in enumerate(value):
+        item_name = f"{name}[{index}]"
+        item = _object(raw, item_name)
+        _keys(item, _CLAIM_KEYS, item_name)
+        claim_name = _claim_name(item["name"], f"{item_name}.name")
+        state = _string(item["state"], f"{item_name}.state")
+        if state not in _OBSERVED_STATES:
+            raise ProtocolError(f"{item_name}.state is invalid")
+        _provenance(item["evidence_ref"], f"{item_name}.evidence_ref", nullable=True)
+        _diagnostics(item["diagnostics"], f"{item_name}.diagnostics")
+        names.append(claim_name)
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise ProtocolError(f"{name} must be unique and name-sorted")
+
+
+def _successor(value: Any, name: str) -> None:
+    item = _object(value, name)
+    _keys(item, _SUCCESSOR_KEYS, name)
+    _uuid4(item["package_id"], f"{name}.package_id", nullable=True)
+    resolution = _string(item["resolution"], f"{name}.resolution")
+    if resolution not in {"not_declared", "resolved", "unknown"}:
+        raise ProtocolError(f"{name}.resolution is invalid")
+    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
+
+
+def _catalog_program(value: Any, name: str) -> str:
+    item = _object(value, name)
+    _keys(item, _CATALOG_PROGRAM_KEYS, name)
+    program_id = _uuid4(item["program_id"], f"{name}.program_id")
+    title = _string(item["title"], f"{name}.title")
+    if not 1 <= len(title) <= 120 or any(
+        ord(character) < 32 or ord(character) == 127 for character in title
+    ):
+        raise ProtocolError(f"{name}.title is invalid")
+    member_ids = item["member_package_ids"]
+    if type(member_ids) is not list:
+        raise ProtocolError(f"{name}.member_package_ids must be a list")
+    members = [
+        _uuid4(member_id, f"{name}.member_package_ids[{index}]")
+        for index, member_id in enumerate(member_ids)
+    ]
+    if members != sorted(members):
+        raise ProtocolError(f"{name}.member_package_ids must be sorted")
+    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
+    return program_id
+
+
+def _transitive_diagnostics(value: Any, name: str) -> None:
+    if type(value) is not list:
+        raise ProtocolError(f"{name} must be a list")
+    for index, raw in enumerate(value):
+        item_name = f"{name}[{index}]"
+        item = _object(raw, item_name)
+        if set(item) == {"code"}:
+            if item["code"] != "transitive_diagnostics_truncated":
+                raise ProtocolError(f"{item_name} has an invalid shape")
+            continue
+        _keys(item, _TRANSITIVE_DIAGNOSTIC_KEYS, item_name)
+        _uuid4(item["origin_package_id"], f"{item_name}.origin_package_id")
+        code = _string(item["code"], f"{item_name}.code")
+        if code not in DIAGNOSTIC_CODES:
+            raise ProtocolError(f"{item_name}.code is invalid")
+        path_ids = item["path_package_ids"]
+        if type(path_ids) is not list:
+            raise ProtocolError(f"{item_name}.path_package_ids must be a list")
+        for path_index, package_id in enumerate(path_ids):
+            _uuid4(package_id, f"{item_name}.path_package_ids[{path_index}]")
+
+
 def _edge(value: Any, name: str) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _EDGE_KEYS, name)
     target = _uuid4(item["target_package_id"], f"{name}.target_package_id", nullable=True)
     claim_name = _claim_name(item["claim_name"], f"{name}.claim_name", nullable=True)
+    observed_state = _string(item["observed_state"], f"{name}.observed_state", nullable=True)
+    if observed_state is not None and observed_state not in _OBSERVED_STATES:
+        raise ProtocolError(f"{name}.observed_state is invalid")
+    _provenance(item["observed_evidence_ref"], f"{name}.observed_evidence_ref", nullable=True)
     resolved_state = _string(item["resolved_state"], f"{name}.resolved_state")
     if resolved_state not in _OBSERVED_STATES:
         raise ProtocolError(f"{name}.resolved_state is invalid")
@@ -343,6 +446,7 @@ def _program(value: Any, name: str) -> tuple[str | None, str | None]:
         or any(ord(character) < 32 or ord(character) == 127 for character in title)
     ):
         raise ProtocolError(f"{name}.title is invalid")
+    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
     if resolution == "resolved" and program_id is not None:
         return program_id, title
     return None, None
@@ -360,13 +464,9 @@ def _relationship(
     direct_state = _string(item["direct_prerequisite_state"], f"{name}.direct_prerequisite_state")
     if direct_state not in _DIRECT_PREREQUISITE_STATES:
         raise ProtocolError(f"{name}.direct_prerequisite_state is invalid")
-    if type(item["claims"]) is not list:
-        raise ProtocolError(f"{name}.claims must be a list")
-    if type(item["superseded_by"]) is not dict:
-        raise ProtocolError(f"{name}.superseded_by must be an object")
-    if participation != "available":
-        return None, None, (), "relationship_unavailable"
+    _claims(item["claims"], f"{name}.claims")
     program_id, program_title = _program(item["program"], f"{name}.program")
+    _successor(item["superseded_by"], f"{name}.superseded_by")
     prerequisites_value = item["prerequisites"]
     if type(prerequisites_value) is not list:
         raise ProtocolError(f"{name}.prerequisites must be a list")
@@ -380,6 +480,8 @@ def _relationship(
     ]
     if edge_sort != sorted(edge_sort):
         raise ProtocolError(f"{name}.prerequisites must be sorted")
+    if participation != "available":
+        return None, None, (), "relationship_unavailable"
     return program_id, program_title, prerequisites, direct_state
 
 
@@ -401,6 +503,9 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     }
     program_id, program_title, prerequisites, direct_state = _relationship(
         item["relationship"], index
+    )
+    _transitive_diagnostics(
+        item["transitive_diagnostics"], f"entries[{index}].transitive_diagnostics"
     )
     return CatalogEntry(
         package_path=_package_path(item["package_path"]),
@@ -452,7 +557,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
     ):
         raise ProtocolError("invalid catalog digest")
     for name in ("identity_coverage", "program_coverage"):
-        _object(catalog[name], name)
+        _coverage(catalog[name], name)
     if type(catalog["entries"]) is not list:
         raise ProtocolError("entries must be a list")
     entries = tuple(_entry(item, index) for index, item in enumerate(catalog["entries"]))
@@ -461,6 +566,12 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         raise ProtocolError("entries must be unique and path-sorted")
     if type(catalog["programs"]) is not list:
         raise ProtocolError("programs must be a list")
+    program_ids = [
+        _catalog_program(program, f"programs[{index}]")
+        for index, program in enumerate(catalog["programs"])
+    ]
+    if program_ids != sorted(program_ids) or len(program_ids) != len(set(program_ids)):
+        raise ProtocolError("programs must be unique and ID-sorted")
     diagnostics = _diagnostics(catalog["discovery_diagnostics"], "discovery_diagnostics")
     if canonical_digest(catalog) != digest:
         raise ProtocolError("catalog digest mismatch")
