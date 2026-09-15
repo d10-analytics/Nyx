@@ -88,3 +88,127 @@ def test_active_setup_rejects_changed_root_or_policy_without_cli_mutation(capsys
             lease.close()
         assert paths.config_file.read_bytes() == before
         assert "stop Nyx" in capsys.readouterr().err
+
+
+def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifecycle(
+    capsys,
+):
+    configuration = state.ConfigurationObservation(
+        "configured",
+        specification_root=Path("/private/spec\n-root\x1b[31m\u0085"),
+        hidden_stages=("Done", "Queue\n\u0085"),
+    )
+    runtime_observation = runtime.RuntimeObservation("not_running")
+    with patch.object(state, "observe_configuration", return_value=configuration) as observe_config, patch.object(
+        runtime, "observe_runtime", return_value=runtime_observation
+    ) as observe_runtime, patch.object(runtime, "start") as start, patch.object(
+        runtime, "stop"
+    ) as stop, patch.object(runtime, "setup") as setup:
+        assert cli.main(["--status"]) == 0
+
+    observe_config.assert_called_once_with()
+    observe_runtime.assert_called_once_with()
+    start.assert_not_called()
+    stop.assert_not_called()
+    setup.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "Configuration: configured",
+        'Specification root: "/private/spec\\n-root\\u001b[31m\\u0085"',
+        'Hidden stages: ["Done", "Queue\\n\\u0085"]',
+        "Runtime: not running",
+    ]
+    assert captured.err == ""
+
+
+def test_status_running_prints_verified_url_after_runtime(capsys):
+    configuration = state.ConfigurationObservation("not_configured")
+    runtime_observation = runtime.RuntimeObservation(
+        "running", url="http://127.0.0.1:8765/\n"
+    )
+    with patch.object(state, "observe_configuration", return_value=configuration) as observe_config, patch.object(
+        runtime, "observe_runtime", return_value=runtime_observation
+    ) as observe_runtime:
+        assert cli.main(["--status"]) == 0
+
+    observe_config.assert_called_once_with()
+    observe_runtime.assert_called_once_with()
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "Configuration: not configured",
+        "Specification root: not configured",
+        "Hidden stages: not configured",
+        "Runtime: running",
+        'URL: "http://127.0.0.1:8765/\\n"',
+    ]
+    assert captured.err == ""
+
+
+def test_status_keeps_runtime_result_when_configuration_is_unavailable(capsys):
+    configuration = state.ConfigurationObservation(
+        "unavailable", diagnostic="persisted secret must not be printed"
+    )
+    runtime_observation = runtime.RuntimeObservation(
+        "running", url=runtime.URL
+    )
+    with patch.object(state, "observe_configuration", return_value=configuration), patch.object(
+        runtime, "observe_runtime", return_value=runtime_observation
+    ):
+        assert cli.main(["--status"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "Configuration: unavailable",
+        "Specification root: unavailable",
+        "Hidden stages: unavailable",
+        "Runtime: running",
+        f'URL: "{runtime.URL}"',
+        "Diagnostic: configuration unavailable",
+    ]
+    assert "persisted secret" not in captured.out
+    assert captured.err == ""
+
+
+def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_diagnostic(
+    capsys,
+):
+    configuration = state.ConfigurationObservation(
+        "configured", specification_root=Path("/private/spec"), hidden_stages=()
+    )
+    runtime_observation = runtime.RuntimeObservation(
+        "unknown", diagnostic="raw runtime exception"
+    )
+    with patch.object(state, "observe_configuration", return_value=configuration), patch.object(
+        runtime, "observe_runtime", return_value=runtime_observation
+    ):
+        assert cli.main(["--status"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "Configuration: configured",
+        'Specification root: "/private/spec"',
+        "Hidden stages: []",
+        "Runtime: unknown",
+        "Diagnostic: runtime state unavailable",
+    ]
+    assert "raw runtime exception" not in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("arguments", [["--status", "--setup", "/tmp/spec"], ["--status", "--stop"]])
+def test_status_rejects_other_commands_before_observing(arguments, capsys):
+    with patch.object(state, "observe_configuration") as observe_config, patch.object(
+        runtime, "observe_runtime"
+    ) as observe_runtime, patch.object(runtime, "setup") as setup, patch.object(
+        runtime, "start"
+    ) as start, patch.object(runtime, "stop") as stop:
+        with pytest.raises(SystemExit) as error:
+            cli.main(arguments)
+
+    assert error.value.code == 2
+    observe_config.assert_not_called()
+    observe_runtime.assert_not_called()
+    setup.assert_not_called()
+    start.assert_not_called()
+    stop.assert_not_called()
+    assert capsys.readouterr().out == ""
