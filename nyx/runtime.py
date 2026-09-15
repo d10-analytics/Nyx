@@ -261,6 +261,11 @@ def _metadata_unchanged(path: Path, original: _Metadata, *, read_data: bool = Fa
     return current == original
 
 
+def _require_deadline(deadline: float) -> None:
+    if deadline - time.monotonic() <= 0:
+        raise _ControlTimeoutError("control deadline expired")
+
+
 def _paths(*, create: bool = True) -> state.StatePaths:
     return state.state_paths(create=create)
 
@@ -494,11 +499,17 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
             if response.get("status") != "ready" or response.get("url") != URL:
                 return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
-            if not _metadata_unchanged(record_path, record_initial, read_data=True):
-                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _metadata_unchanged(lease_path, lease_initial):
-                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _metadata_unchanged(operation_path, operation_initial):
+            try:
+                _require_deadline(deadline)
+                record_stable = _metadata_unchanged(record_path, record_initial, read_data=True)
+                _require_deadline(deadline)
+                lease_stable = _metadata_unchanged(lease_path, lease_initial)
+                _require_deadline(deadline)
+                operation_stable = _metadata_unchanged(operation_path, operation_initial)
+                _require_deadline(deadline)
+            except _ControlTimeoutError:
+                return _runtime_unknown(paths, RUNTIME_CONTROL_TIMED_OUT)
+            if not record_stable or not lease_stable or not operation_stable:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             return _runtime_observation("running", paths, url=URL)
 
