@@ -199,7 +199,7 @@ def _catalog_read_fd(descriptor: int) -> bytes:
 def _catalog_scandir(descriptor: int):
     try:
         return os.scandir(descriptor)
-    except NotImplementedError as error:
+    except (TypeError, NotImplementedError) as error:
         raise ValueError("catalog descriptor enumeration is unavailable") from error
 
 
@@ -222,9 +222,9 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
                 os.O_RDONLY | cloexec | nofollow,
                 dir_fd=parent_fd,
             )
-        except (TypeError, NotImplementedError) as error:
+        except (TypeError, NotImplementedError, ValueError) as error:
             raise ValueError("catalog descriptor-relative open is unavailable") from error
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, OSError):
             return None, "nonregular_anchor"
         try:
             admitted = os.fstat(descriptor)
