@@ -207,6 +207,9 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
     """Read an admitted regular anchor through a descriptor-relative no-follow open."""
     last_data: bytes | None = None
     nofollow, _directory, cloexec = _catalog_require_descriptor_capabilities()
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(nonblocking, int) or nonblocking <= 0:
+        raise ValueError("catalog descriptor-relative open is unavailable")
     for _ in range(2):
         try:
             before = _catalog_stat_at(parent_fd, name)
@@ -219,7 +222,7 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
         try:
             descriptor = os.open(
                 name,
-                os.O_RDONLY | cloexec | nofollow,
+                os.O_RDONLY | cloexec | nofollow | nonblocking,
                 dir_fd=parent_fd,
             )
         except (TypeError, NotImplementedError, ValueError) as error:
