@@ -342,3 +342,162 @@ def test_unsupported_platform_fails_before_mutating_account_home():
         ), pytest.raises(state.UnsupportedPlatformError):
             state.setup(home)
         assert not (home / ".config").exists()
+
+
+def _managed_snapshot(home: Path) -> dict[str, tuple[str, bytes | None, int]]:
+    snapshot: dict[str, tuple[str, bytes | None, int]] = {}
+    if not home.exists():
+        return snapshot
+    for path in sorted(home.rglob("*")):
+        relative = str(path.relative_to(home))
+        details = path.lstat()
+        if stat.S_ISREG(details.st_mode):
+            content: bytes | None = path.read_bytes()
+            kind = "file"
+        elif stat.S_ISDIR(details.st_mode):
+            content = None
+            kind = "directory"
+        else:
+            content = None
+            kind = "other"
+        snapshot[relative] = (kind, content, stat.S_IMODE(details.st_mode))
+    return snapshot
+
+
+def test_configuration_observation_reports_confirmed_absence_without_defaults_or_writes():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        before = _managed_snapshot(home)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            observed = state.observe_configuration()
+        assert observed.status == "not_configured"
+        assert observed.specification_root is None
+        assert observed.hidden_stages is None
+        assert observed.diagnostic is None
+        assert _managed_snapshot(home) == before
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_configuration_observation_returns_valid_schema_data_only_when_configured(schema_version):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            payload = {
+                "schema_version": schema_version,
+                "specification_root": str(spec_root.resolve()),
+            }
+            if schema_version == 2:
+                payload["hidden_stages"] = ["Queue"]
+            paths.config_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            before = _managed_snapshot(home)
+            observed = state.observe_configuration()
+
+        assert observed.status == "configured"
+        assert observed.specification_root == spec_root.resolve()
+        assert observed.hidden_stages == (("Queue",) if schema_version == 2 else ())
+        assert observed.configuration == state.Configuration(
+            spec_root.resolve(), ("Queue",) if schema_version == 2 else ()
+        )
+        assert _managed_snapshot(home) == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 2, "hidden_stages": ["Queue"], "specification_root": "/tmp/root", "extra": 1},
+        {"schema_version": 99, "hidden_stages": [], "specification_root": "/tmp/root"},
+        {"schema_version": 2, "hidden_stages": ["bad/name"], "specification_root": "/tmp/root"},
+    ],
+)
+def test_configuration_observation_collapses_invalid_and_unsupported_records(payload):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.config_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            observed = state.observe_configuration()
+        assert observed.status == "unavailable"
+        assert observed.diagnostic == state.CONFIGURATION_UNAVAILABLE
+        assert observed.specification_root is None
+        assert observed.hidden_stages is None
+
+
+def test_configuration_observation_isolated_from_unsafe_runtime_ancestry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(spec_root, ["Queue"])
+            paths = state.state_paths()
+            os.chmod(paths.runtime_directory, 0o755)
+            with patch.object(state, "state_paths", side_effect=AssertionError("aggregate paths used")):
+                observed = state.observe_configuration()
+        assert observed.status == "configured"
+        assert observed.specification_root == spec_root.resolve()
+        assert observed.hidden_stages == ("Queue",)
+
+
+def test_runtime_observation_isolated_from_unsafe_configuration_and_has_no_create_path():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.config_file.write_text("not json\n", encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            os.chmod(paths.config_directory, 0o755)
+            before = _managed_snapshot(home)
+            with patch.object(state, "state_paths", side_effect=AssertionError("aggregate paths used")), patch.object(
+                state, "load_configuration", side_effect=AssertionError("configuration read")
+            ):
+                observed = state.observe_runtime()
+        assert observed.status == "not_running"
+        assert observed.paths is not None
+        assert _managed_snapshot(home) == before
+        assert not paths.runtime_directory.joinpath("operation.lock").exists()
+
+
+def test_runtime_observation_reports_incomplete_or_unsafe_layout_without_mutation():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.runtime_directory.rmdir()
+            before = _managed_snapshot(home)
+            assert state.observe_runtime().status == "unknown"
+            assert _managed_snapshot(home) == before
+            paths.runtime_directory.mkdir(mode=0o700)
+            paths.runtime_directory.joinpath("instance.json").write_text("{}\n", encoding="utf-8")
+            os.chmod(paths.runtime_directory.joinpath("instance.json"), 0o644)
+            before = _managed_snapshot(home)
+            assert state.observe_runtime().status == "unknown"
+            assert _managed_snapshot(home) == before
+
+
+def test_fresh_runtime_observation_does_not_create_runtime_directory_or_lock():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            before = _managed_snapshot(home)
+            observed = state.observe_runtime()
+        assert observed.status == "not_running"
+        assert _managed_snapshot(home) == before
+        assert not (home / ".local").exists()
