@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import stat
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -269,6 +270,76 @@ class CatalogTests(TestCase):
                 self.assertEqual("unknown", relationship["resolution"])
                 self.assertIsNone(relationship["title"])
 
+    def test_anchor_fifo_replacement_is_nonblocking_and_closes_admitted_descriptors(self) -> None:
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "specs"
+            package_path = package(root, "Queue", "one", "# Inside\n")
+            anchor = package_path / "spec.md"
+            original_stat = os.stat
+            original_open = os.open
+            original_fstat = os.fstat
+            original_read = os.read
+            original_close = os.close
+            replaced = False
+            opened: list[int] = []
+            anchor_fds: list[int] = []
+            fifo_fds: set[int] = set()
+            read_fds: list[int] = []
+            closed: list[int] = []
+
+            def replacing_stat(*args, **kwargs):
+                nonlocal replaced
+                result = original_stat(*args, **kwargs)
+                if args and args[0] == "spec.md" and not replaced:
+                    self.assertTrue(stat.S_ISREG(result.st_mode))
+                    anchor.rename(base / "original-spec.md")
+                    os.mkfifo(anchor)
+                    replaced = True
+                return result
+
+            def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+                if path == "spec.md" and dir_fd is not None:
+                    self.assertTrue(flags & os.O_NONBLOCK)
+                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                opened.append(descriptor)
+                if path == "spec.md":
+                    anchor_fds.append(descriptor)
+                    if stat.S_ISFIFO(original_fstat(descriptor).st_mode):
+                        fifo_fds.add(descriptor)
+                return descriptor
+
+            def guarded_read(descriptor: int, size: int) -> bytes:
+                self.assertNotIn(descriptor, fifo_fds, "catalog attempted to read a FIFO")
+                read_fds.append(descriptor)
+                return original_read(descriptor, size)
+
+            def tracked_close(descriptor: int) -> None:
+                closed.append(descriptor)
+                original_close(descriptor)
+
+            with (
+                patch.object(catalog.os, "stat", side_effect=replacing_stat),
+                patch.object(catalog.os, "open", side_effect=guarded_open),
+                patch.object(catalog.os, "read", side_effect=guarded_read),
+                patch.object(catalog.os, "close", side_effect=tracked_close),
+            ):
+                value = json.loads(catalog.scan_catalog(root))
+
+            self.assertTrue(replaced)
+            self.assertEqual(1, len(anchor_fds))
+            self.assertEqual(1, len(fifo_fds))
+            self.assertEqual(set(opened), set(closed))
+            self.assertNotIn(next(iter(fifo_fds)), read_fds)
+            expected = {
+                "code": "nonregular_anchor",
+                "message": "nonregular anchor: Fictional/Queue/one",
+            }
+            self.assertEqual([expected], value["entries"][0]["diagnostics"])
+            self.assertEqual([expected], value["identity_coverage"]["diagnostics"])
+            self.assertEqual("incomplete", value["identity_coverage"]["state"])
+
+
     def test_descriptor_capabilities_fail_without_path_fallback(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -282,6 +353,11 @@ class CatalogTests(TestCase):
                 with patch.object(catalog.os, flag_name, 0):
                     with self.assertRaises(ValueError):
                         catalog.scan_catalog(root)
+            with patch.object(catalog.os, "O_NONBLOCK", None), patch.object(
+                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
+            ):
+                with self.assertRaisesRegex(ValueError, "catalog descriptor-relative open is unavailable"):
+                    catalog.scan_catalog(root)
 
             original_open = os.open
 
