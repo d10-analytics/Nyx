@@ -605,13 +605,13 @@ def test_observe_runtime_rejects_record_replacement_after_ready_response():
             connection, _ = listener.accept()
             with connection:
                 connection.recv(4096)
-                connection.sendall(
-                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
-                )
                 record = paths.runtime_directory / "instance.json"
                 before = record.stat()
                 record.write_bytes(record.read_bytes().replace(b"instance", b"changed_"))
                 os.utime(record, ns=(before.st_atime_ns, before.st_mtime_ns))
+                connection.sendall(
+                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
+                )
 
         server = threading.Thread(target=serve)
         server.start()
