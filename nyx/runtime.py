@@ -261,6 +261,28 @@ def _metadata_unchanged(path: Path, original: _Metadata, *, read_data: bool = Fa
     return current == original
 
 
+def _directory_stamp(path: Path) -> tuple[int, int, int, int, int, int, int]:
+    details = path.lstat()
+    if not stat.S_ISDIR(details.st_mode):
+        raise RuntimeErrorBase("unsafe Nyx runtime state")
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_uid,
+        stat.S_IMODE(details.st_mode),
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def _directory_unchanged(path: Path, original: tuple[int, int, int, int, int, int, int]) -> bool:
+    try:
+        return _directory_stamp(path) == original
+    except (OSError, RuntimeErrorBase):
+        return False
+
+
 def _require_deadline(deadline: float) -> None:
     if deadline - time.monotonic() <= 0:
         raise _ControlTimeoutError("control deadline expired")
@@ -462,6 +484,10 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         if not _safe_lock_metadata(details):
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+    try:
+        layout_initial = _directory_stamp(paths.runtime_directory)
+    except (OSError, RuntimeErrorBase):
+        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
 
     operation = _ExistingLock(operation_path)
     operation_state = operation.acquire()
@@ -508,9 +534,11 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 _require_deadline(deadline)
                 operation_stable = _metadata_unchanged(operation_path, operation_initial)
                 _require_deadline(deadline)
+                layout_stable = _directory_unchanged(paths.runtime_directory, layout_initial)
+                _require_deadline(deadline)
             except _ControlTimeoutError:
                 return _runtime_unknown(paths, RUNTIME_CONTROL_TIMED_OUT)
-            if not record_stable or not lease_stable or not operation_stable:
+            if not record_stable or not lease_stable or not operation_stable or not layout_stable:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             return _runtime_observation("running", paths, url=URL)
 
@@ -527,6 +555,8 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             if not _metadata_unchanged(record_path, record_initial, read_data=True):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            if not _directory_unchanged(paths.runtime_directory, layout_initial):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             return _runtime_observation("not_running", paths)
 
         # An existing lease descriptor was successfully acquired, so it is free.
@@ -540,6 +570,8 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
         if not _metadata_unchanged(lease_path, lease_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         if not _metadata_unchanged(record_path, record_initial, read_data=True):
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        if not _directory_unchanged(paths.runtime_directory, layout_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         return _runtime_observation("not_running", paths)
     finally:
