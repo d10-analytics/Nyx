@@ -378,7 +378,7 @@ def _configuration_from_payload(payload: Any) -> Configuration:
         raise ConfigurationError("Nyx configuration root is invalid")
     try:
         canonical = Path(root).resolve(strict=False)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise ConfigurationError("Nyx configuration root is invalid") from error
     return Configuration(canonical, hidden_stages)
 
