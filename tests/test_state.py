@@ -59,10 +59,12 @@ def test_setup_uses_passwd_home_and_persists_canonical_empty_symlink_root():
             loaded = state.load_configuration(paths)
 
         assert result.specification_root == actual.resolve()
+        assert result.hidden_stages == ()
         assert loaded == result
         payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
         assert payload == {
-            "schema_version": 1,
+            "schema_version": 2,
+            "hidden_stages": [],
             "specification_root": str(actual.resolve()),
         }
         assert paths.config_file.is_relative_to(home)
@@ -129,6 +131,104 @@ def test_invalid_replacement_preserves_exact_previous_configuration_bytes():
                 state.setup(missing)
             assert config_file.read_bytes() == before
             assert state.load_configuration().specification_root == first.resolve()
+
+
+def test_hidden_stages_are_deduplicated_and_scalar_sorted_without_normalization():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            result = state.setup(spec_root, ["z", "é", "z", " A ", "a"])
+            payload = json.loads(state.state_paths().config_file.read_text(encoding="utf-8"))
+
+        assert result.hidden_stages == (" A ", "a", "z", "é")
+        assert payload == {
+            "hidden_stages": [" A ", "a", "z", "é"],
+            "schema_version": 2,
+            "specification_root": str(spec_root.resolve()),
+        }
+
+
+@pytest.mark.parametrize("invalid", ["", ".", "..", "a/b", "a\\b", "a\x00b", "a\x7fb", "\ud800"])
+def test_invalid_hidden_stage_rejected_before_state_creation(invalid):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch, pytest.raises(state.HiddenStageError):
+            state.setup(spec_root, [invalid])
+        assert not (home / ".config").exists()
+
+
+def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            paths.config_file.write_text(
+                json.dumps({"schema_version": 1, "specification_root": str(first.resolve())}) + "\n",
+                encoding="utf-8",
+            )
+            before = paths.config_file.read_bytes()
+            assert state.load_configuration(paths).hidden_stages == ()
+            assert paths.config_file.read_bytes() == before
+            migrated = state.setup(second, ["Queue"])
+
+        assert migrated.hidden_stages == ("Queue",)
+        assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
+            "hidden_stages": ["Queue"],
+            "schema_version": 2,
+            "specification_root": str(second.resolve()),
+        }
+
+
+def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(spec_root, ["Queue"])
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            preserved = state.setup(spec_root)
+            assert preserved.hidden_stages == ("Queue",)
+            assert paths.config_file.read_bytes() == before
+            cleared = state.setup(spec_root, [])
+
+        assert cleared.hidden_stages == ()
+        assert json.loads(paths.config_file.read_text(encoding="utf-8"))["hidden_stages"] == []
+
+
+def test_post_replace_verification_failure_keeps_new_record_without_claiming_rollback():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            with patch.object(state.os, "fsync", side_effect=[None, OSError("directory sync failed")]), pytest.raises(
+                state.ConfigurationError, match="cannot replace"
+            ):
+                state.setup(second, ["Queue"])
+
+        assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
+            "hidden_stages": ["Queue"],
+            "schema_version": 2,
+            "specification_root": str(second.resolve()),
+        }
 
 
 def test_atomic_replacement_failure_preserves_previous_configuration_bytes():

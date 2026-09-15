@@ -6,7 +6,6 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
@@ -24,6 +23,11 @@ CATALOG_LIFECYCLE_DIRECTORIES = {
 CATALOG_BOARD_LIFECYCLES = {
     "under_development", "queue", "needs_fixes", "awaiting_retrospective",
 }
+CATALOG_HIDDEN_STAGES = sorted(
+    directory
+    for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
+    if lifecycle not in CATALOG_BOARD_LIFECYCLES
+)
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
     "unreadable_anchor": "unreadable anchor",
@@ -114,12 +118,15 @@ def _catalog_declared(lines: list[str]) -> dict[str, str | None]:
     return values
 
 
-def _catalog_readable(path: Path, *, directory: bool = False) -> bool:
-    """Honor ordinary permission bits even when the producer runs as root."""
-    try:
-        mode = path.lstat().st_mode
-    except OSError:
-        return False
+def _catalog_require_descriptor_capabilities() -> tuple[int, int, int]:
+    """Require the no-follow descriptor operations used by one scan session."""
+    flags = tuple(getattr(os, name, None) for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"))
+    if any(not isinstance(value, int) or value <= 0 for value in flags):
+        raise ValueError("catalog descriptor capabilities are unavailable")
+    return flags  # type: ignore[return-value]
+
+
+def _catalog_fd_readable(mode: int, *, directory: bool = False) -> bool:
     read_bits = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
     if not mode & read_bits:
         return False
@@ -129,50 +136,118 @@ def _catalog_readable(path: Path, *, directory: bool = False) -> bool:
     return True
 
 
-def _catalog_fingerprint(path: Path) -> tuple[int, int, int, int, int, int]:
-    info = path.lstat()
-    return (
-        info.st_dev,
-        info.st_ino,
-        info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )
+def _catalog_open_root(spec_root: Path) -> int:
+    nofollow, directory, cloexec = _catalog_require_descriptor_capabilities()
+    try:
+        descriptor = os.open(spec_root, os.O_RDONLY | directory | cloexec | nofollow)
+    except (OSError, TypeError, NotImplementedError, ValueError) as error:
+        raise ValueError("specification root cannot be read") from error
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISDIR(mode) or not _catalog_fd_readable(mode, directory=True):
+            raise OSError("specification root cannot be read")
+    except BaseException:
+        os.close(descriptor)
+        raise ValueError("specification root cannot be read")
+    return descriptor
 
 
-def _catalog_read_anchor(anchor: Path) -> tuple[bytes | None, str | None]:
-    """Read an anchor with one retry when its identity changes during the read."""
+def _catalog_open_directory_at(parent_fd: int, name: str) -> int:
+    nofollow, directory, cloexec = _catalog_require_descriptor_capabilities()
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | directory | cloexec | nofollow,
+            dir_fd=parent_fd,
+        )
+    except (TypeError, NotImplementedError) as error:
+        raise ValueError("catalog descriptor-relative open is unavailable") from error
+    except (OSError, ValueError) as error:
+        raise error
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISDIR(mode) or not _catalog_fd_readable(mode, directory=True):
+            raise OSError("catalog directory cannot be read")
+    except NotImplementedError as error:
+        os.close(descriptor)
+        raise ValueError("catalog descriptor-relative stat is unavailable") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _catalog_stat_at(parent_fd: int, name: str) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (TypeError, NotImplementedError, ValueError) as error:
+        raise ValueError("catalog descriptor-relative stat is unavailable") from error
+
+
+def _catalog_read_fd(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(descriptor, 1024 * 1024)
+        except NotImplementedError as error:
+            raise ValueError("catalog descriptor read is unavailable") from error
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _catalog_scandir(descriptor: int):
+    try:
+        return os.scandir(descriptor)
+    except (TypeError, NotImplementedError) as error:
+        raise ValueError("catalog descriptor enumeration is unavailable") from error
+
+
+def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, str | None]:
+    """Read an admitted regular anchor through a descriptor-relative no-follow open."""
     last_data: bytes | None = None
+    nofollow, _directory, cloexec = _catalog_require_descriptor_capabilities()
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(nonblocking, int) or nonblocking <= 0:
+        raise ValueError("catalog descriptor-relative open is unavailable")
     for _ in range(2):
         try:
-            before = _catalog_fingerprint(anchor)
-        except OSError:
+            before = _catalog_stat_at(parent_fd, name)
+        except (FileNotFoundError, OSError):
             return None, "unreadable_anchor"
-        if stat.S_ISLNK(before[2]):
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             return None, "nonregular_anchor"
-        if not stat.S_ISREG(before[2]):
-            return None, "nonregular_anchor"
-        if not _catalog_readable(anchor):
+        if not _catalog_fd_readable(before.st_mode):
             return None, "unreadable_anchor"
         try:
-            last_data = anchor.read_bytes()
-            after = _catalog_fingerprint(anchor)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | cloexec | nofollow | nonblocking,
+                dir_fd=parent_fd,
+            )
+        except (TypeError, NotImplementedError, ValueError) as error:
+            raise ValueError("catalog descriptor-relative open is unavailable") from error
+        except (FileNotFoundError, OSError):
+            return None, "nonregular_anchor"
+        try:
+            admitted = os.fstat(descriptor)
+            if not stat.S_ISREG(admitted.st_mode) or not _catalog_fd_readable(admitted.st_mode):
+                return None, "nonregular_anchor"
+            last_data = _catalog_read_fd(descriptor)
+            after = os.fstat(descriptor)
+        except NotImplementedError as error:
+            raise ValueError("catalog descriptor read is unavailable") from error
         except OSError:
             return None, "unreadable_anchor"
-        if before == after:
+        finally:
+            os.close(descriptor)
+        before_identity = (admitted.st_dev, admitted.st_ino, admitted.st_mode, admitted.st_size,
+                           admitted.st_mtime_ns, admitted.st_ctime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns)
+        if before_identity == after_identity:
             return last_data, None
     return last_data, "changed_during_read"
-
-
-def _catalog_scan_root(spec_root: Path) -> list[os.DirEntry[str]]:
-    """Return root entries while containing permission and scan failures."""
-    if not _catalog_readable(spec_root, directory=True):
-        raise ValueError("specification root cannot be read")
-    try:
-        return sorted(os.scandir(spec_root), key=lambda item: item.name)
-    except OSError as error:
-        raise ValueError("specification root cannot be read") from error
 
 
 def _uuid(value: str) -> str | None:
@@ -454,75 +529,77 @@ def _parse_program_descriptor(
 
 
 def _scan_programs(
+    repository_fd: int,
     repository_path: Path,
     spec_root: Path,
     programs: list[dict[str, object]],
     diagnostics: list[dict[str, str]],
 ) -> None:
-    namespace = repository_path / "Reference" / "Programs"
+    """Read program metadata through descriptors retained for this scan."""
+    reference_path = repository_path / "Reference"
+    namespace_path = reference_path / "Programs"
     try:
-        mode = namespace.lstat().st_mode
+        reference_fd = _catalog_open_directory_at(repository_fd, "Reference")
     except FileNotFoundError:
         return
     except OSError:
-        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
-        return
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not _catalog_readable(namespace, directory=True):
-        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
+        diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(reference_path, spec_root)))
         return
     try:
-        children = sorted(os.scandir(namespace), key=lambda item: item.name)
-    except OSError:
-        diagnostics.append(_diagnostic("discovery_unavailable", _catalog_relative(namespace, spec_root)))
-        return
-    for child in children:
-        child_path = Path(child.path)
-        program_path = _catalog_relative(child_path, spec_root)
-        # Only a canonical UUID directory owns a program descriptor.  Other
-        # Reference/Programs material is unrelated reference content and must
-        # not make an otherwise complete program namespace incomplete.
-        directory_id = _uuid(child.name)
-        if directory_id is None:
-            continue
         try:
-            if child.is_symlink() or not child.is_dir(follow_symlinks=False):
-                diagnostics.append(_diagnostic("invalid_package", program_path))
-                continue
+            namespace_fd = _catalog_open_directory_at(reference_fd, "Programs")
+        except FileNotFoundError:
+            return
         except OSError:
-            diagnostics.append(_catalog_diagnostic("discovery_unavailable", program_path))
-            continue
-        if not _catalog_readable(child_path, directory=True):
-            diagnostics.append(_catalog_diagnostic("discovery_unavailable", program_path))
-            continue
-        descriptor = child_path / "program.md"
+            diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(namespace_path, spec_root)))
+            return
         try:
-            descriptor_mode = descriptor.lstat().st_mode
-        except OSError:
-            diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(descriptor, spec_root)))
-            continue
-        if stat.S_ISLNK(descriptor_mode) or not stat.S_ISREG(descriptor_mode):
-            diagnostics.append(_catalog_diagnostic("invalid_package", program_path))
-            continue
-        data, read_diagnostic = _catalog_read_anchor(descriptor)
-        if data is None:
-            diagnostics.append(_catalog_diagnostic(read_diagnostic or "unreadable_anchor", program_path))
-            continue
-        try:
-            lines = data.decode("utf-8").splitlines()
-        except UnicodeDecodeError:
-            diagnostics.append(_catalog_diagnostic("invalid_package", program_path))
-            continue
-        parsed, candidates, parsed_diagnostics = _parse_program_descriptor(
-            lines, directory_id, program_path
-        )
-        parsed["candidate_ids"] = candidates
-        parsed["read_diagnostic"] = read_diagnostic
-        if read_diagnostic:
-            parsed["diagnostics"].append(_catalog_diagnostic(read_diagnostic, program_path))
-            parsed["state"] = "partial"
-            diagnostics.append(_catalog_diagnostic(read_diagnostic, program_path))
-        programs.append(parsed)
-        diagnostics.extend(parsed_diagnostics)
+            try:
+                with _catalog_scandir(namespace_fd) as entries:
+                    children = sorted(entries, key=lambda item: item.name)
+            except OSError:
+                diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(namespace_path, spec_root)))
+                return
+            for child in children:
+                directory_id = _uuid(child.name)
+                if directory_id is None:
+                    continue
+                program_path = _catalog_relative(namespace_path / child.name, spec_root)
+                try:
+                    child_fd = _catalog_open_directory_at(namespace_fd, child.name)
+                except FileNotFoundError:
+                    diagnostics.append(_catalog_diagnostic("discovery_unavailable", program_path))
+                    continue
+                except OSError:
+                    diagnostics.append(_diagnostic("invalid_package", program_path))
+                    continue
+                try:
+                    data, read_diagnostic = _catalog_read_anchor_at(child_fd, "program.md")
+                finally:
+                    os.close(child_fd)
+                if data is None:
+                    diagnostics.append(_catalog_diagnostic(read_diagnostic or "unreadable_anchor", program_path))
+                    continue
+                try:
+                    lines = data.decode("utf-8").splitlines()
+                except UnicodeDecodeError:
+                    diagnostics.append(_catalog_diagnostic("invalid_package", program_path))
+                    continue
+                parsed, candidates, parsed_diagnostics = _parse_program_descriptor(
+                    lines, directory_id, program_path
+                )
+                parsed["candidate_ids"] = candidates
+                parsed["read_diagnostic"] = read_diagnostic
+                if read_diagnostic:
+                    parsed["diagnostics"].append(_catalog_diagnostic(read_diagnostic, program_path))
+                    parsed["state"] = "partial"
+                    diagnostics.append(_catalog_diagnostic(read_diagnostic, program_path))
+                programs.append(parsed)
+                diagnostics.extend(parsed_diagnostics)
+        finally:
+            os.close(namespace_fd)
+    finally:
+        os.close(reference_fd)
 
 
 def _program_index(
@@ -701,61 +778,36 @@ def _scan_stage(
     stage_path: Path,
     lifecycle: str,
     spec_root: Path,
+    stage_fd: int,
     records: list[dict[str, object]],
     discovery_diagnostics: list[dict[str, str]],
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> None:
-    pending = [stage_path]
-    while pending:
-        current = pending.pop()
-        if not _catalog_readable(current, directory=True):
-            discovery_diagnostics.append(
-                _catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root))
-            )
-            continue
-        try:
-            children = sorted(os.scandir(current), key=lambda item: item.name)
-        except OSError:
-            discovery_diagnostics.append(
-                _catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root))
-            )
-            continue
-        for child in children:
-            child_path = Path(child.path)
-            if child.name == "spec.md":
-                package_path = _catalog_relative(current, spec_root)
-                if child.is_symlink() or not child.is_file(follow_symlinks=False):
-                    records.append(
-                        {
-                            "package_path": package_path,
-                            "lifecycle": lifecycle,
-                            "data": None,
-                            "read_diagnostic": "nonregular_anchor",
-                            "declared": _empty_declared(),
-                            "relationship": None,
-                            "candidate_ids": set(),
-                            "package_id": None,
-                            "diagnostics": [_catalog_diagnostic("nonregular_anchor", package_path)],
-                            "state": "partial",
-                        }
-                    )
-                else:
-                    data, read_diagnostic = _catalog_read_anchor(child_path)
+    """Traverse one lifecycle stage using only descriptors admitted by parents."""
+    pending: list[tuple[Path, int]] = [(stage_path, stage_fd)]
+    try:
+        while pending:
+            current, current_fd = pending.pop()
+            try:
+                try:
+                    with _catalog_scandir(current_fd) as entries:
+                        children = sorted(entries, key=lambda item: item.name)
+                except OSError:
+                    discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                    continue
+                anchor = next((child for child in children if child.name == "spec.md"), None)
+                if anchor is not None:
+                    package_path = _catalog_relative(current, spec_root)
+                    data, read_diagnostic = _catalog_read_anchor_at(current_fd, "spec.md")
                     declared = _empty_declared()
                     relationship = None
                     candidates: set[str] = set()
                     diagnostics: list[dict[str, str]] = []
+                    decode_diagnostic: str | None = None
                     if data is not None:
                         lines, decode_diagnostic = _header(data)
                         if lines:
                             declared = _catalog_declared(lines)
                             relationship, candidates, diagnostics = _parse_header(lines, package_path)
-                            if full_validity is not None:
-                                try:
-                                    if full_validity(child_path.parent, lines):
-                                        diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-                                except (OSError, UnicodeError, ValueError):
-                                    diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
                         else:
                             diagnostics.append(_catalog_diagnostic(decode_diagnostic or "invalid_package", package_path))
                     if read_diagnostic:
@@ -772,7 +824,11 @@ def _scan_stage(
                             "package_path": package_path,
                             "lifecycle": lifecycle,
                             "data": data,
-                            "read_diagnostic": read_diagnostic or decode_diagnostic if data is not None else "unreadable_anchor",
+                            "read_diagnostic": (
+                                read_diagnostic
+                                if data is None
+                                else read_diagnostic or decode_diagnostic
+                            ),
                             "declared": declared,
                             "relationship": relationship,
                             "candidate_ids": candidates,
@@ -781,14 +837,32 @@ def _scan_stage(
                             "state": "partial" if diagnostics else "complete",
                         }
                     )
-                continue
-            try:
-                if child.name != ".pipeline" and child.is_dir(follow_symlinks=False):
-                    pending.append(child_path)
-            except OSError:
-                discovery_diagnostics.append(
-                    _catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root))
-                )
+                    continue
+                for child in children:
+                    if child.name in {".pipeline", "Reference"}:
+                        continue
+                    child_path = current / child.name
+                    try:
+                        child_fd = _catalog_open_directory_at(current_fd, child.name)
+                    except FileNotFoundError:
+                        discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                        continue
+                    except OSError:
+                        try:
+                            child_stat = _catalog_stat_at(current_fd, child.name)
+                        except OSError:
+                            discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                            continue
+                        if stat.S_ISLNK(child_stat.st_mode) or not stat.S_ISDIR(child_stat.st_mode):
+                            continue
+                        discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root)))
+                        continue
+                    pending.append((child_path, child_fd))
+            finally:
+                os.close(current_fd)
+    finally:
+        for _path, descriptor in pending:
+            os.close(descriptor)
 
 
 def _edge(
@@ -954,65 +1028,84 @@ def _render_entry(
         "superseded_by": rendered_successor,
     }
     diagnostics = _sort_diagnostics(list(record["diagnostics"]))
+    package_path = str(record["package_path"])
+    path_parts = package_path.split("/")
+    project, stage = path_parts[0], path_parts[1]
     return {
         "package_id": record["package_id"],
-        "package_path": record["package_path"],
-        "lifecycle": record["lifecycle"],
+        "package_path": package_path,
+        "project": project,
+        "stage": stage,
+        "board_visible": record["lifecycle"] in CATALOG_BOARD_LIFECYCLES,
         "state": record["state"],
         "declared": record["declared"],
         "diagnostics": diagnostics,
         "relationship": relationship_out,
-        "transitive_diagnostics": _transitive_diagnostics(
-            record, index, identity_complete
-        ),
+        "transitive_diagnostics": [],
     }
 
 
 def _build_catalog(
     spec_root: Path,
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
     """Build the relationship catalog from one captured scan."""
-    if not spec_root.exists() or not spec_root.is_dir():
-        raise ValueError(f"specification root is not a directory: {spec_root}")
     records: list[dict[str, object]] = []
     discovery_diagnostics: list[dict[str, str]] = []
     program_descriptors: list[dict[str, object]] = []
     program_diagnostics: list[dict[str, str]] = []
-    for repository in _catalog_scan_root(spec_root):
+    root_fd = _catalog_open_root(spec_root)
+    try:
         try:
-            if not repository.is_dir(follow_symlinks=False):
+            with _catalog_scandir(root_fd) as entries:
+                repositories = sorted(entries, key=lambda item: item.name)
+        except OSError as error:
+            raise ValueError("specification root cannot be read") from error
+        for repository in repositories:
+            if repository.name.startswith(".") or repository.name == "Reference":
                 continue
-        except OSError:
-            continue
-        repository_path = Path(repository.path)
-        _scan_programs(
-            repository_path, spec_root, program_descriptors, program_diagnostics
-        )
-        for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items():
-            stage_path = repository_path / directory
+            repository_path = spec_root / repository.name
             try:
-                mode = stage_path.lstat().st_mode
+                repository_fd = _catalog_open_directory_at(root_fd, repository.name)
             except FileNotFoundError:
                 continue
             except OSError:
-                discovery_diagnostics.append(
-                    _catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root))
-                )
+                try:
+                    repository_stat = _catalog_stat_at(root_fd, repository.name)
+                except OSError:
+                    discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
+                    continue
+                if stat.S_ISLNK(repository_stat.st_mode) or not stat.S_ISDIR(repository_stat.st_mode):
+                    continue
+                discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
                 continue
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                discovery_diagnostics.append(
-                    _catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root))
+            try:
+                _scan_programs(
+                    repository_fd, repository_path, spec_root,
+                    program_descriptors, program_diagnostics,
                 )
-                continue
-            _scan_stage(
-                stage_path,
-                lifecycle,
-                spec_root,
-                records,
-                discovery_diagnostics,
-                full_validity,
-            )
+                for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items():
+                    stage_path = repository_path / directory
+                    try:
+                        stage_fd = _catalog_open_directory_at(repository_fd, directory)
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        try:
+                            stage_stat = _catalog_stat_at(repository_fd, directory)
+                        except OSError:
+                            discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
+                            continue
+                        if stat.S_ISLNK(stage_stat.st_mode) or not stat.S_ISDIR(stage_stat.st_mode):
+                            discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root)))
+                        continue
+                    _scan_stage(
+                        stage_path, lifecycle, spec_root, stage_fd,
+                        records, discovery_diagnostics,
+                    )
+            finally:
+                os.close(repository_fd)
+    finally:
+        os.close(root_fd)
 
     index: dict[str, list[dict[str, object]]] = {}
     for record in records:
@@ -1116,8 +1209,13 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "catalog_digest": None,
+        "visibility": {
+            "hidden_stages": CATALOG_HIDDEN_STAGES,
+            "visible_entry_count": len(board),
+            "hidden_entry_count": len(records) - len(board),
+        },
         "identity_coverage": {"state": "complete" if identity_complete else "incomplete", "diagnostics": identity_diagnostics},
         "program_coverage": {
             "state": "complete" if program_coverage_complete else "incomplete",
@@ -1145,8 +1243,6 @@ def build_catalog(spec_root: Path) -> str:
 
 def scan_catalog(
     spec_root: Path,
-    *,
-    _full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
-    """Build the deterministic catalog with the private validity hook."""
-    return _build_catalog(spec_root, _full_validity)
+    """Build the deterministic catalog."""
+    return _build_catalog(spec_root)

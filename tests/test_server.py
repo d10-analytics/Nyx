@@ -1,6 +1,7 @@
 import http.client
 import json
 import threading
+from dataclasses import replace
 from unittest.mock import patch
 from uuid import UUID
 
@@ -26,7 +27,9 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                        "visible_entry_count": 2, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -38,7 +41,9 @@ def raw_catalog():
         value["entries"].append({
             "package_id": str(UUID(int=len(value["entries"]) + 1, version=4)),
             "package_path": path,
-            "lifecycle": "queue" if "Queue" in path else "under_development",
+            "project": path.split("/")[0],
+            "stage": path.split("/")[1],
+            "board_visible": True,
             "state": "complete",
             "declared": {"title": title, "target_project": "Fictional",
                          "status": "ready", "closure": "approved",
@@ -111,6 +116,46 @@ def test_default_provider_uses_unselected_scanner():
         result = server._default_provider()
     assert result == valid_catalog()
     scanner.assert_called_once_with(server.Path.cwd())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(schema_version=2),
+        lambda value: value.update(unknown=True),
+        lambda value: value["entries"][0].update(board_visible="true"),
+        lambda value: value["entries"][0].update(stage="Done"),
+        lambda value: value["entries"][0].update(
+            transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
+        ),
+    ],
+    ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
+)
+def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
+    value = raw_catalog()
+    mutate(value)
+    value["catalog_digest"] = canonical_digest(value)
+    with pytest.raises(ValueError):
+        parse_catalog(value)
+
+
+def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
+    value = raw_catalog()
+    value["catalog_digest"] = "0" * 64
+    with pytest.raises(ValueError):
+        parse_catalog(value)
+
+
+@pytest.mark.parametrize("alter", [
+    lambda catalog: replace(catalog, schema_version=2),
+    lambda catalog: replace(
+        catalog,
+        entries=(replace(catalog.entries[0], board_visible="yes"), *catalog.entries[1:]),
+    ),
+])
+def test_catalog_object_providers_are_revalidated_as_schema_three(alter):
+    with pytest.raises(CatalogError, match="producer_protocol_error"):
+        server._catalog_from_provider(lambda: alter(valid_catalog()))
 
 
 class RunningServer:

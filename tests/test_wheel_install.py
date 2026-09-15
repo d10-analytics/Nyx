@@ -120,7 +120,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 entry = {
                     "package_id": "123e4567-e89b-42d3-a456-426614174000",
                     "package_path": "Fictional/Queue/installed-demo",
-                    "lifecycle": "queue",
+                    "project": "Fictional",
+                    "stage": "Queue",
+                    "board_visible": True,
                     "state": "complete",
                     "declared": {
                         "title": "Installed catalog entry",
@@ -151,7 +153,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 2,
+                    "schema_version": 3,
+                    "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                                    "visible_entry_count": 1, "hidden_entry_count": 0},
                     "identity_coverage": {"state": "complete", "diagnostics": []},
                     "program_coverage": {"state": "complete", "diagnostics": []},
                     "discovery_diagnostics": [],

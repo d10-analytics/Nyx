@@ -39,10 +39,13 @@ def _edge(target_id, name):
 
 
 def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diagnostics=None):
+    stage = path.split("/")[1]
     return {
         "package_id": package_id,
         "package_path": path,
-        "lifecycle": lifecycle,
+        "project": project,
+        "stage": stage,
+        "board_visible": lifecycle in {"under_development", "queue", "needs_fixes", "awaiting_retrospective"},
         "state": "complete",
         "declared": _declared(title, project),
         "diagnostics": [] if diagnostics is None else diagnostics,
@@ -65,10 +68,23 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
     }
 
 
+def _refresh_visibility_and_digest(value):
+    entries = value["entries"]
+    value["visibility"]["visible_entry_count"] = sum(
+        entry["board_visible"] for entry in entries
+    )
+    value["visibility"]["hidden_entry_count"] = sum(
+        not entry["board_visible"] for entry in entries
+    )
+    value["catalog_digest"] = canonical_digest(value)
+
+
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                        "visible_entry_count": 4, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -108,7 +124,7 @@ def board_payload(*, titles=None):
         ],
         "programs": [],
     }
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
 
 
@@ -186,6 +202,14 @@ def test_board_renders_lifecycle_rows_and_project_columns(open_page):
         "Needs Fixes",
         "Awaiting Retrospective",
     ]
+    assert page.locator("#board .card").count() == 4
+
+
+def test_browser_accepts_explicit_blank_declared_metadata(open_page):
+    value = json.loads(board_payload())
+    value["entries"][0]["declared"]["status"] = ""
+    value["catalog_digest"] = canonical_digest(value)
+    page = open_page(StaticClient(value))
     assert page.locator("#board .card").count() == 4
 
 
@@ -406,7 +430,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     second["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": "refreshed catalog discovery failure"}
     ]
-    second["catalog_digest"] = canonical_digest(second)
+    _refresh_visibility_and_digest(second)
     page = open_page(SequenceClient([first, second]))
 
     assert "first catalog discovery failure" in page.locator("#details").inner_text()
@@ -442,7 +466,7 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     value["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": discovery_message}
     ]
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     page = open_page(StaticClient(value))
 
     assert page.locator("#board .card").count() == 0
@@ -603,14 +627,14 @@ def routing_payload():
     value["entries"].extend([
         _entry(far, "Gamma/Done/far", "done", "Far prerequisite", "Gamma",
                prerequisites=[_edge(STEP_ONE, "forward")]),
-        _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", None,
+        _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", "Other",
                prerequisites=[_edge(far, "input")]),
     ])
     # Reverse cross-project edge and a cycle; neither implies a topological order.
     value["entries"][1]["relationship"]["prerequisites"] = [_edge(far, "reverse")]
     value["entries"][1]["relationship"]["direct_prerequisite_state"] = "unsatisfied"
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     return value, far, unknown
 
 
@@ -655,7 +679,7 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
     elif reason == "missing_target":
         edge["target_package_id"] = "123e4567-e89b-42d3-a456-426614174009"
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     page = open_page(StaticClient(value))
     assert (STEP_ONE, LOOSE) not in connection_pairs(page)
     if duplicate_record:
@@ -865,7 +889,7 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
                [_edge(GATE, "input")]),
     ]
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     page = open_page(StaticClient(value))
     assert page.locator(".card-title").all_text_contents() == [
         "Z upstream", "X cycle B", "Y cycle A", "B prerequisite C", "A dependent D",
@@ -890,7 +914,7 @@ def test_unresolved_relationship_does_not_change_card_order(open_page, reason):
         _entry(STEP_ONE, "Alpha/Queue/a", "queue", "Z candidate", "Alpha"),
         _entry(STEP_TWO, "Alpha/Queue/b", "queue", "A unresolved", "Alpha", [edge]),
     ]
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     page = open_page(StaticClient(value))
     assert page.locator(".card-title").all_text_contents() == ["A unresolved", "Z candidate"]
     assert connection_pairs(page) == set()
@@ -907,7 +931,7 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
                [_edge(STEP_ONE, "input")]),
         _entry(duplicate_id, "Beta/Queue/c", "queue", "Duplicate", "Beta"),
     ]
-    value["catalog_digest"] = canonical_digest(value)
+    _refresh_visibility_and_digest(value)
     page = open_page(StaticClient(value))
     assert page.locator('.board-row[data-lifecycle="queue"] .cell').first.locator(
         '.card-title'

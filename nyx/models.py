@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 LIFECYCLES = frozenset(
     {
@@ -71,6 +71,7 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "catalog_digest",
+        "visibility",
         "identity_coverage",
         "program_coverage",
         "discovery_diagnostics",
@@ -82,7 +83,9 @@ _ENTRY_KEYS = frozenset(
     {
         "package_id",
         "package_path",
-        "lifecycle",
+        "project",
+        "stage",
+        "board_visible",
         "state",
         "declared",
         "diagnostics",
@@ -112,6 +115,7 @@ _EDGE_KEYS = frozenset(
 )
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
+_VISIBILITY_KEYS = frozenset({"hidden_stages", "visible_entry_count", "hidden_entry_count"})
 _CLAIM_KEYS = frozenset({"name", "state", "evidence_ref", "diagnostics"})
 _SUCCESSOR_KEYS = frozenset({"package_id", "resolution", "diagnostics"})
 _CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids", "diagnostics"})
@@ -164,7 +168,9 @@ class CatalogEntry:
     """One displayed package, reduced to the fields the board renders."""
 
     package_path: str
-    lifecycle: str
+    project: str
+    stage: str
+    board_visible: bool
     declared: dict[str, str | None]
     diagnostics: tuple[Diagnostic, ...]
     state: str = "complete"
@@ -173,19 +179,42 @@ class CatalogEntry:
     program_title: str | None = None
     prerequisites: tuple[dict[str, Any], ...] = ()
     direct_prerequisite_state: str = "relationship_unavailable"
+    relationship_data: dict[str, Any] | None = None
+    transitive_diagnostics: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def lifecycle(self) -> str:
+        """Return the historical normalized stage name for internal callers."""
+        return self.stage.lower()
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "declared": dict(self.declared),
             "diagnostics": [item.as_dict() for item in self.diagnostics],
-            "lifecycle": self.lifecycle,
             "package_id": self.package_id,
             "package_path": self.package_path,
-            "prerequisites": [dict(edge) for edge in self.prerequisites],
-            "direct_prerequisite_state": self.direct_prerequisite_state,
-            "program_id": self.program_id,
-            "program_title": self.program_title,
+            "project": self.project,
+            "stage": self.stage,
+            "board_visible": self.board_visible,
             "state": self.state,
+            "relationship": self.relationship_data or {
+                "participation": "available" if self.direct_prerequisite_state != "relationship_unavailable" else "legacy",
+                "claims": [],
+                "prerequisites": [dict(edge) for edge in self.prerequisites],
+                "direct_prerequisite_state": self.direct_prerequisite_state,
+                "program": {
+                    "program_id": self.program_id,
+                    "title": self.program_title,
+                    "resolution": "resolved" if self.program_id is not None else "not_declared",
+                    "diagnostics": [],
+                },
+                "superseded_by": {
+                    "package_id": None,
+                    "resolution": "not_declared",
+                    "diagnostics": [],
+                },
+            },
+            "transitive_diagnostics": [dict(item) for item in self.transitive_diagnostics],
         }
 
 
@@ -194,18 +223,27 @@ class Catalog:
     entries: tuple[CatalogEntry, ...]
     discovery_diagnostics: tuple[Diagnostic, ...]
     catalog_digest: str
+    visibility: dict[str, Any]
+    identity_coverage: dict[str, Any]
+    program_coverage: dict[str, Any]
+    programs: tuple[dict[str, Any], ...]
     schema_version: int = SCHEMA_VERSION
 
     def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
+            "catalog_digest": self.catalog_digest if include_digest else None,
             "discovery_diagnostics": [
                 item.as_dict() for item in self.discovery_diagnostics
             ],
             "entries": [item.as_dict() for item in self.entries],
+            "identity_coverage": self.identity_coverage,
+            "program_coverage": self.program_coverage,
+            "programs": [dict(item) for item in self.programs],
             "schema_version": self.schema_version,
+            "visibility": dict(self.visibility),
         }
-        if include_digest:
-            result["catalog_digest"] = self.catalog_digest
+        if not include_digest:
+            result.pop("catalog_digest")
         return result
 
 
@@ -281,7 +319,10 @@ def _package_path(value: Any) -> str:
         not path
         or path.startswith("/")
         or "\\" in path
-        or any(ord(c) < 32 or ord(c) == 127 for c in path)
+        or any(
+            ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF
+            for c in path
+        )
     ):
         raise ProtocolError("package_path must be a nonempty relative POSIX path")
     parts = PurePosixPath(path).parts
@@ -337,6 +378,35 @@ def _coverage(value: Any, name: str) -> None:
     _diagnostics(item["diagnostics"], f"{name}.diagnostics")
 
 
+def _component(value: Any, name: str) -> str:
+    result = _string(value, name)
+    if (
+        not result
+        or result in {".", ".."}
+        or "/" in result
+        or "\\" in result
+        or any(ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF for character in result)
+    ):
+        raise ProtocolError(f"{name} must be one safe path component")
+    return result
+
+
+def _visibility(value: Any) -> tuple[tuple[str, ...], int, int]:
+    item = _object(value, "visibility")
+    _keys(item, _VISIBILITY_KEYS, "visibility")
+    hidden = item["hidden_stages"]
+    if type(hidden) is not list:
+        raise ProtocolError("visibility.hidden_stages must be a list")
+    hidden_stages = tuple(_component(stage, f"visibility.hidden_stages[{index}]") for index, stage in enumerate(hidden))
+    if list(hidden_stages) != sorted(hidden_stages) or len(hidden_stages) != len(set(hidden_stages)):
+        raise ProtocolError("visibility.hidden_stages must be unique and sorted")
+    visible = item["visible_entry_count"]
+    concealed = item["hidden_entry_count"]
+    if type(visible) is not int or visible < 0 or type(concealed) is not int or concealed < 0:
+        raise ProtocolError("visibility counts must be nonnegative integers")
+    return hidden_stages, visible, concealed
+
+
 def _claims(value: Any, name: str) -> None:
     if type(value) is not list:
         raise ProtocolError(f"{name} must be a list")
@@ -389,25 +459,8 @@ def _catalog_program(value: Any, name: str) -> str:
 
 
 def _transitive_diagnostics(value: Any, name: str) -> None:
-    if type(value) is not list:
-        raise ProtocolError(f"{name} must be a list")
-    for index, raw in enumerate(value):
-        item_name = f"{name}[{index}]"
-        item = _object(raw, item_name)
-        if set(item) == {"code"}:
-            if item["code"] != "transitive_diagnostics_truncated":
-                raise ProtocolError(f"{item_name} has an invalid shape")
-            continue
-        _keys(item, _TRANSITIVE_DIAGNOSTIC_KEYS, item_name)
-        _uuid4(item["origin_package_id"], f"{item_name}.origin_package_id")
-        code = _string(item["code"], f"{item_name}.code")
-        if code not in DIAGNOSTIC_CODES:
-            raise ProtocolError(f"{item_name}.code is invalid")
-        path_ids = item["path_package_ids"]
-        if type(path_ids) is not list:
-            raise ProtocolError(f"{item_name}.path_package_ids must be a list")
-        for path_index, package_id in enumerate(path_ids):
-            _uuid4(package_id, f"{item_name}.path_package_ids[{path_index}]")
+    if value != []:
+        raise ProtocolError(f"{name} must be the empty reference list")
 
 
 def _edge(value: Any, name: str) -> dict[str, Any]:
@@ -428,6 +481,8 @@ def _edge(value: Any, name: str) -> dict[str, Any]:
     return {
         "target_package_id": target,
         "claim_name": claim_name,
+        "observed_state": observed_state,
+        "observed_evidence_ref": item["observed_evidence_ref"],
         "resolved_state": resolved_state,
         "reason": reason,
     }
@@ -489,10 +544,14 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     item = _object(value, f"entries[{index}]")
     _keys(item, _ENTRY_KEYS, f"entries[{index}]")
     package_id = _uuid4(item["package_id"], f"entries[{index}].package_id", nullable=True)
-    lifecycle = _string(item["lifecycle"], f"entries[{index}].lifecycle")
+    project = _component(item["project"], f"entries[{index}].project")
+    stage = _component(item["stage"], f"entries[{index}].stage")
+    board_visible = item["board_visible"]
+    if type(board_visible) is not bool:
+        raise ProtocolError(f"entries[{index}].board_visible must be a boolean")
     state = _string(item["state"], f"entries[{index}].state")
-    if lifecycle not in LIFECYCLES or state not in _STATES:
-        raise ProtocolError(f"entries[{index}] has an invalid lifecycle or state")
+    if state not in _STATES:
+        raise ProtocolError(f"entries[{index}] has an invalid state")
     declared = _object(item["declared"], f"entries[{index}].declared")
     _keys(declared, frozenset(DECLARED_FIELDS), f"entries[{index}].declared")
     declared_values = {
@@ -504,12 +563,17 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     program_id, program_title, prerequisites, direct_state = _relationship(
         item["relationship"], index
     )
-    _transitive_diagnostics(
-        item["transitive_diagnostics"], f"entries[{index}].transitive_diagnostics"
-    )
+    transitive_value = item["transitive_diagnostics"]
+    _transitive_diagnostics(transitive_value, f"entries[{index}].transitive_diagnostics")
+    package_path = _package_path(item["package_path"])
+    parts = package_path.split("/")
+    if len(parts) < 2 or project != parts[0] or stage != parts[1]:
+        raise ProtocolError(f"entries[{index}] has inconsistent project/stage path")
     return CatalogEntry(
-        package_path=_package_path(item["package_path"]),
-        lifecycle=lifecycle,
+        package_path=package_path,
+        project=project,
+        stage=stage,
+        board_visible=board_visible,
         declared=declared_values,
         diagnostics=_diagnostics(item["diagnostics"], f"entries[{index}].diagnostics"),
         state=state,
@@ -518,6 +582,15 @@ def _entry(value: Any, index: int) -> CatalogEntry:
         program_title=program_title,
         prerequisites=prerequisites,
         direct_prerequisite_state=direct_state,
+        relationship_data={
+            "participation": item["relationship"]["participation"],
+            "claims": item["relationship"]["claims"],
+            "prerequisites": [dict(edge) for edge in item["relationship"]["prerequisites"]],
+            "direct_prerequisite_state": item["relationship"]["direct_prerequisite_state"],
+            "program": item["relationship"]["program"],
+            "superseded_by": item["relationship"]["superseded_by"],
+        },
+        transitive_diagnostics=tuple(dict(item) for item in transitive_value),
     )
 
 
@@ -556,6 +629,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         c not in "0123456789abcdef" for c in digest
     ):
         raise ProtocolError("invalid catalog digest")
+    hidden_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
     for name in ("identity_coverage", "program_coverage"):
         _coverage(catalog[name], name)
     if type(catalog["entries"]) is not list:
@@ -564,6 +638,12 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
     paths = [item.package_path for item in entries]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ProtocolError("entries must be unique and path-sorted")
+    if sum(item.board_visible for item in entries) != visible_count:
+        raise ProtocolError("visibility.visible_entry_count does not match entries")
+    if hidden_count < sum(not item.board_visible for item in entries):
+        raise ProtocolError("visibility.hidden_entry_count is below emitted hidden entries")
+    if any(item.board_visible == (item.stage in hidden_stages) for item in entries):
+        raise ProtocolError("entry board visibility conflicts with hidden stage policy")
     if type(catalog["programs"]) is not list:
         raise ProtocolError("programs must be a list")
     program_ids = [
@@ -579,4 +659,12 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         entries=entries,
         discovery_diagnostics=diagnostics,
         catalog_digest=digest,
+        visibility={
+            "hidden_stages": list(hidden_stages),
+            "visible_entry_count": visible_count,
+            "hidden_entry_count": hidden_count,
+        },
+        identity_coverage=dict(catalog["identity_coverage"]),
+        program_coverage=dict(catalog["program_coverage"]),
+        programs=tuple(dict(program) for program in catalog["programs"]),
     )

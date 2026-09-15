@@ -61,7 +61,7 @@ def _catalog_from_provider(provider: Provider) -> Catalog:
     try:
         value = provider.fetch_catalog() if hasattr(provider, "fetch_catalog") else provider()
         if isinstance(value, Catalog):
-            return value
+            return parse_catalog(value.as_dict())
         return parse_catalog(value)
     except CatalogError:
         raise
