@@ -1,5 +1,7 @@
 import inspect
 import json
+import os
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -16,6 +18,9 @@ Human Sanity Decision: AFFIRMED
 Target repo: /fictional/repo
 """
 
+PROGRAM_ID = "88888888-8888-4888-8888-888888888888"
+SMALL_ORACLE_BYTES = "{\"catalog_digest\":\"e58865c903fe64fe60473a420098a7f1445a05a397ade8e8ab5e8fe070d43abb\",\"discovery_diagnostics\":[],\"entries\":[{\"board_visible\":true,\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"One\"},\"diagnostics\":[],\"package_id\":null,\"package_path\":\"Fictional/Queue/one\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"relationship_unavailable\",\"participation\":\"legacy\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Queue\",\"state\":\"complete\",\"transitive_diagnostics\":[]}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[],\"schema_version\":3,\"visibility\":{\"hidden_entry_count\":0,\"hidden_stages\":[\"Archive\",\"Done\",\"In_Progress\"],\"visible_entry_count\":1}}"
+
 
 def package(root: Path, stage: str, name: str, content: str = V1) -> Path:
     path = root / "Fictional" / stage / name
@@ -25,6 +30,213 @@ def package(root: Path, stage: str, name: str, content: str = V1) -> Path:
 
 
 class CatalogTests(TestCase):
+    def test_descriptor_relative_package_boundaries_survive_replacement(self) -> None:
+        for boundary in ("root", "repository", "stage", "package"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = base / "specs"
+                package_path = package(root, "Queue", "inside", "# Inside\n")
+                outside = base / "outside"
+                outside_package = outside / "Queue" / "escape"
+                outside_package.mkdir(parents=True)
+                outside_package.joinpath("spec.md").write_text("# Escaped\n", encoding="utf-8")
+                original_open = os.open
+                replaced = False
+
+                def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+                    nonlocal replaced
+                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                    target = {
+                        "root": root,
+                        "repository": "Fictional",
+                        "stage": "Queue",
+                        "package": "inside",
+                    }[boundary]
+                    if not replaced and path == target:
+                        if boundary == "root":
+                            root.rename(base / "original-root")
+                            root.symlink_to(outside, target_is_directory=True)
+                        elif boundary == "repository":
+                            repository = root / "Fictional"
+                            repository.rename(base / "original-repository")
+                            repository.symlink_to(outside, target_is_directory=True)
+                        elif boundary == "stage":
+                            stage = root / "Fictional" / "Queue"
+                            stage.rename(base / "original-stage")
+                            stage.symlink_to(outside / "Queue", target_is_directory=True)
+                        else:
+                            package_path.rename(base / "original-package")
+                            package_path.symlink_to(outside_package, target_is_directory=True)
+                        replaced = True
+                    return descriptor
+
+                with patch.object(catalog.os, "open", side_effect=guarded_open):
+                    value = json.loads(catalog.scan_catalog(root))
+                self.assertTrue(replaced)
+                self.assertNotIn("Escaped", json.dumps(value))
+                self.assertEqual("Inside", value["entries"][0]["declared"]["title"])
+
+    def test_descriptor_relative_program_boundaries_survive_replacement(self) -> None:
+        for boundary in ("reference", "programs", "uuid", "anchor"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = base / "specs"
+                package(
+                    root,
+                    "Queue",
+                    "one",
+                    f"# Package\nProgram Membership: {PROGRAM_ID}\n",
+                )
+                repository = root / "Fictional"
+                program_dir = repository / "Reference" / "Programs" / PROGRAM_ID
+                program_dir.mkdir(parents=True)
+                program_dir.joinpath("program.md").write_text(
+                    f"Program ID: {PROGRAM_ID}\nProgram Title: Inside\n", encoding="utf-8"
+                )
+                outside = base / "outside"
+                outside_dir = outside / "Reference" / "Programs" / PROGRAM_ID
+                outside_dir.mkdir(parents=True)
+                outside_dir.joinpath("program.md").write_text(
+                    f"Program ID: {PROGRAM_ID}\nProgram Title: Escaped\n", encoding="utf-8"
+                )
+                outside_anchor = outside / "program.md"
+                outside_anchor.write_text(
+                    f"Program ID: {PROGRAM_ID}\nProgram Title: Escaped\n", encoding="utf-8"
+                )
+                original_open = os.open
+                replaced = False
+
+                def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+                    nonlocal replaced
+                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                    if not replaced and path == {
+                        "reference": "Reference",
+                        "programs": "Programs",
+                        "uuid": PROGRAM_ID,
+                        "anchor": "program.md",
+                    }[boundary]:
+                        if boundary == "reference":
+                            (repository / "Reference").rename(base / "original-reference")
+                            (repository / "Reference").symlink_to(
+                                outside / "Reference", target_is_directory=True
+                            )
+                        elif boundary == "programs":
+                            (repository / "Reference" / "Programs").rename(base / "original-programs")
+                            (repository / "Reference" / "Programs").symlink_to(
+                                outside / "Reference" / "Programs", target_is_directory=True
+                            )
+                        elif boundary == "uuid":
+                            program_dir.rename(base / "original-program")
+                            program_dir.symlink_to(outside_dir, target_is_directory=True)
+                        else:
+                            program_dir.joinpath("program.md").rename(base / "original-program.md")
+                            program_dir.joinpath("program.md").symlink_to(outside_anchor)
+                        replaced = True
+                    return descriptor
+
+                with patch.object(catalog.os, "open", side_effect=guarded_open):
+                    value = json.loads(catalog.scan_catalog(root))
+                self.assertTrue(replaced)
+                self.assertNotIn("Escaped", json.dumps(value))
+                self.assertEqual("Inside", value["programs"][0]["title"])
+
+    def test_descriptor_capabilities_fail_without_path_fallback(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one")
+            with patch.object(catalog.os, "O_NOFOLLOW", None), patch.object(
+                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
+            ):
+                with self.assertRaises(ValueError):
+                    catalog.scan_catalog(root)
+
+            original_open = os.open
+
+            def unsupported_dir_fd(path, flags, mode=0o777, *, dir_fd=None):
+                if dir_fd is not None:
+                    raise TypeError("dir_fd unsupported")
+                return original_open(path, flags, mode)
+
+            with patch.object(catalog.os, "open", side_effect=unsupported_dir_fd):
+                with self.assertRaises(ValueError):
+                    catalog.scan_catalog(root)
+
+    def test_descriptor_session_closes_on_parser_exception_and_concurrent_scans_overlap(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one")
+            original_open, original_close = os.open, os.close
+            opened: list[int] = []
+            closed: list[int] = []
+
+            def tracked_open(*args, **kwargs):
+                descriptor = original_open(*args, **kwargs)
+                opened.append(descriptor)
+                return descriptor
+
+            def tracked_close(descriptor):
+                closed.append(descriptor)
+                return original_close(descriptor)
+
+            with patch.object(catalog.os, "open", side_effect=tracked_open), patch.object(
+                catalog.os, "close", side_effect=tracked_close
+            ), patch.object(catalog, "_parse_header", side_effect=RuntimeError("parser")):
+                with self.assertRaisesRegex(RuntimeError, "parser"):
+                    catalog.scan_catalog(root)
+            self.assertEqual(set(opened), set(closed))
+
+            roots = []
+            for title in ("First", "Second"):
+                scan_root = root / title
+                package(scan_root, "Queue", "one", f"# {title}\n")
+                roots.append(scan_root)
+            barrier = threading.Barrier(2)
+            original_root_open = os.open
+
+            def synchronized_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = original_root_open(path, flags, mode, dir_fd=dir_fd)
+                if dir_fd is None and path in roots:
+                    barrier.wait(timeout=5)
+                return descriptor
+
+            results: list[dict[str, object]] = []
+
+            def scan(scan_root: Path) -> None:
+                results.append(json.loads(catalog.scan_catalog(scan_root)))
+
+            with patch.object(catalog.os, "open", side_effect=synchronized_open):
+                threads = [threading.Thread(target=scan, args=(scan_root,)) for scan_root in roots]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+            self.assertEqual({"First", "Second"}, {result["entries"][0]["declared"]["title"] for result in results})
+
+    def test_both_public_producers_retain_fixed_schema_three_oracle_without_writes(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Queue", "one", "# One\n")
+            before = sorted(
+                (path.relative_to(root).as_posix(), path.read_bytes())
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            original_open = os.open
+
+            def reject_writes(path, flags, mode=0o777, *, dir_fd=None):
+                self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch.object(catalog.os, "open", side_effect=reject_writes):
+                self.assertEqual(SMALL_ORACLE_BYTES, catalog.build_catalog(root))
+                self.assertEqual(SMALL_ORACLE_BYTES, catalog.scan_catalog(root))
+            after = sorted(
+                (path.relative_to(root).as_posix(), path.read_bytes())
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            self.assertEqual(before, after)
+
     def test_catalog_is_deterministic_and_declared_only(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
