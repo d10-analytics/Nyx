@@ -6,7 +6,6 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
@@ -708,7 +707,6 @@ def _scan_stage(
     spec_root: Path,
     records: list[dict[str, object]],
     discovery_diagnostics: list[dict[str, str]],
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> None:
     pending = [stage_path]
     while pending:
@@ -755,12 +753,6 @@ def _scan_stage(
                         if lines:
                             declared = _catalog_declared(lines)
                             relationship, candidates, diagnostics = _parse_header(lines, package_path)
-                            if full_validity is not None:
-                                try:
-                                    if full_validity(child_path.parent, lines):
-                                        diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
-                                except (OSError, UnicodeError, ValueError):
-                                    diagnostics.append(_catalog_diagnostic("invalid_package", package_path))
                         else:
                             diagnostics.append(_catalog_diagnostic(decode_diagnostic or "invalid_package", package_path))
                     if read_diagnostic:
@@ -978,7 +970,6 @@ def _render_entry(
 
 def _build_catalog(
     spec_root: Path,
-    full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
     """Build the relationship catalog from one captured scan."""
     if not spec_root.exists() or not spec_root.is_dir():
@@ -1019,7 +1010,6 @@ def _build_catalog(
                 spec_root,
                 records,
                 discovery_diagnostics,
-                full_validity,
             )
 
     index: dict[str, list[dict[str, object]]] = {}
@@ -1158,8 +1148,6 @@ def build_catalog(spec_root: Path) -> str:
 
 def scan_catalog(
     spec_root: Path,
-    *,
-    _full_validity: Callable[[Path, list[str]], bool] | None = None,
 ) -> str:
-    """Build the deterministic catalog with the private validity hook."""
-    return _build_catalog(spec_root, _full_validity)
+    """Build the deterministic catalog."""
+    return _build_catalog(spec_root)

@@ -119,102 +119,6 @@ class CatalogTests(TestCase):
                              entries["Fictional/Queue/unreadable"]["diagnostics"][0]["code"])
             self.assertNotIn(str(malformed), json.dumps(value))
 
-    def test_private_callback_receives_captured_lines_once_and_no_shared_import(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            anchor = package(root, "Queue", "callback", V1)
-            calls: list[tuple[Path, list[str]]] = []
-
-            def full_validity(package_path: Path, lines: list[str]) -> bool:
-                calls.append((package_path, lines))
-                return False
-
-            original_read = Path.read_bytes
-            with patch.object(
-                Path, "read_bytes", autospec=True,
-                side_effect=lambda path: original_read(path),
-            ) as read_bytes:
-                result = catalog.scan_catalog(root, _full_validity=full_validity)
-            self.assertEqual(1, read_bytes.call_count)
-            self.assertEqual(anchor, calls[0][0])
-            self.assertEqual(V1.splitlines(), calls[0][1])
-            self.assertEqual("complete", json.loads(result)["entries"][0]["state"])
-
-    def test_stable_body_anchor_is_read_once_and_hook_gets_header_only(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            anchor = package(
-                root,
-                "Queue",
-                "callback",
-                "# Header\nStatus: approved\n## Details\nprivate body\n",
-            ) / "spec.md"
-            calls: list[tuple[Path, list[str]]] = []
-
-            def full_validity(package_path: Path, lines: list[str]) -> bool:
-                calls.append((package_path, lines))
-                return False
-
-            original_read = Path.read_bytes
-            with patch.object(
-                Path,
-                "read_bytes",
-                autospec=True,
-                side_effect=lambda path: original_read(path),
-            ) as read_bytes:
-                rendered = catalog.scan_catalog(root, _full_validity=full_validity)
-            value = json.loads(rendered)
-            self.assertEqual(1, read_bytes.call_count)
-            self.assertEqual([(anchor.parent, ["# Header", "Status: approved"])], calls)
-            self.assertNotIn("private body", rendered)
-            self.assertEqual("complete", value["entries"][0]["state"])
-
-    def test_private_callback_receives_nonempty_malformed_capture(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            anchor = package(root, "Queue", "malformed", "Status: approved\nbody\n")
-            calls: list[tuple[Path, list[str]]] = []
-
-            def full_validity(package_path: Path, lines: list[str]) -> bool:
-                calls.append((package_path, lines))
-                return False
-
-            result = catalog.scan_catalog(root, _full_validity=full_validity)
-
-            self.assertEqual([(anchor, ["Status: approved", "body"])], calls)
-            self.assertEqual(
-                "complete",
-                json.loads(result)["entries"][0]["state"],
-            )
-
-    def test_public_builders_do_not_accept_full_validity_hooks(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package(root, "Queue", "one", V1)
-            with self.assertRaises(TypeError):
-                catalog.build_catalog(root, lambda _path, _lines: False)
-
-    def test_malformed_callback_and_catalog_diagnostic_are_single_pass(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            anchor = package(root, "Queue", "malformed", "Status: approved\nbody\n")
-            calls: list[list[str]] = []
-
-            def full_validity(_package_path: Path, lines: list[str]) -> bool:
-                calls.append(lines)
-                return True
-
-            value = json.loads(
-                catalog.scan_catalog(root, _full_validity=full_validity)
-            )
-            self.assertEqual([["Status: approved", "body"]], calls)
-            entry = value["entries"][0]
-            self.assertEqual(anchor.as_posix(), (root / entry["package_path"]).as_posix())
-            self.assertEqual(
-                ["invalid_package"],
-                [item["code"] for item in entry["diagnostics"]],
-            )
-
     def test_output_bound_is_enforced(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -270,7 +174,7 @@ class CatalogTests(TestCase):
             str(__import__("inspect").signature(catalog.build_catalog)),
         )
         self.assertEqual(
-            "(spec_root: 'Path', *, _full_validity: 'Callable[[Path, list[str]], bool] | None' = None) -> 'str'",
+            "(spec_root: 'Path') -> 'str'",
             str(inspect.signature(catalog.scan_catalog)),
         )
 
@@ -283,61 +187,6 @@ class CatalogTests(TestCase):
                 catalog.scan_catalog(root)
             self.assertEqual(2, builder.call_count)
             self.assertEqual([root, root], [call.args[0] for call in builder.call_args_list])
-
-    def test_empty_and_first_level_two_headers_do_not_call_hook(self) -> None:
-        for content in (b"", b"## Body\nsecret"):
-            with self.subTest(content=content), TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                anchor = package(root, "Queue", "one", "# placeholder\n") / "spec.md"
-                anchor.write_bytes(content)
-                calls: list[object] = []
-                catalog.scan_catalog(root, _full_validity=lambda *_: calls.append(True))
-                self.assertEqual([], calls)
-
-    def test_changed_fingerprint_retries_before_hook_capture(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            anchor = package(root, "Queue", "one", "# Heading\n## Body\nsecret") / "spec.md"
-            calls: list[tuple[Path, list[str]]] = []
-            original = catalog._catalog_fingerprint
-            fingerprints = 0
-
-            def fingerprint(path: Path) -> tuple[int, int, int, int, int, int]:
-                nonlocal fingerprints
-                fingerprints += 1
-                result = original(path)
-                if fingerprints == 2:
-                    return (*result[:5], result[5] + 1)
-                return result
-
-            with patch.object(catalog, "_catalog_fingerprint", side_effect=fingerprint):
-                catalog.scan_catalog(root, _full_validity=lambda path, lines: calls.append((path, lines)) or False)
-            self.assertGreaterEqual(fingerprints, 4)
-            self.assertEqual([(anchor.parent, ["# Heading"])], calls)
-
-    def test_hook_exception_classes_mark_stable_capture_invalid(self) -> None:
-        for error_type in (OSError, UnicodeError, ValueError):
-            with self.subTest(error_type=error_type), TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                package(root, "Queue", "one", "# Heading\n## Body\nsecret")
-
-                def hook(_path: Path, _lines: list[str], error_type=error_type) -> bool:
-                    raise error_type("hook failure")
-
-                value = json.loads(catalog.scan_catalog(root, _full_validity=hook))
-                self.assertEqual("partial", value["entries"][0]["state"])
-                self.assertEqual("invalid_package", value["entries"][0]["diagnostics"][0]["code"])
-
-    def test_unexpected_hook_exception_propagates(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package(root, "Queue", "one", "# Heading\n## Body\nsecret")
-
-            def hook(_path: Path, _lines: list[str]) -> bool:
-                raise RuntimeError("unexpected hook failure")
-
-            with self.assertRaisesRegex(RuntimeError, "unexpected hook failure"):
-                catalog.scan_catalog(root, _full_validity=hook)
 
     def test_fixed_lifecycle_projection_has_retained_digest_and_wire_bytes(self) -> None:
         with TemporaryDirectory() as temporary:
