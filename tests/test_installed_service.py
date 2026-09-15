@@ -40,6 +40,21 @@ def _run_nyx(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _account_snapshot() -> tuple[tuple[str, str, bytes | str | None], ...]:
+    """Capture account paths and application-managed bytes without following links."""
+
+    snapshot: list[tuple[str, str, bytes | str | None]] = []
+    for path in sorted(ACCOUNT_HOME.rglob("*")):
+        relative = str(path.relative_to(ACCOUNT_HOME))
+        if path.is_symlink():
+            snapshot.append((relative, "symlink", os.readlink(path)))
+        elif path.is_dir():
+            snapshot.append((relative, "directory", None))
+        else:
+            snapshot.append((relative, "file", path.read_bytes()))
+    return tuple(snapshot)
+
+
 def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     assert os.environ.get("HOME") == str(ACCOUNT_HOME)
     command_path = subprocess.check_output(
@@ -52,6 +67,18 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         == str(VENV_COMMAND)
     )
     assert SYMLINK.readlink() == VENV_COMMAND
+
+    before_status = _account_snapshot()
+    unconfigured = _run_nyx("--status")
+    assert unconfigured.returncode == 0, unconfigured.stderr
+    assert unconfigured.stdout.splitlines() == [
+        "Configuration: not configured",
+        "Specification root: not configured",
+        "Hidden stages: not configured",
+        "Runtime: not running",
+    ]
+    assert unconfigured.stderr == ""
+    assert _account_snapshot() == before_status
 
     specification_root = ACCOUNT_HOME / "fictional-specifications"
     anchor = specification_root / "Fictional" / "Queue" / "sample" / "spec.md"
@@ -68,6 +95,18 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         config_file = ACCOUNT_HOME / ".config" / "nyx" / "config.json"
         assert config_file.is_relative_to(ACCOUNT_HOME)
         assert config_file.exists()
+        configuration_bytes = config_file.read_bytes()
+
+        configured_stopped = _run_nyx("--status")
+        assert configured_stopped.returncode == 0, configured_stopped.stderr
+        assert configured_stopped.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: not running",
+        ]
+        assert configured_stopped.stderr == ""
+        assert config_file.read_bytes() == configuration_bytes
 
         first = _run_nyx()
         assert first.returncode == 0, first.stderr
@@ -76,6 +115,20 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         instance_file = ACCOUNT_HOME / ".local" / "state" / "nyx" / "runtime" / "instance.json"
         first_instance = json.loads(instance_file.read_text(encoding="utf-8"))
         assert instance_file.is_relative_to(ACCOUNT_HOME)
+        instance_bytes = instance_file.read_bytes()
+
+        running_status = _run_nyx("--status")
+        assert running_status.returncode == 0, running_status.stderr
+        assert running_status.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: running",
+            'URL: "http://127.0.0.1:8765/"',
+        ]
+        assert running_status.stderr == ""
+        assert config_file.read_bytes() == configuration_bytes
+        assert instance_file.read_bytes() == instance_bytes
 
         connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
         connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
@@ -98,6 +151,17 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert stopped.stdout.strip() == "stopped"
         started = False
         assert not instance_file.exists()
+
+        post_stop = _run_nyx("--status")
+        assert post_stop.returncode == 0, post_stop.stderr
+        assert post_stop.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: not running",
+        ]
+        assert post_stop.stderr == ""
+        assert config_file.read_bytes() == configuration_bytes
     finally:
         if started:
             _run_nyx("--stop")
