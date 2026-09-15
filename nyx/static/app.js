@@ -4,16 +4,19 @@
   const BOARD_ROWS = [
     ["under_development", "Under Development"],
     ["queue", "Queue"],
+    ["in_progress", "In Progress"],
     ["needs_fixes", "Needs Fixes"],
     ["awaiting_retrospective", "Awaiting Retrospective"],
+    ["done", "Done"],
+    ["archive", "Archive"],
   ];
   const BOARD_LABELS = new Map(BOARD_ROWS);
   const BOARD_STAGES = new Map([
     ["Under_Development", "under_development"], ["Queue", "queue"],
-    ["Needs_Fixes", "needs_fixes"], ["Awaiting_Retrospective", "awaiting_retrospective"],
+    ["In_Progress", "in_progress"], ["Needs_Fixes", "needs_fixes"],
+    ["Awaiting_Retrospective", "awaiting_retrospective"], ["Done", "done"],
+    ["Archive", "archive"],
   ]);
-  const OFF_BOARD = "__off_board__";
-  const OFF_BOARD_LABEL = "Reference — off board";
   const DECLARED_FIELDS = [
     ["title", "Title"], ["target_project", "Target project"], ["status", "Status"],
     ["closure", "Closure"], ["sanity_recommendation", "Sanity recommendation"],
@@ -177,7 +180,7 @@
 
   function rowKeyOf(entry) {
     return entry.board_visible && BOARD_STAGES.has(entry.stage)
-      ? BOARD_STAGES.get(entry.stage) : OFF_BOARD;
+      ? BOARD_STAGES.get(entry.stage) : null;
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -277,7 +280,7 @@
   }
 
   function renderBoard() {
-    const entries = displayed ? displayed.entries : [];
+    const entries = displayed ? displayed.entries.filter((entry) => entry.board_visible) : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
     const columns = columnsFor(entries);
@@ -309,14 +312,15 @@
       const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
       return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
     }).join(" "));
-    const rows = [...BOARD_ROWS, [OFF_BOARD, OFF_BOARD_LABEL]];
+    const hiddenStages = new Set(displayed?.visibility.hidden_stages || []);
+    const rows = BOARD_ROWS.filter(([key]) => {
+      const stage = [...BOARD_STAGES.entries()].find(([, rowKey]) => rowKey === key)?.[0];
+      return stage === undefined || !hiddenStages.has(stage);
+    });
     let html = '<h2 class="board-corner" aria-hidden="true"></h2>' +
       columns.map(([, label]) => `<h2 class="column-head">${text(label)}</h2>`).join("");
     rows.forEach(([key, label]) => {
-      const rowEntries = key === OFF_BOARD
-        ? entries.filter((entry) => !entry.board_visible)
-        : entries.filter((entry) => BOARD_STAGES.get(entry.stage) === key);
-      if (key === OFF_BOARD && rowEntries.length === 0) return;
+      const rowEntries = entries.filter((entry) => BOARD_STAGES.get(entry.stage) === key);
       const cells = columns.map(([columnKey]) => {
         const { depth, reserved } = plans.get(columnKey);
         const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
@@ -424,7 +428,7 @@
 
   function renderDetails() {
     const entries = displayed ? displayed.entries : [];
-    const entry = entries.find((item) => item.package_path === selectedPath);
+    const entry = entries.find((item) => item.board_visible && item.package_path === selectedPath);
     if (!entry) {
       const emptyCatalog = displayed && entries.length === 0;
       detailPanel.innerHTML = (emptyCatalog
@@ -506,6 +510,25 @@
     if (!condition) throw new Error("producer_protocol_error");
   }
 
+  // Python compares Unicode strings by scalar value; JavaScript relational
+  // operators compare UTF-16 code units. Protocol order must use one scalar
+  // comparator for every producer-canonical string sequence.
+  function scalarCompare(first, second) {
+    const left = [...first];
+    const right = [...second];
+    const length = Math.min(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const leftCode = left[index].codePointAt(0);
+      const rightCode = right[index].codePointAt(0);
+      if (leftCode !== rightCode) return leftCode - rightCode;
+    }
+    return left.length - right.length;
+  }
+
+  function scalarDiagnosticCompare(first, second) {
+    return scalarCompare(first.code, second.code) || scalarCompare(first.message, second.message);
+  }
+
   function safeText(value, nullable = false) {
     return (nullable && value === null) ||
       (typeof value === "string" && value.length > 0 && value.length <= 1024 &&
@@ -531,7 +554,7 @@
       protocol(exactKeys(item, ["code", "message"]) && safeText(item.code) && safeText(item.message));
     });
     protocol(value.every((item, index) => index === 0 ||
-      `${item.code}\u0000${item.message}` >= `${value[index - 1].code}\u0000${value[index - 1].message}`));
+      scalarDiagnosticCompare(item, value[index - 1]) >= 0));
   }
 
   function uuid(value, nullable = false) {
@@ -620,7 +643,7 @@
     }
     snapshot.visibility.hidden_stages.forEach((stage) => protocol(component(stage)));
     protocol(snapshot.visibility.hidden_stages.every((stage, index) =>
-      index === 0 || stage > snapshot.visibility.hidden_stages[index - 1]));
+      index === 0 || scalarCompare(stage, snapshot.visibility.hidden_stages[index - 1]) >= 0));
     diagnostics(snapshot.discovery_diagnostics);
     [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
       protocol(exactKeys(coverage, ["diagnostics", "state"]) && ["complete", "incomplete"].includes(coverage.state));
@@ -641,12 +664,12 @@
       protocol(exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
         "project", "relationship", "stage", "state", "transitive_diagnostics"]));
       uuid(entry.package_id, true);
-      protocol(component(entry.project) && component(entry.stage) && safeText(entry.package_path) &&
+      protocol(component(entry.project) && BOARD_STAGES.has(entry.stage) && safeText(entry.package_path) &&
         !(entry.package_path.startsWith("/") || entry.package_path.includes("\\") ||
           entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
         (entry.package_path === `${entry.project}/${entry.stage}` ||
           entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)) &&
-        typeof entry.board_visible === "boolean" && entry.board_visible !== hidden.has(entry.stage) &&
+        typeof entry.board_visible === "boolean" && entry.board_visible === !hidden.has(entry.stage) &&
         ["complete", "partial"].includes(entry.state));
       protocol(exactKeys(entry.declared, ["closure", "human_sanity_decision", "sanity_recommendation",
         "status", "target_project", "title"]));
@@ -657,7 +680,8 @@
       paths.push(entry.package_path);
       if (entry.board_visible) visible += 1;
     });
-    protocol(paths.every((path, index) => index === 0 || path > paths[index - 1]) &&
+    protocol(paths.every((path, index) => index === 0 ||
+      scalarCompare(path, paths[index - 1]) >= 0) &&
       new Set(paths).size === paths.length);
     if (visible !== snapshot.visibility.visible_entry_count ||
         snapshot.visibility.hidden_entry_count < snapshot.entries.length - visible) {
@@ -685,7 +709,8 @@
     displayed = snapshot;
     pending = null;
     setPending(false);
-    if (selectedPath && !snapshot.entries.some((entry) => entry.package_path === selectedPath)) {
+    if (selectedPath && !snapshot.entries.some((entry) =>
+      entry.board_visible && entry.package_path === selectedPath)) {
       selectedPath = null;
     }
     status.textContent = loadedStatus(snapshot);
