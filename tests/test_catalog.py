@@ -42,6 +42,7 @@ class CatalogTests(TestCase):
                 outside_package.mkdir(parents=True)
                 outside_package.joinpath("spec.md").write_text("# Escaped\n", encoding="utf-8")
                 original_open = os.open
+                intercepted_parent_fds: list[int | None] = []
                 replaced = False
 
                 def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
@@ -54,6 +55,7 @@ class CatalogTests(TestCase):
                         "package": "inside",
                     }[boundary]
                     if not replaced and path == target:
+                        intercepted_parent_fds.append(dir_fd)
                         if boundary == "root":
                             root.rename(base / "original-root")
                             root.symlink_to(outside, target_is_directory=True)
@@ -74,6 +76,11 @@ class CatalogTests(TestCase):
                 with patch.object(catalog.os, "open", side_effect=guarded_open):
                     value = json.loads(catalog.scan_catalog(root))
                 self.assertTrue(replaced)
+                self.assertEqual(1, len(intercepted_parent_fds))
+                if boundary == "root":
+                    self.assertIsNone(intercepted_parent_fds[0])
+                else:
+                    self.assertIsNotNone(intercepted_parent_fds[0])
                 self.assertNotIn("Escaped", json.dumps(value))
                 self.assertEqual("Inside", value["entries"][0]["declared"]["title"])
 
@@ -146,11 +153,17 @@ class CatalogTests(TestCase):
             with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
                 base = Path(temporary)
                 root = base / "specs"
-                package_path = package(root, "Queue", "group", "# Inside\n")
+                group_path = root / "Fictional" / "Queue" / "group"
+                package_path = group_path / "inside"
+                package_path.mkdir(parents=True)
+                package_path.joinpath("spec.md").write_text("# Inside\n", encoding="utf-8")
                 if boundary == "group":
-                    outside = base / "outside" / "escape"
-                    outside.mkdir(parents=True)
-                    outside.joinpath("spec.md").write_text("# Escaped\n", encoding="utf-8")
+                    outside = base / "outside-group"
+                    outside_package = outside / "escape"
+                    outside_package.mkdir(parents=True)
+                    outside_package.joinpath("spec.md").write_text(
+                        "# Escaped\n", encoding="utf-8"
+                    )
                 else:
                     outside = base / "outside-spec.md"
                     outside.write_text("# Escaped\n", encoding="utf-8")
@@ -165,8 +178,8 @@ class CatalogTests(TestCase):
                         intercepted_parent_fds.append(dir_fd)
                         self.assertIsNotNone(dir_fd)
                         if boundary == "group":
-                            package_path.rename(base / "original-group")
-                            package_path.symlink_to(outside, target_is_directory=True)
+                            group_path.rename(base / "original-group")
+                            group_path.symlink_to(outside, target_is_directory=True)
                         else:
                             anchor = package_path / "spec.md"
                             anchor.rename(base / "original-spec.md")
@@ -177,8 +190,10 @@ class CatalogTests(TestCase):
                 with patch.object(catalog.os, "open", side_effect=guarded_open):
                     value = json.loads(catalog.scan_catalog(root))
                 self.assertTrue(replaced)
-                self.assertEqual([value for value in intercepted_parent_fds if value is not None], intercepted_parent_fds)
+                self.assertEqual(1, len(intercepted_parent_fds))
+                self.assertIsNotNone(intercepted_parent_fds[0])
                 self.assertNotIn("Escaped", json.dumps(value))
+                self.assertEqual("Inside", value["entries"][0]["declared"]["title"])
 
     def test_program_object_failures_produce_honest_incomplete_coverage(self) -> None:
         cases = ("missing", "symlink", "nonregular", "unreadable", "changed")
@@ -286,6 +301,24 @@ class CatalogTests(TestCase):
 
             with patch.object(catalog.os, "open", side_effect=not_implemented_dir_fd):
                 with self.assertRaises(ValueError):
+                    catalog.scan_catalog(root)
+
+            for failure in (TypeError, NotImplementedError, ValueError):
+                def unsupported_anchor(path, flags, mode=0o777, *, dir_fd=None):
+                    if path == "spec.md" and dir_fd is not None:
+                        raise failure("anchor dir_fd unsupported")
+                    return original_open(path, flags, mode, dir_fd=dir_fd)
+
+                with patch.object(catalog.os, "open", side_effect=unsupported_anchor), patch.object(
+                    Path, "read_bytes", side_effect=AssertionError("pathname fallback")
+                ):
+                    with self.assertRaisesRegex(ValueError, "descriptor-relative open is unavailable"):
+                        catalog.scan_catalog(root)
+
+            with patch.object(catalog.os, "scandir", side_effect=TypeError("fd scandir unsupported")), patch.object(
+                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
+            ):
+                with self.assertRaisesRegex(ValueError, "descriptor enumeration is unavailable"):
                     catalog.scan_catalog(root)
 
     def test_descriptor_session_closes_on_parser_exception_and_concurrent_scans_overlap(self) -> None:
