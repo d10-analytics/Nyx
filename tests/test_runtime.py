@@ -507,7 +507,7 @@ def test_observe_runtime_requires_same_uid_before_sending_capability():
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_CONTROL_IDENTITY_MISMATCH
         assert received == [b""]
-        assert instance.capability not in b"".join(received)
+        assert instance.capability.encode("utf-8") not in b"".join(received)
 
 
 def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state():
@@ -574,6 +574,7 @@ def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
         started = time.monotonic()
         try:
             observed = _observe(paths)
+            elapsed = time.monotonic() - started
         finally:
             listener.close()
             server.join(timeout=3)
@@ -582,7 +583,7 @@ def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
         assert accepted.is_set()
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_CONTROL_TIMED_OUT
-        assert time.monotonic() - started < 1.5
+        assert elapsed < 1.5
 
 
 def test_observe_runtime_rejects_record_replacement_after_ready_response():
@@ -608,7 +609,9 @@ def test_observe_runtime_rejects_record_replacement_after_ready_response():
                     (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
                 )
                 record = paths.runtime_directory / "instance.json"
-                record.write_bytes(record.read_bytes().replace(b"instance", b"replaced"))
+                before = record.stat()
+                record.write_bytes(record.read_bytes().replace(b"instance", b"changed_"))
+                os.utime(record, ns=(before.st_atime_ns, before.st_mtime_ns))
 
         server = threading.Thread(target=serve)
         server.start()
