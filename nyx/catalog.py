@@ -121,7 +121,7 @@ def _catalog_declared(lines: list[str]) -> dict[str, str | None]:
 def _catalog_require_descriptor_capabilities() -> tuple[int, int, int]:
     """Require the no-follow descriptor operations used by one scan session."""
     flags = tuple(getattr(os, name, None) for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"))
-    if any(not isinstance(value, int) for value in flags):
+    if any(not isinstance(value, int) or value <= 0 for value in flags):
         raise ValueError("catalog descriptor capabilities are unavailable")
     return flags  # type: ignore[return-value]
 
@@ -140,7 +140,7 @@ def _catalog_open_root(spec_root: Path) -> int:
     nofollow, directory, cloexec = _catalog_require_descriptor_capabilities()
     try:
         descriptor = os.open(spec_root, os.O_RDONLY | directory | cloexec | nofollow)
-    except (OSError, TypeError, ValueError) as error:
+    except (OSError, TypeError, NotImplementedError, ValueError) as error:
         raise ValueError("specification root cannot be read") from error
     try:
         mode = os.fstat(descriptor).st_mode
@@ -160,7 +160,7 @@ def _catalog_open_directory_at(parent_fd: int, name: str) -> int:
             os.O_RDONLY | directory | cloexec | nofollow,
             dir_fd=parent_fd,
         )
-    except TypeError as error:
+    except (TypeError, NotImplementedError) as error:
         raise ValueError("catalog descriptor-relative open is unavailable") from error
     except (OSError, ValueError) as error:
         raise error
@@ -168,6 +168,9 @@ def _catalog_open_directory_at(parent_fd: int, name: str) -> int:
         mode = os.fstat(descriptor).st_mode
         if not stat.S_ISDIR(mode) or not _catalog_fd_readable(mode, directory=True):
             raise OSError("catalog directory cannot be read")
+    except NotImplementedError as error:
+        os.close(descriptor)
+        raise ValueError("catalog descriptor-relative stat is unavailable") from error
     except BaseException:
         os.close(descriptor)
         raise
@@ -177,14 +180,17 @@ def _catalog_open_directory_at(parent_fd: int, name: str) -> int:
 def _catalog_stat_at(parent_fd: int, name: str) -> os.stat_result:
     try:
         return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except (TypeError, ValueError) as error:
+    except (TypeError, NotImplementedError, ValueError) as error:
         raise ValueError("catalog descriptor-relative stat is unavailable") from error
 
 
 def _catalog_read_fd(descriptor: int) -> bytes:
     chunks: list[bytes] = []
     while True:
-        chunk = os.read(descriptor, 1024 * 1024)
+        try:
+            chunk = os.read(descriptor, 1024 * 1024)
+        except NotImplementedError as error:
+            raise ValueError("catalog descriptor read is unavailable") from error
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -209,7 +215,7 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
                 os.O_RDONLY | cloexec | nofollow,
                 dir_fd=parent_fd,
             )
-        except TypeError as error:
+        except (TypeError, NotImplementedError) as error:
             raise ValueError("catalog descriptor-relative open is unavailable") from error
         except (FileNotFoundError, OSError, ValueError):
             return None, "nonregular_anchor"
@@ -219,6 +225,8 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
                 return None, "nonregular_anchor"
             last_data = _catalog_read_fd(descriptor)
             after = os.fstat(descriptor)
+        except NotImplementedError as error:
+            raise ValueError("catalog descriptor read is unavailable") from error
         except OSError:
             return None, "unreadable_anchor"
         finally:
