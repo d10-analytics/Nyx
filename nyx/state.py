@@ -28,7 +28,7 @@ _OMITTED = object()
 CONFIGURATION_UNAVAILABLE = "configuration_unavailable"
 
 CONFIGURATION_STATES = frozenset({"configured", "not_configured", "unavailable"})
-RUNTIME_STATES = frozenset({"not_running", "unknown"})
+RUNTIME_STATES = frozenset({"running", "not_running", "unknown"})
 
 
 class StateError(RuntimeError):
