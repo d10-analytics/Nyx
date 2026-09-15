@@ -25,6 +25,11 @@ DEPLOYMENT_FILENAME = "deployment.json"
 RUNTIME_DIRECTORY = "runtime"
 _OMITTED = object()
 
+CONFIGURATION_UNAVAILABLE = "configuration_unavailable"
+
+CONFIGURATION_STATES = frozenset({"configured", "not_configured", "unavailable"})
+RUNTIME_STATES = frozenset({"not_running", "unknown"})
+
 
 class StateError(RuntimeError):
     """Base class for safe, user-facing state errors."""
@@ -75,6 +80,51 @@ class Configuration:
             "hidden_stages": list(self.hidden_stages),
             "specification_root": str(self.specification_root),
         }
+
+
+@dataclass(frozen=True)
+class ConfigurationObservation:
+    """A read-only, configuration-only view of the account state."""
+
+    status: str
+    specification_root: Path | None = None
+    hidden_stages: tuple[str, ...] | None = None
+    diagnostic: str | None = None
+
+    @property
+    def state(self) -> str:
+        """Compatibility spelling for consumers that call the status a state."""
+
+        return self.status
+
+    @property
+    def root(self) -> Path | None:
+        return self.specification_root
+
+    @property
+    def configuration(self) -> Configuration | None:
+        if self.status != "configured":
+            return None
+        assert self.specification_root is not None
+        assert self.hidden_stages is not None
+        return Configuration(self.specification_root, self.hidden_stages)
+
+
+@dataclass(frozen=True)
+class RuntimeObservation:
+    """A read-only view of the fixed runtime tree, independent of configuration."""
+
+    status: str
+    paths: StatePaths | None = None
+    diagnostic: str | None = None
+
+    @property
+    def state(self) -> str:
+        return self.status
+
+    @property
+    def runtime_directory(self) -> Path | None:
+        return None if self.paths is None else self.paths.runtime_directory
 
 
 def _require_linux() -> None:
@@ -179,6 +229,47 @@ def _verify_general_directory(path: Path) -> None:
         raise AccountHomeError("Nyx state parent is writable by another UID")
 
 
+def _fixed_state_paths() -> StatePaths:
+    """Derive fixed per-account paths without validating their children."""
+
+    _require_linux()
+    home = resolve_account_home()
+    paths = StatePaths(
+        account_home=home,
+        config_directory=home / ".config" / "nyx",
+        config_file=home / ".config" / "nyx" / CONFIG_FILENAME,
+        state_directory=home / ".local" / "state" / "nyx",
+        deployment_file=home / ".local" / "state" / "nyx" / DEPLOYMENT_FILENAME,
+        runtime_directory=home / ".local" / "state" / "nyx" / RUNTIME_DIRECTORY,
+    )
+    for path in (
+        home / ".config",
+        paths.config_directory,
+        home / ".local",
+        home / ".local" / "state",
+        paths.state_directory,
+        paths.runtime_directory,
+    ):
+        if any(_is_within(path, footprint) for footprint in _installation_footprints()):
+            raise AccountHomeError("Nyx state would be inside its installation")
+    return paths
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    """Return metadata, preserving a distinction between absent and unavailable."""
+
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise AccountHomeError("Nyx state path is unavailable") from error
+
+
+def _is_missing(path: Path) -> bool:
+    return _lstat(path) is None
+
+
 def _ensure_general_directory(path: Path) -> None:
     try:
         path.mkdir(mode=0o700)
@@ -202,35 +293,21 @@ def _ensure_directory(path: Path, uid: int) -> None:
 def state_paths(*, create: bool = False) -> StatePaths:
     """Return fixed per-account paths, optionally creating Nyx directories."""
 
-    _require_linux()
-    home = resolve_account_home()
+    paths = _fixed_state_paths()
     uid = _current_uid()
-    config_base = home / ".config"
-    config_directory = config_base / "nyx"
-    state_directory = home / ".local" / "state" / "nyx"
-    runtime_directory = state_directory / RUNTIME_DIRECTORY
-    paths = StatePaths(
-        account_home=home,
-        config_directory=config_directory,
-        config_file=config_directory / CONFIG_FILENAME,
-        state_directory=state_directory,
-        deployment_file=state_directory / DEPLOYMENT_FILENAME,
-        runtime_directory=runtime_directory,
-    )
-    for path in (config_base, config_directory, home / ".local", home / ".local" / "state",
-                 state_directory, runtime_directory):
-        if any(_is_within(path, footprint) for footprint in _installation_footprints()):
-            raise AccountHomeError("Nyx state would be inside its installation")
+    config_base = paths.config_directory.parent
+    local_base = paths.state_directory.parents[1]
+    state_parent = paths.state_directory.parent
     if create:
-        for path in (config_base, home / ".local", home / ".local" / "state"):
+        for path in (config_base, local_base, state_parent):
             _ensure_general_directory(path)
-        for path in (config_directory, state_directory, runtime_directory):
+        for path in (paths.config_directory, paths.state_directory, paths.runtime_directory):
             _ensure_directory(path, uid)
     else:
-        for path in (config_base, home / ".local", home / ".local" / "state"):
+        for path in (config_base, local_base, state_parent):
             if path.exists() or path.is_symlink():
                 _verify_general_directory(path)
-        for path in (config_directory, state_directory, runtime_directory):
+        for path in (paths.config_directory, paths.state_directory, paths.runtime_directory):
             if path.exists() or path.is_symlink():
                 _verify_directory(path, uid)
     return paths
@@ -317,6 +394,87 @@ def load_configuration(paths: StatePaths | None = None) -> Configuration:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ConfigurationError("Nyx configuration cannot be read") from error
     return _configuration_from_payload(payload)
+
+
+def _configuration_unavailable() -> ConfigurationObservation:
+    return ConfigurationObservation("unavailable", diagnostic=CONFIGURATION_UNAVAILABLE)
+
+
+def observe_configuration() -> ConfigurationObservation:
+    """Observe only the persisted configuration without inspecting runtime paths.
+
+    A missing, validly absent configuration is represented as ``not_configured``.
+    Every other configuration read or validation failure is deliberately collapsed
+    to the bounded ``configuration_unavailable`` diagnostic.
+    """
+
+    try:
+        paths = _fixed_state_paths()
+        config_parent = paths.config_directory.parent
+        if _is_missing(config_parent):
+            return ConfigurationObservation("not_configured")
+        _verify_general_directory(config_parent)
+        if _is_missing(paths.config_directory):
+            return ConfigurationObservation("not_configured")
+        _verify_directory(paths.config_directory, _current_uid())
+        if _is_missing(paths.config_file):
+            return ConfigurationObservation("not_configured")
+        configuration = load_configuration(paths)
+    except StateError:
+        return _configuration_unavailable()
+    return ConfigurationObservation(
+        "configured",
+        specification_root=configuration.specification_root,
+        hidden_stages=configuration.hidden_stages,
+    )
+
+
+_RUNTIME_RECORDS = frozenset({"operation.lock", "lease.lock", "instance.json"})
+
+
+def observe_runtime() -> RuntimeObservation:
+    """Observe the fixed runtime tree without reading configuration or creating it.
+
+    Runtime file semantics (leases, locks, and instance records) are resolved by
+    the lifecycle owner.  This state-level observer validates their fixed tree
+    and reports a present-but-unresolved tree as ``unknown``.
+    """
+
+    try:
+        paths = _fixed_state_paths()
+        local_parent = paths.state_directory.parents[1]
+        state_parent = paths.state_directory.parent
+        for parent in (local_parent, state_parent):
+            if _is_missing(parent):
+                return RuntimeObservation("not_running", paths=paths)
+            _verify_general_directory(parent)
+        if _is_missing(paths.state_directory):
+            return RuntimeObservation("not_running", paths=paths)
+        _verify_directory(paths.state_directory, _current_uid())
+        if _is_missing(paths.runtime_directory):
+            return RuntimeObservation("unknown", paths=paths)
+        _verify_directory(paths.runtime_directory, _current_uid())
+
+        entries = tuple(paths.runtime_directory.iterdir())
+        if not entries:
+            return RuntimeObservation("not_running", paths=paths)
+        for entry in entries:
+            details = entry.lstat()
+            if entry.name not in _RUNTIME_RECORDS:
+                return RuntimeObservation("unknown", paths=paths)
+            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+                return RuntimeObservation("unknown", paths=paths)
+            if details.st_uid != _current_uid() or stat.S_IMODE(details.st_mode) != 0o600:
+                return RuntimeObservation("unknown", paths=paths)
+    except (OSError, StateError):
+        return RuntimeObservation("unknown")
+    return RuntimeObservation("unknown", paths=paths)
+
+
+# Explicit path-oriented aliases make the ownership boundary visible to callers
+# while retaining one implementation for the read-only runtime tree.
+observe_configuration_paths = observe_configuration
+observe_runtime_paths = observe_runtime
 
 
 def _configuration_bytes(root: Path, hidden_stages: tuple[str, ...]) -> bytes:
@@ -406,16 +564,25 @@ def setup(
 
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
+    "CONFIGURATION_STATES",
+    "CONFIGURATION_UNAVAILABLE",
     "AccountHomeError",
     "Configuration",
     "ConfigurationError",
+    "ConfigurationObservation",
     "HiddenStageError",
     "LEGACY_CONFIG_SCHEMA_VERSION",
+    "RUNTIME_STATES",
+    "RuntimeObservation",
     "SpecificationRootError",
     "StateError",
     "StatePaths",
     "UnsupportedPlatformError",
     "load_configuration",
+    "observe_configuration",
+    "observe_configuration_paths",
+    "observe_runtime",
+    "observe_runtime_paths",
     "resolve_account_home",
     "resolve_specification_root",
     "save_configuration",
