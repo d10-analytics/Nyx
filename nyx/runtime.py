@@ -470,12 +470,13 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
     if operation_state in {"unsafe", "changed"}:
         return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
 
-    operation_initial = _read_metadata(operation_path)
-    lease_initial = _read_metadata(lease_path)
-    record_initial = _read_metadata(record_path, read_data=True)
-    lease = _ExistingLock(lease_path)
-    lease_state = lease.acquire()
+    lease: _ExistingLock | None = None
     try:
+        operation_initial = _read_metadata(operation_path)
+        lease_initial = _read_metadata(lease_path)
+        record_initial = _read_metadata(record_path, read_data=True)
+        lease = _ExistingLock(lease_path)
+        lease_state = lease.acquire()
         if lease_state in {"unsafe", "changed"}:
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         if lease_state == "held":
@@ -542,7 +543,8 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         return _runtime_observation("not_running", paths)
     finally:
-        lease.close()
+        if lease is not None:
+            lease.close()
         operation.close()
 
 
