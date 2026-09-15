@@ -261,6 +261,16 @@ def _metadata_unchanged(path: Path, original: _Metadata, *, read_data: bool = Fa
     return current == original
 
 
+def _record_snapshot(path: Path) -> _Metadata:
+    """Capture record metadata and bytes so equal-size rewrites are observable."""
+
+    return _read_metadata(path, read_data=True)
+
+
+def _record_unchanged(path: Path, original: _Metadata) -> bool:
+    return _metadata_unchanged(path, original, read_data=True)
+
+
 def _directory_stamp(path: Path) -> tuple[int, int, int, int, int, int, int]:
     details = path.lstat()
     if not stat.S_ISDIR(details.st_mode):
@@ -298,7 +308,7 @@ def _stable_absent_runtime(paths: state.StatePaths) -> RuntimeObservation:
         first = (
             _read_metadata(operation_path),
             _read_metadata(lease_path),
-            _read_metadata(record_path, read_data=True),
+            _record_snapshot(record_path),
         )
         if runtime_path.exists():
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
@@ -308,7 +318,7 @@ def _stable_absent_runtime(paths: state.StatePaths) -> RuntimeObservation:
         second = (
             _read_metadata(operation_path),
             _read_metadata(lease_path),
-            _read_metadata(record_path, read_data=True),
+            _record_snapshot(record_path),
         )
         if runtime_path.exists() or first != second or not _directory_unchanged(anchor, anchor_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
@@ -534,7 +544,7 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
     try:
         operation_initial = _read_metadata(operation_path)
         lease_initial = _read_metadata(lease_path)
-        record_initial = _read_metadata(record_path, read_data=True)
+        record_initial = _record_snapshot(record_path)
         lease = _ExistingLock(lease_path)
         lease_state = lease.acquire()
         if lease_state in {"unsafe", "changed"}:
@@ -562,7 +572,7 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
             try:
                 _require_deadline(deadline)
-                record_stable = _metadata_unchanged(record_path, record_initial, read_data=True)
+                record_stable = _record_unchanged(record_path, record_initial)
                 _require_deadline(deadline)
                 lease_stable = _metadata_unchanged(lease_path, lease_initial)
                 _require_deadline(deadline)
@@ -587,7 +597,7 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             if not _metadata_unchanged(lease_path, lease_initial):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _metadata_unchanged(record_path, record_initial, read_data=True):
+            if not _record_unchanged(record_path, record_initial):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             if not _directory_unchanged(paths.runtime_directory, layout_initial):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
@@ -603,7 +613,7 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         if not _metadata_unchanged(lease_path, lease_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        if not _metadata_unchanged(record_path, record_initial, read_data=True):
+        if not _record_unchanged(record_path, record_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         if not _directory_unchanged(paths.runtime_directory, layout_initial):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
