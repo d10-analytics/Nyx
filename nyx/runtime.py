@@ -283,6 +283,40 @@ def _directory_unchanged(path: Path, original: tuple[int, int, int, int, int, in
         return False
 
 
+def _stable_absent_runtime(paths: state.StatePaths) -> RuntimeObservation:
+    """Confirm absence twice while watching the nearest existing directory."""
+
+    runtime_path = paths.runtime_directory
+    operation_path = runtime_path / "operation.lock"
+    lease_path = runtime_path / "lease.lock"
+    record_path = runtime_path / "instance.json"
+    anchor = runtime_path
+    while not anchor.exists() and anchor != anchor.parent:
+        anchor = anchor.parent
+    try:
+        anchor_initial = _directory_stamp(anchor)
+        first = (
+            _read_metadata(operation_path),
+            _read_metadata(lease_path),
+            _read_metadata(record_path, read_data=True),
+        )
+        if runtime_path.exists():
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        structural = state.observe_runtime()
+        if structural.status != "not_running" or structural.paths is None:
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        second = (
+            _read_metadata(operation_path),
+            _read_metadata(lease_path),
+            _read_metadata(record_path, read_data=True),
+        )
+        if runtime_path.exists() or first != second or not _directory_unchanged(anchor, anchor_initial):
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+    except (OSError, RuntimeErrorBase, state.StateError):
+        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+    return _runtime_observation("not_running", paths)
+
+
 def _require_deadline(deadline: float) -> None:
     if deadline - time.monotonic() <= 0:
         raise _ControlTimeoutError("control deadline expired")
@@ -590,7 +624,7 @@ def observe_runtime() -> RuntimeObservation:
             return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
         if not paths.runtime_directory.exists():
             if structural.status == "not_running":
-                return _runtime_observation("not_running", paths)
+                return _stable_absent_runtime(paths)
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         return _observe_runtime_with_paths(paths)
     except (OSError, state.StateError, RuntimeErrorBase):
