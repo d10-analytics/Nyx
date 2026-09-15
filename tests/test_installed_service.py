@@ -112,6 +112,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert config_file.exists()
         configuration_bytes = config_file.read_bytes()
 
+        before_configured_stopped = _account_snapshot()
         configured_stopped = _run_nyx("--status")
         assert configured_stopped.returncode == 0, configured_stopped.stderr
         assert configured_stopped.stdout.splitlines() == [
@@ -122,6 +123,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         ]
         assert configured_stopped.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
+        assert _account_snapshot() == before_configured_stopped
 
         first = _run_nyx()
         assert first.returncode == 0, first.stderr
@@ -132,6 +134,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert instance_file.is_relative_to(ACCOUNT_HOME)
         instance_bytes = instance_file.read_bytes()
 
+        before_running_status = _account_snapshot()
         running_status = _run_nyx("--status")
         assert running_status.returncode == 0, running_status.stderr
         assert running_status.stdout.splitlines() == [
@@ -144,6 +147,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert running_status.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
         assert instance_file.read_bytes() == instance_bytes
+        assert _account_snapshot() == before_running_status
 
         connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
         connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
@@ -167,6 +171,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         started = False
         assert not instance_file.exists()
 
+        before_post_stop = _account_snapshot()
         post_stop = _run_nyx("--status")
         assert post_stop.returncode == 0, post_stop.stderr
         assert post_stop.stdout.splitlines() == [
@@ -177,6 +182,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         ]
         assert post_stop.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
+        assert _account_snapshot() == before_post_stop
     finally:
         if started:
             _run_nyx("--stop")
