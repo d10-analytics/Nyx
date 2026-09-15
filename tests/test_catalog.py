@@ -321,6 +321,58 @@ class CatalogTests(TestCase):
                 with self.assertRaisesRegex(ValueError, "descriptor enumeration is unavailable"):
                     catalog.scan_catalog(root)
 
+    def test_pre_admission_root_symlink_is_rejected(self) -> None:
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            outside = base / "outside"
+            package(outside, "Queue", "escape", "# Escaped\n")
+            root = base / "specs"
+            root.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
+                catalog.scan_catalog(root)
+
+    def test_descriptor_session_closes_on_subtree_open_failure(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested_package = root / "Fictional" / "Queue" / "group" / "inside"
+            nested_package.mkdir(parents=True)
+            nested_package.joinpath("spec.md").write_text("# Inside\n", encoding="utf-8")
+            original_open, original_close = os.open, os.close
+            opened: list[int] = []
+            closed: list[int] = []
+            intercepted = False
+
+            def fail_group_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal intercepted
+                if path == "group" and dir_fd is not None:
+                    intercepted = True
+                    raise OSError("subtree open failed")
+                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                opened.append(descriptor)
+                return descriptor
+
+            def tracked_close(descriptor: int) -> None:
+                closed.append(descriptor)
+                original_close(descriptor)
+
+            with patch.object(catalog.os, "open", side_effect=fail_group_open), patch.object(
+                catalog.os, "close", side_effect=tracked_close
+            ):
+                value = json.loads(catalog.scan_catalog(root))
+
+            self.assertTrue(intercepted)
+            self.assertEqual([], value["entries"])
+            self.assertEqual("incomplete", value["identity_coverage"]["state"])
+            self.assertEqual(
+                ["discovery_unavailable"],
+                [diagnostic["code"] for diagnostic in value["identity_coverage"]["diagnostics"]],
+            )
+            self.assertCountEqual(opened, closed)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
     def test_descriptor_session_closes_on_parser_exception_and_concurrent_scans_overlap(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
