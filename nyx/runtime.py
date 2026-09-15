@@ -584,6 +584,12 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_CONTROL_TIMED_OUT)
             if not record_stable or not lease_stable or not operation_stable or not layout_stable:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            _require_deadline(deadline)
+            lease_probe = _ExistingLock(lease_path)
+            lease_probe_state = lease_probe.acquire()
+            lease_probe.close()
+            if lease_probe_state != "held":
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             return _runtime_observation("running", paths, url=URL)
 
         # There is no held lease: a valid record is stale and remains untouched.
