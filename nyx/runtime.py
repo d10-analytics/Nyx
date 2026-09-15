@@ -181,10 +181,13 @@ class _ExistingLock:
         if not _safe_lock_metadata(before):
             return "unsafe"
         flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd: int | None = None
         try:
             fd = os.open(self.path, flags)
             after = os.fstat(fd)
         except OSError:
+            if fd is not None:
+                os.close(fd)
             return "unsafe"
         if not _safe_lock_metadata(after) or _metadata_identity(before) != _metadata_identity(after):
             os.close(fd)
@@ -441,6 +444,20 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
     lease_path = paths.runtime_directory / "lease.lock"
     record_path = _record_path(paths)
 
+    try:
+        entries = tuple(paths.runtime_directory.iterdir())
+    except OSError:
+        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+    for entry in entries:
+        if entry.name not in {"operation.lock", "lease.lock", "instance.json"}:
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+        try:
+            details = entry.lstat()
+        except OSError:
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+        if not _safe_lock_metadata(details):
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+
     operation = _ExistingLock(operation_path)
     operation_state = operation.acquire()
     if operation_state == "held":
@@ -526,8 +543,10 @@ def observe_runtime() -> RuntimeObservation:
         paths = structural.paths
         if paths is None:
             return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
-        if structural.status == "not_running" and not paths.runtime_directory.exists():
-            return _runtime_observation("not_running", paths)
+        if not paths.runtime_directory.exists():
+            if structural.status == "not_running":
+                return _runtime_observation("not_running", paths)
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         return _observe_runtime_with_paths(paths)
     except (OSError, state.StateError, RuntimeErrorBase):
         return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
