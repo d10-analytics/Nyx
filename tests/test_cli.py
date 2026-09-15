@@ -169,6 +169,36 @@ def test_status_keeps_runtime_result_when_configuration_is_unavailable(capsys):
     assert captured.err == ""
 
 
+def test_status_collapses_malformed_persisted_root_and_preserves_runtime_sibling(capsys):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        home_patch = patch.object(state, "resolve_account_home", return_value=home)
+        uid_patch = patch.object(state, "_current_uid", return_value=os.getuid())
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.config_file.write_text(
+                '{"schema_version":2,"hidden_stages":[],"specification_root":"/\\u0000"}\n',
+                encoding="utf-8",
+            )
+            os.chmod(paths.config_file, 0o600)
+            before = paths.config_file.read_bytes()
+
+            assert cli.main(["--status"]) == 1
+
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [
+            "Configuration: unavailable",
+            "Specification root: unavailable",
+            "Hidden stages: unavailable",
+            "Runtime: not running",
+            "Diagnostic: configuration unavailable",
+        ]
+        assert captured.err == ""
+        assert paths.config_file.read_bytes() == before
+
+
 def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_diagnostic(
     capsys,
 ):

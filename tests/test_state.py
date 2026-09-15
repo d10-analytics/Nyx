@@ -433,6 +433,35 @@ def test_configuration_observation_collapses_invalid_and_unsupported_records(pay
         assert observed.hidden_stages is None
 
 
+def test_configuration_observation_collapses_path_resolution_value_error():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.config_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "hidden_stages": [],
+                        "specification_root": "/\x00",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(paths.config_file, 0o600)
+            before = paths.config_file.read_bytes()
+            observed = state.observe_configuration()
+
+        assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
+        assert observed == state.ConfigurationObservation(
+            "unavailable", diagnostic=state.CONFIGURATION_UNAVAILABLE
+        )
+        assert paths.config_file.read_bytes() == before
+
+
 def test_configuration_observation_isolated_from_unsafe_runtime_ancestry():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
