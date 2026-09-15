@@ -826,47 +826,112 @@ class CatalogTests(TestCase):
                 f"# Done\nPackage ID: {ids[5]}\nClaim: release | satisfied | sha256:{'a' * 64}\n",
                 encoding="utf-8",
             )
-            first = catalog.build_catalog(root)
-            second = catalog.build_catalog(root)
-            self.assertEqual(first.encode("utf-8"), second.encode("utf-8"))
-            value = json.loads(first)
-            self.assertEqual(3, value["schema_version"])
-            self.assertEqual(4, value["visibility"]["visible_entry_count"])
-            self.assertEqual(3, value["visibility"]["hidden_entry_count"])
-            digest_input = dict(value)
-            digest_input.pop("catalog_digest")
-            self.assertEqual(
-                catalog.sha256(json.dumps(digest_input, sort_keys=True,
-                                           separators=(",", ":")).encode()).hexdigest(),
-                value["catalog_digest"],
-            )
-            self.assertEqual(
-                {"Under_Development", "Queue", "Needs_Fixes", "Awaiting_Retrospective", "Done"},
-                {entry["stage"] for entry in value["entries"]},
-            )
-            self.assertEqual(
-                [
-                    "Fictional/Awaiting_Retrospective/awaiting_retrospective",
-                    "Fictional/Done/done",
-                    "Fictional/Needs_Fixes/needs_fixes",
-                    "Fictional/Queue/queue",
-                    "Fictional/Under_Development/under_development",
-                ],
-                [entry["package_path"] for entry in value["entries"]],
-            )
-            self.assertEqual(
-                {
-                    "Awaiting_Retrospective": True,
-                    "Done": False,
-                    "Needs_Fixes": True,
-                    "Queue": True,
-                    "Under_Development": True,
-                },
-                {entry["stage"]: entry["board_visible"] for entry in value["entries"]},
-            )
-            self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
-            queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
-            self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+            def inventory() -> list[tuple[object, ...]]:
+                result = []
+                for path in [root, *sorted(root.rglob("*"))]:
+                    info = path.lstat()
+                    if path.is_symlink():
+                        kind = "symlink"
+                        payload: object = os.readlink(path)
+                    elif path.is_dir():
+                        kind = "directory"
+                        payload = None
+                    elif path.is_file():
+                        kind = "file"
+                        payload = path.read_bytes()
+                    else:
+                        kind = "other"
+                        payload = None
+                    result.append(
+                        (
+                            "." if path == root else path.relative_to(root).as_posix(),
+                            kind,
+                            info.st_mode,
+                            info.st_uid,
+                            info.st_gid,
+                            info.st_size,
+                            info.st_mtime_ns,
+                            info.st_ctime_ns,
+                            payload,
+                        )
+                    )
+                return result
+
+            original_open = os.open
+            renders: list[str] = []
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                with self.subTest(producer=producer.__name__):
+                    before = inventory()
+
+                    def reject_writes(path, flags, mode=0o777, *, dir_fd=None):
+                        self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+                        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+                    def reject_write_operation(*_args, **_kwargs):
+                        raise AssertionError("catalog attempted a write operation")
+
+                    with ExitStack() as stack:
+                        scans = stack.enter_context(
+                            patch.object(
+                                catalog,
+                                "_catalog_scandir",
+                                wraps=catalog._catalog_scandir,
+                            )
+                        )
+                        stack.enter_context(patch.object(catalog.os, "open", side_effect=reject_writes))
+                        for name in (
+                            "mkdir", "unlink", "rename", "replace", "symlink", "chmod",
+                            "truncate", "write", "mknod", "link", "rmdir", "remove",
+                            "fchmod", "ftruncate", "utime",
+                        ):
+                            stack.enter_context(
+                                patch.object(catalog.os, name, side_effect=reject_write_operation)
+                            )
+                        rendered = producer(root)
+
+                    self.assertEqual(15, scans.call_count)
+                    renders.append(rendered)
+                    value = json.loads(rendered)
+                    self.assertEqual(3, value["schema_version"])
+                    self.assertEqual(4, value["visibility"]["visible_entry_count"])
+                    self.assertEqual(3, value["visibility"]["hidden_entry_count"])
+                    digest_input = dict(value)
+                    digest_input.pop("catalog_digest")
+                    self.assertEqual(
+                        catalog.sha256(json.dumps(digest_input, sort_keys=True,
+                                                   separators=(",", ":")).encode()).hexdigest(),
+                        value["catalog_digest"],
+                    )
+                    self.assertEqual(
+                        {"Under_Development", "Queue", "Needs_Fixes", "Awaiting_Retrospective", "Done"},
+                        {entry["stage"] for entry in value["entries"]},
+                    )
+                    self.assertEqual(
+                        [
+                            "Fictional/Awaiting_Retrospective/awaiting_retrospective",
+                            "Fictional/Done/done",
+                            "Fictional/Needs_Fixes/needs_fixes",
+                            "Fictional/Queue/queue",
+                            "Fictional/Under_Development/under_development",
+                        ],
+                        [entry["package_path"] for entry in value["entries"]],
+                    )
+                    self.assertEqual(
+                        {
+                            "Awaiting_Retrospective": True,
+                            "Done": False,
+                            "Needs_Fixes": True,
+                            "Queue": True,
+                            "Under_Development": True,
+                        },
+                        {entry["stage"]: entry["board_visible"] for entry in value["entries"]},
+                    )
+                    self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
+                    queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
+                    self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+                    self.assertEqual(before, inventory())
+
+            self.assertEqual(renders[0].encode("utf-8"), renders[1].encode("utf-8"))
 
     def test_each_explicit_policy_controls_rows_counts_booleans_and_digest(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -975,7 +1040,7 @@ class CatalogTests(TestCase):
 
     def test_unsafe_direct_policies_fail_before_root_open_and_without_writes(self) -> None:
         unsafe = (
-            "Done", b"Done", None, 1, (".",), ("..",), ("stage/name",),
+            "Done", b"Done", None, 1, ("",), (".",), ("..",), ("stage/name",),
             (r"stage\name",), ("control\x1f",), ("delete\x7f",),
             ("surrogate\ud800",), (object(),),
         )
