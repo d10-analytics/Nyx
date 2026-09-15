@@ -32,7 +32,10 @@ def _worker_main() -> int:
 
     try:
         configuration = state.load_configuration()
-        rendered = scan_catalog(configuration.specification_root)
+        rendered = scan_catalog(
+            configuration.specification_root,
+            hidden_stages=configuration.hidden_stages,
+        )
         encoded = rendered.encode("utf-8")
         if len(encoded) > MAX_STDOUT_BYTES:
             return 3
