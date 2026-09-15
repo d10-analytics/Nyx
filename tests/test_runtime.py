@@ -432,6 +432,43 @@ def test_observe_runtime_reports_free_lease_stale_record_and_retains_bytes():
         assert instance.instance_id == "instance"
 
 
+def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        paths.runtime_directory.joinpath("operation.lock").unlink()
+        paths.runtime_directory.joinpath("lease.lock").unlink()
+        paths.runtime_directory.rmdir()
+        paths.state_directory.rmdir()
+        paths.state_directory.parent.rmdir()
+        paths.state_directory.parents[1].rmdir()
+        operation_holder: runtime._FileLock | None = None
+        original_observer = state.observe_runtime
+        observation_count = 0
+
+        def observe_then_start() -> state.RuntimeObservation:
+            result = original_observer()
+            nonlocal operation_holder
+            nonlocal observation_count
+            observation_count += 1
+            if observation_count == 2:
+                paths.runtime_directory.mkdir(mode=0o700, parents=True)
+                operation_holder = runtime._operation_lock(paths, timeout=0.0)
+                assert operation_holder.acquire(blocking=False)
+            return result
+
+        try:
+            with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+                state, "_current_uid", return_value=os.getuid()
+            ), patch.object(state, "observe_runtime", side_effect=observe_then_start):
+                observed = runtime.observe_runtime()
+        finally:
+            if operation_holder is not None:
+                operation_holder.close()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
+        assert paths.runtime_directory.joinpath("operation.lock").exists()
+
+
 def test_observe_runtime_requires_same_uid_before_sending_capability():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
