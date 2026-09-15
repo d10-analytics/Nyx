@@ -547,6 +547,46 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
         assert observed.diagnostic is None
 
 
+def test_observe_runtime_rejects_lease_release_before_ready_response():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+        released = threading.Event()
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                released.set()
+                connection.sendall(
+                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
+                )
+
+        server = threading.Thread(target=serve)
+        server.start()
+        try:
+            observed = _observe(paths)
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert released.is_set()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
+
+
 def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
