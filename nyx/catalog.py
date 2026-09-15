@@ -197,7 +197,7 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
     for _ in range(2):
         try:
             before = _catalog_stat_at(parent_fd, name)
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, OSError):
             return None, "unreadable_anchor"
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             return None, "nonregular_anchor"
@@ -223,8 +223,8 @@ def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, st
             return None, "unreadable_anchor"
         finally:
             os.close(descriptor)
-        before_identity = (before.st_dev, before.st_ino, before.st_mode, before.st_size,
-                           before.st_mtime_ns, before.st_ctime_ns)
+        before_identity = (admitted.st_dev, admitted.st_ino, admitted.st_mode, admitted.st_size,
+                           admitted.st_mtime_ns, admitted.st_ctime_ns)
         after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_size,
                           after.st_mtime_ns, after.st_ctime_ns)
         if before_identity == after_identity:
@@ -524,7 +524,7 @@ def _scan_programs(
         reference_fd = _catalog_open_directory_at(repository_fd, "Reference")
     except FileNotFoundError:
         return
-    except (OSError, ValueError):
+    except OSError:
         diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(reference_path, spec_root)))
         return
     try:
@@ -532,7 +532,7 @@ def _scan_programs(
             namespace_fd = _catalog_open_directory_at(reference_fd, "Programs")
         except FileNotFoundError:
             return
-        except (OSError, ValueError):
+        except OSError:
             diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(namespace_path, spec_root)))
             return
         try:
@@ -552,7 +552,7 @@ def _scan_programs(
                 except FileNotFoundError:
                     diagnostics.append(_catalog_diagnostic("discovery_unavailable", program_path))
                     continue
-                except (OSError, ValueError):
+                except OSError:
                     diagnostics.append(_diagnostic("invalid_package", program_path))
                     continue
                 try:
@@ -829,10 +829,10 @@ def _scan_stage(
                     except FileNotFoundError:
                         discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
                         continue
-                    except (OSError, ValueError):
+                    except OSError:
                         try:
                             child_stat = _catalog_stat_at(current_fd, child.name)
-                        except (OSError, ValueError):
+                        except OSError:
                             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
                             continue
                         if stat.S_ISLNK(child_stat.st_mode) or not stat.S_ISDIR(child_stat.st_mode):
@@ -1050,10 +1050,10 @@ def _build_catalog(
                 repository_fd = _catalog_open_directory_at(root_fd, repository.name)
             except FileNotFoundError:
                 continue
-            except (OSError, ValueError):
+            except OSError:
                 try:
                     repository_stat = _catalog_stat_at(root_fd, repository.name)
-                except (OSError, ValueError):
+                except OSError:
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
                     continue
                 if stat.S_ISLNK(repository_stat.st_mode) or not stat.S_ISDIR(repository_stat.st_mode):
@@ -1071,10 +1071,10 @@ def _build_catalog(
                         stage_fd = _catalog_open_directory_at(repository_fd, directory)
                     except FileNotFoundError:
                         continue
-                    except (OSError, ValueError):
+                    except OSError:
                         try:
                             stage_stat = _catalog_stat_at(repository_fd, directory)
-                        except (OSError, ValueError):
+                        except OSError:
                             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
                             continue
                         if stat.S_ISLNK(stage_stat.st_mode) or not stat.S_ISDIR(stage_stat.st_mode):
