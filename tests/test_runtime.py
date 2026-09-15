@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -375,6 +376,294 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
             assert not list(paths.runtime_directory.glob(".instance.json.*"))
         finally:
             occupant.close()
+
+
+def _write_runtime_record(paths: state.StatePaths, *, instance_id: str = "instance", capability: str = "capability") -> runtime.Instance:
+    instance = runtime.Instance(instance_id, runtime.URL, capability, runtime._control_name())
+    record = paths.runtime_directory / "instance.json"
+    record.write_text(json.dumps(instance.as_dict()) + "\n", encoding="utf-8")
+    os.chmod(record, 0o600)
+    return instance
+
+
+def _held_lease(paths: state.StatePaths) -> tuple[int, runtime._FileLock]:
+    lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(lease_fd, 0o600)
+    fcntl.flock(lease_fd, fcntl.LOCK_EX)
+    lease = runtime._lease_lock(paths, timeout=0.0)
+    return lease_fd, lease
+
+
+def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
+    with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+        state, "_current_uid", return_value=os.getuid()
+    ):
+        return runtime.observe_runtime()
+
+
+def test_observe_runtime_reports_operation_contention_without_mutation():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        operation = runtime._operation_lock(paths, timeout=0.0)
+        assert operation.acquire(blocking=False)
+        before = {path.name: (path.stat().st_mode, path.read_bytes()) for path in paths.runtime_directory.iterdir()}
+        try:
+            observed = _observe(paths)
+        finally:
+            operation.close()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_OPERATION_IN_PROGRESS
+        after = {path.name: (path.stat().st_mode, path.read_bytes()) for path in paths.runtime_directory.iterdir()}
+        assert after == before
+
+
+def test_observe_runtime_reports_free_lease_stale_record_and_retains_bytes():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        instance = _write_runtime_record(paths)
+        before = record.read_bytes()
+        before_mode = stat.S_IMODE(record.stat().st_mode)
+        observed = _observe(paths)
+        assert observed.status == "not_running"
+        assert observed.diagnostic is None
+        assert record.read_bytes() == before
+        assert stat.S_IMODE(record.stat().st_mode) == before_mode
+        assert instance.instance_id == "instance"
+
+
+def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        paths.runtime_directory.joinpath("operation.lock").unlink()
+        paths.runtime_directory.joinpath("lease.lock").unlink()
+        paths.runtime_directory.rmdir()
+        paths.state_directory.rmdir()
+        paths.state_directory.parent.rmdir()
+        paths.state_directory.parents[1].rmdir()
+        operation_holder: runtime._FileLock | None = None
+        original_observer = state.observe_runtime
+        observation_count = 0
+
+        def observe_then_start() -> state.RuntimeObservation:
+            result = original_observer()
+            nonlocal operation_holder
+            nonlocal observation_count
+            observation_count += 1
+            if observation_count == 2:
+                paths.runtime_directory.mkdir(mode=0o700, parents=True)
+                operation_holder = runtime._operation_lock(paths, timeout=0.0)
+                assert operation_holder.acquire(blocking=False)
+            return result
+
+        try:
+            with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+                state, "_current_uid", return_value=os.getuid()
+            ), patch.object(state, "observe_runtime", side_effect=observe_then_start):
+                observed = runtime.observe_runtime()
+        finally:
+            if operation_holder is not None:
+                operation_holder.close()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
+        assert paths.runtime_directory.joinpath("operation.lock").exists()
+
+
+def test_observe_runtime_requires_same_uid_before_sending_capability():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+        received: list[bytes] = []
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(2)
+                try:
+                    received.append(connection.recv(1024))
+                except TimeoutError:
+                    received.append(b"")
+
+        server = threading.Thread(target=serve)
+        server.start()
+        try:
+            with patch.object(runtime, "_peer_uid", return_value=os.getuid() + 1):
+                observed = _observe(paths)
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_CONTROL_IDENTITY_MISMATCH
+        assert received == [b""]
+        assert instance.capability.encode("utf-8") not in b"".join(received)
+
+
+def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                connection.sendall(
+                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
+                )
+
+        server = threading.Thread(target=serve)
+        server.start()
+        try:
+            observed = _observe(paths)
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert observed.status == "running"
+        assert observed.url == runtime.URL
+        assert observed.diagnostic is None
+
+
+def test_observe_runtime_rejects_lease_release_before_ready_response():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+        released = threading.Event()
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                released.set()
+                connection.sendall(
+                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
+                )
+
+        server = threading.Thread(target=serve)
+        server.start()
+        try:
+            observed = _observe(paths)
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert released.is_set()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
+
+
+def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+        accepted = threading.Event()
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            accepted.set()
+            with connection:
+                time.sleep(2)
+
+        server = threading.Thread(target=serve)
+        server.start()
+        started = time.monotonic()
+        try:
+            observed = _observe(paths)
+            elapsed = time.monotonic() - started
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert accepted.is_set()
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_CONTROL_TIMED_OUT
+        assert elapsed < 1.5
+
+
+def test_observe_runtime_rejects_record_replacement_after_ready_response():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = _write_runtime_record(paths)
+        lease_fd, lease = _held_lease(paths)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(runtime._control_name())
+        except PermissionError:
+            listener.close()
+            lease.close()
+            os.close(lease_fd)
+            pytest.skip("sandbox does not permit local control sockets")
+        listener.listen(1)
+
+        def serve() -> None:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                record = paths.runtime_directory / "instance.json"
+                before = record.stat()
+                record.write_bytes(record.read_bytes().replace(b"instance", b"changed_"))
+                os.utime(record, ns=(before.st_atime_ns, before.st_mtime_ns))
+                connection.sendall(
+                    (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
+                )
+
+        server = threading.Thread(target=serve)
+        server.start()
+        try:
+            observed = _observe(paths)
+        finally:
+            listener.close()
+            server.join(timeout=3)
+            lease.close()
+            os.close(lease_fd)
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
 
 
 def test_foreign_control_holder_causes_startup_failure_without_record():
