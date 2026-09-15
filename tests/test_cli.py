@@ -195,8 +195,16 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     assert captured.err == ""
 
 
-@pytest.mark.parametrize("arguments", [["--status", "--setup", "/tmp/spec"], ["--status", "--stop"]])
-def test_status_rejects_other_commands_before_observing(arguments, capsys):
+@pytest.mark.parametrize(
+    ("arguments", "error_fragment"),
+    [
+        (["--status", "--setup", "/tmp/spec"], "argument --setup: not allowed with argument --status"),
+        (["--status", "--stop"], "argument --stop: not allowed with argument --status"),
+        (["--status", "--hide-stage", "Queue"], "--hide-stage and --show-all-stages require --setup"),
+        (["--status", "--show-all-stages"], "--hide-stage and --show-all-stages require --setup"),
+    ],
+)
+def test_status_rejects_other_commands_before_observing(arguments, error_fragment, capsys):
     with patch.object(state, "observe_configuration") as observe_config, patch.object(
         runtime, "observe_runtime"
     ) as observe_runtime, patch.object(runtime, "setup") as setup, patch.object(
@@ -211,4 +219,33 @@ def test_status_rejects_other_commands_before_observing(arguments, capsys):
     setup.assert_not_called()
     start.assert_not_called()
     stop.assert_not_called()
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("usage: nyx ")
+    assert error_fragment in captured.err
+
+
+def test_status_orders_configuration_and_runtime_diagnostics_after_both_observations(
+    capsys,
+):
+    configuration = state.ConfigurationObservation("unavailable")
+    runtime_observation = runtime.RuntimeObservation(
+        "unknown", diagnostic=runtime.RUNTIME_CONTROL_TIMED_OUT
+    )
+    with patch.object(state, "observe_configuration", return_value=configuration) as observe_config, patch.object(
+        runtime, "observe_runtime", return_value=runtime_observation
+    ) as observe_runtime:
+        assert cli.main(["--status"]) == 1
+
+    observe_config.assert_called_once_with()
+    observe_runtime.assert_called_once_with()
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "Configuration: unavailable",
+        "Specification root: unavailable",
+        "Hidden stages: unavailable",
+        "Runtime: unknown",
+        "Diagnostic: configuration unavailable",
+        "Diagnostic: runtime control timed out",
+    ]
+    assert captured.err == ""
