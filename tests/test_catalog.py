@@ -329,8 +329,35 @@ class CatalogTests(TestCase):
             root = base / "specs"
             root.symlink_to(outside, target_is_directory=True)
 
-            with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
-                catalog.scan_catalog(root)
+            original_open = os.open
+            successful_opens: list[int] = []
+            forbidden_accesses: list[str] = []
+
+            def observed_open(*args, **kwargs):
+                descriptor = original_open(*args, **kwargs)
+                successful_opens.append(descriptor)
+                return descriptor
+
+            def reject_access(operation):
+                def reject(*args, **kwargs):
+                    forbidden_accesses.append(operation)
+                    raise AssertionError(f"root rejection must precede {operation}")
+                return reject
+
+            # No descriptor may be admitted, nor any contents inspected, before
+            # rejecting this root. Record violations even if a fallback catches them.
+            with (
+                patch.object(catalog.os, "open", side_effect=observed_open),
+                patch.object(catalog.os, "scandir", side_effect=reject_access("scandir")),
+                patch.object(catalog.os, "listdir", side_effect=reject_access("listdir")),
+                patch.object(catalog.os, "read", side_effect=reject_access("read")),
+                patch("io.open", side_effect=reject_access("io.open")),
+                patch("builtins.open", side_effect=reject_access("builtins.open")),
+            ):
+                with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
+                    catalog.scan_catalog(root)
+            self.assertEqual([], successful_opens)
+            self.assertEqual([], forbidden_accesses)
 
     def test_descriptor_session_closes_on_subtree_open_failure(self) -> None:
         with TemporaryDirectory() as temporary:
