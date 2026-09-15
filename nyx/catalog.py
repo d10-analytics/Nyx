@@ -196,6 +196,13 @@ def _catalog_read_fd(descriptor: int) -> bytes:
         chunks.append(chunk)
 
 
+def _catalog_scandir(descriptor: int):
+    try:
+        return os.scandir(descriptor)
+    except NotImplementedError as error:
+        raise ValueError("catalog descriptor enumeration is unavailable") from error
+
+
 def _catalog_read_anchor_at(parent_fd: int, name: str) -> tuple[bytes | None, str | None]:
     """Read an admitted regular anchor through a descriptor-relative no-follow open."""
     last_data: bytes | None = None
@@ -545,7 +552,7 @@ def _scan_programs(
             return
         try:
             try:
-                with os.scandir(namespace_fd) as entries:
+                with _catalog_scandir(namespace_fd) as entries:
                     children = sorted(entries, key=lambda item: item.name)
             except OSError:
                 diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(namespace_path, spec_root)))
@@ -779,7 +786,7 @@ def _scan_stage(
             current, current_fd = pending.pop()
             try:
                 try:
-                    with os.scandir(current_fd) as entries:
+                    with _catalog_scandir(current_fd) as entries:
                         children = sorted(entries, key=lambda item: item.name)
                 except OSError:
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
@@ -1046,7 +1053,7 @@ def _build_catalog(
     root_fd = _catalog_open_root(spec_root)
     try:
         try:
-            with os.scandir(root_fd) as entries:
+            with _catalog_scandir(root_fd) as entries:
                 repositories = sorted(entries, key=lambda item: item.name)
         except OSError as error:
             raise ValueError("specification root cannot be read") from error
