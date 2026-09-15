@@ -807,9 +807,9 @@ def _scan_stage(
                             "lifecycle": lifecycle,
                             "data": data,
                             "read_diagnostic": (
-                                read_diagnostic or decode_diagnostic
-                                if data is not None
-                                else "unreadable_anchor"
+                                read_diagnostic
+                                if data is None
+                                else read_diagnostic or decode_diagnostic
                             ),
                             "declared": declared,
                             "relationship": relationship,
