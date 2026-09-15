@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -40,19 +41,33 @@ def _run_nyx(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _account_snapshot() -> tuple[tuple[str, str, bytes | str | None], ...]:
+def _account_snapshot() -> dict[str, tuple[str, bytes | str | None, int, int, int]]:
     """Capture account paths and application-managed bytes without following links."""
 
-    snapshot: list[tuple[str, str, bytes | str | None]] = []
+    snapshot: dict[str, tuple[str, bytes | str | None, int, int, int]] = {}
     for path in sorted(ACCOUNT_HOME.rglob("*")):
         relative = str(path.relative_to(ACCOUNT_HOME))
-        if path.is_symlink():
-            snapshot.append((relative, "symlink", os.readlink(path)))
-        elif path.is_dir():
-            snapshot.append((relative, "directory", None))
+        details = path.lstat()
+        if stat.S_ISREG(details.st_mode):
+            kind = "file"
+            content: bytes | str | None = path.read_bytes()
+        elif stat.S_ISDIR(details.st_mode):
+            kind = "directory"
+            content = None
+        elif stat.S_ISLNK(details.st_mode):
+            kind = "symlink"
+            content = os.readlink(path)
         else:
-            snapshot.append((relative, "file", path.read_bytes()))
-    return tuple(snapshot)
+            kind = "other"
+            content = None
+        snapshot[relative] = (
+            kind,
+            content,
+            stat.S_IMODE(details.st_mode),
+            details.st_uid,
+            details.st_gid,
+        )
+    return snapshot
 
 
 def test_bare_installed_command_owns_setup_start_reuse_and_stop():
