@@ -32,6 +32,15 @@ SCHEMA_VERSION = 1
 LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
+RUNTIME_CONTROL_TIMEOUT = 1.0
+
+RUNTIME_OPERATION_IN_PROGRESS = "runtime operation in progress"
+RUNTIME_STATE_UNAVAILABLE = "runtime state unavailable"
+RUNTIME_STATE_CHANGED = "runtime state changed"
+RUNTIME_CONTROL_TIMED_OUT = "runtime control timed out"
+RUNTIME_CONTROL_UNAVAILABLE = "runtime control unavailable"
+RUNTIME_CONTROL_IDENTITY_MISMATCH = "runtime control identity mismatch"
+RUNTIME_UNHEALTHY = "runtime unhealthy"
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -59,6 +68,18 @@ class PortConflictError(StartupError):
 
 
 class ShutdownTimeoutError(RuntimeErrorBase):
+    pass
+
+
+class _ControlTimeoutError(UnhealthyInstanceError):
+    pass
+
+
+class _ControlUnavailableError(UnhealthyInstanceError):
+    pass
+
+
+class _ControlIdentityError(UnhealthyInstanceError):
     pass
 
 
@@ -131,6 +152,110 @@ class _FileLock:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+@dataclass(frozen=True)
+class _Metadata:
+    """The identity and contents needed to detect a lifecycle race."""
+
+    exists: bool
+    identity: tuple[int, int, int, int, int, int] | None = None
+    data: bytes | None = None
+
+
+class _ExistingLock:
+    """A descriptor-backed lock opened without creating its path."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fd: int | None = None
+        self.metadata: _Metadata | None = None
+
+    def acquire(self) -> str:
+        try:
+            before = self.path.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unsafe"
+        if not _safe_lock_metadata(before):
+            return "unsafe"
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags)
+            after = os.fstat(fd)
+        except OSError:
+            return "unsafe"
+        if not _safe_lock_metadata(after) or _metadata_identity(before) != _metadata_identity(after):
+            os.close(fd)
+            return "changed"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            os.close(fd)
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return "held"
+            return "unsafe"
+        self.fd = fd
+        self.metadata = _metadata_from_stat(after)
+        return "acquired"
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self) -> Self:
+        if self.acquire() != "acquired":
+            raise RuntimeErrorBase("existing Nyx lock could not be acquired")
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _metadata_identity(details: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_uid,
+        stat.S_IMODE(details.st_mode),
+        details.st_size,
+        details.st_mtime_ns,
+    )
+
+
+def _metadata_from_stat(details: os.stat_result, data: bytes | None = None) -> _Metadata:
+    return _Metadata(True, _metadata_identity(details), data)
+
+
+def _safe_lock_metadata(details: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(details.st_mode)
+        and details.st_uid == os.getuid()
+        and stat.S_IMODE(details.st_mode) == 0o600
+    )
+
+
+def _read_metadata(path: Path, *, read_data: bool = False) -> _Metadata:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return _Metadata(False)
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+        raise RuntimeErrorBase("unsafe Nyx runtime state")
+    if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o600:
+        raise RuntimeErrorBase("unsafe Nyx runtime state")
+    data = path.read_bytes() if read_data else None
+    return _metadata_from_stat(details, data)
+
+
+def _metadata_unchanged(path: Path, original: _Metadata, *, read_data: bool = False) -> bool:
+    try:
+        current = _read_metadata(path, read_data=read_data)
+    except (OSError, RuntimeErrorBase):
+        return False
+    return current == original
 
 
 def _paths(*, create: bool = True) -> state.StatePaths:
@@ -235,24 +360,180 @@ def _peer_uid(connection: socket.socket) -> int | None:
         return None
 
 
-def _send_control(instance: Instance, command: str, *, timeout: float = 1.0) -> dict[str, Any]:
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(timeout)
+def _send_control(
+    instance: Instance,
+    command: str,
+    *,
+    timeout: float = RUNTIME_CONTROL_TIMEOUT,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Send one authenticated command, checking the peer before its capability."""
+
+    def remaining() -> float:
+        value = timeout if deadline is None else min(timeout, deadline - time.monotonic())
+        if value <= 0:
+            raise _ControlTimeoutError("control deadline expired")
+        return value
+
+    connection: socket.socket | None = None
     try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(remaining())
         connection.connect(instance.control)
+        if _peer_uid(connection) != os.getuid():
+            raise _ControlIdentityError("control peer identity did not match")
+        connection.settimeout(remaining())
         payload = {"version": 1, "capability": instance.capability, "command": command}
         connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        connection.settimeout(remaining())
         data = connection.recv(8192)
         if not data:
-            raise UnhealthyInstanceError("Nyx control did not respond")
+            raise _ControlUnavailableError("control did not respond")
         response = json.loads(data.splitlines()[0])
-        if not isinstance(response, dict) or response.get("instance_id") != instance.instance_id:
-            raise UnhealthyInstanceError("Nyx control identity did not match")
+        if not isinstance(response, dict):
+            raise _ControlUnavailableError("control response was malformed")
+        if response.get("instance_id") != instance.instance_id:
+            raise _ControlIdentityError("control response identity did not match")
         return response
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise UnhealthyInstanceError("Nyx instance is unhealthy") from error
+    except _ControlTimeoutError:
+        raise
+    except _ControlIdentityError:
+        raise
+    except (TimeoutError, socket.timeout) as error:
+        raise _ControlTimeoutError("control timed out") from error
+    except (OSError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise _ControlUnavailableError("control is unavailable") from error
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
+
+
+@dataclass(frozen=True)
+class RuntimeObservation:
+    """A coherent, read-only view of this account's runtime."""
+
+    status: str
+    paths: state.StatePaths | None = None
+    url: str | None = None
+    diagnostic: str | None = None
+
+    @property
+    def state(self) -> str:
+        return self.status
+
+
+def _runtime_observation(
+    status: str,
+    paths: state.StatePaths | None,
+    diagnostic: str | None = None,
+    *,
+    url: str | None = None,
+) -> RuntimeObservation:
+    return RuntimeObservation(status=status, paths=paths, url=url, diagnostic=diagnostic)
+
+
+def _runtime_unknown(paths: state.StatePaths | None, diagnostic: str) -> RuntimeObservation:
+    return _runtime_observation("unknown", paths, diagnostic)
+
+
+def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
+    operation_path = paths.runtime_directory / "operation.lock"
+    lease_path = paths.runtime_directory / "lease.lock"
+    record_path = _record_path(paths)
+
+    operation = _ExistingLock(operation_path)
+    operation_state = operation.acquire()
+    if operation_state == "held":
+        return _runtime_unknown(paths, RUNTIME_OPERATION_IN_PROGRESS)
+    if operation_state in {"unsafe", "changed"}:
+        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+
+    operation_initial = _read_metadata(operation_path)
+    lease_initial = _read_metadata(lease_path)
+    record_initial = _read_metadata(record_path, read_data=True)
+    lease = _ExistingLock(lease_path)
+    lease_state = lease.acquire()
+    try:
+        if lease_state in {"unsafe", "changed"}:
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+        if lease_state == "held":
+            # The daemon owns the lease. Its record must be valid before control.
+            if not record_initial.exists:
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            try:
+                instance = _read_instance(paths)
+            except UnhealthyInstanceError:
+                return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+            deadline = time.monotonic() + RUNTIME_CONTROL_TIMEOUT
+            try:
+                response = _send_control(instance, "status", deadline=deadline)
+            except _ControlTimeoutError:
+                return _runtime_unknown(paths, RUNTIME_CONTROL_TIMED_OUT)
+            except _ControlIdentityError:
+                return _runtime_unknown(paths, RUNTIME_CONTROL_IDENTITY_MISMATCH)
+            except _ControlUnavailableError:
+                return _runtime_unknown(paths, RUNTIME_CONTROL_UNAVAILABLE)
+            if response.get("status") == "unhealthy":
+                return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
+            if response.get("status") != "ready" or response.get("url") != URL:
+                return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
+            if not _metadata_unchanged(record_path, record_initial, read_data=True):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            if not _metadata_unchanged(lease_path, lease_initial):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            if not _metadata_unchanged(operation_path, operation_initial):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            return _runtime_observation("running", paths, url=URL)
+
+        # There is no held lease: a valid record is stale and remains untouched.
+        if lease_state == "absent":
+            if record_initial.exists:
+                try:
+                    _read_instance(paths)
+                except UnhealthyInstanceError:
+                    return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+            if not _metadata_unchanged(operation_path, operation_initial):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            if not _metadata_unchanged(lease_path, lease_initial):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            if not _metadata_unchanged(record_path, record_initial, read_data=True):
+                return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+            return _runtime_observation("not_running", paths)
+
+        # An existing lease descriptor was successfully acquired, so it is free.
+        if record_initial.exists:
+            try:
+                _read_instance(paths)
+            except UnhealthyInstanceError:
+                return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+        if not _metadata_unchanged(operation_path, operation_initial):
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        if not _metadata_unchanged(lease_path, lease_initial):
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        if not _metadata_unchanged(record_path, record_initial, read_data=True):
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        return _runtime_observation("not_running", paths)
+    finally:
+        lease.close()
+        operation.close()
+
+
+def observe_runtime() -> RuntimeObservation:
+    """Observe runtime state without creating, changing, or cleaning up files."""
+
+    try:
+        structural = state.observe_runtime()
+        paths = structural.paths
+        if paths is None:
+            return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
+        if structural.status == "not_running" and not paths.runtime_directory.exists():
+            return _runtime_observation("not_running", paths)
+        return _observe_runtime_with_paths(paths)
+    except (OSError, state.StateError, RuntimeErrorBase):
+        return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
+
+
+observe_runtime_paths = observe_runtime
 
 
 class _Daemon:
@@ -577,6 +858,14 @@ if __name__ == "__main__":
 
 __all__ = [
     "PORT",
+    "RUNTIME_CONTROL_IDENTITY_MISMATCH",
+    "RUNTIME_CONTROL_TIMED_OUT",
+    "RUNTIME_CONTROL_UNAVAILABLE",
+    "RUNTIME_OPERATION_IN_PROGRESS",
+    "RUNTIME_STATE_CHANGED",
+    "RUNTIME_STATE_UNAVAILABLE",
+    "RUNTIME_UNHEALTHY",
+    "RUNTIME_CONTROL_TIMEOUT",
     "SHUTDOWN_TIMEOUT",
     "STARTUP_TIMEOUT",
     "URL",
@@ -585,9 +874,12 @@ __all__ = [
     "OperationBusyError",
     "PortConflictError",
     "RuntimeErrorBase",
+    "RuntimeObservation",
     "ShutdownTimeoutError",
     "StartupError",
     "UnhealthyInstanceError",
+    "observe_runtime",
+    "observe_runtime_paths",
     "setup",
     "start",
     "stop",
