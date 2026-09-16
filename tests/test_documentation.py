@@ -240,6 +240,7 @@ def test_root_guide_explains_limits_workspace_and_authority() -> None:
 
 
 def test_sample_documentation_is_synthetic_and_has_no_generated_artifacts() -> None:
+    sample_files = [path for path in SAMPLE_ROOT.rglob("*") if path.is_file()]
     documentation = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(SAMPLE_ROOT.rglob("*.md"))
@@ -257,6 +258,12 @@ def test_sample_documentation_is_synthetic_and_has_no_generated_artifacts() -> N
         path.name in {"catalog.json", "catalog.html", "screenshot.png", "screenshot.jpg"}
         or path.suffix in {".json", ".png", ".jpg", ".jpeg"}
         for path in SAMPLE_ROOT.rglob("*")
+    )
+    assert all(path.suffix == ".md" for path in sample_files)
+    assert all(
+        part not in {"__pycache__", ".cache", ".pytest_cache", "build", "dist"}
+        for path in sample_files
+        for part in path.relative_to(SAMPLE_ROOT).parts
     )
     assert not any(path.name == "__pycache__" for path in SAMPLE_ROOT.rglob("*"))
 
