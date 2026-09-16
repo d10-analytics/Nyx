@@ -286,7 +286,9 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         )
         assert changed_while_running.returncode == 1
         assert changed_while_running.stdout == ""
-        assert "active" in changed_while_running.stderr.lower()
+        assert changed_while_running.stderr == (
+            "nyx: stop Nyx before changing its specification root\n"
+        )
         assert config_file.read_bytes() == configuration_bytes
         assert instance_file.read_bytes() == instance_bytes
 
