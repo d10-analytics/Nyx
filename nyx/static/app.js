@@ -651,7 +651,7 @@
     }
     snapshot.visibility.hidden_stages.forEach((stage) => protocol(component(stage)));
     protocol(snapshot.visibility.hidden_stages.every((stage, index) =>
-      index === 0 || scalarCompare(stage, snapshot.visibility.hidden_stages[index - 1]) >= 0));
+      index === 0 || scalarCompare(stage, snapshot.visibility.hidden_stages[index - 1]) > 0));
     diagnostics(snapshot.discovery_diagnostics);
     [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
       protocol(exactKeys(coverage, ["diagnostics", "state"]) && ["complete", "incomplete"].includes(coverage.state));
