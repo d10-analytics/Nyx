@@ -1197,3 +1197,29 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
         "cards => cards.map(card => card.dataset.packagePath)"
     )) == expected_paths
     assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
+    valid = json.loads(lifecycle_payload())
+    duplicate = json.loads(lifecycle_payload(hidden_stages=("Done",)))
+    duplicate["visibility"]["hidden_stages"] = ["Done", "Done"]
+    _reseal(duplicate)
+    assert duplicate["catalog_digest"] == canonical_digest(duplicate)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    client = RawSequenceClient([valid, duplicate])
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(client)
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert client.calls >= 2
