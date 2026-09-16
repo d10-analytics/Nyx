@@ -262,7 +262,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert running_status.stdout.splitlines() == [
             "Configuration: configured",
             f'Specification root: {json.dumps(str(specification_root.resolve()))}',
-            "Hidden stages: []",
+            'Hidden stages: ["Done"]',
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',
         ]
