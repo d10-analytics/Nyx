@@ -180,6 +180,12 @@ def test_root_guide_contains_the_literal_repository_workflow() -> None:
     assert "Apply update" in root
     assert "Refresh view" in root
     assert "stop-before-reconfiguration order is required" in root
+    quick_start = root[root.index("```bash") : root.index("```", root.index("```bash") + 3)]
+    assert quick_start.index("python3.12 -m venv .venv") < quick_start.index(
+        ". .venv/bin/activate"
+    ) < quick_start.index("python -m pip install -e '.[test]'") < quick_start.index(
+        "nyx --setup examples/sample-specifications --hide-stage Done"
+    ) < quick_start.index("nyx --status") < quick_start.index("\nnyx\n")
     assert root.index(
         "nyx --stop\nnyx --setup examples/sample-specifications --show-all-stages"
     ) < root.index("## Workspace and terminology")
@@ -191,6 +197,9 @@ def test_root_guide_explains_limits_workspace_and_authority() -> None:
         "Linux-local",
         "loopback-only",
         "read-only",
+        "Python 3.12 or newer",
+        "current account's configuration",
+        "runtime state",
         "specification root / project / lifecycle / groups / package / spec.md",
         "program",
         "claim",
