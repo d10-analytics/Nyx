@@ -48,7 +48,8 @@ jobs:
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
             "${nyx_verify_wheels[0]}" "$nyx_verify_wheel"
           sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m pip install \
-            "$nyx_verify_wheel" pytest
+            "$nyx_verify_wheel" pytest playwright
+          sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m playwright install chromium
           sudo -u "$nyx_verify_user" -H ln -s "$nyx_verify_root/venv/bin/nyx" \
             "$nyx_verify_home/.local/bin/nyx"
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \

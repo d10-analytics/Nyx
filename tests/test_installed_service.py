@@ -41,6 +41,128 @@ def _run_nyx(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+STAGES = (
+    "Under_Development",
+    "Queue",
+    "In_Progress",
+    "Needs_Fixes",
+    "Awaiting_Retrospective",
+    "Done",
+    "Archive",
+)
+STAGE_LABELS = {
+    "Under_Development": "Under Development",
+    "Queue": "Queue",
+    "In_Progress": "In Progress",
+    "Needs_Fixes": "Needs Fixes",
+    "Awaiting_Retrospective": "Awaiting Retrospective",
+    "Done": "Done",
+    "Archive": "Archive",
+}
+PACKAGE_IDS = {
+    stage: f"123e4567-e89b-42d3-a456-4266141740{index:02d}"
+    for index, stage in enumerate(STAGES, start=10)
+}
+
+
+def _write_fictional_stages(specification_root: Path) -> None:
+    for stage in STAGES:
+        package_path = specification_root / "Fictional" / stage / stage.lower()
+        package_path.mkdir(parents=True)
+        lines = [f"# {STAGE_LABELS[stage]} package", f"Package ID: {PACKAGE_IDS[stage]}"]
+        if stage == "Queue":
+            lines.append(f"Prerequisite: {PACKAGE_IDS['Done']} | release")
+        if stage == "Done":
+            lines.append(f"Claim: release | satisfied | sha256:{'a' * 64}")
+        package_path.joinpath("spec.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _fetch_catalog(url: str) -> dict[str, object]:
+    connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
+    connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    assert response.status == 200
+    assert url == "http://127.0.0.1:8765/"
+    return json.loads(body)
+
+
+def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
+    entries = value["entries"]
+    assert value["schema_version"] == 3
+    assert value["visibility"]["hidden_stages"] == hidden_stages
+    assert value["visibility"]["visible_entry_count"] == 7 - len(hidden_stages)
+    assert value["visibility"]["hidden_entry_count"] == len(hidden_stages)
+    assert [entry["package_path"] for entry in entries] == sorted(
+        f"Fictional/{stage}/{stage.lower()}" for stage in STAGES
+    )
+    assert {entry["stage"]: entry["board_visible"] for entry in entries} == {
+        stage: stage not in hidden_stages for stage in STAGES
+    }
+    queue = next(entry for entry in entries if entry["stage"] == "Queue")
+    prerequisite = queue["relationship"]["prerequisites"][0]
+    assert prerequisite == {
+        "claim_name": "release",
+        "observed_evidence_ref": "sha256:" + "a" * 64,
+        "observed_state": "satisfied",
+        "reason": "claim_satisfied",
+        "resolved_state": "satisfied",
+        "target_package_id": PACKAGE_IDS["Done"],
+    }
+    done = next(entry for entry in entries if entry["stage"] == "Done")
+    assert done["declared"]["title"] == "Done package"
+
+
+def _assert_hidden_browser(url: str) -> None:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(url)
+            page.locator("#board .card").first.wait_for()
+            assert page.locator("#board .card").count() == 6
+            assert page.locator(".row-head").all_text_contents() == [
+                STAGE_LABELS[stage] for stage in STAGES if stage != "Done"
+            ]
+            assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+            assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 0
+            page.fill("#filter", "Done package")
+            assert page.locator("#board .card:visible").count() == 0
+            page.fill("#filter", "")
+
+            queue = page.locator('.card[data-package-path="Fictional/Queue/queue"]')
+            queue.click()
+            assert queue.locator(".card-links").count() == 0
+            assert page.locator('.connection[data-source="%s"]' % PACKAGE_IDS["Done"]).count() == 0
+            assert page.locator("#details .prerequisite-target").inner_text() == "Done package"
+        finally:
+            browser.close()
+
+
+def _assert_show_all_browser(url: str) -> None:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(url)
+            page.locator("#board .card").first.wait_for()
+            assert page.locator("#board .card").count() == 7
+            assert page.locator(".row-head").all_text_contents() == [
+                STAGE_LABELS[stage] for stage in STAGES
+            ]
+            assert page.locator(".board-row").evaluate_all(
+                "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
+            ) == [(stage.lower(), f"{STAGE_LABELS[stage]} package") for stage in STAGES]
+            assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 1
+        finally:
+            browser.close()
+
+
 def _account_snapshot() -> dict[str, tuple[str, bytes | str | None, int, int, int]]:
     """Capture account paths and application-managed bytes without following links."""
 
@@ -96,15 +218,10 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     assert _account_snapshot() == before_status
 
     specification_root = ACCOUNT_HOME / "fictional-specifications"
-    anchor = specification_root / "Fictional" / "Queue" / "sample" / "spec.md"
-    anchor.parent.mkdir(parents=True)
-    anchor.write_text(
-        "# Fictional sample\nPackage ID: 123e4567-e89b-42d3-a456-426614174000\n",
-        encoding="utf-8",
-    )
+    _write_fictional_stages(specification_root)
     started = False
     try:
-        configured = _run_nyx("--setup", str(specification_root))
+        configured = _run_nyx("--setup", str(specification_root), "--hide-stage", "Done")
         assert configured.returncode == 0, configured.stderr
         assert configured.stdout.strip() == f"configured {specification_root.resolve()}"
         config_file = ACCOUNT_HOME / ".config" / "nyx" / "config.json"
@@ -118,7 +235,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert configured_stopped.stdout.splitlines() == [
             "Configuration: configured",
             f'Specification root: {json.dumps(str(specification_root.resolve()))}',
-            "Hidden stages: []",
+            'Hidden stages: ["Done"]',
             "Runtime: not running",
         ]
         assert configured_stopped.stderr == ""
@@ -156,8 +273,17 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         connection.close()
         assert response.status == 200
         payload = json.loads(body)
-        assert payload["schema_version"] == 3
-        assert payload["entries"][0]["package_path"] == "Fictional/Queue/sample"
+        _assert_catalog(payload, ["Done"])
+        _assert_hidden_browser(first.stdout.strip())
+
+        changed_while_running = _run_nyx(
+            "--setup", str(specification_root), "--show-all-stages"
+        )
+        assert changed_while_running.returncode == 1
+        assert changed_while_running.stdout == ""
+        assert "active" in changed_while_running.stderr.lower()
+        assert config_file.read_bytes() == configuration_bytes
+        assert instance_file.read_bytes() == instance_bytes
 
         reused = _run_nyx()
         assert reused.returncode == 0, reused.stderr
@@ -177,12 +303,57 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert post_stop.stdout.splitlines() == [
             "Configuration: configured",
             f'Specification root: {json.dumps(str(specification_root.resolve()))}',
-            "Hidden stages: []",
+            'Hidden stages: ["Done"]',
             "Runtime: not running",
         ]
         assert post_stop.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
         assert _account_snapshot() == before_post_stop
+
+        show_all = _run_nyx("--setup", str(specification_root), "--show-all-stages")
+        assert show_all.returncode == 0, show_all.stderr
+        assert show_all.stdout.strip() == f"configured {specification_root.resolve()}"
+        show_all_config_bytes = config_file.read_bytes()
+        before_show_all_stopped = _account_snapshot()
+        show_all_stopped = _run_nyx("--status")
+        assert show_all_stopped.returncode == 0, show_all_stopped.stderr
+        assert show_all_stopped.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: not running",
+        ]
+        assert show_all_stopped.stderr == ""
+        assert config_file.read_bytes() == show_all_config_bytes
+        assert _account_snapshot() == before_show_all_stopped
+
+        second = _run_nyx()
+        assert second.returncode == 0, second.stderr
+        assert second.stdout.strip() == "http://127.0.0.1:8765/"
+        started = True
+        second_instance_bytes = instance_file.read_bytes()
+        before_second_running_status = _account_snapshot()
+        second_running_status = _run_nyx("--status")
+        assert second_running_status.returncode == 0, second_running_status.stderr
+        assert second_running_status.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: running",
+            'URL: "http://127.0.0.1:8765/"',
+        ]
+        assert second_running_status.stderr == ""
+        assert config_file.read_bytes() == show_all_config_bytes
+        assert instance_file.read_bytes() == second_instance_bytes
+        assert _account_snapshot() == before_second_running_status
+        second_payload = _fetch_catalog(second.stdout.strip())
+        _assert_catalog(second_payload, [])
+        _assert_show_all_browser(second.stdout.strip())
+
+        final_stop = _run_nyx("--stop")
+        assert final_stop.returncode == 0, final_stop.stderr
+        assert final_stop.stdout.strip() == "stopped"
+        started = False
     finally:
         if started:
             _run_nyx("--stop")
