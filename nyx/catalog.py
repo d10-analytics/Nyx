@@ -6,10 +6,14 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
 
+from .state import _validate_hidden_stages
+
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+_OMITTED = object()
 
 CATALOG_LIFECYCLE_DIRECTORIES = {
     "Under_Development": "under_development",
@@ -64,6 +68,14 @@ _PROVENANCE = re.compile(
 _HEADER_FIELD = re.compile(
     r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
 )
+
+
+def _catalog_policy(hidden_stages: Iterable[str] | object) -> tuple[str, ...]:
+    """Return the canonical policy, retaining the omitted-call legacy default."""
+    if hidden_stages is _OMITTED:
+        return tuple(CATALOG_HIDDEN_STAGES)
+    return _validate_hidden_stages(hidden_stages)
+
 
 def _metadata_value(lines: list[str], label: str) -> str | None:
     pattern = re.compile(
@@ -823,6 +835,7 @@ def _scan_stage(
                         {
                             "package_path": package_path,
                             "lifecycle": lifecycle,
+                            "stage": stage_path.name,
                             "data": data,
                             "read_diagnostic": (
                                 read_diagnostic
@@ -950,6 +963,7 @@ def _render_entry(
     identity_complete: bool,
     program_index: dict[str, list[dict[str, object]]],
     program_coverage_complete: bool,
+    hidden_stages: tuple[str, ...],
 ) -> dict[str, object]:
     relationship = record["relationship"]
     if relationship is None:
@@ -1036,7 +1050,7 @@ def _render_entry(
         "package_path": package_path,
         "project": project,
         "stage": stage,
-        "board_visible": record["lifecycle"] in CATALOG_BOARD_LIFECYCLES,
+        "board_visible": stage not in hidden_stages,
         "state": record["state"],
         "declared": record["declared"],
         "diagnostics": diagnostics,
@@ -1047,8 +1061,11 @@ def _render_entry(
 
 def _build_catalog(
     spec_root: Path,
+    *,
+    hidden_stages: Iterable[str] | object = _OMITTED,
 ) -> str:
     """Build the relationship catalog from one captured scan."""
+    policy = _catalog_policy(hidden_stages)
     records: list[dict[str, object]] = []
     discovery_diagnostics: list[dict[str, str]] = []
     program_descriptors: list[dict[str, object]] = []
@@ -1156,18 +1173,27 @@ def _build_catalog(
             for descriptor in program_index.get(program_id, []):
                 descriptor.setdefault("member_package_ids", []).append(record.get("package_id"))
 
-    board = [record for record in records if record["lifecycle"] in CATALOG_BOARD_LIFECYCLES]
-    referenced_ids = {
+    board = [record for record in records if record["stage"] not in policy]
+    visible_ids = {
         row["target_package_id"]
         for record in board
         for row in (record["relationship"]["prerequisites"] if record["relationship"] else [])
         if row["target_package_id"] is not None
     }
     projected = list(board)
-    for target_id in sorted(referenced_ids):
-        for record in index.get(target_id, []):
-            if record not in projected:
-                projected.append(record)
+    for target_id in sorted(visible_ids):
+        candidates = index.get(target_id, [])
+        if len(candidates) != 1:
+            continue
+        target = candidates[0]
+        if (
+            target.get("package_id") != target_id
+            or target.get("relationship") is None
+            or target["stage"] not in policy
+        ):
+            continue
+        if target not in projected:
+            projected.append(target)
     projected.sort(key=lambda record: str(record["package_path"]))
     entries = [
         _render_entry(
@@ -1176,6 +1202,7 @@ def _build_catalog(
             identity_complete,
             program_index,
             program_coverage_complete,
+            policy,
         )
         for record in projected
     ]
@@ -1212,7 +1239,7 @@ def _build_catalog(
         "schema_version": 3,
         "catalog_digest": None,
         "visibility": {
-            "hidden_stages": CATALOG_HIDDEN_STAGES,
+            "hidden_stages": list(policy),
             "visible_entry_count": len(board),
             "hidden_entry_count": len(records) - len(board),
         },
@@ -1236,13 +1263,21 @@ def _build_catalog(
     return rendered
 
 
-def build_catalog(spec_root: Path) -> str:
+def build_catalog(
+    spec_root: Path,
+    *,
+    hidden_stages: Iterable[str] | object = _OMITTED,
+) -> str:
     """Build the deterministic catalog without shared validation hooks."""
-    return _build_catalog(spec_root)
+    policy = _catalog_policy(hidden_stages)
+    return _build_catalog(spec_root, hidden_stages=policy)
 
 
 def scan_catalog(
     spec_root: Path,
+    *,
+    hidden_stages: Iterable[str] | object = _OMITTED,
 ) -> str:
     """Build the deterministic catalog."""
-    return _build_catalog(spec_root)
+    policy = _catalog_policy(hidden_stages)
+    return _build_catalog(spec_root, hidden_stages=policy)

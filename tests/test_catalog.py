@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from nyx import catalog
 from nyx.models import parse_catalog
+from nyx.state import HiddenStageError
 
 V1 = """# Example
 Status: approved
@@ -776,14 +778,23 @@ class CatalogTests(TestCase):
         from nyx import __all__
 
         self.assertEqual(["build_catalog", "scan_catalog"], __all__)
-        self.assertEqual(
-            "(spec_root: 'Path') -> 'str'",
-            str(__import__("inspect").signature(catalog.build_catalog)),
-        )
-        self.assertEqual(
-            "(spec_root: 'Path') -> 'str'",
-            str(inspect.signature(catalog.scan_catalog)),
-        )
+        for producer in (catalog.build_catalog, catalog.scan_catalog):
+            signature = inspect.signature(producer)
+            rendered = str(signature).replace(str(catalog._OMITTED), "<omitted>")
+            self.assertEqual(
+                "(spec_root: 'Path', *, hidden_stages: 'Iterable[str] | object' = <omitted>) -> 'str'",
+                rendered,
+            )
+            self.assertEqual(
+                ["spec_root", "hidden_stages"], list(signature.parameters)
+            )
+            self.assertEqual(
+                inspect.Parameter.KEYWORD_ONLY,
+                signature.parameters["hidden_stages"].kind,
+            )
+            self.assertIs(
+                catalog._OMITTED, signature.parameters["hidden_stages"].default
+            )
 
     def test_public_entry_points_share_the_canonical_builder(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -815,27 +826,256 @@ class CatalogTests(TestCase):
                 f"# Done\nPackage ID: {ids[5]}\nClaim: release | satisfied | sha256:{'a' * 64}\n",
                 encoding="utf-8",
             )
-            first = catalog.build_catalog(root)
-            second = catalog.build_catalog(root)
-            self.assertEqual(first.encode("utf-8"), second.encode("utf-8"))
-            value = json.loads(first)
-            self.assertEqual(3, value["schema_version"])
-            self.assertEqual(4, value["visibility"]["visible_entry_count"])
-            self.assertEqual(3, value["visibility"]["hidden_entry_count"])
+            def inventory() -> list[tuple[object, ...]]:
+                result = []
+                for path in [root, *sorted(root.rglob("*"))]:
+                    info = path.lstat()
+                    if path.is_symlink():
+                        kind = "symlink"
+                        payload: object = os.readlink(path)
+                    elif path.is_dir():
+                        kind = "directory"
+                        payload = None
+                    elif path.is_file():
+                        kind = "file"
+                        payload = path.read_bytes()
+                    else:
+                        kind = "other"
+                        payload = None
+                    result.append(
+                        (
+                            "." if path == root else path.relative_to(root).as_posix(),
+                            kind,
+                            info.st_mode,
+                            info.st_uid,
+                            info.st_gid,
+                            info.st_size,
+                            info.st_mtime_ns,
+                            info.st_ctime_ns,
+                            payload,
+                        )
+                    )
+                return result
+
+            original_open = os.open
+            renders: list[str] = []
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                with self.subTest(producer=producer.__name__):
+                    before = inventory()
+
+                    def reject_writes(path, flags, mode=0o777, *, dir_fd=None):
+                        self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+                        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+                    def reject_write_operation(*_args, **_kwargs):
+                        raise AssertionError("catalog attempted a write operation")
+
+                    with ExitStack() as stack:
+                        scans = stack.enter_context(
+                            patch.object(
+                                catalog,
+                                "_catalog_scandir",
+                                wraps=catalog._catalog_scandir,
+                            )
+                        )
+                        stack.enter_context(patch.object(catalog.os, "open", side_effect=reject_writes))
+                        for name in (
+                            "mkdir", "unlink", "rename", "replace", "symlink", "chmod",
+                            "truncate", "write", "mknod", "link", "rmdir", "remove",
+                            "fchmod", "ftruncate", "utime",
+                        ):
+                            stack.enter_context(
+                                patch.object(catalog.os, name, side_effect=reject_write_operation)
+                            )
+                        rendered = producer(root)
+
+                    self.assertEqual(15, scans.call_count)
+                    renders.append(rendered)
+                    value = json.loads(rendered)
+                    self.assertEqual(3, value["schema_version"])
+                    self.assertEqual(4, value["visibility"]["visible_entry_count"])
+                    self.assertEqual(3, value["visibility"]["hidden_entry_count"])
+                    digest_input = dict(value)
+                    digest_input.pop("catalog_digest")
+                    self.assertEqual(
+                        catalog.sha256(json.dumps(digest_input, sort_keys=True,
+                                                   separators=(",", ":")).encode()).hexdigest(),
+                        value["catalog_digest"],
+                    )
+                    self.assertEqual(
+                        {"Under_Development", "Queue", "Needs_Fixes", "Awaiting_Retrospective", "Done"},
+                        {entry["stage"] for entry in value["entries"]},
+                    )
+                    self.assertEqual(
+                        [
+                            "Fictional/Awaiting_Retrospective/awaiting_retrospective",
+                            "Fictional/Done/done",
+                            "Fictional/Needs_Fixes/needs_fixes",
+                            "Fictional/Queue/queue",
+                            "Fictional/Under_Development/under_development",
+                        ],
+                        [entry["package_path"] for entry in value["entries"]],
+                    )
+                    self.assertEqual(
+                        {
+                            "Awaiting_Retrospective": True,
+                            "Done": False,
+                            "Needs_Fixes": True,
+                            "Queue": True,
+                            "Under_Development": True,
+                        },
+                        {entry["stage"]: entry["board_visible"] for entry in value["entries"]},
+                    )
+                    self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
+                    queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
+                    self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+                    self.assertEqual(before, inventory())
+
+            self.assertEqual(renders[0].encode("utf-8"), renders[1].encode("utf-8"))
+
+    def test_each_explicit_policy_controls_rows_counts_booleans_and_digest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stages = (
+                "Under_Development", "Queue", "In_Progress", "Needs_Fixes",
+                "Awaiting_Retrospective", "Done", "Archive",
+            )
+            for stage in stages:
+                package(root, stage, stage.lower(), f"# {stage} title\n")
+
+            policies = (
+                ("omitted", None, ["Archive", "Done", "In_Progress"], 4, 3),
+                ("empty", [], [], 7, 0),
+                ("known", ["Done"], ["Done"], 6, 1),
+                ("unknown", ["Custom"], ["Custom"], 7, 0),
+                ("case-distinct", ["done"], ["done"], 7, 0),
+                ("deduplicated", ["Done", "Archive", "Done"], ["Archive", "Done"], 5, 2),
+            )
+            expected_paths = sorted([
+                f"Fictional/{stage}/{stage.lower()}"
+                for stage in stages
+            ])
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                for label, policy, hidden, visible_count, hidden_count in policies:
+                    with self.subTest(producer=producer.__name__, policy=label):
+                        kwargs = {} if policy is None else {"hidden_stages": policy}
+                        value = json.loads(producer(root, **kwargs))
+                        self.assertEqual(hidden, value["visibility"]["hidden_stages"])
+                        self.assertEqual(visible_count, value["visibility"]["visible_entry_count"])
+                        self.assertEqual(hidden_count, value["visibility"]["hidden_entry_count"])
+                        entries = value["entries"]
+                        self.assertEqual(
+                            [path for path in expected_paths if path.split("/")[1] not in hidden],
+                            [entry["package_path"] for entry in entries],
+                        )
+                        self.assertEqual(
+                            {stage: stage not in hidden for stage in stages if stage not in hidden},
+                            {entry["stage"]: entry["board_visible"] for entry in entries},
+                        )
+                        self.assertEqual(
+                            {f"{stage} title" for stage in stages if stage not in hidden},
+                            {entry["declared"]["title"] for entry in entries},
+                        )
+                        digest_input = dict(value)
+                        digest_input.pop("catalog_digest")
+                        self.assertEqual(
+                            catalog.sha256(
+                                json.dumps(
+                                    digest_input,
+                                    ensure_ascii=True,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                            value["catalog_digest"],
+                        )
+
+    def test_hidden_prerequisite_is_direct_context_and_disconnected_hidden_is_omitted(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_id = "11111111-1111-4111-8111-111111111111"
+            target_id = "22222222-2222-4222-8222-222222222222"
+            package(
+                root,
+                "Queue",
+                "source",
+                f"# Source title\nPackage ID: {source_id}\n"
+                f"Prerequisite: {target_id} | release\n",
+            )
+            package(
+                root,
+                "Done",
+                "target",
+                f"# Target title\nPackage ID: {target_id}\n"
+                f"Claim: release | satisfied | sha256:{'a' * 64}\n",
+            )
+            package(root, "Archive", "disconnected", "# Disconnected title\n")
+            value = json.loads(catalog.build_catalog(root))
+            self.assertEqual(
+                ["Fictional/Done/target", "Fictional/Queue/source"],
+                [entry["package_path"] for entry in value["entries"]],
+            )
+            self.assertEqual(
+                {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                 "visible_entry_count": 1, "hidden_entry_count": 2},
+                value["visibility"],
+            )
+            target = value["entries"][0]
+            source = value["entries"][1]
+            self.assertEqual("Target title", target["declared"]["title"])
+            self.assertFalse(target["board_visible"])
+            self.assertEqual("complete", target["state"])
+            self.assertEqual("satisfied", source["relationship"]["direct_prerequisite_state"])
+            self.assertEqual("satisfied", source["relationship"]["prerequisites"][0]["resolved_state"])
+            self.assertEqual("claim_satisfied", source["relationship"]["prerequisites"][0]["reason"])
             digest_input = dict(value)
             digest_input.pop("catalog_digest")
             self.assertEqual(
-                catalog.sha256(json.dumps(digest_input, sort_keys=True,
-                                           separators=(",", ":")).encode()).hexdigest(),
+                catalog.sha256(
+                    json.dumps(digest_input, ensure_ascii=True, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
                 value["catalog_digest"],
             )
-            self.assertEqual(
-                {"Under_Development", "Queue", "Needs_Fixes", "Awaiting_Retrospective", "Done"},
-                {entry["stage"] for entry in value["entries"]},
-            )
-            self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
-            queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
-            self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+
+    def test_unsafe_direct_policies_fail_before_root_open_and_without_writes(self) -> None:
+        unsafe = (
+            "Done", b"Done", None, 1, ("",), (".",), ("..",), ("stage/name",),
+            (r"stage\name",), ("control\x1f",), ("delete\x7f",),
+            ("surrogate\ud800",), (object(),),
+        )
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_open = os.open
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                for policy in unsafe:
+                    with self.subTest(producer=producer.__name__, policy=repr(policy)):
+                        def reject_writes(path, flags, mode=0o777, *, dir_fd=None):
+                            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+                            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+                        with ExitStack() as stack:
+                            stack.enter_context(
+                                patch.object(
+                                    catalog, "_catalog_open_root",
+                                    side_effect=AssertionError("root opened before policy validation"),
+                                )
+                            )
+                            stack.enter_context(patch.object(catalog.os, "open", side_effect=reject_writes))
+                            for name in (
+                                "mkdir", "unlink", "rename", "replace", "symlink", "chmod",
+                                "truncate", "write", "mknod", "link", "rmdir", "remove",
+                                "fchmod", "ftruncate", "utime",
+                            ):
+                                stack.enter_context(
+                                    patch.object(
+                                        catalog.os,
+                                        name,
+                                        side_effect=AssertionError(f"catalog attempted os.{name}"),
+                                    )
+                                )
+                            with self.assertRaises(HiddenStageError):
+                                producer(root, hidden_stages=policy)
 
 ORACLE_IDS = [
     "11111111-1111-4111-8111-111111111111",

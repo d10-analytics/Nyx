@@ -1,9 +1,12 @@
 import json
 import re
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
+from nyx.catalog import scan_catalog
 from nyx.models import canonical_digest, parse_catalog
 from nyx.server import CatalogError, create_server
 
@@ -68,7 +71,7 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
     }
 
 
-def _refresh_visibility_and_digest(value):
+def _reseal(value):
     entries = value["entries"]
     value["visibility"]["visible_entry_count"] = sum(
         entry["board_visible"] for entry in entries
@@ -77,6 +80,7 @@ def _refresh_visibility_and_digest(value):
         not entry["board_visible"] for entry in entries
     )
     value["catalog_digest"] = canonical_digest(value)
+    return value
 
 
 def board_payload(*, titles=None):
@@ -124,8 +128,111 @@ def board_payload(*, titles=None):
         ],
         "programs": [],
     }
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+STAGE_ROWS = (
+    ("Under_Development", "under_development", "Under Development", "Under Development package"),
+    ("Queue", "queue", "Queue", "Queue package"),
+    ("In_Progress", "in_progress", "In Progress", "In Progress package"),
+    ("Needs_Fixes", "needs_fixes", "Needs Fixes", "Needs Fixes package"),
+    ("Awaiting_Retrospective", "awaiting_retrospective", "Awaiting Retrospective", "Awaiting Retrospective package"),
+    ("Done", "done", "Done", "Done target"),
+    ("Archive", "archive", "Archive", "Archive package"),
+)
+STAGE_IDS = {
+    stage: f"123e4567-e89b-42d3-a456-426614174{index + 6:03d}"
+    for index, (stage, *_rest) in enumerate(STAGE_ROWS)
+}
+UNICODE_LOW = "\ue000"
+UNICODE_HIGH = "\U00010000"
+
+
+def lifecycle_payload(*, hidden_stages=()):
+    entries = []
+    for stage, lifecycle, _label, title in STAGE_ROWS:
+        prerequisites = None
+        if stage == "Queue":
+            edge = _edge(STAGE_IDS["Done"], "release")
+            evidence = "sha256:" + "b" * 64
+            edge.update(
+                observed_state="satisfied",
+                observed_evidence_ref=evidence,
+                resolved_state="satisfied",
+                reason="claim_satisfied",
+            )
+            prerequisites = [edge]
+        entry = _entry(
+            STAGE_IDS[stage],
+            f"Fictional/{stage}/package",
+            lifecycle,
+            title,
+            "Fictional",
+            prerequisites=prerequisites,
+        )
+        entry["board_visible"] = stage not in hidden_stages
+        if stage == "Done":
+            entry["relationship"]["claims"] = [{
+                "name": "release",
+                "state": "satisfied",
+                "evidence_ref": "sha256:" + "b" * 64,
+                "diagnostics": [],
+            }]
+        entries.append(entry)
+    value = {
+        "schema_version": 3,
+        "visibility": {
+            "hidden_stages": list(hidden_stages),
+            "visible_entry_count": 0,
+            "hidden_entry_count": 0,
+        },
+        "identity_coverage": {"state": "complete", "diagnostics": []},
+        "program_coverage": {"state": "complete", "diagnostics": []},
+        "discovery_diagnostics": [],
+        "entries": sorted(entries, key=lambda entry: entry["package_path"]),
+        "programs": [],
+    }
+    _reseal(value)
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+def unicode_producer_payload():
+    """Build a producer snapshot whose ordering is Python's scalar ordering."""
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for index, marker in enumerate((UNICODE_LOW, UNICODE_HIGH), start=1):
+            project = f"Project{marker}"
+            package_path = root / project / "Queue" / f"diagnostic-{marker}"
+            package_path.mkdir(parents=True)
+            package_path.joinpath("spec.md").write_text(
+                f"# Diagnostic {marker}\nPackage ID: malformed-{index}\n",
+                encoding="utf-8",
+            )
+            program_path = root / project / "Reference" / "Programs" / (
+                f"123e4567-e89b-42d3-a456-42661417400{index}"
+            )
+            program_path.mkdir(parents=True)
+            program_path.joinpath("program.md").write_text(
+                f"# malformed program {marker}\n", encoding="utf-8"
+            )
+        payload = scan_catalog(root, hidden_stages=(UNICODE_LOW, UNICODE_HIGH))
+    value = json.loads(payload)
+    return payload.encode("utf-8"), value
+
+
+def reversed_unicode_payload(payload, kind):
+    value = json.loads(payload)
+    if kind == "policy":
+        value["visibility"]["hidden_stages"].reverse()
+    elif kind == "path":
+        value["entries"].reverse()
+    else:
+        diagnostics = value["program_coverage"]["diagnostics"]
+        assert len(diagnostics) == 2
+        diagnostics.reverse()
+    _reseal(value)
+    return value
 
 
 class StaticClient:
@@ -148,6 +255,30 @@ class SequenceClient:
         if isinstance(payload, Exception):
             raise payload
         return parse_catalog(payload)
+
+
+class RawCatalog:
+    """Keep a deliberately malformed wire snapshot reachable by browser validation."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def as_dict(self):
+        return self.value
+
+
+class RawSequenceClient:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = 0
+
+    def fetch_catalog(self):
+        index = min(self.calls, len(self.payloads) - 1)
+        self.calls += 1
+        payload = self.payloads[index]
+        if isinstance(payload, Exception):
+            raise payload
+        return RawCatalog(payload)
 
 
 @pytest.fixture
@@ -208,7 +339,7 @@ def test_board_renders_lifecycle_rows_and_project_columns(open_page):
 def test_browser_accepts_explicit_blank_declared_metadata(open_page):
     value = json.loads(board_payload())
     value["entries"][0]["declared"]["status"] = ""
-    value["catalog_digest"] = canonical_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator("#board .card").count() == 4
 
@@ -360,7 +491,7 @@ def test_details_list_every_claim_while_the_graph_deduplicates_the_package_pair(
     dependent["relationship"].update(
         prerequisites=[build, testing], direct_prerequisite_state="unsatisfied"
     )
-    value["catalog_digest"] = canonical_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
 
     page.locator(f'.card[data-package-id="{LOOSE}"]').click()
@@ -403,7 +534,7 @@ def test_details_distinguish_confirmed_empty_from_unknown_or_unavailable_prerequ
         direct_prerequisite_state=state,
         prerequisites=[],
     )
-    value["catalog_digest"] = canonical_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'.card[data-package-id="{GATE}"]')
     card.click()
@@ -424,13 +555,13 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     first["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": "first catalog discovery failure"}
     ]
-    first["catalog_digest"] = canonical_digest(first)
+    _reseal(first)
     second = json.loads(board_payload())
     second["entries"] = []
     second["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": "refreshed catalog discovery failure"}
     ]
-    _refresh_visibility_and_digest(second)
+    _reseal(second)
     page = open_page(SequenceClient([first, second]))
 
     assert "first catalog discovery failure" in page.locator("#details").inner_text()
@@ -466,7 +597,7 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     value["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": discovery_message}
     ]
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
 
     assert page.locator("#board .card").count() == 0
@@ -508,7 +639,7 @@ def test_unblocked_cards_require_confirmed_clear_prerequisites(
     relationship.update(
         participation=participation, direct_prerequisite_state=state, prerequisites=edges
     )
-    value["catalog_digest"] = canonical_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
     assert card.locator(".card-status").all_text_contents() == (["Unblocked"] if unblocked else [])
@@ -533,7 +664,7 @@ def test_refresh_removes_unblocked_indicator_when_a_prerequisite_becomes_unknown
     first = json.loads(board_payload())
     second = json.loads(board_payload())
     second["entries"][1]["relationship"]["direct_prerequisite_state"] = "unknown"
-    second["catalog_digest"] = canonical_digest(second)
+    _reseal(second)
     page = open_page(SequenceClient([first, second]))
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
     assert card.locator(".card-status").inner_text() == "Unblocked"
@@ -634,7 +765,7 @@ def routing_payload():
     value["entries"][1]["relationship"]["prerequisites"] = [_edge(far, "reverse")]
     value["entries"][1]["relationship"]["direct_prerequisite_state"] = "unsatisfied"
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     return value, far, unknown
 
 
@@ -643,9 +774,12 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     page = open_page(StaticClient(value))
     expected = {
         (STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE),
-        (STEP_ONE, far), (far, STEP_ONE), (far, unknown),
     }
     assert connection_pairs(page) == expected
+    assert page.locator(f'.card[data-package-id="{far}"]').count() == 0
+    assert page.locator(f'.card[data-package-id="{unknown}"]').count() == 1
+    assert page.locator(f'.card[data-package-id="{unknown}"] .card-links').count() == 0
+    assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
     for width in (650, 1800):
         before = page.locator(".rail").first.get_attribute("d")
@@ -654,12 +788,14 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
             "before => document.querySelector('.rail').getAttribute('d') !== before", arg=before
         )
         assert connection_pairs(page) == expected
+        assert all(far not in pair for pair in connection_pairs(page))
         assert_readable_arrows(page)
     page.fill("#filter", "Alpha")
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE)}
     assert_readable_arrows(page)
     page.fill("#filter", "")
     assert connection_pairs(page) == expected
+    assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
 
 
@@ -679,7 +815,7 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
     elif reason == "missing_target":
         edge["target_package_id"] = "123e4567-e89b-42d3-a456-426614174009"
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert (STEP_ONE, LOOSE) not in connection_pairs(page)
     if duplicate_record:
@@ -693,7 +829,7 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
 def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
     value = json.loads(board_payload())
     value["entries"][3]["relationship"]["prerequisites"].append(_edge(STEP_ONE, "testing"))
-    value["catalog_digest"] = canonical_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
     assert page.locator(".rail").count() == 3
@@ -706,7 +842,7 @@ def test_refresh_rebuilds_connections_and_keeps_selection_emphasis(open_page):
     first = json.loads(board_payload())
     second = json.loads(board_payload())
     second["entries"][3]["relationship"]["prerequisites"] = [_edge(STEP_TWO, "shared")]
-    second["catalog_digest"] = canonical_digest(second)
+    _reseal(second)
     page = open_page(SequenceClient([first, second]))
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     page.click("#refresh")
@@ -889,7 +1025,7 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
                [_edge(GATE, "input")]),
     ]
     value["entries"].sort(key=lambda entry: entry["package_path"])
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator(".card-title").all_text_contents() == [
         "Z upstream", "X cycle B", "Y cycle A", "B prerequisite C", "A dependent D",
@@ -914,7 +1050,7 @@ def test_unresolved_relationship_does_not_change_card_order(open_page, reason):
         _entry(STEP_ONE, "Alpha/Queue/a", "queue", "Z candidate", "Alpha"),
         _entry(STEP_TWO, "Alpha/Queue/b", "queue", "A unresolved", "Alpha", [edge]),
     ]
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator(".card-title").all_text_contents() == ["A unresolved", "Z candidate"]
     assert connection_pairs(page) == set()
@@ -931,7 +1067,7 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
                [_edge(STEP_ONE, "input")]),
         _entry(duplicate_id, "Beta/Queue/c", "queue", "Duplicate", "Beta"),
     ]
-    _refresh_visibility_and_digest(value)
+    _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator('.board-row[data-lifecycle="queue"] .cell').first.locator(
         '.card-title'
@@ -955,3 +1091,135 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
     page.click("#refresh")
     assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 1
     assert client.calls == 3
+
+
+def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_context(
+    open_page,
+):
+    page = open_page(StaticClient(lifecycle_payload()))
+    assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in STAGE_ROWS]
+    assert page.locator("#board .card").count() == 7
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
+    ) == [[lifecycle, title] for _, lifecycle, _, title in STAGE_ROWS]
+
+    hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
+    queue_path = "Fictional/Queue/package"
+    done_path = "Fictional/Done/package"
+    hidden_page = open_page(StaticClient(hidden))
+    queue = hidden_page.locator(f'.card[data-package-path="{queue_path}"]')
+    queue.click()
+
+    assert hidden_page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert hidden_page.locator(f'.card[data-package-path="{done_path}"]').count() == 0
+    hidden_page.fill("#filter", "Done target")
+    assert hidden_page.locator("#board .card:visible").count() == 0
+    hidden_page.fill("#filter", "")
+    assert queue.locator(".card-links").count() == 0
+    assert hidden_page.locator(
+        f'.connection[data-source="{STAGE_IDS["Done"]}"]'
+    ).count() == 0
+    assert hidden_page.locator("#details .prerequisite-target").inner_text() == "Done target"
+
+
+def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_page):
+    first = lifecycle_payload()
+    second = lifecycle_payload(hidden_stages=("Done",))
+    page = open_page(SequenceClient([first, second]))
+    done = page.locator('.card[data-package-path="Fictional/Done/package"]')
+    done.click()
+    assert done.get_attribute("aria-pressed") == "true"
+
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
+    assert done.get_attribute("aria-pressed") == "true"
+
+    page.click("#refresh")
+    page.wait_for_function(
+        "() => !document.querySelector('#refresh').classList.contains('pending')",
+        timeout=15000,
+    )
+    assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 0
+    assert page.locator("#details h2").inner_text() == "Select a package"
+
+
+def test_real_producer_scalar_policy_paths_and_diagnostics_are_displayed(open_page):
+    payload, value = unicode_producer_payload()
+    assert value["visibility"]["hidden_stages"] == [UNICODE_LOW, UNICODE_HIGH]
+    diagnostics = value["program_coverage"]["diagnostics"]
+    assert [item["code"] for item in diagnostics] == ["invalid_package", "invalid_package"]
+    assert diagnostics[0]["message"] < diagnostics[1]["message"]
+
+    page = open_page(StaticClient(payload))
+    paths = page.locator("#board .card").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)"
+    )
+    expected_paths = [
+        f"Project{marker}/Queue/diagnostic-{marker}"
+        for marker in (UNICODE_LOW, UNICODE_HIGH)
+    ]
+    assert sorted(paths) == expected_paths
+    for marker, path in zip((UNICODE_LOW, UNICODE_HIGH), expected_paths):
+        card = page.locator(f'.card[data-package-path="{path}"]')
+        card.click()
+        assert f"invalid package identity: {path}" in page.locator("#details").inner_text()
+        assert f"Diagnostic {marker}" in page.locator("#details h2").inner_text()
+
+
+@pytest.mark.parametrize("kind", ["policy", "path", "diagnostics"])
+def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open_page, kind):
+    payload, value = unicode_producer_payload()
+    reversed_value = reversed_unicode_payload(payload, kind)
+    expected_paths = [
+        f"Project{marker}/Queue/diagnostic-{marker}"
+        for marker in (UNICODE_LOW, UNICODE_HIGH)
+    ]
+    assert value["catalog_digest"] != reversed_value["catalog_digest"]
+    if kind == "diagnostics":
+        assert {item["code"] for item in reversed_value["program_coverage"]["diagnostics"]} == {
+            "invalid_package"
+        }
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert sorted(page.locator("#board .card").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)"
+    )) == expected_paths
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
+    valid = json.loads(lifecycle_payload())
+    duplicate = json.loads(lifecycle_payload(hidden_stages=("Done",)))
+    duplicate["visibility"]["hidden_stages"] = ["Done", "Done"]
+    _reseal(duplicate)
+    assert duplicate["catalog_digest"] == canonical_digest(duplicate)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    client = RawSequenceClient([valid, duplicate])
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(client)
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert client.calls >= 2
