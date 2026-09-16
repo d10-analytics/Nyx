@@ -162,7 +162,7 @@ def _assert_show_all_browser(url: str) -> None:
             ]
             assert page.locator(".board-row").evaluate_all(
                 "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-            ) == [(stage.lower(), f"{STAGE_LABELS[stage]} package") for stage in STAGES]
+            ) == [[stage.lower(), f"{STAGE_LABELS[stage]} package"] for stage in STAGES]
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 1
         finally:
             browser.close()

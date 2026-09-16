@@ -39,6 +39,7 @@ jobs:
           nyx_verify_home="$(getent passwd "$nyx_verify_user" | cut -d: -f6)"
           sudo install -d --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0700 \
             "$nyx_verify_root" "$nyx_verify_root/exercise" "$nyx_verify_root/wheels" \
+            "$nyx_verify_root/playwright-browsers" \
             "$nyx_verify_home/.local" "$nyx_verify_home/.local/bin"
           sudo -u "$nyx_verify_user" -H "$runner_python" -m venv "$nyx_verify_root/venv"
           nyx_verify_wheels=("$GITHUB_WORKSPACE"/dist/*.whl)
@@ -49,12 +50,15 @@ jobs:
             "${nyx_verify_wheels[0]}" "$nyx_verify_wheel"
           sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m pip install \
             "$nyx_verify_wheel" pytest playwright
-          sudo -u "$nyx_verify_user" -H "$nyx_verify_root/venv/bin/python" -m playwright install chromium
+          sudo -u "$nyx_verify_user" -H env \
+            PLAYWRIGHT_BROWSERS_PATH="$nyx_verify_root/playwright-browsers" \
+            "$nyx_verify_root/venv/bin/python" -m playwright install chromium
           sudo -u "$nyx_verify_user" -H ln -s "$nyx_verify_root/venv/bin/nyx" \
             "$nyx_verify_home/.local/bin/nyx"
           sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \
             tests/test_installed_service.py "$nyx_verify_root/exercise/test_installed_service.py"
           timeout --preserve-status 90s sudo -u "$nyx_verify_user" -H env -u PYTHONPATH -u PYTHONHOME \
+            PLAYWRIGHT_BROWSERS_PATH="$nyx_verify_root/playwright-browsers" \
             PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \
             /bin/bash -c 'cd "$1" && exec "$2" -m pytest test_installed_service.py -v' \
             nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"
