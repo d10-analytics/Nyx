@@ -101,6 +101,7 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
         stage: stage not in hidden_stages for stage in STAGES
     }
     queue = next(entry for entry in entries if entry["stage"] == "Queue")
+    assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
     prerequisite = queue["relationship"]["prerequisites"][0]
     assert prerequisite == {
         "claim_name": "release",
@@ -138,6 +139,10 @@ def _assert_hidden_browser(url: str) -> None:
             assert queue.locator(".card-links").count() == 0
             assert page.locator('.connection[data-source="%s"]' % PACKAGE_IDS["Done"]).count() == 0
             assert page.locator("#details .prerequisite-target").inner_text() == "Done package"
+            assert page.locator("#details .direct-prerequisite-state").inner_text() == (
+                "Reported direct prerequisite state: satisfied."
+            )
+            assert page.locator("#details .reported-state").inner_text() == "Reported state: satisfied"
         finally:
             browser.close()
 
