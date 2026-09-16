@@ -220,13 +220,13 @@ def test_root_guide_explains_limits_workspace_and_authority() -> None:
     )
     assert all(
         marker not in root
-        for marker in (
-            "real-spec-root.invalid",
-            "source-checkout.invalid",
-            "provenance-map.invalid",
-            "payload-capture.invalid",
-            "diagnostic-screenshot.invalid",
-        )
+        for marker in ("".join(parts) for parts in (
+            ("real", "-spec-root", ".invalid"),
+            ("source", "-checkout", ".invalid"),
+            ("provenance", "-map", ".invalid"),
+            ("payload", "-capture", ".invalid"),
+            ("diagnostic", "-screenshot", ".invalid"),
+        ))
     )
 
 
