@@ -1,5 +1,7 @@
 # Fictional sample specifications
 
+[Return to the root Nyx guide](../../README.md).
+
 This directory is a small, self-contained walkthrough for Nyx's catalog. Every
 name, identifier, claim, and provenance value here is fictional. Point Nyx at
 this directory directly; do not copy or generate anything into it.
