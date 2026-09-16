@@ -774,9 +774,12 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     page = open_page(StaticClient(value))
     expected = {
         (STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE),
-        (STEP_ONE, far), (far, STEP_ONE), (far, unknown),
     }
     assert connection_pairs(page) == expected
+    assert page.locator(f'.card[data-package-id="{far}"]').count() == 0
+    assert page.locator(f'.card[data-package-id="{unknown}"]').count() == 1
+    assert page.locator(f'.card[data-package-id="{unknown}"] .card-links').count() == 0
+    assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
     for width in (650, 1800):
         before = page.locator(".rail").first.get_attribute("d")
@@ -785,12 +788,14 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
             "before => document.querySelector('.rail').getAttribute('d') !== before", arg=before
         )
         assert connection_pairs(page) == expected
+        assert all(far not in pair for pair in connection_pairs(page))
         assert_readable_arrows(page)
     page.fill("#filter", "Alpha")
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE)}
     assert_readable_arrows(page)
     page.fill("#filter", "")
     assert connection_pairs(page) == expected
+    assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
 
 
@@ -1096,7 +1101,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     assert page.locator("#board .card").count() == 7
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-    ) == [(lifecycle, title) for _, lifecycle, _, title in STAGE_ROWS]
+    ) == [[lifecycle, title] for _, lifecycle, _, title in STAGE_ROWS]
 
     hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
     queue_path = "Fictional/Queue/package"
