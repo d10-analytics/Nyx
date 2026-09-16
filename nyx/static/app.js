@@ -17,6 +17,11 @@
     ["Awaiting_Retrospective", "awaiting_retrospective"], ["Done", "done"],
     ["Archive", "archive"],
   ]);
+  const UNRESOLVED_EDGE_REASONS = new Set([
+    "missing_target", "duplicate_target", "identity_coverage_incomplete",
+    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+    "invalid_prerequisite", "self_edge",
+  ]);
   const DECLARED_FIELDS = [
     ["title", "Title"], ["target_project", "Target project"], ["status", "Status"],
     ["closure", "Closure"], ["sanity_recommendation", "Sanity recommendation"],
@@ -172,9 +177,7 @@
   }
 
   function prerequisiteTarget(edge, byId) {
-    if (["missing_target", "duplicate_target", "identity_coverage_incomplete",
-      "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-      "invalid_prerequisite", "self_edge"].includes(edge.reason)) return null;
+    if (UNRESOLVED_EDGE_REASONS.has(edge.reason)) return null;
     return byId.get(edge.target_package_id) || null;
   }
 
@@ -231,7 +234,12 @@
   function needsHtml(entry, byId) {
     const parts = prerequisiteTargets(entry).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
-      if (!target) return '<span class="link unresolved">unresolved target</span>';
+      if (!target) {
+        // A valid edge may point to a hidden context entry. It is intentionally
+        // absent from the interactive index, but it is not an unresolved target.
+        if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
+        return '<span class="link unresolved">unresolved target</span>';
+      }
       if (columnKeyOf(target) === columnKeyOf(entry)) return "";
       return `<span class="link cross">${text(titleOf(target))} ` +
         `<em>${text(projectOf(target))}</em></span>`;
