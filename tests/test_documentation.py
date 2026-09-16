@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import json
+import re
+import tomllib
 from pathlib import Path
+from unittest.mock import patch
 
-from nyx import catalog
+import pytest
 
+from nyx import catalog, cli, runtime, state
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
 SAMPLE_ROOT = Path(__file__).parents[1] / "examples" / "sample-specifications"
 PROGRAM_ID = "99999999-9999-4999-8999-999999999999"
 PREREQUISITE_ID = "55555555-5555-4555-8555-555555555555"
+FICTIONAL_IDS = {
+    PROGRAM_ID,
+    PREREQUISITE_ID,
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+}
 
 
 def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, object]:
@@ -132,3 +146,196 @@ def test_committed_sample_catalog_proves_documented_walkthrough() -> None:
             "diagnostics": [],
         }
     ]
+
+
+def test_root_and_sample_guides_are_mutually_linked() -> None:
+    root = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    sample = (SAMPLE_ROOT / "README.md").read_text(encoding="utf-8")
+
+    root_link = REPOSITORY_ROOT / "examples" / "sample-specifications" / "README.md"
+    sample_link = SAMPLE_ROOT / "../../README.md"
+    assert "[fictional sample walkthrough](examples/sample-specifications/README.md)" in root
+    assert "[Return to the root Nyx guide](../../README.md)" in sample
+    assert root_link.resolve() == (SAMPLE_ROOT / "README.md").resolve()
+    assert sample_link.resolve() == (REPOSITORY_ROOT / "README.md").resolve()
+
+
+def test_root_guide_contains_the_literal_repository_workflow() -> None:
+    root = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    required_lines = (
+        "python3.12 -m venv .venv",
+        ". .venv/bin/activate",
+        "python -m pip install -e '.[test]'",
+        "nyx --setup examples/sample-specifications --hide-stage Done",
+        "nyx --status",
+        "nyx",
+        "nyx --stop",
+        "nyx --setup examples/sample-specifications --show-all-stages",
+    )
+    for line in required_lines:
+        assert line in root
+
+    assert "http://127.0.0.1:8765/" in root
+    assert "every ten seconds" in root
+    assert "Apply update" in root
+    assert "Refresh view" in root
+    assert "stop-before-reconfiguration order is required" in root
+    assert root.index(
+        "nyx --stop\nnyx --setup examples/sample-specifications --show-all-stages"
+    ) < root.index("## Workspace and terminology")
+
+
+def test_root_guide_explains_limits_workspace_and_authority() -> None:
+    root = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    required_terms = (
+        "Linux-local",
+        "loopback-only",
+        "read-only",
+        "specification root / project / lifecycle / groups / package / spec.md",
+        "program",
+        "claim",
+        "prerequisite",
+        "diagnostics",
+        "Find",
+        "select a card",
+        "Unblocked",
+        "implementation",
+        "approval",
+        "review",
+        "queue authority",
+        "merge",
+        "release",
+        "deployment",
+        "confidentiality",
+        "runtime execution",
+    )
+    for term in required_terms:
+        assert term in root
+
+    assert not re.search(r"(?<!:)\/(?:home|tmp|opt|var|etc|proc|root)\/", root)
+    assert not re.search(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        root,
+        flags=re.IGNORECASE,
+    )
+    assert all(
+        marker not in root
+        for marker in (
+            "real-spec-root.invalid",
+            "source-checkout.invalid",
+            "provenance-map.invalid",
+            "payload-capture.invalid",
+            "diagnostic-screenshot.invalid",
+        )
+    )
+
+
+def test_sample_documentation_is_synthetic_and_has_no_generated_artifacts() -> None:
+    documentation = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(SAMPLE_ROOT.rglob("*.md"))
+    )
+    identifiers = set(
+        re.findall(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+            documentation,
+            flags=re.IGNORECASE,
+        )
+    )
+    assert identifiers == FICTIONAL_IDS
+    assert not re.search(r"(?<!:)\/(?:home|tmp|opt|var|etc|proc|root)\/", documentation)
+    assert not any(
+        path.name in {"catalog.json", "catalog.html", "screenshot.png", "screenshot.jpg"}
+        or path.suffix in {".json", ".png", ".jpg", ".jpeg"}
+        for path in SAMPLE_ROOT.rglob("*")
+    )
+    assert not any(path.name == "__pycache__" for path in SAMPLE_ROOT.rglob("*"))
+
+
+def test_root_guide_preserves_packaging_metadata() -> None:
+    with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)["project"]
+    assert project["name"] == "nyx"
+    assert project["description"] == "Private catalog viewer"
+    assert project["requires-python"] == ">=3.12"
+
+
+def test_root_guide_matches_runtime_and_browser_sources() -> None:
+    root = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    browser = (REPOSITORY_ROOT / "nyx" / "static" / "app.js").read_text(encoding="utf-8")
+    index = (REPOSITORY_ROOT / "nyx" / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert runtime.URL in root
+    assert "const POLL_INTERVAL = 10000;" in browser
+    assert 'refreshButton.textContent = available ? "Apply update" : "Refresh view";' in browser
+    assert 'id="filter" type="search"' in index
+    assert 'id="refresh" type="button"' in index
+    assert 'id="details"' in index
+
+
+def test_documented_cli_shapes_use_the_real_parser_and_dispatch_branches(capsys) -> None:
+    parser = cli._parser()
+    setup = parser.parse_args(
+        ["--setup", "examples/sample-specifications", "--hide-stage", "Done"]
+    )
+    show_all = parser.parse_args(
+        ["--setup", "examples/sample-specifications", "--show-all-stages"]
+    )
+    status = parser.parse_args(["--status"])
+    stop = parser.parse_args(["--stop"])
+    start = parser.parse_args([])
+    assert (setup.setup, setup.hide_stage, setup.show_all_stages) == (
+        "examples/sample-specifications",
+        ["Done"],
+        False,
+    )
+    assert (show_all.setup, show_all.hide_stage, show_all.show_all_stages) == (
+        "examples/sample-specifications",
+        None,
+        True,
+    )
+    assert status.status is True
+    assert stop.stop is True
+    assert not any(vars(start).values())
+
+    class Configuration:
+        specification_root = Path("examples/sample-specifications")
+
+    with patch.object(cli.runtime, "setup", return_value=Configuration()) as setup_call:
+        assert cli.main(
+            ["--setup", "examples/sample-specifications", "--hide-stage", "Done"]
+        ) == 0
+    setup_call.assert_called_once_with(
+        "examples/sample-specifications", hidden_stages=["Done"]
+    )
+    with patch.object(cli.runtime, "setup", return_value=Configuration()) as show_all_call:
+        assert cli.main(
+            ["--setup", "examples/sample-specifications", "--show-all-stages"]
+        ) == 0
+    show_all_call.assert_called_once_with(
+        "examples/sample-specifications", hidden_stages=()
+    )
+    with patch.object(cli.runtime, "start", return_value=runtime.URL) as start_call:
+        assert cli.main([]) == 0
+    start_call.assert_called_once_with()
+    with patch.object(cli.runtime, "stop", return_value="stopped") as stop_call:
+        assert cli.main(["--stop"]) == 0
+    stop_call.assert_called_once_with()
+    with patch.object(
+        cli.state,
+        "observe_configuration",
+        return_value=state.ConfigurationObservation("not_configured"),
+    ) as observe_configuration, patch.object(
+        cli.runtime,
+        "observe_runtime",
+        return_value=runtime.RuntimeObservation("not_running"),
+    ) as observe_runtime:
+        assert cli.main(["--status"]) == 0
+    observe_configuration.assert_called_once_with()
+    observe_runtime.assert_called_once_with()
+    capsys.readouterr()
+
+    for arguments in (("--hide-stage", "Done"), ("--show-all-stages",)):
+        with pytest.raises(SystemExit) as error:
+            cli.main(list(arguments))
+        assert error.value.code == 2
