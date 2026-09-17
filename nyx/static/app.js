@@ -367,6 +367,13 @@
     if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
       return '<p class="empty board-empty">No packages in the catalog.</p>';
     }
+    const hiddenStages = new Set(displayed.visibility.hidden_stages || []);
+    const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
+      displayed.inventory.stages.some((stage) =>
+        !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
+    if (incomplete && !axes.stages.length) {
+      return '<p class="empty board-empty incomplete-empty">Discovery is incomplete; unavailable dimensions remain hidden until they can be confirmed.</p>';
+    }
     if (!axes.hasEligibleStages) {
       if (!compactView && displayed.inventory.projects.length) {
         return '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
