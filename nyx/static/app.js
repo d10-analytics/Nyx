@@ -327,7 +327,7 @@
       const hasStage = projectStages.some((stage) => !hiddenStages.has(stage.stage));
       const incompleteStage = projectStages.some((stage) =>
         !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
-      if (!hasStage && hasEligibleStages) return;
+      if (projectStages.length && !hasStage) return;
       const dimension = {
         key: record.name,
         project: record.name,
