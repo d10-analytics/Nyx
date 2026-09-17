@@ -9,6 +9,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -49,7 +50,10 @@ STAGES = (
     "Awaiting_Retrospective",
     "Done",
     "Archive",
+    "Review",
+    "Empty",
 )
+PACKAGED_STAGES = tuple(stage for stage in STAGES if stage != "Empty")
 STAGE_LABELS = {
     "Under_Development": "Under Development",
     "Queue": "Queue",
@@ -58,6 +62,8 @@ STAGE_LABELS = {
     "Awaiting_Retrospective": "Awaiting Retrospective",
     "Done": "Done",
     "Archive": "Archive",
+    "Review": "Review",
+    "Empty": "Empty",
 }
 PACKAGE_IDS = {
     stage: f"123e4567-e89b-42d3-a456-4266141740{index:02d}"
@@ -69,6 +75,8 @@ def _write_fictional_stages(specification_root: Path) -> None:
     for stage in STAGES:
         package_path = specification_root / "Fictional" / stage / stage.lower()
         package_path.mkdir(parents=True)
+        if stage == "Empty":
+            continue
         lines = [f"# {STAGE_LABELS[stage]} package", f"Package ID: {PACKAGE_IDS[stage]}"]
         if stage == "Queue":
             lines.append(f"Prerequisite: {PACKAGE_IDS['Done']} | release")
@@ -90,15 +98,22 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     entries = value["entries"]
-    assert value["schema_version"] == 3
+    assert value["schema_version"] == 4
+    assert value["inventory"] == {
+        "projects": [{"name": "Fictional", "availability": "complete"}],
+        "stages": [
+            {"project": "Fictional", "stage": stage, "availability": "complete"}
+            for stage in sorted(STAGES)
+        ],
+    }
     assert value["visibility"]["hidden_stages"] == hidden_stages
-    assert value["visibility"]["visible_entry_count"] == 7 - len(hidden_stages)
+    assert value["visibility"]["visible_entry_count"] == len(PACKAGED_STAGES) - len(hidden_stages)
     assert value["visibility"]["hidden_entry_count"] == len(hidden_stages)
     assert [entry["package_path"] for entry in entries] == sorted(
-        f"Fictional/{stage}/{stage.lower()}" for stage in STAGES
+        f"Fictional/{stage}/{stage.lower()}" for stage in PACKAGED_STAGES
     )
     assert {entry["stage"]: entry["board_visible"] for entry in entries} == {
-        stage: stage not in hidden_stages for stage in STAGES
+        stage: stage not in hidden_stages for stage in PACKAGED_STAGES
     }
     queue = next(entry for entry in entries if entry["stage"] == "Queue")
     assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
@@ -115,6 +130,55 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     assert done["declared"]["title"] == "Done package"
 
 
+@pytest.mark.parametrize("case", ["schema-3", "duplicate-project"])
+def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: str) -> None:
+    from nyx.models import canonical_digest
+    from nyx.server import create_server
+
+    value = {
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [],
+        },
+        "visibility": {
+            "hidden_stages": [],
+            "visible_entry_count": 0,
+            "hidden_entry_count": 0,
+        },
+        "identity_coverage": {"state": "complete", "diagnostics": []},
+        "program_coverage": {"state": "complete", "diagnostics": []},
+        "discovery_diagnostics": [],
+        "entries": [],
+        "programs": [],
+    }
+    if case == "schema-3":
+        value["schema_version"] = 3
+    else:
+        value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
+    value["catalog_digest"] = canonical_digest(value)
+
+    service = create_server(lambda: value, port=0)
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", service.server_port, timeout=5)
+        connection.request(
+            "GET",
+            "/api/catalog",
+            headers={"Host": f"127.0.0.1:{service.server_port}"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 502
+        assert json.loads(body) == {"error": "producer_protocol_error"}
+    finally:
+        service.shutdown()
+        thread.join(timeout=5)
+        service.server_close()
+
+
 def _assert_hidden_browser(url: str) -> None:
     from playwright.sync_api import sync_playwright
 
@@ -124,12 +188,18 @@ def _assert_hidden_browser(url: str) -> None:
             page = browser.new_page()
             page.goto(url)
             page.locator("#board .card").first.wait_for()
-            assert page.locator("#board .card").count() == 6
+            assert page.locator("#board .card").count() == len(PACKAGED_STAGES) - 1
             assert page.locator(".row-head").all_text_contents() == [
-                STAGE_LABELS[stage] for stage in STAGES if stage != "Done"
+                STAGE_LABELS[stage] for stage in sorted(PACKAGED_STAGES) if stage != "Done"
             ]
-            assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+            assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 0
+            assert page.locator('.card[data-package-path="Fictional/Review/review"]').count() == 1
+            compact = page.get_by_label("Hide empty rows and columns", exact=True)
+            assert compact.is_checked()
+            compact.uncheck()
+            assert page.locator('.board-row[data-lifecycle="Empty"]').count() == 1
+            assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
             page.fill("#filter", "Done package")
             assert page.locator("#board .card:visible").count() == 0
             page.fill("#filter", "")
@@ -156,13 +226,17 @@ def _assert_show_all_browser(url: str) -> None:
             page = browser.new_page()
             page.goto(url)
             page.locator("#board .card").first.wait_for()
-            assert page.locator("#board .card").count() == 7
+            assert page.locator("#board .card").count() == len(PACKAGED_STAGES)
             assert page.locator(".row-head").all_text_contents() == [
-                STAGE_LABELS[stage] for stage in STAGES
+                STAGE_LABELS[stage] for stage in sorted(PACKAGED_STAGES)
             ]
+            compact = page.get_by_label("Hide empty rows and columns", exact=True)
+            assert compact.is_checked()
+            compact.uncheck()
             assert page.locator(".board-row").evaluate_all(
                 "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-            ) == [[stage.lower(), f"{STAGE_LABELS[stage]} package"] for stage in STAGES]
+            ) == [[stage, None if stage == "Empty" else f"{STAGE_LABELS[stage]} package"]
+                  for stage in sorted(STAGES)]
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 1
         finally:
             browser.close()

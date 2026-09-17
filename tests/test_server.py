@@ -27,7 +27,14 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [
+                {"project": "Fictional", "stage": "Queue", "availability": "complete"},
+                {"project": "Fictional", "stage": "Under_Development", "availability": "complete"},
+            ],
+        },
         "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                         "visible_entry_count": 2, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -121,7 +128,7 @@ def test_default_provider_uses_unselected_scanner():
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda value: value.update(schema_version=2),
+        lambda value: value.update(schema_version=3),
         lambda value: value.update(unknown=True),
         lambda value: value["entries"][0].update(board_visible="true"),
         lambda value: value["entries"][0].update(stage="Done"),
@@ -131,7 +138,7 @@ def test_default_provider_uses_unselected_scanner():
     ],
     ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
 )
-def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
+def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
     mutate(value)
     value["catalog_digest"] = canonical_digest(value)
@@ -139,7 +146,7 @@ def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate)
         parse_catalog(value)
 
 
-def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
+def test_schema_four_parser_rejects_bad_digest_even_when_shape_is_valid():
     value = raw_catalog()
     value["catalog_digest"] = "0" * 64
     with pytest.raises(ValueError):
@@ -147,13 +154,13 @@ def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
 
 
 @pytest.mark.parametrize("alter", [
-    lambda catalog: replace(catalog, schema_version=2),
+    lambda catalog: replace(catalog, schema_version=3),
     lambda catalog: replace(
         catalog,
         entries=(replace(catalog.entries[0], board_visible="yes"), *catalog.entries[1:]),
     ),
 ])
-def test_catalog_object_providers_are_revalidated_as_schema_three(alter):
+def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
     with pytest.raises(CatalogError, match="producer_protocol_error"):
         server._catalog_from_provider(lambda: alter(valid_catalog()))
 
@@ -209,6 +216,75 @@ def test_catalog_route_accepts_a_callable_provider():
     assert status == 200
     assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/first"
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate"),
+    [
+        ("schema-3", lambda value: value.update(schema_version=3)),
+        ("unknown-inventory-key", lambda value: value["inventory"].update(extra=[])),
+        ("projects-type", lambda value: value["inventory"].update(projects={})),
+        (
+            "duplicate-project",
+            lambda value: value["inventory"]["projects"].append(
+                dict(value["inventory"]["projects"][0])
+            ),
+        ),
+        (
+            "unordered-project",
+            lambda value: value["inventory"]["projects"].append(
+                {"name": "Alpha", "availability": "complete"}
+            ),
+        ),
+        (
+            "duplicate-stage-pair",
+            lambda value: value["inventory"]["stages"].append(
+                dict(value["inventory"]["stages"][-1])
+            ),
+        ),
+        ("unordered-stage-pair", lambda value: value["inventory"]["stages"].reverse()),
+        (
+            "unsafe-project",
+            lambda value: value["inventory"]["projects"][0].update(name="../outside"),
+        ),
+        (
+            "missing-stage-parent",
+            lambda value: value["inventory"]["stages"][0].update(project="Missing"),
+        ),
+        (
+            "invalid-availability",
+            lambda value: value["inventory"]["stages"][0].update(availability="unknown"),
+        ),
+        ("entry-not-admitted", lambda value: value["entries"][0].update(stage="Missing")),
+        ("digest-mismatch", lambda value: value.update(catalog_digest="0" * 64)),
+    ],
+    ids=[
+        "schema-3",
+        "unknown-inventory-key",
+        "projects-type",
+        "duplicate-project",
+        "unordered-project",
+        "duplicate-stage-pair",
+        "unordered-stage-pair",
+        "unsafe-project",
+        "missing-stage-parent",
+        "invalid-availability",
+        "entry-not-admitted",
+        "digest-mismatch",
+    ],
+)
+def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
+    value = raw_catalog()
+    mutate(value)
+    if case != "digest-mismatch":
+        value["catalog_digest"] = canonical_digest(value)
+
+    with RunningServer(lambda: value) as port:
+        status, content_type, body = request(port, "GET", "/api/catalog")
+
+    assert status == 502
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "producer_protocol_error"}
 
 
 @pytest.mark.parametrize(

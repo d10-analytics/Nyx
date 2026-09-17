@@ -6,6 +6,11 @@ Nyx requires Linux and Python 3.12 or newer. The
 [root guide](../README.md#try-the-sample) covers installation from a checkout.
 Activate the virtual environment where you installed Nyx before using its commands.
 
+Nyx reads and displays specifications; it does not edit them or move them
+between directories. Setup and runtime commands write account-local configuration
+and runtime state. The board's compact preference is separate and belongs only
+to the browser.
+
 ## Set up a workspace
 
 ```bash
@@ -41,7 +46,9 @@ nyx
 ```
 
 Repeat `--hide-stage` for each stage to hide. Use the directory names listed in
-the [workspace guide](workspaces.md), with the same capitalization.
+the [workspace guide](workspaces.md), with the same capitalization. Any admitted
+literal stage directory can be hidden by its exact name, including a custom
+stage such as `Testing`.
 
 To show every stage:
 
@@ -65,12 +72,29 @@ Nyx checks for changed information every ten seconds. **Apply update** loads the
 waiting snapshot; **Refresh view** requests an immediate check when no update is
 waiting. Changes are not applied automatically while you are reading a snapshot.
 
+The **Hide empty rows and columns** checkbox starts checked. It compacts only
+the currently displayed catalog, and its value is persisted in browser local
+storage when available. If browser storage is blocked or full, Nyx keeps the
+preference in memory for the current page and safely falls back to checked on a
+new page. This preference never changes setup, the workspace, or the catalog.
+
+Search filters cards and their visible dependency rails without changing the
+project and stage axes. A hidden configured stage stays absent even when compact
+view is unchecked. Incomplete or unavailable dimensions remain visible with an
+`incomplete / unavailable` notice; Nyx does not compact them as if they were
+empty. If a refresh returns malformed data, Nyx reports the refresh failure and
+retains the last valid displayed board and browser-local preference.
+
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 
 ## If something looks wrong
 
 - **The board is empty:** check the workspace reported by `nyx --status`, the
   [directory layout](workspaces.md), and whether the relevant stages are hidden.
+  If the catalog contains admitted folders but no packages, uncheck **Hide
+  empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
+  discovery is reported separately and must not be treated as confirmation that
+  a directory is empty.
 - **A card or dependency has a diagnostic:** inspect its `spec.md` header for a
   missing or duplicated ID, a malformed field, or an unavailable prerequisite.
   The [reference](specification-reference.md) explains the expected format.

@@ -83,10 +83,36 @@ def _reseal(value):
     return value
 
 
+def _admit_inventory_stage(value, project, stage):
+    projects = value["inventory"]["projects"]
+    if not any(item["name"] == project for item in projects):
+        projects.append({"name": project, "availability": "complete"})
+        projects.sort(key=lambda item: item["name"])
+    stages = value["inventory"]["stages"]
+    if not any(item["project"] == project and item["stage"] == stage for item in stages):
+        stages.append({
+            "project": project,
+            "stage": stage,
+            "availability": "complete",
+        })
+        stages.sort(key=lambda item: (item["project"], item["stage"]))
+
+
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [
+                {"name": "Alpha", "availability": "complete"},
+                {"name": "Beta", "availability": "complete"},
+            ],
+            "stages": [
+                {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+                {"project": "Alpha", "stage": "Under_Development", "availability": "complete"},
+                {"project": "Beta", "stage": "Under_Development", "availability": "complete"},
+            ],
+        },
         "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                         "visible_entry_count": 4, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -181,7 +207,14 @@ def lifecycle_payload(*, hidden_stages=()):
             }]
         entries.append(entry)
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [
+                {"project": "Fictional", "stage": stage, "availability": "complete"}
+                for stage, *_rest in sorted(STAGE_ROWS)
+            ],
+        },
         "visibility": {
             "hidden_stages": list(hidden_stages),
             "visible_entry_count": 0,
@@ -191,6 +224,93 @@ def lifecycle_payload(*, hidden_stages=()):
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
         "entries": sorted(entries, key=lambda entry: entry["package_path"]),
+        "programs": [],
+    }
+    _reseal(value)
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+COMPACT_CARD = "123e4567-e89b-42d3-a456-426614174020"
+COMPACT_DEPENDENT = "123e4567-e89b-42d3-a456-426614174021"
+COMPACT_HIDDEN = "123e4567-e89b-42d3-a456-426614174022"
+
+
+def compact_payload(*, extra_stage=False):
+    hidden_edge = _edge(COMPACT_HIDDEN, "release")
+    hidden_edge.update(
+        observed_state="satisfied",
+        observed_evidence_ref="sha256:" + "c" * 64,
+        resolved_state="satisfied",
+        reason="claim_satisfied",
+    )
+    visible_edge = _edge(COMPACT_CARD, "build")
+    visible_edge.update(
+        observed_state="satisfied",
+        observed_evidence_ref="sha256:" + "d" * 64,
+        resolved_state="satisfied",
+        reason="claim_satisfied",
+    )
+    entries = [
+        _entry(
+            COMPACT_CARD, "Alpha/Testing/custom", "under_development", "Custom stage card", "Alpha"
+        ),
+        _entry(
+            COMPACT_DEPENDENT,
+            "Alpha/Queue/dependent",
+            "queue",
+            "Visible dependent",
+            "Alpha",
+            prerequisites=[visible_edge, hidden_edge],
+        ),
+        _entry(
+            COMPACT_HIDDEN,
+            "HiddenOnly/Done/hidden",
+            "Done",
+            "Hidden prerequisite",
+            "HiddenOnly",
+        ),
+    ]
+    if extra_stage:
+        entries.append(_entry(
+            "123e4567-e89b-42d3-a456-426614174023",
+            "Alpha/Review/new",
+            "under_development",
+            "Pending new stage",
+            "Alpha",
+        ))
+    entries.sort(key=lambda entry: entry["package_path"])
+    stages = [
+        {"project": "Alpha", "stage": "Partial", "availability": "incomplete"},
+        {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+        {"project": "Alpha", "stage": "Review", "availability": "complete"},
+        {"project": "Alpha", "stage": "Testing", "availability": "complete"},
+        {"project": "EmptyProject", "stage": "Empty", "availability": "complete"},
+        {"project": "HiddenOnly", "stage": "Done", "availability": "complete"},
+    ]
+    if not extra_stage:
+        stages.remove({"project": "Alpha", "stage": "Review", "availability": "complete"})
+    value = {
+        "schema_version": 4,
+        "inventory": {
+            "projects": [
+                {"name": "Alpha", "availability": "complete"},
+                {"name": "EmptyProject", "availability": "complete"},
+                {"name": "HiddenOnly", "availability": "complete"},
+                {"name": "ZeroProject", "availability": "complete"},
+            ],
+            "stages": stages,
+        },
+        "visibility": {
+            "hidden_stages": ["Done"],
+            "visible_entry_count": 0,
+            "hidden_entry_count": 0,
+        },
+        "identity_coverage": {"state": "complete", "diagnostics": []},
+        "program_coverage": {"state": "complete", "diagnostics": []},
+        "discovery_diagnostics": [
+            {"code": "discovery_unavailable", "message": "Partial stage scan incomplete"}
+        ],
+        "entries": entries,
         "programs": [],
     }
     _reseal(value)
@@ -323,16 +443,17 @@ def card_titles(page, column=1, row="Under Development"):
     return page.locator(selector).all_inner_texts()
 
 
+def row_labels(page):
+    return page.locator(".row-head").evaluate_all(
+        "rows => rows.map(row => row.firstChild.textContent)"
+    )
+
+
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
     assert page.locator(".column-head").all_inner_texts() == ["Alpha", "Beta"]
     rows = page.locator(".row-head").all_inner_texts()
-    assert rows[:4] == [
-        "Under Development",
-        "Queue",
-        "Needs Fixes",
-        "Awaiting Retrospective",
-    ]
+    assert rows == ["Queue", "Under Development"]
     assert page.locator("#board .card").count() == 4
 
 
@@ -601,7 +722,7 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     page = open_page(StaticClient(value))
 
     assert page.locator("#board .card").count() == 0
-    assert page.locator("#board .board-empty").inner_text() == "No packages in the catalog."
+    assert "Empty folders are hidden" in page.locator("#board .board-empty").inner_text()
     assert discovery_message in page.locator("#details").inner_text()
     assert page.locator("#details h2").inner_text() == "No packages available"
     assert page.locator("#details .catalog-diagnostics li").inner_text() == (
@@ -761,6 +882,8 @@ def routing_payload():
         _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", "Other",
                prerequisites=[_edge(far, "input")]),
     ])
+    _admit_inventory_stage(value, "Gamma", "Done")
+    _admit_inventory_stage(value, "Other", "Queue")
     # Reverse cross-project edge and a cycle; neither implies a topological order.
     value["entries"][1]["relationship"]["prerequisites"] = [_edge(far, "reverse")]
     value["entries"][1]["relationship"]["direct_prerequisite_state"] = "unsatisfied"
@@ -812,6 +935,7 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
         value["entries"].append(_entry(
             STEP_ONE, "Gamma/Queue/duplicate", "queue", "Duplicate source", "Gamma"
         ))
+        _admit_inventory_stage(value, "Gamma", "Queue")
     elif reason == "missing_target":
         edge["target_package_id"] = "123e4567-e89b-42d3-a456-426614174009"
     value["entries"].sort(key=lambda entry: entry["package_path"])
@@ -1067,9 +1191,10 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
                [_edge(STEP_ONE, "input")]),
         _entry(duplicate_id, "Beta/Queue/c", "queue", "Duplicate", "Beta"),
     ]
+    _admit_inventory_stage(value, "Beta", "Queue")
     _reseal(value)
     page = open_page(StaticClient(value))
-    assert page.locator('.board-row[data-lifecycle="queue"] .cell').first.locator(
+    assert page.locator('.board-row[data-lifecycle="Queue"] .cell').first.locator(
         '.card-title'
     ).all_text_contents() == ["A dependent", "Z candidate"]
     assert connection_pairs(page) == set()
@@ -1097,11 +1222,12 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     open_page,
 ):
     page = open_page(StaticClient(lifecycle_payload()))
-    assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in STAGE_ROWS]
+    ordered_rows = sorted(STAGE_ROWS)
+    assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in ordered_rows]
     assert page.locator("#board .card").count() == 7
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-    ) == [[lifecycle, title] for _, lifecycle, _, title in STAGE_ROWS]
+    ) == [[stage, title] for stage, _, _, title in ordered_rows]
 
     hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
     queue_path = "Fictional/Queue/package"
@@ -1110,7 +1236,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     queue = hidden_page.locator(f'.card[data-package-path="{queue_path}"]')
     queue.click()
 
-    assert hidden_page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert hidden_page.locator('.board-row[data-lifecycle="Done"]').count() == 0
     assert hidden_page.locator(f'.card[data-package-path="{done_path}"]').count() == 0
     hidden_page.fill("#filter", "Done target")
     assert hidden_page.locator("#board .card:visible").count() == 0
@@ -1120,6 +1246,206 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
         f'.connection[data-source="{STAGE_IDS["Done"]}"]'
     ).count() == 0
     assert hidden_page.locator("#details .prerequisite-target").inner_text() == "Done target"
+
+
+def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page):
+    page = open_page(StaticClient(compact_payload()))
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    assert compact.is_checked()
+    assert page.locator(".column-head").all_text_contents() == ["Alpha"]
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
+    assert page.locator('.card[data-package-path="Alpha/Testing/custom"]').count() == 1
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+    assert "incomplete / unavailable" in page.locator(".row-head").first.inner_text()
+
+    dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
+    dependent.click()
+    details = page.locator("#details")
+    assert details.locator(".prerequisite-target").all_text_contents() == [
+        "Custom stage card", "Hidden prerequisite"
+    ]
+    assert "Partial stage scan incomplete" in details.inner_text()
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+
+    compact.uncheck()
+    assert not compact.is_checked()
+    assert page.locator(".column-head").all_text_contents() == [
+        "Alpha", "EmptyProject", "ZeroProject"
+    ]
+    assert row_labels(page) == [
+        "Partial", "Queue", "Testing", "Empty"
+    ]
+    assert page.locator('.board-row[data-lifecycle="Empty"] .empty').all_text_contents() == [
+        "—", "—", "—"
+    ]
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+
+
+def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open_page):
+    value = json.loads(compact_payload())
+    hidden = sorted(stage["stage"] for stage in value["inventory"]["stages"])
+    value["visibility"]["hidden_stages"] = hidden
+    for entry in value["entries"]:
+        entry["board_visible"] = False
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.get_by_text("Empty folders are hidden", exact=False).count() == 1
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    compact.uncheck()
+    assert page.locator(".column-head").all_text_contents() == ["ZeroProject"]
+    assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
+
+
+def test_compact_view_keeps_incomplete_project_when_no_stage_is_discoverable(open_page):
+    value = json.loads(compact_payload())
+    value["inventory"] = {
+        "projects": [{"name": "UnreadableProject", "availability": "incomplete"}],
+        "stages": [],
+    }
+    value["visibility"]["hidden_stages"] = []
+    value["entries"] = []
+    _reseal(value)
+
+    page = open_page(StaticClient(value))
+
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    heading = page.locator(".column-head")
+    assert heading.count() == 1
+    assert heading.evaluate("node => node.firstChild.textContent") == "UnreadableProject"
+    assert heading.locator(".dimension-incomplete").inner_text() == "incomplete / unavailable"
+    assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
+
+
+def test_literal_stage_names_do_not_alias_builtin_labels(open_page):
+    value = json.loads(board_payload())
+    value["inventory"] = {
+        "projects": [{"name": "Alpha", "availability": "complete"}],
+        "stages": [
+            {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+            {"project": "Alpha", "stage": "queue", "availability": "complete"},
+        ],
+    }
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/upper", "queue", "Upper Queue", "Alpha"),
+        _entry(STEP_TWO, "Alpha/queue/lower", "queue", "Lower queue", "Alpha"),
+    ]
+    _reseal(value)
+
+    page = open_page(StaticClient(value))
+
+    assert page.locator(".row-head").all_text_contents() == ["Queue", "queue"]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => row.dataset.lifecycle)"
+    ) == ["Queue", "queue"]
+
+
+def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
+    admitted = json.loads(lifecycle_payload())
+    admitted["entries"] = []
+    _reseal(admitted)
+    admitted_page = open_page(StaticClient(admitted))
+    compact = admitted_page.get_by_label("Hide empty rows and columns", exact=True)
+    compact.uncheck()
+    assert admitted_page.locator(".board-empty").inner_text() == (
+        "The catalog contains admitted folders but no packages."
+    )
+
+    incomplete = json.loads(compact_payload())
+    incomplete["entries"] = []
+    _reseal(incomplete)
+    incomplete_page = open_page(StaticClient(incomplete))
+    assert incomplete_page.locator(".board-empty").inner_text() == (
+        "The catalog has incomplete dimensions; no packages are currently available."
+    )
+
+    empty = json.loads(lifecycle_payload())
+    empty["inventory"] = {"projects": [], "stages": []}
+    empty["entries"] = []
+    _reseal(empty)
+    empty_page = open_page(StaticClient(empty))
+    assert empty_page.locator(".board-empty").inner_text() == "No packages in the catalog."
+
+
+def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
+    valid = json.loads(compact_payload())
+    invalid = json.loads(compact_payload(extra_stage=True))
+    invalid["inventory"]["stages"].reverse()
+    _reseal(invalid)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(
+            RawSequenceClient([valid, invalid]),
+            init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
+        )
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert not page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    assert page.locator(".column-head").all_text_contents() == [
+        "Alpha", "EmptyProject", "ZeroProject"
+    ]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => row.dataset.lifecycle)"
+    ) == ["Partial", "Queue", "Testing", "Empty"]
+    assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+@pytest.mark.parametrize("storage_setup", [
+    "localStorage.setItem('spec-tracker-compact-view', 'false');",
+    """Object.defineProperty(window, 'localStorage', {
+      get() { throw new DOMException('Blocked', 'SecurityError'); }
+    });""",
+    """Storage.prototype.setItem = function() {
+      throw new DOMException('Full', 'QuotaExceededError');
+    };""",
+])
+def test_compact_preference_uses_storage_and_checked_fallback(open_page, storage_setup):
+    page = open_page(StaticClient(compact_payload()), init_script=storage_setup)
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    if "setItem('spec-tracker-compact-view', 'false')" in storage_setup:
+        assert not compact.is_checked()
+        assert page.locator(".column-head").all_text_contents() == [
+            "Alpha", "EmptyProject", "ZeroProject"
+        ]
+    else:
+        assert compact.is_checked()
+    compact.uncheck()
+    assert not compact.is_checked()
+    page.reload()
+    assert not compact.is_checked() if "setItem('spec-tracker-compact-view', 'false')" in storage_setup else compact.is_checked()
+
+
+def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
+    first = compact_payload()
+    second = compact_payload(extra_stage=True)
+    page = open_page(SequenceClient([first, second]))
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
+    assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
+    page.fill("#filter", "custom")
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
+    assert page.locator("#board .card:visible").count() == 1
+    assert page.locator(".rail-layer .rail").count() == 0
+    page.fill("#filter", "")
+    before = page.locator(".rail").first.get_attribute("d")
+    page.set_viewport_size({"width": 650, "height": 900})
+    page.wait_for_function(
+        "before => document.querySelector('.rail').getAttribute('d') !== before", arg=before
+    )
+    assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
+    assert page.locator('.board-row[data-lifecycle="Review"]').count() == 0
+    page.click("#refresh")
+    page.locator('.card[data-package-path="Alpha/Review/new"]').wait_for(timeout=15000)
+    assert page.locator('.board-row[data-lifecycle="Review"]').count() == 1
 
 
 def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_page):
@@ -1139,7 +1465,7 @@ def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_pag
         "() => !document.querySelector('#refresh').classList.contains('pending')",
         timeout=15000,
     )
-    assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 0
     assert page.locator("#details h2").inner_text() == "Select a package"
 
@@ -1223,3 +1549,100 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
     assert page.locator("#refresh").inner_text() == "Refresh view"
     assert client.calls >= 2
+
+
+def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
+    valid = json.loads(lifecycle_payload())
+    invalid = json.loads(lifecycle_payload())
+    invalid["inventory"]["stages"].reverse()
+    _reseal(invalid)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def _malformed_browser_inventory(case):
+    value = json.loads(lifecycle_payload())
+    if case == "schema-3":
+        value["schema_version"] = 3
+    elif case == "unknown-inventory-key":
+        value["inventory"]["extra"] = []
+    elif case == "projects-type":
+        value["inventory"]["projects"] = {}
+    elif case == "duplicate-project":
+        value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
+    elif case == "unordered-project":
+        value["inventory"]["projects"].append(
+            {"name": "Alpha", "availability": "complete"}
+        )
+    elif case == "duplicate-stage-pair":
+        value["inventory"]["stages"].append(dict(value["inventory"]["stages"][-1]))
+    elif case == "unordered-stage-pair":
+        value["inventory"]["stages"].reverse()
+    elif case == "unsafe-project":
+        value["inventory"]["projects"][0]["name"] = "../outside"
+    elif case == "missing-stage-parent":
+        value["inventory"]["stages"][0]["project"] = "Missing"
+    elif case == "invalid-availability":
+        value["inventory"]["stages"][0]["availability"] = "unknown"
+    elif case == "entry-not-admitted":
+        value["entries"][0]["stage"] = "Missing"
+    elif case == "digest-mismatch":
+        value["catalog_digest"] = "0" * 64
+        return value
+    else:  # pragma: no cover - the parameter list owns the cases
+        raise AssertionError(case)
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "schema-3",
+        "unknown-inventory-key",
+        "projects-type",
+        "duplicate-project",
+        "unordered-project",
+        "duplicate-stage-pair",
+        "unordered-stage-pair",
+        "unsafe-project",
+        "missing-stage-parent",
+        "invalid-availability",
+        "entry-not-admitted",
+        "digest-mismatch",
+    ],
+)
+def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
+    open_page, case
+):
+    valid = json.loads(lifecycle_payload())
+    invalid = _malformed_browser_inventory(case)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
+    assert page.locator("#refresh").inner_text() == "Refresh view"

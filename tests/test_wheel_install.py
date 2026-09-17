@@ -106,6 +106,79 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             capture_output=True,
             text=True,
         )
+        rejection = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                textwrap.dedent(
+                    """
+                    import http.client
+                    import json
+                    import threading
+                    from nyx.models import canonical_digest
+                    from nyx.server import create_server
+
+                    baseline = {
+                        "schema_version": 4,
+                        "inventory": {
+                            "projects": [{"name": "Fictional", "availability": "complete"}],
+                            "stages": [],
+                        },
+                        "visibility": {
+                            "hidden_stages": [],
+                            "visible_entry_count": 0,
+                            "hidden_entry_count": 0,
+                        },
+                        "identity_coverage": {"state": "complete", "diagnostics": []},
+                        "program_coverage": {"state": "complete", "diagnostics": []},
+                        "discovery_diagnostics": [],
+                        "entries": [],
+                        "programs": [],
+                    }
+                    malformed = []
+                    legacy = json.loads(json.dumps(baseline))
+                    legacy["schema_version"] = 3
+                    legacy["catalog_digest"] = canonical_digest(legacy)
+                    malformed.append(legacy)
+                    duplicate = json.loads(json.dumps(baseline))
+                    duplicate["inventory"]["projects"].append(
+                        dict(duplicate["inventory"]["projects"][0])
+                    )
+                    duplicate["catalog_digest"] = canonical_digest(duplicate)
+                    malformed.append(duplicate)
+
+                    for value in malformed:
+                        service = create_server(lambda value=value: value, port=0)
+                        thread = threading.Thread(target=service.serve_forever)
+                        thread.start()
+                        try:
+                            connection = http.client.HTTPConnection(
+                                "127.0.0.1", service.server_port, timeout=5
+                            )
+                            connection.request(
+                                "GET",
+                                "/api/catalog",
+                                headers={"Host": f"127.0.0.1:{service.server_port}"},
+                            )
+                            response = connection.getresponse()
+                            body = response.read()
+                            connection.close()
+                            assert response.status == 502
+                            assert json.loads(body) == {"error": "producer_protocol_error"}
+                        finally:
+                            service.shutdown()
+                            thread.join(timeout=5)
+                            service.server_close()
+                    """
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env={key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}},
+        )
+        assert rejection.returncode == 0, rejection.stderr
         probe = root / "probe.py"
         probe.write_text(
             textwrap.dedent(
@@ -153,7 +226,18 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 3,
+                    "schema_version": 4,
+                    "inventory": {
+                        "projects": [{"name": "Fictional", "availability": "complete"}],
+                        "stages": [
+                            {"project": "Fictional", "stage": "Queue", "availability": "complete"},
+                            {
+                                "project": "Fictional",
+                                "stage": "Under_Development",
+                                "availability": "complete",
+                            },
+                        ],
+                    },
                     "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                                     "visible_entry_count": 1, "hidden_entry_count": 0},
                     "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -218,10 +302,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     page.goto(f"http://127.0.0.1:{port}/")
                     page.locator(".card-title").wait_for(timeout=15000)
                     assert page.locator(".column-head").all_inner_texts() == ["Fictional"]
-                    assert page.locator(".row-head").all_inner_texts()[:2] == [
-                        "Under Development",
-                        "Queue",
-                    ]
+                    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+                    assert compact.is_checked()
+                    assert page.locator(".row-head").all_inner_texts() == ["Queue"]
                     assert page.locator(".card-title").all_inner_texts() == [
                         "Installed catalog entry"
                     ]
@@ -231,6 +314,14 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     assert page.locator("#board").inner_text().count(
                         "Installed catalog entry"
                     ) == 1
+                    compact.uncheck()
+                    assert page.locator(".row-head").all_inner_texts() == [
+                        "Queue",
+                        "Under Development",
+                    ]
+                    assert page.locator(
+                        '.board-row[data-lifecycle="Under_Development"] .card'
+                    ).count() == 0
                 finally:
                     page.close()
                     browser.close()

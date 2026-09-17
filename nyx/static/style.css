@@ -70,6 +70,8 @@ h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: .25rem; font-size: 1.5rem; }
 .toolbar p { margin-bottom: 0; color: var(--toolbar-muted); }
 .controls { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.compact-control { display: inline-flex; align-items: center; gap: .35rem; color: var(--toolbar-text); }
+.compact-control input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
 input, button, select { border: 1px solid var(--control-border); border-radius: .3rem; padding: .5rem .7rem; font: inherit; }
 input, select { background: var(--surface); color: var(--heading); }
 input::placeholder { color: var(--muted); opacity: 1; }
@@ -95,6 +97,12 @@ button.pending {
   padding: 1.5rem 2rem 1rem;
 }
 .board-empty { grid-column: 1 / -1; }
+.board-empty.compact-hidden, .board-empty.admitted-empty, .board-empty.no-eligible-stages {
+  padding: 1.25rem;
+  border: 1px dashed var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
 .rail-layer {
   position: absolute;
   top: 0;
@@ -124,6 +132,13 @@ button.pending {
   border-bottom: 2px solid var(--border);
   font-size: 1.05rem;
   color: var(--heading);
+}
+.dimension-incomplete {
+  display: block;
+  margin-top: .2rem;
+  color: var(--warning);
+  font-size: .76rem;
+  font-weight: 600;
 }
 .row-head {
   margin: .4rem 0 0;
