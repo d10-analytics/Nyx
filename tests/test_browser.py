@@ -1368,7 +1368,9 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
         )
 
     assert not page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
-    assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+    assert page.locator(".column-head").all_text_contents() == [
+        "Alpha", "EmptyProject", "ZeroProject"
+    ]
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => row.dataset.lifecycle)"
     ) == ["Partial", "Queue", "Testing", "Empty"]
@@ -1390,7 +1392,9 @@ def test_compact_preference_uses_storage_and_checked_fallback(open_page, storage
     compact = page.get_by_label("Hide empty rows and columns", exact=True)
     if "setItem('spec-tracker-compact-view', 'false')" in storage_setup:
         assert not compact.is_checked()
-        assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+        assert page.locator(".column-head").all_text_contents() == [
+            "Alpha", "EmptyProject", "ZeroProject"
+        ]
     else:
         assert compact.is_checked()
     compact.uncheck()
