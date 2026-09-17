@@ -28,6 +28,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     assert value["inventory"] == {
         "projects": [
             {"name": "Trail_API", "availability": "complete"},
+            {"name": "Trail_Mobile", "availability": "complete"},
             {"name": "Trail_Web", "availability": "complete"},
         ],
         "stages": [
@@ -37,13 +38,15 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
                 ("Trail_Web", "Awaiting_Retrospective"),
                 ("Trail_Web", "Needs_Fixes"),
                 ("Trail_Web", "Queue"),
+                ("Trail_Web", "Ready_For_Review"),
+                ("Trail_Web", "Testing"),
                 ("Trail_Web", "Under_Development"),
             )
         ],
     }
     assert value["visibility"] == {
         "hidden_stages": list(hidden_stages),
-        "visible_entry_count": 4 if hidden_stages else 5,
+            "visible_entry_count": 5 if hidden_stages else 6,
         "hidden_entry_count": 1 if hidden_stages else 0,
     }
     assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
@@ -73,6 +76,12 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "Review the route search",
             "44444444-4444-4444-8444-444444444444",
             "Awaiting_Retrospective",
+            True,
+        ),
+        "Trail_Web/Testing/verify": (
+            "Verify the route preview",
+            "66666666-6666-4666-8666-666666666666",
+            "Testing",
             True,
         ),
         "Trail_API/Done/record": (
@@ -127,6 +136,19 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "reason": "claim_unsatisfied",
         }
     ]
+    verify = _entry_by_path(value, "Trail_Web/Testing/verify")
+    assert verify["relationship"]["program"] == plan["relationship"]["program"]
+    assert verify["relationship"]["direct_prerequisite_state"] == "satisfied"
+    assert verify["relationship"]["prerequisites"] == [
+        {
+            "target_package_id": PREREQUISITE_ID,
+            "claim_name": "contract-ready",
+            "observed_state": "satisfied",
+            "observed_evidence_ref": "sha256:" + "f" * 64,
+            "resolved_state": "satisfied",
+            "reason": "claim_satisfied",
+        }
+    ]
     assert hidden["relationship"]["claims"] == [
         {
             "name": "contract-ready",
@@ -148,6 +170,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "member_package_ids": [
                 "11111111-1111-4111-8111-111111111111",
                 "22222222-2222-4222-8222-222222222222",
+                "66666666-6666-4666-8666-666666666666",
             ],
             "diagnostics": [],
         }
