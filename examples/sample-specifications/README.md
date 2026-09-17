@@ -41,8 +41,9 @@ three projects and six package records. The package records are:
 The empty `Ready_For_Review` stage and `Trail_Mobile` project are inventory
 facts; direct `.gitkeep` files do not appear as cards. When **Hide empty rows and
 columns** is checked, confirmed-empty dimensions are compacted out of the board.
-Uncheck it to restore the empty `Ready_For_Review` row. The browser preference
-is local to that browser and does not alter this sample or Nyx setup.
+Uncheck it to restore the empty `Ready_For_Review` row and `Trail_Mobile`
+column. The browser preference is local to that browser and does not alter this
+sample or Nyx setup.
 
 ## Follow a dependency
 
@@ -109,10 +110,10 @@ board rather than partially applying the result.
 
 With `Done` hidden and the sample package restored to `Testing`, leave **Hide
 empty rows and columns** checked for the compact view. Then uncheck it to show
-the admitted empty `Ready_For_Review` row alongside the populated rows. Search
-filters cards but leaves the axes unchanged. Select **Verify the route preview**
-in either state to inspect its satisfied API prerequisite; the hidden card is
-not added to the board or search results.
+the admitted empty `Ready_For_Review` row and `Trail_Mobile` column alongside
+the populated dimensions. Search filters cards but leaves the axes unchanged.
+Select **Verify the route preview** in either state to inspect its satisfied API
+prerequisite; the hidden card is not added to the board or search results.
 
 When you finish exploring, run `nyx --stop`.
 
