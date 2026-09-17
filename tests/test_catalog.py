@@ -725,6 +725,36 @@ class CatalogTests(TestCase):
             assert parsed.inventory == value["inventory"]
             assert "outside" not in rendered
 
+    def test_symlinked_project_and_stage_candidates_emit_bounded_diagnostics(self) -> None:
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "specs"
+            (root / "Fictional" / "Queue").mkdir(parents=True)
+            outside = base / "outside"
+            outside.mkdir()
+            (root / "Fictional" / "Link").symlink_to(outside, target_is_directory=True)
+            (root / "LinkProject").symlink_to(outside, target_is_directory=True)
+
+            value = json.loads(catalog.scan_catalog(root))
+
+            assert value["inventory"] == {
+                "projects": [{"name": "Fictional", "availability": "complete"}],
+                "stages": [
+                    {"project": "Fictional", "stage": "Queue", "availability": "complete"}
+                ],
+            }
+            assert [item["code"] for item in value["discovery_diagnostics"]] == [
+                "discovery_unavailable",
+                "discovery_unavailable",
+            ]
+            assert {
+                item["message"] for item in value["discovery_diagnostics"]
+            } <= {
+                "discovery unavailable: .",
+                "discovery unavailable: Fictional",
+            }
+            assert "outside" not in json.dumps(value)
+
     def test_schema_four_inventory_mutations_are_rejected_before_use(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
