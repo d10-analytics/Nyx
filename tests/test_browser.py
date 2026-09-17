@@ -700,7 +700,7 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     page = open_page(StaticClient(value))
 
     assert page.locator("#board .card").count() == 0
-    assert page.locator("#board .board-empty").inner_text() == "No packages in the catalog."
+    assert "Empty folders are hidden" in page.locator("#board .board-empty").inner_text()
     assert discovery_message in page.locator("#details").inner_text()
     assert page.locator("#details h2").inner_text() == "No packages available"
     assert page.locator("#details .catalog-diagnostics li").inner_text() == (
