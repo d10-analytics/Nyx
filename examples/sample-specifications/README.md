@@ -89,10 +89,13 @@ mv examples/sample-specifications/Trail_Web/Testing/verify \
    examples/sample-specifications/Trail_Web/Ready_For_Review/verify
 ```
 
-Choose **Refresh view**. The changed catalog is held as a pending snapshot and
-the button becomes **Apply update**; click it to adopt the new stage and card
-location together. Move the package back to `Testing` and refresh/apply again so
-the checked-in sample returns to its documented starting state:
+Wait for Nyx's automatic update check (it runs every ten seconds). The changed
+catalog is held as a pending snapshot and the button becomes **Apply update**;
+click it to adopt the new stage and card location together. When no update is
+pending, **Refresh view** requests an immediate check and applies that response
+directly. Move the package back to `Testing`, wait for the next automatic check,
+and apply it again so the checked-in sample returns to its documented starting
+state:
 
 ```bash
 mv examples/sample-specifications/Trail_Web/Ready_For_Review/verify \
