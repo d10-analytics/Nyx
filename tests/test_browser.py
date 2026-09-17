@@ -83,6 +83,21 @@ def _reseal(value):
     return value
 
 
+def _admit_inventory_stage(value, project, stage):
+    projects = value["inventory"]["projects"]
+    if not any(item["name"] == project for item in projects):
+        projects.append({"name": project, "availability": "complete"})
+        projects.sort(key=lambda item: item["name"])
+    stages = value["inventory"]["stages"]
+    if not any(item["project"] == project and item["stage"] == stage for item in stages):
+        stages.append({
+            "project": project,
+            "stage": stage,
+            "availability": "complete",
+        })
+        stages.sort(key=lambda item: (item["project"], item["stage"]))
+
+
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
@@ -242,10 +257,10 @@ def compact_payload(*, extra_stage=False):
         _entry(
             COMPACT_DEPENDENT,
             "Alpha/Queue/dependent",
-            "Queue",
+            "queue",
             "Visible dependent",
             "Alpha",
-            prerequisites=[hidden_edge, visible_edge],
+            prerequisites=[visible_edge, hidden_edge],
         ),
         _entry(
             COMPACT_HIDDEN,
@@ -427,11 +442,17 @@ def card_titles(page, column=1, row="Under Development"):
     return page.locator(selector).all_inner_texts()
 
 
+def row_labels(page):
+    return page.locator(".row-head").evaluate_all(
+        "rows => rows.map(row => row.firstChild.textContent)"
+    )
+
+
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
     assert page.locator(".column-head").all_inner_texts() == ["Alpha", "Beta"]
     rows = page.locator(".row-head").all_inner_texts()
-    assert rows == ["Under Development", "Queue"]
+    assert rows == ["Queue", "Under Development"]
     assert page.locator("#board .card").count() == 4
 
 
@@ -860,6 +881,8 @@ def routing_payload():
         _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", "Other",
                prerequisites=[_edge(far, "input")]),
     ])
+    _admit_inventory_stage(value, "Gamma", "Done")
+    _admit_inventory_stage(value, "Other", "Queue")
     # Reverse cross-project edge and a cycle; neither implies a topological order.
     value["entries"][1]["relationship"]["prerequisites"] = [_edge(far, "reverse")]
     value["entries"][1]["relationship"]["direct_prerequisite_state"] = "unsatisfied"
@@ -911,6 +934,7 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
         value["entries"].append(_entry(
             STEP_ONE, "Gamma/Queue/duplicate", "queue", "Duplicate source", "Gamma"
         ))
+        _admit_inventory_stage(value, "Gamma", "Queue")
     elif reason == "missing_target":
         edge["target_package_id"] = "123e4567-e89b-42d3-a456-426614174009"
     value["entries"].sort(key=lambda entry: entry["package_path"])
@@ -1166,6 +1190,7 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
                [_edge(STEP_ONE, "input")]),
         _entry(duplicate_id, "Beta/Queue/c", "queue", "Duplicate", "Beta"),
     ]
+    _admit_inventory_stage(value, "Beta", "Queue")
     _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator('.board-row[data-lifecycle="Queue"] .cell').first.locator(
@@ -1227,7 +1252,7 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     compact = page.get_by_label("Hide empty rows and columns", exact=True)
     assert compact.is_checked()
     assert page.locator(".column-head").all_text_contents() == ["Alpha"]
-    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert page.locator('.card[data-package-path="Alpha/Testing/custom"]').count() == 1
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
     assert "incomplete / unavailable" in page.locator(".row-head").first.inner_text()
@@ -1236,7 +1261,7 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     dependent.click()
     details = page.locator("#details")
     assert details.locator(".prerequisite-target").all_text_contents() == [
-        "Hidden prerequisite", "Custom stage card"
+        "Custom stage card", "Hidden prerequisite"
     ]
     assert "Partial stage scan incomplete" in details.inner_text()
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
@@ -1244,10 +1269,12 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     compact.uncheck()
     assert not compact.is_checked()
     assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
-    assert page.locator(".row-head").all_text_contents() == [
+    assert row_labels(page) == [
         "Partial", "Queue", "Testing", "Empty"
     ]
-    assert page.locator('.board-row[data-lifecycle="Empty"] .empty').inner_text() == "—"
+    assert page.locator('.board-row[data-lifecycle="Empty"] .empty').all_text_contents() == [
+        "—", "—"
+    ]
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
 
 
@@ -1368,17 +1395,17 @@ def test_compact_preference_uses_storage_and_checked_fallback(open_page, storage
     compact.uncheck()
     assert not compact.is_checked()
     page.reload()
-    assert not compact.is_checked() if "Blocked" not in storage_setup else compact.is_checked()
+    assert not compact.is_checked() if "setItem('spec-tracker-compact-view', 'false')" in storage_setup else compact.is_checked()
 
 
 def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     first = compact_payload()
     second = compact_payload(extra_stage=True)
     page = open_page(SequenceClient([first, second]))
-    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
     page.fill("#filter", "custom")
-    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert page.locator("#board .card:visible").count() == 1
     assert page.locator(".rail-layer .rail").count() == 0
     page.fill("#filter", "")
