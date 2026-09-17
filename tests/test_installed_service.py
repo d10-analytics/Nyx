@@ -50,7 +50,10 @@ STAGES = (
     "Awaiting_Retrospective",
     "Done",
     "Archive",
+    "Review",
+    "Empty",
 )
+PACKAGED_STAGES = tuple(stage for stage in STAGES if stage != "Empty")
 STAGE_LABELS = {
     "Under_Development": "Under Development",
     "Queue": "Queue",
@@ -59,6 +62,8 @@ STAGE_LABELS = {
     "Awaiting_Retrospective": "Awaiting Retrospective",
     "Done": "Done",
     "Archive": "Archive",
+    "Review": "Review",
+    "Empty": "Empty",
 }
 PACKAGE_IDS = {
     stage: f"123e4567-e89b-42d3-a456-4266141740{index:02d}"
@@ -70,6 +75,8 @@ def _write_fictional_stages(specification_root: Path) -> None:
     for stage in STAGES:
         package_path = specification_root / "Fictional" / stage / stage.lower()
         package_path.mkdir(parents=True)
+        if stage == "Empty":
+            continue
         lines = [f"# {STAGE_LABELS[stage]} package", f"Package ID: {PACKAGE_IDS[stage]}"]
         if stage == "Queue":
             lines.append(f"Prerequisite: {PACKAGE_IDS['Done']} | release")
@@ -100,13 +107,13 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
         ],
     }
     assert value["visibility"]["hidden_stages"] == hidden_stages
-    assert value["visibility"]["visible_entry_count"] == 7 - len(hidden_stages)
+    assert value["visibility"]["visible_entry_count"] == len(PACKAGED_STAGES) - len(hidden_stages)
     assert value["visibility"]["hidden_entry_count"] == len(hidden_stages)
     assert [entry["package_path"] for entry in entries] == sorted(
-        f"Fictional/{stage}/{stage.lower()}" for stage in STAGES
+        f"Fictional/{stage}/{stage.lower()}" for stage in PACKAGED_STAGES
     )
     assert {entry["stage"]: entry["board_visible"] for entry in entries} == {
-        stage: stage not in hidden_stages for stage in STAGES
+        stage: stage not in hidden_stages for stage in PACKAGED_STAGES
     }
     queue = next(entry for entry in entries if entry["stage"] == "Queue")
     assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
@@ -181,12 +188,18 @@ def _assert_hidden_browser(url: str) -> None:
             page = browser.new_page()
             page.goto(url)
             page.locator("#board .card").first.wait_for()
-            assert page.locator("#board .card").count() == 6
+            assert page.locator("#board .card").count() == len(PACKAGED_STAGES) - 1
             assert page.locator(".row-head").all_text_contents() == [
-                STAGE_LABELS[stage] for stage in STAGES if stage != "Done"
+                STAGE_LABELS[stage] for stage in sorted(PACKAGED_STAGES) if stage != "Done"
             ]
             assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 0
+            assert page.locator('.card[data-package-path="Fictional/Review/review"]').count() == 1
+            compact = page.get_by_label("Hide empty rows and columns", exact=True)
+            assert compact.is_checked()
+            compact.uncheck()
+            assert page.locator('.board-row[data-lifecycle="Empty"]').count() == 1
+            assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
             page.fill("#filter", "Done package")
             assert page.locator("#board .card:visible").count() == 0
             page.fill("#filter", "")
@@ -213,13 +226,18 @@ def _assert_show_all_browser(url: str) -> None:
             page = browser.new_page()
             page.goto(url)
             page.locator("#board .card").first.wait_for()
-            assert page.locator("#board .card").count() == 7
+            assert page.locator("#board .card").count() == len(PACKAGED_STAGES)
             assert page.locator(".row-head").all_text_contents() == [
-                STAGE_LABELS[stage] for stage in STAGES
+                STAGE_LABELS[stage] for stage in sorted(PACKAGED_STAGES)
             ]
+            compact = page.get_by_label("Hide empty rows and columns", exact=True)
+            assert compact.is_checked()
+            compact.uncheck()
             assert page.locator(".board-row").evaluate_all(
                 "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-            ) == [[stage.lower(), f"{STAGE_LABELS[stage]} package"] for stage in STAGES]
+            ) == [[stage if stage in {"Empty", "Review"} else stage.lower(),
+                   None if stage == "Empty" else f"{STAGE_LABELS[stage]} package"]
+                  for stage in sorted(STAGES)]
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 1
         finally:
             browser.close()

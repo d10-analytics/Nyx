@@ -215,6 +215,92 @@ def lifecycle_payload(*, hidden_stages=()):
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
 
 
+COMPACT_CARD = "123e4567-e89b-42d3-a456-426614174020"
+COMPACT_DEPENDENT = "123e4567-e89b-42d3-a456-426614174021"
+COMPACT_HIDDEN = "123e4567-e89b-42d3-a456-426614174022"
+
+
+def compact_payload(*, extra_stage=False):
+    hidden_edge = _edge(COMPACT_HIDDEN, "release")
+    hidden_edge.update(
+        observed_state="satisfied",
+        observed_evidence_ref="sha256:" + "c" * 64,
+        resolved_state="satisfied",
+        reason="claim_satisfied",
+    )
+    visible_edge = _edge(COMPACT_CARD, "build")
+    visible_edge.update(
+        observed_state="satisfied",
+        observed_evidence_ref="sha256:" + "d" * 64,
+        resolved_state="satisfied",
+        reason="claim_satisfied",
+    )
+    entries = [
+        _entry(
+            COMPACT_CARD, "Alpha/Testing/custom", "under_development", "Custom stage card", "Alpha"
+        ),
+        _entry(
+            COMPACT_DEPENDENT,
+            "Alpha/Queue/dependent",
+            "Queue",
+            "Visible dependent",
+            "Alpha",
+            prerequisites=[hidden_edge, visible_edge],
+        ),
+        _entry(
+            COMPACT_HIDDEN,
+            "HiddenOnly/Done/hidden",
+            "Done",
+            "Hidden prerequisite",
+            "HiddenOnly",
+        ),
+    ]
+    if extra_stage:
+        entries.append(_entry(
+            "123e4567-e89b-42d3-a456-426614174023",
+            "Alpha/Review/new",
+            "under_development",
+            "Pending new stage",
+            "Alpha",
+        ))
+    entries.sort(key=lambda entry: entry["package_path"])
+    stages = [
+        {"project": "Alpha", "stage": "Partial", "availability": "incomplete"},
+        {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+        {"project": "Alpha", "stage": "Review", "availability": "complete"},
+        {"project": "Alpha", "stage": "Testing", "availability": "complete"},
+        {"project": "EmptyProject", "stage": "Empty", "availability": "complete"},
+        {"project": "HiddenOnly", "stage": "Done", "availability": "complete"},
+    ]
+    if not extra_stage:
+        stages.remove({"project": "Alpha", "stage": "Review", "availability": "complete"})
+    value = {
+        "schema_version": 4,
+        "inventory": {
+            "projects": [
+                {"name": "Alpha", "availability": "complete"},
+                {"name": "EmptyProject", "availability": "complete"},
+                {"name": "HiddenOnly", "availability": "complete"},
+            ],
+            "stages": stages,
+        },
+        "visibility": {
+            "hidden_stages": ["Done"],
+            "visible_entry_count": 0,
+            "hidden_entry_count": 0,
+        },
+        "identity_coverage": {"state": "complete", "diagnostics": []},
+        "program_coverage": {"state": "complete", "diagnostics": []},
+        "discovery_diagnostics": [
+            {"code": "discovery_unavailable", "message": "Partial stage scan incomplete"}
+        ],
+        "entries": entries,
+        "programs": [],
+    }
+    _reseal(value)
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
 def unicode_producer_payload():
     """Build a producer snapshot whose ordering is Python's scalar ordering."""
     with TemporaryDirectory() as temporary:
@@ -345,12 +431,7 @@ def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
     assert page.locator(".column-head").all_inner_texts() == ["Alpha", "Beta"]
     rows = page.locator(".row-head").all_inner_texts()
-    assert rows[:4] == [
-        "Under Development",
-        "Queue",
-        "Needs Fixes",
-        "Awaiting Retrospective",
-    ]
+    assert rows == ["Under Development", "Queue"]
     assert page.locator("#board .card").count() == 4
 
 
@@ -1115,11 +1196,12 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     open_page,
 ):
     page = open_page(StaticClient(lifecycle_payload()))
-    assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in STAGE_ROWS]
+    ordered_rows = sorted(STAGE_ROWS)
+    assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in ordered_rows]
     assert page.locator("#board .card").count() == 7
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-    ) == [[lifecycle, title] for _, lifecycle, _, title in STAGE_ROWS]
+    ) == [[lifecycle, title] for _, lifecycle, _, title in ordered_rows]
 
     hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
     queue_path = "Fictional/Queue/package"
@@ -1138,6 +1220,83 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
         f'.connection[data-source="{STAGE_IDS["Done"]}"]'
     ).count() == 0
     assert hidden_page.locator("#details .prerequisite-target").inner_text() == "Done target"
+
+
+def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page):
+    page = open_page(StaticClient(compact_payload()))
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    assert compact.is_checked()
+    assert page.locator(".column-head").all_text_contents() == ["Alpha"]
+    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert page.locator('.card[data-package-path="Alpha/Testing/custom"]').count() == 1
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+    assert "incomplete / unavailable" in page.locator(".row-head").first.inner_text()
+
+    dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
+    dependent.click()
+    details = page.locator("#details")
+    assert details.locator(".prerequisite-target").all_text_contents() == [
+        "Hidden prerequisite", "Custom stage card"
+    ]
+    assert "Partial stage scan incomplete" in details.inner_text()
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+
+    compact.uncheck()
+    assert not compact.is_checked()
+    assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+    assert page.locator(".row-head").all_text_contents() == [
+        "Partial", "Queue", "Testing", "Empty"
+    ]
+    assert page.locator('.board-row[data-lifecycle="Empty"] .empty').inner_text() == "—"
+    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+
+
+@pytest.mark.parametrize("storage_setup", [
+    "localStorage.setItem('spec-tracker-compact-view', 'false');",
+    """Object.defineProperty(window, 'localStorage', {
+      get() { throw new DOMException('Blocked', 'SecurityError'); }
+    });""",
+    """Storage.prototype.setItem = function() {
+      throw new DOMException('Full', 'QuotaExceededError');
+    };""",
+])
+def test_compact_preference_uses_storage_and_checked_fallback(open_page, storage_setup):
+    page = open_page(StaticClient(compact_payload()), init_script=storage_setup)
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    if "setItem('spec-tracker-compact-view', 'false')" in storage_setup:
+        assert not compact.is_checked()
+        assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+    else:
+        assert compact.is_checked()
+    compact.uncheck()
+    assert not compact.is_checked()
+    page.reload()
+    assert not compact.is_checked() if "Blocked" not in storage_setup else compact.is_checked()
+
+
+def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
+    first = compact_payload()
+    second = compact_payload(extra_stage=True)
+    page = open_page(SequenceClient([first, second]))
+    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
+    page.fill("#filter", "custom")
+    assert page.locator(".row-head").all_text_contents() == ["Partial", "Queue", "Testing"]
+    assert page.locator("#board .card:visible").count() == 1
+    assert page.locator(".rail-layer .rail").count() == 0
+    page.fill("#filter", "")
+    before = page.locator(".rail").first.get_attribute("d")
+    page.set_viewport_size({"width": 650, "height": 900})
+    page.wait_for_function(
+        "before => document.querySelector('.rail').getAttribute('d') !== before", arg=before
+    )
+    assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
+    assert page.locator('.board-row[data-lifecycle="Review"]').count() == 0
+    page.click("#refresh")
+    page.locator('.card[data-package-path="Alpha/Review/new"]').wait_for(timeout=15000)
+    assert page.locator('.board-row[data-lifecycle="Review"]').count() == 1
 
 
 def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_page):
