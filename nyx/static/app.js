@@ -398,6 +398,13 @@
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
+    if (!axes.stages.length && !compactView && axes.projects.length) {
+      board.style.setProperty("--column-tracks", columns.map(() => "minmax(var(--card-min-width), 1fr)").join(" "));
+      board.innerHTML = '<h2 class="board-corner" aria-hidden="true"></h2>' +
+        axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
+        '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
+      return;
+    }
     if (!axes.stages.length || !axes.projects.length) {
       board.innerHTML = emptyBoardHtml(axes, entries);
       return;
