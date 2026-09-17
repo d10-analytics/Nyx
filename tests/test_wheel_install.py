@@ -229,7 +229,14 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "schema_version": 4,
                     "inventory": {
                         "projects": [{"name": "Fictional", "availability": "complete"}],
-                        "stages": [{"project": "Fictional", "stage": "Queue", "availability": "complete"}],
+                        "stages": [
+                            {"project": "Fictional", "stage": "Queue", "availability": "complete"},
+                            {
+                                "project": "Fictional",
+                                "stage": "Under_Development",
+                                "availability": "complete",
+                            },
+                        ],
                     },
                     "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                                     "visible_entry_count": 1, "hidden_entry_count": 0},
@@ -295,10 +302,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     page.goto(f"http://127.0.0.1:{port}/")
                     page.locator(".card-title").wait_for(timeout=15000)
                     assert page.locator(".column-head").all_inner_texts() == ["Fictional"]
-                    assert page.locator(".row-head").all_inner_texts()[:2] == [
-                        "Under Development",
-                        "Queue",
-                    ]
+                    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+                    assert compact.is_checked()
+                    assert page.locator(".row-head").all_inner_texts() == ["Queue"]
                     assert page.locator(".card-title").all_inner_texts() == [
                         "Installed catalog entry"
                     ]
@@ -308,6 +314,14 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     assert page.locator("#board").inner_text().count(
                         "Installed catalog entry"
                     ) == 1
+                    compact.uncheck()
+                    assert page.locator(".row-head").all_inner_texts() == [
+                        "Queue",
+                        "Under Development",
+                    ]
+                    assert page.locator(
+                        '.board-row[data-lifecycle="Under_Development"] .card'
+                    ).count() == 0
                 finally:
                     page.close()
                     browser.close()
