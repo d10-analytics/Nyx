@@ -296,6 +296,7 @@ def compact_payload(*, extra_stage=False):
                 {"name": "Alpha", "availability": "complete"},
                 {"name": "EmptyProject", "availability": "complete"},
                 {"name": "HiddenOnly", "availability": "complete"},
+                {"name": "ZeroProject", "availability": "complete"},
             ],
             "stages": stages,
         },
@@ -1268,12 +1269,14 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
 
     compact.uncheck()
     assert not compact.is_checked()
-    assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+    assert page.locator(".column-head").all_text_contents() == [
+        "Alpha", "EmptyProject", "ZeroProject"
+    ]
     assert row_labels(page) == [
         "Partial", "Queue", "Testing", "Empty"
     ]
     assert page.locator('.board-row[data-lifecycle="Empty"] .empty').all_text_contents() == [
-        "—", "—"
+        "—", "—", "—"
     ]
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
 
@@ -1289,9 +1292,7 @@ def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open
     assert page.get_by_text("Empty folders are hidden", exact=False).count() == 1
     compact = page.get_by_label("Hide empty rows and columns", exact=True)
     compact.uncheck()
-    assert page.locator(".column-head").all_text_contents() == [
-        "Alpha", "EmptyProject", "HiddenOnly"
-    ]
+    assert page.locator(".column-head").all_text_contents() == ["ZeroProject"]
     assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
 
 
