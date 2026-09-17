@@ -1,10 +1,9 @@
 # Nyx
 
-Nyx is a Python application for Linux that reads a file-based specification
-workspace and displays its plans, progress, and dependencies in a browser on
-your local machine. When work spans several features or repositories, it helps
-you see where each effort stands, which pieces depend on one another, and what
-needs attention next.
+Nyx is a project management and tracking tool for software development that
+brings your plans, progress, and dependencies together in a local browser view.
+When work spans several features or repositories, it helps you see where each
+effort stands, which pieces depend on one another, and what needs attention next.
 
 Your specifications remain ordinary Markdown files, where you can develop an
 idea, describe the intended behavior, and keep the context needed to carry it
