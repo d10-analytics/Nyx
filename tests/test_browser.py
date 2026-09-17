@@ -1296,6 +1296,26 @@ def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open
     assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
 
 
+def test_compact_view_keeps_incomplete_project_when_no_stage_is_discoverable(open_page):
+    value = json.loads(compact_payload())
+    value["inventory"] = {
+        "projects": [{"name": "UnreadableProject", "availability": "incomplete"}],
+        "stages": [],
+    }
+    value["visibility"]["hidden_stages"] = []
+    value["entries"] = []
+    _reseal(value)
+
+    page = open_page(StaticClient(value))
+
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    heading = page.locator(".column-head")
+    assert heading.count() == 1
+    assert heading.evaluate("node => node.firstChild.textContent") == "UnreadableProject"
+    assert heading.locator(".dimension-incomplete").inner_text() == "incomplete / unavailable"
+    assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
+
+
 def test_literal_stage_names_do_not_alias_builtin_labels(open_page):
     value = json.loads(board_payload())
     value["inventory"] = {
