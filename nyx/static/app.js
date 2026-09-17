@@ -36,11 +36,13 @@
   const RAIL_INSET = 20;
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
+  const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
 
   const board = document.querySelector("#board");
   const detailPanel = document.querySelector("#details");
   const status = document.querySelector("#status");
   const filter = document.querySelector("#filter");
+  const compactControl = document.querySelector("#compact-view");
   const refreshButton = document.querySelector("#refresh");
 
   let displayed = null;
@@ -51,6 +53,7 @@
   let railPlan = new Map();
   let railColumns = [];
   let railEdges = [];
+  let compactView = true;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -182,8 +185,19 @@
   }
 
   function rowKeyOf(entry) {
-    return entry.board_visible && BOARD_STAGES.has(entry.stage)
-      ? BOARD_STAGES.get(entry.stage) : null;
+    return entry.board_visible ? rowDataKeyOf(entry.stage) : null;
+  }
+
+  function stageKeyOf(stage) {
+    return stage;
+  }
+
+  function rowDataKeyOf(stage) {
+    return BOARD_STAGES.get(stage) || stage;
+  }
+
+  function stageLabelOf(stage) {
+    return BOARD_LABELS.get(rowDataKeyOf(stage)) || stage;
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -287,16 +301,98 @@
       cell.map((entry) => cardHtml(entry, byId, dependentsOf)).join("") + "</div>";
   }
 
+  function inventoryAxes(entries) {
+    const hiddenStages = new Set(displayed?.visibility.hidden_stages || []);
+    const inventory = displayed?.inventory || { projects: [], stages: [] };
+    const stages = [];
+    const stageByKey = new Map();
+    inventory.stages.forEach((record) => {
+      if (hiddenStages.has(record.stage)) return;
+      const key = stageKeyOf(record.stage);
+      let dimension = stageByKey.get(key);
+      if (!dimension) {
+        dimension = { key, stage: record.stage, availability: record.availability };
+        stageByKey.set(key, dimension);
+        stages.push(dimension);
+      } else if (record.availability === "incomplete") {
+        dimension.availability = "incomplete";
+      }
+    });
+
+    const entryProjects = new Set(entries.map((entry) => entry.project));
+    const hasEligibleStages = stages.length > 0;
+    const projects = [];
+    inventory.projects.forEach((record) => {
+      const projectStages = inventory.stages.filter((stage) => stage.project === record.name);
+      const hasStage = projectStages.some((stage) => !hiddenStages.has(stage.stage));
+      const incompleteStage = projectStages.some((stage) =>
+        !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
+      if (!hasStage && hasEligibleStages) return;
+      const dimension = {
+        key: record.name,
+        project: record.name,
+        availability: record.availability,
+      };
+      if (!compactView || dimension.availability === "incomplete" || incompleteStage || entryProjects.has(record.name)) {
+        projects.push(dimension);
+      }
+    });
+
+    const populatedStages = new Set();
+    const populatedProjects = new Set();
+    entries.forEach((entry) => {
+      const stage = stageKeyOf(entry.stage);
+      if (stageByKey.has(stage)) populatedStages.add(stage);
+      populatedProjects.add(entry.project);
+    });
+    const visibleStages = compactView
+      ? stages.filter((stage) => stage.availability === "incomplete" || populatedStages.has(stage.key))
+      : stages;
+    const visibleProjects = compactView
+      ? projects.filter((project) =>
+        project.availability === "incomplete" || populatedProjects.has(project.key))
+      : projects;
+    return { stages: visibleStages, projects: visibleProjects, hasEligibleStages };
+  }
+
+  function dimensionNotice(dimension) {
+    return dimension.availability === "incomplete"
+      ? '<span class="dimension-incomplete" title="Discovery is incomplete; this dimension may contain undiscovered packages">' +
+        "incomplete / unavailable</span>"
+      : "";
+  }
+
+  function emptyBoardHtml(axes, entries) {
+    if (!displayed) return '<p class="empty board-empty">No packages in the catalog.</p>';
+    if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
+      return '<p class="empty board-empty">No packages in the catalog.</p>';
+    }
+    if (!axes.hasEligibleStages) {
+      if (!compactView && displayed.inventory.projects.length) {
+        return '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
+      }
+      return '<p class="empty board-empty compact-hidden">Empty folders are hidden. Uncheck “Hide empty rows and columns” to show them.</p>';
+    }
+    if (compactView && !axes.stages.length && !axes.projects.length) {
+      return '<p class="empty board-empty compact-hidden">Empty folders are hidden. Uncheck “Hide empty rows and columns” to show them.</p>';
+    }
+    if (!entries.length) {
+      return '<p class="empty board-empty admitted-empty">The catalog contains admitted folders but no packages.</p>';
+    }
+    return '<p class="empty board-empty">No packages match the current board.</p>';
+  }
+
   function renderBoard() {
     const entries = displayed ? displayed.entries.filter((entry) => entry.board_visible) : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
-    const columns = columnsFor(entries);
+    const axes = inventoryAxes(entries);
+    const columns = axes.projects.map((project) => [project.key, project.project]);
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
-    if (!entries.length) {
-      board.innerHTML = '<p class="empty board-empty">No packages in the catalog.</p>';
+    if (!axes.stages.length || !axes.projects.length) {
+      board.innerHTML = emptyBoardHtml(axes, entries);
       return;
     }
     railEdges = planEdges(entries, byId);
@@ -320,15 +416,16 @@
       const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
       return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
     }).join(" "));
-    const hiddenStages = new Set(displayed?.visibility.hidden_stages || []);
-    const rows = BOARD_ROWS.filter(([key]) => {
-      const stage = [...BOARD_STAGES.entries()].find(([, rowKey]) => rowKey === key)?.[0];
-      return stage === undefined || !hiddenStages.has(stage);
-    });
-    let html = '<h2 class="board-corner" aria-hidden="true"></h2>' +
-      columns.map(([, label]) => `<h2 class="column-head">${text(label)}</h2>`).join("");
-    rows.forEach(([key, label]) => {
-      const rowEntries = entries.filter((entry) => BOARD_STAGES.get(entry.stage) === key);
+    let html = (!entries.length
+      ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
+        ? "The catalog has incomplete dimensions; no packages are currently available."
+        : "The catalog contains admitted folders but no packages."}</p>` : "") +
+      '<h2 class="board-corner" aria-hidden="true"></h2>' +
+      axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("");
+    axes.stages.forEach((stage) => {
+      const key = stage.key;
+      const rowKey = rowDataKeyOf(stage.stage);
+      const rowEntries = entries.filter((entry) => stageKeyOf(entry.stage) === key);
       const cells = columns.map(([columnKey]) => {
         const { depth, reserved } = plans.get(columnKey);
         const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
@@ -339,11 +436,11 @@
           gutter,
         );
       }).join("");
-      const band = bands.has(key)
+      const band = bands.has(rowKey)
         ? `<span class="connection-band" aria-hidden="true" ` +
-          `style="height:${bands.get(key) * RAIL_PITCH + RAIL_INSET}px"></span>` : "";
-      html += `<section class="board-row" data-lifecycle="${text(key)}">${band}` +
-        `<h2 class="row-head">${text(label)}</h2>${cells}</section>`;
+          `style="height:${bands.get(rowKey) * RAIL_PITCH + RAIL_INSET}px"></span>` : "";
+      html += `<section class="board-row" data-lifecycle="${text(rowDataKeyOf(stage.stage))}">${band}` +
+        `<h2 class="row-head">${text(stageLabelOf(stage.stage))}${dimensionNotice(stage)}</h2>${cells}</section>`;
     });
     board.innerHTML = html;
     applyFilter();
@@ -750,6 +847,28 @@
     renderDetails();
   }
 
+  function readCompactPreference() {
+    compactView = true;
+    try {
+      const value = window.localStorage.getItem(COMPACT_STORAGE_KEY);
+      if (value === "true") compactView = true;
+      if (value === "false") compactView = false;
+    } catch (_) {
+      // A checked checkbox is the safe fallback when browser storage is unavailable.
+    }
+    compactControl.checked = compactView;
+  }
+
+  function setCompactPreference(value) {
+    compactView = value;
+    try { window.localStorage.setItem(COMPACT_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
+    compactControl.checked = compactView;
+    if (displayed) {
+      renderBoard();
+      renderDetails();
+    }
+  }
+
   function safeCategory(error) {
     return SAFE_CATEGORIES.includes(error.message) ? error.message : "producer_unavailable";
   }
@@ -803,6 +922,7 @@
     else request("manual");
   });
   filter.addEventListener("input", applyFilter);
+  compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   if (typeof ResizeObserver === "function") {
     let resizeFrame = null;
     new ResizeObserver(() => {
@@ -814,6 +934,7 @@
     }).observe(board);
   }
 
+  readCompactPreference();
   request("manual");
   window.setInterval(() => request("poll"), POLL_INTERVAL);
 })();
