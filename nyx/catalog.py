@@ -1123,7 +1123,15 @@ def _build_catalog(
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
                     inventory_projects.append({"name": repository.name, "availability": "incomplete"})
                     continue
-                if stat.S_ISLNK(repository_stat.st_mode) or not stat.S_ISDIR(repository_stat.st_mode):
+                if stat.S_ISLNK(repository_stat.st_mode):
+                    discovery_diagnostics.append(
+                        _catalog_diagnostic(
+                            "discovery_unavailable",
+                            _catalog_relative(spec_root, spec_root),
+                        )
+                    )
+                    continue
+                if not stat.S_ISDIR(repository_stat.st_mode):
                     continue
                 discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
                 inventory_projects.append({"name": repository.name, "availability": "incomplete"})
@@ -1171,7 +1179,15 @@ def _build_catalog(
                             )
                             project_inventory["availability"] = "incomplete"
                             continue
-                        if stat.S_ISLNK(stage_stat.st_mode) or not stat.S_ISDIR(stage_stat.st_mode):
+                        if stat.S_ISLNK(stage_stat.st_mode):
+                            discovery_diagnostics.append(
+                                _catalog_diagnostic(
+                                    "discovery_unavailable",
+                                    _catalog_relative(repository_path, spec_root),
+                                )
+                            )
+                            continue
+                        if not stat.S_ISDIR(stage_stat.st_mode):
                             continue
                         discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root)))
                         inventory_stages.append(
