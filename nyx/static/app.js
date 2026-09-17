@@ -193,11 +193,11 @@
   }
 
   function rowDataKeyOf(stage) {
-    return BOARD_STAGES.get(stage) || stage;
+    return stage;
   }
 
   function stageLabelOf(stage) {
-    return BOARD_LABELS.get(rowDataKeyOf(stage)) || stage;
+    return BOARD_LABELS.get(BOARD_STAGES.get(stage)) || stage;
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
