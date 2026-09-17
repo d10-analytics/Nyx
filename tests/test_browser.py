@@ -1291,6 +1291,33 @@ def test_literal_stage_names_do_not_alias_builtin_labels(open_page):
     ) == ["Queue", "queue"]
 
 
+def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
+    admitted = json.loads(lifecycle_payload())
+    admitted["entries"] = []
+    _reseal(admitted)
+    admitted_page = open_page(StaticClient(admitted))
+    compact = admitted_page.get_by_label("Hide empty rows and columns", exact=True)
+    compact.uncheck()
+    assert admitted_page.locator(".board-empty").inner_text() == (
+        "The catalog contains admitted folders but no packages."
+    )
+
+    incomplete = json.loads(compact_payload())
+    incomplete["entries"] = []
+    _reseal(incomplete)
+    incomplete_page = open_page(StaticClient(incomplete))
+    assert incomplete_page.locator(".board-empty").inner_text() == (
+        "The catalog has incomplete dimensions; no packages are currently available."
+    )
+
+    empty = json.loads(lifecycle_payload())
+    empty["inventory"] = {"projects": [], "stages": []}
+    empty["entries"] = []
+    _reseal(empty)
+    empty_page = open_page(StaticClient(empty))
+    assert empty_page.locator(".board-empty").inner_text() == "No packages in the catalog."
+
+
 @pytest.mark.parametrize("storage_setup", [
     "localStorage.setItem('spec-tracker-compact-view', 'false');",
     """Object.defineProperty(window, 'localStorage', {
