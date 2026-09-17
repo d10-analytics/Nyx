@@ -4,6 +4,8 @@
 
 A workspace is a directory of development specifications, grouped by project
 and stage. It can live alongside your repositories or in a separate location.
+Nyx discovers the literal direct-child project and stage directory names; it
+does not require a fixed lifecycle vocabulary.
 You can keep it in version control if that fits your workflow.
 
 ## Create your first specification
@@ -67,7 +69,7 @@ For example, move `route-preview` from `Under_Development` to `Queue` when it
 is ready to be scheduled. Keep its package ID unchanged so dependency references
 continue to identify the same work.
 
-Nyx recognizes these stage directory names:
+These familiar stage directory names are used by the bundled examples:
 
 | Directory | Board label | Typical use |
 | --- | --- | --- |
@@ -80,8 +82,34 @@ Nyx recognizes these stage directory names:
 | `Archive` | Archive | Retain work outside the active workflow. |
 
 These descriptions are suggested uses; Nyx displays directory placement rather
-than deciding when work can move. You do not need to create every stage in advance.
-After moving files, refresh the board and apply the update.
+than deciding when work can move. A safe direct child such as `Testing` or
+`Ready_For_Review` is also a stage, and its spelling is preserved on the board.
+You do not need to create every stage in advance. Direct files such as a tracked
+`.gitkeep` preserve an empty directory in version control but are not packages.
+After moving files, request a refresh and apply the update.
+
+At the project level, names beginning with `.`, plus `Reference`, are reserved
+and are not project columns. At the stage level, names beginning with `.`, plus
+`Reference` and `.pipeline`, are reserved and are not stage rows. Nyx ignores
+non-directory stage candidates and never follows symlinks. A safely identified
+but unreadable project or stage remains an incomplete dimension with a bounded
+diagnostic; it is not reported as an empty directory.
+
+## Move files yourself
+
+Nyx does not provide lifecycle buttons. Move a package directory with your
+editor or existing file tools while Nyx is running, then choose **Refresh view**
+when no update is waiting. If the refreshed catalog differs, the button becomes
+**Apply update**; the new inventory, cards, and diagnostics remain pending until
+you apply them together. A failed or malformed refresh leaves the displayed
+snapshot in place.
+
+Configured hidden stages and compact view are different controls. `--hide-stage`
+removes a literal stage from the displayed policy and from search and rails, but
+its prerequisite can remain visible in a selected card's details. The browser's
+**Hide empty rows and columns** checkbox only compacts admitted, policy-eligible
+dimensions from the displayed snapshot; unchecking it restores confirmed-empty
+rows and columns without changing the workspace or configuration.
 
 ## Add another project or a dependency
 

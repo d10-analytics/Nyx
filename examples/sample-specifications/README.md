@@ -3,12 +3,16 @@
 [Return to Nyx](../../README.md).
 
 Imagine you are building a trail-planning app with a web interface and a route
-API. The API contract is complete, so you can plan the route preview, but the API
-implementation is not ready for the web feature to use. Meanwhile, an existing
-navigation feature needs a fix and the route-search work is ready for review.
+API. The API contract is complete, so you can plan and verify the route preview,
+but the API implementation is not ready for the web feature to use. Meanwhile,
+an existing navigation feature needs a fix and the route-search work is ready
+for review.
 
 This small workspace shows how Nyx brings those efforts together. All names,
-identifiers, and evidence values are fictional.
+identifiers, and evidence values are fictional. `Trail_Web/Testing` is a custom
+stage, `Trail_Web/Ready_For_Review` is an admitted empty stage, and the tracked
+`Trail_Mobile/.gitkeep` preserves an admitted empty project without creating a
+package.
 
 ## Open the board
 
@@ -22,7 +26,8 @@ nyx --setup examples/sample-specifications --show-all-stages
 nyx
 ```
 
-Open **http://127.0.0.1:8765/**. You will see two project columns and five cards:
+Open **http://127.0.0.1:8765/**. With all stages shown, the catalog contains
+three projects and six package records. The package records are:
 
 | Project | Stage | Work |
 | --- | --- | --- |
@@ -30,7 +35,14 @@ Open **http://127.0.0.1:8765/**. You will see two project columns and five cards
 | Trail_Web | Queue | Build the route preview |
 | Trail_Web | Needs Fixes | Fix saved-route navigation |
 | Trail_Web | Awaiting Retrospective | Review the route search |
+| Trail_Web | Testing | Verify the route preview |
 | Trail_API | Done | Define the route API contract |
+
+The empty `Ready_For_Review` stage and `Trail_Mobile` project are inventory
+facts; direct `.gitkeep` files do not appear as cards. When **Hide empty rows and
+columns** is checked, confirmed-empty dimensions are compacted out of the board.
+Uncheck it to restore the empty `Ready_For_Review` row. The browser preference
+is local to that browser and does not alter this sample or Nyx setup.
 
 ## Follow a dependency
 
@@ -42,8 +54,9 @@ same specification: `implementation-ready`, which is still unsatisfied. Finishin
 the contract did not finish the implementation. A specification's stage and its
 individual claims describe different things.
 
-Both web specifications belong to the **Route preview** program, which appears
-in their details. Try searching for `Route preview` to focus on that work.
+The three web specifications belong to the **Route preview** program, which
+appears in their details. Try searching for `Route preview` to focus on that
+work.
 
 ## Focus on unfinished work
 
@@ -55,10 +68,48 @@ nyx --setup examples/sample-specifications --hide-stage Done
 nyx
 ```
 
-There are now four visible cards. Select **Build the route preview** again: the
-API contract is still available as prerequisite context in its details, even
-though its card is hidden. To restore the full board, stop Nyx and run setup
-again with `--show-all-stages`.
+There are now five visible package records. Select **Verify the route preview**:
+the API contract is a configured-hidden prerequisite, but it remains available
+in the selected card's details. Select **Build the route preview** as well to
+compare its unsatisfied implementation prerequisite. The API contract remains
+available as prerequisite context even though its card is hidden. To restore the
+full board, stop Nyx and run setup again with `--show-all-stages`.
+
+The configured `Done` policy is separate from compact view. The checkbox can
+hide confirmed-empty rows and columns, but it cannot reveal a configured-hidden
+stage or its cards.
+
+## Move a package and apply the update
+
+Nyx reads directory placement; it does not move packages. From the repository
+root, move the fictional verification package manually:
+
+```bash
+mv examples/sample-specifications/Trail_Web/Testing/verify \
+   examples/sample-specifications/Trail_Web/Ready_For_Review/verify
+```
+
+Choose **Refresh view**. The changed catalog is held as a pending snapshot and
+the button becomes **Apply update**; click it to adopt the new stage and card
+location together. Move the package back to `Testing` and refresh/apply again so
+the checked-in sample returns to its documented starting state:
+
+```bash
+mv examples/sample-specifications/Trail_Web/Ready_For_Review/verify \
+   examples/sample-specifications/Trail_Web/Testing/verify
+```
+
+If a refresh is malformed, Nyx reports the failure and retains the last valid
+board rather than partially applying the result.
+
+## Compare compact and expanded views
+
+With `Done` hidden and the sample package restored to `Testing`, leave **Hide
+empty rows and columns** checked for the compact view. Then uncheck it to show
+the admitted empty `Ready_For_Review` row alongside the populated rows. Search
+filters cards but leaves the axes unchanged. Select **Verify the route preview**
+in either state to inspect its satisfied API prerequisite; the hidden card is
+not added to the board or search results.
 
 When you finish exploring, run `nyx --stop`.
 

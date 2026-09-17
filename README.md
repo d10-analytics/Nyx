@@ -1,9 +1,10 @@
 # Nyx
 
-Nyx is a project management and tracking tool for software development that
-brings your plans, progress, and dependencies together in a local browser view.
-When work spans several features or repositories, it helps you see where each
-effort stands, which pieces depend on one another, and what needs attention next.
+Nyx is a Python application for Linux that reads a file-based specification
+workspace and displays its plans, progress, and dependencies in a browser on
+your local machine. When work spans several features or repositories, it helps
+you see where each effort stands, which pieces depend on one another, and what
+needs attention next.
 
 Your specifications remain ordinary Markdown files, where you can develop an
 idea, describe the intended behavior, and keep the context needed to carry it
@@ -11,11 +12,11 @@ through implementation and review. Nyx organizes that work into a board by
 project and development stage, giving you an overview without having to open
 each specification individually.
 
-You can maintain those files yourself or work with an LLM coding agent to write
-and update them. Either way, the files remain the shared record of the work,
-and Nyx provides a consistent place to follow it. The current application reads
-your specifications; you make changes using your editor or existing development
-workflow.
+You create, edit, and move those files yourself with an editor or your existing
+development tools, or you can use an LLM coding agent to help. Either way, the
+files remain the shared record of the work, and Nyx provides a consistent place
+to follow it. Nyx reads your specifications and displays the result; it does
+not edit specifications or move them for you.
 
 ![Nyx showing a fictional trail-planning app, with web work linked to an API contract and the route preview selected.](docs/images/sample-board.png)
 
@@ -34,7 +35,9 @@ related specifications. You can hide stages to focus on active work and still
 inspect a hidden prerequisite through a visible card's details.
 
 Your plans stay in files you can edit, keep in version control, and use with
-other tools. Nyx runs locally on Linux and opens in your browser.
+other tools. Nyx runs locally on Linux and opens in your browser. Setup and
+runtime commands save account-local configuration and runtime state, but the
+board itself remains a read-only view of the workspace.
 
 ## Try the sample
 
@@ -51,15 +54,18 @@ nyx
 Open **http://127.0.0.1:8765/**. Select **Build the route preview** to see why
 its prerequisite is not yet satisfied, then compare it with **Plan the route
 preview**. The [sample walkthrough](examples/sample-specifications/README.md)
-explains the fictional project and what to explore.
+explains the fictional project, its custom stage, and the compact-view workflow.
 
 When files change, Nyx checks for an update every ten seconds. Click **Apply
 update** when it appears to load the new view. **Refresh view** checks immediately
 when no update is waiting. Run `nyx --stop` when you are finished.
 
-Setup saves the workspace location and stage visibility for your Linux account.
-If Nyx is already running with a different setup, stop it before changing these
-settings. See [running Nyx](docs/running-nyx.md) for status and configuration options.
+Setup saves the workspace location and configured stage visibility for your
+Linux account. These setup choices are separate from the browser's personal
+**Hide empty rows and columns** preference, which is stored only in that
+browser. If Nyx is already running with a different setup, stop it before
+changing the account-local settings. See [running Nyx](docs/running-nyx.md) for
+status and configuration options.
 
 ## Track your own work
 

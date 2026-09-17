@@ -25,6 +25,18 @@ Nyx also reads `Closure`, `Sanity Recommendation`, and `Human Sanity Decision`
 as reported text. These fields are optional; they do not trigger actions.
 Project and stage come from the package's directory location.
 
+The project is the first directory below the configured workspace root, and the
+stage is the next direct directory containing the package. Directory names are
+literal identities: `Testing` and `testing` are different stages, and Nyx does
+not title-case, normalize, or alias them. Grouping directories may appear below
+the stage before the package directory.
+
+Nyx discovers safe direct project and stage directories even when they are not
+in the familiar lifecycle table. Names beginning with `.`, `Reference`, and
+`.pipeline` are reserved at their documented levels. Direct regular files such
+as `.gitkeep` are ignored, so they can preserve an empty project or stage in a
+versioned sample without creating a package. Symlinks are not followed.
+
 Generate fresh IDs with `python3 -c 'import uuid; print(uuid.uuid4())'`. Use each
 package ID once in a workspace and retain it when moving the package. Repeat
 `Claim` and `Prerequisite` rows for distinct outcomes and requirements; do not
@@ -102,3 +114,9 @@ unreadable files, duplicate IDs, invalid fields, or unresolved references.
 Inspect the affected specification and its prerequisites rather than inferring
 completion from an incomplete view. A prerequisite hidden from the board by
 stage policy can still be included as context in a visible dependent's details.
+
+Discovery diagnostics also distinguish a safely identified but incomplete
+project or stage from a confirmed empty one. Inspect the affected directory and
+retry after restoring access; do not infer that no packages exist from an
+incomplete scan. The browser retains the last valid displayed catalog when a
+later refresh is malformed.
