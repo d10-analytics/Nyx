@@ -332,6 +332,7 @@
         key: record.name,
         project: record.name,
         availability: record.availability,
+        incompleteStage,
       };
       if (!compactView || dimension.availability === "incomplete" || incompleteStage || entryProjects.has(record.name)) {
         projects.push(dimension);
@@ -350,7 +351,8 @@
       : stages;
     const visibleProjects = compactView
       ? projects.filter((project) =>
-        project.availability === "incomplete" || populatedProjects.has(project.key))
+        project.availability === "incomplete" || project.incompleteStage ||
+          populatedProjects.has(project.key))
       : projects;
     return { stages: visibleStages, projects: visibleProjects, hasEligibleStages };
   }
