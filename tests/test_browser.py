@@ -1251,6 +1251,23 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
 
 
+def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open_page):
+    value = json.loads(compact_payload())
+    hidden = sorted(stage["stage"] for stage in value["inventory"]["stages"])
+    value["visibility"]["hidden_stages"] = hidden
+    for entry in value["entries"]:
+        entry["board_visible"] = False
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.get_by_text("Empty folders are hidden", exact=False).count() == 1
+    compact = page.get_by_label("Hide empty rows and columns", exact=True)
+    compact.uncheck()
+    assert page.locator(".column-head").all_text_contents() == [
+        "Alpha", "EmptyProject", "HiddenOnly"
+    ]
+    assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
+
+
 @pytest.mark.parametrize("storage_setup", [
     "localStorage.setItem('spec-tracker-compact-view', 'false');",
     """Object.defineProperty(window, 'localStorage', {
