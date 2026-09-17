@@ -192,7 +192,7 @@ def _assert_hidden_browser(url: str) -> None:
             assert page.locator(".row-head").all_text_contents() == [
                 STAGE_LABELS[stage] for stage in sorted(PACKAGED_STAGES) if stage != "Done"
             ]
-            assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+            assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 0
             assert page.locator('.card[data-package-path="Fictional/Review/review"]').count() == 1
             compact = page.get_by_label("Hide empty rows and columns", exact=True)
@@ -235,8 +235,7 @@ def _assert_show_all_browser(url: str) -> None:
             compact.uncheck()
             assert page.locator(".board-row").evaluate_all(
                 "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-            ) == [[stage if stage in {"Empty", "Review"} else stage.lower(),
-                   None if stage == "Empty" else f"{STAGE_LABELS[stage]} package"]
+            ) == [[stage, None if stage == "Empty" else f"{STAGE_LABELS[stage]} package"]
                   for stage in sorted(STAGES)]
             assert page.locator('.card[data-package-path="Fictional/Done/done"]').count() == 1
         finally:

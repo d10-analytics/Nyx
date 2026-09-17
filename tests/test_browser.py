@@ -1168,7 +1168,7 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
     ]
     _reseal(value)
     page = open_page(StaticClient(value))
-    assert page.locator('.board-row[data-lifecycle="queue"] .cell').first.locator(
+    assert page.locator('.board-row[data-lifecycle="Queue"] .cell').first.locator(
         '.card-title'
     ).all_text_contents() == ["A dependent", "Z candidate"]
     assert connection_pairs(page) == set()
@@ -1201,7 +1201,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     assert page.locator("#board .card").count() == 7
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
-    ) == [[lifecycle, title] for _, lifecycle, _, title in ordered_rows]
+    ) == [[stage, title] for stage, _, _, title in ordered_rows]
 
     hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
     queue_path = "Fictional/Queue/package"
@@ -1210,7 +1210,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     queue = hidden_page.locator(f'.card[data-package-path="{queue_path}"]')
     queue.click()
 
-    assert hidden_page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert hidden_page.locator('.board-row[data-lifecycle="Done"]').count() == 0
     assert hidden_page.locator(f'.card[data-package-path="{done_path}"]').count() == 0
     hidden_page.fill("#filter", "Done target")
     assert hidden_page.locator("#board .card:visible").count() == 0
@@ -1413,7 +1413,7 @@ def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_pag
         "() => !document.querySelector('#refresh').classList.contains('pending')",
         timeout=15000,
     )
-    assert page.locator('.board-row[data-lifecycle="done"]').count() == 0
+    assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 0
     assert page.locator("#details h2").inner_text() == "Select a package"
 
