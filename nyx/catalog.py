@@ -32,6 +32,7 @@ CATALOG_HIDDEN_STAGES = sorted(
     for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
     if lifecycle not in CATALOG_BOARD_LIFECYCLES
 )
+_SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
     "unreadable_anchor": "unreadable anchor",
@@ -94,6 +95,23 @@ def _metadata_value(lines: list[str], label: str) -> str | None:
 def _catalog_relative(path: Path, spec_root: Path) -> str:
     """Return the stable POSIX path exposed by the catalog protocol."""
     return path.relative_to(spec_root).as_posix()
+
+
+def _catalog_safe_component(value: str) -> bool:
+    """Return whether a filesystem name can be admitted as a catalog component."""
+    return bool(
+        value
+        and len(value) <= _SAFE_COMPONENT_MAX
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not any(
+            ord(character) < 32
+            or ord(character) == 127
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    )
 
 
 def _catalog_diagnostic(code: str, package_path: str) -> dict[str, str]:
@@ -793,9 +811,10 @@ def _scan_stage(
     stage_fd: int,
     records: list[dict[str, object]],
     discovery_diagnostics: list[dict[str, str]],
-) -> None:
+) -> bool:
     """Traverse one lifecycle stage using only descriptors admitted by parents."""
     pending: list[tuple[Path, int]] = [(stage_path, stage_fd)]
+    complete = True
     try:
         while pending:
             current, current_fd = pending.pop()
@@ -805,6 +824,7 @@ def _scan_stage(
                         children = sorted(entries, key=lambda item: item.name)
                 except OSError:
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                    complete = False
                     continue
                 anchor = next((child for child in children if child.name == "spec.md"), None)
                 if anchor is not None:
@@ -859,16 +879,19 @@ def _scan_stage(
                         child_fd = _catalog_open_directory_at(current_fd, child.name)
                     except FileNotFoundError:
                         discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                        complete = False
                         continue
                     except OSError:
                         try:
                             child_stat = _catalog_stat_at(current_fd, child.name)
                         except OSError:
                             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
+                            complete = False
                             continue
                         if stat.S_ISLNK(child_stat.st_mode) or not stat.S_ISDIR(child_stat.st_mode):
                             continue
                         discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root)))
+                        complete = False
                         continue
                     pending.append((child_path, child_fd))
             finally:
@@ -876,6 +899,7 @@ def _scan_stage(
     finally:
         for _path, descriptor in pending:
             os.close(descriptor)
+    return complete
 
 
 def _edge(
@@ -1070,6 +1094,8 @@ def _build_catalog(
     discovery_diagnostics: list[dict[str, str]] = []
     program_descriptors: list[dict[str, object]] = []
     program_diagnostics: list[dict[str, str]] = []
+    inventory_projects: list[dict[str, str]] = []
+    inventory_stages: list[dict[str, str]] = []
     root_fd = _catalog_open_root(spec_root)
     try:
         try:
@@ -1081,6 +1107,11 @@ def _build_catalog(
             if repository.name.startswith(".") or repository.name == "Reference":
                 continue
             repository_path = spec_root / repository.name
+            if not _catalog_safe_component(repository.name):
+                discovery_diagnostics.append(
+                    _catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root))
+                )
+                continue
             try:
                 repository_fd = _catalog_open_directory_at(root_fd, repository.name)
             except FileNotFoundError:
@@ -1090,17 +1121,41 @@ def _build_catalog(
                     repository_stat = _catalog_stat_at(root_fd, repository.name)
                 except OSError:
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
+                    inventory_projects.append({"name": repository.name, "availability": "incomplete"})
                     continue
                 if stat.S_ISLNK(repository_stat.st_mode) or not stat.S_ISDIR(repository_stat.st_mode):
                     continue
                 discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
+                inventory_projects.append({"name": repository.name, "availability": "incomplete"})
                 continue
+            project_inventory = {"name": repository.name, "availability": "complete"}
+            inventory_projects.append(project_inventory)
             try:
                 _scan_programs(
                     repository_fd, repository_path, spec_root,
                     program_descriptors, program_diagnostics,
                 )
-                for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items():
+                try:
+                    with _catalog_scandir(repository_fd) as stage_entries:
+                        stage_candidates = sorted(stage_entries, key=lambda item: item.name)
+                except OSError:
+                    discovery_diagnostics.append(
+                        _catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root))
+                    )
+                    project_inventory["availability"] = "incomplete"
+                    stage_candidates = []
+                for stage_entry in stage_candidates:
+                    directory = stage_entry.name
+                    if (
+                        directory.startswith(".")
+                        or directory in {"Reference", ".pipeline"}
+                        or not _catalog_safe_component(directory)
+                    ):
+                        if not directory.startswith(".") and directory not in {"Reference", ".pipeline"}:
+                            discovery_diagnostics.append(
+                                _catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root))
+                            )
+                        continue
                     stage_path = repository_path / directory
                     try:
                         stage_fd = _catalog_open_directory_at(repository_fd, directory)
@@ -1111,14 +1166,31 @@ def _build_catalog(
                             stage_stat = _catalog_stat_at(repository_fd, directory)
                         except OSError:
                             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
+                            inventory_stages.append(
+                                {"project": repository.name, "stage": directory, "availability": "incomplete"}
+                            )
+                            project_inventory["availability"] = "incomplete"
                             continue
                         if stat.S_ISLNK(stage_stat.st_mode) or not stat.S_ISDIR(stage_stat.st_mode):
-                            discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root)))
+                            continue
+                        discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(stage_path, spec_root)))
+                        inventory_stages.append(
+                            {"project": repository.name, "stage": directory, "availability": "incomplete"}
+                        )
+                        project_inventory["availability"] = "incomplete"
                         continue
-                    _scan_stage(
-                        stage_path, lifecycle, spec_root, stage_fd,
+                    stage_inventory = {
+                        "project": repository.name,
+                        "stage": directory,
+                        "availability": "complete",
+                    }
+                    inventory_stages.append(stage_inventory)
+                    if not _scan_stage(
+                        stage_path, directory, spec_root, stage_fd,
                         records, discovery_diagnostics,
-                    )
+                    ):
+                        stage_inventory["availability"] = "incomplete"
+                        project_inventory["availability"] = "incomplete"
             finally:
                 os.close(repository_fd)
     finally:
@@ -1236,8 +1308,12 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "catalog_digest": None,
+        "inventory": {
+            "projects": inventory_projects,
+            "stages": inventory_stages,
+        },
         "visibility": {
             "hidden_stages": list(policy),
             "visible_entry_count": len(board),

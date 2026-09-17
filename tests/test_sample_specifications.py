@@ -24,7 +24,23 @@ def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, obj
 def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages) -> None:
     value = json.loads(catalog.build_catalog(SAMPLE_ROOT, hidden_stages=hidden_stages))
 
-    assert value["schema_version"] == 3
+    assert value["schema_version"] == 4
+    assert value["inventory"] == {
+        "projects": [
+            {"name": "Trail_API", "availability": "complete"},
+            {"name": "Trail_Web", "availability": "complete"},
+        ],
+        "stages": [
+            {"project": project, "stage": stage, "availability": "complete"}
+            for project, stage in (
+                ("Trail_API", "Done"),
+                ("Trail_Web", "Awaiting_Retrospective"),
+                ("Trail_Web", "Needs_Fixes"),
+                ("Trail_Web", "Queue"),
+                ("Trail_Web", "Under_Development"),
+            )
+        ],
+    }
     assert value["visibility"] == {
         "hidden_stages": list(hidden_stages),
         "visible_entry_count": 4 if hidden_stages else 5,

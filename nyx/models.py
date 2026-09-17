@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 LIFECYCLES = frozenset(
     {
@@ -71,6 +71,7 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "catalog_digest",
+        "inventory",
         "visibility",
         "identity_coverage",
         "program_coverage",
@@ -116,6 +117,9 @@ _EDGE_KEYS = frozenset(
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
 _VISIBILITY_KEYS = frozenset({"hidden_stages", "visible_entry_count", "hidden_entry_count"})
+_INVENTORY_KEYS = frozenset({"projects", "stages"})
+_INVENTORY_PROJECT_KEYS = frozenset({"name", "availability"})
+_INVENTORY_STAGE_KEYS = frozenset({"project", "stage", "availability"})
 _CLAIM_KEYS = frozenset({"name", "state", "evidence_ref", "diagnostics"})
 _SUCCESSOR_KEYS = frozenset({"package_id", "resolution", "diagnostics"})
 _CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids", "diagnostics"})
@@ -227,6 +231,7 @@ class Catalog:
     identity_coverage: dict[str, Any]
     program_coverage: dict[str, Any]
     programs: tuple[dict[str, Any], ...]
+    inventory: dict[str, Any]
     schema_version: int = SCHEMA_VERSION
 
     def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
@@ -237,6 +242,7 @@ class Catalog:
             ],
             "entries": [item.as_dict() for item in self.entries],
             "identity_coverage": self.identity_coverage,
+            "inventory": self.inventory,
             "program_coverage": self.program_coverage,
             "programs": [dict(item) for item in self.programs],
             "schema_version": self.schema_version,
@@ -382,6 +388,7 @@ def _component(value: Any, name: str) -> str:
     result = _string(value, name)
     if (
         not result
+        or len(result) > 1024
         or result in {".", ".."}
         or "/" in result
         or "\\" in result
@@ -389,6 +396,56 @@ def _component(value: Any, name: str) -> str:
     ):
         raise ProtocolError(f"{name} must be one safe path component")
     return result
+
+
+def _inventory(value: Any) -> tuple[dict[str, Any], set[str], set[tuple[str, str]]]:
+    item = _object(value, "inventory")
+    _keys(item, _INVENTORY_KEYS, "inventory")
+    projects_value = item["projects"]
+    stages_value = item["stages"]
+    if type(projects_value) is not list or type(stages_value) is not list:
+        raise ProtocolError("inventory projects and stages must be lists")
+
+    projects: list[dict[str, str]] = []
+    project_names: set[str] = set()
+    for index, raw in enumerate(projects_value):
+        name = f"inventory.projects[{index}]"
+        project = _object(raw, name)
+        _keys(project, _INVENTORY_PROJECT_KEYS, name)
+        project_name = _component(project["name"], f"{name}.name")
+        availability = _string(project["availability"], f"{name}.availability")
+        if availability not in {"complete", "incomplete"}:
+            raise ProtocolError(f"{name}.availability is invalid")
+        if project_name in project_names:
+            raise ProtocolError("inventory.projects must be unique and name-sorted")
+        project_names.add(project_name)
+        projects.append({"name": project_name, "availability": availability})
+    if [project["name"] for project in projects] != sorted(project_names):
+        raise ProtocolError("inventory.projects must be unique and name-sorted")
+
+    stages: list[dict[str, str]] = []
+    stage_pairs: set[tuple[str, str]] = set()
+    for index, raw in enumerate(stages_value):
+        name = f"inventory.stages[{index}]"
+        stage = _object(raw, name)
+        _keys(stage, _INVENTORY_STAGE_KEYS, name)
+        project_name = _component(stage["project"], f"{name}.project")
+        stage_name = _component(stage["stage"], f"{name}.stage")
+        availability = _string(stage["availability"], f"{name}.availability")
+        if availability not in {"complete", "incomplete"}:
+            raise ProtocolError(f"{name}.availability is invalid")
+        pair = (project_name, stage_name)
+        if project_name not in project_names or pair in stage_pairs:
+            raise ProtocolError("inventory.stages must reference unique admitted projects")
+        stage_pairs.add(pair)
+        stages.append({
+            "project": project_name,
+            "stage": stage_name,
+            "availability": availability,
+        })
+    if [(stage["project"], stage["stage"]) for stage in stages] != sorted(stage_pairs):
+        raise ProtocolError("inventory.stages must be unique and pair-sorted")
+    return {"projects": projects, "stages": stages}, project_names, stage_pairs
 
 
 def _visibility(value: Any) -> tuple[tuple[str, ...], int, int]:
@@ -630,11 +687,14 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
     ):
         raise ProtocolError("invalid catalog digest")
     hidden_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
+    inventory, _project_names, inventory_pairs = _inventory(catalog["inventory"])
     for name in ("identity_coverage", "program_coverage"):
         _coverage(catalog[name], name)
     if type(catalog["entries"]) is not list:
         raise ProtocolError("entries must be a list")
     entries = tuple(_entry(item, index) for index, item in enumerate(catalog["entries"]))
+    if any((entry.project, entry.stage) not in inventory_pairs for entry in entries):
+        raise ProtocolError("entries must reference admitted inventory stages")
     paths = [item.package_path for item in entries]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ProtocolError("entries must be unique and path-sorted")
@@ -667,4 +727,5 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         identity_coverage=dict(catalog["identity_coverage"]),
         program_coverage=dict(catalog["program_coverage"]),
         programs=tuple(dict(program) for program in catalog["programs"]),
+        inventory=inventory,
     )

@@ -27,7 +27,14 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [
+                {"project": "Fictional", "stage": "Queue", "availability": "complete"},
+                {"project": "Fictional", "stage": "Under_Development", "availability": "complete"},
+            ],
+        },
         "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                         "visible_entry_count": 2, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -121,7 +128,7 @@ def test_default_provider_uses_unselected_scanner():
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda value: value.update(schema_version=2),
+        lambda value: value.update(schema_version=3),
         lambda value: value.update(unknown=True),
         lambda value: value["entries"][0].update(board_visible="true"),
         lambda value: value["entries"][0].update(stage="Done"),
@@ -131,7 +138,7 @@ def test_default_provider_uses_unselected_scanner():
     ],
     ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
 )
-def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
+def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
     mutate(value)
     value["catalog_digest"] = canonical_digest(value)
@@ -139,7 +146,7 @@ def test_schema_three_parser_rejects_legacy_unknown_and_mutated_payloads(mutate)
         parse_catalog(value)
 
 
-def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
+def test_schema_four_parser_rejects_bad_digest_even_when_shape_is_valid():
     value = raw_catalog()
     value["catalog_digest"] = "0" * 64
     with pytest.raises(ValueError):
@@ -147,13 +154,13 @@ def test_schema_three_parser_rejects_bad_digest_even_when_shape_is_valid():
 
 
 @pytest.mark.parametrize("alter", [
-    lambda catalog: replace(catalog, schema_version=2),
+    lambda catalog: replace(catalog, schema_version=3),
     lambda catalog: replace(
         catalog,
         entries=(replace(catalog.entries[0], board_visible="yes"), *catalog.entries[1:]),
     ),
 ])
-def test_catalog_object_providers_are_revalidated_as_schema_three(alter):
+def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
     with pytest.raises(CatalogError, match="producer_protocol_error"):
         server._catalog_from_provider(lambda: alter(valid_catalog()))
 

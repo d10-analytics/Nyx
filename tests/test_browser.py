@@ -86,7 +86,18 @@ def _reseal(value):
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [
+                {"name": "Alpha", "availability": "complete"},
+                {"name": "Beta", "availability": "complete"},
+            ],
+            "stages": [
+                {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+                {"project": "Alpha", "stage": "Under_Development", "availability": "complete"},
+                {"project": "Beta", "stage": "Under_Development", "availability": "complete"},
+            ],
+        },
         "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                         "visible_entry_count": 4, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
@@ -181,7 +192,14 @@ def lifecycle_payload(*, hidden_stages=()):
             }]
         entries.append(entry)
     value = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [
+                {"project": "Fictional", "stage": stage, "availability": "complete"}
+                for stage, *_rest in sorted(STAGE_ROWS)
+            ],
+        },
         "visibility": {
             "hidden_stages": list(hidden_stages),
             "visible_entry_count": 0,

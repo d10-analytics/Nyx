@@ -639,10 +639,33 @@
 
   function validateSnapshot(snapshot) {
     const top = ["catalog_digest", "discovery_diagnostics", "entries", "identity_coverage",
-      "program_coverage", "programs", "schema_version", "visibility"];
-    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 3 &&
+      "inventory", "program_coverage", "programs", "schema_version", "visibility"];
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 4 &&
       /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
       Array.isArray(snapshot.programs));
+    protocol(exactKeys(snapshot.inventory, ["projects", "stages"]) &&
+      Array.isArray(snapshot.inventory.projects) && Array.isArray(snapshot.inventory.stages));
+    const inventoryProjects = new Set();
+    snapshot.inventory.projects.forEach((project) => {
+      protocol(exactKeys(project, ["availability", "name"]) && component(project.name) &&
+        ["complete", "incomplete"].includes(project.availability) &&
+        !inventoryProjects.has(project.name));
+      inventoryProjects.add(project.name);
+    });
+    protocol(snapshot.inventory.projects.every((project, index) => index === 0 ||
+      scalarCompare(project.name, snapshot.inventory.projects[index - 1].name) > 0));
+    const inventoryStages = new Set();
+    snapshot.inventory.stages.forEach((stage) => {
+      const key = `${stage.project}\u0000${stage.stage}`;
+      protocol(exactKeys(stage, ["availability", "project", "stage"]) &&
+        component(stage.project) && component(stage.stage) && inventoryProjects.has(stage.project) &&
+        ["complete", "incomplete"].includes(stage.availability) && !inventoryStages.has(key));
+      inventoryStages.add(key);
+    });
+    protocol(snapshot.inventory.stages.every((stage, index) => index === 0 ||
+      scalarCompare(stage.project, snapshot.inventory.stages[index - 1].project) > 0 ||
+      (stage.project === snapshot.inventory.stages[index - 1].project &&
+        scalarCompare(stage.stage, snapshot.inventory.stages[index - 1].stage) > 0)));
     if (!exactKeys(snapshot.visibility, ["hidden_stages", "visible_entry_count", "hidden_entry_count"]) ||
         !Array.isArray(snapshot.visibility.hidden_stages) ||
         !Number.isInteger(snapshot.visibility.visible_entry_count) || snapshot.visibility.visible_entry_count < 0 ||
@@ -672,7 +695,8 @@
       protocol(exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
         "project", "relationship", "stage", "state", "transitive_diagnostics"]));
       uuid(entry.package_id, true);
-      protocol(component(entry.project) && BOARD_STAGES.has(entry.stage) && safeText(entry.package_path) &&
+      protocol(component(entry.project) && component(entry.stage) &&
+        inventoryStages.has(`${entry.project}\u0000${entry.stage}`) && safeText(entry.package_path) &&
         !(entry.package_path.startsWith("/") || entry.package_path.includes("\\") ||
           entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
         (entry.package_path === `${entry.project}/${entry.stage}` ||

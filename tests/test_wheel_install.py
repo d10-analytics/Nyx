@@ -153,7 +153,11 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 3,
+                    "schema_version": 4,
+                    "inventory": {
+                        "projects": [{"name": "Fictional", "availability": "complete"}],
+                        "stages": [{"project": "Fictional", "stage": "Queue", "availability": "complete"}],
+                    },
                     "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
                                     "visible_entry_count": 1, "hidden_entry_count": 0},
                     "identity_coverage": {"state": "complete", "diagnostics": []},

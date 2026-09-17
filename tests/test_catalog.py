@@ -10,7 +10,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from nyx import catalog
-from nyx.models import parse_catalog
+from nyx.models import canonical_digest, parse_catalog
 from nyx.state import HiddenStageError
 
 V1 = """# Example
@@ -24,6 +24,29 @@ Target repo: /fictional/repo
 PROGRAM_ID = "88888888-8888-4888-8888-888888888888"
 SMALL_ORACLE_BYTES = "{\"catalog_digest\":\"e58865c903fe64fe60473a420098a7f1445a05a397ade8e8ab5e8fe070d43abb\",\"discovery_diagnostics\":[],\"entries\":[{\"board_visible\":true,\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"One\"},\"diagnostics\":[],\"package_id\":null,\"package_path\":\"Fictional/Queue/one\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"relationship_unavailable\",\"participation\":\"legacy\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Queue\",\"state\":\"complete\",\"transitive_diagnostics\":[]}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[],\"schema_version\":3,\"visibility\":{\"hidden_entry_count\":0,\"hidden_stages\":[\"Archive\",\"Done\",\"In_Progress\"],\"visible_entry_count\":1}}"
 COMPLETE_ORACLE_BYTES = '{"catalog_digest":"f1040b4367b54ea507ff91e667a8ca6237809f4ecf67aed952650b352d2cb575","discovery_diagnostics":[],"entries":[{"board_visible":true,"declared":{"closure":null,"human_sanity_decision":null,"sanity_recommendation":null,"status":null,"target_project":null,"title":"Retro"},"diagnostics":[],"package_id":"55555555-5555-4555-8555-555555555555","package_path":"Fictional/Awaiting_Retrospective/pkg","project":"Fictional","relationship":{"claims":[],"direct_prerequisite_state":"no_declared_prerequisites","participation":"available","prerequisites":[],"program":{"diagnostics":[],"program_id":null,"resolution":"not_declared","title":null},"superseded_by":{"diagnostics":[],"package_id":null,"resolution":"not_declared"}},"stage":"Awaiting_Retrospective","state":"complete","transitive_diagnostics":[]},{"board_visible":false,"declared":{"closure":null,"human_sanity_decision":null,"sanity_recommendation":null,"status":null,"target_project":null,"title":"Progress"},"diagnostics":[],"package_id":"33333333-3333-4333-8333-333333333333","package_path":"Fictional/In_Progress/pkg","project":"Fictional","relationship":{"claims":[{"diagnostics":[],"evidence_ref":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"release","state":"satisfied"}],"direct_prerequisite_state":"no_declared_prerequisites","participation":"available","prerequisites":[],"program":{"diagnostics":[],"program_id":null,"resolution":"not_declared","title":null},"superseded_by":{"diagnostics":[{"code":"successor_cycle","message":"successor cycle detected: Fictional/In_Progress/pkg"}],"package_id":"22222222-2222-4222-8222-222222222222","resolution":"resolved"}},"stage":"In_Progress","state":"complete","transitive_diagnostics":[]},{"board_visible":true,"declared":{"closure":null,"human_sanity_decision":null,"sanity_recommendation":null,"status":null,"target_project":null,"title":"Fix"},"diagnostics":[],"package_id":"44444444-4444-4444-8444-444444444444","package_path":"Fictional/Needs_Fixes/pkg","project":"Fictional","relationship":{"claims":[],"direct_prerequisite_state":"no_declared_prerequisites","participation":"available","prerequisites":[],"program":{"diagnostics":[],"program_id":null,"resolution":"not_declared","title":null},"superseded_by":{"diagnostics":[],"package_id":null,"resolution":"not_declared"}},"stage":"Needs_Fixes","state":"complete","transitive_diagnostics":[]},{"board_visible":true,"declared":{"closure":null,"human_sanity_decision":null,"sanity_recommendation":null,"status":null,"target_project":null,"title":"Queue"},"diagnostics":[{"code":"invalid_claim","message":"invalid claim: Fictional/Queue/pkg"},{"code":"invalid_prerequisite","message":"invalid prerequisite: Fictional/Queue/pkg"}],"package_id":"22222222-2222-4222-8222-222222222222","package_path":"Fictional/Queue/pkg","project":"Fictional","relationship":{"claims":[{"diagnostics":[],"evidence_ref":null,"name":"release","state":"unsatisfied"}],"direct_prerequisite_state":"unknown","participation":"available","prerequisites":[{"claim_name":null,"observed_evidence_ref":null,"observed_state":null,"reason":"invalid_prerequisite","resolved_state":"unknown","target_package_id":null},{"claim_name":"release","observed_evidence_ref":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","observed_state":"satisfied","reason":"claim_satisfied","resolved_state":"satisfied","target_package_id":"33333333-3333-4333-8333-333333333333"}],"program":{"diagnostics":[],"program_id":"88888888-8888-4888-8888-888888888888","resolution":"resolved","title":"Core"},"superseded_by":{"diagnostics":[{"code":"successor_cycle","message":"successor cycle detected: Fictional/Queue/pkg"}],"package_id":"33333333-3333-4333-8333-333333333333","resolution":"resolved"}},"stage":"Queue","state":"partial","transitive_diagnostics":[]},{"board_visible":true,"declared":{"closure":null,"human_sanity_decision":null,"sanity_recommendation":null,"status":null,"target_project":null,"title":"Under"},"diagnostics":[],"package_id":"11111111-1111-4111-8111-111111111111","package_path":"Fictional/Under_Development/pkg","project":"Fictional","relationship":{"claims":[{"diagnostics":[],"evidence_ref":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"design","state":"satisfied"}],"direct_prerequisite_state":"no_declared_prerequisites","participation":"available","prerequisites":[],"program":{"diagnostics":[],"program_id":"88888888-8888-4888-8888-888888888888","resolution":"resolved","title":"Core"},"superseded_by":{"diagnostics":[],"package_id":null,"resolution":"not_declared"}},"stage":"Under_Development","state":"complete","transitive_diagnostics":[]}],"identity_coverage":{"diagnostics":[],"state":"complete"},"program_coverage":{"diagnostics":[],"state":"complete"},"programs":[{"diagnostics":[],"member_package_ids":["11111111-1111-4111-8111-111111111111","22222222-2222-4222-8222-222222222222"],"program_id":"88888888-8888-4888-8888-888888888888","title":"Core"}],"schema_version":3,"visibility":{"hidden_entry_count":3,"hidden_stages":["Archive","Done","In_Progress"],"visible_entry_count":4}}'
+
+
+def _migrate_oracle(legacy: str) -> str:
+    """Keep the historical graph assertions exact while adding the v4 inventory."""
+    value = json.loads(legacy)
+    value["schema_version"] = 4
+    projects = sorted({entry["project"] for entry in value["entries"]})
+    stages = sorted({(entry["project"], entry["stage"]) for entry in value["entries"]})
+    if len(value["entries"]) >= 5 and projects == ["Fictional"]:
+        stages = sorted(("Fictional", stage) for stage in catalog.CATALOG_LIFECYCLE_DIRECTORIES)
+    value["inventory"] = {
+        "projects": [{"name": project, "availability": "complete"} for project in projects],
+        "stages": [
+            {"project": project, "stage": stage, "availability": "complete"}
+            for project, stage in stages
+        ],
+    }
+    value["catalog_digest"] = canonical_digest(value)
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+SMALL_ORACLE_BYTES = _migrate_oracle(SMALL_ORACLE_BYTES)
+COMPLETE_ORACLE_BYTES = _migrate_oracle(COMPLETE_ORACLE_BYTES)
 
 
 def package(root: Path, stage: str, name: str, content: str = V1) -> Path:
@@ -555,7 +578,7 @@ class CatalogTests(TestCase):
                 {descriptor for values in closed_by_thread.values() for descriptor in values},
             )
 
-    def test_both_public_producers_retain_fixed_schema_three_oracle_without_writes(self) -> None:
+    def test_both_public_producers_retain_fixed_schema_four_oracle_without_writes(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             package(root, "Queue", "one", "# One\n")
@@ -628,7 +651,7 @@ class CatalogTests(TestCase):
             after = snapshot()
             self.assertEqual(before, after)
 
-    def test_both_public_producers_match_fixed_complete_graph_schema_three_oracle(self) -> None:
+    def test_both_public_producers_match_fixed_complete_graph_schema_four_oracle(self) -> None:
         with TemporaryDirectory() as temporary:
             root = make_baseline_graph(Path(temporary))
             self.assertEqual(COMPLETE_ORACLE_BYTES, catalog.build_catalog(root))
@@ -645,7 +668,15 @@ class CatalogTests(TestCase):
             value = json.loads(first)
             self.assertEqual(["Fictional/Queue/zeta", "Fictional/Under_Development/alpha"],
                              [entry["package_path"] for entry in value["entries"]])
-            self.assertEqual(3, value["schema_version"])
+            self.assertEqual(4, value["schema_version"])
+            self.assertEqual(
+                {"projects": [{"name": "Fictional", "availability": "complete"}],
+                 "stages": [
+                     {"project": "Fictional", "stage": stage, "availability": "complete"}
+                     for stage in ("Queue", "Under_Development")
+                 ]},
+                value["inventory"],
+            )
             self.assertEqual({"hidden_stages": ["Archive", "Done", "In_Progress"],
                               "visible_entry_count": 2, "hidden_entry_count": 0},
                              value["visibility"])
@@ -659,7 +690,7 @@ class CatalogTests(TestCase):
             ).hexdigest()
             self.assertEqual(expected, value["catalog_digest"])
 
-    def test_stage_root_anchor_round_trips_through_schema_three_parser(self) -> None:
+    def test_stage_root_anchor_round_trips_through_schema_four_parser(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage = root / "Fictional" / "Queue"
@@ -889,10 +920,10 @@ class CatalogTests(TestCase):
                             )
                         rendered = producer(root)
 
-                    self.assertEqual(15, scans.call_count)
+                    self.assertEqual(16, scans.call_count)
                     renders.append(rendered)
                     value = json.loads(rendered)
-                    self.assertEqual(3, value["schema_version"])
+                    self.assertEqual(4, value["schema_version"])
                     self.assertEqual(4, value["visibility"]["visible_entry_count"])
                     self.assertEqual(3, value["visibility"]["hidden_entry_count"])
                     digest_input = dict(value)
@@ -1125,10 +1156,18 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         root = make_baseline_graph(Path(temporary))
         rendered = catalog.build_catalog(root)
         value = json.loads(rendered)
-        assert value["schema_version"] == 3
+        assert value["schema_version"] == 4
         assert set(value) == {
             "schema_version", "catalog_digest", "visibility", "identity_coverage",
-            "program_coverage", "discovery_diagnostics", "entries", "programs",
+            "program_coverage", "discovery_diagnostics", "entries", "programs", "inventory",
+        }
+        assert value["inventory"] == {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [
+                {"project": "Fictional", "stage": stage, "availability": "complete"}
+                for stage in ("Archive", "Awaiting_Retrospective", "Done", "In_Progress",
+                              "Needs_Fixes", "Queue", "Under_Development")
+            ],
         }
         digest_input = dict(value)
         digest_input.pop("catalog_digest")

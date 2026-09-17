@@ -90,7 +90,14 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     entries = value["entries"]
-    assert value["schema_version"] == 3
+    assert value["schema_version"] == 4
+    assert value["inventory"] == {
+        "projects": [{"name": "Fictional", "availability": "complete"}],
+        "stages": [
+            {"project": "Fictional", "stage": stage, "availability": "complete"}
+            for stage in sorted(STAGES)
+        ],
+    }
     assert value["visibility"]["hidden_stages"] == hidden_stages
     assert value["visibility"]["visible_entry_count"] == 7 - len(hidden_stages)
     assert value["visibility"]["hidden_entry_count"] == len(hidden_stages)
