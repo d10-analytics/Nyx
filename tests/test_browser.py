@@ -1318,6 +1318,36 @@ def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
     assert empty_page.locator(".board-empty").inner_text() == "No packages in the catalog."
 
 
+def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
+    valid = json.loads(compact_payload())
+    invalid = json.loads(compact_payload(extra_stage=True))
+    invalid["inventory"]["stages"].reverse()
+    _reseal(invalid)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(
+            RawSequenceClient([valid, invalid]),
+            init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
+        )
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert not page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    assert page.locator(".column-head").all_text_contents() == ["Alpha", "EmptyProject"]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => row.dataset.lifecycle)"
+    ) == ["Partial", "Queue", "Testing", "Empty"]
+    assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
 @pytest.mark.parametrize("storage_setup", [
     "localStorage.setItem('spec-tracker-compact-view', 'false');",
     """Object.defineProperty(window, 'localStorage', {
