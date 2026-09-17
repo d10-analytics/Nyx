@@ -1241,3 +1241,25 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
     assert page.locator("#refresh").inner_text() == "Refresh view"
     assert client.calls >= 2
+
+
+def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
+    valid = json.loads(lifecycle_payload())
+    invalid = json.loads(lifecycle_payload())
+    invalid["inventory"]["stages"].reverse()
+    _reseal(invalid)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator("#refresh").inner_text() == "Refresh view"

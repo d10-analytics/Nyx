@@ -690,6 +690,92 @@ class CatalogTests(TestCase):
             ).hexdigest()
             self.assertEqual(expected, value["catalog_digest"])
 
+    def test_discovered_inventory_admits_custom_and_empty_dimensions_without_following_controls(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "specs"
+            root.mkdir()
+            package(root, "Testing", "custom", "# Custom\n")
+            (root / "Fictional" / "Empty").mkdir()
+            (root / "Fictional" / "Empty" / ".gitkeep").write_text("", encoding="utf-8")
+            (root / "EmptyProject").mkdir()
+            (root / "EmptyProject" / ".gitkeep").write_text("", encoding="utf-8")
+            (root / "Fictional" / "Reference").mkdir()
+            (root / "Fictional" / ".pipeline").mkdir()
+            (root / "Fictional" / "direct-file").write_text("ignored", encoding="utf-8")
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            (root / "Fictional" / "Escaped").symlink_to(outside, target_is_directory=True)
+
+            rendered = catalog.scan_catalog(root)
+            value = json.loads(rendered)
+            assert value["inventory"] == {
+                "projects": [
+                    {"name": "EmptyProject", "availability": "complete"},
+                    {"name": "Fictional", "availability": "complete"},
+                ],
+                "stages": [
+                    {"project": "Fictional", "stage": "Empty", "availability": "complete"},
+                    {"project": "Fictional", "stage": "Testing", "availability": "complete"},
+                ],
+            }
+            assert [entry["package_path"] for entry in value["entries"]] == [
+                "Fictional/Testing/custom"
+            ]
+            parsed = parse_catalog(rendered)
+            assert parsed.inventory == value["inventory"]
+            assert "outside" not in rendered
+
+    def test_schema_four_inventory_mutations_are_rejected_before_use(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Testing", "custom", "# Custom\n")
+            (root / "Fictional" / "Empty").mkdir()
+            baseline = json.loads(catalog.scan_catalog(root))
+
+        mutations = (
+            lambda value: value.update(schema_version=3),
+            lambda value: value["inventory"].update(extra=[]),
+            lambda value: value["inventory"].update(projects={}),
+            lambda value: value["inventory"]["projects"].append(value["inventory"]["projects"][0]),
+            lambda value: value["inventory"]["stages"].reverse(),
+            lambda value: value["inventory"]["stages"][0].update(availability="unknown"),
+            lambda value: value["inventory"]["stages"][0].update(project="Missing"),
+            lambda value: value["entries"][0].update(stage="Missing"),
+            lambda value: value.update(catalog_digest="0" * 64),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                value = json.loads(json.dumps(baseline))
+                mutate(value)
+                if value.get("catalog_digest") != "0" * 64:
+                    value["catalog_digest"] = canonical_digest(value)
+                with self.assertRaises(ValueError):
+                    parse_catalog(value)
+
+    def test_unavailable_admitted_stage_is_incomplete_not_empty(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package(root, "Testing", "custom", "# Custom\n")
+            original_open = catalog._catalog_open_directory_at
+
+            def deny_testing(parent_fd: int, name: str) -> int:
+                if name == "Testing":
+                    raise PermissionError("simulated stage boundary")
+                return original_open(parent_fd, name)
+
+            with patch.object(catalog, "_catalog_open_directory_at", side_effect=deny_testing):
+                value = json.loads(catalog.scan_catalog(root))
+            assert value["inventory"] == {
+                "projects": [{"name": "Fictional", "availability": "incomplete"}],
+                "stages": [
+                    {"project": "Fictional", "stage": "Testing", "availability": "incomplete"}
+                ],
+            }
+            assert value["entries"] == []
+            assert value["discovery_diagnostics"] == [
+                {"code": "discovery_unavailable", "message": "discovery unavailable: Fictional/Testing"}
+            ]
+
     def test_stage_root_anchor_round_trips_through_schema_four_parser(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
