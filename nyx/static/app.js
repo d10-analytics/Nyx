@@ -400,7 +400,7 @@
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
-    if (!axes.stages.length && !compactView && axes.projects.length) {
+    if (!axes.stages.length && axes.projects.length) {
       board.style.setProperty("--column-tracks", columns.map(() => "minmax(var(--card-min-width), 1fr)").join(" "));
       board.innerHTML = '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
