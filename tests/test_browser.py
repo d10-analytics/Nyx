@@ -1268,6 +1268,29 @@ def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open
     assert page.get_by_text("No eligible stage directories were found.", exact=True).count() == 1
 
 
+def test_literal_stage_names_do_not_alias_builtin_labels(open_page):
+    value = json.loads(board_payload())
+    value["inventory"] = {
+        "projects": [{"name": "Alpha", "availability": "complete"}],
+        "stages": [
+            {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+            {"project": "Alpha", "stage": "queue", "availability": "complete"},
+        ],
+    }
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/upper", "queue", "Upper Queue", "Alpha"),
+        _entry(STEP_TWO, "Alpha/queue/lower", "queue", "Lower queue", "Alpha"),
+    ]
+    _reseal(value)
+
+    page = open_page(StaticClient(value))
+
+    assert page.locator(".row-head").all_text_contents() == ["Queue", "queue"]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => row.dataset.lifecycle)"
+    ) == ["Queue", "queue"]
+
+
 @pytest.mark.parametrize("storage_setup", [
     "localStorage.setItem('spec-tracker-compact-view', 'false');",
     """Object.defineProperty(window, 'localStorage', {
