@@ -219,6 +219,75 @@ def test_catalog_route_accepts_a_callable_provider():
 
 
 @pytest.mark.parametrize(
+    ("case", "mutate"),
+    [
+        ("schema-3", lambda value: value.update(schema_version=3)),
+        ("unknown-inventory-key", lambda value: value["inventory"].update(extra=[])),
+        ("projects-type", lambda value: value["inventory"].update(projects={})),
+        (
+            "duplicate-project",
+            lambda value: value["inventory"]["projects"].append(
+                dict(value["inventory"]["projects"][0])
+            ),
+        ),
+        (
+            "unordered-project",
+            lambda value: value["inventory"]["projects"].append(
+                {"name": "Alpha", "availability": "complete"}
+            ),
+        ),
+        (
+            "duplicate-stage-pair",
+            lambda value: value["inventory"]["stages"].append(
+                dict(value["inventory"]["stages"][-1])
+            ),
+        ),
+        ("unordered-stage-pair", lambda value: value["inventory"]["stages"].reverse()),
+        (
+            "unsafe-project",
+            lambda value: value["inventory"]["projects"][0].update(name="../outside"),
+        ),
+        (
+            "missing-stage-parent",
+            lambda value: value["inventory"]["stages"][0].update(project="Missing"),
+        ),
+        (
+            "invalid-availability",
+            lambda value: value["inventory"]["stages"][0].update(availability="unknown"),
+        ),
+        ("entry-not-admitted", lambda value: value["entries"][0].update(stage="Missing")),
+        ("digest-mismatch", lambda value: value.update(catalog_digest="0" * 64)),
+    ],
+    ids=[
+        "schema-3",
+        "unknown-inventory-key",
+        "projects-type",
+        "duplicate-project",
+        "unordered-project",
+        "duplicate-stage-pair",
+        "unordered-stage-pair",
+        "unsafe-project",
+        "missing-stage-parent",
+        "invalid-availability",
+        "entry-not-admitted",
+        "digest-mismatch",
+    ],
+)
+def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
+    value = raw_catalog()
+    mutate(value)
+    if case != "digest-mismatch":
+        value["catalog_digest"] = canonical_digest(value)
+
+    with RunningServer(lambda: value) as port:
+        status, content_type, body = request(port, "GET", "/api/catalog")
+
+    assert status == 502
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "producer_protocol_error"}
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         lambda value: value["identity_coverage"].update({"diagnostics": {}}),

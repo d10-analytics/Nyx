@@ -1263,3 +1263,78 @@ def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
 
     assert page.locator("#board .card").count() == 7
     assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def _malformed_browser_inventory(case):
+    value = json.loads(lifecycle_payload())
+    if case == "schema-3":
+        value["schema_version"] = 3
+    elif case == "unknown-inventory-key":
+        value["inventory"]["extra"] = []
+    elif case == "projects-type":
+        value["inventory"]["projects"] = {}
+    elif case == "duplicate-project":
+        value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
+    elif case == "unordered-project":
+        value["inventory"]["projects"].append(
+            {"name": "Alpha", "availability": "complete"}
+        )
+    elif case == "duplicate-stage-pair":
+        value["inventory"]["stages"].append(dict(value["inventory"]["stages"][-1]))
+    elif case == "unordered-stage-pair":
+        value["inventory"]["stages"].reverse()
+    elif case == "unsafe-project":
+        value["inventory"]["projects"][0]["name"] = "../outside"
+    elif case == "missing-stage-parent":
+        value["inventory"]["stages"][0]["project"] = "Missing"
+    elif case == "invalid-availability":
+        value["inventory"]["stages"][0]["availability"] = "unknown"
+    elif case == "entry-not-admitted":
+        value["entries"][0]["stage"] = "Missing"
+    elif case == "digest-mismatch":
+        value["catalog_digest"] = "0" * 64
+        return value
+    else:  # pragma: no cover - the parameter list owns the cases
+        raise AssertionError(case)
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "schema-3",
+        "unknown-inventory-key",
+        "projects-type",
+        "duplicate-project",
+        "unordered-project",
+        "duplicate-stage-pair",
+        "unordered-stage-pair",
+        "unsafe-project",
+        "missing-stage-parent",
+        "invalid-availability",
+        "entry-not-admitted",
+        "digest-mismatch",
+    ],
+)
+def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
+    open_page, case
+):
+    valid = json.loads(lifecycle_payload())
+    invalid = _malformed_browser_inventory(case)
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 7
+    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
+    assert page.locator("#refresh").inner_text() == "Refresh view"

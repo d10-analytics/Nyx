@@ -9,6 +9,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,55 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     }
     done = next(entry for entry in entries if entry["stage"] == "Done")
     assert done["declared"]["title"] == "Done package"
+
+
+@pytest.mark.parametrize("case", ["schema-3", "duplicate-project"])
+def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: str) -> None:
+    from nyx.models import canonical_digest
+    from nyx.server import create_server
+
+    value = {
+        "schema_version": 4,
+        "inventory": {
+            "projects": [{"name": "Fictional", "availability": "complete"}],
+            "stages": [],
+        },
+        "visibility": {
+            "hidden_stages": [],
+            "visible_entry_count": 0,
+            "hidden_entry_count": 0,
+        },
+        "identity_coverage": {"state": "complete", "diagnostics": []},
+        "program_coverage": {"state": "complete", "diagnostics": []},
+        "discovery_diagnostics": [],
+        "entries": [],
+        "programs": [],
+    }
+    if case == "schema-3":
+        value["schema_version"] = 3
+    else:
+        value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
+    value["catalog_digest"] = canonical_digest(value)
+
+    service = create_server(lambda: value, port=0)
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", service.server_port, timeout=5)
+        connection.request(
+            "GET",
+            "/api/catalog",
+            headers={"Host": f"127.0.0.1:{service.server_port}"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 502
+        assert json.loads(body) == {"error": "producer_protocol_error"}
+    finally:
+        service.shutdown()
+        thread.join(timeout=5)
+        service.server_close()
 
 
 def _assert_hidden_browser(url: str) -> None:
