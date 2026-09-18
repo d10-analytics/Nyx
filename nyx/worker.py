@@ -269,18 +269,36 @@ class CatalogWorkerManager:
             error = self._terminal_error(child)
             if error is not None:
                 raise error
+            wait_for_process = False
             with self._lock:
                 if child.readers_complete.is_set():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         self._select_terminal_locked(child, "producer_timeout")
                         raise WorkerError("producer_timeout")
-                    try:
-                        child.process.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
+                    wait_for_process = True
+
+                if not wait_for_process:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         self._select_terminal_locked(child, "producer_timeout")
-                        raise WorkerError("producer_timeout") from None
+                        raise WorkerError("producer_timeout")
+            if wait_for_process:
+                try:
+                    child.process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    with self._lock:
+                        if child.terminal_reason is None:
+                            self._select_terminal_locked(child, "producer_timeout")
+                        reason = child.terminal_reason
+                    if reason not in {None, "success"}:
+                        raise WorkerError(reason)
+                    continue
+                with self._lock:
                     if child.terminal_reason is not None:
+                        reason = child.terminal_reason
+                        if reason != "success":
+                            raise WorkerError(reason)
                         continue
                     if self._closing or child.cancelled:
                         self._select_terminal_locked(child, "producer_cancelled")
@@ -297,11 +315,6 @@ class CatalogWorkerManager:
                     )
                     self._select_terminal_locked(child, code)
                     raise WorkerError(code)
-
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._select_terminal_locked(child, "producer_timeout")
-                    raise WorkerError("producer_timeout")
             child.progress.wait(timeout=remaining)
             child.progress.clear()
 
