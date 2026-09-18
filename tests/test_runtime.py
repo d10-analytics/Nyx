@@ -825,7 +825,7 @@ def test_worker_timeout_after_prefix_stall_finishes_autonomously():
     started = time.monotonic()
     with pytest.raises(runtime.WorkerError, match="producer_timeout"):
         manager.fetch_catalog()
-    assert time.monotonic() - started < 0.8
+    assert time.monotonic() - started < 0.35
     deadline = time.monotonic() + 2
     while manager.active_count and time.monotonic() < deadline:
         time.sleep(0.01)
