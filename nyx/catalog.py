@@ -32,6 +32,8 @@ CATALOG_HIDDEN_STAGES = sorted(
     for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
     if lifecycle not in CATALOG_BOARD_LIFECYCLES
 )
+_IGNORED_ROOT_SYMLINK_NAMES = {"CLAUDE.md", "CODEX.md"}
+_IGNORED_PROJECT_SYMLINK_NAME = "template_spec.md"
 _SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
@@ -888,7 +890,16 @@ def _scan_stage(
                             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(current, spec_root)))
                             complete = False
                             continue
-                        if stat.S_ISLNK(child_stat.st_mode) or not stat.S_ISDIR(child_stat.st_mode):
+                        if stat.S_ISLNK(child_stat.st_mode):
+                            discovery_diagnostics.append(
+                                _catalog_diagnostic(
+                                    "discovery_unavailable",
+                                    _catalog_relative(child_path, spec_root),
+                                )
+                            )
+                            complete = False
+                            continue
+                        if not stat.S_ISDIR(child_stat.st_mode):
                             continue
                         discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root)))
                         complete = False
@@ -1124,6 +1135,8 @@ def _build_catalog(
                     inventory_projects.append({"name": repository.name, "availability": "incomplete"})
                     continue
                 if stat.S_ISLNK(repository_stat.st_mode):
+                    if repository.name in _IGNORED_ROOT_SYMLINK_NAMES:
+                        continue
                     discovery_diagnostics.append(
                         _catalog_diagnostic(
                             "discovery_unavailable",
@@ -1180,6 +1193,8 @@ def _build_catalog(
                             project_inventory["availability"] = "incomplete"
                             continue
                         if stat.S_ISLNK(stage_stat.st_mode):
+                            if directory == _IGNORED_PROJECT_SYMLINK_NAME:
+                                continue
                             discovery_diagnostics.append(
                                 _catalog_diagnostic(
                                     "discovery_unavailable",
