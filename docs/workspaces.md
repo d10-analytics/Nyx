@@ -8,6 +8,15 @@ Nyx discovers the literal direct-child project and stage directory names; it
 does not require a fixed lifecycle vocabulary.
 You can keep it in version control if that fits your workflow.
 
+Setup resolves a supplied workspace path to its literal, readable directory
+before saving it. A catalog scan invoked directly with a symlink or Windows
+reparse point as its root rejects that root. The same literal-directory rule
+applies to discovered projects, stages, grouping directories, packages, and
+program directories; linked or reparse entries are skipped with bounded
+discovery information. This is a trusted-local workspace contract, not
+containment against a hostile process changing a pathname while a scan is in
+progress.
+
 ## Create your first specification
 
 For a fictional trail-planning app, start with this layout:
@@ -94,6 +103,9 @@ and are not project columns. At the stage level, names beginning with `.`, plus
 non-directory stage candidates and never follows symlinks. A safely identified
 but unreadable project or stage remains an incomplete dimension with a bounded
 diagnostic; it is not reported as an empty directory.
+Names are compared literally. Case-distinct siblings are representable only on
+host filesystems that support them; Nyx does not normalize case or claim that
+every host can store both spellings.
 
 ## Move files yourself
 
