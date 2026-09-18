@@ -947,6 +947,84 @@ def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
     assert [error.code for error in errors] == ["producer_cancelled"]
 
 
+def test_worker_shared_shutdown_reaps_cooperative_child_with_portable_resistant_facade():
+    real_popen = subprocess.Popen
+    process_calls = 0
+    process_lock = threading.Lock()
+    command_calls = 0
+
+    class _PortableProcessControl:
+        def __init__(self, process: subprocess.Popen[bytes], *, resistant: bool) -> None:
+            self._process = process
+            self._resistant = resistant
+
+        def terminate(self) -> None:
+            if not self._resistant:
+                self._process.terminate()
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._process, name)
+
+    def portable_popen(*args: object, **kwargs: object) -> _PortableProcessControl:
+        nonlocal process_calls
+        with process_lock:
+            resistant = process_calls == 0
+            process_calls += 1
+        return _PortableProcessControl(
+            real_popen(*args, **kwargs),
+            resistant=resistant,
+        )
+
+    def command_factory() -> list[str]:
+        nonlocal command_calls
+        with process_lock:
+            resistant = command_calls == 0
+            command_calls += 1
+        if resistant:
+            return [sys.executable, "-c", "import time; time.sleep(30)"]
+        return [
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('cooperative'); sys.stdout.flush(); time.sleep(.05)",
+        ]
+
+    manager = runtime.CatalogWorkerManager(command_factory=command_factory, timeout=30)
+    errors: list[runtime.WorkerError] = []
+    results: list[bytes] = []
+
+    def fetch() -> None:
+        try:
+            results.append(manager.fetch_catalog())
+        except runtime.WorkerError as error:
+            errors.append(error)
+
+    with patch.object(worker.subprocess, "Popen", side_effect=portable_popen):
+        resistant_thread = threading.Thread(target=fetch, daemon=True)
+        resistant_thread.start()
+        deadline = time.monotonic() + 2
+        while not manager._children and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(manager._children) == 1
+
+        cooperative_thread = threading.Thread(target=fetch, daemon=True)
+        cooperative_thread.start()
+        cooperative_thread.join(timeout=2)
+        assert not cooperative_thread.is_alive()
+        assert results == [b"cooperative"]
+
+        assert manager.close(time.monotonic() + 0.2) is False
+        assert manager.active_count == 1
+
+        resistant_child = manager._children[0]
+        resistant_child.process.kill()
+        assert manager.close(time.monotonic() + 2)
+        resistant_thread.join(timeout=2)
+
+    assert not resistant_thread.is_alive()
+    assert [error.code for error in errors] == ["producer_cancelled"]
+    assert manager.active_count == 0
+
+
 def _capture_worker_error(
     manager: runtime.CatalogWorkerManager, errors: list[runtime.WorkerError]
 ) -> None:
