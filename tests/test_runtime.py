@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nyx import runtime, state
+from nyx import runtime, state, worker
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
@@ -791,6 +791,139 @@ def test_worker_timeout_has_no_additive_reap_window():
     elapsed = time.monotonic() - started
     assert elapsed < 0.8
     assert manager.close(time.monotonic() + 2)
+
+
+def test_worker_collects_interleaved_flushed_streams_with_real_pipes():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write(b'one'); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'noise'); sys.stderr.flush(); "
+                "sys.stdout.buffer.write(b'-two'); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'other'); sys.stderr.flush()"
+            ),
+        ],
+        timeout=2,
+    )
+
+    assert manager.fetch_catalog() == b"one-two"
+    assert manager.close(time.monotonic() + 2)
+
+
+def test_worker_timeout_after_prefix_stall_finishes_autonomously():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('prefix'); sys.stdout.flush(); time.sleep(30)",
+        ],
+        timeout=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_timeout"):
+        manager.fetch_catalog()
+    assert time.monotonic() - started < 0.8
+    deadline = time.monotonic() + 2
+    while manager.active_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 0
+
+
+def test_worker_retains_no_bytes_beyond_stream_caps_and_completes_readers():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write(b'x' * (2**21 + 1)); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'y' * (2**13 + 1)); sys.stderr.flush()"
+            ),
+        ],
+        timeout=2,
+    )
+    finalized: list[object] = []
+    original_start = manager._start_finalizer_locked
+
+    def observe_finalizer(child: object) -> None:
+        finalized.append(child)
+        original_start(child)  # type: ignore[arg-type]
+
+    with patch.object(manager, "_start_finalizer_locked", side_effect=observe_finalizer):
+        with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+            manager.fetch_catalog()
+    deadline = time.monotonic() + 2
+    while manager.active_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 0
+    child = finalized[0]
+    assert child.retained_bytes["stdout"] <= worker.MAX_STDOUT_BYTES  # type: ignore[attr-defined]
+    assert child.retained_bytes["stderr"] <= worker.MAX_STDERR_BYTES  # type: ignore[attr-defined]
+    assert child.readers_complete.is_set()  # type: ignore[attr-defined]
+
+
+def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
+    for exit_code, expected in ((4, "producer_unavailable"), (7, "producer_failed")):
+        manager = runtime.CatalogWorkerManager(
+            command_factory=lambda exit_code=exit_code: [
+                sys.executable,
+                "-c",
+                f"import sys; sys.stdout.close(); sys.stderr.close(); sys.exit({exit_code})",
+            ],
+            timeout=2,
+        )
+        with pytest.raises(runtime.WorkerError, match=expected):
+            manager.fetch_catalog()
+        assert manager.close(time.monotonic() + 2)
+        assert manager.active_count == 0
+
+
+def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+        ],
+        timeout=30,
+    )
+    errors: list[runtime.WorkerError] = []
+    thread = threading.Thread(
+        target=lambda: _capture_worker_error(manager, errors),
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 2
+    while manager.active_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 1
+    assert manager.close(time.monotonic() + 0.2) is False
+    assert manager.active_count == 1
+    child = manager._children[0]
+    child.process.kill()
+    assert manager.close(time.monotonic() + 2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert [error.code for error in errors] == ["producer_cancelled"]
+
+
+def _capture_worker_error(
+    manager: runtime.CatalogWorkerManager, errors: list[runtime.WorkerError]
+) -> None:
+    try:
+        manager.fetch_catalog()
+    except runtime.WorkerError as error:
+        errors.append(error)
+
+
+def test_worker_source_has_no_selector_or_nonblocking_pipe_path():
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+    assert "selectors" not in source
+    assert "os.set_blocking" not in source
+    assert "os.read" not in source
 
 
 def test_stop_during_spawn_reaps_child_registered_after_admission_closes():
