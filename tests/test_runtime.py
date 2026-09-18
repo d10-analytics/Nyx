@@ -881,6 +881,43 @@ def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
         assert manager.active_count == 0
 
 
+def test_worker_cancellation_after_eof_wins_before_success_publication():
+    with TemporaryDirectory() as temporary:
+        gate = Path(temporary) / "release"
+        manager = runtime.CatalogWorkerManager(
+            command_factory=lambda: [
+                sys.executable,
+                "-c",
+                (
+                    "import os,time,sys\n"
+                    "os.close(1); os.close(2)\n"
+                    f"gate={str(gate)!r}\n"
+                    "while not os.path.exists(gate):\n"
+                    "    time.sleep(.01)\n"
+                ),
+            ],
+            timeout=2,
+        )
+        errors: list[runtime.WorkerError] = []
+        thread = threading.Thread(target=lambda: _capture_worker_error(manager, errors), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        child = None
+        while child is None and time.monotonic() < deadline:
+            with manager._lock:
+                if manager._children:
+                    child = manager._children[0]
+            time.sleep(0.01)
+        assert child is not None
+        while not child.readers_complete.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child.readers_complete.is_set()
+        assert manager.close(time.monotonic() + 2)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert [error.code for error in errors] == ["producer_cancelled"]
+
+
 def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
     manager = runtime.CatalogWorkerManager(
         command_factory=lambda: [
