@@ -755,6 +755,220 @@ class CatalogTests(TestCase):
             }
             assert "outside" not in json.dumps(value)
 
+    def test_nonpackage_workspace_symlinks_are_ignored_for_complete_relationships(self) -> None:
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "specs"
+            target_id = "22222222-2222-4222-8222-222222222222"
+            source_id = "11111111-1111-4111-8111-111111111111"
+            package(
+                root,
+                "Queue",
+                "source",
+                f"# Source\nPackage ID: {source_id}\n"
+                f"Prerequisite: {target_id} | handoff\n",
+            )
+            package(
+                root,
+                "Done",
+                "target",
+                f"# Target\nPackage ID: {target_id}\n"
+                f"Claim: handoff | satisfied | sha256:{'a' * 64}\n",
+            )
+
+            outside_root = base / "outside-root"
+            (outside_root / "Queue" / "escaped").mkdir(parents=True)
+            (outside_root / "Queue" / "escaped" / "spec.md").write_text(
+                "# Escaped root link\n", encoding="utf-8"
+            )
+            root.joinpath("CLAUDE.md").symlink_to(outside_root, target_is_directory=True)
+            root.joinpath("CODEX.md").symlink_to(outside_root, target_is_directory=True)
+
+            outside_template = base / "outside-template"
+            (outside_template / "escaped").mkdir(parents=True)
+            (outside_template / "escaped" / "spec.md").write_text(
+                "# Escaped template link\n", encoding="utf-8"
+            )
+            (root / "Fictional" / "template_spec.md").symlink_to(
+                outside_template, target_is_directory=True
+            )
+
+            value = json.loads(catalog.scan_catalog(root))
+            entries = {entry["package_path"]: entry for entry in value["entries"]}
+            source = entries["Fictional/Queue/source"]
+            target = entries["Fictional/Done/target"]
+            edge = source["relationship"]["prerequisites"][0]
+
+            self.assertEqual("complete", value["identity_coverage"]["state"])
+            self.assertEqual([], value["identity_coverage"]["diagnostics"])
+            self.assertEqual("complete", value["program_coverage"]["state"])
+            self.assertEqual([], value["discovery_diagnostics"])
+            self.assertEqual(
+                {"Fictional/Done/target", "Fictional/Queue/source"},
+                set(entries),
+            )
+            self.assertEqual("Source", source["declared"]["title"])
+            self.assertEqual("Target", target["declared"]["title"])
+            self.assertEqual(
+                [{
+                    "diagnostics": [],
+                    "evidence_ref": f"sha256:{'a' * 64}",
+                    "name": "handoff",
+                    "state": "satisfied",
+                }],
+                target["relationship"]["claims"],
+            )
+            self.assertEqual(target_id, edge["target_package_id"])
+            self.assertEqual("handoff", edge["claim_name"])
+            self.assertEqual("satisfied", edge["observed_state"])
+            self.assertEqual(f"sha256:{'a' * 64}", edge["observed_evidence_ref"])
+            self.assertEqual("satisfied", edge["resolved_state"])
+            self.assertEqual("claim_satisfied", edge["reason"])
+            self.assertNotIn("Escaped", json.dumps(value))
+
+    def test_regular_workspace_link_names_remain_ordinary_candidates(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "specs"
+            fixtures = (
+                ("CLAUDE.md", "Queue", "claude"),
+                ("CODEX.md", "Queue", "codex"),
+                ("Fictional", "template_spec.md", "template"),
+            )
+            for project, stage, name in fixtures:
+                package_path = root / project / stage / name
+                package_path.mkdir(parents=True)
+                package_path.joinpath("spec.md").write_text(
+                    f"# {name}\n", encoding="utf-8"
+                )
+
+            value = json.loads(catalog.scan_catalog(root))
+
+            self.assertEqual(
+                [
+                    {"name": "CLAUDE.md", "availability": "complete"},
+                    {"name": "CODEX.md", "availability": "complete"},
+                    {"name": "Fictional", "availability": "complete"},
+                ],
+                value["inventory"]["projects"],
+            )
+            self.assertEqual(
+                {
+                    "CLAUDE.md/Queue/claude",
+                    "CODEX.md/Queue/codex",
+                    "Fictional/template_spec.md/template",
+                },
+                {entry["package_path"] for entry in value["entries"]},
+            )
+            self.assertEqual([], value["discovery_diagnostics"])
+
+    def test_unrecognized_catalog_symlinks_remain_untraversed_and_incomplete(self) -> None:
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "specs"
+            package(root, "Queue", "valid", "# Valid\n")
+            member_id = "33333333-3333-4333-8333-333333333333"
+            package(
+                root,
+                "Queue",
+                "member",
+                f"# Member\nProgram Membership: {member_id}\n",
+            )
+
+            outside_project = base / "outside-project"
+            (outside_project / "Queue" / "escaped").mkdir(parents=True)
+            (outside_project / "Queue" / "escaped" / "spec.md").write_text(
+                "# Escaped project\n", encoding="utf-8"
+            )
+            (root / "UnexpectedProject").symlink_to(
+                outside_project, target_is_directory=True
+            )
+
+            outside_stage = base / "outside-stage"
+            (outside_stage / "escaped").mkdir(parents=True)
+            (outside_stage / "escaped" / "spec.md").write_text(
+                "# Escaped stage\n", encoding="utf-8"
+            )
+            (root / "Fictional" / "UnexpectedStage").symlink_to(
+                outside_stage, target_is_directory=True
+            )
+
+            outside_group = base / "outside-group"
+            (outside_group / "escaped").mkdir(parents=True)
+            (outside_group / "escaped" / "spec.md").write_text(
+                "# Escaped group\n", encoding="utf-8"
+            )
+            (root / "Fictional" / "Queue" / "group").symlink_to(
+                outside_group, target_is_directory=True
+            )
+
+            programs = root / "Fictional" / "Reference" / "Programs"
+            programs.mkdir(parents=True)
+            outside_program = base / "outside-program"
+            outside_program.mkdir()
+            (outside_program / "program.md").write_text(
+                f"Program ID: {member_id}\nProgram Title: Escaped\n",
+                encoding="utf-8",
+            )
+            (programs / member_id).symlink_to(outside_program, target_is_directory=True)
+
+            anchor_id = "44444444-4444-4444-8444-444444444444"
+            anchor_program = programs / anchor_id
+            anchor_program.mkdir(parents=True)
+            outside_anchor = base / "outside-program.md"
+            outside_anchor.write_text(
+                f"Program ID: {anchor_id}\nProgram Title: Escaped anchor\n",
+                encoding="utf-8",
+            )
+            anchor_program.joinpath("program.md").symlink_to(outside_anchor)
+
+            linked_package = root / "Fictional" / "Queue" / "linked-package"
+            linked_package.mkdir()
+            outside_spec = base / "outside-spec.md"
+            outside_spec.write_text("# Escaped spec\n", encoding="utf-8")
+            linked_package.joinpath("spec.md").symlink_to(outside_spec)
+
+            value = json.loads(catalog.scan_catalog(root))
+            diagnostics = {
+                item["message"] for item in value["discovery_diagnostics"]
+            }
+            self.assertEqual(
+                {
+                    "discovery unavailable: .",
+                    "discovery unavailable: Fictional",
+                    "discovery unavailable: Fictional/Queue/group",
+                },
+                diagnostics,
+            )
+            self.assertEqual("incomplete", value["identity_coverage"]["state"])
+            self.assertIn(
+                "discovery unavailable: Fictional/Queue/group",
+                {item["message"] for item in value["identity_coverage"]["diagnostics"]},
+            )
+            self.assertEqual("incomplete", value["program_coverage"]["state"])
+            program_diagnostics = {
+                item["message"] for item in value["program_coverage"]["diagnostics"]
+            }
+            self.assertIn(
+                f"invalid package: Fictional/Reference/Programs/{member_id}",
+                program_diagnostics,
+            )
+            self.assertIn(
+                f"nonregular anchor: Fictional/Reference/Programs/{anchor_id}",
+                program_diagnostics,
+            )
+            entries = {entry["package_path"]: entry for entry in value["entries"]}
+            self.assertNotIn("UnexpectedProject", " ".join(entries))
+            self.assertNotIn("UnexpectedStage", " ".join(entries))
+            self.assertNotIn("/group", " ".join(entries))
+            self.assertEqual([], value["programs"])
+            self.assertIn("Fictional/Queue/linked-package", entries)
+            self.assertEqual(
+                [{"code": "nonregular_anchor", "message":
+                  "nonregular anchor: Fictional/Queue/linked-package"}],
+                entries["Fictional/Queue/linked-package"]["diagnostics"],
+            )
+            self.assertNotIn("Escaped", json.dumps(value))
+
     def test_schema_four_inventory_mutations_are_rejected_before_use(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
