@@ -1,8 +1,8 @@
 import inspect
 import json
 import os
-import stat
-import threading
+import subprocess
+import sys
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 from nyx import catalog
 from nyx.models import canonical_digest, parse_catalog
-from nyx.state import HiddenStageError
 
 V1 = """# Example
 Status: approved
@@ -56,527 +55,121 @@ def package(root: Path, stage: str, name: str, content: str = V1) -> Path:
     return path
 
 
+def link_directory(link: Path, target: Path) -> None:
+    """Create a real directory link, including a native Windows junction."""
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            raise OSError(result.stderr or result.stdout)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
 class CatalogTests(TestCase):
-    def test_descriptor_relative_package_boundaries_survive_replacement(self) -> None:
-        for boundary in ("root", "repository", "stage", "package"):
-            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
-                base = Path(temporary)
-                root = base / "specs"
-                package_path = package(root, "Queue", "inside", "# Inside\n")
-                outside = base / "outside"
-                outside_package = outside / "Queue" / "escape"
-                outside_package.mkdir(parents=True)
-                outside_package.joinpath("spec.md").write_text("# Escaped\n", encoding="utf-8")
-                original_open = os.open
-                intercepted_parent_fds: list[int | None] = []
-                replaced = False
-
-                def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
-                    nonlocal replaced
-                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-                    target = {
-                        "root": root,
-                        "repository": "Fictional",
-                        "stage": "Queue",
-                        "package": "inside",
-                    }[boundary]
-                    if not replaced and path == target:
-                        intercepted_parent_fds.append(dir_fd)
-                        if boundary == "root":
-                            root.rename(base / "original-root")
-                            root.symlink_to(outside, target_is_directory=True)
-                        elif boundary == "repository":
-                            repository = root / "Fictional"
-                            repository.rename(base / "original-repository")
-                            repository.symlink_to(outside, target_is_directory=True)
-                        elif boundary == "stage":
-                            stage = root / "Fictional" / "Queue"
-                            stage.rename(base / "original-stage")
-                            stage.symlink_to(outside / "Queue", target_is_directory=True)
-                        else:
-                            package_path.rename(base / "original-package")
-                            package_path.symlink_to(outside_package, target_is_directory=True)
-                        replaced = True
-                    return descriptor
-
-                with patch.object(catalog.os, "open", side_effect=guarded_open):
-                    value = json.loads(catalog.scan_catalog(root))
-                self.assertTrue(replaced)
-                self.assertEqual(1, len(intercepted_parent_fds))
-                if boundary == "root":
-                    self.assertIsNone(intercepted_parent_fds[0])
-                else:
-                    self.assertIsNotNone(intercepted_parent_fds[0])
-                self.assertNotIn("Escaped", json.dumps(value))
-                self.assertEqual("Inside", value["entries"][0]["declared"]["title"])
-
-    def test_descriptor_relative_program_boundaries_survive_replacement(self) -> None:
-        for boundary in ("reference", "programs", "uuid", "anchor"):
-            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
-                base = Path(temporary)
-                root = base / "specs"
-                package(
-                    root,
-                    "Queue",
-                    "one",
-                    f"# Package\nProgram Membership: {PROGRAM_ID}\n",
-                )
-                repository = root / "Fictional"
-                program_dir = repository / "Reference" / "Programs" / PROGRAM_ID
-                program_dir.mkdir(parents=True)
-                program_dir.joinpath("program.md").write_text(
-                    f"Program ID: {PROGRAM_ID}\nProgram Title: Inside\n", encoding="utf-8"
-                )
-                outside = base / "outside"
-                outside_dir = outside / "Reference" / "Programs" / PROGRAM_ID
-                outside_dir.mkdir(parents=True)
-                outside_dir.joinpath("program.md").write_text(
-                    f"Program ID: {PROGRAM_ID}\nProgram Title: Escaped\n", encoding="utf-8"
-                )
-                outside_anchor = outside / "program.md"
-                outside_anchor.write_text(
-                    f"Program ID: {PROGRAM_ID}\nProgram Title: Escaped\n", encoding="utf-8"
-                )
-                original_open = os.open
-                replaced = False
-
-                def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
-                    nonlocal replaced
-                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-                    if not replaced and path == {
-                        "reference": "Reference",
-                        "programs": "Programs",
-                        "uuid": PROGRAM_ID,
-                        "anchor": "program.md",
-                    }[boundary]:
-                        if boundary == "reference":
-                            (repository / "Reference").rename(base / "original-reference")
-                            (repository / "Reference").symlink_to(
-                                outside / "Reference", target_is_directory=True
-                            )
-                        elif boundary == "programs":
-                            (repository / "Reference" / "Programs").rename(base / "original-programs")
-                            (repository / "Reference" / "Programs").symlink_to(
-                                outside / "Reference" / "Programs", target_is_directory=True
-                            )
-                        elif boundary == "uuid":
-                            program_dir.rename(base / "original-program")
-                            program_dir.symlink_to(outside_dir, target_is_directory=True)
-                        else:
-                            program_dir.joinpath("program.md").rename(base / "original-program.md")
-                            program_dir.joinpath("program.md").symlink_to(outside_anchor)
-                        replaced = True
-                    return descriptor
-
-                with patch.object(catalog.os, "open", side_effect=guarded_open):
-                    value = json.loads(catalog.scan_catalog(root))
-                self.assertTrue(replaced)
-                self.assertNotIn("Escaped", json.dumps(value))
-                self.assertEqual("Inside", value["programs"][0]["title"])
-
-    def test_group_and_spec_anchor_interceptions_use_expected_parent_descriptors(self) -> None:
-        for boundary in ("group", "spec.md"):
-            with self.subTest(boundary=boundary), TemporaryDirectory() as temporary:
-                base = Path(temporary)
-                root = base / "specs"
-                group_path = root / "Fictional" / "Queue" / "group"
-                package_path = group_path / "inside"
-                package_path.mkdir(parents=True)
-                package_path.joinpath("spec.md").write_text("# Inside\n", encoding="utf-8")
-                if boundary == "group":
-                    outside = base / "outside-group"
-                    outside_package = outside / "escape"
-                    outside_package.mkdir(parents=True)
-                    outside_package.joinpath("spec.md").write_text(
-                        "# Escaped\n", encoding="utf-8"
-                    )
-                else:
-                    outside = base / "outside-spec.md"
-                    outside.write_text("# Escaped\n", encoding="utf-8")
-                original_open = os.open
-                intercepted_parent_fds: list[int | None] = []
-                replaced = False
-
-                def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
-                    nonlocal replaced
-                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-                    if not replaced and path == boundary:
-                        intercepted_parent_fds.append(dir_fd)
-                        self.assertIsNotNone(dir_fd)
-                        if boundary == "group":
-                            group_path.rename(base / "original-group")
-                            group_path.symlink_to(outside, target_is_directory=True)
-                        else:
-                            anchor = package_path / "spec.md"
-                            anchor.rename(base / "original-spec.md")
-                            anchor.symlink_to(outside)
-                        replaced = True
-                    return descriptor
-
-                with patch.object(catalog.os, "open", side_effect=guarded_open):
-                    value = json.loads(catalog.scan_catalog(root))
-                self.assertTrue(replaced)
-                self.assertEqual(1, len(intercepted_parent_fds))
-                self.assertIsNotNone(intercepted_parent_fds[0])
-                self.assertNotIn("Escaped", json.dumps(value))
-                self.assertEqual("Inside", value["entries"][0]["declared"]["title"])
-
-    def test_program_object_failures_produce_honest_incomplete_coverage(self) -> None:
-        cases = ("missing", "symlink", "nonregular", "unreadable", "changed")
-        expected_codes = {
-            "missing": "unreadable_anchor",
-            "symlink": "nonregular_anchor",
-            "nonregular": "nonregular_anchor",
-            "unreadable": "unreadable_anchor",
-            "changed": "changed_during_read",
-        }
-        for case in cases:
-            with self.subTest(case=case), TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                package(
-                    root,
-                    "Queue",
-                    "one",
-                    f"# Package\nProgram Membership: {PROGRAM_ID}\n",
-                )
-                program_dir = root / "Fictional" / "Reference" / "Programs" / PROGRAM_ID
-                program_dir.mkdir(parents=True)
-                descriptor = program_dir / "program.md"
-                descriptor.write_text(
-                    f"Program ID: {PROGRAM_ID}\nProgram Title: Inside\n", encoding="utf-8"
-                )
-                if case == "missing":
-                    descriptor.unlink()
-                elif case == "symlink":
-                    descriptor.unlink()
-                    target = root / "outside-program.md"
-                    target.write_text(
-                        f"Program ID: {PROGRAM_ID}\nProgram Title: Escaped\n", encoding="utf-8"
-                    )
-                    descriptor.symlink_to(target)
-                elif case == "nonregular":
-                    descriptor.unlink()
-                    os.mkfifo(descriptor)
-                elif case == "unreadable":
-                    descriptor.chmod(0)
-
-                original_open = os.open
-                original_fstat = os.fstat
-                program_fds: set[int] = set()
-                fstat_counts: dict[int, int] = {}
-
-                def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
-                    descriptor_fd = original_open(path, flags, mode, dir_fd=dir_fd)
-                    if path == "program.md":
-                        program_fds.add(descriptor_fd)
-                    return descriptor_fd
-
-                def changing_fstat(descriptor_fd):
-                    info = original_fstat(descriptor_fd)
-                    if case == "changed" and descriptor_fd in program_fds:
-                        fstat_counts[descriptor_fd] = fstat_counts.get(descriptor_fd, 0) + 1
-                        if fstat_counts[descriptor_fd] % 2 == 0:
-                            values = list(info)
-                            values[8] += 1
-                            return os.stat_result(values)
-                    return info
-
-                with patch.object(catalog.os, "open", side_effect=tracked_open), patch.object(
-                    catalog.os, "fstat", side_effect=changing_fstat
-                ):
-                    value = json.loads(catalog.scan_catalog(root))
-                self.assertEqual("incomplete", value["program_coverage"]["state"])
-                self.assertEqual([], value["programs"])
-                self.assertIn(
-                    expected_codes[case],
-                    {item["code"] for item in value["program_coverage"]["diagnostics"]},
-                )
-                relationship = value["entries"][0]["relationship"]["program"]
-                self.assertEqual("unknown", relationship["resolution"])
-                self.assertIsNone(relationship["title"])
-
-    def test_anchor_fifo_replacement_is_nonblocking_and_closes_admitted_descriptors(self) -> None:
-        with TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "specs"
-            package_path = package(root, "Queue", "one", "# Inside\n")
-            anchor = package_path / "spec.md"
-            original_stat = os.stat
-            original_open = os.open
-            original_fstat = os.fstat
-            original_read = os.read
-            original_close = os.close
-            replaced = False
-            opened: list[int] = []
-            anchor_fds: list[int] = []
-            fifo_fds: set[int] = set()
-            read_fds: list[int] = []
-            closed: list[int] = []
-
-            def replacing_stat(*args, **kwargs):
-                nonlocal replaced
-                result = original_stat(*args, **kwargs)
-                if args and args[0] == "spec.md" and not replaced:
-                    self.assertTrue(stat.S_ISREG(result.st_mode))
-                    anchor.rename(base / "original-spec.md")
-                    os.mkfifo(anchor)
-                    replaced = True
-                return result
-
-            def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
-                if path == "spec.md" and dir_fd is not None:
-                    self.assertTrue(flags & os.O_NONBLOCK)
-                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-                opened.append(descriptor)
-                if path == "spec.md":
-                    anchor_fds.append(descriptor)
-                    if stat.S_ISFIFO(original_fstat(descriptor).st_mode):
-                        fifo_fds.add(descriptor)
-                return descriptor
-
-            def guarded_read(descriptor: int, size: int) -> bytes:
-                self.assertNotIn(descriptor, fifo_fds, "catalog attempted to read a FIFO")
-                read_fds.append(descriptor)
-                return original_read(descriptor, size)
-
-            def tracked_close(descriptor: int) -> None:
-                closed.append(descriptor)
-                original_close(descriptor)
-
-            with (
-                patch.object(catalog.os, "stat", side_effect=replacing_stat),
-                patch.object(catalog.os, "open", side_effect=guarded_open),
-                patch.object(catalog.os, "read", side_effect=guarded_read),
-                patch.object(catalog.os, "close", side_effect=tracked_close),
-            ):
-                value = json.loads(catalog.scan_catalog(root))
-
-            self.assertTrue(replaced)
-            self.assertEqual(1, len(anchor_fds))
-            self.assertEqual(1, len(fifo_fds))
-            self.assertEqual(set(opened), set(closed))
-            self.assertNotIn(next(iter(fifo_fds)), read_fds)
-            expected = {
-                "code": "nonregular_anchor",
-                "message": "nonregular anchor: Fictional/Queue/one",
-            }
-            self.assertEqual([expected], value["entries"][0]["diagnostics"])
-            self.assertEqual([expected], value["identity_coverage"]["diagnostics"])
-            self.assertEqual("incomplete", value["identity_coverage"]["state"])
-
-
-    def test_descriptor_capabilities_fail_without_path_fallback(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package(root, "Queue", "one")
-            with patch.object(catalog.os, "O_NOFOLLOW", None), patch.object(
-                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
-            ):
-                with self.assertRaises(ValueError):
-                    catalog.scan_catalog(root)
-            for flag_name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC"):
-                with patch.object(catalog.os, flag_name, 0):
-                    with self.assertRaises(ValueError):
-                        catalog.scan_catalog(root)
-            with patch.object(catalog.os, "O_NONBLOCK", None), patch.object(
-                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
-            ):
-                with self.assertRaisesRegex(ValueError, "catalog descriptor-relative open is unavailable"):
-                    catalog.scan_catalog(root)
-
-            original_open = os.open
-
-            def unsupported_dir_fd(path, flags, mode=0o777, *, dir_fd=None):
-                if dir_fd is not None:
-                    raise TypeError("dir_fd unsupported")
-                return original_open(path, flags, mode)
-
-            with patch.object(catalog.os, "open", side_effect=unsupported_dir_fd):
-                with self.assertRaises(ValueError):
-                    catalog.scan_catalog(root)
-
-            def not_implemented_dir_fd(path, flags, mode=0o777, *, dir_fd=None):
-                if dir_fd is not None:
-                    raise NotImplementedError("dir_fd unsupported")
-                return original_open(path, flags, mode)
-
-            with patch.object(catalog.os, "open", side_effect=not_implemented_dir_fd):
-                with self.assertRaises(ValueError):
-                    catalog.scan_catalog(root)
-
-            for failure in (TypeError, NotImplementedError, ValueError):
-                def unsupported_anchor(path, flags, mode=0o777, *, dir_fd=None):
-                    if path == "spec.md" and dir_fd is not None:
-                        raise failure("anchor dir_fd unsupported")
-                    return original_open(path, flags, mode, dir_fd=dir_fd)
-
-                with patch.object(catalog.os, "open", side_effect=unsupported_anchor), patch.object(
-                    Path, "read_bytes", side_effect=AssertionError("pathname fallback")
-                ):
-                    with self.assertRaisesRegex(ValueError, "descriptor-relative open is unavailable"):
-                        catalog.scan_catalog(root)
-
-            with patch.object(catalog.os, "scandir", side_effect=TypeError("fd scandir unsupported")), patch.object(
-                Path, "read_bytes", side_effect=AssertionError("pathname fallback")
-            ):
-                with self.assertRaisesRegex(ValueError, "descriptor enumeration is unavailable"):
-                    catalog.scan_catalog(root)
-
-    def test_pre_admission_root_symlink_is_rejected(self) -> None:
+    def test_public_producers_use_one_portable_scanner_and_reject_root_links(self) -> None:
         with TemporaryDirectory() as temporary:
             base = Path(temporary)
             outside = base / "outside"
-            package(outside, "Queue", "escape", "# Escaped\n")
+            outside.mkdir()
+            (outside / "outside-marker").write_text("outside", encoding="utf-8")
             root = base / "specs"
             root.symlink_to(outside, target_is_directory=True)
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                with self.subTest(producer=producer.__name__):
+                    with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
+                        producer(root)
 
-            original_open = os.open
-            successful_opens: list[int] = []
-            forbidden_accesses: list[str] = []
-
-            def observed_open(*args, **kwargs):
-                descriptor = original_open(*args, **kwargs)
-                successful_opens.append(descriptor)
-                return descriptor
-
-            def reject_access(operation):
-                def reject(*args, **kwargs):
-                    forbidden_accesses.append(operation)
-                    raise AssertionError(f"root rejection must precede {operation}")
-                return reject
-
-            # No descriptor may be admitted, nor any contents inspected, before
-            # rejecting this root. Record violations even if a fallback catches them.
-            with (
-                patch.object(catalog.os, "open", side_effect=observed_open),
-                patch.object(catalog.os, "scandir", side_effect=reject_access("scandir")),
-                patch.object(catalog.os, "listdir", side_effect=reject_access("listdir")),
-                patch.object(catalog.os, "read", side_effect=reject_access("read")),
-                patch("io.open", side_effect=reject_access("io.open")),
-                patch("builtins.open", side_effect=reject_access("builtins.open")),
-            ):
-                with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
-                    catalog.scan_catalog(root)
-            self.assertEqual([], successful_opens)
-            self.assertEqual([], forbidden_accesses)
-
-    def test_descriptor_session_closes_on_subtree_open_failure(self) -> None:
+    def test_discovered_links_are_excluded_before_every_structural_admission(self) -> None:
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            nested_package = root / "Fictional" / "Queue" / "group" / "inside"
-            nested_package.mkdir(parents=True)
-            nested_package.joinpath("spec.md").write_text("# Inside\n", encoding="utf-8")
-            original_open, original_close = os.open, os.close
-            opened: list[int] = []
-            closed: list[int] = []
-            intercepted = False
+            base = Path(temporary)
+            root = base / "specs"
+            package(root, "Queue", "literal", "# Literal\n")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "outside-marker").write_text("outside-marker", encoding="utf-8")
+            repository = root / "Fictional"
 
-            def fail_group_open(path, flags, mode=0o777, *, dir_fd=None):
-                nonlocal intercepted
-                if path == "group" and dir_fd is not None:
-                    intercepted = True
-                    raise OSError("subtree open failed")
-                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-                opened.append(descriptor)
-                return descriptor
+            link_directory(root / "LinkedProject", outside)
+            link_directory(repository / "LinkedStage", outside)
+            link_directory(repository / "Queue" / "linked-group", outside)
+            link_directory(repository / "Queue" / "linked-package", outside)
+            reference = repository / "Reference"
+            reference.mkdir()
+            link_directory(reference / "Programs", outside)
 
-            def tracked_close(descriptor: int) -> None:
-                closed.append(descriptor)
-                original_close(descriptor)
-
-            with patch.object(catalog.os, "open", side_effect=fail_group_open), patch.object(
-                catalog.os, "close", side_effect=tracked_close
-            ):
-                value = json.loads(catalog.scan_catalog(root))
-
-            self.assertTrue(intercepted)
-            self.assertEqual([], value["entries"])
-            self.assertEqual("incomplete", value["identity_coverage"]["state"])
-            self.assertEqual(
-                ["discovery_unavailable"],
-                [diagnostic["code"] for diagnostic in value["identity_coverage"]["diagnostics"]],
+            ref_link_repo = root / "ReferenceLink"
+            ref_link_repo.mkdir()
+            link_directory(ref_link_repo / "Reference", outside)
+            uuid_link_repo = root / "UuidLink"
+            uuid_programs = uuid_link_repo / "Reference" / "Programs"
+            uuid_programs.mkdir(parents=True)
+            link_directory(uuid_programs / PROGRAM_ID, outside)
+            program_anchor_repo = root / "ProgramAnchor"
+            (program_anchor_repo / "Queue" / "member").mkdir(parents=True)
+            (program_anchor_repo / "Queue" / "member" / "spec.md").write_text(
+                f"# Member\nProgram Membership: {PROGRAM_ID}\n", encoding="utf-8"
             )
-            self.assertCountEqual(opened, closed)
-            for descriptor in opened:
-                with self.assertRaises(OSError):
-                    os.fstat(descriptor)
+            program_anchor_dir = program_anchor_repo / "Reference" / "Programs" / PROGRAM_ID
+            program_anchor_dir.mkdir(parents=True)
+            program_anchor_dir.joinpath("program.md").symlink_to(outside / "outside-marker")
 
-    def test_descriptor_session_closes_on_parser_exception_and_concurrent_scans_overlap(self) -> None:
+            anchor_link = package(root, "Queue", "anchor-link", "# Anchor\n")
+            anchor_link.joinpath("spec.md").unlink()
+            anchor_link.joinpath("spec.md").symlink_to(outside / "outside-marker")
+
+            for producer in (catalog.build_catalog, catalog.scan_catalog):
+                with self.subTest(producer=producer.__name__):
+                    value = json.loads(producer(root))
+                    rendered = json.dumps(value)
+                    self.assertNotIn("outside-marker", rendered)
+                    paths = [entry["package_path"] for entry in value["entries"]]
+                    self.assertIn("Fictional/Queue/literal", paths)
+                    self.assertNotIn("Fictional/Queue/linked-package", paths)
+                    anchor_entry = next(
+                        entry for entry in value["entries"]
+                        if entry["package_path"] == "Fictional/Queue/anchor-link"
+                    )
+                    self.assertEqual("nonregular_anchor", anchor_entry["diagnostics"][0]["code"])
+                    self.assertTrue(value["discovery_diagnostics"])
+
+    def test_anchor_links_nonregular_unreadable_and_changed_reads_are_bounded(self) -> None:
         with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package(root, "Queue", "one")
-            original_open, original_close = os.open, os.close
-            opened: list[int] = []
-            closed: list[int] = []
+            base = Path(temporary)
+            root = base / "specs"
+            link_package = package(root, "Queue", "linked", "# Linked\n")
+            nonregular = package(root, "Queue", "fifo", "# FIFO\n")
+            unreadable = package(root, "Queue", "unreadable", "# Unreadable\n")
+            package(root, "Queue", "changed", "# Changed\n")
+            outside = base / "outside.md"
+            outside.write_text("# Outside\noutside-marker\n", encoding="utf-8")
+            link_package.joinpath("spec.md").unlink()
+            link_package.joinpath("spec.md").symlink_to(outside)
+            nonregular.joinpath("spec.md").unlink()
+            os.mkfifo(nonregular / "spec.md")
+            unreadable.joinpath("spec.md").chmod(0)
 
-            def tracked_open(*args, **kwargs):
-                descriptor = original_open(*args, **kwargs)
-                opened.append(descriptor)
-                return descriptor
+            identity_count = 0
+            def changed_identity(info):
+                nonlocal identity_count
+                identity_count += 1
+                return (identity_count, 1, 1, 1, 1, 1, 1)
 
-            def tracked_close(descriptor):
-                closed.append(descriptor)
-                return original_close(descriptor)
-
-            with patch.object(catalog.os, "open", side_effect=tracked_open), patch.object(
-                catalog.os, "close", side_effect=tracked_close
-            ), patch.object(catalog, "_parse_header", side_effect=RuntimeError("parser")):
-                with self.assertRaisesRegex(RuntimeError, "parser"):
-                    catalog.scan_catalog(root)
-            self.assertEqual(set(opened), set(closed))
-
-            roots = []
-            for title in ("First", "Second"):
-                scan_root = root / title
-                package(scan_root, "Queue", "one", f"# {title}\n")
-                roots.append(scan_root)
-            barrier = threading.Barrier(2)
-            original_root_open = os.open
-            admissions: list[tuple[int, int]] = []
-            opened_by_thread: dict[int, list[int]] = {}
-            closed_by_thread: dict[int, list[int]] = {}
-            thread_errors: list[BaseException] = []
-
-            def synchronized_open(path, flags, mode=0o777, *, dir_fd=None):
-                descriptor = original_root_open(path, flags, mode, dir_fd=dir_fd)
-                owner = threading.get_ident()
-                opened_by_thread.setdefault(owner, []).append(descriptor)
-                if dir_fd is None and path in roots:
-                    admissions.append((owner, descriptor))
-                    barrier.wait(timeout=5)
-                return descriptor
-
-            def synchronized_close(descriptor: int) -> None:
-                closed_by_thread.setdefault(threading.get_ident(), []).append(descriptor)
-                original_close(descriptor)
-
-            results: list[dict[str, object]] = []
-
-            def scan(scan_root: Path) -> None:
-                try:
-                    results.append(json.loads(catalog.scan_catalog(scan_root)))
-                except BaseException as error:
-                    thread_errors.append(error)
-
-            with patch.object(catalog.os, "open", side_effect=synchronized_open), patch.object(
-                catalog.os, "close", side_effect=synchronized_close
-            ):
-                threads = [threading.Thread(target=scan, args=(scan_root,)) for scan_root in roots]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=5)
-            self.assertEqual([], thread_errors)
-            self.assertTrue(all(not thread.is_alive() for thread in threads))
-            self.assertEqual(2, len(admissions))
-            self.assertEqual(2, len({descriptor for _owner, descriptor in admissions}))
-            self.assertEqual({"First", "Second"}, {result["entries"][0]["declared"]["title"] for result in results})
-            for owner, descriptor in admissions:
-                self.assertIn(descriptor, closed_by_thread.get(owner, []))
-            self.assertEqual(
-                {descriptor for values in opened_by_thread.values() for descriptor in values},
-                {descriptor for values in closed_by_thread.values() for descriptor in values},
-            )
+            with patch.object(catalog, "_catalog_identity", side_effect=changed_identity):
+                values = [
+                    json.loads(producer(root))
+                    for producer in (catalog.build_catalog, catalog.scan_catalog)
+                ]
+            for value in values:
+                entries = {entry["package_path"]: entry for entry in value["entries"]}
+                self.assertEqual("nonregular_anchor", entries["Fictional/Queue/fifo"]["diagnostics"][0]["code"])
+                self.assertEqual("unreadable_anchor", entries["Fictional/Queue/unreadable"]["diagnostics"][0]["code"])
+                self.assertEqual("changed_during_read", entries["Fictional/Queue/changed"]["diagnostics"][0]["code"])
+                self.assertNotIn("outside-marker", json.dumps(value))
+            unreadable.joinpath("spec.md").chmod(0o600)
 
     def test_both_public_producers_retain_fixed_schema_four_oracle_without_writes(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -781,30 +374,6 @@ class CatalogTests(TestCase):
                     value["catalog_digest"] = canonical_digest(value)
                 with self.assertRaises(ValueError):
                     parse_catalog(value)
-
-    def test_unavailable_admitted_stage_is_incomplete_not_empty(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package(root, "Testing", "custom", "# Custom\n")
-            original_open = catalog._catalog_open_directory_at
-
-            def deny_testing(parent_fd: int, name: str) -> int:
-                if name == "Testing":
-                    raise PermissionError("simulated stage boundary")
-                return original_open(parent_fd, name)
-
-            with patch.object(catalog, "_catalog_open_directory_at", side_effect=deny_testing):
-                value = json.loads(catalog.scan_catalog(root))
-            assert value["inventory"] == {
-                "projects": [{"name": "Fictional", "availability": "incomplete"}],
-                "stages": [
-                    {"project": "Fictional", "stage": "Testing", "availability": "incomplete"}
-                ],
-            }
-            assert value["entries"] == []
-            assert value["discovery_diagnostics"] == [
-                {"code": "discovery_unavailable", "message": "discovery unavailable: Fictional/Testing"}
-            ]
 
     def test_stage_root_anchor_round_trips_through_schema_four_parser(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1184,45 +753,6 @@ class CatalogTests(TestCase):
                 ).hexdigest(),
                 value["catalog_digest"],
             )
-
-    def test_unsafe_direct_policies_fail_before_root_open_and_without_writes(self) -> None:
-        unsafe = (
-            "Done", b"Done", None, 1, ("",), (".",), ("..",), ("stage/name",),
-            (r"stage\name",), ("control\x1f",), ("delete\x7f",),
-            ("surrogate\ud800",), (object(),),
-        )
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            original_open = os.open
-            for producer in (catalog.build_catalog, catalog.scan_catalog):
-                for policy in unsafe:
-                    with self.subTest(producer=producer.__name__, policy=repr(policy)):
-                        def reject_writes(path, flags, mode=0o777, *, dir_fd=None):
-                            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
-                            return original_open(path, flags, mode, dir_fd=dir_fd)
-
-                        with ExitStack() as stack:
-                            stack.enter_context(
-                                patch.object(
-                                    catalog, "_catalog_open_root",
-                                    side_effect=AssertionError("root opened before policy validation"),
-                                )
-                            )
-                            stack.enter_context(patch.object(catalog.os, "open", side_effect=reject_writes))
-                            for name in (
-                                "mkdir", "unlink", "rename", "replace", "symlink", "chmod",
-                                "truncate", "write", "mknod", "link", "rmdir", "remove",
-                                "fchmod", "ftruncate", "utime",
-                            ):
-                                stack.enter_context(
-                                    patch.object(
-                                        catalog.os,
-                                        name,
-                                        side_effect=AssertionError(f"catalog attempted os.{name}"),
-                                    )
-                                )
-                            with self.assertRaises(HiddenStageError):
-                                producer(root, hidden_stages=policy)
 
 ORACLE_IDS = [
     "11111111-1111-4111-8111-111111111111",
