@@ -1039,6 +1039,7 @@ def test_worker_source_has_no_selector_or_nonblocking_pipe_path():
     assert "selectors" not in source
     assert "os.set_blocking" not in source
     assert "os.read" not in source
+    assert "communicate" not in source
 
 
 def test_stop_during_spawn_reaps_child_registered_after_admission_closes():
