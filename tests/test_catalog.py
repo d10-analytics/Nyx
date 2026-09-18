@@ -77,7 +77,7 @@ class CatalogTests(TestCase):
             outside.mkdir()
             (outside / "outside-marker").write_text("outside", encoding="utf-8")
             root = base / "specs"
-            root.symlink_to(outside, target_is_directory=True)
+            link_directory(root, outside)
             for producer in (catalog.build_catalog, catalog.scan_catalog):
                 with self.subTest(producer=producer.__name__):
                     with self.assertRaisesRegex(ValueError, "specification root cannot be read"):
