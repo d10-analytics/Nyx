@@ -32,6 +32,8 @@ CATALOG_HIDDEN_STAGES = sorted(
     for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
     if lifecycle not in CATALOG_BOARD_LIFECYCLES
 )
+_IGNORED_ROOT_SYMLINK_NAMES = {"CLAUDE.md", "CODEX.md"}
+_IGNORED_PROJECT_SYMLINK_NAME = "template_spec.md"
 _SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
