@@ -35,14 +35,16 @@ Nyx discovers safe direct project and stage directories even when they are not
 in the familiar lifecycle table. Names beginning with `.`, `Reference`, and
 `.pipeline` are reserved at their documented levels. Direct regular files such
 as `.gitkeep` are ignored, so they can preserve an empty project or stage in a
-versioned sample without creating a package. The configured workspace root and
-every discovered structural directory must be literal: Nyx rejects symlinks and
-Windows reparse points before descent, including project, stage, grouping,
-package, `Reference`, `Programs`, and UUID program directories. Symlinked or
-reparse anchors are not read. This is a trusted-local input contract and does
-not claim hostile concurrent path-substitution containment. Case is preserved
-literally; case-distinct siblings exist only where the host filesystem supports
-them, and Nyx does not normalize or alias their names.
+versioned sample without creating a package. Setup resolves a supplied workspace
+path to its literal root before saving it, while a catalog scan invoked directly
+with a linked or reparse root rejects that root. Every discovered structural
+directory must be literal: Nyx rejects symlinks and Windows reparse points before
+descent, including project, stage, grouping, package, `Reference`, `Programs`,
+and UUID program directories. Symlinked or reparse anchors are not read. This is
+a trusted-local input contract and does not claim hostile concurrent
+path-substitution containment. Case is preserved literally; case-distinct
+siblings exist only where the host filesystem supports them, and Nyx does not
+normalize or alias their names.
 
 Generate fresh IDs with `python3 -c 'import uuid; print(uuid.uuid4())'`. Use each
 package ID once in a workspace and retain it when moving the package. Repeat

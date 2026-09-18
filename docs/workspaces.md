@@ -8,13 +8,14 @@ Nyx discovers the literal direct-child project and stage directory names; it
 does not require a fixed lifecycle vocabulary.
 You can keep it in version control if that fits your workflow.
 
-The configured workspace root must itself be a literal, readable directory.
-Nyx does not follow a symlink or Windows reparse point used as that root. The
-same literal-directory rule applies to discovered projects, stages, grouping
-directories, packages, and program directories; linked or reparse entries are
-skipped with bounded discovery information. This is a trusted-local workspace
-contract, not containment against a hostile process changing a pathname while a
-scan is in progress.
+Setup resolves a supplied workspace path to its literal, readable directory
+before saving it. A catalog scan invoked directly with a symlink or Windows
+reparse point as its root rejects that root. The same literal-directory rule
+applies to discovered projects, stages, grouping directories, packages, and
+program directories; linked or reparse entries are skipped with bounded
+discovery information. This is a trusted-local workspace contract, not
+containment against a hostile process changing a pathname while a scan is in
+progress.
 
 ## Create your first specification
 
