@@ -32,8 +32,8 @@ CATALOG_HIDDEN_STAGES = sorted(
     for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
     if lifecycle not in CATALOG_BOARD_LIFECYCLES
 )
-_IGNORED_ROOT_LINK_NAMES = {"CLAUDE.md", "CODEX.md"}
-_IGNORED_PROJECT_LINK_NAME = "template_spec.md"
+_IGNORED_ROOT_SYMLINK_NAMES = {"CLAUDE.md", "CODEX.md"}
+_IGNORED_PROJECT_SYMLINK_NAME = "template_spec.md"
 _SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
@@ -1050,7 +1050,7 @@ def _build_catalog(
             inventory_projects.append({"name": repository.name, "availability": "incomplete"})
             continue
         if _catalog_is_reparse(repository_info):
-            if repository.name in _IGNORED_ROOT_LINK_NAMES:
+            if repository.name in _IGNORED_ROOT_SYMLINK_NAMES:
                 continue
             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
             continue
@@ -1098,7 +1098,7 @@ def _build_catalog(
                     project_inventory["availability"] = "incomplete"
                     continue
                 if _catalog_is_reparse(stage_info):
-                    if directory == _IGNORED_PROJECT_LINK_NAME:
+                    if directory == _IGNORED_PROJECT_SYMLINK_NAME:
                         continue
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
                     continue
