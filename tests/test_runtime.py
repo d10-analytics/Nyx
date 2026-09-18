@@ -918,12 +918,30 @@ def test_worker_cancellation_after_eof_wins_before_success_publication():
         assert [error.code for error in errors] == ["producer_cancelled"]
 
 
+class _PortableProcessControl:
+    def __init__(self, process: subprocess.Popen[bytes], *, resistant: bool) -> None:
+        self._process = process
+        self._resistant = resistant
+
+    def terminate(self) -> None:
+        if not self._resistant:
+            self._process.terminate()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._process, name)
+
+
 def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
+    real_popen = subprocess.Popen
+
+    def portable_popen(*args: object, **kwargs: object) -> _PortableProcessControl:
+        return _PortableProcessControl(real_popen(*args, **kwargs), resistant=True)
+
     manager = runtime.CatalogWorkerManager(
         command_factory=lambda: [
             sys.executable,
             "-c",
-            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            "import time; time.sleep(30)",
         ],
         timeout=30,
     )
@@ -932,17 +950,18 @@ def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
         target=lambda: _capture_worker_error(manager, errors),
         daemon=True,
     )
-    thread.start()
-    deadline = time.monotonic() + 2
-    while manager.active_count == 0 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert manager.active_count == 1
-    assert manager.close(time.monotonic() + 0.2) is False
-    assert manager.active_count == 1
-    child = manager._children[0]
-    child.process.kill()
-    assert manager.close(time.monotonic() + 2)
-    thread.join(timeout=2)
+    with patch.object(worker.subprocess, "Popen", side_effect=portable_popen):
+        thread.start()
+        deadline = time.monotonic() + 2
+        while manager.active_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert manager.active_count == 1
+        assert manager.close(time.monotonic() + 0.2) is False
+        assert manager.active_count == 1
+        child = manager._children[0]
+        child.process.kill()
+        assert manager.close(time.monotonic() + 2)
+        thread.join(timeout=2)
     assert not thread.is_alive()
     assert [error.code for error in errors] == ["producer_cancelled"]
 
@@ -952,18 +971,6 @@ def test_worker_shared_shutdown_reaps_cooperative_child_with_portable_resistant_
     process_calls = 0
     process_lock = threading.Lock()
     command_calls = 0
-
-    class _PortableProcessControl:
-        def __init__(self, process: subprocess.Popen[bytes], *, resistant: bool) -> None:
-            self._process = process
-            self._resistant = resistant
-
-        def terminate(self) -> None:
-            if not self._resistant:
-                self._process.terminate()
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._process, name)
 
     def portable_popen(*args: object, **kwargs: object) -> _PortableProcessControl:
         nonlocal process_calls
