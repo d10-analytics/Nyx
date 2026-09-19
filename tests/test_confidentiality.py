@@ -137,5 +137,6 @@ def test_bytecode_enabled_import_creates_own_fixture_bytecode_without_failing_sc
 def test_no_environment_redirects_catalog_state_into_the_checkout():
     assert not (REPOSITORY_ROOT / ".config").exists()
     assert not (REPOSITORY_ROOT / ".local").exists()
+    assert not (REPOSITORY_ROOT / ".nyx").exists()
     assert os.environ.get("XDG_CONFIG_HOME") != str(REPOSITORY_ROOT / ".config")
     assert os.environ.get("XDG_STATE_HOME") != str(REPOSITORY_ROOT / ".local" / "state")

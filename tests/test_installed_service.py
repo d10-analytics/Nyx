@@ -303,7 +303,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         configured = _run_nyx("--setup", str(specification_root), "--hide-stage", "Done")
         assert configured.returncode == 0, configured.stderr
         assert configured.stdout.strip() == f"configured {specification_root.resolve()}"
-        config_file = ACCOUNT_HOME / ".config" / "nyx" / "config.json"
+        config_file = ACCOUNT_HOME / ".nyx" / "config" / "config.json"
         assert config_file.is_relative_to(ACCOUNT_HOME)
         assert config_file.exists()
         configuration_bytes = config_file.read_bytes()
@@ -325,7 +325,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert first.returncode == 0, first.stderr
         assert first.stdout.strip() == "http://127.0.0.1:8765/"
         started = True
-        instance_file = ACCOUNT_HOME / ".local" / "state" / "nyx" / "runtime" / "instance.json"
+        instance_file = ACCOUNT_HOME / ".nyx" / "runtime" / "instance.json"
         first_instance = json.loads(instance_file.read_text(encoding="utf-8"))
         assert instance_file.is_relative_to(ACCOUNT_HOME)
         instance_bytes = instance_file.read_bytes()

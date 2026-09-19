@@ -1,15 +1,15 @@
-"""Secure per-account configuration for Nyx.
+"""Portable per-account configuration and state admission for Nyx.
 
-This module owns the durable setup record.  Process ownership and lifecycle
-leases are deliberately kept in the runtime layer; public replacements are
-delegated there while the private writer remains responsible for durable bytes.
+This module owns the host-local ``Path.home() / ".nyx"`` tree, configuration
+schema, structural admission, and atomic configuration replacement.  Lifecycle
+ownership remains in :mod:`nyx.runtime`; this module never treats a locator or
+runtime file as proof of ownership.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import pwd
 import stat
 import sys
 import tempfile
@@ -36,11 +36,11 @@ class StateError(RuntimeError):
 
 
 class UnsupportedPlatformError(StateError):
-    """The fixed account-home state contract is Linux-only."""
+    """Retained for callers that import the historical exception type."""
 
 
 class AccountHomeError(StateError):
-    """The current UID does not have a usable account home."""
+    """The controlled home or a managed state component is unusable."""
 
 
 class SpecificationRootError(StateError):
@@ -57,7 +57,7 @@ class HiddenStageError(ConfigurationError):
 
 @dataclass(frozen=True)
 class StatePaths:
-    """The fixed paths belonging to the current UID's account home."""
+    """The fixed paths belonging to the current user's home."""
 
     account_home: Path
     config_directory: Path
@@ -93,8 +93,6 @@ class ConfigurationObservation:
 
     @property
     def state(self) -> str:
-        """Compatibility spelling for consumers that call the status a state."""
-
         return self.status
 
     @property
@@ -112,7 +110,7 @@ class ConfigurationObservation:
 
 @dataclass(frozen=True)
 class RuntimeObservation:
-    """A read-only view of the fixed runtime tree, independent of configuration."""
+    """A read-only view of the fixed runtime tree, independent of config."""
 
     status: str
     paths: StatePaths | None = None
@@ -128,40 +126,28 @@ class RuntimeObservation:
 
 
 def _require_linux() -> None:
-    if sys.platform != "linux":
-        raise UnsupportedPlatformError("Nyx state is supported on Linux only")
+    """Compatibility no-op for callers of the former Linux-only owner."""
 
 
 def _current_uid() -> int:
+    """Retain the old test seam without making UID part of state admission."""
+
     try:
         return os.getuid()
-    except AttributeError as error:  # pragma: no cover - Linux has getuid
-        raise UnsupportedPlatformError("Nyx requires a Linux UID") from error
+    except AttributeError:  # pragma: no cover - only unusual Python hosts
+        return -1
 
 
 def resolve_account_home() -> Path:
-    """Resolve the current UID's passwd home without consulting the environment."""
+    """Return the direct, controlled ``Path.home()`` value."""
 
-    _require_linux()
-    uid = _current_uid()
     try:
-        account = pwd.getpwuid(uid)
-        raw_home = account.pw_dir
-    except (KeyError, OSError, TypeError) as error:
-        raise AccountHomeError("current UID has no account home") from error
-    if not isinstance(raw_home, str) or not raw_home or not os.path.isabs(raw_home):
-        raise AccountHomeError("current account home is not an absolute path")
-    home = Path(raw_home)
-    try:
-        canonical = home.resolve(strict=True)
-        mode = canonical.stat()
-    except (OSError, RuntimeError) as error:
-        raise AccountHomeError("current account home is unusable") from error
-    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != uid:
-        raise AccountHomeError("current account home is not a UID-owned directory")
-    if not os.access(canonical, os.R_OK | os.W_OK | os.X_OK):
-        raise AccountHomeError("current account home is not accessible")
-    return canonical
+        home = Path.home()
+    except (RuntimeError, OSError) as error:
+        raise AccountHomeError("current account home is unavailable") from error
+    if not home.is_absolute():
+        raise AccountHomeError("current account home is not absolute")
+    return home
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -207,56 +193,26 @@ def resolve_specification_root(value: str | os.PathLike[str]) -> Path:
     return canonical
 
 
-def _verify_directory(path: Path, uid: int) -> None:
-    try:
-        details = path.lstat()
-    except OSError as error:
-        raise AccountHomeError("Nyx state directory is unavailable") from error
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
-        raise AccountHomeError("Nyx state directory is not a real directory")
-    if details.st_uid != uid or stat.S_IMODE(details.st_mode) != 0o700:
-        raise AccountHomeError("Nyx state directory has unsafe ownership or mode")
+def _is_reparse_or_link(path: Path, details: os.stat_result) -> bool:
+    """Reject links and native Windows reparse points without following them."""
 
-
-def _verify_general_directory(path: Path) -> None:
-    try:
-        details = path.lstat()
-    except OSError as error:
-        raise AccountHomeError("Nyx state parent directory is unavailable") from error
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
-        raise AccountHomeError("Nyx state parent is not a real directory")
-    if stat.S_IMODE(details.st_mode) & 0o022:
-        raise AccountHomeError("Nyx state parent is writable by another UID")
-
-
-def _fixed_state_paths() -> StatePaths:
-    """Derive fixed per-account paths without validating their children."""
-
-    _require_linux()
-    home = resolve_account_home()
-    paths = StatePaths(
-        account_home=home,
-        config_directory=home / ".config" / "nyx",
-        config_file=home / ".config" / "nyx" / CONFIG_FILENAME,
-        state_directory=home / ".local" / "state" / "nyx",
-        deployment_file=home / ".local" / "state" / "nyx" / DEPLOYMENT_FILENAME,
-        runtime_directory=home / ".local" / "state" / "nyx" / RUNTIME_DIRECTORY,
-    )
-    for path in (
-        home / ".config",
-        paths.config_directory,
-        home / ".local",
-        home / ".local" / "state",
-        paths.state_directory,
-        paths.runtime_directory,
-    ):
-        if any(_is_within(path, footprint) for footprint in _installation_footprints()):
-            raise AccountHomeError("Nyx state would be inside its installation")
-    return paths
+    if stat.S_ISLNK(details.st_mode):
+        return True
+    attributes = getattr(details, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if attributes & reparse_flag:
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            return bool(is_junction())
+        except OSError:
+            return True
+    return False
 
 
 def _lstat(path: Path) -> os.stat_result | None:
-    """Return metadata, preserving a distinction between absent and unavailable."""
+    """Return metadata, preserving a distinction between absent and unusable."""
 
     try:
         return path.lstat()
@@ -266,64 +222,81 @@ def _lstat(path: Path) -> os.stat_result | None:
         raise AccountHomeError("Nyx state path is unavailable") from error
 
 
-def _is_missing(path: Path) -> bool:
-    return _lstat(path) is None
+def _identity(details: os.stat_result) -> tuple[int, int, int, int]:
+    return (details.st_dev, details.st_ino, details.st_mode, details.st_size)
 
 
-def _ensure_general_directory(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise AccountHomeError("cannot create Nyx state parent directory") from error
-    _verify_general_directory(path)
+def _admit_directory(path: Path, *, create: bool) -> bool:
+    """Admit one managed directory, creating it only when requested."""
+
+    before = _lstat(path)
+    if before is None:
+        if not create:
+            return False
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise AccountHomeError("cannot create Nyx state directory") from error
+        after = _lstat(path)
+        if after is None:
+            raise AccountHomeError("Nyx state directory disappeared during admission")
+    else:
+        after = before
+
+    if _is_reparse_or_link(path, after) or not stat.S_ISDIR(after.st_mode):
+        raise AccountHomeError("Nyx state directory is not an ordinary directory")
+    if before is not None and _identity(before) != _identity(after):
+        raise AccountHomeError("Nyx state directory changed during admission")
+    return True
 
 
-def _ensure_directory(path: Path, uid: int) -> None:
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise AccountHomeError("cannot create Nyx state directory") from error
-    _verify_directory(path, uid)
+def _managed_paths() -> StatePaths:
+    home = resolve_account_home()
+    root = home / ".nyx"
+    config = root / "config"
+    runtime = root / RUNTIME_DIRECTORY
+    return StatePaths(
+        account_home=home,
+        config_directory=config,
+        config_file=config / CONFIG_FILENAME,
+        state_directory=root,
+        deployment_file=runtime / DEPLOYMENT_FILENAME,
+        runtime_directory=runtime,
+    )
+
+
+def _fixed_state_paths() -> StatePaths:
+    """Derive managed paths without validating or creating any child."""
+
+    return _managed_paths()
 
 
 def state_paths(*, create: bool = False) -> StatePaths:
-    """Return fixed per-account paths, optionally creating Nyx directories."""
+    """Return fixed paths and optionally admit the managed directories."""
 
     paths = _fixed_state_paths()
-    uid = _current_uid()
-    config_base = paths.config_directory.parent
-    local_base = paths.state_directory.parents[1]
-    state_parent = paths.state_directory.parent
     if create:
-        for path in (config_base, local_base, state_parent):
-            _ensure_general_directory(path)
-        for path in (paths.config_directory, paths.state_directory, paths.runtime_directory):
-            _ensure_directory(path, uid)
+        _admit_directory(paths.state_directory, create=True)
+        _admit_directory(paths.config_directory, create=True)
+        _admit_directory(paths.runtime_directory, create=True)
     else:
-        for path in (config_base, local_base, state_parent):
-            if path.exists() or path.is_symlink():
-                _verify_general_directory(path)
-        for path in (paths.config_directory, paths.state_directory, paths.runtime_directory):
-            if path.exists() or path.is_symlink():
-                _verify_directory(path, uid)
+        for path in (paths.state_directory, paths.config_directory, paths.runtime_directory):
+            if _lstat(path) is not None:
+                _admit_directory(path, create=False)
     return paths
 
 
-def _verify_record(path: Path, uid: int) -> os.stat_result:
+def _verify_record(path: Path, _uid: int | None = None) -> os.stat_result:
     try:
         details = path.lstat()
     except FileNotFoundError as error:
         raise ConfigurationError("Nyx configuration is missing") from error
     except OSError as error:
         raise ConfigurationError("Nyx configuration is unavailable") from error
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+    if _is_reparse_or_link(path, details) or not stat.S_ISREG(details.st_mode):
         raise ConfigurationError("Nyx configuration is not a regular file")
-    if details.st_uid != uid or stat.S_IMODE(details.st_mode) != 0o600:
-        raise ConfigurationError("Nyx configuration has unsafe ownership or mode")
     return details
 
 
@@ -384,11 +357,14 @@ def _configuration_from_payload(payload: Any) -> Configuration:
 
 
 def load_configuration(paths: StatePaths | None = None) -> Configuration:
-    """Read and validate the secure setup record without checking root contents."""
+    """Read and validate the setup record without checking root contents."""
 
-    _require_linux()
     selected = state_paths() if paths is None else paths
-    _verify_record(selected.config_file, _current_uid())
+    if not _admit_directory(selected.state_directory, create=False):
+        raise ConfigurationError("Nyx configuration is missing")
+    if not _admit_directory(selected.config_directory, create=False):
+        raise ConfigurationError("Nyx configuration is missing")
+    _verify_record(selected.config_file)
     try:
         payload = json.loads(selected.config_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -401,26 +377,18 @@ def _configuration_unavailable() -> ConfigurationObservation:
 
 
 def observe_configuration() -> ConfigurationObservation:
-    """Observe only the persisted configuration without inspecting runtime paths.
-
-    A missing, validly absent configuration is represented as ``not_configured``.
-    Every other configuration read or validation failure is deliberately collapsed
-    to the bounded ``configuration_unavailable`` diagnostic.
-    """
+    """Observe configuration without creating, changing, or reading runtime."""
 
     try:
         paths = _fixed_state_paths()
-        config_parent = paths.config_directory.parent
-        if _is_missing(config_parent):
+        if not _admit_directory(paths.state_directory, create=False):
             return ConfigurationObservation("not_configured")
-        _verify_general_directory(config_parent)
-        if _is_missing(paths.config_directory):
+        if not _admit_directory(paths.config_directory, create=False):
             return ConfigurationObservation("not_configured")
-        _verify_directory(paths.config_directory, _current_uid())
-        if _is_missing(paths.config_file):
+        if _lstat(paths.config_file) is None:
             return ConfigurationObservation("not_configured")
         configuration = load_configuration(paths)
-    except StateError:
+    except (StateError, OSError, ValueError):
         return _configuration_unavailable()
     return ConfigurationObservation(
         "configured",
@@ -433,28 +401,14 @@ _RUNTIME_RECORDS = frozenset({"operation.lock", "lease.lock", "instance.json"})
 
 
 def observe_runtime() -> RuntimeObservation:
-    """Observe the fixed runtime tree without reading configuration or creating it.
+    """Observe runtime structure without reading configuration or creating it."""
 
-    Runtime file semantics (leases, locks, and instance records) are resolved by
-    the lifecycle owner.  This state-level observer validates their fixed tree
-    and reports a present-but-unresolved tree as ``unknown``.
-    """
-
+    paths = _fixed_state_paths()
     try:
-        paths = _fixed_state_paths()
-        local_parent = paths.state_directory.parents[1]
-        state_parent = paths.state_directory.parent
-        for parent in (local_parent, state_parent):
-            if _is_missing(parent):
-                return RuntimeObservation("not_running", paths=paths)
-            _verify_general_directory(parent)
-        if _is_missing(paths.state_directory):
+        if not _admit_directory(paths.state_directory, create=False):
             return RuntimeObservation("not_running", paths=paths)
-        _verify_directory(paths.state_directory, _current_uid())
-        if _is_missing(paths.runtime_directory):
-            return RuntimeObservation("unknown", paths=paths)
-        _verify_directory(paths.runtime_directory, _current_uid())
-
+        if not _admit_directory(paths.runtime_directory, create=False):
+            return RuntimeObservation("not_running", paths=paths)
         entries = tuple(paths.runtime_directory.iterdir())
         if not entries:
             return RuntimeObservation("not_running", paths=paths)
@@ -462,41 +416,56 @@ def observe_runtime() -> RuntimeObservation:
             details = entry.lstat()
             if entry.name not in _RUNTIME_RECORDS:
                 return RuntimeObservation("unknown", paths=paths)
-            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-                return RuntimeObservation("unknown", paths=paths)
-            if details.st_uid != _current_uid() or stat.S_IMODE(details.st_mode) != 0o600:
+            if _is_reparse_or_link(entry, details) or not stat.S_ISREG(details.st_mode):
                 return RuntimeObservation("unknown", paths=paths)
     except (OSError, StateError):
-        return RuntimeObservation("unknown")
+        return RuntimeObservation("unknown", paths=paths)
     return RuntimeObservation("unknown", paths=paths)
 
 
-# Explicit path-oriented aliases make the ownership boundary visible to callers
-# while retaining one implementation for the read-only runtime tree.
 observe_configuration_paths = observe_configuration
 observe_runtime_paths = observe_runtime
 
 
 def _configuration_bytes(root: Path, hidden_stages: tuple[str, ...]) -> bytes:
-    return (json.dumps(
-        Configuration(root, hidden_stages).as_dict(),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "\n").encode("utf-8")
+    return (
+        json.dumps(
+            Configuration(root, hidden_stages).as_dict(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sync_directory(path: Path) -> None:
+    """Best-effort directory flush on hosts that expose directory handles."""
+
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path, flags)
+    except (AttributeError, OSError):
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _atomic_write_configuration(
     paths: StatePaths, root: Path, hidden_stages: tuple[str, ...]
 ) -> None:
-    uid = _current_uid()
     temporary_name: str | None = None
     try:
+        if not _admit_directory(paths.state_directory, create=False) or not _admit_directory(
+            paths.config_directory, create=False
+        ):
+            raise ConfigurationError("Nyx configuration directory is unavailable")
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
         )
         try:
-            os.fchmod(fd, 0o600)
             data = _configuration_bytes(root, hidden_stages)
             written = 0
             while written < len(data):
@@ -506,13 +475,11 @@ def _atomic_write_configuration(
             os.close(fd)
         os.replace(temporary_name, paths.config_file)
         temporary_name = None
-        _verify_record(paths.config_file, uid)
-        directory_fd = os.open(paths.config_directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except (OSError, ValueError) as error:
+        _verify_record(paths.config_file)
+        _sync_directory(paths.config_directory)
+    except (OSError, ValueError, ConfigurationError) as error:
+        if isinstance(error, ConfigurationError):
+            raise
         raise ConfigurationError("cannot replace Nyx configuration") from error
     finally:
         if temporary_name is not None:
@@ -527,11 +494,10 @@ def _save_configuration(
     root: Path,
     hidden_stages: tuple[str, ...],
 ) -> Configuration:
-    """Atomically persist a validated configuration while runtime owns authorization."""
+    """Atomically persist validated configuration under runtime authorization."""
 
-    _require_linux()
-    if paths.config_file.exists() or paths.config_file.is_symlink():
-        _verify_record(paths.config_file, _current_uid())
+    if _lstat(paths.config_file) is not None:
+        _verify_record(paths.config_file)
     _atomic_write_configuration(paths, root, hidden_stages)
     return Configuration(root, hidden_stages)
 

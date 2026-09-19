@@ -5,7 +5,6 @@ import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -27,23 +26,33 @@ def isolated_root(root: Path, name: str) -> Path:
 
 
 def configure_home(home: Path):
-    return patch.object(state, "resolve_account_home", return_value=home), patch.object(
+    return patch.object(Path, "home", return_value=home), patch.object(
         state, "_current_uid", return_value=os.getuid()
     )
 
 
-def test_account_home_comes_from_uid_record_even_when_environment_differs():
+def test_account_home_comes_from_controlled_path_home_even_when_environment_differs():
     with TemporaryDirectory() as temporary:
         home = isolated_home(Path(temporary))
-        with patch.object(state, "_current_uid", return_value=os.getuid()), patch.object(
-            state.pwd,
-            "getpwuid",
-            return_value=SimpleNamespace(pw_dir=str(home)),
-        ), patch.dict(os.environ, {"HOME": str(Path(temporary) / "wrong")}):
+        with patch.object(Path, "home", return_value=home), patch.dict(
+            os.environ, {"HOME": str(Path(temporary) / "wrong")}
+        ):
             assert state.resolve_account_home() == home.resolve()
 
 
-def test_setup_uses_passwd_home_and_persists_canonical_empty_symlink_root():
+def test_state_paths_use_exact_home_nyx_children_without_observation_creation():
+    with TemporaryDirectory() as temporary:
+        home = isolated_home(Path(temporary))
+        with patch.object(Path, "home", return_value=home):
+            paths = state.state_paths()
+            assert paths.account_home == home
+            assert paths.state_directory == home / ".nyx"
+            assert paths.config_file == home / ".nyx" / "config" / "config.json"
+            assert paths.runtime_directory == home / ".nyx" / "runtime"
+            assert not (home / ".nyx").exists()
+
+
+def test_setup_uses_controlled_home_and_persists_canonical_empty_symlink_root():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = isolated_home(root)
@@ -258,15 +267,74 @@ def test_preexisting_nyx_directory_symlink_is_rejected_without_writing_through_i
         spec_root = isolated_root(root, "spec-root")
         external = root / "external"
         external.mkdir(mode=0o700)
-        (home / ".config").mkdir(mode=0o755)
-        (home / ".config" / "nyx").symlink_to(external, target_is_directory=True)
+        (home / ".nyx").symlink_to(external, target_is_directory=True)
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch, pytest.raises(state.AccountHomeError):
             state.setup(spec_root)
         assert list(external.iterdir()) == []
 
 
-def test_state_children_are_private_uid_owned_records_and_no_deployment_record_is_written():
+@pytest.mark.parametrize("wrong_type", ["file", "symlink"])
+def test_managed_root_wrong_type_is_rejected_without_following_or_repairing(wrong_type):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        managed = home / ".nyx"
+        if wrong_type == "file":
+            managed.write_bytes(b"sentinel")
+        else:
+            managed.symlink_to(external, target_is_directory=True)
+        with patch.object(Path, "home", return_value=home), pytest.raises(state.AccountHomeError):
+            state.state_paths(create=True)
+        assert managed.is_symlink() if wrong_type == "symlink" else managed.read_bytes() == b"sentinel"
+        assert list(external.iterdir()) == []
+
+
+def test_changed_managed_target_is_rejected_after_creation_without_writing_through_replacement():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        original_mkdir = Path.mkdir
+
+        def replace_root(path, *args, **kwargs):
+            original_mkdir(path, *args, **kwargs)
+            if path == home / ".nyx":
+                path.rmdir()
+                path.symlink_to(external, target_is_directory=True)
+
+        with patch.object(Path, "home", return_value=home), patch.object(
+            Path, "mkdir", replace_root
+        ), pytest.raises(state.AccountHomeError, match="ordinary directory"):
+            state.state_paths(create=True)
+        assert list(external.iterdir()) == []
+
+
+@pytest.mark.parametrize("child_name", ["config", "runtime"])
+@pytest.mark.parametrize("wrong_type", ["file", "symlink"])
+def test_managed_child_wrong_type_is_rejected_without_following(wrong_type, child_name):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        managed_root = home / ".nyx"
+        managed_root.mkdir()
+        external = root / "external"
+        external.mkdir()
+        child = managed_root / child_name
+        if wrong_type == "file":
+            child.write_bytes(b"sentinel")
+        else:
+            child.symlink_to(external, target_is_directory=True)
+        with patch.object(Path, "home", return_value=home), pytest.raises(state.AccountHomeError):
+            state.state_paths(create=True)
+        assert child.is_symlink() if wrong_type == "symlink" else child.read_bytes() == b"sentinel"
+        assert list(external.iterdir()) == []
+
+
+def test_state_children_are_ordinary_directories_and_no_deployment_record_is_written():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = isolated_home(root)
@@ -278,20 +346,10 @@ def test_state_children_are_private_uid_owned_records_and_no_deployment_record_i
             paths = state.state_paths()
 
         assert stat.S_IMODE(home.stat().st_mode) == original_home_mode
-        for directory in (paths.config_directory, paths.state_directory, paths.runtime_directory):
+        for directory in (paths.state_directory, paths.config_directory, paths.runtime_directory):
             assert directory.is_dir()
             assert not directory.is_symlink()
-            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-            assert directory.stat().st_uid == os.getuid()
-        for directory in (
-            paths.config_file.parent.parent,
-            paths.state_directory.parent.parent,
-            paths.state_directory.parent,
-        ):
-            assert directory.is_dir()
-            assert not directory.is_symlink()
-        assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
-        assert paths.config_file.stat().st_uid == os.getuid()
+        assert paths.config_file.is_file()
         assert not paths.deployment_file.exists()
 
 
@@ -299,23 +357,20 @@ def test_existing_general_parents_are_not_repermissioned():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = isolated_home(root)
-        config_parent = home / ".config"
-        state_parent = home / ".local" / "state"
+        nyx_root = home / ".nyx"
+        config_parent = nyx_root / "config"
+        runtime_parent = nyx_root / "runtime"
+        nyx_root.mkdir(mode=0o755)
         config_parent.mkdir(mode=0o755)
-        (home / ".local").mkdir(mode=0o755)
-        state_parent.mkdir(mode=0o755)
-        os.chmod(home / ".local", 0o755)
-        os.chmod(state_parent, 0o755)
+        runtime_parent.mkdir(mode=0o755)
         config_mode = stat.S_IMODE(config_parent.stat().st_mode)
-        local_mode = stat.S_IMODE((home / ".local").stat().st_mode)
-        state_mode = stat.S_IMODE(state_parent.stat().st_mode)
+        runtime_mode = stat.S_IMODE(runtime_parent.stat().st_mode)
         spec_root = isolated_root(root, "spec-root")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
             state.setup(spec_root)
         assert stat.S_IMODE(config_parent.stat().st_mode) == config_mode
-        assert stat.S_IMODE((home / ".local").stat().st_mode) == local_mode
-        assert stat.S_IMODE(state_parent.stat().st_mode) == state_mode
+        assert stat.S_IMODE(runtime_parent.stat().st_mode) == runtime_mode
 
 
 def test_root_inside_package_or_interpreter_footprint_is_rejected_before_state_creation():
@@ -334,14 +389,16 @@ def test_root_inside_package_or_interpreter_footprint_is_rejected_before_state_c
         assert not (home / ".config").exists()
 
 
-def test_unsupported_platform_fails_before_mutating_account_home():
+def test_state_admission_is_portable_across_platform_labels():
     with TemporaryDirectory() as temporary:
         home = isolated_home(Path(temporary))
+        spec_root = isolated_root(Path(temporary), "spec-root")
         with patch.object(state.sys, "platform", "darwin"), patch.object(
-            state, "resolve_account_home", return_value=home
-        ), pytest.raises(state.UnsupportedPlatformError):
-            state.setup(home)
-        assert not (home / ".config").exists()
+            Path, "home", return_value=home
+        ):
+            paths = state.state_paths(create=True)
+            state._save_configuration(paths, spec_root.resolve(), ())
+        assert paths.config_file.exists()
 
 
 def _managed_snapshot(home: Path) -> dict[str, tuple[str, bytes | None, int]]:
@@ -509,7 +566,7 @@ def test_runtime_observation_reports_incomplete_or_unsafe_layout_without_mutatio
             paths = state.state_paths(create=True)
             paths.runtime_directory.rmdir()
             before = _managed_snapshot(home)
-            assert state.observe_runtime().status == "unknown"
+            assert state.observe_runtime().status == "not_running"
             assert _managed_snapshot(home) == before
             paths.runtime_directory.mkdir(mode=0o700)
             paths.runtime_directory.joinpath("instance.json").write_text("{}\n", encoding="utf-8")
@@ -529,4 +586,4 @@ def test_fresh_runtime_observation_does_not_create_runtime_directory_or_lock():
             observed = state.observe_runtime()
         assert observed.status == "not_running"
         assert _managed_snapshot(home) == before
-        assert not (home / ".local").exists()
+        assert not (home / ".nyx").exists()
