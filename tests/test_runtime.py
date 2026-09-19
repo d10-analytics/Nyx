@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nyx import runtime, state
+from nyx import runtime, state, worker
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
@@ -791,6 +791,262 @@ def test_worker_timeout_has_no_additive_reap_window():
     elapsed = time.monotonic() - started
     assert elapsed < 0.8
     assert manager.close(time.monotonic() + 2)
+
+
+def test_worker_collects_interleaved_flushed_streams_with_real_pipes():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write(b'one'); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'noise'); sys.stderr.flush(); "
+                "sys.stdout.buffer.write(b'-two'); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'other'); sys.stderr.flush()"
+            ),
+        ],
+        timeout=2,
+    )
+
+    assert manager.fetch_catalog() == b"one-two"
+    assert manager.close(time.monotonic() + 2)
+
+
+def test_worker_timeout_after_prefix_stall_finishes_autonomously():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('prefix'); sys.stdout.flush(); time.sleep(30)",
+        ],
+        timeout=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(runtime.WorkerError, match="producer_timeout"):
+        manager.fetch_catalog()
+    assert time.monotonic() - started < 0.35
+    deadline = time.monotonic() + 2
+    while manager.active_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 0
+
+
+def test_worker_retains_no_bytes_beyond_stream_caps_and_completes_readers():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write(b'x' * (2**21 + 1)); sys.stdout.flush(); "
+                "sys.stderr.buffer.write(b'y' * (2**13 + 1)); sys.stderr.flush()"
+            ),
+        ],
+        timeout=2,
+    )
+    finalized: list[object] = []
+    original_start = manager._start_finalizer_locked
+
+    def observe_finalizer(child: object) -> None:
+        finalized.append(child)
+        original_start(child)  # type: ignore[arg-type]
+
+    with patch.object(manager, "_start_finalizer_locked", side_effect=observe_finalizer):
+        with pytest.raises(runtime.WorkerError, match="producer_output_too_large"):
+            manager.fetch_catalog()
+    deadline = time.monotonic() + 2
+    while manager.active_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 0
+    child = finalized[0]
+    assert child.retained_bytes["stdout"] <= worker.MAX_STDOUT_BYTES  # type: ignore[attr-defined]
+    assert child.retained_bytes["stderr"] <= worker.MAX_STDERR_BYTES  # type: ignore[attr-defined]
+    assert child.readers_complete.is_set()  # type: ignore[attr-defined]
+
+
+def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
+    for exit_code, expected in ((4, "producer_unavailable"), (7, "producer_failed")):
+        manager = runtime.CatalogWorkerManager(
+            command_factory=lambda exit_code=exit_code: [
+                sys.executable,
+                "-c",
+                f"import sys; sys.stdout.close(); sys.stderr.close(); sys.exit({exit_code})",
+            ],
+            timeout=2,
+        )
+        with pytest.raises(runtime.WorkerError, match=expected):
+            manager.fetch_catalog()
+        assert manager.close(time.monotonic() + 2)
+        assert manager.active_count == 0
+
+
+def test_worker_cancellation_after_eof_wins_before_success_publication():
+    with TemporaryDirectory() as temporary:
+        gate = Path(temporary) / "release"
+        manager = runtime.CatalogWorkerManager(
+            command_factory=lambda: [
+                sys.executable,
+                "-c",
+                (
+                    "import os,time,sys\n"
+                    "os.close(1); os.close(2)\n"
+                    f"gate={str(gate)!r}\n"
+                    "while not os.path.exists(gate):\n"
+                    "    time.sleep(.01)\n"
+                ),
+            ],
+            timeout=2,
+        )
+        errors: list[runtime.WorkerError] = []
+        thread = threading.Thread(target=lambda: _capture_worker_error(manager, errors), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        child = None
+        while child is None and time.monotonic() < deadline:
+            with manager._lock:
+                if manager._children:
+                    child = manager._children[0]
+            time.sleep(0.01)
+        assert child is not None
+        while not child.readers_complete.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child.readers_complete.is_set()
+        assert manager.close(time.monotonic() + 2)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert [error.code for error in errors] == ["producer_cancelled"]
+
+
+class _PortableProcessControl:
+    def __init__(self, process: subprocess.Popen[bytes], *, resistant: bool) -> None:
+        self._process = process
+        self._resistant = resistant
+
+    def terminate(self) -> None:
+        if not self._resistant:
+            self._process.terminate()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._process, name)
+
+
+def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
+    real_popen = subprocess.Popen
+
+    def portable_popen(*args: object, **kwargs: object) -> _PortableProcessControl:
+        return _PortableProcessControl(real_popen(*args, **kwargs), resistant=True)
+
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        ],
+        timeout=30,
+    )
+    errors: list[runtime.WorkerError] = []
+    thread = threading.Thread(
+        target=lambda: _capture_worker_error(manager, errors),
+        daemon=True,
+    )
+    with patch.object(worker.subprocess, "Popen", side_effect=portable_popen):
+        thread.start()
+        deadline = time.monotonic() + 2
+        while manager.active_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert manager.active_count == 1
+        assert manager.close(time.monotonic() + 0.2) is False
+        assert manager.active_count == 1
+        child = manager._children[0]
+        child.process.kill()
+        assert manager.close(time.monotonic() + 2)
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert [error.code for error in errors] == ["producer_cancelled"]
+
+
+def test_worker_shared_shutdown_reaps_cooperative_child_with_portable_resistant_facade():
+    real_popen = subprocess.Popen
+    process_calls = 0
+    process_lock = threading.Lock()
+    command_calls = 0
+
+    def portable_popen(*args: object, **kwargs: object) -> _PortableProcessControl:
+        nonlocal process_calls
+        with process_lock:
+            resistant = process_calls == 0
+            process_calls += 1
+        return _PortableProcessControl(
+            real_popen(*args, **kwargs),
+            resistant=resistant,
+        )
+
+    def command_factory() -> list[str]:
+        nonlocal command_calls
+        with process_lock:
+            resistant = command_calls == 0
+            command_calls += 1
+        if resistant:
+            return [sys.executable, "-c", "import time; time.sleep(30)"]
+        return [
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('cooperative'); sys.stdout.flush(); time.sleep(.05)",
+        ]
+
+    manager = runtime.CatalogWorkerManager(command_factory=command_factory, timeout=30)
+    errors: list[runtime.WorkerError] = []
+    results: list[bytes] = []
+
+    def fetch() -> None:
+        try:
+            results.append(manager.fetch_catalog())
+        except runtime.WorkerError as error:
+            errors.append(error)
+
+    with patch.object(worker.subprocess, "Popen", side_effect=portable_popen):
+        resistant_thread = threading.Thread(target=fetch, daemon=True)
+        resistant_thread.start()
+        deadline = time.monotonic() + 2
+        while not manager._children and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(manager._children) == 1
+
+        cooperative_thread = threading.Thread(target=fetch, daemon=True)
+        cooperative_thread.start()
+        cooperative_thread.join(timeout=2)
+        assert not cooperative_thread.is_alive()
+        assert results == [b"cooperative"]
+
+        assert manager.close(time.monotonic() + 0.2) is False
+        assert manager.active_count == 1
+
+        resistant_child = manager._children[0]
+        resistant_child.process.kill()
+        assert manager.close(time.monotonic() + 2)
+        resistant_thread.join(timeout=2)
+
+    assert not resistant_thread.is_alive()
+    assert [error.code for error in errors] == ["producer_cancelled"]
+    assert manager.active_count == 0
+
+
+def _capture_worker_error(
+    manager: runtime.CatalogWorkerManager, errors: list[runtime.WorkerError]
+) -> None:
+    try:
+        manager.fetch_catalog()
+    except runtime.WorkerError as error:
+        errors.append(error)
+
+
+def test_worker_source_has_no_selector_or_nonblocking_pipe_path():
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+    assert "selectors" not in source
+    assert "os.set_blocking" not in source
+    assert "os.read" not in source
+    assert "communicate" not in source
 
 
 def test_stop_during_spawn_reaps_child_registered_after_admission_closes():

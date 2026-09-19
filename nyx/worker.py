@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import os
-import selectors
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import state
 from .catalog import scan_catalog
@@ -17,6 +15,7 @@ from .catalog import scan_catalog
 MAX_STDOUT_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 WORKER_TIMEOUT = 5.0
+_READ_CHUNK_BYTES = 64 * 1024
 
 
 class WorkerError(RuntimeError):
@@ -54,6 +53,18 @@ def _worker_main() -> int:
 class _Child:
     process: subprocess.Popen[bytes]
     cancelled: bool = False
+    terminal_reason: str | None = None
+    finalizer_started: bool = False
+    finalizer_done: threading.Event = field(default_factory=threading.Event)
+    progress: threading.Event = field(default_factory=threading.Event)
+    readers_complete: threading.Event = field(default_factory=threading.Event)
+    reader_threads: list[threading.Thread] = field(default_factory=list)
+    reader_count: int = 0
+    reader_done_count: int = 0
+    retained_bytes: dict[str, int] = field(default_factory=lambda: {"stdout": 0, "stderr": 0})
+    captured: dict[str, bytearray] = field(
+        default_factory=lambda: {"stdout": bytearray(), "stderr": bytearray()}
+    )
 
 
 @dataclass
@@ -106,109 +117,235 @@ class CatalogWorkerManager:
             with self._lock:
                 self._reservations.remove(reservation)
             raise
+
         child = _Child(process)
         with self._lock:
             self._reservations.remove(reservation)
             reservation.completed = True
             self._children.append(child)
+            self._start_readers_locked(child)
             if self._closing:
                 child.cancelled = True
-                child.process.terminate()
+                self._select_terminal_locked(child, "producer_cancelled")
 
         try:
             return self._collect(child)
         finally:
+            # Cleanup is manager-owned and deliberately continues after the
+            # request returns.  In particular, do not remove a child merely
+            # because poll() reports exit while a reader still owns a pipe.
             with self._lock:
-                if child in self._children and child.process.poll() is not None:
-                    self._children.remove(child)
+                if child.terminal_reason is None:
+                    self._select_terminal_locked(child, "producer_failed")
+                else:
+                    self._start_finalizer_locked(child)
 
-    def _collect(self, child: _Child) -> bytes:
-        """Read both pipes incrementally under one request deadline."""
+    def _start_readers_locked(self, child: _Child) -> None:
+        """Start one blocking reader per pipe while the child is registered."""
 
-        limits = {"stdout": MAX_STDOUT_BYTES, "stderr": MAX_STDERR_BYTES}
-        captured = {"stdout": bytearray(), "stderr": bytearray()}
-        selector = selectors.DefaultSelector()
-        streams: dict[int, str] = {}
-        for name, stream in (("stdout", child.process.stdout), ("stderr", child.process.stderr)):
-            if stream is not None:
-                stream_fd = stream.fileno()
-                os.set_blocking(stream_fd, False)
-                streams[stream_fd] = name
-                selector.register(stream_fd, selectors.EVENT_READ)
-        deadline = time.monotonic() + self._timeout
+        if child.reader_threads:
+            return
+        streams = (
+            ("stdout", child.process.stdout, MAX_STDOUT_BYTES),
+            ("stderr", child.process.stderr, MAX_STDERR_BYTES),
+        )
+        for name, stream, limit in streams:
+            if stream is None:
+                continue
+            reader = threading.Thread(
+                target=self._read_stream,
+                args=(child, name, stream, limit),
+                daemon=True,
+                name=f"nyx-worker-{name}",
+            )
+            child.reader_threads.append(reader)
+            child.reader_count += 1
+            reader.start()
+
+    def _read_stream(self, child: _Child, name: str, stream: object, limit: int) -> None:
+        """Drain one ordinary blocking pipe, retaining only its bounded prefix."""
+
         try:
-            while streams:
-                if child.cancelled:
-                    child.process.terminate()
-                    raise WorkerError("producer_cancelled")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    child.cancelled = True
-                    if child.process.poll() is None:
-                        child.process.terminate()
-                    raise WorkerError("producer_timeout")
-                for key, _ in selector.select(remaining):
-                    stream_fd = key.fd
-                    name = streams[stream_fd]
-                    try:
-                        chunk = os.read(stream_fd, 64 * 1024)
-                    except BlockingIOError:
+            while True:
+                chunk = stream.read(_READ_CHUNK_BYTES)  # type: ignore[attr-defined]
+                if not chunk:
+                    break
+                with self._lock:
+                    if child.terminal_reason is not None:
+                        # Once another terminal reason wins, continue draining
+                        # so the sibling reader and child can reach EOF without
+                        # retaining bytes that cannot be published.
                         continue
-                    if not chunk:
-                        selector.unregister(stream_fd)
-                        streams.pop(stream_fd)
+                    remaining = limit - len(child.captured[name])
+                    if len(chunk) > remaining:
+                        if remaining:
+                            child.captured[name].extend(chunk[:remaining])
+                        child.retained_bytes[name] = len(child.captured[name])
+                        self._select_terminal_locked(child, "producer_output_too_large")
                         continue
-                    captured[name].extend(chunk)
-                    if len(captured[name]) > limits[name]:
-                        child.cancelled = True
-                        if child.process.poll() is None:
-                            child.process.terminate()
-                        raise WorkerError("producer_output_too_large")
-            child.process.wait()
-            if child.cancelled:
-                raise WorkerError("producer_cancelled")
-            if child.process.returncode != 0:
-                if child.process.returncode == 4:
-                    raise WorkerError("producer_unavailable")
-                raise WorkerError("producer_failed")
-            return bytes(captured["stdout"])
+                    child.captured[name].extend(chunk)
+                    child.retained_bytes[name] = len(child.captured[name])
+        except (OSError, ValueError):
+            with self._lock:
+                if child.terminal_reason is None:
+                    self._select_terminal_locked(child, "producer_failed")
         finally:
-            selector.close()
+            with self._lock:
+                child.reader_done_count += 1
+                if child.reader_done_count >= child.reader_count:
+                    child.readers_complete.set()
+                child.progress.set()
+
+    def _select_terminal_locked(self, child: _Child, reason: str) -> None:
+        """Select the first terminal request reason and start its finalizer."""
+
+        if child.terminal_reason is not None:
+            return
+        child.terminal_reason = reason
+        if reason != "producer_failed":
+            child.cancelled = reason in {
+                "producer_cancelled",
+                "producer_timeout",
+                "producer_output_too_large",
+            }
+        if child.process.poll() is None and reason != "producer_failed":
+            try:
+                child.process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
+        child.progress.set()
+        self._start_finalizer_locked(child)
+
+    def _start_finalizer_locked(self, child: _Child) -> None:
+        """Start exactly one autonomous manager-owned cleanup operation."""
+
+        if child.finalizer_started:
+            return
+        child.finalizer_started = True
+        threading.Thread(
+            target=self._finalize_child,
+            args=(child,),
+            daemon=True,
+            name="nyx-worker-finalizer",
+        ).start()
+
+    def _finalize_child(self, child: _Child) -> None:
+        """Terminate, reap, drain and close a child without request coupling."""
+
+        try:
+            if child.process.poll() is None:
+                try:
+                    child.process.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
+            # No request deadline is used here.  close() supplies the separate
+            # manager shutdown deadline while this operation retains ownership.
+            child.process.wait()
+            for reader in child.reader_threads:
+                reader.join()
             for stream in (child.process.stdout, child.process.stderr):
                 if stream is not None:
                     stream.close()
+        finally:
+            with self._lock:
+                if child.process.poll() is not None and child.readers_complete.is_set():
+                    if child in self._children:
+                        self._children.remove(child)
+                    child.finalizer_done.set()
+                child.progress.set()
+
+    def _terminal_error(self, child: _Child) -> WorkerError | None:
+        with self._lock:
+            reason = child.terminal_reason
+        if reason in {None, "success"}:
+            return None
+        return WorkerError(reason)
+
+    def _collect(self, child: _Child) -> bytes:
+        """Collect both pipes under one absolute request deadline."""
+
+        deadline = time.monotonic() + self._timeout
+        while True:
+            error = self._terminal_error(child)
+            if error is not None:
+                raise error
+            wait_for_process = False
+            with self._lock:
+                if child.readers_complete.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._select_terminal_locked(child, "producer_timeout")
+                        raise WorkerError("producer_timeout")
+                    wait_for_process = True
+
+                if not wait_for_process:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._select_terminal_locked(child, "producer_timeout")
+                        raise WorkerError("producer_timeout")
+            if wait_for_process:
+                try:
+                    child.process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    with self._lock:
+                        if child.terminal_reason is None:
+                            self._select_terminal_locked(child, "producer_timeout")
+                        reason = child.terminal_reason
+                    if reason not in {None, "success"}:
+                        raise WorkerError(reason)
+                    continue
+                with self._lock:
+                    if child.terminal_reason is not None:
+                        reason = child.terminal_reason
+                        if reason != "success":
+                            raise WorkerError(reason)
+                        continue
+                    if self._closing or child.cancelled:
+                        self._select_terminal_locked(child, "producer_cancelled")
+                        raise WorkerError("producer_cancelled")
+                    if child.process.returncode == 0:
+                        # Keep the final cancellation check and result capture
+                        # under the manager lock so close cannot publish bytes
+                        # after it has won the ordering race.
+                        child.terminal_reason = "success"
+                        self._start_finalizer_locked(child)
+                        return bytes(child.captured["stdout"])
+                    code = (
+                        "producer_unavailable" if child.process.returncode == 4 else "producer_failed"
+                    )
+                    self._select_terminal_locked(child, code)
+                    raise WorkerError(code)
+            child.progress.wait(timeout=remaining)
+            child.progress.clear()
 
     def close(self, deadline: float) -> bool:
-        """Close admission and reap direct children before the deadline."""
+        """Close admission and reap direct children before one shared deadline."""
 
         self.close_admission()
-        while time.monotonic() < deadline:
+        while True:
+            remaining_time = deadline - time.monotonic()
             with self._lock:
-                remaining = tuple(self._children)
-                spawning = tuple(self._reservations)
-            if not remaining and not spawning:
-                return True
-            for child in remaining:
-                try:
-                    child.process.wait(timeout=max(0.0, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    pass
-            with self._lock:
-                for child in tuple(self._children):
-                    if child.process.poll() is not None:
-                        self._children.remove(child)
-        with self._lock:
-            return not self._children and not self._reservations
+                if not self._children and not self._reservations:
+                    return True
+                children = tuple(self._children)
+                for child in children:
+                    child.cancelled = True
+                    self._select_terminal_locked(child, "producer_cancelled")
+            if remaining_time <= 0:
+                return False
+            for child in children:
+                child.finalizer_done.wait(timeout=max(0.0, deadline - time.monotonic()))
+                if time.monotonic() >= deadline:
+                    break
 
     def close_admission(self) -> None:
         """Prevent new requests and cancel currently registered children."""
 
         with self._lock:
             self._closing = True
-            children = tuple(self._children)
-            for child in children:
+            for child in tuple(self._children):
                 child.cancelled = True
-                child.process.terminate()
+                self._select_terminal_locked(child, "producer_cancelled")
 
 
 if __name__ == "__main__":
