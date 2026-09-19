@@ -243,7 +243,9 @@ def _admit_directory(path: Path, *, create: bool) -> bool:
         if after is None:
             raise AccountHomeError("Nyx state directory disappeared during admission")
     else:
-        after = before
+        after = _lstat(path)
+        if after is None:
+            raise AccountHomeError("Nyx state directory disappeared during admission")
 
     if _is_reparse_or_link(path, after) or not stat.S_ISDIR(after.st_mode):
         raise AccountHomeError("Nyx state directory is not an ordinary directory")
