@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import errno
-import fcntl
 import http.client
 import json
 import os
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from . import state
+from ._native_claim import NativeClaim
 from .models import Catalog, ProtocolError, parse_catalog
 from .server import CatalogError, TrackerServer, create_server
 from .worker import CatalogWorkerManager, WorkerError
@@ -104,46 +104,24 @@ class _FileLock:
     def __init__(self, path: Path, *, timeout: float = LOCK_TIMEOUT) -> None:
         self.path = path
         self.timeout = timeout
-        self.fd: int | None = None
+        self._claim = NativeClaim(path)
+
+    @property
+    def fd(self) -> int | None:
+        return self._claim.fd
 
     def acquire(self, *, blocking: bool = True) -> bool:
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(self.path, flags, 0o600)
-            details = os.fstat(fd)
-            uid = os.getuid()
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or details.st_uid != uid
-                or stat.S_IMODE(details.st_mode) != 0o600
-            ):
-                os.close(fd)
-                raise RuntimeErrorBase("Nyx lock has unsafe ownership or mode")
+            return self._claim.acquire(
+                create=True,
+                blocking=blocking,
+                deadline=time.monotonic() + self.timeout,
+            )
         except OSError as error:
             raise RuntimeErrorBase("Nyx lock is unavailable") from error
-        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if not blocking else 0)
-        deadline = time.monotonic() + self.timeout
-        try:
-            while True:
-                try:
-                    fcntl.flock(fd, operation)
-                    self.fd = fd
-                    return True
-                except OSError as error:
-                    if error.errno not in (errno.EACCES, errno.EAGAIN):
-                        raise RuntimeErrorBase("Nyx lock cannot be acquired") from error
-                    if not blocking or time.monotonic() >= deadline:
-                        os.close(fd)
-                        return False
-                    time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-        except BaseException:
-            os.close(fd)
-            raise
 
     def close(self) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        self._claim.close()
 
     def __enter__(self) -> Self:
         if not self.acquire():
@@ -168,45 +146,28 @@ class _ExistingLock:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.fd: int | None = None
+        self._claim = NativeClaim(path)
         self.metadata: _Metadata | None = None
 
+    @property
+    def fd(self) -> int | None:
+        return self._claim.fd
+
     def acquire(self) -> str:
+        result = NativeClaim.probe(self.path)
+        if result != "free":
+            return result
         try:
-            before = self.path.lstat()
-        except FileNotFoundError:
-            return "absent"
-        except OSError:
-            return "unsafe"
-        if not _safe_lock_metadata(before):
-            return "unsafe"
-        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        fd: int | None = None
-        try:
-            fd = os.open(self.path, flags)
-            after = os.fstat(fd)
-        except OSError:
-            if fd is not None:
-                os.close(fd)
-            return "unsafe"
-        if not _safe_lock_metadata(after) or _metadata_identity(before) != _metadata_identity(after):
-            os.close(fd)
-            return "changed"
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            os.close(fd)
-            if error.errno in (errno.EACCES, errno.EAGAIN):
+            if not self._claim.acquire(create=False, blocking=False):
                 return "held"
+            assert self._claim.fd is not None
+            self.metadata = _metadata_from_stat(os.fstat(self._claim.fd))
+            return "acquired"
+        except OSError:
             return "unsafe"
-        self.fd = fd
-        self.metadata = _metadata_from_stat(after)
-        return "acquired"
 
     def close(self) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        self._claim.close()
 
     def __enter__(self) -> Self:
         if self.acquire() != "acquired":
@@ -221,7 +182,7 @@ def _metadata_identity(details: os.stat_result) -> tuple[int, int, int, int, int
     return (
         details.st_dev,
         details.st_ino,
-        details.st_uid,
+        getattr(details, "st_uid", 0),
         stat.S_IMODE(details.st_mode),
         details.st_size,
         details.st_mtime_ns,
@@ -233,11 +194,7 @@ def _metadata_from_stat(details: os.stat_result, data: bytes | None = None) -> _
 
 
 def _safe_lock_metadata(details: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(details.st_mode)
-        and details.st_uid == os.getuid()
-        and stat.S_IMODE(details.st_mode) == 0o600
-    )
+    return stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode)
 
 
 def _read_metadata(path: Path, *, read_data: bool = False) -> _Metadata:
@@ -246,8 +203,6 @@ def _read_metadata(path: Path, *, read_data: bool = False) -> _Metadata:
     except FileNotFoundError:
         return _Metadata(False)
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-        raise RuntimeErrorBase("unsafe Nyx runtime state")
-    if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o600:
         raise RuntimeErrorBase("unsafe Nyx runtime state")
     data = path.read_bytes() if read_data else None
     return _metadata_from_stat(details, data)
@@ -278,7 +233,7 @@ def _directory_stamp(path: Path) -> tuple[int, int, int, int, int, int, int]:
     return (
         details.st_dev,
         details.st_ino,
-        details.st_uid,
+        getattr(details, "st_uid", 0),
         stat.S_IMODE(details.st_mode),
         details.st_size,
         details.st_mtime_ns,
@@ -332,8 +287,13 @@ def _require_deadline(deadline: float) -> None:
         raise _ControlTimeoutError("control deadline expired")
 
 
-def _paths(*, create: bool = True) -> state.StatePaths:
-    return state.state_paths(create=create)
+def _paths(
+    *,
+    create: bool = True,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
+) -> state.StatePaths:
+    return state.state_paths(create=create, deadline=deadline, deadline_ns=deadline_ns)
 
 
 def _operation_lock(paths: state.StatePaths, *, timeout: float = LOCK_TIMEOUT) -> _FileLock:
@@ -345,7 +305,21 @@ def _lease_lock(paths: state.StatePaths, *, timeout: float = LOCK_TIMEOUT) -> _F
 
 
 def _control_name() -> str:
-    return f"\x00nyx-control-{os.getuid()}"
+    uid = getattr(os, "getuid", lambda: 0)()
+    return f"\x00nyx-control-{uid}"
+
+
+def _control_endpoint(port: int) -> str:
+    return f"127.0.0.1:{port}"
+
+
+def _parse_control_endpoint(value: str) -> tuple[int, str | tuple[str, int]]:
+    if value.startswith("\x00"):
+        return socket.AF_UNIX, value
+    host, separator, raw_port = value.rpartition(":")
+    if separator != ":" or host != "127.0.0.1":
+        raise ValueError("control endpoint is not loopback")
+    return socket.AF_INET, (host, int(raw_port))
 
 
 def _record_path(paths: state.StatePaths) -> Path:
@@ -359,8 +333,6 @@ def _read_instance(paths: state.StatePaths) -> Instance:
         if (
             stat.S_ISLNK(details.st_mode)
             or not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or stat.S_IMODE(details.st_mode) != 0o600
         ):
             raise UnhealthyInstanceError("Nyx instance record is unsafe")
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -369,15 +341,21 @@ def _read_instance(paths: state.StatePaths) -> Instance:
             or payload.get("schema_version") != SCHEMA_VERSION
             or set(payload) != {"schema_version", "instance_id", "url", "capability", "control"}
             or payload.get("url") != URL
-            or payload.get("control") != _control_name()
             or not all(isinstance(payload.get(key), str) and payload[key] for key in ("instance_id", "capability"))
         ):
             raise UnhealthyInstanceError("Nyx instance record is invalid")
+        control = payload.get("control")
+        if not isinstance(control, str):
+            raise UnhealthyInstanceError("Nyx instance record is invalid")
+        try:
+            _parse_control_endpoint(control)
+        except (TypeError, ValueError):
+            raise UnhealthyInstanceError("Nyx instance record is invalid") from None
         return Instance(
             instance_id=payload["instance_id"],
             url=payload["url"],
             capability=payload["capability"],
-            control=payload["control"],
+            control=control,
         )
     except FileNotFoundError as error:
         raise UnhealthyInstanceError("Nyx instance is not ready") from error
@@ -415,8 +393,6 @@ def _remove_stale_instance(paths: state.StatePaths) -> None:
         if (
             stat.S_ISLNK(details.st_mode)
             or not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or stat.S_IMODE(details.st_mode) != 0o600
         ):
             raise UnhealthyInstanceError("Nyx instance record is unsafe")
         record.unlink()
@@ -440,6 +416,7 @@ def _send_control(
     *,
     timeout: float = RUNTIME_CONTROL_TIMEOUT,
     deadline: float | None = None,
+    deadline_ns: int | None = None,
 ) -> dict[str, Any]:
     """Send one authenticated command, checking the peer before its capability."""
 
@@ -451,13 +428,16 @@ def _send_control(
 
     connection: socket.socket | None = None
     try:
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        family, address = _parse_control_endpoint(instance.control)
+        connection = socket.socket(family, socket.SOCK_STREAM)
         connection.settimeout(remaining())
-        connection.connect(instance.control)
-        if _peer_uid(connection) != os.getuid():
+        connection.connect(address)
+        if family == socket.AF_UNIX and _peer_uid(connection) != os.getuid():
             raise _ControlIdentityError("control peer identity did not match")
         connection.settimeout(remaining())
         payload = {"version": 1, "capability": instance.capability, "command": command}
+        if deadline_ns is not None:
+            payload["deadline_ns"] = deadline_ns
         connection.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
         connection.settimeout(remaining())
         data = connection.recv(8192)
@@ -651,9 +631,10 @@ observe_runtime_paths = observe_runtime
 
 
 class _Daemon:
-    def __init__(self, lease_fd: int, deadline_ns: int) -> None:
+    def __init__(self, lease_fd: int, deadline_ns: int, *, ack_fd: int | None = None) -> None:
         self.lease_fd = lease_fd
         self.deadline_ns = deadline_ns
+        self.ack_fd = ack_fd
         self.paths = _paths(create=True)
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
@@ -665,11 +646,14 @@ class _Daemon:
         self.control_thread: threading.Thread | None = None
         self.http_thread: threading.Thread | None = None
         self.shutdown_result: str = "running"
+        self.catalog_admitted = False
 
     def _deadline(self) -> float:
         return self.deadline_ns / 1_000_000_000
 
     def _provider(self) -> Catalog:
+        if not self.catalog_admitted:
+            raise CatalogError("producer_unavailable")
         try:
             return parse_catalog(self.workers.fetch_catalog())
         except WorkerError as error:
@@ -678,10 +662,11 @@ class _Daemon:
             raise CatalogError("producer_protocol_error") from error
 
     def _bind_control(self) -> socket.socket:
-        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         control.settimeout(0.2)
         try:
-            control.bind(_control_name())
+            control.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            control.bind(("127.0.0.1", 0))
             control.listen(16)
         except OSError:
             control.close()
@@ -710,8 +695,6 @@ class _Daemon:
             except OSError:
                 break
             with connection:
-                if _peer_uid(connection) != os.getuid():
-                    continue
                 try:
                     connection.settimeout(1.0)
                     data = connection.recv(8192)
@@ -729,7 +712,14 @@ class _Daemon:
                     elif command == "stop":
                         response = {"status": "stopping", "instance_id": self.instance.instance_id, "url": URL}
                         connection.sendall((json.dumps(response) + "\n").encode())
-                        threading.Thread(target=self.shutdown, daemon=True).start()
+                        requested_deadline = request.get("deadline_ns")
+                        if type(requested_deadline) is not int:
+                            requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
+                        threading.Thread(
+                            target=self.shutdown,
+                            args=(requested_deadline / 1_000_000_000,),
+                            daemon=True,
+                        ).start()
                         continue
                     else:
                         continue
@@ -754,11 +744,12 @@ class _Daemon:
                 instance_id=secrets.token_hex(16),
                 url=URL,
                 capability=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("="),
-                control=_control_name(),
+                control=_control_endpoint(self.control.getsockname()[1]),
             )
             if time.monotonic() >= self._deadline():
                 raise StartupError("Nyx startup timed out")
             _write_instance(self.paths, self.instance)
+            self.catalog_admitted = True
             self.control_thread = threading.Thread(target=self._serve_control, daemon=True)
             self.control_thread.start()
             self.http_thread.join()
@@ -778,6 +769,7 @@ class _Daemon:
                 pass
         if self.server is not None:
             self.server.shutdown()
+            self.server.close_active_connections()
             self.server.server_close()
         try:
             if self.instance is not None:
@@ -785,12 +777,12 @@ class _Daemon:
         except OSError:
             pass
 
-    def shutdown(self) -> str:
+    def shutdown(self, deadline: float | None = None) -> str:
         try:
             with self.shutdown_lock:
                 if self.shutdown_result not in {"running", "timeout"}:
                     return self.shutdown_result
-                deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+                deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
                 self.stop_requested.set()
                 self.workers.close_admission()
                 if self.server is not None:
@@ -839,16 +831,78 @@ class _Daemon:
         return 0
 
 
-def _spawn_daemon(lease_fd: int, deadline_ns: int) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
-        [sys.executable, "-m", "nyx.runtime", "--daemon-fd", str(lease_fd), "--deadline-ns", str(deadline_ns)],
+def _spawn_daemon(
+    lease_fd: int,
+    deadline_ns: int,
+    *,
+    ack_fd: int | None = None,
+    claim_path: Path | None = None,
+) -> subprocess.Popen[bytes]:
+    command = [
+        sys.executable,
+        "-m",
+        "nyx.runtime",
+        "--daemon-fd",
+        str(lease_fd),
+        "--deadline-ns",
+        str(deadline_ns),
+    ]
+    pass_fds = [lease_fd]
+    if ack_fd is not None:
+        command += ["--ack-fd", str(ack_fd)]
+        pass_fds.append(ack_fd)
+    if claim_path is not None:
+        command += ["--claim-path", str(claim_path)]
+    kwargs: dict[str, Any] = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
-        pass_fds=(lease_fd,),
-        start_new_session=True,
     )
+    if os.name == "nt":  # pragma: no cover - native Windows lane
+        startup = subprocess.STARTUPINFO()
+        startup.lpAttributeList = {"handle_list": [
+            subprocess.Handle(lease_fd) if hasattr(subprocess, "Handle") else lease_fd,
+            subprocess.Handle(ack_fd) if ack_fd is not None and hasattr(subprocess, "Handle") else ack_fd,
+        ]}
+        kwargs.update(
+            startupinfo=startup,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+    else:
+        kwargs.update(pass_fds=tuple(pass_fds), start_new_session=True)
+    return subprocess.Popen(command, **kwargs)
+
+
+def _wait_for_ack(
+    process: subprocess.Popen[bytes], ack_fd: int, deadline: float
+) -> bool:
+    os.set_blocking(ack_fd, False)
+    while time.monotonic() < deadline:
+        try:
+            data = os.read(ack_fd, 1)
+            if data:
+                return data == b"1" and process.poll() is None
+            if process.poll() is not None:
+                return False
+        except BlockingIOError:
+            pass
+        time.sleep(0.005)
+    return False
+
+
+def _ack_received_claim(fd: int, claim_path: Path, ack_fd: int) -> bool:
+    valid = NativeClaim.validate_received(fd, claim_path)
+    try:
+        os.write(ack_fd, b"1" if valid else b"0")
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(ack_fd)
+        except OSError:
+            pass
+    return valid
 
 
 def setup(
@@ -857,13 +911,17 @@ def setup(
 ) -> state.Configuration:
     """Persist setup while excluding mutation during any held lifecycle lease."""
 
+    deadline_ns = time.monotonic_ns() + int(STARTUP_TIMEOUT * 1_000_000_000)
+    deadline = deadline_ns / 1_000_000_000
+    if time.monotonic_ns() >= deadline_ns:
+        raise StartupError("Nyx setup timed out")
     root = state.resolve_specification_root(specification_root)
     if hidden_stages is state._OMITTED:
         requested_hidden: tuple[str, ...] | object = state._OMITTED
     else:
         requested_hidden = state._validate_hidden_stages(hidden_stages)
-    paths = _paths(create=True)
-    with _operation_lock(paths):
+    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
         lease = _lease_lock(paths, timeout=0.0)
         if not lease.acquire(blocking=False):
             try:
@@ -888,7 +946,9 @@ def setup(
             )
         else:
             effective_hidden = () if requested_hidden is state._OMITTED else requested_hidden
-        return state._save_configuration(paths, root, effective_hidden)
+        return state._save_configuration(
+            paths, root, effective_hidden, deadline=deadline, deadline_ns=deadline_ns
+        )
 
 
 def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadline: float) -> Instance:
@@ -908,9 +968,10 @@ def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadl
 
 def start() -> str:
     """Start or authenticate the current user's fixed-port instance."""
-
-    paths = _paths(create=True)
-    with _operation_lock(paths):
+    deadline_ns = time.monotonic_ns() + int(STARTUP_TIMEOUT * 1_000_000_000)
+    deadline = deadline_ns / 1_000_000_000
+    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
         state.load_configuration(paths)
         lease = _lease_lock(paths, timeout=0.0)
         if not lease.acquire(blocking=False):
@@ -921,11 +982,39 @@ def start() -> str:
             return URL
         try:
             _remove_stale_instance(paths)
-            deadline = time.monotonic() + STARTUP_TIMEOUT
-            process = _spawn_daemon(lease.fd, int(deadline * 1_000_000_000))
-            lease.close()
-            instance = _wait_ready(paths, process, deadline)
-            return instance.url
+            ack_read, ack_write = os.pipe()
+            process: subprocess.Popen[bytes] | None = None
+            try:
+                process = _spawn_daemon(
+                    lease.fd,
+                    int(deadline * 1_000_000_000),
+                    ack_fd=ack_write,
+                    claim_path=paths.runtime_directory / "lease.lock",
+                )
+                os.close(ack_write)
+                ack_write = -1
+                if not _wait_for_ack(process, ack_read, deadline):
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait(timeout=max(0.1, min(1.0, max(0.0, deadline - time.monotonic()))))
+                    raise StartupError("Nyx daemon did not validate its inherited claim")
+                # The child now owns the same native object.  Closing this
+                # descriptor is the handoff; no path reopen occurs in child.
+                lease.close()
+                return _wait_ready(paths, process, deadline).url
+            except BaseException:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                raise
+            finally:
+                os.close(ack_read)
+                if ack_write >= 0:
+                    os.close(ack_write)
         except BaseException:
             lease.close()
             raise
@@ -933,17 +1022,22 @@ def start() -> str:
 
 def stop() -> str:
     """Stop an authenticated instance, or report the already-stopped state."""
-
-    paths = _paths(create=True)
-    with _operation_lock(paths):
+    deadline_ns = time.monotonic_ns() + int(SHUTDOWN_TIMEOUT * 1_000_000_000)
+    deadline = deadline_ns / 1_000_000_000
+    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
         lease = _lease_lock(paths, timeout=0.0)
         if lease.acquire(blocking=False):
             lease.close()
             _remove_stale_instance(paths)
             return "stopped"
         instance = _read_instance(paths)
-        _send_control(instance, "stop")
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+        _send_control(
+            instance,
+            "stop",
+            deadline=deadline,
+            deadline_ns=deadline_ns,
+        )
         while time.monotonic() < deadline:
             probe = _lease_lock(paths, timeout=0.0)
             if probe.acquire(blocking=False):
@@ -955,8 +1049,17 @@ def stop() -> str:
         raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
 
 
-def _daemon_entry(fd: int, deadline_ns: int) -> int:
-    return _Daemon(fd, deadline_ns).run()
+def _daemon_entry(
+    fd: int,
+    deadline_ns: int,
+    *,
+    ack_fd: int | None = None,
+    claim_path: Path | None = None,
+) -> int:
+    if ack_fd is not None and claim_path is not None and not _ack_received_claim(fd, claim_path, ack_fd):
+        os.close(fd)
+        return 1
+    return _Daemon(fd, deadline_ns, ack_fd=ack_fd).run()
 
 
 if __name__ == "__main__":
@@ -965,9 +1068,11 @@ if __name__ == "__main__":
     try:
         fd = int(sys.argv[sys.argv.index("--daemon-fd") + 1])
         deadline = int(sys.argv[sys.argv.index("--deadline-ns") + 1])
+        ack = int(sys.argv[sys.argv.index("--ack-fd") + 1]) if "--ack-fd" in sys.argv else None
+        claim = Path(sys.argv[sys.argv.index("--claim-path") + 1]) if "--claim-path" in sys.argv else None
     except (ValueError, IndexError):
         raise SystemExit("invalid lifecycle arguments") from None
-    raise SystemExit(_daemon_entry(fd, deadline))
+    raise SystemExit(_daemon_entry(fd, deadline, ack_fd=ack, claim_path=claim))
 
 
 __all__ = [

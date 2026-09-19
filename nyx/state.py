@@ -13,6 +13,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,15 @@ CONFIGURATION_UNAVAILABLE = "configuration_unavailable"
 
 CONFIGURATION_STATES = frozenset({"configured", "not_configured", "unavailable"})
 RUNTIME_STATES = frozenset({"running", "not_running", "unknown"})
+
+
+def _check_deadline(deadline: float | None = None, deadline_ns: int | None = None) -> None:
+    """Reject an expired operation before the next filesystem mutation."""
+
+    if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
+        raise TimeoutError("Nyx operation deadline expired")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("Nyx operation deadline expired")
 
 
 class StateError(RuntimeError):
@@ -239,13 +249,20 @@ def _record_identity(details: os.stat_result) -> tuple[int, int, int, int, int, 
     )
 
 
-def _admit_directory(path: Path, *, create: bool) -> bool:
+def _admit_directory(
+    path: Path,
+    *,
+    create: bool,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
+) -> bool:
     """Admit one managed directory, creating it only when requested."""
 
     before = _lstat(path)
     if before is None:
         if not create:
             return False
+        _check_deadline(deadline, deadline_ns)
         try:
             path.mkdir()
         except FileExistsError:
@@ -288,14 +305,19 @@ def _fixed_state_paths() -> StatePaths:
     return _managed_paths()
 
 
-def state_paths(*, create: bool = False) -> StatePaths:
+def state_paths(
+    *,
+    create: bool = False,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
+) -> StatePaths:
     """Return fixed paths and optionally admit the managed directories."""
 
     paths = _fixed_state_paths()
     if create:
-        _admit_directory(paths.state_directory, create=True)
-        _admit_directory(paths.config_directory, create=True)
-        _admit_directory(paths.runtime_directory, create=True)
+        _admit_directory(paths.state_directory, create=True, deadline=deadline, deadline_ns=deadline_ns)
+        _admit_directory(paths.config_directory, create=True, deadline=deadline, deadline_ns=deadline_ns)
+        _admit_directory(paths.runtime_directory, create=True, deadline=deadline, deadline_ns=deadline_ns)
     else:
         for path in (paths.state_directory, paths.config_directory, paths.runtime_directory):
             if _lstat(path) is not None:
@@ -474,7 +496,12 @@ def _sync_directory(path: Path) -> None:
 
 
 def _atomic_write_configuration(
-    paths: StatePaths, root: Path, hidden_stages: tuple[str, ...]
+    paths: StatePaths,
+    root: Path,
+    hidden_stages: tuple[str, ...],
+    *,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
 ) -> None:
     temporary_name: str | None = None
     try:
@@ -482,6 +509,7 @@ def _atomic_write_configuration(
             paths.config_directory, create=False
         ):
             raise ConfigurationError("Nyx configuration directory is unavailable")
+        _check_deadline(deadline, deadline_ns)
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
         )
@@ -489,10 +517,13 @@ def _atomic_write_configuration(
             data = _configuration_bytes(root, hidden_stages)
             written = 0
             while written < len(data):
+                _check_deadline(deadline, deadline_ns)
                 written += os.write(fd, data[written:])
+            _check_deadline(deadline, deadline_ns)
             os.fsync(fd)
         finally:
             os.close(fd)
+        _check_deadline(deadline, deadline_ns)
         os.replace(temporary_name, paths.config_file)
         temporary_name = None
         _verify_record(paths.config_file)
@@ -513,12 +544,17 @@ def _save_configuration(
     paths: StatePaths,
     root: Path,
     hidden_stages: tuple[str, ...],
+    *,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
 ) -> Configuration:
     """Atomically persist validated configuration under runtime authorization."""
 
     if _lstat(paths.config_file) is not None:
         _verify_record(paths.config_file)
-    _atomic_write_configuration(paths, root, hidden_stages)
+    _atomic_write_configuration(
+        paths, root, hidden_stages, deadline=deadline, deadline_ns=deadline_ns
+    )
     return Configuration(root, hidden_stages)
 
 

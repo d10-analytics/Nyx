@@ -21,6 +21,7 @@ EXPECTED_MODULES = {
     "nyx/catalog.py",
     "nyx/cli.py",
     "nyx/models.py",
+    "nyx/_native_claim.py",
     "nyx/runtime.py",
     "nyx/server.py",
     "nyx/state.py",
