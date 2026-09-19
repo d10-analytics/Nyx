@@ -274,6 +274,32 @@ def test_preexisting_nyx_directory_symlink_is_rejected_without_writing_through_i
         assert list(external.iterdir()) == []
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows junction")
+def test_preexisting_nyx_directory_junction_is_rejected_without_writing_through_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        junction = home / ".nyx"
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert junction.is_junction()
+
+        with patch.object(Path, "home", return_value=home), pytest.raises(
+            state.AccountHomeError, match="ordinary directory"
+        ):
+            state.state_paths(create=True)
+
+        assert junction.is_junction()
+        assert list(external.iterdir()) == []
+
+
 @pytest.mark.parametrize("wrong_type", ["file", "symlink"])
 def test_managed_root_wrong_type_is_rejected_without_following_or_repairing(wrong_type):
     with TemporaryDirectory() as temporary:
@@ -519,6 +545,35 @@ def test_configuration_observation_collapses_path_resolution_value_error():
         assert paths.config_file.read_bytes() == before
 
 
+def test_configuration_observation_reports_concurrent_valid_replacement_as_unavailable():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            original_load = state.load_configuration
+            replacement = paths.config_directory / "replacement.json"
+            replacement.write_bytes(state._configuration_bytes(second.resolve(), ("Queue",)))
+
+            def replace_during_read(selected):
+                os.replace(replacement, paths.config_file)
+                return original_load(selected)
+
+            with patch.object(state, "load_configuration", side_effect=replace_during_read):
+                observed = state.observe_configuration()
+
+        assert observed == state.ConfigurationObservation(
+            "unavailable", diagnostic=state.CONFIGURATION_UNAVAILABLE
+        )
+        assert state.load_configuration(paths) == state.Configuration(
+            second.resolve(), ("Queue",)
+        )
+
+
 def test_configuration_observation_isolated_from_unsafe_runtime_ancestry():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -587,3 +642,10 @@ def test_fresh_runtime_observation_does_not_create_runtime_directory_or_lock():
         assert observed.status == "not_running"
         assert _managed_snapshot(home) == before
         assert not (home / ".nyx").exists()
+
+
+def test_runtime_observation_bounds_unavailable_controlled_home_as_unknown():
+    with patch.object(Path, "home", side_effect=OSError("home unavailable")):
+        observed = state.observe_runtime()
+
+    assert observed == state.RuntimeObservation("unknown")

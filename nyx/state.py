@@ -226,6 +226,19 @@ def _identity(details: os.stat_result) -> tuple[int, int, int, int]:
     return (details.st_dev, details.st_ino, details.st_mode, details.st_size)
 
 
+def _record_identity(details: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return the fields that expose record replacement or in-place mutation."""
+
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
 def _admit_directory(path: Path, *, create: bool) -> bool:
     """Admit one managed directory, creating it only when requested."""
 
@@ -389,7 +402,11 @@ def observe_configuration() -> ConfigurationObservation:
             return ConfigurationObservation("not_configured")
         if _lstat(paths.config_file) is None:
             return ConfigurationObservation("not_configured")
+        before = _verify_record(paths.config_file)
         configuration = load_configuration(paths)
+        after = _verify_record(paths.config_file)
+        if _record_identity(before) != _record_identity(after):
+            return _configuration_unavailable()
     except (StateError, OSError, ValueError):
         return _configuration_unavailable()
     return ConfigurationObservation(
@@ -405,8 +422,9 @@ _RUNTIME_RECORDS = frozenset({"operation.lock", "lease.lock", "instance.json"})
 def observe_runtime() -> RuntimeObservation:
     """Observe runtime structure without reading configuration or creating it."""
 
-    paths = _fixed_state_paths()
+    paths: StatePaths | None = None
     try:
+        paths = _fixed_state_paths()
         if not _admit_directory(paths.state_directory, create=False):
             return RuntimeObservation("not_running", paths=paths)
         if not _admit_directory(paths.runtime_directory, create=False):
