@@ -159,7 +159,12 @@ class CatalogTests(TestCase):
                         raise PermissionError("injected unreadable anchor")
                     return original_open(path, *args, **kwargs)
 
-                open_patch = patch.object(catalog.Path, "open", side_effect=deny_unreadable)
+                open_patch = patch.object(
+                    catalog.Path,
+                    "open",
+                    autospec=True,
+                    side_effect=deny_unreadable,
+                )
             else:
                 os.mkfifo(nonregular / "spec.md")
                 unreadable.joinpath("spec.md").chmod(0)
@@ -677,7 +682,12 @@ class CatalogTests(TestCase):
                         raise PermissionError("injected unreadable anchor")
                     return original_open(path, *args, **kwargs)
 
-                open_patch = patch.object(catalog.Path, "open", side_effect=deny_unreadable)
+                open_patch = patch.object(
+                    catalog.Path,
+                    "open",
+                    autospec=True,
+                    side_effect=deny_unreadable,
+                )
             else:
                 unreadable_anchor.chmod(0)
                 open_patch = nullcontext()
