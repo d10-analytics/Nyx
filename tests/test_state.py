@@ -638,6 +638,92 @@ def test_runtime_observation_reports_incomplete_or_unsafe_layout_without_mutatio
             assert _managed_snapshot(home) == before
 
 
+def test_runtime_observation_preserves_empty_claims_and_metadata():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            claims = [paths.runtime_directory / "operation.lock", paths.runtime_directory / "lease.lock"]
+            for claim in claims:
+                claim.write_bytes(b"")
+            before = {
+                claim: (
+                    claim.lstat().st_dev,
+                    claim.lstat().st_ino,
+                    claim.lstat().st_mode,
+                    claim.lstat().st_size,
+                    claim.lstat().st_mtime_ns,
+                    claim.lstat().st_ctime_ns,
+                    claim.read_bytes(),
+                )
+                for claim in claims
+            }
+
+            observed = state.observe_runtime()
+
+        after = {
+            claim: (
+                claim.lstat().st_dev,
+                claim.lstat().st_ino,
+                claim.lstat().st_mode,
+                claim.lstat().st_size,
+                claim.lstat().st_mtime_ns,
+                claim.lstat().st_ctime_ns,
+                claim.read_bytes(),
+            )
+            for claim in claims
+        }
+        assert observed.status == "unknown"
+        assert after == before
+
+
+def test_runtime_observation_rejects_runtime_symlink_without_following_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        outside_claim = external / "operation.lock"
+        outside_claim.write_bytes(b"outside")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.runtime_directory.rmdir()
+            paths.runtime_directory.symlink_to(external, target_is_directory=True)
+            observed = state.observe_runtime()
+
+        assert observed.status == "unknown"
+        assert outside_claim.read_bytes() == b"outside"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows junction")
+def test_runtime_observation_rejects_runtime_junction_without_following_it():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        outside_claim = external / "operation.lock"
+        outside_claim.write_bytes(b"outside")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.runtime_directory.rmdir()
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(paths.runtime_directory), str(external)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert completed.returncode == 0, completed.stderr
+            observed = state.observe_runtime()
+
+        assert observed.status == "unknown"
+        assert outside_claim.read_bytes() == b"outside"
+
+
 def test_fresh_runtime_observation_does_not_create_runtime_directory_or_lock():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)

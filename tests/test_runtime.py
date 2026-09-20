@@ -1334,6 +1334,105 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         return runtime.observe_runtime()
 
 
+def _claim_snapshot(path: Path) -> tuple[int, int, int, int, int, int]:
+    details = path.lstat()
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def test_observe_runtime_preserves_empty_existing_claims_and_metadata():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        claims = [paths.runtime_directory / "operation.lock", paths.runtime_directory / "lease.lock"]
+        for claim in claims:
+            claim.write_bytes(b"")
+        before = {claim: (_claim_snapshot(claim), claim.read_bytes()) for claim in claims}
+
+        observed = _observe(paths)
+
+        assert observed.status == "not_running", observed.diagnostic
+        assert observed.diagnostic is None
+        assert {claim: (_claim_snapshot(claim), claim.read_bytes()) for claim in claims} == before
+
+
+def test_observe_runtime_rejects_replaced_runtime_ancestry_before_outside_iteration():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        external = root / "external"
+        external.mkdir()
+        outside_claim = external / "operation.lock"
+        outside_claim.write_bytes(b"outside")
+        outside_before = (_claim_snapshot(outside_claim), outside_claim.read_bytes())
+        original_observe = state.observe_runtime
+
+        def replace_after_admission() -> state.RuntimeObservation:
+            result = original_observe()
+            paths.runtime_directory.rmdir()
+            paths.runtime_directory.symlink_to(external, target_is_directory=True)
+            return result
+
+        iterated: list[tuple[Path, bool]] = []
+        original_iterdir = Path.iterdir
+
+        def record_iteration(path: Path):
+            iterated.append((path, path.is_symlink()))
+            return original_iterdir(path)
+
+        with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ), patch.object(state, "observe_runtime", side_effect=replace_after_admission), patch.object(
+            Path, "iterdir", record_iteration
+        ):
+            observed = runtime.observe_runtime()
+
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+        assert not any(path == paths.runtime_directory and is_link for path, is_link in iterated)
+        assert (_claim_snapshot(outside_claim), outside_claim.read_bytes()) == outside_before
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows junction")
+def test_observe_runtime_rejects_native_runtime_junction_before_outside_iteration():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        paths.runtime_directory.rmdir()
+        external = root / "external"
+        external.mkdir()
+        outside_claim = external / "operation.lock"
+        outside_claim.write_bytes(b"outside")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(paths.runtime_directory), str(external)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        iterated: list[Path] = []
+        original_iterdir = Path.iterdir
+
+        def record_iteration(path: Path):
+            iterated.append(path)
+            return original_iterdir(path)
+
+        with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ), patch.object(Path, "iterdir", record_iteration):
+            observed = runtime.observe_runtime()
+
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+        assert paths.runtime_directory not in iterated
+        assert outside_claim.read_bytes() == b"outside"
+
+
 def test_observe_runtime_reports_operation_contention_without_mutation():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
