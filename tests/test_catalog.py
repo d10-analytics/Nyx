@@ -260,7 +260,7 @@ class CatalogTests(TestCase):
             ), patch.object(catalog.os, "link", side_effect=reject_write_operation), patch.object(
                 catalog.os, "rmdir", side_effect=reject_write_operation
             ), patch.object(catalog.os, "remove", side_effect=reject_write_operation), patch.object(
-                catalog.os, "fchmod", side_effect=reject_write_operation
+                catalog.os, "fchmod", side_effect=reject_write_operation, create=True
             ), patch.object(catalog.os, "ftruncate", side_effect=reject_write_operation), patch.object(
                 catalog.os, "utime", side_effect=reject_write_operation
             ):

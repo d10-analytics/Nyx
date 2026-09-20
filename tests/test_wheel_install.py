@@ -467,9 +467,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             line = process.stdout.readline()
             assert line, process.stderr.read() if process.stderr is not None else ""
             details = json.loads(line)
-            installed_module = Path(details["module"])
+            installed_module = Path(details["module"]).resolve()
             port = int(details["port"])
-            assert installed_module.is_relative_to(venv)
+            assert installed_module.is_relative_to(venv.resolve())
             assert not installed_module.is_relative_to(REPOSITORY_ROOT)
 
             connection = http.client.HTTPConnection("127.0.0.1", port)
