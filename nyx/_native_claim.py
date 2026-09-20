@@ -38,6 +38,12 @@ def _identity(details: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _object_identity(details: os.stat_result) -> tuple[int, int]:
+    """Return the stable filesystem object identity shared by path and handle."""
+
+    return details.st_dev, details.st_ino
+
+
 def _regular(details: os.stat_result) -> bool:
     return stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode)
 
@@ -142,20 +148,27 @@ class NativeClaim:
     ) -> bool:
         if deadline is not None and _remaining(deadline) <= 0:
             raise TimeoutError("native claim deadline expired")
+        while True:
+            try:
+                fd = _open_claim(self.path, create=create)
+            except OSError as error:
+                if not _sharing_busy(error):
+                    raise
+                if not blocking or (deadline is not None and _remaining(deadline) <= 0):
+                    return False
+                time.sleep(min(0.02, _remaining(deadline)))
+                continue
+            break
         try:
-            fd = _open_claim(self.path, create=create)
             details = os.fstat(fd)
             if not _regular(details):
-                os.close(fd)
                 raise OSError(errno.ELOOP, "claim is not a regular file")
             if details.st_size == 0:
                 if deadline is not None and _remaining(deadline) <= 0:
-                    os.close(fd)
                     raise TimeoutError("native claim deadline expired")
                 os.write(fd, b"\0")
-        except OSError as error:
-            if _sharing_busy(error):
-                return False
+        except BaseException:
+            os.close(fd)
             raise
         try:
             if deadline is not None and _remaining(deadline) <= 0:
@@ -237,7 +250,11 @@ class NativeClaim:
             current = path.lstat()
         except OSError:
             return False
-        return _regular(received) and _regular(current) and _identity(received) == _identity(current)
+        return (
+            _regular(received)
+            and _regular(current)
+            and _object_identity(received) == _object_identity(current)
+        )
 
     @staticmethod
     def transfer_handle(fd: int) -> int:
