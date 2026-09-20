@@ -267,6 +267,9 @@ def _admit_directory(
     if before is None:
         if not create:
             return False
+        # Metadata admission can block.  Do not let an expired public
+        # operation create the next managed directory after that lookup.
+        _check_deadline(deadline, deadline_ns)
         try:
             path.mkdir()
         except FileExistsError:

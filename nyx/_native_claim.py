@@ -75,6 +75,8 @@ def _lock_fd(fd: int, *, blocking: bool, deadline: float | None) -> bool:
         os.lseek(fd, 0, os.SEEK_SET)
         mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
         while True:
+            if deadline is not None and _remaining(deadline) <= 0:
+                return False
             try:
                 msvcrt.locking(fd, mode, 1)
                 return True
@@ -86,6 +88,8 @@ def _lock_fd(fd: int, *, blocking: bool, deadline: float | None) -> bool:
                 time.sleep(min(0.02, _remaining(deadline)))
     operation = fcntl.LOCK_EX | fcntl.LOCK_NB
     while True:
+        if deadline is not None and _remaining(deadline) <= 0:
+            return False
         try:
             fcntl.flock(fd, operation)
             return True
@@ -297,6 +301,8 @@ class NativeClaim:
         if deadline is not None and _remaining(deadline) <= 0:
             raise TimeoutError("native claim deadline expired")
         while True:
+            if deadline is not None and _remaining(deadline) <= 0:
+                raise TimeoutError("native claim deadline expired")
             try:
                 fd = (
                     _open_claim(self.path, create=create)
