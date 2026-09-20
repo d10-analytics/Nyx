@@ -53,121 +53,30 @@ def _assert_claim_available(path: Path) -> None:
         claim.close()
 
 
-def _wait_for_record(paths: state.StatePaths, *, trace_root: Path | None = None) -> runtime.Instance:
+def _wait_for_record(paths: state.StatePaths) -> runtime.Instance:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
             return runtime._read_instance(paths)
         except runtime.UnhealthyInstanceError:
             time.sleep(0.02)
-    diagnostic = "" if trace_root is None else "\n" + _startup_trace(trace_root)
-    raise AssertionError("daemon did not publish instance record" + diagnostic)
+    raise AssertionError("daemon did not publish instance record")
 
 
-_STARTUP_TRACE_CODE = '''
-import sys
-import threading
-import time
-trace_root = Path(os.environ['NYX_TEST_TRACE_DIRECTORY'])
-is_daemon = '--daemon-fd' in sys.argv or '--daemon-handle' in sys.argv
-trace_file = trace_root / (('daemon-' if is_daemon else 'launcher-') + str(os.getpid()) + '.trace')
-trace_file.write_text('entered\\n', encoding='ascii')
-trace_lock = threading.Lock()
-trace_count = 0
-trace_seen = set()
-trace_labels = {
-    '_daemon_entry': 'entry', '_ack_received_claim': 'claim-ack',
-    '_paths': 'paths', 'create_server': 'http-create',
-    '_static_ready': 'http-ready', '_bind_control': 'control-bind',
-    '_send_control': 'control-exchange', '_write_instance': 'publish',
-    '_read_instance': 'locator-read', '_wait_ready': 'launcher-ready',
-    '_cleanup_start_failure': 'failed-cleanup',
-    '_finish_start_failure_cleanup': 'failed-cleanup-worker', 'shutdown': 'shutdown',
-    'server_bind': 'http-bind', 'server_activate': 'http-listen',
-    'getfqdn': 'reverse-name', 'gethostbyaddr': 'native-reverse-name',
-    'bind': 'native-bind', 'listen': 'native-listen',
-}
-def trace(frame, event, result):
-    global trace_count
-    if event not in ('call', 'return', 'c_call', 'c_return', 'c_exception'):
-        return
-    module = frame.f_globals.get('__name__')
-    if module not in ('nyx.runtime', 'nyx.server', '__main__', 'http.server', 'socketserver', 'socket'):
-        return
-    name = getattr(result, '__name__', None) if event.startswith('c_') else frame.f_code.co_name
-    label = trace_labels.get(name)
-    if label is None:
-        return
-    suffix = event
-    if event == 'return':
-        suffix = 'returned' if result is not None else 'empty-or-raised'
-        if name == '_paths' and result is not None:
-            suffix = ('home-match' if result.account_home.resolve() ==
-                      Path(os.environ['NYX_TEST_HOME']).resolve() else 'home-mismatch')
-        elif name == '_static_ready':
-            suffix = 'ready' if result is True else 'not-ready'
-    with trace_lock:
-        if trace_count < 64 and (label, suffix) not in trace_seen:
-            with trace_file.open('a', encoding='ascii') as stream:
-                stream.write(label + ':' + suffix + '\\n')
-            trace_count += 1
-            trace_seen.add((label, suffix))
-def fixture_cleanup():
-    while not (trace_root / 'finish').exists():
-        time.sleep(0.01)
-    os._exit(0)
-if is_daemon:
-    threading.Thread(target=fixture_cleanup, daemon=True).start()
-sys.setprofile(trace)
-threading.setprofile(trace)
-'''
-
-
-def _subprocess_environment(
-    home: Path, site_directory: Path, *, trace_startup: bool = False
-) -> dict[str, str]:
+def _subprocess_environment(home: Path, site_directory: Path) -> dict[str, str]:
     site_directory.mkdir()
     (site_directory / "sitecustomize.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "from nyx import state\n"
-        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
-        + (_STARTUP_TRACE_CODE if trace_startup else ""),
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n",
         encoding="utf-8",
     )
     environment = os.environ.copy()
     environment["NYX_TEST_HOME"] = str(home)
     environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get("PYTHONPATH", "")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    if trace_startup:
-        environment["NYX_TEST_TRACE_DIRECTORY"] = str(site_directory)
     return environment
-
-
-def _startup_trace(site_directory: Path) -> str:
-    return "\n".join(
-        ("daemon" if path.name.startswith("daemon-") else "launcher") + ":\n"
-        + path.read_text(encoding="ascii")
-        for path in sorted(site_directory.glob("*.trace"))
-    )
-
-
-def _finish_traced_children(paths: state.StatePaths, site_directory: Path) -> None:
-    # Only daemons created by this opt-in fixture observe this cleanup marker.
-    # Call after assertions and ordinary stop attempts, never during ownership proof.
-    (site_directory / "finish").touch()
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        claim = runtime.NativeClaim(paths.runtime_directory / "lease.lock")
-        try:
-            if claim.acquire(create=False, blocking=False):
-                return
-        except FileNotFoundError:
-            return
-        finally:
-            claim.close()
-        time.sleep(0.01)
-    raise AssertionError("owned test child did not release its claim")
 
 
 def test_runtime_tests_collect_without_test_owned_posix_primitives():
@@ -416,12 +325,12 @@ def test_public_start_reports_sanitized_detached_child_failure():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         paths, home, _ = _fixture(root)
-        environment = _subprocess_environment(home, root / "site", trace_startup=True)
+        environment = _subprocess_environment(home, root / "site")
         script = (
             "import errno, runpy; from nyx import server\n"
-            "def create_server(**kwargs):\n"
+            "def fail(**kwargs):\n"
             "    raise OSError(errno.EADDRINUSE, 'private-child-detail')\n"
-            "server.create_server=create_server\n"
+            "server.create_server=fail\n"
             "runpy.run_module('nyx.runtime', run_name='__main__')\n"
         )
         with patch.dict(os.environ, environment), patch.object(
@@ -438,80 +347,6 @@ def test_public_start_reports_sanitized_detached_child_failure():
         assert "private-child-detail" not in str(caught.value)
         assert not runtime._record_path(paths).exists()
         _assert_claim_available(paths.runtime_directory / "lease.lock")
-        trace = _startup_trace(root / "site")
-        assert "entry:call" in trace and "claim-ack:returned" in trace
-        assert "paths:home-match" in trace and "http-create:call" in trace
-        assert "private-child-detail" not in trace
-        assert str(root) not in trace
-
-
-def test_startup_trace_captures_native_server_construction_without_values():
-    try:
-        capability = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability.close()
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        _, home, _ = _fixture(root)
-        site = root / "site"
-        environment = _subprocess_environment(home, site, trace_startup=True)
-        try:
-            process = subprocess.run(
-                [sys.executable, "-c",
-                 "from nyx.server import create_server; server=create_server(); server.server_close()"],
-                env=environment, capture_output=True, text=True, timeout=5, check=False,
-            )
-        except subprocess.TimeoutExpired:
-            raise AssertionError("server construction timed out\n" + _startup_trace(site)) from None
-        assert process.returncode == 0, process.stderr
-        trace = _startup_trace(site)
-        assert "http-create:call" in trace and "http-create:returned" in trace
-        assert "native-bind:c_call" in trace and "native-bind:c_return" in trace
-        assert "native-reverse-name:c_call" in trace and "native-reverse-name:c_return" in trace
-        assert str(root) not in trace and "127.0.0.1" not in trace
-        assert len(trace.splitlines()) <= 66
-
-
-def test_traced_fixture_cleanup_releases_only_its_owned_child_after_observation():
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        paths, home, _ = _fixture(root)
-        site = root / "site"
-        environment = _subprocess_environment(home, site, trace_startup=True)
-        claim = runtime.NativeClaim(paths.runtime_directory / "lease.lock")
-        assert claim.acquire(create=False, blocking=False)
-        child = (
-            "import sys,time; from pathlib import Path; "
-            "Path(sys.argv[1]).touch(); time.sleep(60)"
-        )
-        process = None
-        try:
-            with patch.dict(os.environ, environment), patch.object(
-                runtime, "_daemon_command",
-                return_value=[sys.executable, "-c", child, str(site / "child-ready")],
-            ):
-                process = runtime._spawn_daemon(claim.fd, time.monotonic_ns() + 10**9)
-            claim.close()
-            deadline = time.monotonic() + 3
-            while not (site / "child-ready").exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert (site / "child-ready").exists()
-            contender = runtime.NativeClaim(paths.runtime_directory / "lease.lock")
-            try:
-                assert not contender.acquire(create=False, blocking=False)
-                assert process.poll() is None
-            finally:
-                contender.close()
-            _finish_traced_children(paths, site)
-            assert process.wait(timeout=3) == 0
-            _assert_claim_available(paths.runtime_directory / "lease.lock")
-        finally:
-            claim.close()
-            if process is not None and process.poll() is None:
-                process.kill()
-                process.wait(timeout=3)
 
 
 def test_daemon_entry_rejects_unvalidated_inherited_object_before_initialization():
@@ -1506,7 +1341,7 @@ def test_observe_runtime_reports_free_lease_stale_record_and_retains_bytes():
         before = record.read_bytes()
         before_mode = stat.S_IMODE(record.stat().st_mode)
         observed = _observe(paths)
-        assert observed.status == "not_running"
+        assert observed.status == "not_running", observed.diagnostic
         assert observed.diagnostic is None
         assert record.read_bytes() == before
         assert stat.S_IMODE(record.stat().st_mode) == before_mode
@@ -1649,31 +1484,6 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
 
         listener.settimeout(1)
         served: list[str] = []
-        probes: list[tuple[str, str, tuple[str, ...]]] = []
-        original_probe = runtime.NativeClaim.probe
-        original_identity = _native_claim._identity
-
-        def probe(path):
-            identities = []
-
-            def identity(details):
-                result = original_identity(details)
-                identities.append(result)
-                return result
-
-            with patch.object(_native_claim, "_identity", side_effect=identity):
-                result = original_probe(path)
-            changed = ()
-            if result == "changed" and len(identities) == 2:
-                changed = tuple(
-                    name for name, before, after in zip(
-                        ("device", "inode", "mode", "size", "modified", "created"),
-                        identities[0], identities[1], strict=True,
-                    ) if before != after
-                )
-            probes.append(("operation" if path.name == "operation.lock" else "lease", result, changed))
-            return result
-
         def serve() -> None:
             try:
                 connection, _ = listener.accept()
@@ -1690,14 +1500,13 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
         server = threading.Thread(target=serve)
         server.start()
         try:
-            with patch.object(runtime.NativeClaim, "probe", side_effect=probe):
-                observed = _observe(paths)
+            observed = _observe(paths)
         finally:
             server.join(timeout=3)
             listener.close()
             lease.close()
             os.close(lease_fd)
-        assert observed.status == "running", (observed.diagnostic, served, probes)
+        assert observed.status == "running", (observed.diagnostic, served)
         assert served == ["response-sent"]
         assert not server.is_alive()
         assert observed.url == runtime.URL
@@ -2251,10 +2060,9 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
         specification_root = root / "spec"
         specification_root.mkdir()
         site_directory = root / "site"
-        environment = _subprocess_environment(home, site_directory, trace_startup=True)
+        environment = _subprocess_environment(home, site_directory)
         with patch.object(state, "resolve_account_home", return_value=home):
             state.setup(specification_root)
-            paths = state.state_paths()
         first = second = None
         try:
             command = (
@@ -2280,31 +2088,27 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
             )
             first_stdout, first_stderr = first.communicate(timeout=25)
             second_stdout, second_stderr = second.communicate(timeout=25)
-            diagnostic = (first.returncode, second.returncode, _startup_trace(site_directory))
-            assert first.returncode == 0, (first_stderr, diagnostic)
-            assert second.returncode == 0, (second_stderr, diagnostic)
+            assert first.returncode == 0, first_stderr
+            assert second.returncode == 0, second_stderr
             first_lines = first_stdout.splitlines()
             second_lines = second_stdout.splitlines()
             assert first_lines[0] == runtime.URL
             assert second_lines[0] == runtime.URL
             assert first_lines[1] == second_lines[1]
         finally:
-            try:
-                subprocess.run(
-                    [sys.executable, "-c", "from nyx import runtime; runtime.stop()"],
-                    cwd=Path(__file__).parents[1],
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                    check=False,
-                )
-            finally:
-                for process in (first, second):
-                    if process is not None and process.poll() is None:
-                        process.kill()
-                        process.wait(timeout=3)
-                _finish_traced_children(paths, site_directory)
+            subprocess.run(
+                [sys.executable, "-c", "from nyx import runtime; runtime.stop()"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            for process in (first, second):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
 
 
 def test_actual_daemon_spawn_retains_lease_after_launcher_death():
@@ -2315,7 +2119,7 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
         specification_root = root / "spec"
         specification_root.mkdir()
         site_directory = root / "site"
-        environment = _subprocess_environment(home, site_directory, trace_startup=True)
+        environment = _subprocess_environment(home, site_directory)
         with patch.object(state, "resolve_account_home", return_value=home):
             state.setup(specification_root)
             paths = state.state_paths()
@@ -2333,16 +2137,13 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
             timeout=5,
             check=False,
         )
-        try:
-            assert launcher.returncode == 0, launcher.stderr
-            _wait_for_record(paths, trace_root=site_directory)
-            probe = runtime._lease_lock(paths, timeout=0.0)
-            assert not probe.acquire(blocking=False)
-            probe.close()
-            with patch.object(runtime, "_paths", return_value=paths):
-                assert runtime.stop() == "stopped"
-        finally:
-            _finish_traced_children(paths, site_directory)
+        assert launcher.returncode == 0, launcher.stderr
+        _wait_for_record(paths)
+        probe = runtime._lease_lock(paths, timeout=0.0)
+        assert not probe.acquire(blocking=False)
+        probe.close()
+        with patch.object(runtime, "_paths", return_value=paths):
+            assert runtime.stop() == "stopped"
 
 
 def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
@@ -2360,7 +2161,7 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
         specification_root = root / "spec"
         specification_root.mkdir()
         site_directory = root / "site"
-        environment = _subprocess_environment(home, site_directory, trace_startup=True)
+        environment = _subprocess_environment(home, site_directory)
         with patch.object(state, "resolve_account_home", return_value=home):
             state.setup(specification_root)
             paths = state.state_paths()
@@ -2374,18 +2175,15 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
             check=False,
         )
         try:
-            assert launcher.returncode == 0, (launcher.stderr, _startup_trace(site_directory))
+            assert launcher.returncode == 0, launcher.stderr
             assert launcher.stdout.strip() == runtime.URL
             _wait_for_record(paths)
             contender = runtime._lease_lock(paths, timeout=0.0)
             assert not contender.acquire(blocking=False)
             contender.close()
         finally:
-            try:
-                with patch.object(runtime, "_paths", return_value=paths):
-                    runtime.stop()
-            finally:
-                _finish_traced_children(paths, site_directory)
+            with patch.object(runtime, "_paths", return_value=paths):
+                runtime.stop()
 
 
 def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit():
