@@ -567,9 +567,14 @@ def _runtime_unknown(paths: state.StatePaths | None, diagnostic: str) -> Runtime
 def _admit_runtime_ancestry(paths: state.StatePaths) -> bool:
     """Use the state owner's classifier for the complete runtime ancestry."""
 
-    return state._admit_directory(
-        paths.state_directory, create=False
-    ) and state._admit_directory(paths.runtime_directory, create=False)
+    for path in (paths.state_directory, paths.runtime_directory):
+        if not state._admit_directory(path, create=False):
+            return False
+        # Revalidate before advancing to a child or observing directory
+        # contents, so a replacement immediately after admission is rejected.
+        if not state._admit_directory(path, create=False):
+            return False
+    return True
 
 
 def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
