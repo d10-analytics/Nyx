@@ -398,15 +398,28 @@ def _control_endpoint(port: int) -> str:
 
 
 def _parse_control_endpoint(value: str) -> tuple[int, str | tuple[str, int]]:
-    if value.startswith("\x00"):
-        family = getattr(socket, "AF_UNIX", None)
-        if family is None:
-            raise ValueError("local socket control is unavailable")
-        return family, value
-    host, separator, raw_port = value.rpartition(":")
-    if separator != ":" or host != "127.0.0.1":
+    """Parse the closed, published TCP control endpoint grammar.
+
+    Control records are persisted input, so validation must reject every
+    spelling outside the one endpoint form that Nyx publishes before any
+    socket or capability operation can occur.
+    """
+
+    prefix = "127.0.0.1:"
+    if not isinstance(value, str) or not value.startswith(prefix):
         raise ValueError("control endpoint is not loopback")
-    return socket.AF_INET, (host, int(raw_port))
+    raw_port = value[len(prefix) :]
+    if (
+        not raw_port
+        or len(raw_port) > 5
+        or raw_port.startswith("0")
+        or any(char < "0" or char > "9" for char in raw_port)
+    ):
+        raise ValueError("control endpoint port is invalid")
+    port = int(raw_port)
+    if port > 65535:
+        raise ValueError("control endpoint port is invalid")
+    return socket.AF_INET, (prefix[:-1], port)
 
 
 def _record_path(paths: state.StatePaths) -> Path:
