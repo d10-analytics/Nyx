@@ -165,7 +165,7 @@ class NativeClaim:
             details = os.fstat(fd)
             if not _regular(details):
                 raise OSError(errno.ELOOP, "claim is not a regular file")
-            if details.st_size == 0:
+            if create and details.st_size == 0:
                 if deadline is not None and _remaining(deadline) <= 0:
                     raise TimeoutError("native claim deadline expired")
                 os.write(fd, b"\0")
