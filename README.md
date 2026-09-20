@@ -34,20 +34,36 @@ related specifications. You can hide stages to focus on active work and still
 inspect a hidden prerequisite through a visible card's details.
 
 Your plans stay in files you can edit, keep in version control, and use with
-other tools. Nyx runs locally on Linux and opens in your browser. Setup and
+other tools. Nyx runs locally on Linux, Windows, and macOS and opens in your browser. Setup and
 runtime commands save account-local configuration and runtime state, but the
 board itself remains a read-only view of the workspace.
 
 ## Try the sample
 
-You need Linux and Python 3.12 or newer. From a checkout of this repository:
+You need Linux, Windows, or macOS and Python 3.12. From the repository root,
+use the commands for your host; virtual environment activation is not required.
+After starting Nyx, explore the board before running the final stop command.
+
+Linux or macOS (POSIX shell):
 
 ```bash
 python3.12 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-nyx --setup examples/sample-specifications --show-all-stages
-nyx
+.venv/bin/python -m pip install .
+.venv/bin/nyx --setup examples/sample-specifications --show-all-stages
+.venv/bin/nyx
+.venv/bin/nyx --status
+.venv/bin/nyx --stop
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\nyx.exe --setup .\examples\sample-specifications --show-all-stages
+.\.venv\Scripts\nyx.exe
+.\.venv\Scripts\nyx.exe --status
+.\.venv\Scripts\nyx.exe --stop
 ```
 
 Open **http://127.0.0.1:8765/**. Select **Build the route preview** to see why
@@ -57,14 +73,21 @@ explains the fictional project, its custom stage, and the compact-view workflow.
 
 When files change, Nyx checks for an update every ten seconds. Click **Apply
 update** when it appears to load the new view. **Refresh view** checks immediately
-when no update is waiting. Run `nyx --stop` when you are finished.
+when no update is waiting. Use the stop command above when you are finished.
 
 Setup saves the workspace location and configured stage visibility for your
-Linux account. These setup choices are separate from the browser's personal
+account on this host. These setup choices are separate from the browser's personal
 **Hide empty rows and columns** preference, which is stored only in that
 browser. If Nyx is already running with a different setup, stop it before
 changing the account-local settings. See [running Nyx](docs/running-nyx.md) for
 status and configuration options.
+
+Nyx stores configuration and runtime state in `.nyx` inside your home directory.
+This is intentionally a fresh state root: legacy Linux state is neither read nor
+migrated, and Nyx does not copy, remove, or fall back to it. Stop Nyx with your
+existing installation before upgrading, then rerun setup with the new installation.
+Setup saves an absolute workspace path local to that host; rerun setup on each
+host using its local workspace location.
 
 ## Track your own work
 
@@ -97,5 +120,5 @@ Nyx itself does not launch agents or execute the work described by a specificati
 - [Running Nyx](docs/running-nyx.md): start, stop, check status, and choose visible stages.
 - [Specification reference](docs/specification-reference.md): metadata, programs, and dependencies.
 
-Nyx currently serves one Linux account on the local loopback address. The browser
+Nyx serves one local account on the fixed loopback address. The browser
 is read-only; shared or remote hosting is not supported.

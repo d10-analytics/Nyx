@@ -2,9 +2,35 @@
 
 [Return to Nyx](../README.md).
 
-Nyx requires Linux and Python 3.12 or newer. The
-[root guide](../README.md#try-the-sample) covers installation from a checkout.
-Activate the virtual environment where you installed Nyx before using its commands.
+Nyx supports Linux, Windows, and macOS with Python 3.12. From the repository
+root, install and try the sample with the commands for your host. These use the
+installed console directly and require no virtual environment activation.
+Explore the board after starting Nyx, before running the final stop command.
+
+Linux or macOS (POSIX shell):
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/nyx --setup examples/sample-specifications --show-all-stages
+.venv/bin/nyx
+.venv/bin/nyx --status
+.venv/bin/nyx --stop
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\nyx.exe --setup .\examples\sample-specifications --show-all-stages
+.\.venv\Scripts\nyx.exe
+.\.venv\Scripts\nyx.exe --status
+.\.venv\Scripts\nyx.exe --stop
+```
+
+In the remaining examples, `nyx` means `.venv/bin/nyx` on Linux or macOS, or
+`.\.venv\Scripts\nyx.exe` in Windows PowerShell, run from the repository root.
 
 Nyx reads and displays specifications; it does not edit them or move them
 between directories. Setup and runtime commands write account-local configuration
@@ -19,11 +45,23 @@ nyx
 ```
 
 Replace `path/to/specifications` with your workspace directory. Setup saves its
-location and stage visibility for the current Linux account. The browser runs
+absolute location and stage visibility for the current account on this host. The browser runs
 at **http://127.0.0.1:8765/**.
 
 Run `nyx` again to reuse an already running, ready instance. It prints the same
 URL rather than starting a second instance.
+
+## Upgrade or use another host
+
+Configuration and runtime state live in `.nyx` inside your home directory.
+This is intentionally a fresh state root: legacy Linux state is neither read nor
+migrated. Nyx does not copy, remove, or fall back to those legacy locations.
+Stop Nyx with your existing installation before upgrading, then rerun setup
+with the new installation.
+
+Saved workspace paths are absolute and local to each host. Rerun setup on every
+host using its local workspace location, even when the specification files are
+copied or synchronized between hosts.
 
 ## Check status and stop
 
@@ -105,4 +143,4 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 
 Nyx reads specification files without modifying them. Setup and runtime commands
 do write account-local configuration and runtime state. The service is intended
-for one Linux account through its loopback interface, not shared or remote hosting.
+for one local account through its fixed loopback interface, not shared or remote hosting.
