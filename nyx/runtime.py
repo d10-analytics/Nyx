@@ -1137,8 +1137,6 @@ class _Daemon:
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 workers_ok = self.workers.close(deadline)
-                if self.control_thread is not None:
-                    self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
                 if not workers_ok or time.monotonic() >= deadline:
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
@@ -1155,6 +1153,14 @@ class _Daemon:
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 self.shutdown_result = "stopped"
+                # Closing the listener and publishing the terminal state must
+                # precede joining this thread.  During an incomplete cleanup
+                # the thread is the authenticated retry consumer, so joining
+                # it before the state transition would consume the entire
+                # retry budget waiting for a thread that is required to stay
+                # alive until this exact terminal point.
+                if self.control_thread is not None:
+                    self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
                 return self.shutdown_result
         finally:
             self.shutdown_done.set()
