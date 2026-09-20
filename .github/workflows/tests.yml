@@ -77,17 +77,25 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           python -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -e '.[test]' build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/ -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m build --wheel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $wheels = @(Get-ChildItem -Path dist -Filter '*.whl' -File)
           if ($wheels.Count -ne 1) {
             throw "Expected exactly one wheel, found $($wheels.Count)"
           }
           python -m pytest tests/test_wheel_install.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-macos:
     runs-on: macos-latest
