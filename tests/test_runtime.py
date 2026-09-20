@@ -1439,6 +1439,85 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         return runtime.observe_runtime()
 
 
+@pytest.mark.parametrize(
+    ("control", "label"),
+    [
+        ("", "empty"),
+        ("127.0.0.1:-1", "negative"),
+        ("127.0.0.1:0", "zero"),
+        ("127.0.0.1:65536", "too-large"),
+        ("127.0.0.1:+1", "signed-positive"),
+        ("127.0.0.1:01", "leading-zero"),
+        ("127.0.0.1:1 ", "trailing-whitespace"),
+        (" 127.0.0.1:1", "leading-whitespace"),
+        ("127.0.0.1:١", "non-ascii-digit"),
+        ("localhost:1", "alternate-host"),
+        ("127.0.0.1:1/suffix", "suffix"),
+        ("\x00nyx-control-1000", "legacy-abstract-socket"),
+    ],
+)
+def test_public_lifecycle_rejects_invalid_control_records_without_use(
+    control: str, label: str
+):
+    del label
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd, lease = _held_lease(paths)
+        record = paths.runtime_directory / "instance.json"
+        _write_runtime_record(paths, control=control)
+        before = record.read_bytes()
+        try:
+            with patch.object(runtime, "_send_control") as send_control, patch.object(
+                runtime.socket, "socket", side_effect=AssertionError("socket use")
+            ) as create_socket:
+                observed = _observe(paths)
+            assert observed.status == "unknown"
+            assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+            send_control.assert_not_called()
+            create_socket.assert_not_called()
+
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control"
+            ) as send_control, patch.object(
+                runtime.socket, "socket", side_effect=AssertionError("socket use")
+            ) as create_socket, pytest.raises(
+                runtime.UnhealthyInstanceError, match="record is unavailable"
+            ):
+                runtime.start()
+            send_control.assert_not_called()
+            create_socket.assert_not_called()
+
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control"
+            ) as send_control, patch.object(
+                runtime.socket, "socket", side_effect=AssertionError("socket use")
+            ) as create_socket, pytest.raises(
+                runtime.UnhealthyInstanceError, match="record is unavailable"
+            ):
+                runtime.stop()
+            send_control.assert_not_called()
+            create_socket.assert_not_called()
+        finally:
+            lease.close()
+            os.close(lease_fd)
+        assert record.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("control", "port"),
+    [("127.0.0.1:1", 1), ("127.0.0.1:65535", 65535)],
+)
+def test_record_consumption_accepts_control_port_boundaries(control: str, port: int):
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        _write_runtime_record(paths, control=control)
+        assert runtime._read_instance(paths).control == control
+        assert runtime._parse_control_endpoint(control) == (
+            socket.AF_INET,
+            ("127.0.0.1", port),
+        )
+
+
 def _claim_snapshot(path: Path) -> tuple[int, int, int, int, int, int]:
     details = path.lstat()
     return (
@@ -1823,12 +1902,13 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
 
         listener.settimeout(1)
         served: list[str] = []
+        requests: list[dict[str, object]] = []
         def serve() -> None:
             try:
                 connection, _ = listener.accept()
                 with connection:
                     connection.settimeout(1)
-                    connection.recv(4096)
+                    requests.append(json.loads(connection.recv(4096).splitlines()[0]))
                     connection.sendall(
                         (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
                     )
@@ -1850,6 +1930,9 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
         assert not server.is_alive()
         assert observed.url == runtime.URL
         assert observed.diagnostic is None
+        assert requests == [
+            {"version": 1, "capability": instance.capability, "command": "status"}
+        ]
 
 
 def test_observe_runtime_rejects_lease_release_before_ready_response():
