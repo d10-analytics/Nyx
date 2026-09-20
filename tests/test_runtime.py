@@ -1363,6 +1363,105 @@ def test_wrong_capability_cannot_control_a_ready_instance():
             assert not thread.is_alive()
 
 
+def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
+    published_at_send: list[bool] = []
+    shutdown_deadlines: list[float] = []
+    finished_deadlines: list[float] = []
+    shutdown_lock = threading.Lock()
+    both_shutdowns_started = threading.Event()
+    both_shutdowns_finished = threading.Event()
+    release_shutdowns = threading.Event()
+
+    class Connection:
+        def __init__(self, deadline_ns: int, *, fail_response: bool = False):
+            self.deadline_ns = deadline_ns
+            self.fail_response = fail_response
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+        def recv(self, _limit):
+            return (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "capability": "capability",
+                        "command": "stop",
+                        "deadline_ns": self.deadline_ns,
+                    }
+                )
+                + "\n"
+            ).encode()
+
+        def sendall(self, data):
+            response = json.loads(data.splitlines()[0])
+            assert response["status"] == "stopping"
+            published_at_send.append(daemon.stop_requested.is_set())
+            if self.fail_response:
+                raise OSError("caller disconnected during acknowledgement")
+
+    class Control:
+        def __init__(self):
+            self.connections = iter(
+                [
+                    Connection(2_000_000_000, fail_response=True),
+                    Connection(3_000_000_000),
+                ]
+            )
+
+        def accept(self):
+            try:
+                return next(self.connections), None
+            except StopIteration:
+                raise OSError("test control complete") from None
+
+    def shutdown(deadline):
+        with shutdown_lock:
+            shutdown_deadlines.append(deadline)
+            if len(shutdown_deadlines) == 2:
+                both_shutdowns_started.set()
+        assert release_shutdowns.wait(timeout=2)
+        with shutdown_lock:
+            finished_deadlines.append(deadline)
+            if len(finished_deadlines) == 2:
+                both_shutdowns_finished.set()
+        return "timeout"
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 5_000_000_000)
+            daemon.instance = runtime.Instance(
+                instance_id="instance",
+                url=runtime.URL,
+                capability="capability",
+                control=runtime._control_endpoint(1),
+            )
+            daemon.control = Control()
+            with patch.object(daemon, "shutdown", side_effect=shutdown):
+                control_thread = threading.Thread(target=daemon._serve_control)
+                control_thread.start()
+                control_thread.join(timeout=2)
+                assert not control_thread.is_alive()
+                assert both_shutdowns_started.wait(timeout=2)
+                release_shutdowns.set()
+                assert both_shutdowns_finished.wait(timeout=2)
+            assert published_at_send == [True, True]
+            assert sorted(shutdown_deadlines) == [2.0, 3.0]
+            assert sorted(finished_deadlines) == [2.0, 3.0]
+        finally:
+            release_shutdowns.set()
+            os.close(lease_fd)
+
+
 def test_held_lease_retains_valid_stale_record_without_control_or_signal():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -2983,6 +3082,181 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 except runtime.RuntimeErrorBase:
                     pass
                 daemon_thread.join(timeout=3)
+            try:
+                os.close(lease_fd)
+            except OSError:
+                pass
+
+
+def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
+    stop_command = threading.Event()
+    acknowledgement_sent = threading.Event()
+    allow_acknowledgement_return = threading.Event()
+    control_closed = threading.Event()
+    shutdown_started = threading.Event()
+    operation_gate = threading.Lock()
+
+    class Operation:
+        def __init__(self):
+            self.acquired = False
+
+        def acquire(self, *, blocking=True):
+            self.acquired = operation_gate.acquire(blocking=blocking)
+            return self.acquired
+
+        def close(self):
+            if self.acquired:
+                self.acquired = False
+                operation_gate.release()
+
+        def __enter__(self):
+            assert self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    class HeldLease:
+        def acquire(self, *, blocking=True):
+            return False
+
+        def close(self):
+            return None
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def settimeout(self, _timeout):
+            return None
+
+        def recv(self, _limit):
+            return (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "capability": "capability",
+                        "command": "stop",
+                        "deadline_ns": time.monotonic_ns() + 1_000_000_000,
+                    }
+                )
+                + "\n"
+            ).encode()
+
+        def sendall(self, data):
+            response = json.loads(data.splitlines()[0])
+            assert response["status"] == "stopping"
+            acknowledgement_sent.set()
+            assert allow_acknowledgement_return.wait(timeout=2)
+
+    class Control:
+        def __init__(self):
+            self.accepted = False
+
+        def accept(self):
+            if not self.accepted:
+                assert stop_command.wait(timeout=2)
+                self.accepted = True
+                return Connection(), None
+            if control_closed.wait(timeout=0.05):
+                raise OSError("test control closed")
+            raise TimeoutError
+
+        def close(self):
+            control_closed.set()
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        daemon = None
+        control_thread = None
+        stop_thread = None
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 5_000_000_000)
+            daemon.instance = runtime.Instance(
+                instance_id="instance",
+                url=runtime.URL,
+                capability="capability",
+                control=runtime._control_endpoint(1),
+            )
+            daemon.published_record = runtime._write_instance(
+                paths, daemon.instance, deadline=time.monotonic() + 1
+            )
+            daemon.control = Control()
+
+            def send_control(instance, command, **_kwargs):
+                assert instance == daemon.instance
+                if command == "stop":
+                    stop_command.set()
+                    assert acknowledgement_sent.wait(timeout=2)
+                    return {
+                        "status": "stopping",
+                        "instance_id": instance.instance_id,
+                        "url": runtime.URL,
+                    }
+                assert command == "status"
+                return {
+                    "status": "unhealthy" if daemon.stop_requested.is_set() else "ready",
+                    "instance_id": instance.instance_id,
+                    "url": runtime.URL,
+                }
+
+            stop_errors: list[BaseException] = []
+
+            def public_stop():
+                try:
+                    runtime.stop()
+                except BaseException as error:  # noqa: BLE001 - asserted below
+                    stop_errors.append(error)
+
+            def retained_shutdown(_deadline):
+                shutdown_started.set()
+                return "timeout"
+
+            # Exercise the public lifecycle functions and real persisted record
+            # while an in-memory claim/transport fixture exposes the exact
+            # acknowledgement handoff without requiring a loopback socket.
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=send_control
+            ), patch.object(
+                runtime, "_operation_lock", side_effect=lambda *_args, **_kwargs: Operation()
+            ), patch.object(
+                runtime, "_lease_lock", side_effect=lambda *_args, **_kwargs: HeldLease()
+            ), patch.object(runtime, "SHUTDOWN_TIMEOUT", 0.2), patch.object(
+                daemon, "shutdown", side_effect=retained_shutdown
+            ):
+                control_thread = threading.Thread(target=daemon._serve_control)
+                control_thread.start()
+                stop_thread = threading.Thread(target=public_stop)
+                stop_thread.start()
+                assert acknowledgement_sent.wait(timeout=2), (
+                    stop_thread.is_alive(),
+                    stop_errors,
+                    record.exists(),
+                )
+                assert not shutdown_started.is_set()
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime.start()
+                assert daemon.stop_requested.is_set()
+                assert record.exists()
+                allow_acknowledgement_return.set()
+                assert shutdown_started.wait(timeout=2)
+                stop_thread.join(timeout=2)
+                assert not stop_thread.is_alive()
+                assert len(stop_errors) == 1
+                assert isinstance(stop_errors[0], runtime.ShutdownTimeoutError)
+        finally:
+            allow_acknowledgement_return.set()
+            control_closed.set()
+            if stop_thread is not None:
+                stop_thread.join(timeout=2)
+            if control_thread is not None:
+                control_thread.join(timeout=2)
             try:
                 os.close(lease_fd)
             except OSError:
