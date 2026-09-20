@@ -608,14 +608,19 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
 
 def test_public_start_rejects_external_child_path_reacquisition_without_handoff_gap():
     child = (
-        "import os,sys; from pathlib import Path; "
-        "from nyx._native_claim import NativeClaim; "
-        "fd=int(sys.argv[sys.argv.index('--daemon-fd')+1]); "
-        "ack=int(sys.argv[sys.argv.index('--ack-fd')+1]); "
-        "path=Path(sys.argv[sys.argv.index('--claim-path')+1]); "
-        "os.close(fd); contender=NativeClaim(path); "
-        "acquired=contender.acquire(create=False,blocking=False); "
-        "Path(sys.argv[1]).write_text('free' if acquired else 'busy',encoding='utf-8'); "
+        "import os,sys\n"
+        "from pathlib import Path\n"
+        "from nyx._native_claim import NativeClaim\n"
+        "if '--daemon-handle' in sys.argv:\n"
+        "    fd=NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--daemon-handle')+1]))\n"
+        "    ack=NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--ack-handle')+1]), write_only=True)\n"
+        "else:\n"
+        "    fd=int(sys.argv[sys.argv.index('--daemon-fd')+1])\n"
+        "    ack=int(sys.argv[sys.argv.index('--ack-fd')+1])\n"
+        "path=Path(sys.argv[sys.argv.index('--claim-path')+1])\n"
+        "os.close(fd); contender=NativeClaim(path)\n"
+        "acquired=contender.acquire(create=False,blocking=False)\n"
+        "Path(sys.argv[1]).write_text('free' if acquired else 'busy',encoding='utf-8')\n"
         "os.write(ack,b'1' if acquired else b'0'); contender.close()"
     )
     with TemporaryDirectory() as temporary:
