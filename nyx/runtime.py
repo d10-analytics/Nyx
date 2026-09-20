@@ -997,6 +997,7 @@ class _Daemon:
         try:
             self.startup_failure_code = 23
             state.load_configuration(self.paths)
+            _require_deadline(self._deadline())
             self.startup_failure_code = 24
             self.server = create_server(provider=self._provider, port=PORT)
             self.http_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -1305,6 +1306,7 @@ def setup(
                 current = state.load_configuration(paths)
             except state.StateError as error:
                 raise ActiveInstanceError("active Nyx instance has no usable configuration") from error
+            _require_deadline(deadline)
             effective_hidden = (
                 current.hidden_stages
                 if requested_hidden is state._OMITTED
