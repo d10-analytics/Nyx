@@ -299,6 +299,23 @@ def test_free_lease_retains_unsafe_instance_record():
         assert paths.runtime_directory.joinpath("instance.json").is_symlink()
 
 
+def test_shutdown_does_not_remove_replaced_instance_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        record.write_bytes(b"daemon-record")
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+                record.write_bytes(b"replacement-record")
+                assert daemon.shutdown(deadline=time.monotonic() + 1) == "stopped"
+            assert record.read_bytes() == b"replacement-record"
+        finally:
+            os.close(lease_fd)
+
+
 def test_wrong_capability_cannot_control_a_ready_instance():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
