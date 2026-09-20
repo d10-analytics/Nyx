@@ -1524,10 +1524,35 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
         released = threading.Event()
+        listener.settimeout(1)
+        probe_notes: list[tuple[str, str, tuple[str, ...]]] = []
+        real_probe = runtime.NativeClaim.probe
+        real_identity = _native_claim._identity
+
+        def probe(path: Path) -> str:
+            identities: list[tuple[int, ...]] = []
+
+            def identity(details: os.stat_result) -> tuple[int, ...]:
+                result = real_identity(details)
+                identities.append(result)
+                return result
+
+            with patch.object(_native_claim, "_identity", side_effect=identity):
+                result = real_probe(path)
+            fields = ("device", "inode", "mode", "size", "modified", "created")
+            differences = tuple(
+                field for index, field in enumerate(fields)
+                if len(identities) == 2 and identities[0][index] != identities[1][index]
+            )
+            probe_notes.append(("operation" if path.name == "operation.lock" else "lease", result, differences))
+            return result
 
         def serve() -> None:
             nonlocal lease_fd
-            connection, _ = listener.accept()
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                return
             with connection:
                 connection.recv(4096)
                 os.close(lease_fd)
@@ -1540,14 +1565,16 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
         server = threading.Thread(target=serve)
         server.start()
         try:
-            observed = _observe(paths)
+            with patch.object(runtime.NativeClaim, "probe", side_effect=probe):
+                observed = _observe(paths)
         finally:
-            listener.close()
             server.join(timeout=3)
+            listener.close()
             lease.close()
             if lease_fd >= 0:
                 os.close(lease_fd)
-        assert released.is_set()
+        assert released.is_set(), (observed.status, observed.diagnostic, probe_notes)
+        assert not server.is_alive()
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
 
@@ -1918,12 +1945,17 @@ def test_worker_resistant_child_keeps_manager_ownership_after_shared_deadline():
     with patch.object(worker.subprocess, "Popen", side_effect=portable_popen):
         thread.start()
         deadline = time.monotonic() + 2
-        while manager.active_count == 0 and time.monotonic() < deadline:
+        child = None
+        while time.monotonic() < deadline:
+            with manager._lock:
+                if manager._children:
+                    child = manager._children[0]
+                    break
             time.sleep(0.01)
+        assert child is not None
         assert manager.active_count == 1
         assert manager.close(time.monotonic() + 0.2) is False
         assert manager.active_count == 1
-        child = manager._children[0]
         child.process.kill()
         assert manager.close(time.monotonic() + 2)
         thread.join(timeout=2)
