@@ -34,7 +34,9 @@ def _identity(details: os.stat_result) -> tuple[int, int, int, int, int, int]:
         details.st_mode,
         details.st_size,
         details.st_mtime_ns,
-        details.st_ctime_ns,
+        # Windows path stat and descriptor stat can expose different ctime
+        # meanings. Birth time is the same creation timestamp in both APIs.
+        details.st_birthtime_ns if os.name == "nt" else details.st_ctime_ns,
     )
 
 
