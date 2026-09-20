@@ -3,13 +3,14 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pytest
 
-from nyx import state
+from nyx import runtime, state
 from nyx.catalog import scan_catalog
 
 
@@ -139,7 +140,49 @@ def test_invalid_replacement_preserves_exact_previous_configuration_bytes():
             with pytest.raises(state.SpecificationRootError):
                 state.setup(missing)
             assert config_file.read_bytes() == before
-            assert state.load_configuration().specification_root == first.resolve()
+        assert state.load_configuration().specification_root == first.resolve()
+
+
+def test_expired_admission_preserves_existing_configuration_and_claims():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            claims = [paths.runtime_directory / "operation.lock", paths.runtime_directory / "lease.lock"]
+            for claim in claims:
+                claim.write_bytes(b"claim-bytes")
+            before = {
+                path: (path.lstat().st_ino, path.lstat().st_size, path.read_bytes())
+                for path in claims
+            }
+            config_before = paths.config_file.read_bytes()
+            original_lstat = state._lstat
+            lookup_count = 0
+
+            def delayed_admission_lookup(path):
+                nonlocal lookup_count
+                lookup_count += 1
+                if lookup_count == 1:
+                    time.sleep(0.03)
+                return original_lstat(path)
+
+            with patch.object(runtime, "STARTUP_TIMEOUT", 0.01), patch.object(
+                state, "_lstat", side_effect=delayed_admission_lookup
+            ), pytest.raises(runtime.StartupError):
+                state.setup(second)
+
+            assert paths.config_file.read_bytes() == config_before
+            after = {
+                path: (path.lstat().st_ino, path.lstat().st_size, path.read_bytes())
+                for path in claims
+            }
+
+        assert after == before
 
 
 def test_hidden_stages_are_deduplicated_and_scalar_sorted_without_normalization():

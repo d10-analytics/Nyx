@@ -643,11 +643,40 @@ def test_expired_public_admission_leaves_fresh_state_tree_absent(operation, time
         home.mkdir()
         specification = base / "spec"
         specification.mkdir()
+        original_lstat = state._lstat
+        lookup_count = 0
+
+        def delayed_admission_lookup(path):
+            nonlocal lookup_count
+            lookup_count += 1
+            if lookup_count == 1:
+                time.sleep(0.03)
+            return original_lstat(path)
+
         with patch.object(state, "resolve_account_home", return_value=home), patch.object(
-            runtime, timeout_name, 0.0
-        ), pytest.raises((TimeoutError, runtime.RuntimeErrorBase)):
+            runtime, timeout_name, 0.01
+        ), patch.object(state, "_lstat", side_effect=delayed_admission_lookup), pytest.raises(
+            (TimeoutError, runtime.RuntimeErrorBase)
+        ):
             operation(specification)
         assert not (home / ".nyx").exists()
+
+
+def test_native_open_retry_rechecks_public_deadline_before_retrying():
+    busy = OSError(13, "sharing violation")
+    busy.winerror = 32
+    original_sleep = time.sleep
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "STARTUP_TIMEOUT", 0.01
+        ), patch.object(_native_claim, "_open_claim", side_effect=busy) as open_claim, patch.object(
+            _native_claim.time, "sleep", side_effect=lambda _interval: original_sleep(0.02)
+        ), pytest.raises(runtime.RuntimeErrorBase):
+            runtime.start()
+
+    assert open_claim.call_count == 1
 
 
 def test_active_start_propagates_its_public_deadline_to_status_control():
