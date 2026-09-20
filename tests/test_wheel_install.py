@@ -151,7 +151,6 @@ def test_built_wheel_python_and_static_members_have_current_terms():
 
 def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():
     wheel = _wheel_path()
-    pytest.importorskip("playwright.sync_api")
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         venv = root / "venv"
@@ -468,6 +467,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             assert response.status == 200
             assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/installed-demo"
 
+            pytest.importorskip("playwright.sync_api")
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as api:
