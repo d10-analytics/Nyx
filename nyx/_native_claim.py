@@ -49,6 +49,13 @@ def _busy(error: OSError) -> bool:
     }
 
 
+def _sharing_busy(error: OSError) -> bool:
+    """Return whether an open failed because Windows share-zero is held."""
+
+    winerror = getattr(error, "winerror", None)
+    return winerror in {32, 33} or (os.name == "nt" and error.errno in {32, 33})
+
+
 def _remaining(deadline: float | None) -> float:
     if deadline is None:
         return 0.02
@@ -133,6 +140,8 @@ class NativeClaim:
         blocking: bool = True,
         deadline: float | None = None,
     ) -> bool:
+        if deadline is not None and _remaining(deadline) <= 0:
+            raise TimeoutError("native claim deadline expired")
         try:
             fd = _open_claim(self.path, create=create)
             details = os.fstat(fd)
@@ -140,10 +149,17 @@ class NativeClaim:
                 os.close(fd)
                 raise OSError(errno.ELOOP, "claim is not a regular file")
             if details.st_size == 0:
+                if deadline is not None and _remaining(deadline) <= 0:
+                    os.close(fd)
+                    raise TimeoutError("native claim deadline expired")
                 os.write(fd, b"\0")
-        except OSError:
+        except OSError as error:
+            if _sharing_busy(error):
+                return False
             raise
         try:
+            if deadline is not None and _remaining(deadline) <= 0:
+                raise TimeoutError("native claim deadline expired")
             if not _lock_fd(fd, blocking=blocking, deadline=deadline):
                 os.close(fd)
                 return False
@@ -187,7 +203,7 @@ class NativeClaim:
             # A share-zero Windows owner prevents even an existing-only open.
             # That qualified sharing violation is the ownership observation;
             # unrelated open failures remain unsafe.
-            return "held" if _busy(error) else "unsafe"
+            return "held" if _sharing_busy(error) else "unsafe"
         if not _regular(before):
             return "unsafe"
         fd: int | None = None
@@ -207,7 +223,7 @@ class NativeClaim:
         except FileNotFoundError:
             return "changed"
         except OSError as error:
-            return "held" if _busy(error) else "unsafe"
+            return "held" if _sharing_busy(error) else "unsafe"
         finally:
             if fd is not None:
                 os.close(fd)

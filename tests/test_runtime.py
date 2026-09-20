@@ -178,9 +178,14 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
 
         def start(self):
             events.append("thread-start")
+            if self.target.__name__ == "_finish_start_failure_cleanup":
+                self.target()
 
         def join(self, timeout=None):
             return None
+
+        def is_alive(self):
+            return False
 
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -256,10 +261,15 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
             self.target = target
 
         def start(self):
+            if self.target.__name__ == "_finish_start_failure_cleanup":
+                self.target()
             return None
 
         def join(self, timeout=None):
             return None
+
+        def is_alive(self):
+            return False
 
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -294,6 +304,74 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
             "http-close",
             "control-close",
         ]
+        contender = runtime._lease_lock(paths, timeout=0.0)
+        assert contender.acquire(blocking=False)
+        contender.close()
+
+
+def test_external_catalog_request_stays_closed_during_failed_publication():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        worker_marker = root / "worker-started"
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        assert lease.fd is not None
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 5_000_000_000)
+        daemon.workers = runtime.CatalogWorkerManager(
+            command_factory=lambda: [
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(worker_marker)!r}).write_text('started')",
+            ]
+        )
+        publication_entered = threading.Event()
+        allow_failure = threading.Event()
+
+        def fail_publication(*_args, **_kwargs):
+            publication_entered.set()
+            assert allow_failure.wait(timeout=3)
+            raise runtime.StartupError("injected publication failure")
+
+        result: list[int] = []
+        with patch.object(runtime, "_write_instance", side_effect=fail_publication):
+            daemon_thread = threading.Thread(target=lambda: result.append(daemon.run()))
+            daemon_thread.start()
+            try:
+                assert publication_entered.wait(timeout=5)
+                connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=2)
+                try:
+                    connection.request(
+                        "GET",
+                        "/api/catalog",
+                        headers={"Host": f"127.0.0.1:{runtime.PORT}"},
+                    )
+                    response = connection.getresponse()
+                    body = json.loads(response.read())
+                finally:
+                    connection.close()
+                assert response.status == 502
+                assert body == {"error": "producer_unavailable"}
+                assert not worker_marker.exists()
+                contender = runtime._lease_lock(paths, timeout=0.0)
+                assert not contender.acquire(blocking=False)
+                contender.close()
+            finally:
+                allow_failure.set()
+                daemon_thread.join(timeout=5)
+
+        assert not daemon_thread.is_alive()
+        assert result == [1]
+        assert not worker_marker.exists()
+        assert not (paths.runtime_directory / "instance.json").exists()
         contender = runtime._lease_lock(paths, timeout=0.0)
         assert contender.acquire(blocking=False)
         contender.close()
@@ -340,6 +418,34 @@ def test_active_start_propagates_its_public_deadline_to_status_control():
         assert send.call_args.kwargs["deadline"] > time.monotonic()
 
 
+def test_public_setup_propagates_one_deadline_into_lifetime_acquisition():
+    seen: list[float | None] = []
+    original = runtime._lease_lock
+
+    def capture(paths, *, timeout=runtime.LOCK_TIMEOUT, deadline=None):
+        seen.append(deadline)
+        return original(paths, timeout=timeout, deadline=deadline)
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, specification = _fixture(root)
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_lease_lock", side_effect=capture
+        ):
+            assert runtime.setup(specification).specification_root == specification.resolve()
+    assert len(seen) == 1
+    assert seen[0] is not None and seen[0] > time.monotonic()
+
+
+def test_expired_lifetime_deadline_prevents_native_open():
+    lock = runtime._FileLock(Path("lease.lock"), deadline=time.monotonic() - 1)
+    with patch.object(_native_claim, "_open_claim") as open_claim, pytest.raises(
+        runtime.UnhealthyInstanceError
+    ):
+        lock.acquire(blocking=False)
+    open_claim.assert_not_called()
+
+
 def test_failed_acknowledgement_keeps_parent_claim_until_child_reaped():
     class Process:
         def __init__(self):
@@ -378,6 +484,152 @@ def test_failed_acknowledgement_keeps_parent_claim_until_child_reaped():
         ):
             runtime.start()
         assert process.reaped
+        contender = runtime._lease_lock(paths, timeout=0.0)
+        assert contender.acquire(blocking=False)
+        contender.close()
+
+
+def test_resistant_failed_child_defers_claim_release_without_additive_wait():
+    release = threading.Event()
+
+    class Process:
+        killed = False
+        reaped = False
+
+        def poll(self):
+            return None if not self.reaped else 1
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            assert release.wait(timeout=2)
+            self.reaped = True
+            return 1
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        process = Process()
+        started = time.monotonic()
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "STARTUP_TIMEOUT", 0.05
+        ), patch.object(runtime, "_spawn_daemon", return_value=process), patch.object(
+            runtime, "_wait_for_ack", return_value=False
+        ), pytest.raises(runtime.StartupError):
+            runtime.start()
+        assert time.monotonic() - started < 0.5
+        assert process.killed
+        contender = runtime._lease_lock(paths, timeout=0.0)
+        assert not contender.acquire(blocking=False)
+        contender.close()
+        release.set()
+        deadline = time.monotonic() + 2
+        while not process.reaped and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert process.reaped
+        contender = runtime._lease_lock(paths, timeout=0.0)
+        assert contender.acquire(blocking=False)
+        contender.close()
+
+
+def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+
+    class Server:
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            cleanup_entered.set()
+            assert allow_cleanup.wait(timeout=2)
+
+        def close_active_connections(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class Control:
+        def getsockname(self):
+            return ("127.0.0.1", 43210)
+
+        def close(self):
+            return None
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        assert lease.fd is not None
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 50_000_000)
+        with patch.object(runtime, "create_server", return_value=Server()), patch.object(
+            daemon, "_static_ready", return_value=True
+        ), patch.object(daemon, "_bind_control", return_value=Control()), patch.object(
+            daemon, "_serve_control", return_value=None
+        ), patch.object(
+            runtime,
+            "_send_control",
+            return_value={"status": "ready", "url": runtime.URL},
+        ), patch.object(
+            runtime, "_write_instance", side_effect=runtime.StartupError("publication failed")
+        ):
+            daemon_thread = threading.Thread(target=daemon.run)
+            daemon_thread.start()
+            assert cleanup_entered.wait(timeout=1)
+            deadline = time.monotonic() + 1
+            while daemon.shutdown_result != "timeout" and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert daemon.shutdown_result == "timeout"
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            assert not contender.acquire(blocking=False)
+            contender.close()
+            allow_cleanup.set()
+            daemon_thread.join(timeout=2)
+
+        assert not daemon_thread.is_alive()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            if contender.acquire(blocking=False):
+                contender.close()
+                break
+            contender.close()
+            time.sleep(0.01)
+        else:
+            raise AssertionError("startup cleanup did not release its lifetime claim")
+
+
+def test_public_start_rejects_external_child_path_reacquisition_without_handoff_gap():
+    child = (
+        "import os,sys; from pathlib import Path; "
+        "from nyx._native_claim import NativeClaim; "
+        "fd=int(sys.argv[sys.argv.index('--daemon-fd')+1]); "
+        "ack=int(sys.argv[sys.argv.index('--ack-fd')+1]); "
+        "path=Path(sys.argv[sys.argv.index('--claim-path')+1]); "
+        "os.close(fd); contender=NativeClaim(path); "
+        "acquired=contender.acquire(create=False,blocking=False); "
+        "Path(sys.argv[1]).write_text('free' if acquired else 'busy',encoding='utf-8'); "
+        "os.write(ack,b'1' if acquired else b'0'); contender.close()"
+    )
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        marker = root / "child-result"
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime,
+            "_daemon_command",
+            side_effect=lambda _deadline_ns: [sys.executable, "-c", child, str(marker)],
+        ), pytest.raises(runtime.StartupError):
+            runtime.start()
+        assert marker.read_text(encoding="utf-8") == "busy"
+        assert not (paths.runtime_directory / "instance.json").exists()
         contender = runtime._lease_lock(paths, timeout=0.0)
         assert contender.acquire(blocking=False)
         contender.close()
@@ -1580,6 +1832,110 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
         probe.close()
         with patch.object(runtime, "_paths", return_value=paths):
             assert runtime.stop() == "stopped"
+
+
+def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "spec"
+        specification_root.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification_root)
+            paths = state.state_paths()
+        launcher = subprocess.run(
+            [sys.executable, "-c", "from nyx import runtime; print(runtime.start())"],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        try:
+            assert launcher.returncode == 0, launcher.stderr
+            assert launcher.stdout.strip() == runtime.URL
+            _wait_for_record(paths)
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            assert not contender.acquire(blocking=False)
+            contender.close()
+        finally:
+            with patch.object(runtime, "_paths", return_value=paths):
+                runtime.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher kill phase")
+def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit():
+    child = (
+        "import os,sys,time; from pathlib import Path; "
+        "from nyx._native_claim import NativeClaim; "
+        "fd=int(sys.argv[sys.argv.index('--daemon-fd')+1]); "
+        "ack=int(sys.argv[sys.argv.index('--ack-fd')+1]); "
+        "path=Path(sys.argv[sys.argv.index('--claim-path')+1]); "
+        "time.sleep(.4); valid=NativeClaim.validate_received(fd,path); "
+        "exec(\"try:\\n os.write(ack,b'1' if valid else b'0')\\nexcept OSError:\\n pass\"); "
+        "os.close(ack); os.close(fd)"
+    )
+    launcher_code = (
+        "import os,sys,time; from pathlib import Path; from nyx import runtime; "
+        "paths=runtime._paths(create=True); lease=runtime._lease_lock(paths,timeout=0); "
+        "assert lease.acquire(blocking=False); read_fd,write_fd=os.pipe(); "
+        f"runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r}]; "
+        "process=runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
+        "ack_fd=write_fd,claim_path=paths.runtime_directory/'lease.lock'); "
+        "Path(sys.argv[1]).write_text(str(process.pid),encoding='utf-8'); time.sleep(30)"
+    )
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification = root / "spec"
+        specification.mkdir()
+        site_directory = root / "site"
+        environment = _subprocess_environment(home, site_directory)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(specification)
+            paths = state.state_paths()
+        marker = root / "spawned"
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", launcher_code, str(marker)],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not marker.exists() and launcher.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists()
+            launcher.kill()
+            launcher.wait(timeout=2)
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            assert not contender.acquire(blocking=False)
+            contender.close()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                contender = runtime._lease_lock(paths, timeout=0.0)
+                if contender.acquire(blocking=False):
+                    contender.close()
+                    break
+                contender.close()
+                time.sleep(0.02)
+            else:
+                raise AssertionError("inherited claim did not release after failed acknowledgement")
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.wait(timeout=2)
 
 
 def test_actual_launcher_death_before_spawn_releases_lease():

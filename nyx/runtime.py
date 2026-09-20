@@ -122,11 +122,18 @@ class _FileLock:
         if deadline is not None and time.monotonic() >= deadline:
             raise _ControlTimeoutError("operation deadline expired")
         try:
+            claim_deadline = (
+                deadline
+                if deadline is not None
+                else (time.monotonic() + self.timeout if blocking else None)
+            )
             return self._claim.acquire(
                 create=True,
                 blocking=blocking,
-                deadline=time.monotonic() + self.timeout if deadline is None else deadline,
+                deadline=claim_deadline,
             )
+        except TimeoutError as error:
+            raise _ControlTimeoutError("operation deadline expired") from error
         except OSError as error:
             raise RuntimeErrorBase("Nyx lock is unavailable") from error
 
@@ -315,8 +322,13 @@ def _operation_lock(
     return _FileLock(paths.runtime_directory / "operation.lock", timeout=timeout, deadline=deadline)
 
 
-def _lease_lock(paths: state.StatePaths, *, timeout: float = LOCK_TIMEOUT) -> _FileLock:
-    return _FileLock(paths.runtime_directory / "lease.lock", timeout=timeout)
+def _lease_lock(
+    paths: state.StatePaths,
+    *,
+    timeout: float = LOCK_TIMEOUT,
+    deadline: float | None = None,
+) -> _FileLock:
+    return _FileLock(paths.runtime_directory / "lease.lock", timeout=timeout, deadline=deadline)
 
 
 def _control_name() -> str:
@@ -809,43 +821,45 @@ class _Daemon:
                 self._cleanup_start_failure()
 
     def _cleanup_start_failure(self) -> None:
-        deadline = self._deadline()
-        if time.monotonic() >= deadline:
-            self.shutdown_result = "timeout"
-            return
+        # Publish retention before the asynchronous cleanup can finish.  The
+        # cleanup thread is the sole writer of the terminal state, avoiding a
+        # race that could overwrite ``stopped`` with ``timeout`` forever.
+        self.shutdown_result = "timeout"
+        cleanup = threading.Thread(target=self._finish_start_failure_cleanup, daemon=True)
+        cleanup.start()
+        cleanup.join(timeout=max(0.0, self._deadline() - time.monotonic()))
+
+    def _finish_start_failure_cleanup(self) -> None:
         self.catalog_admitted = False
-        self.workers.close_admission()
-        if self.server is not None:
-            if time.monotonic() >= deadline:
-                self.shutdown_result = "timeout"
-                return
-            self.server.shutdown()
-            if time.monotonic() >= deadline:
-                self.shutdown_result = "timeout"
-                return
-            self.server.close_active_connections()
-            if time.monotonic() >= deadline:
-                self.shutdown_result = "timeout"
-                return
-            self.server.server_close()
         try:
-            if self.published_record is not None and _record_unchanged(
-                _record_path(self.paths), self.published_record
-            ):
-                if time.monotonic() >= deadline:
-                    self.shutdown_result = "timeout"
-                    return
-                _record_path(self.paths).unlink()
-        except OSError:
-            pass
-        if self.control is not None:
-            if time.monotonic() >= deadline:
-                self.shutdown_result = "timeout"
-                return
             try:
-                self.control.close()
+                self.workers.close_admission()
+            except Exception:
+                pass
+            if self.server is not None:
+                for cleanup in (
+                    self.server.shutdown,
+                    self.server.close_active_connections,
+                    self.server.server_close,
+                ):
+                    try:
+                        cleanup()
+                    except Exception:
+                        pass
+            try:
+                if self.published_record is not None and _record_unchanged(
+                    _record_path(self.paths), self.published_record
+                ):
+                    _record_path(self.paths).unlink()
             except OSError:
                 pass
+            if self.control is not None:
+                try:
+                    self.control.close()
+                except OSError:
+                    pass
+        finally:
+            self.shutdown_result = "stopped"
 
     def shutdown(self, deadline: float | None = None) -> str:
         try:
@@ -913,12 +927,21 @@ class _Daemon:
                 # or connection shutdown is unresolved.
                 while self.shutdown_result == "timeout":
                     time.sleep(1.0)
-            else:
-                try:
-                    os.close(self.lease_fd)
-                except OSError:
-                    pass
+            try:
+                os.close(self.lease_fd)
+            except OSError:
+                pass
         return 0
+
+
+def _daemon_command(deadline_ns: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "nyx.runtime",
+        "--deadline-ns",
+        str(deadline_ns),
+    ]
 
 
 def _spawn_daemon(
@@ -928,13 +951,7 @@ def _spawn_daemon(
     ack_fd: int | None = None,
     claim_path: Path | None = None,
 ) -> subprocess.Popen[bytes]:
-    command = [
-        sys.executable,
-        "-m",
-        "nyx.runtime",
-        "--deadline-ns",
-        str(deadline_ns),
-    ]
+    command = _daemon_command(deadline_ns)
     pass_fds = [lease_fd]
     if claim_path is not None:
         command += ["--claim-path", str(claim_path)]
@@ -992,17 +1009,33 @@ def _wait_for_ack(
     return False
 
 
-def _terminate_and_reap(process: subprocess.Popen[bytes], deadline: float) -> None:
+def _terminate_and_reap(process: subprocess.Popen[bytes], deadline: float) -> bool:
     """Stop a failed child without granting it a replacement wait budget."""
 
     if process.poll() is not None:
-        return
+        return True
     process.terminate()
     try:
         process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return False
+    return True
+
+
+def _release_claim_after_reap(process: subprocess.Popen[bytes], claim: _FileLock) -> None:
+    """Retain a parent claim until a resistant failed child is actually reaped."""
+
+    def reap() -> None:
+        try:
+            process.wait()
+        finally:
+            claim.close()
+
+    threading.Thread(target=reap, daemon=True).start()
 
 
 def _ack_received_claim(fd: int, claim_path: Path, ack_fd: int) -> bool:
@@ -1040,7 +1073,7 @@ def setup(
         raise StartupError("Nyx setup timed out") from error
     with _operation_lock(paths, deadline=deadline):
         _require_deadline(deadline)
-        lease = _lease_lock(paths, timeout=0.0)
+        lease = _lease_lock(paths, timeout=0.0, deadline=deadline)
         if not lease.acquire(blocking=False):
             try:
                 current = state.load_configuration(paths)
@@ -1100,13 +1133,14 @@ def start() -> str:
     with _operation_lock(paths, deadline=deadline):
         state.load_configuration(paths)
         _require_deadline(deadline)
-        lease = _lease_lock(paths, timeout=0.0)
+        lease = _lease_lock(paths, timeout=0.0, deadline=deadline)
         if not lease.acquire(blocking=False):
             instance = _read_instance(paths)
             response = _send_control(instance, "status", deadline=deadline)
             if response.get("status") != "ready" or response.get("url") != URL:
                 raise UnhealthyInstanceError("Nyx instance is unhealthy")
             return URL
+        release_deferred = False
         try:
             _remove_stale_instance(paths, deadline=deadline)
             _require_deadline(deadline)
@@ -1123,22 +1157,27 @@ def start() -> str:
                 os.close(ack_write)
                 ack_write = -1
                 if not _wait_for_ack(process, ack_read, deadline):
-                    _terminate_and_reap(process, deadline)
+                    if not _terminate_and_reap(process, deadline):
+                        _release_claim_after_reap(process, lease)
+                        release_deferred = True
                     raise StartupError("Nyx daemon did not validate its inherited claim")
                 # The child now owns the same native object.  Closing this
                 # descriptor is the handoff; no path reopen occurs in child.
                 lease.close()
                 return _wait_ready(paths, process, deadline).url
             except BaseException:
-                if process is not None:
-                    _terminate_and_reap(process, deadline)
+                if process is not None and not release_deferred:
+                    if not _terminate_and_reap(process, deadline):
+                        _release_claim_after_reap(process, lease)
+                        release_deferred = True
                 raise
             finally:
                 os.close(ack_read)
                 if ack_write >= 0:
                     os.close(ack_write)
         except BaseException:
-            lease.close()
+            if not release_deferred:
+                lease.close()
             raise
 
 
@@ -1152,7 +1191,7 @@ def stop() -> str:
         raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained") from error
     with _operation_lock(paths, deadline=deadline):
         _require_deadline(deadline)
-        lease = _lease_lock(paths, timeout=0.0)
+        lease = _lease_lock(paths, timeout=0.0, deadline=deadline)
         if lease.acquire(blocking=False):
             lease.close()
             _remove_stale_instance(paths, deadline=deadline)
@@ -1165,7 +1204,7 @@ def stop() -> str:
             deadline_ns=deadline_ns,
         )
         while time.monotonic() < deadline:
-            probe = _lease_lock(paths, timeout=0.0)
+            probe = _lease_lock(paths, timeout=0.0, deadline=deadline)
             if probe.acquire(blocking=False):
                 probe.close()
                 _remove_stale_instance(paths, deadline=deadline)
