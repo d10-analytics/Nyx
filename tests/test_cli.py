@@ -33,6 +33,42 @@ def test_start_and_stop_are_terminal_commands(capsys):
     assert capsys.readouterr().out.splitlines() == [runtime.URL, "stopped"]
 
 
+def test_real_setup_cli_uses_portable_state_layout(capsys):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification = root / "spec"
+        specification.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            assert cli.main(["--setup", str(specification)]) == 0
+        paths = state.StatePaths(
+            account_home=home,
+            config_directory=home / ".nyx" / "config",
+            config_file=home / ".nyx" / "config" / "config.json",
+            state_directory=home / ".nyx",
+            deployment_file=home / ".nyx" / "runtime" / "deployment.json",
+            runtime_directory=home / ".nyx" / "runtime",
+        )
+        assert paths.config_file.is_file()
+        assert paths.runtime_directory.is_dir()
+        assert not (home / ".config" / "nyx").exists()
+        assert not (home / ".local" / "state" / "nyx").exists()
+        assert capsys.readouterr().out == f"configured {specification.resolve()}\n"
+
+
+def test_expired_start_cli_reports_bounded_error_without_creating_state(capsys):
+    with TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        home.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+            runtime, "STARTUP_TIMEOUT", 0.0
+        ):
+            assert cli.main([]) == 1
+        assert not (home / ".nyx").exists()
+        assert capsys.readouterr().err == "nyx: Nyx startup timed out\n"
+
+
 def test_setup_replaces_hidden_stage_policy_from_repeated_options(capsys):
     class Configuration:
         specification_root = "/private/spec-root"

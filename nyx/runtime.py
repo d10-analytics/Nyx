@@ -101,9 +101,16 @@ class Instance:
 
 
 class _FileLock:
-    def __init__(self, path: Path, *, timeout: float = LOCK_TIMEOUT) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        timeout: float = LOCK_TIMEOUT,
+        deadline: float | None = None,
+    ) -> None:
         self.path = path
         self.timeout = timeout
+        self.deadline = deadline
         self._claim = NativeClaim(path)
 
     @property
@@ -111,11 +118,14 @@ class _FileLock:
         return self._claim.fd
 
     def acquire(self, *, blocking: bool = True) -> bool:
+        deadline = self.deadline
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _ControlTimeoutError("operation deadline expired")
         try:
             return self._claim.acquire(
                 create=True,
                 blocking=blocking,
-                deadline=time.monotonic() + self.timeout,
+                deadline=time.monotonic() + self.timeout if deadline is None else deadline,
             )
         except OSError as error:
             raise RuntimeErrorBase("Nyx lock is unavailable") from error
@@ -296,8 +306,13 @@ def _paths(
     return state.state_paths(create=create, deadline=deadline, deadline_ns=deadline_ns)
 
 
-def _operation_lock(paths: state.StatePaths, *, timeout: float = LOCK_TIMEOUT) -> _FileLock:
-    return _FileLock(paths.runtime_directory / "operation.lock", timeout=timeout)
+def _operation_lock(
+    paths: state.StatePaths,
+    *,
+    timeout: float = LOCK_TIMEOUT,
+    deadline: float | None = None,
+) -> _FileLock:
+    return _FileLock(paths.runtime_directory / "operation.lock", timeout=timeout, deadline=deadline)
 
 
 def _lease_lock(paths: state.StatePaths, *, timeout: float = LOCK_TIMEOUT) -> _FileLock:
@@ -363,22 +378,42 @@ def _read_instance(paths: state.StatePaths) -> Instance:
         raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
 
 
-def _write_instance(paths: state.StatePaths, instance: Instance) -> None:
+def _write_instance(
+    paths: state.StatePaths,
+    instance: Instance,
+    *,
+    deadline: float,
+) -> _Metadata:
     data = (json.dumps(instance.as_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd: int | None = None
     temporary: str | None = None
     try:
+        _require_deadline(deadline)
         fd, temporary = tempfile.mkstemp(prefix=".instance.json.", dir=paths.runtime_directory)
+        _require_deadline(deadline)
         os.fchmod(fd, 0o600)
         written = 0
         while written < len(data):
+            _require_deadline(deadline)
             written += os.write(fd, data[written:])
+        _require_deadline(deadline)
         os.fsync(fd)
         os.close(fd)
+        fd = None
+        _require_deadline(deadline)
         os.replace(temporary, _record_path(paths))
         temporary = None
+        return _record_snapshot(_record_path(paths))
+    except _ControlTimeoutError as error:
+        raise StartupError("Nyx startup timed out before readiness publication") from error
     except OSError as error:
         raise StartupError("Nyx could not publish readiness") from error
     finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if temporary is not None:
             try:
                 os.unlink(temporary)
@@ -386,7 +421,7 @@ def _write_instance(paths: state.StatePaths, instance: Instance) -> None:
                 pass
 
 
-def _remove_stale_instance(paths: state.StatePaths) -> None:
+def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
     try:
         record = _record_path(paths)
         details = record.lstat()
@@ -395,6 +430,7 @@ def _remove_stale_instance(paths: state.StatePaths) -> None:
             or not stat.S_ISREG(details.st_mode)
         ):
             raise UnhealthyInstanceError("Nyx instance record is unsafe")
+        _require_deadline(deadline)
         record.unlink()
     except FileNotFoundError:
         pass
@@ -635,7 +671,9 @@ class _Daemon:
         self.lease_fd = lease_fd
         self.deadline_ns = deadline_ns
         self.ack_fd = ack_fd
-        self.paths = _paths(create=True)
+        if time.monotonic_ns() >= deadline_ns:
+            raise StartupError("Nyx startup timed out")
+        self.paths = _paths(create=True, deadline_ns=deadline_ns)
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
         self.shutdown_done = threading.Event()
@@ -647,6 +685,7 @@ class _Daemon:
         self.http_thread: threading.Thread | None = None
         self.shutdown_result: str = "running"
         self.catalog_admitted = False
+        self.published_record: _Metadata | None = None
 
     def _deadline(self) -> float:
         return self.deadline_ns / 1_000_000_000
@@ -746,12 +785,20 @@ class _Daemon:
                 capability=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("="),
                 control=_control_endpoint(self.control.getsockname()[1]),
             )
-            if time.monotonic() >= self._deadline():
-                raise StartupError("Nyx startup timed out")
-            _write_instance(self.paths, self.instance)
-            self.catalog_admitted = True
             self.control_thread = threading.Thread(target=self._serve_control, daemon=True)
             self.control_thread.start()
+            try:
+                response = _send_control(self.instance, "status", deadline=self._deadline())
+            except UnhealthyInstanceError as error:
+                raise StartupError("Nyx control endpoint did not become ready") from error
+            if response.get("status") != "ready" or response.get("url") != URL:
+                raise StartupError("Nyx control endpoint did not become ready")
+            self.published_record = _write_instance(
+                self.paths,
+                self.instance,
+                deadline=self._deadline(),
+            )
+            self.catalog_admitted = True
             self.http_thread.join()
         except OSError as error:
             if error.errno in (errno.EADDRINUSE, errno.EACCES):
@@ -762,20 +809,43 @@ class _Daemon:
                 self._cleanup_start_failure()
 
     def _cleanup_start_failure(self) -> None:
+        deadline = self._deadline()
+        if time.monotonic() >= deadline:
+            self.shutdown_result = "timeout"
+            return
+        self.catalog_admitted = False
+        self.workers.close_admission()
+        if self.server is not None:
+            if time.monotonic() >= deadline:
+                self.shutdown_result = "timeout"
+                return
+            self.server.shutdown()
+            if time.monotonic() >= deadline:
+                self.shutdown_result = "timeout"
+                return
+            self.server.close_active_connections()
+            if time.monotonic() >= deadline:
+                self.shutdown_result = "timeout"
+                return
+            self.server.server_close()
+        try:
+            if self.published_record is not None and _record_unchanged(
+                _record_path(self.paths), self.published_record
+            ):
+                if time.monotonic() >= deadline:
+                    self.shutdown_result = "timeout"
+                    return
+                _record_path(self.paths).unlink()
+        except OSError:
+            pass
         if self.control is not None:
+            if time.monotonic() >= deadline:
+                self.shutdown_result = "timeout"
+                return
             try:
                 self.control.close()
             except OSError:
                 pass
-        if self.server is not None:
-            self.server.shutdown()
-            self.server.close_active_connections()
-            self.server.server_close()
-        try:
-            if self.instance is not None:
-                _record_path(self.paths).unlink()
-        except OSError:
-            pass
 
     def shutdown(self, deadline: float | None = None) -> str:
         try:
@@ -783,12 +853,28 @@ class _Daemon:
                 if self.shutdown_result not in {"running", "timeout"}:
                     return self.shutdown_result
                 deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
+                if time.monotonic() >= deadline:
+                    self.shutdown_result = "timeout"
+                    return self.shutdown_result
                 self.stop_requested.set()
+                self.catalog_admitted = False
                 self.workers.close_admission()
                 if self.server is not None:
+                    if time.monotonic() >= deadline:
+                        self.shutdown_result = "timeout"
+                        return self.shutdown_result
                     self.server.shutdown()
+                    if time.monotonic() >= deadline:
+                        self.shutdown_result = "timeout"
+                        return self.shutdown_result
                     self.server.close_active_connections()
+                    if time.monotonic() >= deadline:
+                        self.shutdown_result = "timeout"
+                        return self.shutdown_result
                     self.server.server_close()
+                if time.monotonic() >= deadline:
+                    self.shutdown_result = "timeout"
+                    return self.shutdown_result
                 workers_ok = self.workers.close(deadline)
                 if self.control_thread is not None:
                     self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -796,10 +882,15 @@ class _Daemon:
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 try:
+                    if self.published_record is not None and _record_unchanged(
+                        _record_path(self.paths), self.published_record
+                    ):
+                        _require_deadline(deadline)
+                        _record_path(self.paths).unlink()
+                    _require_deadline(deadline)
                     if self.control is not None:
                         self.control.close()
-                    _record_path(self.paths).unlink()
-                except OSError:
+                except (OSError, _ControlTimeoutError):
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 self.shutdown_result = "stopped"
@@ -813,12 +904,11 @@ class _Daemon:
             self.start()
             completed = True
         except StartupError:
-            self._cleanup_start_failure()
             return 1
         finally:
             if completed and self.stop_requested.is_set():
                 self.shutdown_done.wait()
-            if completed and self.shutdown_result == "timeout":
+            if self.shutdown_result == "timeout":
                 # Ownership stays with this daemon while direct-child cleanup
                 # or connection shutdown is unresolved.
                 while self.shutdown_result == "timeout":
@@ -842,15 +932,10 @@ def _spawn_daemon(
         sys.executable,
         "-m",
         "nyx.runtime",
-        "--daemon-fd",
-        str(lease_fd),
         "--deadline-ns",
         str(deadline_ns),
     ]
     pass_fds = [lease_fd]
-    if ack_fd is not None:
-        command += ["--ack-fd", str(ack_fd)]
-        pass_fds.append(ack_fd)
     if claim_path is not None:
         command += ["--claim-path", str(claim_path)]
     kwargs: dict[str, Any] = dict(
@@ -860,16 +945,32 @@ def _spawn_daemon(
         close_fds=True,
     )
     if os.name == "nt":  # pragma: no cover - native Windows lane
+        claim_handle = NativeClaim.transfer_handle(lease_fd)
+        ack_handle = NativeClaim.transfer_handle(ack_fd) if ack_fd is not None else None
+        command += ["--daemon-handle", str(claim_handle)]
+        if ack_handle is not None:
+            command += ["--ack-handle", str(ack_handle)]
+        transfer_handles = [claim_handle]
+        if ack_handle is not None:
+            transfer_handles.append(ack_handle)
+        for handle in transfer_handles:
+            os.set_handle_inheritable(handle, True)
         startup = subprocess.STARTUPINFO()
-        startup.lpAttributeList = {"handle_list": [
-            subprocess.Handle(lease_fd) if hasattr(subprocess, "Handle") else lease_fd,
-            subprocess.Handle(ack_fd) if ack_fd is not None and hasattr(subprocess, "Handle") else ack_fd,
-        ]}
+        startup.lpAttributeList = {"handle_list": transfer_handles}
         kwargs.update(
             startupinfo=startup,
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+        try:
+            return subprocess.Popen(command, **kwargs)
+        finally:
+            for handle in transfer_handles:
+                os.set_handle_inheritable(handle, False)
     else:
+        command += ["--daemon-fd", str(lease_fd)]
+        if ack_fd is not None:
+            command += ["--ack-fd", str(ack_fd)]
+            pass_fds.append(ack_fd)
         kwargs.update(pass_fds=tuple(pass_fds), start_new_session=True)
     return subprocess.Popen(command, **kwargs)
 
@@ -889,6 +990,19 @@ def _wait_for_ack(
             pass
         time.sleep(0.005)
     return False
+
+
+def _terminate_and_reap(process: subprocess.Popen[bytes], deadline: float) -> None:
+    """Stop a failed child without granting it a replacement wait budget."""
+
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def _ack_received_claim(fd: int, claim_path: Path, ack_fd: int) -> bool:
@@ -920,8 +1034,12 @@ def setup(
         requested_hidden: tuple[str, ...] | object = state._OMITTED
     else:
         requested_hidden = state._validate_hidden_stages(hidden_stages)
-    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
-    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
+    try:
+        paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    except TimeoutError as error:
+        raise StartupError("Nyx setup timed out") from error
+    with _operation_lock(paths, deadline=deadline):
+        _require_deadline(deadline)
         lease = _lease_lock(paths, timeout=0.0)
         if not lease.acquire(blocking=False):
             try:
@@ -957,7 +1075,12 @@ def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadl
             raise StartupError("Nyx daemon exited before readiness")
         try:
             instance = _read_instance(paths)
-            response = _send_control(instance, "status", timeout=min(0.2, max(0.01, deadline - time.monotonic())))
+            response = _send_control(
+                instance,
+                "status",
+                timeout=min(0.2, max(0.01, deadline - time.monotonic())),
+                deadline=deadline,
+            )
             if response.get("status") == "ready" and response.get("url") == URL:
                 return instance
         except UnhealthyInstanceError:
@@ -970,46 +1093,45 @@ def start() -> str:
     """Start or authenticate the current user's fixed-port instance."""
     deadline_ns = time.monotonic_ns() + int(STARTUP_TIMEOUT * 1_000_000_000)
     deadline = deadline_ns / 1_000_000_000
-    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
-    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
+    try:
+        paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    except TimeoutError as error:
+        raise StartupError("Nyx startup timed out") from error
+    with _operation_lock(paths, deadline=deadline):
         state.load_configuration(paths)
+        _require_deadline(deadline)
         lease = _lease_lock(paths, timeout=0.0)
         if not lease.acquire(blocking=False):
             instance = _read_instance(paths)
-            response = _send_control(instance, "status")
+            response = _send_control(instance, "status", deadline=deadline)
             if response.get("status") != "ready" or response.get("url") != URL:
                 raise UnhealthyInstanceError("Nyx instance is unhealthy")
             return URL
         try:
-            _remove_stale_instance(paths)
+            _remove_stale_instance(paths, deadline=deadline)
+            _require_deadline(deadline)
             ack_read, ack_write = os.pipe()
             process: subprocess.Popen[bytes] | None = None
             try:
+                _require_deadline(deadline)
                 process = _spawn_daemon(
                     lease.fd,
-                    int(deadline * 1_000_000_000),
+                    deadline_ns,
                     ack_fd=ack_write,
                     claim_path=paths.runtime_directory / "lease.lock",
                 )
                 os.close(ack_write)
                 ack_write = -1
                 if not _wait_for_ack(process, ack_read, deadline):
-                    if process.poll() is None:
-                        process.terminate()
-                    process.wait(timeout=max(0.1, min(1.0, max(0.0, deadline - time.monotonic()))))
+                    _terminate_and_reap(process, deadline)
                     raise StartupError("Nyx daemon did not validate its inherited claim")
                 # The child now owns the same native object.  Closing this
                 # descriptor is the handoff; no path reopen occurs in child.
                 lease.close()
                 return _wait_ready(paths, process, deadline).url
             except BaseException:
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                if process is not None:
+                    _terminate_and_reap(process, deadline)
                 raise
             finally:
                 os.close(ack_read)
@@ -1024,12 +1146,16 @@ def stop() -> str:
     """Stop an authenticated instance, or report the already-stopped state."""
     deadline_ns = time.monotonic_ns() + int(SHUTDOWN_TIMEOUT * 1_000_000_000)
     deadline = deadline_ns / 1_000_000_000
-    paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
-    with _operation_lock(paths, timeout=max(0.0, min(LOCK_TIMEOUT, deadline - time.monotonic()))):
+    try:
+        paths = _paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+    except TimeoutError as error:
+        raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained") from error
+    with _operation_lock(paths, deadline=deadline):
+        _require_deadline(deadline)
         lease = _lease_lock(paths, timeout=0.0)
         if lease.acquire(blocking=False):
             lease.close()
-            _remove_stale_instance(paths)
+            _remove_stale_instance(paths, deadline=deadline)
             return "stopped"
         instance = _read_instance(paths)
         _send_control(
@@ -1042,7 +1168,7 @@ def stop() -> str:
             probe = _lease_lock(paths, timeout=0.0)
             if probe.acquire(blocking=False):
                 probe.close()
-                _remove_stale_instance(paths)
+                _remove_stale_instance(paths, deadline=deadline)
                 return "stopped"
             probe.close()
             time.sleep(0.03)
@@ -1062,13 +1188,31 @@ def _daemon_entry(
     return _Daemon(fd, deadline_ns, ack_fd=ack_fd).run()
 
 
+def _receive_daemon_handles(claim_handle: int, ack_handle: int | None) -> tuple[int, int | None]:
+    claim_fd = NativeClaim.receive_handle(claim_handle)
+    ack_fd = (
+        NativeClaim.receive_handle(ack_handle, write_only=True)
+        if ack_handle is not None
+        else None
+    )
+    return claim_fd, ack_fd
+
+
 if __name__ == "__main__":
-    if "--daemon-fd" not in sys.argv:
+    if "--daemon-fd" not in sys.argv and "--daemon-handle" not in sys.argv:
         raise SystemExit("internal lifecycle entry point")
     try:
-        fd = int(sys.argv[sys.argv.index("--daemon-fd") + 1])
         deadline = int(sys.argv[sys.argv.index("--deadline-ns") + 1])
-        ack = int(sys.argv[sys.argv.index("--ack-fd") + 1]) if "--ack-fd" in sys.argv else None
+        if "--daemon-handle" in sys.argv:
+            fd, ack = _receive_daemon_handles(
+                int(sys.argv[sys.argv.index("--daemon-handle") + 1]),
+                int(sys.argv[sys.argv.index("--ack-handle") + 1])
+                if "--ack-handle" in sys.argv
+                else None,
+            )
+        else:
+            fd = int(sys.argv[sys.argv.index("--daemon-fd") + 1])
+            ack = int(sys.argv[sys.argv.index("--ack-fd") + 1]) if "--ack-fd" in sys.argv else None
         claim = Path(sys.argv[sys.argv.index("--claim-path") + 1]) if "--claim-path" in sys.argv else None
     except (ValueError, IndexError):
         raise SystemExit("invalid lifecycle arguments") from None

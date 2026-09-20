@@ -36,13 +36,17 @@ def _check_deadline(deadline: float | None = None, deadline_ns: int | None = Non
     """Reject an expired operation before the next filesystem mutation."""
 
     if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
-        raise TimeoutError("Nyx operation deadline expired")
+        raise OperationDeadlineError("Nyx operation deadline expired")
     if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError("Nyx operation deadline expired")
+        raise OperationDeadlineError("Nyx operation deadline expired")
 
 
 class StateError(RuntimeError):
     """Base class for safe, user-facing state errors."""
+
+
+class OperationDeadlineError(StateError, TimeoutError):
+    """A public operation expired before its next state mutation."""
 
 
 class UnsupportedPlatformError(StateError):
@@ -258,11 +262,11 @@ def _admit_directory(
 ) -> bool:
     """Admit one managed directory, creating it only when requested."""
 
+    _check_deadline(deadline, deadline_ns)
     before = _lstat(path)
     if before is None:
         if not create:
             return False
-        _check_deadline(deadline, deadline_ns)
         try:
             path.mkdir()
         except FileExistsError:

@@ -23,7 +23,7 @@ else:  # pragma: no cover - import selection is platform-defined
     import fcntl
 
 
-_BUSY_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK, 13, 33})
+_BUSY_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK, 13, 32, 33})
 _MISSING = "absent"
 
 
@@ -183,8 +183,11 @@ class NativeClaim:
             before = path.lstat()
         except FileNotFoundError:
             return _MISSING
-        except OSError:
-            return "unsafe"
+        except OSError as error:
+            # A share-zero Windows owner prevents even an existing-only open.
+            # That qualified sharing violation is the ownership observation;
+            # unrelated open failures remain unsafe.
+            return "held" if _busy(error) else "unsafe"
         if not _regular(before):
             return "unsafe"
         fd: int | None = None
@@ -203,8 +206,8 @@ class NativeClaim:
                 return "held" if _busy(error) else "unsafe"
         except FileNotFoundError:
             return "changed"
-        except OSError:
-            return "unsafe"
+        except OSError as error:
+            return "held" if _busy(error) else "unsafe"
         finally:
             if fd is not None:
                 os.close(fd)
@@ -219,6 +222,23 @@ class NativeClaim:
         except OSError:
             return False
         return _regular(received) and _regular(current) and _identity(received) == _identity(current)
+
+    @staticmethod
+    def transfer_handle(fd: int) -> int:
+        """Return the native object identifier supplied to a child process."""
+
+        if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+            return int(msvcrt.get_osfhandle(fd))
+        return fd
+
+    @staticmethod
+    def receive_handle(handle: int, *, write_only: bool = False) -> int:
+        """Map an inherited native object into this process's descriptor table."""
+
+        if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+            flags = os.O_WRONLY if write_only else os.O_RDWR
+            return msvcrt.open_osfhandle(handle, flags)
+        return handle
 
 
 __all__ = ["NativeClaim"]
