@@ -167,6 +167,37 @@ def test_received_claim_validation_uses_stable_object_identity():
         assert not runtime.NativeClaim.validate_received(17, path)
 
 
+@pytest.mark.parametrize(
+    ("platform", "changed_field", "expected"),
+    [("nt", None, "free"), ("nt", "st_ino", "changed"),
+     ("nt", "st_dev", "changed"), ("nt", "st_birthtime_ns", "changed"),
+     ("nt", "st_mtime_ns", "changed"), ("nt", "st_size", "changed"),
+     ("nt", "st_mode", "unsafe"), ("posix", None, "changed")],
+)
+def test_claim_probe_compares_portable_metadata_without_losing_change_detection(platform, changed_field, expected):
+    fields = dict(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o600,
+                  st_size=1, st_mtime_ns=20, st_ctime_ns=30, st_birthtime_ns=30)
+    before = SimpleNamespace(**fields)
+    fields["st_ctime_ns"] = 40
+    if changed_field is not None:
+        fields[changed_field] = stat.S_IFDIR | 0o700 if changed_field == "st_mode" else fields[changed_field] + 1
+    after = SimpleNamespace(**fields)
+    path = Path("claim.lock")
+    with patch.object(_native_claim.os, "name", platform), patch.object(
+        Path, "lstat", return_value=before
+    ), patch.object(_native_claim, "_open_claim", return_value=17), patch.object(
+        _native_claim.os, "fstat", return_value=after
+    ), patch.object(_native_claim, "_lock_fd", return_value=True) as lock, patch.object(
+        _native_claim.os, "close"
+    ) as close:
+        assert runtime.NativeClaim.probe(path) == expected
+    close.assert_called_once_with(17)
+    if expected == "free":
+        lock.assert_called_once_with(17, blocking=False, deadline=None)
+    else:
+        lock.assert_not_called()
+
+
 def test_windows_spawn_transfers_native_handles_and_child_maps_them():
     startup = type("Startup", (), {"lpAttributeList": None})()
     process = object()
@@ -1525,27 +1556,6 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
             pytest.skip("sandbox does not permit local control sockets")
         released = threading.Event()
         listener.settimeout(1)
-        probe_notes: list[tuple[str, str, tuple[str, ...]]] = []
-        real_probe = runtime.NativeClaim.probe
-        real_identity = _native_claim._identity
-
-        def probe(path: Path) -> str:
-            identities: list[tuple[int, ...]] = []
-
-            def identity(details: os.stat_result) -> tuple[int, ...]:
-                result = real_identity(details)
-                identities.append(result)
-                return result
-
-            with patch.object(_native_claim, "_identity", side_effect=identity):
-                result = real_probe(path)
-            fields = ("device", "inode", "mode", "size", "modified", "created")
-            differences = tuple(
-                field for index, field in enumerate(fields)
-                if len(identities) == 2 and identities[0][index] != identities[1][index]
-            )
-            probe_notes.append(("operation" if path.name == "operation.lock" else "lease", result, differences))
-            return result
 
         def serve() -> None:
             nonlocal lease_fd
@@ -1565,15 +1575,14 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
         server = threading.Thread(target=serve)
         server.start()
         try:
-            with patch.object(runtime.NativeClaim, "probe", side_effect=probe):
-                observed = _observe(paths)
+            observed = _observe(paths)
         finally:
             server.join(timeout=3)
             listener.close()
             lease.close()
             if lease_fd >= 0:
                 os.close(lease_fd)
-        assert released.is_set(), (observed.status, observed.diagnostic, probe_notes)
+        assert released.is_set(), (observed.status, observed.diagnostic)
         assert not server.is_alive()
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
