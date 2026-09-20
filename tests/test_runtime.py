@@ -1518,6 +1518,27 @@ def test_record_consumption_accepts_control_port_boundaries(control: str, port: 
         )
 
 
+def test_free_lease_start_and_stop_retain_invalid_stale_control_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        _write_runtime_record(paths, control="127.0.0.1:0")
+        before = record.read_bytes()
+
+        for operation in (runtime.start, runtime.stop):
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control"
+            ) as send_control, patch.object(
+                runtime.socket, "socket", side_effect=AssertionError("socket use")
+            ) as create_socket, pytest.raises(
+                runtime.UnhealthyInstanceError, match="record is unavailable"
+            ):
+                operation()
+            send_control.assert_not_called()
+            create_socket.assert_not_called()
+            assert record.read_bytes() == before
+
+
 def _claim_snapshot(path: Path) -> tuple[int, int, int, int, int, int]:
     details = path.lstat()
     return (
