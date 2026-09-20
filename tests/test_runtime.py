@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -211,6 +211,136 @@ def test_readiness_publication_rejects_expiry_before_creating_temp_record():
         mkstemp.assert_not_called()
 
 
+def test_tcp_control_does_not_require_unix_socket_or_uid(monkeypatch):
+    instance = runtime.Instance("instance", runtime.URL, "secret", "127.0.0.1:43210")
+    response = {"instance_id": "instance", "status": "ready", "url": runtime.URL}
+    connection = Mock()
+    connection.recv.return_value = json.dumps(response).encode() + b"\n"
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    monkeypatch.delattr(os, "getuid", raising=False)
+    with patch.object(socket, "socket", return_value=connection) as create:
+        assert runtime._send_control(instance, "status") == response
+    create.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+    connection.connect.assert_called_once_with(("127.0.0.1", 43210))
+    assert json.loads(connection.sendall.call_args.args[0]) == {
+        "version": 1, "capability": "secret", "command": "status"
+    }
+    connection.close.assert_called_once()
+
+
+def test_readiness_publication_does_not_require_fchmod(monkeypatch):
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        instance = runtime.Instance("instance", runtime.URL, "capability", "127.0.0.1:43210")
+        monkeypatch.delattr(os, "fchmod", raising=False)
+        snapshot = runtime._write_instance(paths, instance, deadline=time.monotonic() + 2)
+        assert runtime._read_instance(paths) == instance
+        assert runtime._record_unchanged(runtime._record_path(paths), snapshot)
+        assert not list(paths.runtime_directory.glob(".instance.json.*"))
+
+
+@pytest.mark.parametrize(
+    ("payload", "exit_code", "expected", "accepted"),
+    [(b"1", None, "acknowledgement-accepted", True),
+     (b"0", None, "acknowledgement-rejected", False),
+     (b"", None, "acknowledgement-eof", False),
+     (b"1", 22, "acknowledgement-accepted", False)],
+)
+def test_acknowledgement_diagnostics_distinguish_wire_outcomes(payload, exit_code, expected, accepted):
+    read_fd, write_fd = os.pipe()
+    process = SimpleNamespace(poll=lambda: exit_code)
+    try:
+        if payload:
+            os.write(write_fd, payload)
+        os.close(write_fd)
+        assert runtime._wait_for_ack(process, read_fd, time.monotonic() + 1) is accepted
+        assert process._nyx_ack_outcome == expected
+    finally:
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize("exited", [False, True])
+def test_acknowledgement_diagnostics_distinguish_deadline_and_early_exit(exited):
+    read_fd, write_fd = os.pipe()
+    process = SimpleNamespace(poll=lambda: 22 if exited else None)
+    try:
+        deadline = time.monotonic() + (1 if exited else 0)
+        assert not runtime._wait_for_ack(process, read_fd, deadline)
+        assert process._nyx_ack_outcome == (
+            "child-exited-before-acknowledgement" if exited else "acknowledgement-deadline"
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_daemon_entry_classifies_initialization_failure_after_valid_ack():
+    with TemporaryDirectory() as temporary:
+        claim = Path(temporary) / "lease.lock"
+        claim_fd = _transferred_claim_fd(claim)
+        read_fd, write_fd = os.pipe()
+        try:
+            with patch.object(runtime, "_Daemon", side_effect=ValueError("private-detail")):
+                assert runtime._daemon_entry(
+                    claim_fd, time.monotonic_ns() + 10**9, ack_fd=write_fd, claim_path=claim
+                ) == 22
+            assert os.read(read_fd, 1) == b"1"
+            assert runtime.NativeClaim.probe(claim) == "free"
+        finally:
+            os.close(read_fd)
+
+
+def test_daemon_entry_classifies_broken_ack_pipe_and_closes_claim():
+    with TemporaryDirectory() as temporary:
+        claim = Path(temporary) / "lease.lock"
+        claim_fd = _transferred_claim_fd(claim)
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        with patch.object(runtime, "_Daemon") as daemon:
+            assert runtime._daemon_entry(
+                claim_fd, time.monotonic_ns() + 10**9, ack_fd=write_fd, claim_path=claim
+            ) == 21
+        daemon.assert_not_called()
+        assert runtime.NativeClaim.probe(claim) == "free"
+
+
+def test_startup_diagnostic_notes_preserve_public_message_and_hide_child_details():
+    process = SimpleNamespace(poll=lambda: 28)
+    error = runtime._startup_failure("Nyx daemon exited before readiness", process, "readiness")
+    assert str(error) == "Nyx daemon exited before readiness"
+    assert error.__notes__ == [
+        "internal startup phase=readiness; outcome=locator-publication-failed; exit=28"
+    ]
+
+
+def test_public_start_reports_sanitized_detached_child_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, home, _ = _fixture(root)
+        environment = _subprocess_environment(home, root / "site")
+        script = (
+            "import errno, runpy; from nyx import server\n"
+            "def fail(**kwargs):\n"
+            "    raise OSError(errno.EADDRINUSE, 'private-child-detail')\n"
+            "server.create_server=fail\n"
+            "runpy.run_module('nyx.runtime', run_name='__main__')\n"
+        )
+        with patch.dict(os.environ, environment), patch.object(
+            state, "resolve_account_home", return_value=home
+        ), patch.object(
+            runtime, "_daemon_command",
+            side_effect=lambda deadline: [
+                sys.executable, "-c", script, "--deadline-ns", str(deadline)
+            ],
+        ), pytest.raises(runtime.StartupError) as caught:
+            runtime.start()
+        assert "outcome=fixed-port-unavailable; exit=30" in caught.value.__notes__[0]
+        assert "private-child-detail" not in repr(caught.value.__notes__)
+        assert "private-child-detail" not in str(caught.value)
+        assert not runtime._record_path(paths).exists()
+        assert runtime.NativeClaim.probe(paths.runtime_directory / "lease.lock") == "free"
+
+
 def test_daemon_entry_rejects_unvalidated_inherited_object_before_initialization():
     with TemporaryDirectory() as temporary:
         claim = Path(temporary) / "lease.lock"
@@ -225,7 +355,7 @@ def test_daemon_entry_rejects_unvalidated_inherited_object_before_initialization
                 time.monotonic_ns() + 1_000_000_000,
                 ack_fd=ack_write,
                 claim_path=claim,
-            ) == 1
+            ) == 20
         assert os.read(ack_read, 1) == b"0"
         daemon.assert_not_called()
         os.close(ack_read)
@@ -378,7 +508,7 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
         ), patch.object(
             runtime, "_write_instance", side_effect=runtime.StartupError("publication failed")
         ):
-            assert daemon.run() == 1
+            assert daemon.run() == 28
 
         assert events == [
             "http-shutdown",
@@ -451,7 +581,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
                 daemon_thread.join(timeout=15)
 
         assert not daemon_thread.is_alive()
-        assert result == [1]
+        assert result == [28]
         assert not worker_marker.exists()
         assert not (paths.runtime_directory / "instance.json").exists()
         contender = runtime._lease_lock(paths, timeout=0.0)
@@ -713,9 +843,10 @@ def test_public_start_rejects_external_child_path_reacquisition_without_handoff_
             runtime,
             "_daemon_command",
             side_effect=lambda _deadline_ns: [sys.executable, "-c", child, str(marker)],
-        ), pytest.raises(runtime.StartupError):
+        ), pytest.raises(runtime.StartupError) as caught:
             runtime.start()
         assert marker.read_text(encoding="utf-8") == "busy"
+        assert "phase=acknowledgement-rejected;" in caught.value.__notes__[0]
         assert not (paths.runtime_directory / "instance.json").exists()
         contender = runtime._lease_lock(paths, timeout=0.0)
         assert contender.acquire(blocking=False)
@@ -1106,7 +1237,7 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
                 thread.start()
                 thread.join(timeout=8)
                 assert not thread.is_alive()
-            assert result == [1]
+            assert result == [30]
             assert not paths.runtime_directory.joinpath("instance.json").exists()
             assert not list(paths.runtime_directory.glob(".instance.json.*"))
         finally:
@@ -1502,7 +1633,7 @@ def test_foreign_control_holder_causes_startup_failure_without_record():
                     thread.start()
                     thread.join(timeout=5)
                     assert not thread.is_alive()
-            assert result == [1]
+            assert result == [26]
             assert not paths.runtime_directory.joinpath("instance.json").exists()
         finally:
             occupant.close()
