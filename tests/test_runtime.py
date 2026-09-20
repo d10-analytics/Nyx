@@ -83,15 +83,18 @@ trace_labels = {
     '_read_instance': 'locator-read', '_wait_ready': 'launcher-ready',
     '_cleanup_start_failure': 'failed-cleanup',
     '_finish_start_failure_cleanup': 'failed-cleanup-worker', 'shutdown': 'shutdown',
+    'server_bind': 'http-bind', 'server_activate': 'http-listen',
+    'getfqdn': 'reverse-name', 'gethostbyaddr': 'native-reverse-name',
+    'bind': 'native-bind', 'listen': 'native-listen',
 }
 def trace(frame, event, result):
     global trace_count
-    if event not in ('call', 'return'):
+    if event not in ('call', 'return', 'c_call', 'c_return', 'c_exception'):
         return
     module = frame.f_globals.get('__name__')
-    if module not in ('nyx.runtime', 'nyx.server', '__main__'):
+    if module not in ('nyx.runtime', 'nyx.server', '__main__', 'http.server', 'socketserver', 'socket'):
         return
-    name = frame.f_code.co_name
+    name = getattr(result, '__name__', None) if event.startswith('c_') else frame.f_code.co_name
     label = trace_labels.get(name)
     if label is None:
         return
@@ -440,6 +443,35 @@ def test_public_start_reports_sanitized_detached_child_failure():
         assert "paths:home-match" in trace and "http-create:call" in trace
         assert "private-child-detail" not in trace
         assert str(root) not in trace
+
+
+def test_startup_trace_captures_native_server_construction_without_values():
+    try:
+        capability = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability.close()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        _, home, _ = _fixture(root)
+        site = root / "site"
+        environment = _subprocess_environment(home, site, trace_startup=True)
+        try:
+            process = subprocess.run(
+                [sys.executable, "-c",
+                 "from nyx.server import create_server; server=create_server(); server.server_close()"],
+                env=environment, capture_output=True, text=True, timeout=5, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise AssertionError("server construction timed out\n" + _startup_trace(site)) from None
+        assert process.returncode == 0, process.stderr
+        trace = _startup_trace(site)
+        assert "http-create:call" in trace and "http-create:returned" in trace
+        assert "native-bind:c_call" in trace and "native-bind:c_return" in trace
+        assert "native-reverse-name:c_call" in trace and "native-reverse-name:c_return" in trace
+        assert str(root) not in trace and "127.0.0.1" not in trace
+        assert len(trace.splitlines()) <= 66
 
 
 def test_traced_fixture_cleanup_releases_only_its_owned_child_after_observation():
