@@ -239,6 +239,35 @@ def test_daemon_rejects_expired_deadline_before_path_admission():
     paths.assert_not_called()
 
 
+def test_daemon_rechecks_shared_deadline_after_configuration_admission():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
+        original_lstat = state._lstat
+        lookup_delayed = False
+
+        def delayed_admission_lookup(path):
+            nonlocal lookup_delayed
+            if not lookup_delayed:
+                lookup_delayed = True
+                time.sleep(0.03)
+            return original_lstat(path)
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 10_000_000)
+            with patch.object(
+                state, "_lstat", side_effect=delayed_admission_lookup
+            ), patch.object(runtime, "create_server") as create_server, pytest.raises(
+                runtime.UnhealthyInstanceError, match="deadline expired"
+            ):
+                daemon.start()
+            create_server.assert_not_called()
+            assert daemon.server is None
+        finally:
+            os.close(lease_fd)
+
+
 def test_readiness_publication_rejects_expiry_before_creating_temp_record():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -1033,6 +1062,53 @@ def test_held_lease_allows_same_root_setup_without_mutation():
             lease.close()
         assert configuration.specification_root == first.resolve()
         assert paths.config_file.read_bytes() == before
+
+
+def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
+    with TemporaryDirectory() as temporary:
+        paths, _, first = _fixture(Path(temporary))
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        records = (
+            paths.config_file,
+            paths.runtime_directory / "operation.lock",
+            paths.runtime_directory / "lease.lock",
+        )
+
+        def snapshot():
+            result = {}
+            for path in records:
+                details = path.lstat()
+                result[path] = (details.st_dev, details.st_ino, details.st_size, path.read_bytes())
+            return result
+
+        before = snapshot()
+        original_lstat = state._lstat
+        lookup_delayed = False
+
+        def delayed_admission_lookup(path):
+            nonlocal lookup_delayed
+            if not lookup_delayed:
+                lookup_delayed = True
+                time.sleep(0.03)
+            return original_lstat(path)
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "STARTUP_TIMEOUT", 0.01
+            ), patch.object(
+                state, "_lstat", side_effect=delayed_admission_lookup
+            ), patch.object(
+                state, "_save_configuration", wraps=state._save_configuration
+            ) as save_configuration, pytest.raises(
+                runtime.UnhealthyInstanceError, match="deadline expired"
+            ):
+                runtime.setup(first)
+            save_configuration.assert_not_called()
+            assert lookup_delayed
+            assert snapshot() == before
+        finally:
+            lease.close()
 
 
 def test_held_lease_excludes_changed_hidden_stage_policy_without_mutation():
