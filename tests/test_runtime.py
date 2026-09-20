@@ -1436,7 +1436,9 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
         original_iterdir = Path.iterdir
         original_read_bytes = Path.read_bytes
         original_read_text = Path.read_text
+        original_exists = Path.exists
         original_probe = runtime.NativeClaim.probe
+        original_lstat = state._lstat
 
         def record_iteration(path: Path):
             if path.resolve() == external_runtime_resolved:
@@ -1453,21 +1455,35 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
                 outside_accesses.append(("text", path))
             return original_read_text(path, *args, **kwargs)
 
+        def record_exists(path: Path):
+            if path.resolve().is_relative_to(external_runtime_resolved):
+                outside_accesses.append(("exists", path))
+            return original_exists(path)
+
         def record_claim_probe(path: Path):
             if path.resolve().is_relative_to(external_runtime_resolved):
                 outside_accesses.append(("claim", path))
             return original_probe(path)
+
+        def record_metadata_read(path: Path):
+            if path.parent.resolve().is_relative_to(external_state.resolve()):
+                outside_accesses.append(("metadata", path))
+            return original_lstat(path)
 
         with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
             state, "_current_uid", return_value=state._current_uid()
         ), patch.object(
             state, "_admit_directory", side_effect=replace_after_second_admission
         ), patch.object(
+            state, "_lstat", side_effect=record_metadata_read
+        ), patch.object(
             Path, "iterdir", record_iteration
         ), patch.object(
             Path, "read_bytes", record_bytes_read
         ), patch.object(
             Path, "read_text", record_text_read
+        ), patch.object(
+            Path, "exists", record_exists
         ), patch.object(
             runtime.NativeClaim, "probe", side_effect=record_claim_probe
         ):
