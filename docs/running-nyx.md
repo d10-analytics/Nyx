@@ -29,8 +29,11 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\nyx.exe --stop
 ```
 
-In the remaining examples, `nyx` means `.venv/bin/nyx` on Linux or macOS, or
-`.\.venv\Scripts\nyx.exe` in Windows PowerShell, run from the repository root.
+Throughout this guide and the linked guides, bare `nyx` means `.venv/bin/nyx`
+on Linux or macOS, or `.\.venv\Scripts\nyx.exe` in Windows PowerShell. These
+relative paths work from the repository root. From another directory, use the
+absolute path to that same installed console; quote paths containing spaces
+and use PowerShell's `&` before a quoted executable path.
 
 Nyx reads and displays specifications; it does not edit them or move them
 between directories. Setup and runtime commands write account-local configuration

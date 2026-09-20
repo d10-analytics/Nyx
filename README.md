@@ -71,6 +71,13 @@ its prerequisite is not yet satisfied, then compare it with **Plan the route
 preview**. The [sample walkthrough](examples/sample-specifications/README.md)
 explains the fictional project, its custom stage, and the compact-view workflow.
 
+Throughout the linked guides, bare `nyx` is shorthand for the console installed
+above: `.venv/bin/nyx` on Linux or macOS, or `.\.venv\Scripts\nyx.exe` in
+Windows PowerShell. Those relative paths work from the repository root. When a
+guide runs commands from another directory, use the absolute path to that same
+console; quote paths containing spaces and use PowerShell's `&` before a quoted
+executable path.
+
 When files change, Nyx checks for an update every ten seconds. Click **Apply
 update** when it appears to load the new view. **Refresh view** checks immediately
 when no update is waiting. Use the stop command above when you are finished.
