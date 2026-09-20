@@ -27,7 +27,7 @@ def isolated_root(root: Path, name: str) -> Path:
 
 def configure_home(home: Path):
     return patch.object(Path, "home", return_value=home), patch.object(
-        state, "_current_uid", return_value=os.getuid()
+        state, "_current_uid", return_value=state._current_uid()
     )
 
 
@@ -37,7 +37,7 @@ def test_account_home_comes_from_controlled_path_home_even_when_environment_diff
         with patch.object(Path, "home", return_value=home), patch.dict(
             os.environ, {"HOME": str(Path(temporary) / "wrong")}
         ):
-            assert state.resolve_account_home() == home.resolve()
+            assert state.resolve_account_home() == home
 
 
 def test_state_paths_use_exact_home_nyx_children_without_observation_creation():

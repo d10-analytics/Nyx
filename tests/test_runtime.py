@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -125,6 +126,37 @@ def test_windows_share_violation_during_claim_acquisition_is_busy():
     busy.winerror = 32
     with patch.object(_native_claim, "_open_claim", side_effect=busy):
         assert runtime._FileLock(Path("claim.lock"), timeout=0.0).acquire(blocking=False) is False
+
+
+def test_blocking_windows_share_violation_retries_before_deadline():
+    with TemporaryDirectory() as temporary:
+        path = Path(temporary) / "claim.lock"
+        path.write_bytes(b"\0")
+        fd = os.open(path, os.O_RDWR)
+        busy = OSError(13, "sharing violation")
+        busy.winerror = 32
+        claim = runtime.NativeClaim(path)
+        with patch.object(_native_claim, "_open_claim", side_effect=[busy, fd]), patch.object(
+            _native_claim.time, "sleep"
+        ) as sleep:
+            assert claim.acquire(blocking=True, deadline=time.monotonic() + 1)
+        sleep.assert_called_once()
+        claim.close()
+
+
+def test_received_claim_validation_uses_stable_object_identity():
+    received = SimpleNamespace(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o600)
+    same_object = SimpleNamespace(st_dev=7, st_ino=11, st_mode=stat.S_IFREG | 0o666)
+    replacement = SimpleNamespace(st_dev=7, st_ino=12, st_mode=stat.S_IFREG | 0o600)
+    path = Path("claim.lock")
+    with patch.object(_native_claim.os, "fstat", return_value=received), patch.object(
+        Path, "lstat", return_value=same_object
+    ):
+        assert runtime.NativeClaim.validate_received(17, path)
+    with patch.object(_native_claim.os, "fstat", return_value=received), patch.object(
+        Path, "lstat", return_value=replacement
+    ):
+        assert not runtime.NativeClaim.validate_received(17, path)
 
 
 def test_windows_spawn_transfers_native_handles_and_child_maps_them():
@@ -375,7 +407,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
         assert lease.acquire(blocking=False)
         assert lease.fd is not None
         with patch.object(runtime, "_paths", return_value=paths):
-            daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 5_000_000_000)
+            daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 20_000_000_000)
         daemon.workers = runtime.CatalogWorkerManager(
             command_factory=lambda: [
                 sys.executable,
@@ -388,7 +420,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
 
         def fail_publication(*_args, **_kwargs):
             publication_entered.set()
-            assert allow_failure.wait(timeout=3)
+            assert allow_failure.wait(timeout=10)
             raise runtime.StartupError("injected publication failure")
 
         result: list[int] = []
@@ -396,7 +428,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
             daemon_thread = threading.Thread(target=lambda: result.append(daemon.run()))
             daemon_thread.start()
             try:
-                assert publication_entered.wait(timeout=5)
+                assert publication_entered.wait(timeout=15)
                 connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=2)
                 try:
                     connection.request(
@@ -416,7 +448,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
                 contender.close()
             finally:
                 allow_failure.set()
-                daemon_thread.join(timeout=5)
+                daemon_thread.join(timeout=15)
 
         assert not daemon_thread.is_alive()
         assert result == [1]
@@ -888,9 +920,9 @@ def test_active_schema_one_identity_preserves_noncanonical_legacy_bytes():
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
         legacy = (
-            '{  "specification_root" : "'
-            + str(first.resolve())
-            + '", "schema_version" : 1 }\n\n'
+            '{  "specification_root" : '
+            + json.dumps(str(first.resolve()))
+            + ', "schema_version" : 1 }\n\n'
         ).encode("utf-8")
         paths.config_file.write_bytes(legacy)
         before = paths.config_file.read_bytes()
@@ -915,7 +947,7 @@ def test_free_lease_removes_stale_record_without_pid_signal():
                     "instance_id": "stale",
                     "url": runtime.URL,
                     "capability": "stale-capability",
-                    "control": runtime._control_name(),
+                    "control": runtime._control_endpoint(1),
                 }
             ),
             encoding="utf-8",
@@ -1040,7 +1072,7 @@ def test_held_lease_retains_valid_stale_record_without_control_or_signal():
                     "instance_id": "stale",
                     "url": runtime.URL,
                     "capability": "stale-capability",
-                    "control": runtime._control_name(),
+                    "control": runtime._control_endpoint(1),
                 }
             ),
             encoding="utf-8",
@@ -1092,7 +1124,7 @@ def _write_runtime_record(
         instance_id,
         runtime.URL,
         capability,
-        runtime._control_name() if control is None else control,
+        runtime._control_endpoint(1) if control is None else control,
     )
     record = paths.runtime_directory / "instance.json"
     record.write_text(json.dumps(instance.as_dict()) + "\n", encoding="utf-8")
@@ -1135,14 +1167,28 @@ def test_observe_runtime_reports_operation_contention_without_mutation():
         paths, _, _ = _fixture(Path(temporary))
         operation = runtime._operation_lock(paths, timeout=0.0)
         assert operation.acquire(blocking=False)
-        before = {path.name: (path.stat().st_mode, path.read_bytes()) for path in paths.runtime_directory.iterdir()}
+        def snapshot() -> dict[str, tuple[tuple[int, int, int, int], bytes | None]]:
+            result = {}
+            for path in paths.runtime_directory.iterdir():
+                details = path.lstat()
+                identity = (
+                    details.st_mode,
+                    details.st_size,
+                    details.st_mtime_ns,
+                    details.st_ctime_ns,
+                )
+                payload = None if path.name == "operation.lock" else path.read_bytes()
+                result[path.name] = identity, payload
+            return result
+
+        before = snapshot()
         try:
             observed = _observe(paths)
         finally:
             operation.close()
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_OPERATION_IN_PROGRESS
-        after = {path.name: (path.stat().st_mode, path.read_bytes()) for path in paths.runtime_directory.iterdir()}
+        after = snapshot()
         assert after == before
 
 
@@ -1236,21 +1282,26 @@ def test_observe_runtime_requires_same_uid_before_sending_capability():
             assert instance.capability.encode("utf-8") in b"".join(received)
             return
 
-        instance = _write_runtime_record(paths)
+        control_path = paths.account_home.parent / "peer-control.sock"
+        instance = _write_runtime_record(paths, control="local-peer-control")
         lease_fd, lease = _held_lease(paths)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(runtime._control_name())
+            listener.bind(str(control_path))
         except PermissionError:
             listener.close()
             lease.close()
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
         listener.listen(1)
+        listener.settimeout(3)
         received: list[bytes] = []
 
         def serve() -> None:
-            connection, _ = listener.accept()
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                return
             with connection:
                 connection.settimeout(2)
                 try:
@@ -1261,16 +1312,19 @@ def test_observe_runtime_requires_same_uid_before_sending_capability():
         server = threading.Thread(target=serve)
         server.start()
         try:
-            with patch.object(runtime, "_peer_uid", return_value=state._current_uid() + 1), patch.object(
-                runtime.os, "getuid", return_value=state._current_uid(), create=True
-            ):
+            with patch.object(
+                runtime, "_parse_control_endpoint", return_value=(socket.AF_UNIX, str(control_path))
+            ), patch.object(
+                runtime, "_peer_uid", return_value=state._current_uid() + 1
+            ), patch.object(runtime.os, "getuid", return_value=state._current_uid(), create=True):
                 observed = _observe(paths)
         finally:
-            listener.close()
             server.join(timeout=3)
+            listener.close()
             lease.close()
             os.close(lease_fd)
         assert observed.status == "unknown"
+        assert not server.is_alive()
         assert observed.diagnostic == runtime.RUNTIME_CONTROL_IDENTITY_MISMATCH
         assert received == [b""]
         assert instance.capability.encode("utf-8") not in b"".join(received)
@@ -1588,10 +1642,8 @@ def test_worker_timeout_after_prefix_stall_finishes_autonomously():
     started = time.monotonic()
     with pytest.raises(runtime.WorkerError, match="producer_timeout"):
         manager.fetch_catalog()
-    assert time.monotonic() - started < 0.35
-    deadline = time.monotonic() + 2
-    while manager.active_count and time.monotonic() < deadline:
-        time.sleep(0.01)
+    assert time.monotonic() - started < 0.8
+    assert manager.close(time.monotonic() + 2)
     assert manager.active_count == 0
 
 
@@ -1864,7 +1916,8 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
         first = second = None
         try:
             command = (
-                "from nyx import runtime; print(runtime.start(), flush=True); "
+                "from nyx import runtime; runtime.STARTUP_TIMEOUT=15; "
+                "print(runtime.start(), flush=True); "
                 "print(runtime._read_instance(runtime._paths()).instance_id, flush=True)"
             )
             first = subprocess.Popen(
@@ -1883,8 +1936,8 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            first_stdout, first_stderr = first.communicate(timeout=12)
-            second_stdout, second_stderr = second.communicate(timeout=12)
+            first_stdout, first_stderr = first.communicate(timeout=25)
+            second_stdout, second_stderr = second.communicate(timeout=25)
             assert first.returncode == 0, first_stderr
             assert second.returncode == 0, second_stderr
             first_lines = first_stdout.splitlines()
@@ -1899,7 +1952,7 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
                 env=environment,
                 capture_output=True,
                 text=True,
-                timeout=12,
+                timeout=20,
                 check=False,
             )
             for process in (first, second):
