@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import http.client
 import json
 import os
@@ -27,11 +26,22 @@ def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
     spec = root / "spec"
     spec.mkdir()
     with patch.object(state, "resolve_account_home", return_value=home), patch.object(
-        state, "_current_uid", return_value=os.getuid()
+        state, "_current_uid", return_value=state._current_uid()
     ):
         state.setup(spec)
         paths = state.state_paths()
     return paths, home, spec
+
+
+def _transferred_claim_fd(path: Path) -> int:
+    """Acquire one native claim and transfer descriptor ownership to the test."""
+
+    claim = runtime.NativeClaim(path)
+    assert claim.acquire(blocking=False)
+    assert claim.fd is not None
+    fd, claim.fd = claim.fd, None
+    claim.identity = None
+    return fd
 
 
 def _wait_for_record(paths: state.StatePaths) -> runtime.Instance:
@@ -58,6 +68,46 @@ def _subprocess_environment(home: Path, site_directory: Path) -> dict[str, str]:
     environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get("PYTHONPATH", "")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def test_runtime_tests_collect_without_test_owned_posix_primitives():
+    """Model Windows' absent fcntl/getuid boundary during real pytest collection."""
+
+    with TemporaryDirectory() as temporary:
+        site_directory = Path(temporary)
+        (site_directory / "sitecustomize.py").write_text(
+            "import builtins, os\n"
+            "original_import = builtins.__import__\n"
+            "def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+            "    source = '' if globals is None else globals.get('__file__', '')\n"
+            "    if name == 'fcntl' and source.endswith('test_runtime.py'):\n"
+            "        raise ModuleNotFoundError(\"No module named 'fcntl'\")\n"
+            "    return original_import(name, globals, locals, fromlist, level)\n"
+            "builtins.__import__ = guarded_import\n"
+            "if hasattr(os, 'getuid'):\n"
+            "    del os.getuid\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get(
+            "PYTHONPATH", ""
+        )
+        collected = subprocess.run(
+            [sys.executable, "-m", "pytest", __file__, "--collect-only", "-q"],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    assert collected.returncode == 0, collected.stderr
+    assert "test_posix_spawn_preserves_detached_descriptor_contract" in collected.stdout
+    assert (
+        "test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit"
+        in collected.stdout
+    )
+    assert "test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit" in collected.stdout
 
 
 def test_windows_share_violation_is_a_qualified_busy_probe():
@@ -642,7 +692,9 @@ def test_public_start_rejects_external_child_path_reacquisition_without_handoff_
 
 def test_posix_spawn_preserves_detached_descriptor_contract():
     process = object()
-    with patch.object(runtime.subprocess, "Popen", return_value=process) as popen:
+    with patch.object(runtime.os, "name", "posix"), patch.object(
+        runtime.subprocess, "Popen", return_value=process
+    ) as popen:
         assert runtime._spawn_daemon(11, 1234, ack_fd=22, claim_path=Path("claim")) is process
     command, kwargs = popen.call_args.args[0], popen.call_args.kwargs
     assert command[command.index("--daemon-fd") + 1] == "11"
@@ -658,9 +710,7 @@ def test_posix_spawn_preserves_detached_descriptor_contract():
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
             thread = threading.Thread(target=daemon.run)
@@ -684,9 +734,7 @@ def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
         second = Path(temporary) / "second"
         second.mkdir()
         before = paths.config_file.read_bytes()
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
             thread = threading.Thread(target=daemon.run)
@@ -704,9 +752,7 @@ def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
 def test_natural_unhealthy_daemon_keeps_record_and_lease():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
             thread = threading.Thread(target=daemon.run)
@@ -899,8 +945,7 @@ def test_shutdown_does_not_remove_replaced_instance_record():
         paths, _, _ = _fixture(Path(temporary))
         record = paths.runtime_directory / "instance.json"
         record.write_bytes(b"daemon-record")
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
@@ -964,9 +1009,7 @@ def test_shutdown_deadline_stops_before_next_cleanup_mutation(expiring_phase):
 def test_wrong_capability_cannot_control_a_ready_instance():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
             thread = threading.Thread(target=daemon.run)
@@ -1022,9 +1065,7 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
         occupant.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         occupant.bind(("127.0.0.1", runtime.PORT))
         occupant.listen(1)
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         result: list[int] = []
         try:
             with patch.object(runtime, "_paths", return_value=paths):
@@ -1040,25 +1081,51 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
             occupant.close()
 
 
-def _write_runtime_record(paths: state.StatePaths, *, instance_id: str = "instance", capability: str = "capability") -> runtime.Instance:
-    instance = runtime.Instance(instance_id, runtime.URL, capability, runtime._control_name())
+def _write_runtime_record(
+    paths: state.StatePaths,
+    *,
+    instance_id: str = "instance",
+    capability: str = "capability",
+    control: str | None = None,
+) -> runtime.Instance:
+    instance = runtime.Instance(
+        instance_id,
+        runtime.URL,
+        capability,
+        runtime._control_name() if control is None else control,
+    )
     record = paths.runtime_directory / "instance.json"
     record.write_text(json.dumps(instance.as_dict()) + "\n", encoding="utf-8")
     os.chmod(record, 0o600)
     return instance
 
 
+def _tcp_control_record(
+    paths: state.StatePaths,
+) -> tuple[runtime.Instance, socket.socket]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+    except BaseException:
+        listener.close()
+        raise
+    instance = _write_runtime_record(
+        paths,
+        control=runtime._control_endpoint(listener.getsockname()[1]),
+    )
+    return instance, listener
+
+
 def _held_lease(paths: state.StatePaths) -> tuple[int, runtime._FileLock]:
-    lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(lease_fd, 0o600)
-    fcntl.flock(lease_fd, fcntl.LOCK_EX)
+    lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
     lease = runtime._lease_lock(paths, timeout=0.0)
     return lease_fd, lease
 
 
 def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
     with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
-        state, "_current_uid", return_value=os.getuid()
+        state, "_current_uid", return_value=state._current_uid()
     ):
         return runtime.observe_runtime()
 
@@ -1117,7 +1184,7 @@ def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
 
         try:
             with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
-                state, "_current_uid", return_value=os.getuid()
+                state, "_current_uid", return_value=state._current_uid()
             ), patch.object(state, "observe_runtime", side_effect=observe_then_start):
                 observed = runtime.observe_runtime()
         finally:
@@ -1131,6 +1198,44 @@ def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
 def test_observe_runtime_requires_same_uid_before_sending_capability():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
+        if os.name == "nt":
+            lease_fd, lease = _held_lease(paths)
+            instance, listener = _tcp_control_record(paths)
+            received: list[bytes] = []
+
+            def serve_tcp() -> None:
+                connection, _ = listener.accept()
+                with connection:
+                    received.append(connection.recv(4096))
+                    connection.sendall(
+                        (
+                            json.dumps(
+                                {
+                                    "status": "ready",
+                                    "instance_id": instance.instance_id,
+                                    "url": runtime.URL,
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+
+            server = threading.Thread(target=serve_tcp)
+            server.start()
+            try:
+                with patch.object(
+                    runtime, "_peer_uid", side_effect=AssertionError("TCP has no UID probe")
+                ):
+                    observed = _observe(paths)
+            finally:
+                listener.close()
+                server.join(timeout=3)
+                lease.close()
+                os.close(lease_fd)
+            assert observed.status == "running"
+            assert instance.capability.encode("utf-8") in b"".join(received)
+            return
+
         instance = _write_runtime_record(paths)
         lease_fd, lease = _held_lease(paths)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1156,7 +1261,9 @@ def test_observe_runtime_requires_same_uid_before_sending_capability():
         server = threading.Thread(target=serve)
         server.start()
         try:
-            with patch.object(runtime, "_peer_uid", return_value=os.getuid() + 1):
+            with patch.object(runtime, "_peer_uid", return_value=state._current_uid() + 1), patch.object(
+                runtime.os, "getuid", return_value=state._current_uid(), create=True
+            ):
                 observed = _observe(paths)
         finally:
             listener.close()
@@ -1172,17 +1279,13 @@ def test_observe_runtime_requires_same_uid_before_sending_capability():
 def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        instance = _write_runtime_record(paths)
         lease_fd, lease = _held_lease(paths)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(runtime._control_name())
+            instance, listener = _tcp_control_record(paths)
         except PermissionError:
-            listener.close()
             lease.close()
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
-        listener.listen(1)
 
         def serve() -> None:
             connection, _ = listener.accept()
@@ -1209,24 +1312,22 @@ def test_observe_runtime_accepts_authenticated_ready_control_and_rechecks_state(
 def test_observe_runtime_rejects_lease_release_before_ready_response():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        instance = _write_runtime_record(paths)
         lease_fd, lease = _held_lease(paths)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(runtime._control_name())
+            instance, listener = _tcp_control_record(paths)
         except PermissionError:
-            listener.close()
             lease.close()
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
-        listener.listen(1)
         released = threading.Event()
 
         def serve() -> None:
+            nonlocal lease_fd
             connection, _ = listener.accept()
             with connection:
                 connection.recv(4096)
-                fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                os.close(lease_fd)
+                lease_fd = -1
                 released.set()
                 connection.sendall(
                     (json.dumps({"status": "ready", "instance_id": instance.instance_id, "url": runtime.URL}) + "\n").encode()
@@ -1240,7 +1341,8 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
             listener.close()
             server.join(timeout=3)
             lease.close()
-            os.close(lease_fd)
+            if lease_fd >= 0:
+                os.close(lease_fd)
         assert released.is_set()
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
@@ -1249,17 +1351,13 @@ def test_observe_runtime_rejects_lease_release_before_ready_response():
 def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        _write_runtime_record(paths)
         lease_fd, lease = _held_lease(paths)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(runtime._control_name())
+            _, listener = _tcp_control_record(paths)
         except PermissionError:
-            listener.close()
             lease.close()
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
-        listener.listen(1)
         accepted = threading.Event()
 
         def serve() -> None:
@@ -1288,17 +1386,13 @@ def test_observe_runtime_control_timeout_uses_one_total_second_without_retry():
 def test_observe_runtime_rejects_record_replacement_after_ready_response():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        instance = _write_runtime_record(paths)
         lease_fd, lease = _held_lease(paths)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(runtime._control_name())
+            instance, listener = _tcp_control_record(paths)
         except PermissionError:
-            listener.close()
             lease.close()
             os.close(lease_fd)
             pytest.skip("sandbox does not permit local control sockets")
-        listener.listen(1)
 
         def serve() -> None:
             connection, _ = listener.accept()
@@ -1328,20 +1422,32 @@ def test_observe_runtime_rejects_record_replacement_after_ready_response():
 def test_foreign_control_holder_causes_startup_failure_without_record():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        occupant = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        occupant.bind(runtime._control_name())
+        try:
+            occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except PermissionError:
+            pytest.skip("sandbox does not permit loopback sockets")
+        occupant.bind(("127.0.0.1", 0))
         occupant.listen(1)
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         result: list[int] = []
+
+        def bind_occupied_control() -> socket.socket:
+            control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                control.bind(occupant.getsockname())
+            except BaseException:
+                control.close()
+                raise
+            raise AssertionError("occupied endpoint unexpectedly accepted a second bind")
+
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-                thread = threading.Thread(target=lambda: result.append(daemon.run()))
-                thread.start()
-                thread.join(timeout=5)
-                assert not thread.is_alive()
+                with patch.object(daemon, "_bind_control", side_effect=bind_occupied_control):
+                    thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                    thread.start()
+                    thread.join(timeout=5)
+                    assert not thread.is_alive()
             assert result == [1]
             assert not paths.runtime_directory.joinpath("instance.json").exists()
         finally:
@@ -1351,9 +1457,7 @@ def test_foreign_control_holder_causes_startup_failure_without_record():
 def test_idle_http_connection_does_not_block_authenticated_stop():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         idle = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
@@ -1879,13 +1983,13 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
                 runtime.stop()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher kill phase")
 def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit():
     child = (
-        "import os,sys,time; from pathlib import Path; "
-        "from nyx._native_claim import NativeClaim; "
-        "fd=int(sys.argv[sys.argv.index('--daemon-fd')+1]); "
-        "ack=int(sys.argv[sys.argv.index('--ack-fd')+1]); "
+        "import os,sys,time; from pathlib import Path; from nyx._native_claim import NativeClaim; "
+        "fd=(NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--daemon-handle')+1])) "
+        "if '--daemon-handle' in sys.argv else int(sys.argv[sys.argv.index('--daemon-fd')+1])); "
+        "ack=(NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--ack-handle')+1]),write_only=True) "
+        "if '--ack-handle' in sys.argv else int(sys.argv[sys.argv.index('--ack-fd')+1])); "
         "path=Path(sys.argv[sys.argv.index('--claim-path')+1]); "
         "time.sleep(.4); valid=NativeClaim.validate_received(fd,path); "
         "exec(\"try:\\n os.write(ack,b'1' if valid else b'0')\\nexcept OSError:\\n pass\"); "
@@ -1980,7 +2084,9 @@ def test_separate_processes_serialize_on_the_persistent_operation_lock():
         script = (
             "import sys,time; from nyx.runtime import _FileLock; "
             "lock=_FileLock(__import__('pathlib').Path(sys.argv[1]), timeout=2); "
-            "assert lock.acquire(); open(sys.argv[2], 'a').write('acquired\\n'); "
+            "deadline=time.monotonic()+2; acquired=lock.acquire(blocking=False); "
+            "exec(\"while not acquired and time.monotonic()<deadline:\\n time.sleep(.01); acquired=lock.acquire(blocking=False)\"); "
+            "assert acquired; open(sys.argv[2], 'a').write('acquired\\n'); "
             "time.sleep(.35); lock.close()"
         )
         events = Path(temporary) / "events"
@@ -1996,12 +2102,17 @@ def test_separate_processes_serialize_on_the_persistent_operation_lock():
 def test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit():
     with TemporaryDirectory() as temporary:
         lock_path = Path(temporary) / "lease.lock"
+        child = (
+            "import os,sys,time; from nyx._native_claim import NativeClaim; "
+            "fd=(NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--daemon-handle')+1])) "
+            "if '--daemon-handle' in sys.argv else int(sys.argv[sys.argv.index('--daemon-fd')+1])); "
+            "time.sleep(.8); os.close(fd)"
+        )
         script = (
-            "import fcntl,os,subprocess,sys,time; "
-            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); os.fchmod(fd, 0o600); "
-            "fcntl.flock(fd, fcntl.LOCK_EX); "
-            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.8)'], pass_fds=(fd,)); "
-            "os.close(fd); os._exit(0)"
+            "import os,sys,time; from pathlib import Path; from nyx import runtime; "
+            "lease=runtime._FileLock(Path(sys.argv[1]),timeout=0); assert lease.acquire(blocking=False); "
+            f"runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r}]; "
+            "runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9); lease.close(); os._exit(0)"
         )
         launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
         assert launcher.wait(timeout=2) == 0
@@ -2016,8 +2127,9 @@ def test_launcher_loss_before_spawn_releases_untransferred_lease():
     with TemporaryDirectory() as temporary:
         lock_path = Path(temporary) / "lease.lock"
         script = (
-            "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600); "
-            "os.fchmod(fd,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os._exit(0)"
+            "import os,sys; from pathlib import Path; from nyx import runtime; "
+            "lease=runtime._FileLock(Path(sys.argv[1]),timeout=0); "
+            "assert lease.acquire(blocking=False); os._exit(0)"
         )
         launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
         assert launcher.wait(timeout=2) == 0
@@ -2040,7 +2152,7 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
         try:
             _wait_for_record(paths)
             crashed.kill()
-            assert crashed.wait(timeout=2) == -9
+            assert crashed.wait(timeout=2) != 0
             with patch.object(runtime, "_paths", return_value=paths):
                 assert runtime.stop() == "stopped"
             assert not paths.runtime_directory.joinpath("instance.json").exists()
@@ -2053,16 +2165,16 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
 def test_controlled_stop_timeout_retains_daemon_lease_until_child_cleanup():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
-        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
-        os.fchmod(lease_fd, 0o600)
-        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
             daemon.workers = runtime.CatalogWorkerManager(
                 command_factory=lambda: [
                     sys.executable,
                     "-c",
-                    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(.5); time.sleep(30)",
+                    "import subprocess,sys,time; "
+                    "subprocess.Popen([sys.executable,'-c','import time; time.sleep(6)']); "
+                    "time.sleep(30)",
                 ],
                 timeout=30,
             )
