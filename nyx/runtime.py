@@ -1000,16 +1000,28 @@ class _Daemon:
                         )
                         response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
                     elif command == "stop":
-                        response = {"status": "stopping", "instance_id": self.instance.instance_id, "url": URL}
-                        connection.sendall((json.dumps(response) + "\n").encode())
                         requested_deadline = request.get("deadline_ns")
                         if type(requested_deadline) is not int:
                             requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
-                        threading.Thread(
-                            target=self.shutdown,
-                            args=(requested_deadline / 1_000_000_000,),
-                            daemon=True,
-                        ).start()
+                        # Publish the unhealthy transition before the caller
+                        # can observe its acknowledgement and release lifecycle
+                        # exclusion.  Cleanup starts after the send attempt so
+                        # terminal listener closure cannot race the response,
+                        # but a failed response must still begin cleanup.
+                        self.stop_requested.set()
+                        response = {
+                            "status": "stopping",
+                            "instance_id": self.instance.instance_id,
+                            "url": URL,
+                        }
+                        try:
+                            connection.sendall((json.dumps(response) + "\n").encode())
+                        finally:
+                            threading.Thread(
+                                target=self.shutdown,
+                                args=(requested_deadline / 1_000_000_000,),
+                                daemon=True,
+                            ).start()
                         continue
                     else:
                         continue
