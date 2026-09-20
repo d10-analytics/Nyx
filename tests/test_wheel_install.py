@@ -122,6 +122,19 @@ def _native_claim_probe(interpreter: Path, claim: Path, *, root: Path, home: Pat
     return result.stdout.strip()
 
 
+def test_venv_executable_selects_windows_scripts_and_exe(tmp_path, monkeypatch):
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    python = scripts / "python.exe"
+    console = scripts / "nyx.exe"
+    python.touch()
+    console.touch()
+    monkeypatch.setattr(os, "name", "nt")
+
+    assert _venv_executable(tmp_path, "python") == python
+    assert _venv_executable(tmp_path, "nyx") == console
+
+
 def test_wheel_contains_every_module_and_frontend_asset():
     wheel = _wheel_path()
     with zipfile.ZipFile(wheel) as archive:
