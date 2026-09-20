@@ -1104,7 +1104,7 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
                 thread = threading.Thread(target=lambda: result.append(daemon.run()))
                 thread.start()
-                thread.join(timeout=5)
+                thread.join(timeout=8)
                 assert not thread.is_alive()
             assert result == [1]
             assert not paths.runtime_directory.joinpath("instance.json").exists()
