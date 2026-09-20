@@ -63,3 +63,52 @@ jobs:
             /bin/bash -c 'cd "$1" && exec "$2" -m pytest test_installed_service.py -v' \
             nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"
           "$runner_python" -m pytest tests/test_wheel_install.py -v
+
+  nyx-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Verify package and installed lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]' build
+          python -m playwright install chromium
+          ruff check .
+          python -m pytest tests/ -v
+          python -m build --wheel
+          $wheels = @(Get-ChildItem -Path dist -Filter '*.whl' -File)
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel, found $($wheels.Count)"
+          }
+          python -m pytest tests/test_wheel_install.py -v
+
+  nyx-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Verify package and installed lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_python="$(command -v python)"
+          "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          "$runner_python" -m pip install --upgrade pip
+          "$runner_python" -m pip install -e '.[test]' build
+          "$runner_python" -m playwright install chromium
+          ruff check .
+          "$runner_python" -m pytest tests/ -v
+          "$runner_python" -m build --wheel
+          wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          test "$wheel_count" -eq 1
+          "$runner_python" -m pytest tests/test_wheel_install.py -v
