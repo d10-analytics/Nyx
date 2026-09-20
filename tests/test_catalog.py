@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -149,8 +149,21 @@ class CatalogTests(TestCase):
             link_package.joinpath("spec.md").unlink()
             link_package.joinpath("spec.md").symlink_to(outside)
             nonregular.joinpath("spec.md").unlink()
-            os.mkfifo(nonregular / "spec.md")
-            unreadable.joinpath("spec.md").chmod(0)
+
+            if sys.platform == "win32":
+                nonregular.joinpath("spec.md").mkdir()
+                original_open = catalog.Path.open
+
+                def deny_unreadable(path, *args, **kwargs):
+                    if path == unreadable / "spec.md":
+                        raise PermissionError("injected unreadable anchor")
+                    return original_open(path, *args, **kwargs)
+
+                open_patch = patch.object(catalog.Path, "open", side_effect=deny_unreadable)
+            else:
+                os.mkfifo(nonregular / "spec.md")
+                unreadable.joinpath("spec.md").chmod(0)
+                open_patch = nullcontext()
 
             identity_count = 0
             def changed_identity(info):
@@ -158,7 +171,7 @@ class CatalogTests(TestCase):
                 identity_count += 1
                 return (identity_count, 1, 1, 1, 1, 1, 1)
 
-            with patch.object(catalog, "_catalog_identity", side_effect=changed_identity):
+            with open_patch, patch.object(catalog, "_catalog_identity", side_effect=changed_identity):
                 values = [
                     json.loads(producer(root))
                     for producer in (catalog.build_catalog, catalog.scan_catalog)

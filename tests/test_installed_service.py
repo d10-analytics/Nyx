@@ -5,20 +5,24 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import threading
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-if Path(__file__).resolve().parent != Path("/opt/nyx-verify/exercise"):
+if sys.platform != "linux" or Path(__file__).resolve().parent != Path("/opt/nyx-verify/exercise"):
     pytest.skip(
         "installed service proof runs only from the disposable CI exercise directory",
         allow_module_level=True,
     )
+
+
+pwd = import_module("pwd")
 
 
 ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
