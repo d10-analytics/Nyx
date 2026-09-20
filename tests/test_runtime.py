@@ -1398,6 +1398,88 @@ def test_observe_runtime_rejects_replaced_runtime_ancestry_before_outside_iterat
         assert (_claim_snapshot(outside_claim), outside_claim.read_bytes()) == outside_before
 
 
+@pytest.mark.parametrize("replaced_directory", ["state", "runtime"])
+def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
+    replaced_directory,
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        external_state = root / "external-state"
+        external_runtime = external_state / "runtime"
+        external_runtime.mkdir(parents=True)
+        outside_claim = external_runtime / "operation.lock"
+        outside_claim.write_bytes(b"outside")
+        outside_before = (_claim_snapshot(outside_claim), outside_claim.read_bytes())
+        replaced_path = (
+            paths.state_directory
+            if replaced_directory == "state"
+            else paths.runtime_directory
+        )
+        replacement = external_state if replaced_directory == "state" else external_runtime
+        admitted_path = root / f"admitted-{replaced_directory}"
+        original_admit = state._admit_directory
+        admissions = 0
+
+        def replace_after_second_admission(path, **kwargs):
+            nonlocal admissions
+            result = original_admit(path, **kwargs)
+            if path == replaced_path:
+                admissions += 1
+                if admissions == 2:
+                    replaced_path.rename(admitted_path)
+                    replaced_path.symlink_to(replacement, target_is_directory=True)
+            return result
+
+        external_runtime_resolved = external_runtime.resolve()
+        outside_accesses: list[tuple[str, Path]] = []
+        original_iterdir = Path.iterdir
+        original_read_bytes = Path.read_bytes
+        original_read_text = Path.read_text
+        original_probe = runtime.NativeClaim.probe
+
+        def record_iteration(path: Path):
+            if path.resolve() == external_runtime_resolved:
+                outside_accesses.append(("iteration", path))
+            return original_iterdir(path)
+
+        def record_bytes_read(path: Path):
+            if path.resolve().is_relative_to(external_runtime_resolved):
+                outside_accesses.append(("bytes", path))
+            return original_read_bytes(path)
+
+        def record_text_read(path: Path, *args, **kwargs):
+            if path.resolve().is_relative_to(external_runtime_resolved):
+                outside_accesses.append(("text", path))
+            return original_read_text(path, *args, **kwargs)
+
+        def record_claim_probe(path: Path):
+            if path.resolve().is_relative_to(external_runtime_resolved):
+                outside_accesses.append(("claim", path))
+            return original_probe(path)
+
+        with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ), patch.object(
+            state, "_admit_directory", side_effect=replace_after_second_admission
+        ), patch.object(
+            Path, "iterdir", record_iteration
+        ), patch.object(
+            Path, "read_bytes", record_bytes_read
+        ), patch.object(
+            Path, "read_text", record_text_read
+        ), patch.object(
+            runtime.NativeClaim, "probe", side_effect=record_claim_probe
+        ):
+            observed = runtime.observe_runtime()
+
+        assert admissions == 2
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+        assert outside_accesses == []
+        assert (_claim_snapshot(outside_claim), outside_claim.read_bytes()) == outside_before
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows junction")
 def test_observe_runtime_rejects_native_runtime_junction_before_outside_iteration():
     with TemporaryDirectory() as temporary:
