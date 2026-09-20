@@ -515,6 +515,10 @@ def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
             or not stat.S_ISREG(details.st_mode)
         ):
             raise UnhealthyInstanceError("Nyx instance record is unsafe")
+        # A stale record is still persisted control input.  Validate it at the
+        # same boundary as active lifecycle operations before removing it, so a
+        # malformed endpoint cannot be silently discarded.
+        _read_instance(paths)
         _require_deadline(deadline)
         record.unlink()
     except FileNotFoundError:
