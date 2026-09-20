@@ -968,7 +968,12 @@ class _Daemon:
 
     def _serve_control(self) -> None:
         assert self.control is not None
-        while not self.stop_requested.is_set() or self.shutdown_result == "timeout":
+        # The authenticated control endpoint is also the retry path when
+        # cleanup outlives its shared deadline.  Keep accepting requests until
+        # terminal cleanup closes the listener; stop_requested only marks that
+        # cleanup has begun and must not make the endpoint disappear while the
+        # daemon still owns the lease and record.
+        while self.shutdown_result != "stopped":
             try:
                 connection, _ = self.control.accept()
             except TimeoutError:
@@ -988,7 +993,11 @@ class _Daemon:
                         continue
                     command = request.get("command")
                     if command == "status":
-                        status = "unhealthy" if self.shutdown_result == "timeout" else "ready"
+                        status = (
+                            "unhealthy"
+                            if self.stop_requested.is_set() or self.shutdown_result == "timeout"
+                            else "ready"
+                        )
                         response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
                     elif command == "stop":
                         response = {"status": "stopping", "instance_id": self.instance.instance_id, "url": URL}
