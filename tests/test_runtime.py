@@ -70,6 +70,13 @@ def test_windows_share_violation_is_a_qualified_busy_probe():
         assert runtime.NativeClaim.probe(Path("claim.lock")) == "held"
 
 
+def test_windows_share_violation_during_claim_acquisition_is_busy():
+    busy = OSError(13, "sharing violation")
+    busy.winerror = 32
+    with patch.object(_native_claim, "_open_claim", side_effect=busy):
+        assert runtime._FileLock(Path("claim.lock"), timeout=0.0).acquire(blocking=False) is False
+
+
 def test_windows_spawn_transfers_native_handles_and_child_maps_them():
     startup = type("Startup", (), {"lpAttributeList": None})()
     process = object()
