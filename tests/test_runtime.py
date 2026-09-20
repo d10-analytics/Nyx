@@ -2819,58 +2819,113 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
                 crashed.wait()
 
 
-def test_controlled_stop_timeout_retains_daemon_lease_until_child_cleanup():
+def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", 0))
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
+        second_root = Path(temporary) / "second-specification"
+        second_root.mkdir()
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
-        with patch.object(runtime, "_paths", return_value=paths):
-            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            daemon.workers = runtime.CatalogWorkerManager(
-                command_factory=lambda: [
-                    sys.executable,
-                    "-c",
-                    "import subprocess,sys,time; "
-                    "subprocess.Popen([sys.executable,'-c','import time; time.sleep(6)']); "
-                    "time.sleep(30)",
-                ],
-                timeout=30,
-            )
-            daemon_thread = threading.Thread(target=daemon.run)
-            daemon_thread.start()
-            instance = _wait_for_record(paths)
-            request_done: list[object] = []
+        daemon = None
+        daemon_thread = None
+        worker_child = None
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "SHUTDOWN_TIMEOUT", 0.25
+            ):
+                daemon = runtime._Daemon(
+                    lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+                )
+                daemon.workers = runtime.CatalogWorkerManager(
+                    command_factory=lambda: [
+                        sys.executable,
+                        "-c",
+                        "import signal,time; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "time.sleep(30)",
+                    ],
+                    timeout=30,
+                )
+                daemon_thread = threading.Thread(target=daemon.run)
+                daemon_thread.start()
+                _wait_for_record(paths)
+                record_before = paths.runtime_directory.joinpath("instance.json").read_bytes()
 
-            def request_catalog() -> None:
-                connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=10)
+                request_done: list[object] = []
+
+                def request_catalog() -> None:
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", runtime.PORT, timeout=10
+                    )
+                    try:
+                        connection.request(
+                            "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"}
+                        )
+                        request_done.append(connection.getresponse().status)
+                    except OSError:
+                        request_done.append(None)
+                    finally:
+                        connection.close()
+
+                request_thread = threading.Thread(target=request_catalog)
+                request_thread.start()
+                deadline = time.monotonic() + 2
+                while daemon.workers.active_count == 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert daemon.workers.active_count == 1
+                with daemon.workers._lock:
+                    worker_child = daemon.workers._children[0]
+
+                with pytest.raises(runtime.ShutdownTimeoutError):
+                    runtime.stop()
+                assert daemon.shutdown_done.wait(timeout=2)
+                assert daemon.shutdown_result == "timeout"
+                assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
+
+                observed = runtime.observe_runtime()
+                assert observed.status == "unknown"
+                assert observed.diagnostic == runtime.RUNTIME_UNHEALTHY
+
+                configuration_before = paths.config_file.read_bytes()
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime.start()
+                with pytest.raises(runtime.ActiveInstanceError):
+                    runtime.setup(second_root)
+                assert paths.config_file.read_bytes() == configuration_before
+                assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
+                probe = runtime._lease_lock(paths, timeout=0.0)
+                assert not probe.acquire(blocking=False)
+                probe.close()
+
+                # Release only the real worker obstacle; the public stop below
+                # must perform the retry and terminal cleanup.
+                worker_child.process.kill()
+                request_thread.join(timeout=3)
+                assert not request_thread.is_alive()
+                assert runtime.stop() == "stopped"
+                assert not paths.runtime_directory.joinpath("instance.json").exists()
+                _assert_claim_available(paths.runtime_directory / "lease.lock")
+                daemon_thread.join(timeout=3)
+                assert not daemon_thread.is_alive()
+        finally:
+            if worker_child is not None and worker_child.process.poll() is None:
+                worker_child.process.kill()
+            if daemon is not None and daemon_thread is not None and daemon_thread.is_alive():
                 try:
-                    connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"})
-                    request_done.append(connection.getresponse().status)
-                except OSError:
-                    request_done.append(None)
-                finally:
-                    connection.close()
-
-            request_thread = threading.Thread(target=request_catalog)
-            request_thread.start()
-            deadline = time.monotonic() + 2
-            while daemon.workers.active_count == 0 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert daemon.workers.active_count == 1
-            time.sleep(0.7)
-            response = runtime._send_control(instance, "stop")
-            assert response["status"] == "stopping"
-            assert daemon.shutdown_done.wait(timeout=7)
-            assert daemon.shutdown_result == "timeout"
-            probe = runtime._lease_lock(paths, timeout=0.0)
-            assert not probe.acquire(blocking=False)
-            probe.close()
-            # The child and request are test-owned; release them before allowing
-            # the daemon thread to complete its retained-ownership loop.
-            for child in tuple(daemon.workers._children):
-                child.process.kill()
-            request_thread.join(timeout=3)
-            daemon.shutdown_result = "stopped"
-            if daemon.control is not None:
-                daemon.control.close()
-            daemon_thread.join(timeout=3)
-            assert not daemon_thread.is_alive()
+                    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                        runtime, "SHUTDOWN_TIMEOUT", 1.0
+                    ):
+                        runtime.stop()
+                except runtime.RuntimeErrorBase:
+                    pass
+                daemon_thread.join(timeout=3)
+            try:
+                os.close(lease_fd)
+            except OSError:
+                pass
