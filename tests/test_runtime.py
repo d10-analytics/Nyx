@@ -1361,46 +1361,11 @@ def test_observe_runtime_preserves_empty_existing_claims_and_metadata():
         assert {claim: (_claim_snapshot(claim), claim.read_bytes()) for claim in claims} == before
 
 
-def test_observe_runtime_rejects_replaced_runtime_ancestry_before_outside_iteration():
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        paths, _, _ = _fixture(root)
-        external = root / "external"
-        external.mkdir()
-        outside_claim = external / "operation.lock"
-        outside_claim.write_bytes(b"outside")
-        outside_before = (_claim_snapshot(outside_claim), outside_claim.read_bytes())
-        original_observe = state.observe_runtime
-
-        def replace_after_admission() -> state.RuntimeObservation:
-            result = original_observe()
-            paths.runtime_directory.rmdir()
-            paths.runtime_directory.symlink_to(external, target_is_directory=True)
-            return result
-
-        iterated: list[tuple[Path, bool]] = []
-        original_iterdir = Path.iterdir
-
-        def record_iteration(path: Path):
-            iterated.append((path, path.is_symlink()))
-            return original_iterdir(path)
-
-        with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
-            state, "_current_uid", return_value=state._current_uid()
-        ), patch.object(state, "observe_runtime", side_effect=replace_after_admission), patch.object(
-            Path, "iterdir", record_iteration
-        ):
-            observed = runtime.observe_runtime()
-
-        assert observed.status == "unknown"
-        assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
-        assert not any(path == paths.runtime_directory and is_link for path, is_link in iterated)
-        assert (_claim_snapshot(outside_claim), outside_claim.read_bytes()) == outside_before
-
-
+@pytest.mark.parametrize("replacement_phase", ["before_hold", "after_hold"])
 @pytest.mark.parametrize("replaced_directory", ["state", "runtime"])
 def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
     replaced_directory,
+    replacement_phase,
 ):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1418,18 +1383,58 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
         )
         replacement = external_state if replaced_directory == "state" else external_runtime
         admitted_path = root / f"admitted-{replaced_directory}"
-        original_admit = state._admit_directory
-        admissions = 0
+        parent_path = (
+            paths.account_home
+            if replaced_directory == "state"
+            else paths.state_directory
+        )
+        replaced = False
+        replacement_prevented = False
 
-        def replace_after_second_admission(path, **kwargs):
-            nonlocal admissions
-            result = original_admit(path, **kwargs)
-            if path == replaced_path:
-                admissions += 1
-                if admissions == 2:
-                    replaced_path.rename(admitted_path)
+        def replace_directory() -> None:
+            nonlocal replaced
+            nonlocal replacement_prevented
+            try:
+                replaced_path.rename(admitted_path)
+                if sys.platform == "win32":
+                    completed = subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(replaced_path), str(replacement)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if completed.returncode:
+                        raise OSError(completed.stderr or completed.stdout)
+                else:
                     replaced_path.symlink_to(replacement, target_is_directory=True)
-            return result
+            except OSError:
+                replacement_prevented = True
+            else:
+                replaced = True
+
+        original_stat_child = runtime.NativeDirectory.stat_child
+        original_open_child = runtime.NativeDirectory.open_child
+
+        def replace_before_hold(directory, name):
+            details = original_stat_child(directory, name)
+            if (
+                replacement_phase == "before_hold"
+                and not replaced
+                and directory.path == parent_path
+                and name == replaced_path.name
+            ):
+                replace_directory()
+            return details
+
+        def replace_after_hold(directory, name, path):
+            held = original_open_child(directory, name, path)
+            if (
+                replacement_phase == "after_hold"
+                and not replaced
+                and path == replaced_path
+            ):
+                replace_directory()
+            return held
 
         external_runtime_resolved = external_runtime.resolve()
         outside_accesses: list[tuple[str, Path]] = []
@@ -1438,7 +1443,6 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
         original_read_text = Path.read_text
         original_exists = Path.exists
         original_probe = runtime.NativeClaim.probe
-        original_lstat = state._lstat
 
         def record_iteration(path: Path):
             if path.resolve() == external_runtime_resolved:
@@ -1460,22 +1464,17 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
                 outside_accesses.append(("exists", path))
             return original_exists(path)
 
-        def record_claim_probe(path: Path):
-            if path.resolve().is_relative_to(external_runtime_resolved):
+        def record_claim_probe(path: Path, *, dir_fd=None):
+            if dir_fd is None and path.resolve().is_relative_to(external_runtime_resolved):
                 outside_accesses.append(("claim", path))
-            return original_probe(path)
-
-        def record_metadata_read(path: Path):
-            if path.parent.resolve().is_relative_to(external_state.resolve()):
-                outside_accesses.append(("metadata", path))
-            return original_lstat(path)
+            return original_probe(path, dir_fd=dir_fd)
 
         with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
             state, "_current_uid", return_value=state._current_uid()
         ), patch.object(
-            state, "_admit_directory", side_effect=replace_after_second_admission
+            runtime.NativeDirectory, "stat_child", replace_before_hold
         ), patch.object(
-            state, "_lstat", side_effect=record_metadata_read
+            runtime.NativeDirectory, "open_child", replace_after_hold
         ), patch.object(
             Path, "iterdir", record_iteration
         ), patch.object(
@@ -1489,9 +1488,16 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
         ):
             observed = runtime.observe_runtime()
 
-        assert admissions == 2
-        assert observed.status == "unknown"
-        assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+        assert replaced or replacement_prevented
+        if replaced:
+            assert observed.status == "unknown"
+            assert observed.diagnostic in {
+                runtime.RUNTIME_STATE_CHANGED,
+                runtime.RUNTIME_STATE_UNAVAILABLE,
+            }
+        else:
+            assert os.name == "nt" and replacement_phase == "after_hold"
+            assert observed.status == "not_running"
         assert outside_accesses == []
         assert (_claim_snapshot(outside_claim), outside_claim.read_bytes()) == outside_before
 
@@ -1583,24 +1589,24 @@ def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
         paths.runtime_directory.joinpath("lease.lock").unlink()
         paths.runtime_directory.rmdir()
         operation_holder: runtime._FileLock | None = None
-        original_observer = state.observe_runtime
-        observation_count = 0
+        original_stat_child = runtime.NativeDirectory.stat_child
+        runtime_checks = 0
 
-        def observe_then_start() -> state.RuntimeObservation:
-            result = original_observer()
+        def check_then_start(directory, name):
             nonlocal operation_holder
-            nonlocal observation_count
-            observation_count += 1
-            if observation_count == 2:
-                paths.runtime_directory.mkdir(mode=0o700, parents=True)
-                operation_holder = runtime._operation_lock(paths, timeout=0.0)
-                assert operation_holder.acquire(blocking=False)
-            return result
+            nonlocal runtime_checks
+            if directory.path == paths.state_directory and name == paths.runtime_directory.name:
+                runtime_checks += 1
+                if runtime_checks == 2:
+                    paths.runtime_directory.mkdir(mode=0o700, parents=True)
+                    operation_holder = runtime._operation_lock(paths, timeout=0.0)
+                    assert operation_holder.acquire(blocking=False)
+            return original_stat_child(directory, name)
 
         try:
             with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
                 state, "_current_uid", return_value=state._current_uid()
-            ), patch.object(state, "observe_runtime", side_effect=observe_then_start):
+            ), patch.object(runtime.NativeDirectory, "stat_child", check_then_start):
                 observed = runtime.observe_runtime()
         finally:
             if operation_holder is not None:
