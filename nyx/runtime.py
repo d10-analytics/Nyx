@@ -693,11 +693,14 @@ def observe_runtime() -> RuntimeObservation:
         if paths is None:
             return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
         # state owns managed-tree admission and its canonical link/reparse
-        # classifier. Re-admit the tree before any child iteration so a
-        # structural rejection cannot be followed through by this observer.
-        admitted = state.state_paths(create=False)
-        if admitted != paths:
-            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        # classifier. Re-admit only the runtime ancestry before this
+        # observer's child iteration so unsafe configuration does not affect
+        # the runtime view and a rejected path cannot be followed.
+        try:
+            state._admit_directory(paths.state_directory, create=False)
+            state._admit_directory(paths.runtime_directory, create=False)
+        except (OSError, state.StateError):
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         if not paths.runtime_directory.exists():
             if structural.status == "not_running":
                 return _stable_absent_runtime(paths)
