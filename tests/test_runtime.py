@@ -2854,8 +2854,11 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 )
                 daemon_thread = threading.Thread(target=daemon.run)
                 daemon_thread.start()
-                _wait_for_record(paths)
+                instance = _wait_for_record(paths)
                 record_before = paths.runtime_directory.joinpath("instance.json").read_bytes()
+                record_metadata_before = runtime._record_snapshot(
+                    paths.runtime_directory.joinpath("instance.json")
+                )
 
                 request_done: list[object] = []
 
@@ -2882,11 +2885,37 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 with daemon.workers._lock:
                     worker_child = daemon.workers._children[0]
 
-                with pytest.raises(runtime.ShutdownTimeoutError):
-                    runtime.stop()
+                stop_errors: list[BaseException] = []
+
+                def request_stop() -> None:
+                    try:
+                        runtime.stop()
+                    except BaseException as error:  # noqa: BLE001 - assert public error below
+                        stop_errors.append(error)
+
+                stop_thread = threading.Thread(target=request_stop)
+                stop_thread.start()
+                assert daemon.stop_requested.wait(timeout=1)
+                status_deadline = time.monotonic() + 1
+                while time.monotonic() < status_deadline:
+                    try:
+                        if runtime._send_control(instance, "status")["status"] == "unhealthy":
+                            break
+                    except runtime.UnhealthyInstanceError:
+                        pass
+                    time.sleep(0.01)
+                else:
+                    raise AssertionError("authenticated control was unavailable during cleanup")
+                stop_thread.join(timeout=2)
+                assert not stop_thread.is_alive()
+                assert len(stop_errors) == 1
+                assert isinstance(stop_errors[0], runtime.ShutdownTimeoutError)
                 assert daemon.shutdown_done.wait(timeout=2)
                 assert daemon.shutdown_result == "timeout"
                 assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
+                assert runtime._record_snapshot(
+                    paths.runtime_directory.joinpath("instance.json")
+                ) == record_metadata_before
 
                 observed = runtime.observe_runtime()
                 assert observed.status == "unknown"
