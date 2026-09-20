@@ -1146,12 +1146,21 @@ class _Daemon:
                     ):
                         _require_deadline(deadline)
                         _record_path(self.paths).unlink()
-                    _require_deadline(deadline)
-                    if self.control is not None:
-                        self.control.close()
                 except (OSError, _ControlTimeoutError):
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
+                # Removing the owned locator commits terminal cleanup.  Do not
+                # allow the shared deadline to turn that committed transition
+                # back into an incomplete result with no public retry path.
+                # Listener closure is the other half of the same transition.
+                if self.control is not None:
+                    try:
+                        self.control.close()
+                    except OSError:
+                        # socket.close() releases the Python-owned descriptor
+                        # even when the platform reports a close error.  Once
+                        # the locator is gone, retry is no longer representable.
+                        pass
                 self.shutdown_result = "stopped"
                 # Closing the listener and publishing the terminal state must
                 # precede joining this thread.  During an incomplete cleanup
@@ -1467,15 +1476,28 @@ def stop() -> str:
             deadline=deadline,
             deadline_ns=deadline_ns,
         )
-        while time.monotonic() < deadline:
+    # Waiting does not mutate lifecycle state, so release the operation claim.
+    # Public status can then authenticate the retained daemon while cleanup is
+    # in progress.  Each terminal probe reacquires the claim before inspecting
+    # or removing state, preserving exclusion from start/setup mutations.
+    while time.monotonic() < deadline:
+        operation = _operation_lock(paths, timeout=0.0, deadline=deadline)
+        try:
+            if not operation.acquire(blocking=False):
+                time.sleep(0.03)
+                continue
             probe = _lease_lock(paths, timeout=0.0, deadline=deadline)
             if probe.acquire(blocking=False):
                 probe.close()
                 _remove_stale_instance(paths, deadline=deadline)
                 return "stopped"
             probe.close()
-            time.sleep(0.03)
-        raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
+        except _ControlTimeoutError:
+            break
+        finally:
+            operation.close()
+        time.sleep(0.03)
+    raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
 
 
 def _daemon_entry(
