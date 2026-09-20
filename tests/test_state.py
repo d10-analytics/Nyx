@@ -228,7 +228,14 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
         with home_patch, uid_patch:
             state.setup(first)
             paths = state.state_paths()
-            with patch.object(state.os, "fsync", side_effect=[None, OSError("directory sync failed")]), pytest.raises(
+            verify_record = state._verify_record
+
+            def fail_after_replacement(path):
+                verify_record(path)
+                if json.loads(path.read_text(encoding="utf-8"))["specification_root"] == str(second.resolve()):
+                    raise OSError("post-replace verification failed")
+
+            with patch.object(state, "_verify_record", side_effect=fail_after_replacement), pytest.raises(
                 state.ConfigurationError, match="cannot replace"
             ):
                 state.setup(second, ["Queue"])
@@ -534,11 +541,11 @@ def test_configuration_observation_collapses_path_resolution_value_error():
                 + "\n",
                 encoding="utf-8",
             )
-            os.chmod(paths.config_file, 0o600)
             before = paths.config_file.read_bytes()
+            before_mode = stat.S_IMODE(paths.config_file.stat().st_mode)
             observed = state.observe_configuration()
 
-        assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(paths.config_file.stat().st_mode) == before_mode
         assert observed == state.ConfigurationObservation(
             "unavailable", diagnostic=state.CONFIGURATION_UNAVAILABLE
         )
