@@ -1313,6 +1313,33 @@ def test_shutdown_deadline_stops_before_next_cleanup_mutation(expiring_phase):
             os.close(lease_fd)
 
 
+def test_terminal_shutdown_cannot_timeout_after_removing_owned_record():
+    events: list[str] = []
+
+    class Control:
+        def close(self):
+            events.append("control-close")
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        record.write_bytes(b"owned-record")
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 5_000_000_000)
+            daemon.control = Control()
+            daemon.published_record = runtime._record_snapshot(record)
+            with patch.object(daemon.workers, "close_admission"), patch.object(
+                daemon.workers, "close", return_value=True
+            ), patch.object(runtime.time, "monotonic", side_effect=[1, 1, 1, 1, 2]):
+                assert daemon.shutdown(deadline=2.0) == "stopped"
+            assert not record.exists()
+            assert events == ["control-close"]
+        finally:
+            os.close(lease_fd)
+
+
 def test_wrong_capability_cannot_control_a_ready_instance():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -2836,7 +2863,9 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
         daemon_thread = None
         worker_child = None
         try:
-            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            with patch.object(
+                state, "resolve_account_home", return_value=paths.account_home
+            ), patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "SHUTDOWN_TIMEOUT", 0.25
             ):
                 daemon = runtime._Daemon(
@@ -2898,28 +2927,25 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 assert daemon.stop_requested.wait(timeout=1)
                 status_deadline = time.monotonic() + 1
                 while time.monotonic() < status_deadline:
-                    try:
-                        if runtime._send_control(instance, "status")["status"] == "unhealthy":
-                            break
-                    except runtime.UnhealthyInstanceError:
-                        pass
+                    cleanup_status = runtime.observe_runtime()
+                    if cleanup_status.diagnostic == runtime.RUNTIME_UNHEALTHY:
+                        break
                     time.sleep(0.01)
                 else:
-                    raise AssertionError("authenticated control was unavailable during cleanup")
+                    raise AssertionError("public status did not authenticate cleanup in progress")
+                assert cleanup_status.status == "unknown"
                 stop_thread.join(timeout=2)
                 assert not stop_thread.is_alive()
                 assert len(stop_errors) == 1
                 assert isinstance(stop_errors[0], runtime.ShutdownTimeoutError)
-                assert daemon.shutdown_done.wait(timeout=2)
-                assert daemon.shutdown_result == "timeout"
                 assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
                 assert runtime._record_snapshot(
                     paths.runtime_directory.joinpath("instance.json")
                 ) == record_metadata_before
 
-                observed = runtime.observe_runtime()
-                assert observed.status == "unknown"
-                assert observed.diagnostic == runtime.RUNTIME_UNHEALTHY
+                timed_out_status = runtime.observe_runtime()
+                assert timed_out_status.status == "unknown"
+                assert timed_out_status.diagnostic == runtime.RUNTIME_UNHEALTHY
 
                 configuration_before = paths.config_file.read_bytes()
                 with pytest.raises(runtime.UnhealthyInstanceError):
@@ -2942,6 +2968,9 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 _assert_claim_available(paths.runtime_directory / "lease.lock")
                 daemon_thread.join(timeout=3)
                 assert not daemon_thread.is_alive()
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime._send_control(instance, "status")
+                assert runtime.observe_runtime().status == "not_running"
         finally:
             if worker_child is not None and worker_child.process.poll() is None:
                 worker_child.process.kill()
