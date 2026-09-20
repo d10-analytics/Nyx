@@ -42,6 +42,30 @@ RUNTIME_CONTROL_UNAVAILABLE = "runtime control unavailable"
 RUNTIME_CONTROL_IDENTITY_MISMATCH = "runtime control identity mismatch"
 RUNTIME_UNHEALTHY = "runtime unhealthy"
 
+# Private exit statuses keep detached-child failures observable without retaining
+# child output, exception text, filesystem paths, or capability material.
+_DAEMON_FAILURES = {
+    20: "received-claim-rejected",
+    21: "acknowledgement-write-failed",
+    22: "daemon-initialization-failed",
+    23: "configuration-load-failed",
+    24: "http-start-failed",
+    25: "static-readiness-failed",
+    26: "control-bind-failed",
+    27: "control-readiness-failed",
+    28: "locator-publication-failed",
+    29: "serving-failed",
+    30: "fixed-port-unavailable",
+}
+
+
+def _startup_failure(message: str, process: subprocess.Popen[bytes], phase: str) -> StartupError:
+    error = StartupError(message)
+    code = process.poll()
+    outcome = "child-running" if code is None else _DAEMON_FAILURES.get(code, "child-exited")
+    error.add_note(f"internal startup phase={phase}; outcome={outcome}; exit={code}")
+    return error
+
 
 class RuntimeErrorBase(RuntimeError):
     """Base class for safe lifecycle operation failures."""
@@ -342,7 +366,10 @@ def _control_endpoint(port: int) -> str:
 
 def _parse_control_endpoint(value: str) -> tuple[int, str | tuple[str, int]]:
     if value.startswith("\x00"):
-        return socket.AF_UNIX, value
+        family = getattr(socket, "AF_UNIX", None)
+        if family is None:
+            raise ValueError("local socket control is unavailable")
+        return family, value
     host, separator, raw_port = value.rpartition(":")
     if separator != ":" or host != "127.0.0.1":
         raise ValueError("control endpoint is not loopback")
@@ -403,7 +430,6 @@ def _write_instance(
         _require_deadline(deadline)
         fd, temporary = tempfile.mkstemp(prefix=".instance.json.", dir=paths.runtime_directory)
         _require_deadline(deadline)
-        os.fchmod(fd, 0o600)
         written = 0
         while written < len(data):
             _require_deadline(deadline)
@@ -480,7 +506,7 @@ def _send_control(
         connection = socket.socket(family, socket.SOCK_STREAM)
         connection.settimeout(remaining())
         connection.connect(address)
-        if family == socket.AF_UNIX and _peer_uid(connection) != os.getuid():
+        if family == getattr(socket, "AF_UNIX", None) and _peer_uid(connection) != os.getuid():
             raise _ControlIdentityError("control peer identity did not match")
         connection.settimeout(remaining())
         payload = {"version": 1, "capability": instance.capability, "command": command}
@@ -782,14 +808,18 @@ class _Daemon:
         if time.monotonic() >= self._deadline():
             raise StartupError("Nyx startup timed out")
         try:
+            self.startup_failure_code = 23
             state.load_configuration(self.paths)
+            self.startup_failure_code = 24
             self.server = create_server(provider=self._provider, port=PORT)
             self.http_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.http_thread.start()
+            self.startup_failure_code = 25
             while time.monotonic() < self._deadline() and not self._static_ready():
                 time.sleep(0.01)
             if time.monotonic() >= self._deadline():
                 raise StartupError("Nyx static server did not become ready")
+            self.startup_failure_code = 26
             self.control = self._bind_control()
             self.instance = Instance(
                 instance_id=secrets.token_hex(16),
@@ -799,21 +829,24 @@ class _Daemon:
             )
             self.control_thread = threading.Thread(target=self._serve_control, daemon=True)
             self.control_thread.start()
+            self.startup_failure_code = 27
             try:
                 response = _send_control(self.instance, "status", deadline=self._deadline())
             except UnhealthyInstanceError as error:
                 raise StartupError("Nyx control endpoint did not become ready") from error
             if response.get("status") != "ready" or response.get("url") != URL:
                 raise StartupError("Nyx control endpoint did not become ready")
+            self.startup_failure_code = 28
             self.published_record = _write_instance(
                 self.paths,
                 self.instance,
                 deadline=self._deadline(),
             )
             self.catalog_admitted = True
+            self.startup_failure_code = 29
             self.http_thread.join()
         except OSError as error:
-            if error.errno in (errno.EADDRINUSE, errno.EACCES):
+            if self.startup_failure_code == 24 and error.errno in (errno.EADDRINUSE, errno.EACCES):
                 raise PortConflictError("Nyx fixed port 8765 is unavailable") from None
             raise StartupError("Nyx server could not start") from error
         finally:
@@ -917,8 +950,10 @@ class _Daemon:
         try:
             self.start()
             completed = True
-        except StartupError:
-            return 1
+        except PortConflictError:
+            return 30
+        except Exception:
+            return getattr(self, "startup_failure_code", 22)
         finally:
             if completed and self.stop_requested.is_set():
                 self.shutdown_done.wait()
@@ -995,16 +1030,22 @@ def _spawn_daemon(
 def _wait_for_ack(
     process: subprocess.Popen[bytes], ack_fd: int, deadline: float
 ) -> bool:
+    process._nyx_ack_outcome = "acknowledgement-deadline"
     os.set_blocking(ack_fd, False)
     while time.monotonic() < deadline:
         try:
             data = os.read(ack_fd, 1)
             if data:
+                process._nyx_ack_outcome = (
+                    "acknowledgement-accepted" if data == b"1" else "acknowledgement-rejected"
+                )
                 return data == b"1" and process.poll() is None
-            if process.poll() is not None:
-                return False
+            process._nyx_ack_outcome = "acknowledgement-eof"
+            return False
         except BlockingIOError:
-            pass
+            if process.poll() is not None:
+                process._nyx_ack_outcome = "child-exited-before-acknowledgement"
+                return False
         time.sleep(0.005)
     return False
 
@@ -1042,8 +1083,6 @@ def _ack_received_claim(fd: int, claim_path: Path, ack_fd: int) -> bool:
     valid = NativeClaim.validate_received(fd, claim_path)
     try:
         os.write(ack_fd, b"1" if valid else b"0")
-    except OSError:
-        return False
     finally:
         try:
             os.close(ack_fd)
@@ -1105,7 +1144,7 @@ def setup(
 def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadline: float) -> Instance:
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise StartupError("Nyx daemon exited before readiness")
+            raise _startup_failure("Nyx daemon exited before readiness", process, "readiness")
         try:
             instance = _read_instance(paths)
             response = _send_control(
@@ -1119,7 +1158,7 @@ def _wait_ready(paths: state.StatePaths, process: subprocess.Popen[bytes], deadl
         except UnhealthyInstanceError:
             pass
         time.sleep(0.02)
-    raise StartupError("Nyx startup timed out")
+    raise _startup_failure("Nyx startup timed out", process, "readiness-deadline")
 
 
 def start() -> str:
@@ -1160,7 +1199,11 @@ def start() -> str:
                     if not _terminate_and_reap(process, deadline):
                         _release_claim_after_reap(process, lease)
                         release_deferred = True
-                    raise StartupError("Nyx daemon did not validate its inherited claim")
+                    raise _startup_failure(
+                        "Nyx daemon did not validate its inherited claim",
+                        process,
+                        getattr(process, "_nyx_ack_outcome", "acknowledgement-failed"),
+                    )
                 # The child now owns the same native object.  Closing this
                 # descriptor is the handoff; no path reopen occurs in child.
                 lease.close()
@@ -1221,10 +1264,20 @@ def _daemon_entry(
     ack_fd: int | None = None,
     claim_path: Path | None = None,
 ) -> int:
-    if ack_fd is not None and claim_path is not None and not _ack_received_claim(fd, claim_path, ack_fd):
+    try:
+        valid = ack_fd is None or claim_path is None or _ack_received_claim(fd, claim_path, ack_fd)
+    except OSError:
         os.close(fd)
-        return 1
-    return _Daemon(fd, deadline_ns, ack_fd=ack_fd).run()
+        return 21
+    if not valid:
+        os.close(fd)
+        return 20
+    try:
+        daemon = _Daemon(fd, deadline_ns, ack_fd=ack_fd)
+    except Exception:
+        os.close(fd)
+        return 22
+    return daemon.run()
 
 
 def _receive_daemon_handles(claim_handle: int, ack_handle: int | None) -> tuple[int, int | None]:
