@@ -1452,6 +1452,7 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         (" 127.0.0.1:1", "leading-whitespace"),
         ("127.0.0.1:١", "non-ascii-digit"),
         ("localhost:1", "alternate-host"),
+        ("http://127.0.0.1:1", "url-scheme"),
         ("127.0.0.1:1/suffix", "suffix"),
         ("\x00nyx-control-1000", "legacy-abstract-socket"),
     ],
