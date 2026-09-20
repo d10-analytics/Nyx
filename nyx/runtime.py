@@ -564,14 +564,24 @@ def _runtime_unknown(paths: state.StatePaths | None, diagnostic: str) -> Runtime
     return _runtime_observation("unknown", paths, diagnostic)
 
 
+def _admit_runtime_ancestry(paths: state.StatePaths) -> bool:
+    """Use the state owner's classifier for the complete runtime ancestry."""
+
+    return state._admit_directory(
+        paths.state_directory, create=False
+    ) and state._admit_directory(paths.runtime_directory, create=False)
+
+
 def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
     operation_path = paths.runtime_directory / "operation.lock"
     lease_path = paths.runtime_directory / "lease.lock"
     record_path = _record_path(paths)
 
     try:
+        if not _admit_runtime_ancestry(paths):
+            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         entries = tuple(paths.runtime_directory.iterdir())
-    except OSError:
+    except (OSError, state.StateError):
         return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
     for entry in entries:
         if entry.name not in {"operation.lock", "lease.lock", "instance.json"}:
@@ -697,8 +707,7 @@ def observe_runtime() -> RuntimeObservation:
         # observer's child iteration so unsafe configuration does not affect
         # the runtime view and a rejected path cannot be followed.
         try:
-            state._admit_directory(paths.state_directory, create=False)
-            state._admit_directory(paths.runtime_directory, create=False)
+            _admit_runtime_ancestry(paths)
         except (OSError, state.StateError):
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         if not paths.runtime_directory.exists():
