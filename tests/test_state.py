@@ -140,7 +140,7 @@ def test_invalid_replacement_preserves_exact_previous_configuration_bytes():
             with pytest.raises(state.SpecificationRootError):
                 state.setup(missing)
             assert config_file.read_bytes() == before
-        assert state.load_configuration().specification_root == first.resolve()
+            assert state.load_configuration().specification_root == first.resolve()
 
 
 def test_expired_admission_preserves_existing_configuration_and_claims():
