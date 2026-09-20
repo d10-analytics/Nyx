@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from . import state
-from ._native_claim import NativeClaim
+from ._native_claim import NativeClaim, NativeDirectory
 from .models import Catalog, ProtocolError, parse_catalog
 from .server import CatalogError, TrackerServer, create_server
 from .worker import CatalogWorkerManager, WorkerError
@@ -185,9 +185,13 @@ class _Metadata:
 class _ExistingLock:
     """A descriptor-backed lock opened without creating its path."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, directory: NativeDirectory | None = None) -> None:
         self.path = path
-        self._claim = NativeClaim(path)
+        self.directory = directory
+        self._claim = NativeClaim(
+            path,
+            dir_fd=None if directory is None else directory.dir_fd,
+        )
         self.metadata: _Metadata | None = None
 
     @property
@@ -195,7 +199,10 @@ class _ExistingLock:
         return self._claim.fd
 
     def acquire(self) -> str:
-        result = NativeClaim.probe(self.path)
+        result = NativeClaim.probe(
+            self.path,
+            dir_fd=None if self.directory is None else self.directory.dir_fd,
+        )
         if result != "free":
             return result
         try:
@@ -235,40 +242,95 @@ def _metadata_from_stat(details: os.stat_result, data: bytes | None = None) -> _
 
 
 def _safe_lock_metadata(details: os.stat_result) -> bool:
-    return stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return (
+        stat.S_ISREG(details.st_mode)
+        and not stat.S_ISLNK(details.st_mode)
+        and not getattr(details, "st_file_attributes", 0) & reparse_flag
+    )
 
 
-def _read_metadata(path: Path, *, read_data: bool = False) -> _Metadata:
+def _read_descriptor(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _read_metadata(
+    path: Path,
+    *,
+    read_data: bool = False,
+    directory: NativeDirectory | None = None,
+) -> _Metadata:
     try:
-        details = path.lstat()
+        details = path.lstat() if directory is None else directory.stat_child(path.name)
     except FileNotFoundError:
         return _Metadata(False)
-    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+    if not _safe_lock_metadata(details):
         raise RuntimeErrorBase("unsafe Nyx runtime state")
-    data = path.read_bytes() if read_data else None
+    data: bytes | None = None
+    if read_data:
+        if directory is None:
+            data = path.read_bytes()
+        else:
+            fd = directory.open_file(path.name)
+            try:
+                admitted = os.fstat(fd)
+                if not _safe_lock_metadata(admitted) or _metadata_identity(
+                    details
+                ) != _metadata_identity(admitted):
+                    raise RuntimeErrorBase("unsafe Nyx runtime state")
+                data = _read_descriptor(fd)
+                if _metadata_identity(admitted) != _metadata_identity(os.fstat(fd)):
+                    raise RuntimeErrorBase("Nyx runtime state changed during read")
+            finally:
+                os.close(fd)
     return _metadata_from_stat(details, data)
 
 
-def _metadata_unchanged(path: Path, original: _Metadata, *, read_data: bool = False) -> bool:
+def _metadata_unchanged(
+    path: Path,
+    original: _Metadata,
+    *,
+    read_data: bool = False,
+    directory: NativeDirectory | None = None,
+) -> bool:
     try:
-        current = _read_metadata(path, read_data=read_data)
+        current = _read_metadata(path, read_data=read_data, directory=directory)
     except (OSError, RuntimeErrorBase):
         return False
     return current == original
 
 
-def _record_snapshot(path: Path) -> _Metadata:
+def _record_snapshot(
+    path: Path, *, directory: NativeDirectory | None = None
+) -> _Metadata:
     """Capture record metadata and bytes so equal-size rewrites are observable."""
 
-    return _read_metadata(path, read_data=True)
+    return _read_metadata(path, read_data=True, directory=directory)
 
 
-def _record_unchanged(path: Path, original: _Metadata) -> bool:
-    return _metadata_unchanged(path, original, read_data=True)
+def _record_unchanged(
+    path: Path,
+    original: _Metadata,
+    *,
+    directory: NativeDirectory | None = None,
+) -> bool:
+    return _metadata_unchanged(
+        path,
+        original,
+        read_data=True,
+        directory=directory,
+    )
 
 
-def _directory_stamp(path: Path) -> tuple[int, int, int, int, int, int, int]:
-    details = path.lstat()
+def _directory_stamp(
+    path: Path, *, directory: NativeDirectory | None = None
+) -> tuple[int, int, int, int, int, int, int]:
+    details = path.lstat() if directory is None else directory.stat_self()
     if not stat.S_ISDIR(details.st_mode):
         raise RuntimeErrorBase("unsafe Nyx runtime state")
     return (
@@ -282,45 +344,16 @@ def _directory_stamp(path: Path) -> tuple[int, int, int, int, int, int, int]:
     )
 
 
-def _directory_unchanged(path: Path, original: tuple[int, int, int, int, int, int, int]) -> bool:
+def _directory_unchanged(
+    path: Path,
+    original: tuple[int, int, int, int, int, int, int],
+    *,
+    directory: NativeDirectory | None = None,
+) -> bool:
     try:
-        return _directory_stamp(path) == original
+        return _directory_stamp(path, directory=directory) == original
     except (OSError, RuntimeErrorBase):
         return False
-
-
-def _stable_absent_runtime(paths: state.StatePaths) -> RuntimeObservation:
-    """Confirm absence twice while watching the nearest existing directory."""
-
-    runtime_path = paths.runtime_directory
-    operation_path = runtime_path / "operation.lock"
-    lease_path = runtime_path / "lease.lock"
-    record_path = runtime_path / "instance.json"
-    anchor = runtime_path
-    while not anchor.exists() and anchor != anchor.parent:
-        anchor = anchor.parent
-    try:
-        anchor_initial = _directory_stamp(anchor)
-        first = (
-            _read_metadata(operation_path),
-            _read_metadata(lease_path),
-            _record_snapshot(record_path),
-        )
-        if runtime_path.exists():
-            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        structural = state.observe_runtime()
-        if structural.status != "not_running" or structural.paths is None:
-            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        second = (
-            _read_metadata(operation_path),
-            _read_metadata(lease_path),
-            _record_snapshot(record_path),
-        )
-        if runtime_path.exists() or first != second or not _directory_unchanged(anchor, anchor_initial):
-            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-    except (OSError, RuntimeErrorBase, state.StateError):
-        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-    return _runtime_observation("not_running", paths)
 
 
 def _require_deadline(deadline: float) -> None:
@@ -380,16 +413,17 @@ def _record_path(paths: state.StatePaths) -> Path:
     return paths.runtime_directory / "instance.json"
 
 
-def _read_instance(paths: state.StatePaths) -> Instance:
+def _read_instance(
+    paths: state.StatePaths,
+    *,
+    directory: NativeDirectory | None = None,
+) -> Instance:
     path = _record_path(paths)
     try:
-        details = path.lstat()
-        if (
-            stat.S_ISLNK(details.st_mode)
-            or not stat.S_ISREG(details.st_mode)
-        ):
-            raise UnhealthyInstanceError("Nyx instance record is unsafe")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = _record_snapshot(path, directory=directory)
+        if not record.exists or record.data is None:
+            raise FileNotFoundError(path)
+        payload = json.loads(record.data.decode("utf-8"))
         if (
             not isinstance(payload, dict)
             or payload.get("schema_version") != SCHEMA_VERSION
@@ -413,7 +447,7 @@ def _read_instance(paths: state.StatePaths) -> Instance:
         )
     except FileNotFoundError as error:
         raise UnhealthyInstanceError("Nyx instance is not ready") from error
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, RuntimeErrorBase, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
 
 
@@ -564,45 +598,127 @@ def _runtime_unknown(paths: state.StatePaths | None, diagnostic: str) -> Runtime
     return _runtime_observation("unknown", paths, diagnostic)
 
 
-def _admit_runtime_ancestry(paths: state.StatePaths) -> bool:
-    """Use the state owner's classifier for the complete runtime ancestry."""
+class _ObservedRuntimeTree:
+    """Held existing ancestry for one read-only runtime observation."""
 
-    for path in (paths.state_directory, paths.runtime_directory):
-        if not state._admit_directory(path, create=False):
+    def __init__(self, paths: state.StatePaths) -> None:
+        self.paths = paths
+        self.home: NativeDirectory | None = None
+        self.state_directory: NativeDirectory | None = None
+        self.runtime_directory: NativeDirectory | None = None
+
+    @staticmethod
+    def _open_managed_child(
+        parent: NativeDirectory,
+        name: str,
+        path: Path,
+    ) -> NativeDirectory | None:
+        try:
+            before = parent.stat_child(name)
+        except FileNotFoundError:
+            return None
+        if state._is_reparse_or_link(path, before) or not stat.S_ISDIR(before.st_mode):
+            raise state.AccountHomeError("Nyx state directory is not an ordinary directory")
+        child = parent.open_child(name, path)
+        try:
+            after = child.stat_self()
+            if state._is_reparse_or_link(path, after) or not stat.S_ISDIR(after.st_mode):
+                raise state.AccountHomeError(
+                    "Nyx state directory is not an ordinary directory"
+                )
+            if state._identity(before) != state._identity(after):
+                raise state.AccountHomeError("Nyx state directory changed during admission")
+            return child
+        except BaseException:
+            child.close()
+            raise
+
+    def open(self) -> str:
+        self.home = NativeDirectory.open(self.paths.account_home, follow_links=True)
+        self.state_directory = self._open_managed_child(
+            self.home,
+            self.paths.state_directory.name,
+            self.paths.state_directory,
+        )
+        if self.state_directory is None:
+            return "absent"
+        self.runtime_directory = self._open_managed_child(
+            self.state_directory,
+            self.paths.runtime_directory.name,
+            self.paths.runtime_directory,
+        )
+        return "absent" if self.runtime_directory is None else "admitted"
+
+    def is_current(self) -> bool:
+        if self.home is None:
             return False
-        # Revalidate before advancing to a child or observing directory
-        # contents, so a replacement immediately after admission is rejected.
-        if not state._admit_directory(path, create=False):
+        if self.state_directory is None:
+            try:
+                self.home.stat_child(self.paths.state_directory.name)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
             return False
-    return True
+        if not self.home.child_is_same(
+            self.paths.state_directory.name,
+            self.state_directory,
+        ):
+            return False
+        if self.runtime_directory is None:
+            try:
+                self.state_directory.stat_child(self.paths.runtime_directory.name)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            return False
+        return self.state_directory.child_is_same(
+            self.paths.runtime_directory.name,
+            self.runtime_directory,
+        )
+
+    def close(self) -> None:
+        for directory in (
+            self.runtime_directory,
+            self.state_directory,
+            self.home,
+        ):
+            if directory is not None:
+                directory.close()
+        self.runtime_directory = None
+        self.state_directory = None
+        self.home = None
 
 
-def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
+def _observe_runtime_with_paths(
+    paths: state.StatePaths,
+    directory: NativeDirectory,
+) -> RuntimeObservation:
     operation_path = paths.runtime_directory / "operation.lock"
     lease_path = paths.runtime_directory / "lease.lock"
     record_path = _record_path(paths)
 
     try:
-        if not _admit_runtime_ancestry(paths):
-            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-        entries = tuple(paths.runtime_directory.iterdir())
-    except (OSError, state.StateError):
+        with directory.scandir() as scanned:
+            entries = tuple(scanned)
+    except OSError:
         return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
     for entry in entries:
         if entry.name not in {"operation.lock", "lease.lock", "instance.json"}:
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         try:
-            details = entry.lstat()
+            details = entry.stat(follow_symlinks=False)
         except OSError:
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
         if not _safe_lock_metadata(details):
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
     try:
-        layout_initial = _directory_stamp(paths.runtime_directory)
+        layout_initial = _directory_stamp(paths.runtime_directory, directory=directory)
     except (OSError, RuntimeErrorBase):
         return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
 
-    operation = _ExistingLock(operation_path)
+    operation = _ExistingLock(operation_path, directory=directory)
     operation_state = operation.acquire()
     if operation_state == "held":
         return _runtime_unknown(paths, RUNTIME_OPERATION_IN_PROGRESS)
@@ -611,10 +727,10 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
 
     lease: _ExistingLock | None = None
     try:
-        operation_initial = _read_metadata(operation_path)
-        lease_initial = _read_metadata(lease_path)
-        record_initial = _record_snapshot(record_path)
-        lease = _ExistingLock(lease_path)
+        operation_initial = _read_metadata(operation_path, directory=directory)
+        lease_initial = _read_metadata(lease_path, directory=directory)
+        record_initial = _record_snapshot(record_path, directory=directory)
+        lease = _ExistingLock(lease_path, directory=directory)
         lease_state = lease.acquire()
         if lease_state in {"unsafe", "changed"}:
             return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
@@ -623,7 +739,7 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
             if not record_initial.exists:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             try:
-                instance = _read_instance(paths)
+                instance = _read_instance(paths, directory=directory)
             except UnhealthyInstanceError:
                 return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
             deadline = time.monotonic() + RUNTIME_CONTROL_TIMEOUT
@@ -641,20 +757,36 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
                 return _runtime_unknown(paths, RUNTIME_UNHEALTHY)
             try:
                 _require_deadline(deadline)
-                record_stable = _record_unchanged(record_path, record_initial)
+                record_stable = _record_unchanged(
+                    record_path,
+                    record_initial,
+                    directory=directory,
+                )
                 _require_deadline(deadline)
-                lease_stable = _metadata_unchanged(lease_path, lease_initial)
+                lease_stable = _metadata_unchanged(
+                    lease_path,
+                    lease_initial,
+                    directory=directory,
+                )
                 _require_deadline(deadline)
-                operation_stable = _metadata_unchanged(operation_path, operation_initial)
+                operation_stable = _metadata_unchanged(
+                    operation_path,
+                    operation_initial,
+                    directory=directory,
+                )
                 _require_deadline(deadline)
-                layout_stable = _directory_unchanged(paths.runtime_directory, layout_initial)
+                layout_stable = _directory_unchanged(
+                    paths.runtime_directory,
+                    layout_initial,
+                    directory=directory,
+                )
                 _require_deadline(deadline)
             except _ControlTimeoutError:
                 return _runtime_unknown(paths, RUNTIME_CONTROL_TIMED_OUT)
             if not record_stable or not lease_stable or not operation_stable or not layout_stable:
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             _require_deadline(deadline)
-            lease_probe = _ExistingLock(lease_path)
+            lease_probe = _ExistingLock(lease_path, directory=directory)
             lease_probe_state = lease_probe.acquire()
             lease_probe.close()
             if lease_probe_state != "held":
@@ -665,32 +797,64 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
         if lease_state == "absent":
             if record_initial.exists:
                 try:
-                    _read_instance(paths)
+                    _read_instance(paths, directory=directory)
                 except UnhealthyInstanceError:
                     return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-            if not _metadata_unchanged(operation_path, operation_initial):
+            if not _metadata_unchanged(
+                operation_path,
+                operation_initial,
+                directory=directory,
+            ):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _metadata_unchanged(lease_path, lease_initial):
+            if not _metadata_unchanged(
+                lease_path,
+                lease_initial,
+                directory=directory,
+            ):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _record_unchanged(record_path, record_initial):
+            if not _record_unchanged(
+                record_path,
+                record_initial,
+                directory=directory,
+            ):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-            if not _directory_unchanged(paths.runtime_directory, layout_initial):
+            if not _directory_unchanged(
+                paths.runtime_directory,
+                layout_initial,
+                directory=directory,
+            ):
                 return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
             return _runtime_observation("not_running", paths)
 
         # An existing lease descriptor was successfully acquired, so it is free.
         if record_initial.exists:
             try:
-                _read_instance(paths)
+                _read_instance(paths, directory=directory)
             except UnhealthyInstanceError:
                 return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-        if not _metadata_unchanged(operation_path, operation_initial):
+        if not _metadata_unchanged(
+            operation_path,
+            operation_initial,
+            directory=directory,
+        ):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        if not _metadata_unchanged(lease_path, lease_initial):
+        if not _metadata_unchanged(
+            lease_path,
+            lease_initial,
+            directory=directory,
+        ):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        if not _record_unchanged(record_path, record_initial):
+        if not _record_unchanged(
+            record_path,
+            record_initial,
+            directory=directory,
+        ):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
-        if not _directory_unchanged(paths.runtime_directory, layout_initial):
+        if not _directory_unchanged(
+            paths.runtime_directory,
+            layout_initial,
+            directory=directory,
+        ):
             return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
         return _runtime_observation("not_running", paths)
     finally:
@@ -702,26 +866,26 @@ def _observe_runtime_with_paths(paths: state.StatePaths) -> RuntimeObservation:
 def observe_runtime() -> RuntimeObservation:
     """Observe runtime state without creating, changing, or cleaning up files."""
 
+    paths: state.StatePaths | None = None
+    tree: _ObservedRuntimeTree | None = None
     try:
-        structural = state.observe_runtime()
-        paths = structural.paths
-        if paths is None:
-            return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
-        # state owns managed-tree admission and its canonical link/reparse
-        # classifier. Re-admit only the runtime ancestry before this
-        # observer's child iteration so unsafe configuration does not affect
-        # the runtime view and a rejected path cannot be followed.
-        try:
-            _admit_runtime_ancestry(paths)
-        except (OSError, state.StateError):
-            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-        if not paths.runtime_directory.exists():
-            if structural.status == "not_running":
-                return _stable_absent_runtime(paths)
-            return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
-        return _observe_runtime_with_paths(paths)
+        paths = state._fixed_state_paths()
+        tree = _ObservedRuntimeTree(paths)
+        admission = tree.open()
+        if admission == "absent":
+            if tree.is_current():
+                return _runtime_observation("not_running", paths)
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        assert tree.runtime_directory is not None
+        result = _observe_runtime_with_paths(paths, tree.runtime_directory)
+        if not tree.is_current():
+            return _runtime_unknown(paths, RUNTIME_STATE_CHANGED)
+        return result
     except (OSError, state.StateError, RuntimeErrorBase):
-        return _runtime_unknown(None, RUNTIME_STATE_UNAVAILABLE)
+        return _runtime_unknown(paths, RUNTIME_STATE_UNAVAILABLE)
+    finally:
+        if tree is not None:
+            tree.close()
 
 
 observe_runtime_paths = observe_runtime
