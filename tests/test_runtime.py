@@ -1251,11 +1251,22 @@ def test_shutdown_does_not_remove_replaced_instance_record():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         record = paths.runtime_directory / "instance.json"
-        record.write_bytes(b"daemon-record")
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+                daemon.instance = runtime.Instance(
+                    "published-instance",
+                    runtime.URL,
+                    "published-capability",
+                    runtime._control_endpoint(1),
+                )
+                daemon.published_record = runtime._write_instance(
+                    paths,
+                    daemon.instance,
+                    deadline=time.monotonic() + 1,
+                )
+                assert runtime._read_instance(paths) == daemon.instance
                 record.write_bytes(b"replacement-record")
                 assert daemon.shutdown(deadline=time.monotonic() + 1) == "stopped"
             assert record.read_bytes() == b"replacement-record"
@@ -1563,6 +1574,99 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         state, "_current_uid", return_value=state._current_uid()
     ):
         return runtime.observe_runtime()
+
+
+@pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])
+def test_live_locator_damage_never_authorizes_setup_replacement(damage):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, first = _fixture(root)
+        second = root / "second-specification"
+        second.mkdir()
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        if damage == "absent":
+            record.unlink()
+        elif damage == "malformed":
+            record.write_bytes(b"not-json\n")
+        else:
+            _write_runtime_record(paths, instance_id="replacement", capability="foreign")
+        before = paths.config_file.read_bytes()
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+                runtime.ActiveInstanceError
+            ):
+                runtime.setup(second)
+        finally:
+            os.close(lease_fd)
+        assert paths.config_file.read_bytes() == before
+        assert state.load_configuration(paths).specification_root == first.resolve()
+        if damage == "absent":
+            assert not record.exists()
+        elif damage == "malformed":
+            assert record.read_bytes() == b"not-json\n"
+        else:
+            assert runtime._read_instance(paths).instance_id == "replacement"
+        assert original.instance_id == "instance"
+
+
+def test_live_replaced_locator_is_rejected_before_start_authorization():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        replacement = runtime.Instance(
+            "replacement", runtime.URL, "foreign", runtime._control_endpoint(2)
+        )
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+
+        def replace_before_response(instance, command, **_kwargs):
+            assert instance == original
+            assert command == "status"
+            runtime._write_instance(paths, replacement, deadline=time.monotonic() + 1)
+            return {"status": "ready", "instance_id": original.instance_id, "url": runtime.URL}
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=replace_before_response
+            ), pytest.raises(runtime.UnhealthyInstanceError, match="record changed"):
+                runtime.start()
+        finally:
+            os.close(lease_fd)
+        assert record.read_bytes() == (
+            json.dumps(replacement.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+
+
+def test_live_replaced_locator_is_rejected_before_stop_cleanup():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        replacement = runtime.Instance(
+            "replacement", runtime.URL, "foreign", runtime._control_endpoint(2)
+        )
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+
+        def replace_before_response(instance, command, **_kwargs):
+            assert instance == original
+            assert command == "stop"
+            runtime._write_instance(paths, replacement, deadline=time.monotonic() + 1)
+            return {"status": "stopping", "instance_id": original.instance_id, "url": runtime.URL}
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=replace_before_response
+            ), patch.object(runtime, "SHUTDOWN_TIMEOUT", 0.1), pytest.raises(
+                runtime.UnhealthyInstanceError, match="record changed"
+            ):
+                runtime.stop()
+        finally:
+            os.close(lease_fd)
+        assert record.read_bytes() == (
+            json.dumps(replacement.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
 
 
 @pytest.mark.parametrize(
@@ -2372,6 +2476,20 @@ def test_worker_timeout_after_prefix_stall_finishes_autonomously():
     assert manager.active_count == 0
 
 
+def test_worker_timeout_finalizer_reaps_without_manager_close():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=0.2,
+    )
+    with pytest.raises(runtime.WorkerError, match="producer_timeout"):
+        manager.fetch_catalog()
+
+    deadline = time.monotonic() + 2
+    while manager.active_count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.active_count == 0
+
+
 def test_worker_retains_no_bytes_beyond_stream_caps_and_completes_readers():
     manager = runtime.CatalogWorkerManager(
         command_factory=lambda: [
@@ -2919,6 +3037,172 @@ def test_launcher_loss_before_spawn_releases_untransferred_lease():
         probe = runtime._FileLock(lock_path, timeout=0.0)
         assert probe.acquire(blocking=False)
         probe.close()
+
+
+@pytest.mark.parametrize("phase", ["before_spawn", "after_spawn_before_ack", "after_ack"])
+def test_continuous_external_contender_covers_launcher_loss_phase(phase):
+    child = (
+        "import os,sys,time\n"
+        "from pathlib import Path\n"
+        "from nyx._native_claim import NativeClaim\n"
+        "phase,marker,release=sys.argv[1:4]\n"
+        "if '--daemon-handle' in sys.argv:\n"
+        " fd=NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--daemon-handle')+1]))\n"
+        "else:\n"
+        " fd=int(sys.argv[sys.argv.index('--daemon-fd')+1])\n"
+        "if '--ack-handle' in sys.argv:\n"
+        " ack=NativeClaim.receive_handle(int(sys.argv[sys.argv.index('--ack-handle')+1]),write_only=True)\n"
+        "elif '--ack-fd' in sys.argv:\n"
+        " ack=int(sys.argv[sys.argv.index('--ack-fd')+1])\n"
+        "else:\n"
+        " ack=None\n"
+        "Path(marker).write_text('spawned',encoding='utf-8')\n"
+        "if phase == 'after_spawn_before_ack':\n"
+        " time.sleep(.5)\n"
+        "if ack is not None:\n"
+        " os.write(ack,b'1')\n"
+        " os.close(ack)\n"
+        " Path(marker).write_text('ack',encoding='utf-8')\n"
+        "while not Path(release).exists():\n"
+        " time.sleep(.01)\n"
+        "os.close(fd)\n"
+    )
+    launcher = (
+        "import os,sys,time\n"
+        "from pathlib import Path\n"
+        "from nyx import runtime\n"
+        "lock_path,phase,marker,release=sys.argv[1:5]\n"
+        "lease=runtime._FileLock(Path(lock_path),timeout=0)\n"
+        "assert lease.acquire(blocking=False)\n"
+        "if phase == 'before_spawn':\n"
+        " Path(marker).write_text('held',encoding='utf-8')\n"
+        " time.sleep(30)\n"
+        "else:\n"
+        " read_fd,write_fd=os.pipe()\n"
+        f" runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r},phase,marker,release]\n"
+        " runtime._spawn_daemon(lease.fd,time.monotonic_ns()+10**10,ack_fd=write_fd,claim_path=Path(lock_path))\n"
+        " os.close(write_fd)\n"
+        " if phase == 'after_ack':\n"
+        "  os.read(read_fd,1)\n"
+        "  Path(marker).write_text('ack',encoding='utf-8')\n"
+        " os.close(read_fd)\n"
+        " time.sleep(30)\n"
+    )
+    contender = (
+        "import sys,time\n"
+        "from pathlib import Path\n"
+        "from nyx.runtime import _FileLock\n"
+        "lock_path,acquired,stop=sys.argv[1:4]\n"
+        "while not Path(stop).exists():\n"
+        " lock=_FileLock(Path(lock_path),timeout=0)\n"
+        " if lock.acquire(blocking=False):\n"
+        "  Path(acquired).write_text('acquired',encoding='utf-8')\n"
+        "  while not Path(stop).exists():\n"
+        "   time.sleep(.01)\n"
+        "  lock.close()\n"
+        "  break\n"
+        " lock.close()\n"
+        " time.sleep(.005)\n"
+    )
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        lock_path = root / "lease.lock"
+        marker = root / "phase"
+        release = root / "release"
+        acquired = root / "acquired"
+        stop = root / "stop"
+        launcher_process = subprocess.Popen(
+            [sys.executable, "-c", launcher, str(lock_path), phase, str(marker), str(release)],
+            cwd=Path(__file__).parents[1],
+        )
+        contender_process = None
+        try:
+            deadline = time.monotonic() + 3
+            while not marker.exists() and launcher_process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert marker.exists(), phase
+            contender_process = subprocess.Popen(
+                [sys.executable, "-c", contender, str(lock_path), str(acquired), str(stop)],
+                cwd=Path(__file__).parents[1],
+            )
+            time.sleep(0.1)
+            launcher_process.kill()
+            assert launcher_process.wait(timeout=2) != 0
+            if phase == "before_spawn":
+                deadline = time.monotonic() + 2
+                while not acquired.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert acquired.exists()
+            else:
+                time.sleep(0.2)
+                assert not acquired.exists(), phase
+                release.touch()
+                deadline = time.monotonic() + 2
+                while not acquired.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert acquired.exists(), phase
+        finally:
+            release.touch()
+            stop.touch()
+            if contender_process is not None:
+                contender_process.wait(timeout=3)
+            if launcher_process.poll() is None:
+                launcher_process.kill()
+                launcher_process.wait(timeout=2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path replacement is required")
+def test_parent_received_claim_validation_rejects_substituted_path_reopen():
+    child = (
+        "import os,sys,time\n"
+        "from pathlib import Path\n"
+        "from nyx._native_claim import NativeClaim\n"
+        "marker,release=sys.argv[1:3]\n"
+        "fd=int(sys.argv[sys.argv.index('--daemon-fd')+1])\n"
+        "ack=int(sys.argv[sys.argv.index('--ack-fd')+1])\n"
+        "path=Path(sys.argv[sys.argv.index('--claim-path')+1])\n"
+        "Path(marker).write_text('ready',encoding='utf-8')\n"
+        "while not Path(release).exists():\n"
+        " time.sleep(.01)\n"
+        "valid=NativeClaim.validate_received(fd,path)\n"
+        "os.write(ack,b'1' if valid else b'0')\n"
+        "os.close(ack)\n"
+        "os.close(fd)\n"
+    )
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        marker = root / "child-ready"
+        release = root / "release"
+        errors: list[BaseException] = []
+
+        def start() -> None:
+            try:
+                with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                    runtime,
+                    "_daemon_command",
+                    return_value=[sys.executable, "-c", child, str(marker), str(release)],
+                ):
+                    runtime.start()
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                errors.append(error)
+
+        thread = threading.Thread(target=start)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        claim_path = paths.runtime_directory / "lease.lock"
+        replacement = root / "replacement-lease.lock"
+        replacement.write_bytes(b"\0")
+        os.replace(replacement, claim_path)
+        release.touch()
+        thread.join(timeout=4)
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], runtime.StartupError)
+        _assert_claim_available(claim_path)
 
 
 def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
