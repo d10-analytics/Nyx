@@ -1,10 +1,8 @@
 """Native desktop entry and first-launch workspace chooser.
 
-The desktop entry is intentionally a thin shell in this milestone.  It owns
-the account lifetime while the chooser is visible, and it uses the portable
-state owner for all configuration validation and replacement.  Runtime and
-worker admission are added by later desktop slices; this module does not
-silently start the retained Linux daemon.
+The desktop entry owns the account lifetime while the shell is visible.  It
+uses the portable state owner for configuration and the shared application
+runtime for HTTP/catalog work; it never starts the retained Linux daemon.
 
 Qt is imported only when :func:`main` is called.  Importing this module is
 therefore safe in the dependency-light Linux console and wheel paths.
@@ -177,6 +175,8 @@ class DesktopSession:
         self._unverified = False
         self._pending_error: str | None = None
         self._application_runtime: ApplicationRuntime | None = None
+        self._runtime_start_failed = False
+        self._shutdown_blocked = False
         self.snapshot = self._observe()
         if self.claims.recovery_blocked:
             self.snapshot = DesktopSnapshot(
@@ -203,6 +203,14 @@ class DesktopSession:
     def recovery_blocked(self) -> bool:
         return self.claims.recovery_blocked
 
+    @property
+    def runtime_retryable(self) -> bool:
+        return self.snapshot.status == "runtime_blocked"
+
+    @property
+    def shutdown_blocked(self) -> bool:
+        return self._shutdown_blocked
+
     def retry_recovery(self) -> bool:
         """Retry former-worker cleanup without changing persisted state."""
 
@@ -218,6 +226,44 @@ class DesktopSession:
         self.snapshot = self._observe()
         return self.snapshot.status == "configured"
 
+    def retry_runtime(self, *, deadline: float | None = None) -> bool:
+        """Acquire crash recovery and retry an incomplete runtime start."""
+
+        if self._closed:
+            raise DesktopUnavailableError("Nyx desktop session is closed")
+        if self.claims.recovery_blocked and not self.retry_recovery():
+            return False
+        selected_deadline = (
+            time.monotonic() + runtime.STARTUP_TIMEOUT
+            if deadline is None
+            else deadline
+        )
+        if self._application_runtime is not None:
+            if not self._runtime_start_failed:
+                return True
+            try:
+                cleaned = self._application_runtime.cleanup_start_failure(
+                    selected_deadline
+                )
+            except Exception:
+                cleaned = False
+            if not cleaned:
+                self._pending_error = "Nyx runtime cleanup is incomplete; retry"
+                configuration = self.snapshot.configuration or self._observe().configuration
+                self.snapshot = DesktopSnapshot(
+                    "runtime_blocked",
+                    configuration,
+                    diagnostic=UNAVAILABLE_MESSAGE,
+                )
+                return False
+            self._application_runtime = None
+            self._runtime_start_failed = False
+        try:
+            self.start_runtime(deadline=selected_deadline)
+        except DesktopUnavailableError:
+            return False
+        return True
+
     def start_runtime(
         self,
         *,
@@ -228,11 +274,17 @@ class DesktopSession:
 
         if self._closed or not self.claims.held:
             raise DesktopUnavailableError(UNAVAILABLE_MESSAGE)
-        if self.snapshot.status != "configured":
+        if self.snapshot.status not in {"configured", "runtime_blocked"}:
             raise DesktopUnavailableError(UNAVAILABLE_MESSAGE)
         if self._application_runtime is not None:
+            if self._runtime_start_failed:
+                raise DesktopUnavailableError(UNAVAILABLE_MESSAGE)
             return self._application_runtime
-        selected_deadline = deadline or (time.monotonic() + runtime.STARTUP_TIMEOUT)
+        selected_deadline = (
+            time.monotonic() + runtime.STARTUP_TIMEOUT
+            if deadline is None
+            else deadline
+        )
         workers = CatalogWorkerManager(
             recovery_claim=self.claims.recovery,
             recovery_path=self.claims.recovery.path,
@@ -243,13 +295,31 @@ class DesktopSession:
             deadline=selected_deadline,
             workers=workers,
         )
+        self._application_runtime = application
         try:
             application.start(static_ready=static_ready)
             application.admit_catalog()
         except BaseException as error:
-            application.cleanup_start_failure(selected_deadline)
+            self._runtime_start_failed = True
+            try:
+                cleaned = application.cleanup_start_failure(selected_deadline)
+            except Exception:
+                cleaned = False
+            if cleaned:
+                self._application_runtime = None
+                self._runtime_start_failed = False
+            self._pending_error = "Nyx runtime could not start; retry"
+            configuration = self.snapshot.configuration or self._observe().configuration
+            self.snapshot = DesktopSnapshot(
+                "runtime_blocked",
+                configuration,
+                diagnostic=UNAVAILABLE_MESSAGE,
+            )
             raise DesktopUnavailableError(UNAVAILABLE_MESSAGE) from error
-        self._application_runtime = application
+        self._runtime_start_failed = False
+        self._shutdown_blocked = False
+        self._pending_error = None
+        self.snapshot = self._observe()
         return application
 
     def _observe(self) -> DesktopSnapshot:
@@ -337,13 +407,25 @@ class DesktopSession:
             return
         if self._application_runtime is not None:
             deadline = time.monotonic() + runtime.SHUTDOWN_TIMEOUT
-            if not self._application_runtime.shutdown(deadline):
+            try:
+                if self._runtime_start_failed:
+                    closed = self._application_runtime.cleanup_start_failure(deadline)
+                else:
+                    closed = self._application_runtime.shutdown(deadline)
+            except Exception:
+                closed = False
+            if not closed:
+                self._shutdown_blocked = True
                 self._pending_error = "Nyx workers are still stopping; retry Close"
                 self.snapshot = DesktopSnapshot(
-                    "recovery_blocked", diagnostic=UNAVAILABLE_MESSAGE
+                    "shutdown_blocked",
+                    self.snapshot.configuration,
+                    diagnostic=UNAVAILABLE_MESSAGE,
                 )
                 return
             self._application_runtime = None
+            self._runtime_start_failed = False
+        self._shutdown_blocked = False
         self.claims.close()
         self._closed = True
 
@@ -442,7 +524,10 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
                 self._retry.setEnabled(
-                    self._session.unverified or self._session.recovery_blocked
+                    self._session.unverified
+                    or self._session.recovery_blocked
+                    or self._session.runtime_retryable
+                    or self._session.shutdown_blocked
                 )
 
         def _begin_change(self) -> None:
@@ -460,8 +545,14 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
         def _revalidate(self) -> None:
             try:
-                if self._session.recovery_blocked:
-                    self._session.retry_recovery()
+                if self._session.shutdown_blocked:
+                    self.close()
+                    return
+                if (
+                    self._session.recovery_blocked
+                    or self._session.runtime_retryable
+                ):
+                    self._session.retry_runtime()
                 else:
                     self._session.revalidate()
             except DesktopError as error:
@@ -472,7 +563,11 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
         def closeEvent(self, event: Any) -> None:
             self._session.close()
-            event.accept()
+            if self._session.shutdown_blocked:
+                self._render()
+                event.ignore()
+            else:
+                event.accept()
 
     # Keep the QtCore reference live for native binding implementations that
     # inspect the class module while delivering close events.
@@ -503,6 +598,13 @@ def main(argv: list[str] | None = None) -> int:
         owns_application = application is None
         if application is None:
             application = qt["QtWidgets"].QApplication(sys.argv[:1])
+        if session.snapshot.status == "configured":
+            try:
+                session.start_runtime()
+            except DesktopError:
+                # The same window owns the visible retry path for an incomplete
+                # startup or cleanup; do not drop its claims in an error exit.
+                pass
         window = _build_window(qt, session)
         window.show()
         if not owns_application:
