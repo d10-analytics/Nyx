@@ -5,10 +5,12 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
 import socket
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -266,6 +268,52 @@ def test_daemon_rechecks_shared_deadline_after_configuration_admission():
             assert daemon.server is None
         finally:
             os.close(lease_fd)
+
+
+def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
+    class Server:
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def close_active_connections(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class Thread:
+        def __init__(self, *, target, daemon=True, args=()):
+            self.target = target
+
+        def start(self):
+            if self.target.__name__ == "_finish_start_failure_cleanup":
+                self.target()
+
+        def join(self, timeout=None):
+            return None
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(
+                    lease_fd, time.monotonic_ns() + 20_000_000
+                )
+            with patch.object(runtime, "create_server", return_value=Server()), patch.object(
+                runtime.threading, "Thread", Thread
+            ), patch.object(daemon, "_static_ready", return_value=False):
+                assert daemon.run() == 25
+        finally:
+            try:
+                os.close(lease_fd)
+            except OSError:
+                pass
+
+    assert runtime._DAEMON_FAILURES[25] == "static-readiness-failed"
 
 
 def test_readiness_publication_rejects_expiry_before_creating_temp_record():
@@ -724,10 +772,370 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
         assert not daemon_thread.is_alive()
         assert result == [28]
         assert not worker_marker.exists()
+        assert daemon.workers.active_count == 0
+        assert daemon.http_thread is not None
+        assert not daemon.http_thread.is_alive()
+        listener_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            assert listener_probe.connect_ex(("127.0.0.1", runtime.PORT)) != 0
+        finally:
+            listener_probe.close()
         assert not (paths.runtime_directory / "instance.json").exists()
         contender = runtime._lease_lock(paths, timeout=0.0)
         assert contender.acquire(blocking=False)
         contender.close()
+
+
+def test_failed_start_cleanup_retains_resistant_worker_until_later_completion():
+    with TemporaryDirectory() as temporary:
+        marker = Path(temporary) / "worker-ready"
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT,
+            deadline=time.monotonic() + 5,
+            workers=runtime.CatalogWorkerManager(
+                command_factory=lambda: [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import signal,time; from pathlib import Path; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        f"Path({str(marker)!r}).write_text('ready', encoding='utf-8'); "
+                        "time.sleep(30)"
+                    ),
+                ],
+                timeout=30,
+            ),
+        )
+        application.catalog_admitted = True
+        request_errors: list[BaseException] = []
+
+        def request_catalog() -> None:
+            try:
+                application._provider()
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                request_errors.append(error)
+
+        request = threading.Thread(target=request_catalog)
+        request.start()
+        deadline = time.monotonic() + 2
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        assert application.workers.active_count == 1
+
+        assert application.cleanup_start_failure(time.monotonic() + 0.05) is False
+        assert application.catalog_admitted is False
+        assert application.workers.active_count == 1
+        with application.workers._lock:
+            child = application.workers._children[0]
+        assert child.process.poll() is None
+
+        child.process.kill()
+        request.join(timeout=3)
+        assert not request.is_alive()
+        assert len(request_errors) == 1
+        assert isinstance(request_errors[0], runtime.CatalogError)
+        assert application.cleanup_start_failure(time.monotonic() + 2) is True
+        assert application.workers.active_count == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
+def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", runtime.PORT))
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specifications = root / "specifications"
+        package = specifications / "Fictional" / "Queue" / "sample"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text(
+            "# Sample catalog entry\nStatus: approved\nClosure: approved\n",
+            encoding="utf-8",
+        )
+        probe_file = root / "application-owner.jsonl"
+        worker_pid_file = root / "worker.pid"
+        site_directory = root / "site"
+        site_directory.mkdir()
+        site_directory.joinpath("sitecustomize.py").write_text(
+            textwrap.dedent(
+                """
+                import json
+                import os
+                import signal
+                import sys
+                import threading
+                import time
+                from pathlib import Path
+
+                from nyx import app_runtime, state
+
+                state.resolve_account_home = lambda: Path(os.environ["NYX_TEST_HOME"])
+                probe_file = Path(os.environ["NYX_OWNER_PROBE"])
+                worker_pid_file = Path(os.environ["NYX_WORKER_PID"])
+                original_application_runtime = app_runtime.ApplicationRuntime
+
+                def record(**event):
+                    with probe_file.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(event, sort_keys=True) + "\\n")
+
+                worker_code = (
+                    "import os,signal,sys,time; from pathlib import Path; "
+                    "from nyx.worker import _worker_main; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+                    "result=_worker_main(); time.sleep(30); raise SystemExit(result)"
+                )
+
+                class ObservedApplicationRuntime(original_application_runtime):
+                    instance_count = 0
+
+                    def __init__(self, **kwargs):
+                        kwargs["workers"] = app_runtime.CatalogWorkerManager(
+                            command_factory=lambda: [
+                                sys.executable,
+                                "-c",
+                                worker_code,
+                                str(worker_pid_file),
+                            ],
+                            timeout=30,
+                        )
+                        super().__init__(**kwargs)
+                        type(self).instance_count += 1
+                        self.observed_provider = None
+                        self.observed_server = None
+                        original_factory = self._server_factory
+
+                        def observing_factory(**factory_kwargs):
+                            self.observed_provider = factory_kwargs["provider"]
+                            self.observed_server = original_factory(**factory_kwargs)
+                            return self.observed_server
+
+                        self._server_factory = observing_factory
+
+                    def identities(self):
+                        provider_owner = getattr(self.observed_provider, "__self__", None)
+                        return {
+                            "application_id": id(self),
+                            "provider_owner_id": id(provider_owner),
+                            "manager_id": id(self.workers),
+                            "server_id": id(self.server),
+                            "factory_server_id": id(self.observed_server),
+                        }
+
+                    def start(self, **kwargs):
+                        super().start(**kwargs)
+                        record(
+                            event="started",
+                            daemon_pid=os.getpid(),
+                            instance_count=type(self).instance_count,
+                            listener_port=self.server.server_port,
+                            **self.identities(),
+                        )
+                        threading.Thread(
+                            target=self.finish_listener_during_active_work,
+                            daemon=True,
+                        ).start()
+
+                    def finish_listener_during_active_work(self):
+                        deadline = time.monotonic() + 10
+                        while self.workers.active_count == 0 and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        record(
+                            event="active",
+                            active_count=self.workers.active_count,
+                            listener_fileno=self.server.fileno(),
+                            **self.identities(),
+                        )
+                        if self.workers.active_count:
+                            self.server.shutdown()
+
+                    def cleanup_start_failure(self, deadline):
+                        complete = super().cleanup_start_failure(deadline)
+                        record(
+                            event="failed_cleanup",
+                            complete=complete,
+                            active_count=self.workers.active_count,
+                            listener_fileno=self.server.fileno(),
+                            **self.identities(),
+                        )
+                        return complete
+
+                    def shutdown(self, deadline):
+                        complete = super().shutdown(deadline)
+                        record(
+                            event="shutdown",
+                            complete=complete,
+                            active_count=self.workers.active_count,
+                            listener_fileno=self.server.fileno(),
+                            **self.identities(),
+                        )
+                        return complete
+
+                app_runtime.ApplicationRuntime = ObservedApplicationRuntime
+                """
+            ),
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["USERPROFILE"] = str(home)
+        environment["NYX_TEST_HOME"] = str(home)
+        environment["NYX_OWNER_PROBE"] = str(probe_file)
+        environment["NYX_WORKER_PID"] = str(worker_pid_file)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get(
+            "PYTHONPATH", ""
+        )
+        repository_root = Path(__file__).parents[1]
+
+        def run_cli(*arguments: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-m", "nyx.cli", *arguments],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+
+        daemon_pid: int | None = None
+        worker_pid: int | None = None
+        request_result: list[object] = []
+        request_thread: threading.Thread | None = None
+        try:
+            setup = run_cli("--setup", str(specifications))
+            assert setup.returncode == 0, setup.stderr
+            started = run_cli()
+            assert started.returncode == 0, started.stderr
+            assert started.stdout == f"{runtime.URL}\n"
+
+            def request_catalog() -> None:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", runtime.PORT, timeout=15
+                )
+                try:
+                    connection.request(
+                        "GET",
+                        "/api/catalog",
+                        headers={"Host": f"127.0.0.1:{runtime.PORT}"},
+                    )
+                    response = connection.getresponse()
+                    request_result.append((response.status, response.read()))
+                except OSError as error:
+                    request_result.append(error)
+                finally:
+                    connection.close()
+
+            request_thread = threading.Thread(target=request_catalog)
+            request_thread.start()
+            deadline = time.monotonic() + 12
+            events: list[dict[str, object]] = []
+            while time.monotonic() < deadline:
+                if probe_file.exists():
+                    events = [
+                        json.loads(line)
+                        for line in probe_file.read_text(encoding="utf-8").splitlines()
+                    ]
+                if worker_pid_file.exists() and any(
+                    event["event"] == "failed_cleanup" for event in events
+                ):
+                    break
+                time.sleep(0.02)
+            assert worker_pid_file.exists()
+            worker_pid = int(worker_pid_file.read_text(encoding="utf-8"))
+            started_event = next(event for event in events if event["event"] == "started")
+            active_event = next(event for event in events if event["event"] == "active")
+            cleanup_event = next(
+                event for event in events if event["event"] == "failed_cleanup"
+            )
+            daemon_pid = int(started_event["daemon_pid"])
+
+            assert started_event["instance_count"] == 1
+            assert started_event["listener_port"] == runtime.PORT
+            assert started_event["application_id"] == started_event["provider_owner_id"]
+            assert started_event["server_id"] == started_event["factory_server_id"]
+            assert active_event["active_count"] == 1
+            assert active_event["application_id"] == started_event["application_id"]
+            assert active_event["manager_id"] == started_event["manager_id"]
+            assert active_event["server_id"] == started_event["server_id"]
+            assert cleanup_event["complete"] is False
+            assert cleanup_event["active_count"] == 1
+            assert cleanup_event["listener_fileno"] == -1
+
+            instance_file = home / ".nyx" / "runtime" / "instance.json"
+            claim_file = home / ".nyx" / "runtime" / "lease.lock"
+            assert instance_file.exists()
+            contender = runtime.NativeClaim(claim_file)
+            assert not contender.acquire(create=False, blocking=False)
+            contender.close()
+
+            first_stop = run_cli("--stop")
+            assert first_stop.returncode == 1
+            assert "ownership was retained" in first_stop.stderr
+            assert instance_file.exists()
+
+            os.kill(worker_pid, signal.SIGKILL)
+            request_thread.join(timeout=3)
+            assert not request_thread.is_alive()
+            assert request_result
+
+            second_stop = run_cli("--stop")
+            assert second_stop.returncode == 0, second_stop.stderr
+            assert second_stop.stdout == "stopped\n"
+            assert not instance_file.exists()
+            _assert_claim_available(claim_file)
+
+            events = [
+                json.loads(line)
+                for line in probe_file.read_text(encoding="utf-8").splitlines()
+            ]
+            shutdown_events = [event for event in events if event["event"] == "shutdown"]
+            assert [event["complete"] for event in shutdown_events] == [False, True]
+            assert shutdown_events[0]["active_count"] == 1
+            assert shutdown_events[1]["active_count"] == 0
+            assert all(
+                event["application_id"] == started_event["application_id"]
+                and event["manager_id"] == started_event["manager_id"]
+                and event["server_id"] == started_event["server_id"]
+                for event in shutdown_events
+            )
+        finally:
+            if worker_pid is None and worker_pid_file.exists():
+                worker_pid = int(worker_pid_file.read_text(encoding="utf-8"))
+            if worker_pid is not None:
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if request_thread is not None:
+                request_thread.join(timeout=1)
+            for _ in range(2):
+                try:
+                    stopped = run_cli("--stop", timeout=7)
+                except subprocess.TimeoutExpired:
+                    continue
+                if stopped.returncode == 0:
+                    break
+            if daemon_pid is None and probe_file.exists():
+                for event in probe_file.read_text(encoding="utf-8").splitlines():
+                    payload = json.loads(event)
+                    if payload["event"] == "started":
+                        daemon_pid = int(payload["daemon_pid"])
+                        break
+            if daemon_pid is not None:
+                try:
+                    os.kill(daemon_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 @pytest.mark.parametrize(
