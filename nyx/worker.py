@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import select
 import subprocess
 import sys
 import threading
@@ -15,10 +16,30 @@ from . import state
 from ._native_claim import NativeClaim
 from .catalog import scan_catalog
 
+if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+    import ctypes
+    from ctypes import wintypes
+
 MAX_STDOUT_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 WORKER_TIMEOUT = 5.0
 _READ_CHUNK_BYTES = 64 * 1024
+
+
+def _windows_parent_pipe_closed(fd: int) -> bool:
+    """Observe Windows anonymous-pipe closure without a blocking read."""
+
+    if os.name != "nt":
+        raise RuntimeError("Windows pipe observation is unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(NativeClaim.transfer_handle(fd))
+    if kernel32.PeekNamedPipe(handle, None, 0, None, None, None):
+        return False
+    error = ctypes.get_last_error()
+    if error in {109, 233}:
+        return True
+    raise OSError(error, "PeekNamedPipe failed")
 
 
 class WorkerError(RuntimeError):
@@ -34,11 +55,6 @@ class _ParentLossObserver:
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
-        # Python 3.12 supports non-blocking anonymous pipes on every supported
-        # Nyx platform, including Windows.  Keeping the read non-blocking lets
-        # normal worker completion stop and join this observer without closing
-        # a descriptor out from under a blocking read in another thread.
-        os.set_blocking(self.fd, False)
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._observe,
@@ -52,11 +68,23 @@ class _ParentLossObserver:
     def _observe(self) -> None:
         try:
             while not self._stop.is_set():
-                try:
-                    data = os.read(self.fd, 1)
-                except BlockingIOError:
+                if os.name == "nt":
+                    try:
+                        parent_closed = _windows_parent_pipe_closed(self.fd)
+                    except OSError:
+                        return
+                    if parent_closed and not self._stop.is_set():
+                        os._exit(7)
                     self._stop.wait(0.05)
                     continue
+                try:
+                    readable, _, _ = select.select([self.fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    return
+                if not readable:
+                    continue
+                try:
+                    data = getattr(os, "read")(self.fd, 1)
                 except OSError:
                     return
                 if not data and not self._stop.is_set():
