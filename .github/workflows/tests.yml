@@ -88,7 +88,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install -e '.[test,desktop]' build
+          python -m pip install -e '.[test]' build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m playwright install chromium
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -103,15 +103,6 @@ jobs:
             throw "Expected exactly one wheel, found $($wheels.Count)"
           }
           python -m pytest tests/test_wheel_install.py -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify native desktop source and session
-        shell: pwsh
-        env:
-          NYX_REQUIRE_NATIVE_DESKTOP: '1'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -m pytest tests/test_desktop.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify documented installation commands
@@ -138,7 +129,7 @@ jobs:
           runner_python="$(command -v python)"
           "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
           "$runner_python" -m pip install --upgrade pip
-          "$runner_python" -m pip install -e '.[test,desktop]' build
+          "$runner_python" -m pip install -e '.[test]' build
           "$runner_python" -m playwright install chromium
           ruff check .
           "$runner_python" -m pytest tests/ -v
@@ -147,13 +138,6 @@ jobs:
           test "$wheel_count" -eq 1
           "$runner_python" -m pytest tests/test_wheel_install.py -v
 
-      - name: Verify native desktop source and session
-        env:
-          NYX_REQUIRE_NATIVE_DESKTOP: '1'
-        run: |
-          set -euo pipefail
-          python -m pytest tests/test_desktop.py -v
-
       - name: Verify documented installation commands
         shell: bash
         env:
@@ -161,3 +145,73 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest tests/test_documented_install.py -v
+
+  nyx-desktop-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Record native host and session preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:ImageOS) -or
+              [string]::IsNullOrWhiteSpace($env:ImageVersion)) {
+            throw 'GitHub runner image identity is unavailable'
+          }
+          $session = (Get-Process -Id $PID).SessionId
+          $interactive = [Environment]::UserInteractive
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          Write-Host "Architecture=$env:PROCESSOR_ARCHITECTURE SessionId=$session UserInteractive=$interactive"
+          python -c "import platform, sys; print(platform.platform()); assert sys.version_info[:2] == (3, 12); assert platform.machine().lower() in {'amd64', 'x86_64'}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $interactive) {
+            throw 'windows-2025 does not expose an interactive desktop session'
+          }
+      - name: Verify native desktop source and session
+        shell: pwsh
+        env:
+          NYX_EXPECTED_NATIVE_HOST: windows-2025
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e '.[test,desktop]'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest tests/test_desktop.py -v -s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  nyx-desktop-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Record native host and session preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          session_manager="$(launchctl managername)"
+          console_user="$(stat -f '%Su' /dev/console)"
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          echo "Architecture=$(uname -m) SessionManager=$session_manager ConsoleUser=$console_user"
+          python -c "import platform, sys; print(platform.platform()); assert sys.version_info[:2] == (3, 12); assert platform.machine() == 'arm64'"
+          test "$session_manager" = "Aqua"
+      - name: Verify native desktop source and session
+        shell: bash
+        env:
+          NYX_EXPECTED_NATIVE_HOST: macos-15
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test,desktop]'
+          python -m pytest tests/test_desktop.py -v -s
