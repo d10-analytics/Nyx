@@ -4084,6 +4084,48 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
                 crashed.wait()
 
 
+def test_retained_shutdown_retry_wakes_owner_and_releases_original_claim():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_path = paths.runtime_directory / "lease.lock"
+        lease_fd = _transferred_claim_fd(lease_path)
+        daemon_thread = None
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(
+                lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+            )
+        try:
+            with patch.object(daemon, "start"), patch.object(
+                daemon.application, "shutdown", side_effect=[False, True]
+            ):
+                assert daemon.shutdown(deadline=time.monotonic() + 1) == "timeout"
+                daemon_thread = threading.Thread(target=daemon.run)
+                daemon_thread.start()
+
+                # The retained owner consumes the first attempt's notification
+                # and waits for retry completion while continuing to hold the
+                # exact transferred lifetime object.
+                deadline = time.monotonic() + 1
+                while daemon.shutdown_done.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert not daemon.shutdown_done.is_set()
+                contender = runtime._lease_lock(paths, timeout=0.0)
+                assert not contender.acquire(blocking=False)
+                contender.close()
+
+                assert daemon.shutdown(deadline=time.monotonic() + 1) == "stopped"
+                daemon_thread.join(timeout=0.5)
+                assert not daemon_thread.is_alive()
+            _assert_claim_available(lease_path)
+        finally:
+            if daemon_thread is not None and daemon_thread.is_alive():
+                daemon.shutdown_result = "stopped"
+                daemon.shutdown_done.set()
+                daemon_thread.join(timeout=2)
+            if daemon_thread is None:
+                os.close(lease_fd)
+
+
 def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
