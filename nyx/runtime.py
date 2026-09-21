@@ -327,6 +327,35 @@ def _record_unchanged(
     )
 
 
+def _record_transition(path: Path, original: _Metadata) -> str:
+    """Classify one locator after authenticated terminal control."""
+
+    try:
+        current = _record_snapshot(path)
+    except (OSError, RuntimeErrorBase):
+        return "changed"
+    if current == original:
+        return "unchanged"
+    return "absent" if not current.exists else "changed"
+
+
+def _acquired_lock_is_original(
+    path: Path,
+    fd: int | None,
+    original: _Metadata,
+) -> bool:
+    """Confirm that an acquired path is the originally observed native object."""
+
+    if fd is None or not original.exists:
+        return False
+    try:
+        return _metadata_from_stat(os.fstat(fd)) == original and _metadata_unchanged(
+            path, original
+        )
+    except OSError:
+        return False
+
+
 def _directory_stamp(
     path: Path, *, directory: NativeDirectory | None = None
 ) -> tuple[int, int, int, int, int, int, int]:
@@ -1475,11 +1504,22 @@ def stop() -> str:
         raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained") from error
     with _operation_lock(paths, deadline=deadline):
         _require_deadline(deadline)
+        lease_path = paths.runtime_directory / "lease.lock"
+        lease_snapshot = _read_metadata(lease_path)
         lease = _lease_lock(paths, timeout=0.0, deadline=deadline)
         if lease.acquire(blocking=False):
+            if lease_snapshot.exists and not _acquired_lock_is_original(
+                lease_path, lease.fd, lease_snapshot
+            ):
+                lease.close()
+                raise UnhealthyInstanceError("Nyx lifetime lease changed")
             lease.close()
             _remove_stale_instance(paths, deadline=deadline)
             return "stopped"
+        if not lease_snapshot.exists or not _metadata_unchanged(
+            lease_path, lease_snapshot
+        ):
+            raise UnhealthyInstanceError("Nyx lifetime lease changed")
         instance, record_snapshot = _read_live_instance(paths)
         _send_control(
             instance,
@@ -1487,31 +1527,49 @@ def stop() -> str:
             deadline=deadline,
             deadline_ns=deadline_ns,
         )
-        if not _record_unchanged(_record_path(paths), record_snapshot):
-            raise UnhealthyInstanceError("Nyx instance record changed")
     # Waiting does not mutate lifecycle state, so release the operation claim.
     # Public status can then authenticate the retained daemon while cleanup is
     # in progress.  Each terminal probe reacquires the claim before inspecting
     # or removing state, preserving exclusion from start/setup mutations.
+    terminal_absence_seen = False
     while time.monotonic() < deadline:
         operation = _operation_lock(paths, timeout=0.0, deadline=deadline)
+        probe: _ExistingLock | None = None
         try:
             if not operation.acquire(blocking=False):
                 time.sleep(0.03)
                 continue
-            if not _record_unchanged(_record_path(paths), record_snapshot):
-                raise UnhealthyInstanceError("Nyx instance record changed")
-            probe = _lease_lock(paths, timeout=0.0, deadline=deadline)
-            if probe.acquire(blocking=False):
-                probe.close()
+            record_transition = _record_transition(_record_path(paths), record_snapshot)
+            probe = _ExistingLock(lease_path)
+            probe_state = probe.acquire()
+            if probe_state == "acquired":
+                if not _acquired_lock_is_original(
+                    lease_path, probe.fd, lease_snapshot
+                ):
+                    raise UnhealthyInstanceError("Nyx lifetime lease changed")
+                if record_transition == "changed":
+                    raise UnhealthyInstanceError("Nyx instance record changed")
+                if record_transition == "absent":
+                    return "stopped"
                 _remove_stale_instance(paths, deadline=deadline)
                 return "stopped"
-            probe.close()
+            if probe_state != "held" or not _metadata_unchanged(
+                lease_path, lease_snapshot
+            ):
+                raise UnhealthyInstanceError("Nyx lifetime lease changed")
+            if record_transition == "changed":
+                raise UnhealthyInstanceError("Nyx instance record changed")
+            if record_transition == "absent":
+                terminal_absence_seen = True
         except _ControlTimeoutError:
             break
         finally:
+            if probe is not None:
+                probe.close()
             operation.close()
         time.sleep(0.03)
+    if terminal_absence_seen:
+        raise UnhealthyInstanceError("Nyx instance record changed")
     raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
 
 
