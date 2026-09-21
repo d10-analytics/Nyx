@@ -157,7 +157,7 @@ class DesktopSession:
     def choose_workspace(
         self,
         specification_root: str | os.PathLike[str],
-        hidden_stages: tuple[str, ...] | list[str] = (),
+        hidden_stages: tuple[str, ...] | list[str] | object = state._OMITTED,
     ) -> state.Configuration:
         """Validate and atomically save a chooser selection while claims are held."""
 
@@ -253,10 +253,13 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._root = QtWidgets.QLineEdit(self)
             self._status = QtWidgets.QLabel(self)
             self._status.setWordWrap(True)
+            self._change = QtWidgets.QPushButton("Change workspace", self)
             self._save = QtWidgets.QPushButton("Save workspace", self)
             self._cancel = QtWidgets.QPushButton("Cancel", self)
             self._retry = QtWidgets.QPushButton("Revalidate", self)
             self._quit = QtWidgets.QPushButton("Quit", self)
+            self._changing = self._session.snapshot.status == "not_configured"
+            self._change.clicked.connect(self._begin_change)
             self._save.clicked.connect(self._save_selection)
             self._cancel.clicked.connect(self.close)
             self._retry.clicked.connect(self._revalidate)
@@ -264,6 +267,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             form = QtWidgets.QFormLayout()
             form.addRow("Workspace root", self._root)
             actions = QtWidgets.QHBoxLayout()
+            actions.addWidget(self._change)
             actions.addWidget(self._save)
             actions.addWidget(self._retry)
             actions.addWidget(self._cancel)
@@ -279,26 +283,49 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
         def _render(self) -> None:
             snapshot = self._session.snapshot
             if snapshot.status == "configured" and snapshot.configuration is not None:
-                self._status.setText(f"Workspace: {snapshot.configuration.specification_root}")
-                self._root.setText(str(snapshot.configuration.specification_root))
-                self._save.setEnabled(False)
+                if not self._changing:
+                    self._root.setText(str(snapshot.configuration.specification_root))
+                if self._session.pending_error is not None:
+                    self._status.setText(self._session.pending_error)
+                elif self._changing:
+                    self._status.setText("Choose a replacement workspace.")
+                else:
+                    self._status.setText(
+                        f"Workspace: {snapshot.configuration.specification_root}"
+                    )
+                self._root.setEnabled(self._changing)
+                self._change.setEnabled(not self._changing)
+                self._save.setEnabled(self._changing)
                 self._retry.setEnabled(False)
             elif snapshot.status == "not_configured":
-                self._status.setText("Choose a workspace to begin.")
+                self._changing = True
+                self._status.setText(
+                    self._session.pending_error or "Choose a workspace to begin."
+                )
+                self._root.setEnabled(True)
+                self._change.setEnabled(False)
                 self._save.setEnabled(True)
                 self._retry.setEnabled(False)
             else:
                 self._status.setText(
                     self._session.pending_error or "Workspace configuration is unavailable."
                 )
+                self._root.setEnabled(False)
+                self._change.setEnabled(False)
                 self._save.setEnabled(False)
                 self._retry.setEnabled(self._session.unverified)
+
+        def _begin_change(self) -> None:
+            self._changing = True
+            self._render()
 
         def _save_selection(self) -> None:
             try:
                 self._session.choose_workspace(self._root.text())
             except DesktopError as error:
                 self._status.setText(str(error))
+            else:
+                self._changing = False
             self._render()
 
         def _revalidate(self) -> None:
@@ -306,6 +333,8 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._session.revalidate()
             except DesktopError as error:
                 self._status.setText(str(error))
+            else:
+                self._changing = False
             self._render()
 
         def closeEvent(self, event: Any) -> None:
@@ -324,7 +353,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="nyx-desktop")
     parser.parse_args(argv)
     try:
-        qt = _load_qt()
         session = DesktopSession()
     except AlreadyOpenError as error:
         print(str(error), file=sys.stderr)
@@ -332,15 +360,20 @@ def main(argv: list[str] | None = None) -> int:
     except DesktopError as error:
         print(f"nyx-desktop: {error}", file=sys.stderr)
         return 1
-    application = qt["QtWidgets"].QApplication.instance()
-    owns_application = application is None
-    if application is None:
-        application = qt["QtWidgets"].QApplication(sys.argv[:1])
-    window = _build_window(qt, session)
-    window.show()
-    if not owns_application:
-        return 0
     try:
+        try:
+            qt = _load_qt()
+        except DesktopError as error:
+            print(f"nyx-desktop: {error}", file=sys.stderr)
+            return 1
+        application = qt["QtWidgets"].QApplication.instance()
+        owns_application = application is None
+        if application is None:
+            application = qt["QtWidgets"].QApplication(sys.argv[:1])
+        window = _build_window(qt, session)
+        window.show()
+        if not owns_application:
+            return 0
         return int(application.exec())
     finally:
         session.close()
