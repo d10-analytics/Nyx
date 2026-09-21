@@ -1590,7 +1590,9 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
         root = Path(temporary)
         paths, home, first = _fixture(root)
         record = paths.runtime_directory / "instance.json"
-        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        lease_fd: int | None = _transferred_claim_fd(
+            paths.runtime_directory / "lease.lock"
+        )
         daemon_thread: threading.Thread | None = None
         daemon: runtime._Daemon | None = None
         original_bytes: bytes | None = None
@@ -1603,6 +1605,10 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
                 )
                 daemon_thread = threading.Thread(target=daemon.run)
                 daemon_thread.start()
+                # A running daemon owns the transferred descriptor and closes
+                # it in _Daemon.run(); test cleanup owns it only if startup
+                # never handed execution to that thread.
+                lease_fd = None
                 instance = _wait_for_record(paths)
             original_bytes = record.read_bytes()
             if damage == "absent":
@@ -1655,19 +1661,37 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
             assert daemon_thread is not None
             daemon_thread.join(timeout=5)
             assert not daemon_thread.is_alive()
+            assert lease_fd is None
+            assert daemon.control_thread is not None
+            assert not daemon.control_thread.is_alive()
+            assert daemon.http_thread is not None
+            assert not daemon.http_thread.is_alive()
+            assert daemon.control is not None
+            assert daemon.control.fileno() == -1
+            assert daemon.server is not None
+            assert daemon.server.fileno() == -1
+            assert daemon.workers.active_count == 0
+            _assert_claim_available(paths.runtime_directory / "lease.lock")
         finally:
             if daemon_thread is not None and daemon_thread.is_alive():
                 try:
-                    assert original_bytes is not None
-                    record.write_bytes(original_bytes)
-                    with patch.object(
-                        runtime, "_paths", return_value=paths
-                    ), patch.object(state, "resolve_account_home", return_value=home):
-                        runtime.stop()
+                    if original_bytes is not None:
+                        record.write_bytes(original_bytes)
+                        with patch.object(
+                            runtime, "_paths", return_value=paths
+                        ), patch.object(state, "resolve_account_home", return_value=home):
+                            runtime.stop()
                 except (OSError, runtime.RuntimeErrorBase):
                     pass
+                if daemon_thread.is_alive() and daemon is not None:
+                    try:
+                        daemon.shutdown(deadline=time.monotonic() + 3)
+                    except (OSError, runtime.RuntimeErrorBase):
+                        pass
                 daemon_thread.join(timeout=3)
-            os.close(lease_fd)
+                assert not daemon_thread.is_alive()
+            if lease_fd is not None:
+                os.close(lease_fd)
 
 
 def test_live_replaced_locator_is_rejected_before_start_authorization():
