@@ -87,24 +87,35 @@ def _receive_worker_inheritance(
         return (None, None)
     if recovery_fd is None or recovery_path is None or parent_liveness_fd is None:
         return None
+    received_fd: int | None = None
+    liveness_fd: int | None = None
+    claim: NativeClaim | None = None
+    observer: _ParentLossObserver | None = None
+    succeeded = False
     try:
         received_fd = NativeClaim.receive_handle(recovery_fd)
-        liveness_fd = NativeClaim.receive_handle(parent_liveness_fd)
+        liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
         claim = NativeClaim(recovery_path)
         if not claim.adopt_received(received_fd):
-            os.close(received_fd)
-            os.close(liveness_fd)
             return None
+        received_fd = None
         observer = _ParentLossObserver(liveness_fd)
         observer.start()
+        liveness_fd = None
+        succeeded = True
         return claim, observer
     except (OSError, RuntimeError, ValueError):
-        for fd in (recovery_fd, parent_liveness_fd):
+        return None
+    finally:
+        if not succeeded and claim is not None:
+            claim.close()
+        for fd in (received_fd, liveness_fd):
+            if fd is None:
+                continue
             try:
                 os.close(fd)
             except OSError:
                 pass
-        return None
 
 
 def _worker_main(

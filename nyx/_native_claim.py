@@ -431,11 +431,24 @@ class NativeClaim:
         return fd
 
     @staticmethod
-    def receive_handle(handle: int, *, write_only: bool = False) -> int:
+    def receive_handle(
+        handle: int,
+        *,
+        read_only: bool = False,
+        write_only: bool = False,
+    ) -> int:
         """Map an inherited native object into this process's descriptor table."""
 
+        if read_only and write_only:
+            raise ValueError("received handle cannot be both read-only and write-only")
         if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
-            flags = os.O_WRONLY if write_only else os.O_RDWR
+            flags = (
+                os.O_RDONLY
+                if read_only
+                else os.O_WRONLY
+                if write_only
+                else os.O_RDWR
+            )
             return msvcrt.open_osfhandle(handle, flags)
         return handle
 
