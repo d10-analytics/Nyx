@@ -210,7 +210,10 @@ def test_qt_is_optional_for_linux_source_collection():
             desktop._load_qt()
 
 
-@pytest.mark.skipif(QtWidgets is None, reason="optional Qt dependency is not installed")
+@pytest.mark.skipif(
+    QtWidgets is None or not _NATIVE_REQUIRED,
+    reason="required native session lane is not enabled",
+)
 def test_required_native_session_renders_and_delivers_close_event():
     if _NATIVE_REQUIRED and os.environ.get("QT_QPA_PLATFORM", "").lower() in {
         "offscreen",
