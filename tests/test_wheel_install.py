@@ -18,6 +18,7 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 EXPECTED_MODULES = {
     "nyx/__init__.py",
+    "nyx/app_runtime.py",
     "nyx/catalog.py",
     "nyx/cli.py",
     "nyx/models.py",
@@ -189,7 +190,11 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             encoding="utf-8",
         )
         provenance = subprocess.run(
-            [str(interpreter), "-c", "import nyx; print(nyx.__file__)"],
+            [
+                str(interpreter),
+                "-c",
+                "import nyx, nyx.app_runtime; print(nyx.__file__); print(nyx.app_runtime.__file__)",
+            ],
             cwd=root,
             env=_installed_environment(home),
             check=False,
@@ -197,9 +202,14 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             text=True,
         )
         assert provenance.returncode == 0, provenance.stderr
-        installed_module = Path(provenance.stdout.strip()).resolve()
+        provenance_lines = provenance.stdout.splitlines()
+        assert len(provenance_lines) == 2
+        installed_module = Path(provenance_lines[0]).resolve()
+        installed_app_runtime = Path(provenance_lines[1]).resolve()
         assert installed_module.is_relative_to(venv.resolve())
         assert not installed_module.is_relative_to(REPOSITORY_ROOT)
+        assert installed_app_runtime.is_relative_to(venv.resolve())
+        assert not installed_app_runtime.is_relative_to(REPOSITORY_ROOT)
 
         setup = _run_installed_console(
             console, ["--setup", str(specification_root)], root=root, home=home

@@ -504,6 +504,79 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
     ]
 
 
+def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owner():
+    created: list[tuple[object, int]] = []
+
+    class Server:
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def close_active_connections(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class Control:
+        def getsockname(self):
+            return ("127.0.0.1", 43210)
+
+        def close(self):
+            return None
+
+    class Thread:
+        def __init__(self, *, target, daemon=True, args=()):
+            self.target = target
+
+        def start(self):
+            if self.target.__name__ == "_finish_start_failure_cleanup":
+                self.target()
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return False
+
+    def make_server(*, provider, port):
+        created.append((provider, port))
+        return Server()
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(
+                    lease_fd, time.monotonic_ns() + 5_000_000_000
+                )
+            with patch.object(runtime, "create_server", side_effect=make_server), patch.object(
+                runtime.threading, "Thread", Thread
+            ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+                daemon, "_bind_control", return_value=Control()
+            ), patch.object(
+                runtime,
+                "_send_control",
+                return_value={"status": "ready", "url": runtime.URL},
+            ), patch.object(
+                runtime, "_write_instance", return_value=runtime._Metadata(False)
+            ):
+                daemon.start()
+        finally:
+            os.close(lease_fd)
+
+    assert len(created) == 1
+    provider, port = created[0]
+    assert port == runtime.PORT
+    assert getattr(provider, "__self__", None) is daemon.application
+    assert daemon.application.server is daemon.server
+    assert daemon.application.workers is daemon.workers
+    assert daemon.application.catalog_admitted is False
+
+
 def test_publication_failure_tears_down_before_releasing_lifetime_claim():
     events: list[str] = []
     paths: state.StatePaths
