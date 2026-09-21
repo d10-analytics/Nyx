@@ -13,6 +13,18 @@ import pytest
 from nyx import desktop, runtime, state
 from nyx._native_claim import NativeClaim
 
+_NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
+try:
+    from PySide6 import QtCore, QtWidgets
+except ImportError as _qt_error:  # Linux source collection remains dependency-light.
+    QtCore = None
+    QtWidgets = None
+    if _NATIVE_REQUIRED:
+        pytest.fail(
+            f"required native desktop dependency is unavailable: {_qt_error}",
+            allow_module_level=True,
+        )
+
 
 def _home(root: Path) -> Path:
     home = root / "home"
@@ -196,3 +208,33 @@ def test_qt_is_optional_for_linux_source_collection():
     with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
         with pytest.raises(desktop.DesktopDependencyError):
             desktop._load_qt()
+
+
+@pytest.mark.skipif(QtWidgets is None, reason="optional Qt dependency is not installed")
+def test_required_native_session_renders_and_delivers_close_event():
+    if _NATIVE_REQUIRED and os.environ.get("QT_QPA_PLATFORM", "").lower() in {
+        "offscreen",
+        "minimal",
+        "minimalegl",
+    }:
+        pytest.fail("required native desktop lane cannot use an offscreen Qt platform")
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        with _home_patches(home)[0]:
+            session = desktop.DesktopSession()
+            application = QtWidgets.QApplication.instance()
+            owns_application = application is None
+            if application is None:
+                application = QtWidgets.QApplication([])
+            window = desktop._build_window(
+                {"QtCore": QtCore, "QtWidgets": QtWidgets}, session
+            )
+            window.show()
+            application.processEvents()
+            assert window.isVisible()
+            window.close()
+            application.processEvents()
+            assert not session.claims.held
+            if owns_application:
+                application.quit()
