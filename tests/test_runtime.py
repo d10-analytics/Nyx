@@ -1549,33 +1549,36 @@ def test_held_lease_allows_same_root_setup_without_mutation():
 def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
+        lease_path = paths.runtime_directory / "lease.lock"
+        lease_bytes_before = lease_path.read_bytes()
         lease = runtime._lease_lock(paths, timeout=0.0)
         assert lease.acquire(blocking=False)
+        assert lease.fd is not None
         records = (
             paths.config_file,
             paths.runtime_directory / "operation.lock",
-            paths.runtime_directory / "lease.lock",
         )
 
         def snapshot():
             result = {}
             for path in records:
                 details = path.lstat()
-                result[path] = (details.st_dev, details.st_ino, details.st_size, path.read_bytes())
+                result[path] = (_native_claim._identity(details), path.read_bytes())
             return result
 
-        before = snapshot()
-        original_lstat = state._lstat
-        lookup_delayed = False
-
-        def delayed_admission_lookup(path):
-            nonlocal lookup_delayed
-            if not lookup_delayed:
-                lookup_delayed = True
-                time.sleep(0.03)
-            return original_lstat(path)
-
         try:
+            before = snapshot()
+            lease_before = _native_claim._identity(os.fstat(lease.fd))
+            original_lstat = state._lstat
+            lookup_delayed = False
+
+            def delayed_admission_lookup(path):
+                nonlocal lookup_delayed
+                if not lookup_delayed:
+                    lookup_delayed = True
+                    time.sleep(0.03)
+                return original_lstat(path)
+
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "STARTUP_TIMEOUT", 0.01
             ), patch.object(
@@ -1589,8 +1592,12 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
             save_configuration.assert_not_called()
             assert lookup_delayed
             assert snapshot() == before
+            assert _native_claim._identity(os.fstat(lease.fd)) == lease_before
         finally:
             lease.close()
+        assert _native_claim._identity(lease_path.lstat()) == lease_before
+        assert lease_path.read_bytes() == lease_bytes_before
+        _assert_claim_available(lease_path)
 
 
 def test_held_lease_excludes_changed_hidden_stage_policy_without_mutation():
