@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import select
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import state
+from ._native_claim import NativeClaim
 from .catalog import scan_catalog
 
 MAX_STDOUT_BYTES = 2 * 1024 * 1024
@@ -26,8 +30,101 @@ class WorkerError(RuntimeError):
         super().__init__(code)
 
 
-def _worker_main() -> int:
-    """Run the installed catalog engine using the persisted private config."""
+class _ParentLossObserver:
+    """Terminate a desktop worker when its shell closes or disappears."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._observe,
+            daemon=True,
+            name="nyx-worker-parent-observer",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _observe(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    readable, _, _ = select.select([self.fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    # Windows pipes are not select()-able.  A blocking read is
+                    # safe there because stop is only used during process exit.
+                    readable = [self.fd]
+                if not readable:
+                    continue
+                try:
+                    data = getattr(os, "read")(self.fd, 1)
+                except OSError:
+                    return
+                if not data and not self._stop.is_set():
+                    os._exit(7)
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def _receive_worker_inheritance(
+    recovery_fd: int | None,
+    recovery_path: Path | None,
+    parent_liveness_fd: int | None,
+) -> tuple[NativeClaim | None, _ParentLossObserver | None] | None:
+    """Validate desktop inheritance before configuration can be loaded."""
+
+    if recovery_fd is None and recovery_path is None and parent_liveness_fd is None:
+        return (None, None)
+    if recovery_fd is None or recovery_path is None or parent_liveness_fd is None:
+        return None
+    try:
+        received_fd = NativeClaim.receive_handle(recovery_fd)
+        liveness_fd = NativeClaim.receive_handle(parent_liveness_fd)
+        claim = NativeClaim(recovery_path)
+        if not claim.adopt_received(received_fd):
+            os.close(received_fd)
+            os.close(liveness_fd)
+            return None
+        observer = _ParentLossObserver(liveness_fd)
+        observer.start()
+        return claim, observer
+    except (OSError, RuntimeError, ValueError):
+        for fd in (recovery_fd, parent_liveness_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
+def _worker_main(
+    *,
+    recovery_fd: int | None = None,
+    recovery_path: Path | None = None,
+    parent_liveness_fd: int | None = None,
+) -> int:
+    """Run the catalog engine using the persisted private configuration."""
+
+    inherited = _receive_worker_inheritance(
+        recovery_fd, recovery_path, parent_liveness_fd
+    )
+    if inherited is None:
+        if recovery_fd is not None or recovery_path is not None or parent_liveness_fd is not None:
+            return 4
+        claim = None
+        observer = None
+    else:
+        claim, observer = inherited
 
     try:
         configuration = state.load_configuration()
@@ -47,6 +144,11 @@ def _worker_main() -> int:
         return 5
     except Exception:  # noqa: BLE001 - worker boundary has a category-safe envelope
         return 6
+    finally:
+        if observer is not None:
+            observer.close()
+        if claim is not None:
+            claim.close()
 
 
 @dataclass
@@ -82,11 +184,19 @@ class CatalogWorkerManager:
         *,
         command_factory: Callable[[], list[str]] | None = None,
         timeout: float = WORKER_TIMEOUT,
+        recovery_claim: NativeClaim | None = None,
+        recovery_path: Path | None = None,
+        parent_liveness_fd: int | None = None,
     ) -> None:
         self._command_factory = command_factory or (
             lambda: [sys.executable, "-m", "nyx.worker"]
         )
         self._timeout = timeout
+        self._recovery_claim = recovery_claim
+        self._recovery_path = recovery_path or (
+            None if recovery_claim is None else recovery_claim.path
+        )
+        self._parent_liveness_fd = parent_liveness_fd
         self._lock = threading.RLock()
         self._closing = False
         self._children: list[_Child] = []
@@ -106,17 +216,43 @@ class CatalogWorkerManager:
                 raise WorkerError("producer_cancelled")
             self._reservations.append(reservation)
         try:
+            spawn_kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "close_fds": True,
+            }
+            inherited_handles: list[int] = []
+            if self._recovery_claim is not None:
+                if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
+                    raise WorkerError("producer_unavailable")
+                if os.name != "nt":
+                    spawn_kwargs["pass_fds"] = (
+                        self._recovery_claim.fd,
+                        self._parent_liveness_fd,
+                    )
+                else:  # pragma: no cover - exercised by the native Windows lane
+                    inherited_handles = [
+                        NativeClaim.transfer_handle(self._recovery_claim.fd),
+                        NativeClaim.transfer_handle(self._parent_liveness_fd),
+                    ]
+                    for handle in inherited_handles:
+                        os.set_handle_inheritable(handle, True)
+                    startup = subprocess.STARTUPINFO()
+                    startup.lpAttributeList = {"handle_list": inherited_handles}
+                    spawn_kwargs["startupinfo"] = startup
             process = subprocess.Popen(
-                self._command_factory(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
+                self._worker_command(),
+                **spawn_kwargs,
             )
         except BaseException:
             with self._lock:
                 self._reservations.remove(reservation)
             raise
+        finally:
+            if os.name == "nt":  # pragma: no cover - native Windows lane
+                for handle in inherited_handles:
+                    os.set_handle_inheritable(handle, False)
 
         child = _Child(process)
         with self._lock:
@@ -139,6 +275,36 @@ class CatalogWorkerManager:
                     self._select_terminal_locked(child, "producer_failed")
                 else:
                     self._start_finalizer_locked(child)
+
+    def _worker_command(self) -> list[str]:
+        """Add only the catalog worker's inherited desktop objects."""
+
+        command = list(self._command_factory())
+        if self._recovery_claim is None:
+            return command
+        if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
+            raise WorkerError("producer_unavailable")
+        if self._recovery_path is None:
+            raise WorkerError("producer_unavailable")
+        command.extend(
+            [
+                "--recovery-fd",
+                str(
+                    self._recovery_claim.fd
+                    if os.name != "nt"
+                    else NativeClaim.transfer_handle(self._recovery_claim.fd)
+                ),
+                "--recovery-path",
+                str(self._recovery_path),
+                "--parent-liveness-fd",
+                str(
+                    self._parent_liveness_fd
+                    if os.name != "nt"
+                    else NativeClaim.transfer_handle(self._parent_liveness_fd)
+                ),
+            ]
+        )
+        return command
 
     def _start_readers_locked(self, child: _Child) -> None:
         """Start one blocking reader per pipe while the child is registered."""
@@ -349,7 +515,20 @@ class CatalogWorkerManager:
 
 
 if __name__ == "__main__":
-    raise SystemExit(_worker_main())
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="nyx.worker")
+    parser.add_argument("--recovery-fd", type=int)
+    parser.add_argument("--recovery-path", type=Path)
+    parser.add_argument("--parent-liveness-fd", type=int)
+    options = parser.parse_args()
+    raise SystemExit(
+        _worker_main(
+            recovery_fd=options.recovery_fd,
+            recovery_path=options.recovery_path,
+            parent_liveness_fd=options.parent_liveness_fd,
+        )
+    )
 
 
 __all__ = ["CatalogWorkerManager", "WorkerError"]

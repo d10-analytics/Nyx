@@ -439,5 +439,26 @@ class NativeClaim:
             return msvcrt.open_osfhandle(handle, flags)
         return handle
 
+    def adopt_received(self, fd: int) -> bool:
+        """Adopt an inherited descriptor only when it is the claimed object.
+
+        A child must validate the descriptor it actually received before it
+        reads configuration or performs any other stateful work.  Adoption is
+        deliberately close-only: the child keeps this descriptor until its
+        terminal path closes the claim, and never reopens the path.
+        """
+
+        if self.fd is not None or not self.validate_received(fd, self.path):
+            return False
+        try:
+            details = os.fstat(fd)
+        except OSError:
+            return False
+        if not _regular(details):
+            return False
+        self.fd = fd
+        self.identity = _identity(details)
+        return True
+
 
 __all__ = ["NativeClaim", "NativeDirectory"]
