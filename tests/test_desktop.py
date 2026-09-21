@@ -172,6 +172,32 @@ def test_first_launch_cancel_releases_both_claims_without_creating_configuration
             assert NativeClaim.probe(paths.runtime_directory / "recovery.lock") == "free"
 
 
+def test_replacement_holds_application_but_blocks_save_and_start_until_recovery_retry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            paths = state.state_paths()
+            former_worker = NativeClaim(paths.runtime_directory / "recovery.lock")
+            assert former_worker.acquire(blocking=False)
+            session = desktop.DesktopSession()
+            before = paths.config_file.read_bytes()
+            assert session.recovery_blocked
+            assert session.snapshot.status == "recovery_blocked"
+            with pytest.raises(desktop.SelectionUnavailableError):
+                session.choose_workspace(workspace)
+            with pytest.raises(desktop.DesktopUnavailableError):
+                session.start_runtime()
+            assert paths.config_file.read_bytes() == before
+            assert not session.retry_recovery()
+            former_worker.close()
+            assert session.retry_recovery()
+            assert session.claims.held
+            session.close()
+
+
 def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stages():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
