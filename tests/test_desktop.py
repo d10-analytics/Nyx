@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -149,6 +153,142 @@ def _fake_qt():
             QWidget=_Widget,
         ),
     }
+
+
+_CRASH_WORKER_CODE = r"""
+import argparse
+import os
+import time
+from pathlib import Path
+
+from nyx import worker
+
+phase = os.environ["NYX_TEST_CRASH_PHASE"]
+marker_root = Path(os.environ["NYX_TEST_MARKER_ROOT"])
+real_exit = os._exit
+
+def delayed_parent_loss_exit(code):
+    (marker_root / "parent-lost").write_text(str(code), encoding="utf-8")
+    while not (marker_root / "allow-worker-exit").exists():
+        time.sleep(0.01)
+    real_exit(code)
+
+worker.os._exit = delayed_parent_loss_exit
+if phase == "after_spawn_before_registration":
+    real_load = worker.state.load_configuration
+    def blocked_load():
+        (marker_root / "before-config-load").write_text(str(os.getpid()), encoding="utf-8")
+        while not (marker_root / "allow-config-load").exists():
+            time.sleep(0.01)
+        return real_load()
+    worker.state.load_configuration = blocked_load
+elif phase == "during_scan":
+    def blocked_scan(*args, **kwargs):
+        (marker_root / "during-scan").write_text(str(os.getpid()), encoding="utf-8")
+        while not (marker_root / "allow-scan").exists():
+            time.sleep(0.01)
+        return "late"
+    worker.scan_catalog = blocked_scan
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--recovery-fd", type=int, required=True)
+parser.add_argument("--recovery-path", type=Path, required=True)
+parser.add_argument("--parent-liveness-fd", type=int, required=True)
+options = parser.parse_args()
+raise SystemExit(worker._worker_main(
+    recovery_fd=options.recovery_fd,
+    recovery_path=options.recovery_path,
+    parent_liveness_fd=options.parent_liveness_fd,
+))
+"""
+
+
+_CRASH_SHELL_CODE = r"""
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+from nyx import desktop, worker
+
+phase = os.environ["NYX_TEST_CRASH_PHASE"]
+marker_root = Path(os.environ["NYX_TEST_MARKER_ROOT"])
+desktop.runtime.PORT = int(os.environ["NYX_TEST_PORT"])
+real_popen = subprocess.Popen
+
+def scheduled_popen(*args, **kwargs):
+    if phase == "before_spawn":
+        (marker_root / "before-spawn").write_text("entered", encoding="utf-8")
+        while not (marker_root / "allow-spawn").exists():
+            time.sleep(0.01)
+    process = real_popen(*args, **kwargs)
+    if phase == "after_spawn_before_registration":
+        (marker_root / "spawned-unregistered").write_text(
+            str(process.pid), encoding="utf-8"
+        )
+        while not (marker_root / "allow-registration").exists():
+            time.sleep(0.01)
+    return process
+
+worker.subprocess.Popen = scheduled_popen
+manager_type = desktop.CatalogWorkerManager
+def desktop_workers(**kwargs):
+    return manager_type(
+        command_factory=lambda: [sys.executable, "-c", os.environ["NYX_TEST_WORKER_CODE"]],
+        **kwargs,
+    )
+desktop.CatalogWorkerManager = desktop_workers
+
+class Signal:
+    def __init__(self): self.callbacks = []
+    def connect(self, callback): self.callbacks.append(callback)
+class Widget:
+    def __init__(self, *args): self.enabled = True
+    def setEnabled(self, enabled): self.enabled = enabled
+class MainWindow(Widget):
+    def setWindowTitle(self, value): pass
+    def resize(self, *args): pass
+    def setCentralWidget(self, value): pass
+    def close(self): pass
+    def show(self):
+        (marker_root / "shell-visible").write_text(str(os.getpid()), encoding="utf-8")
+class LineEdit(Widget):
+    def __init__(self, *args): super().__init__(*args); self.value = ""
+    def setText(self, value): self.value = value
+    def text(self): return self.value
+class Label(LineEdit):
+    def setWordWrap(self, value): pass
+class Button(Widget):
+    def __init__(self, *args): super().__init__(*args); self.clicked = Signal()
+class Layout:
+    def __init__(self, *args): pass
+    def addRow(self, *args): pass
+    def addWidget(self, *args): pass
+    def addLayout(self, *args): pass
+class Application:
+    @classmethod
+    def instance(cls): return None
+    def __init__(self, *args): pass
+    def exec(self):
+        while True: time.sleep(1)
+
+widgets = SimpleNamespace(
+    QApplication=Application, QFormLayout=Layout, QHBoxLayout=Layout,
+    QLabel=Label, QLineEdit=LineEdit, QMainWindow=MainWindow,
+    QPushButton=Button, QVBoxLayout=Layout, QWidget=Widget,
+)
+desktop._load_qt = lambda: {"QtCore": SimpleNamespace(), "QtWidgets": widgets}
+raise SystemExit(desktop.main([]))
+"""
+
+
+def _wait_for_path(path: Path, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists(), f"timed out waiting for {path.name}"
 
 
 def test_module_import_does_not_require_qt(monkeypatch):
@@ -356,6 +496,224 @@ def test_separate_process_reports_busy_without_writing_or_starting_runtime():
                 assert second.claims.held
             finally:
                 second.close()
+
+
+def test_unrelated_helper_inherits_no_desktop_claim_or_liveness_object():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            descriptors = (
+                session.claims.application.fd,
+                session.claims.recovery.fd,
+                session.claims.parent_liveness_write,
+            )
+            assert all(descriptor is not None for descriptor in descriptors)
+            expected = [
+                (
+                    os.fstat(int(descriptor)).st_dev,
+                    os.fstat(int(descriptor)).st_ino,
+                    os.fstat(int(descriptor)).st_mode,
+                )
+                for descriptor in descriptors
+            ]
+            helper = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json,os,sys\n"
+                        "seen=[]\n"
+                        "for value in sys.argv[1:]:\n"
+                        " try:\n"
+                        "  details=os.fstat(int(value))\n"
+                        "  seen.append([details.st_dev,details.st_ino,details.st_mode])\n"
+                        " except OSError:\n"
+                        "  seen.append(None)\n"
+                        "print(json.dumps(seen))\n"
+                    ),
+                    *(str(descriptor) for descriptor in descriptors),
+                ],
+                cwd=Path(__file__).parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            inherited = json.loads(helper.stdout)
+            assert all(observed != list(identity) for observed, identity in zip(inherited, expected))
+            assert session.claims.held
+            session.close()
+
+
+@pytest.mark.parametrize(
+    ("phase", "stage_marker", "worker_expected"),
+    [
+        ("before_spawn", "before-spawn", False),
+        (
+            "after_spawn_before_registration",
+            "before-config-load",
+            True,
+        ),
+        ("during_scan", "during-scan", True),
+    ],
+)
+def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_terminal(
+    phase,
+    stage_marker,
+    worker_expected,
+):
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    finally:
+        if probe is not None:
+            probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        marker_root = root / "markers"
+        marker_root.mkdir()
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            paths = state.state_paths()
+            configuration_bytes = paths.config_file.read_bytes()
+
+        environment = os.environ.copy()
+        environment.update(
+            HOME=str(home),
+            USERPROFILE=str(home),
+            NYX_TEST_CRASH_PHASE=phase,
+            NYX_TEST_MARKER_ROOT=str(marker_root),
+            NYX_TEST_PORT=str(port),
+            NYX_TEST_WORKER_CODE=_CRASH_WORKER_CODE,
+        )
+        environment.pop("PYTHONHOME", None)
+        shell = subprocess.Popen(
+            [sys.executable, "-c", _CRASH_SHELL_CODE],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        replacement = None
+        demand_errors = []
+
+        def demand_catalog():
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", port, timeout=10
+            )
+            try:
+                connection.request(
+                    "GET",
+                    "/api/catalog",
+                    headers={"Host": f"127.0.0.1:{port}"},
+                )
+                response = connection.getresponse()
+                response.read()
+            except (OSError, http.client.HTTPException) as error:
+                demand_errors.append(type(error).__name__)
+            finally:
+                connection.close()
+
+        try:
+            try:
+                _wait_for_path(marker_root / "shell-visible")
+            except AssertionError:
+                if shell.poll() is not None:
+                    stdout, stderr = shell.communicate(timeout=1)
+                    pytest.fail(
+                        f"desktop shell exited {shell.returncode}: stdout={stdout!r} "
+                        f"stderr={stderr!r}"
+                    )
+                raise
+            demand = threading.Thread(target=demand_catalog, daemon=True)
+            demand.start()
+            _wait_for_path(marker_root / stage_marker)
+
+            shell.kill()
+            assert shell.wait(timeout=5) != 0
+            if worker_expected:
+                _wait_for_path(marker_root / "parent-lost")
+
+            with (
+                _home_patches(home)[0],
+                patch.object(runtime, "PORT", port),
+                patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "USERPROFILE": str(home)},
+                ),
+            ):
+                replacement = desktop.DesktopSession()
+                assert replacement.claims.application.held
+                assert replacement.recovery_blocked is worker_expected
+                assert replacement.runtime is None
+                assert paths.config_file.read_bytes() == configuration_bytes
+                if worker_expected:
+                    with pytest.raises(desktop.DesktopUnavailableError):
+                        replacement.start_runtime()
+
+                third = subprocess.run(
+                    [sys.executable, "-m", "nyx.desktop"],
+                    cwd=Path(__file__).parents[1],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                assert third.returncode == 1
+                assert third.stdout == ""
+                assert third.stderr == f"{desktop.ALREADY_OPEN_MESSAGE}\n"
+                assert paths.config_file.read_bytes() == configuration_bytes
+
+                if worker_expected:
+                    (marker_root / "allow-worker-exit").touch()
+                    deadline = time.monotonic() + 5
+                    while not replacement.retry_recovery() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    assert replacement.claims.held
+
+                application = replacement.start_runtime()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", port, timeout=5
+                )
+                connection.request(
+                    "GET",
+                    "/api/catalog",
+                    headers={"Host": f"127.0.0.1:{port}"},
+                )
+                response = connection.getresponse()
+                assert response.status == 200
+                assert json.loads(response.read())["schema_version"] == 4
+                connection.close()
+                assert application is replacement.runtime
+                replacement.close()
+                assert not replacement.claims.held
+            demand.join(timeout=5)
+            assert not demand.is_alive()
+            if worker_expected:
+                assert demand_errors
+        finally:
+            (marker_root / "allow-worker-exit").touch()
+            (marker_root / "allow-spawn").touch()
+            (marker_root / "allow-registration").touch()
+            (marker_root / "allow-config-load").touch()
+            (marker_root / "allow-scan").touch()
+            if replacement is not None:
+                replacement.close()
+            if shell.poll() is None:
+                shell.kill()
+                shell.wait(timeout=5)
 
 
 def test_unsafe_runtime_ancestry_is_unavailable_not_already_open():

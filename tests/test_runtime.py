@@ -3524,6 +3524,87 @@ def test_stop_during_spawn_reaps_child_registered_after_admission_closes():
         assert manager.active_count == 0
 
 
+def test_spawn_failure_releases_reservation_before_shared_close_completes():
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "raise SystemExit(0)"]
+    )
+    spawned = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        spawned.set()
+        assert release.wait(timeout=3)
+        raise OSError("injected spawn failure")
+
+    def fetch() -> None:
+        try:
+            manager.fetch_catalog()
+        except BaseException as error:
+            errors.append(error)
+
+    with patch.object(worker.subprocess, "Popen", side_effect=fail_spawn):
+        fetch_thread = threading.Thread(target=fetch)
+        fetch_thread.start()
+        assert spawned.wait(timeout=2)
+        assert manager.active_count == 1
+        close_result: list[bool] = []
+        close_thread = threading.Thread(
+            target=lambda: close_result.append(manager.close(time.monotonic() + 3))
+        )
+        close_thread.start()
+        release.set()
+        fetch_thread.join(timeout=4)
+        close_thread.join(timeout=4)
+
+    assert not fetch_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], OSError)
+    assert close_result == [True]
+    assert manager.active_count == 0
+
+
+def test_close_between_real_spawn_and_registration_reaps_the_child():
+    entered = threading.Event()
+    release = threading.Event()
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+
+    def pause_after_spawn(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        entered.set()
+        assert release.wait(timeout=3)
+        return process
+
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    errors: list[runtime.WorkerError] = []
+    fetch_thread = threading.Thread(
+        target=lambda: _capture_worker_error(manager, errors)
+    )
+    with patch.object(worker.subprocess, "Popen", side_effect=pause_after_spawn):
+        fetch_thread.start()
+        assert entered.wait(timeout=2)
+        assert manager.active_count == 1
+        close_result: list[bool] = []
+        close_thread = threading.Thread(
+            target=lambda: close_result.append(manager.close(time.monotonic() + 3))
+        )
+        close_thread.start()
+        release.set()
+        fetch_thread.join(timeout=4)
+        close_thread.join(timeout=4)
+
+    assert not fetch_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert close_result == [True]
+    assert [error.code for error in errors] == ["producer_cancelled"]
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert manager.active_count == 0
+
+
 def test_simultaneous_start_processes_share_one_authenticated_instance():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)

@@ -10,6 +10,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pytest
+
 from nyx import state, worker
 from nyx._native_claim import NativeClaim
 
@@ -81,7 +83,18 @@ def test_inherited_worker_rejects_substituted_claim_before_configuration_load() 
             raise AssertionError("configuration must not load")
 
         try:
-            with patch.object(worker.state, "load_configuration", side_effect=load_configuration):
+            with (
+                patch.object(
+                    worker.NativeClaim,
+                    "receive_handle",
+                    side_effect=lambda fd, **_kwargs: os.dup(fd),
+                ),
+                patch.object(
+                    worker.state,
+                    "load_configuration",
+                    side_effect=load_configuration,
+                ),
+            ):
                 assert (
                     worker._worker_main(
                         recovery_fd=claim.fd,
@@ -112,6 +125,11 @@ def test_inherited_worker_validates_claim_and_parent_observation_before_one_load
             return configuration
 
         with (
+            patch.object(
+                worker.NativeClaim,
+                "receive_handle",
+                side_effect=lambda fd, **_kwargs: os.dup(fd),
+            ),
             patch.object(worker.state, "load_configuration", side_effect=load_configuration),
             patch.object(worker, "scan_catalog", return_value="exact bytes"),
             patch.object(worker.sys, "stdout", stdout),
@@ -160,6 +178,35 @@ def test_partial_inherited_worker_objects_are_rejected_without_loading_config() 
             claim.close()
 
 
+def test_partial_native_handle_mapping_closes_received_object_before_config_load():
+    with (
+        patch.object(
+            worker.NativeClaim,
+            "receive_handle",
+            side_effect=[41, OSError("invalid liveness handle")],
+        ) as receive,
+        patch.object(worker.os, "close") as close,
+    ):
+        assert (
+            worker._receive_worker_inheritance(
+                101,
+                Path("recovery.lock"),
+                202,
+            )
+            is None
+        )
+
+    assert receive.call_args_list[0].args == (101,)
+    assert receive.call_args_list[0].kwargs == {}
+    assert receive.call_args_list[1].args == (202,)
+    assert receive.call_args_list[1].kwargs == {"read_only": True}
+    close.assert_called_once_with(41)
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="direct descriptor fixture is POSIX-only; native handle proof uses the shell path",
+)
 def test_parent_loss_terminates_a_scanning_desktop_worker_and_releases_recovery_claim():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
