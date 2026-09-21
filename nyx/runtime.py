@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import errno
-import http.client
 import json
 import os
 import secrets
@@ -22,9 +21,10 @@ from typing import Any, Self
 
 from . import state
 from ._native_claim import NativeClaim, NativeDirectory
-from .models import Catalog, ProtocolError, parse_catalog
-from .server import CatalogError, TrackerServer, create_server
-from .worker import CatalogWorkerManager, WorkerError
+from .app_runtime import ApplicationRuntime
+from .models import Catalog
+from .server import CatalogError, TrackerServer, create_server  # noqa: F401
+from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
 
 PORT = 8765
 URL = f"http://127.0.0.1:{PORT}/"
@@ -930,28 +930,55 @@ class _Daemon:
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
         self.shutdown_done = threading.Event()
-        self.server: TrackerServer | None = None
+        self.application = ApplicationRuntime(
+            port=PORT,
+            deadline=self._deadline,
+            server_factory=lambda **kwargs: create_server(**kwargs),
+            thread_factory=lambda **kwargs: threading.Thread(**kwargs),
+        )
         self.control: socket.socket | None = None
         self.instance: Instance | None = None
-        self.workers = CatalogWorkerManager()
         self.control_thread: threading.Thread | None = None
-        self.http_thread: threading.Thread | None = None
         self.shutdown_result: str = "running"
-        self.catalog_admitted = False
         self.published_record: _Metadata | None = None
+
+    @property
+    def server(self) -> TrackerServer | None:
+        return self.application.server
+
+    @server.setter
+    def server(self, value: TrackerServer | None) -> None:
+        self.application.server = value
+
+    @property
+    def http_thread(self) -> threading.Thread | None:
+        return self.application.http_thread
+
+    @http_thread.setter
+    def http_thread(self, value: threading.Thread | None) -> None:
+        self.application.http_thread = value
+
+    @property
+    def workers(self) -> CatalogWorkerManager:
+        return self.application.workers
+
+    @workers.setter
+    def workers(self, value: CatalogWorkerManager) -> None:
+        self.application.workers = value
+
+    @property
+    def catalog_admitted(self) -> bool:
+        return self.application.catalog_admitted
+
+    @catalog_admitted.setter
+    def catalog_admitted(self, value: bool) -> None:
+        self.application.catalog_admitted = value
 
     def _deadline(self) -> float:
         return self.deadline_ns / 1_000_000_000
 
     def _provider(self) -> Catalog:
-        if not self.catalog_admitted:
-            raise CatalogError("producer_unavailable")
-        try:
-            return parse_catalog(self.workers.fetch_catalog())
-        except WorkerError as error:
-            raise CatalogError(error.code) from None
-        except (ProtocolError, ValueError, TypeError) as error:
-            raise CatalogError("producer_protocol_error") from error
+        return self.application._provider()
 
     def _bind_control(self) -> socket.socket:
         control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -966,16 +993,7 @@ class _Daemon:
         return control
 
     def _static_ready(self) -> bool:
-        connection = http.client.HTTPConnection("127.0.0.1", PORT, timeout=0.2)
-        try:
-            connection.request("GET", "/", headers={"Host": f"127.0.0.1:{PORT}"})
-            response = connection.getresponse()
-            response.read(64 * 1024)
-            return response.status == 200 and response.getheader("Content-Type") == "text/html; charset=utf-8"
-        except (OSError, http.client.HTTPException):
-            return False
-        finally:
-            connection.close()
+        return self.application._static_ready()
 
     def _serve_control(self) -> None:
         assert self.control is not None
@@ -1048,14 +1066,8 @@ class _Daemon:
             state.load_configuration(self.paths)
             _require_deadline(self._deadline())
             self.startup_failure_code = 24
-            self.server = create_server(provider=self._provider, port=PORT)
-            self.http_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-            self.http_thread.start()
+            self.application.start(static_ready=self._static_ready)
             self.startup_failure_code = 25
-            while time.monotonic() < self._deadline() and not self._static_ready():
-                time.sleep(0.01)
-            if time.monotonic() >= self._deadline():
-                raise StartupError("Nyx static server did not become ready")
             self.startup_failure_code = 26
             self.control = self._bind_control()
             self.instance = Instance(
@@ -1079,9 +1091,9 @@ class _Daemon:
                 self.instance,
                 deadline=self._deadline(),
             )
-            self.catalog_admitted = True
+            self.application.admit_catalog()
             self.startup_failure_code = 29
-            self.http_thread.join()
+            self.application.wait()
         except OSError as error:
             if self.startup_failure_code == 24 and error.errno in (errno.EADDRINUSE, errno.EACCES):
                 raise PortConflictError("Nyx fixed port 8765 is unavailable") from None
@@ -1100,22 +1112,8 @@ class _Daemon:
         cleanup.join(timeout=max(0.0, self._deadline() - time.monotonic()))
 
     def _finish_start_failure_cleanup(self) -> None:
-        self.catalog_admitted = False
         try:
-            try:
-                self.workers.close_admission()
-            except Exception:
-                pass
-            if self.server is not None:
-                for cleanup in (
-                    self.server.shutdown,
-                    self.server.close_active_connections,
-                    self.server.server_close,
-                ):
-                    try:
-                        cleanup()
-                    except Exception:
-                        pass
+            self.application.cleanup_start_failure()
             try:
                 if self.published_record is not None and _record_unchanged(
                     _record_path(self.paths), self.published_record
@@ -1141,26 +1139,7 @@ class _Daemon:
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 self.stop_requested.set()
-                self.catalog_admitted = False
-                self.workers.close_admission()
-                if self.server is not None:
-                    if time.monotonic() >= deadline:
-                        self.shutdown_result = "timeout"
-                        return self.shutdown_result
-                    self.server.shutdown()
-                    if time.monotonic() >= deadline:
-                        self.shutdown_result = "timeout"
-                        return self.shutdown_result
-                    self.server.close_active_connections()
-                    if time.monotonic() >= deadline:
-                        self.shutdown_result = "timeout"
-                        return self.shutdown_result
-                    self.server.server_close()
-                if time.monotonic() >= deadline:
-                    self.shutdown_result = "timeout"
-                    return self.shutdown_result
-                workers_ok = self.workers.close(deadline)
-                if not workers_ok or time.monotonic() >= deadline:
+                if not self.application.shutdown(deadline):
                     self.shutdown_result = "timeout"
                     return self.shutdown_result
                 try:
