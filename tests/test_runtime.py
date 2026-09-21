@@ -4084,6 +4084,52 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
                 crashed.wait()
 
 
+def test_terminal_control_close_wakes_blocked_accept_before_completion():
+    accept_entered = threading.Event()
+    release_accept = threading.Event()
+    shutdown_called = threading.Event()
+    close_called = threading.Event()
+
+    class Control:
+        def accept(self):
+            accept_entered.set()
+            assert release_accept.wait(timeout=2)
+            raise OSError("terminal control listener closed")
+
+        def shutdown(self, how):
+            assert how == socket.SHUT_RDWR
+            shutdown_called.set()
+            release_accept.set()
+
+        def close(self):
+            close_called.set()
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        control_thread = None
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(
+                lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+            )
+        daemon.control = Control()
+        try:
+            control_thread = threading.Thread(target=daemon._serve_control)
+            daemon.control_thread = control_thread
+            control_thread.start()
+            assert accept_entered.wait(timeout=1)
+            with patch.object(daemon.application, "shutdown", return_value=True):
+                assert daemon.shutdown(deadline=time.monotonic() + 0.5) == "stopped"
+            assert shutdown_called.is_set()
+            assert close_called.is_set()
+            assert not control_thread.is_alive()
+        finally:
+            release_accept.set()
+            if control_thread is not None:
+                control_thread.join(timeout=2)
+            os.close(lease_fd)
+
+
 def test_retained_shutdown_retry_wakes_owner_and_releases_original_claim():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
