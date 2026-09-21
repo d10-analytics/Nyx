@@ -434,7 +434,9 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._retry.setEnabled(False)
             else:
                 self._status.setText(
-                    self._session.pending_error or "Workspace configuration is unavailable."
+                    self._session.pending_error
+                    or snapshot.diagnostic
+                    or "Workspace configuration is unavailable."
                 )
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
