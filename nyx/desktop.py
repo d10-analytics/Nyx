@@ -408,10 +408,7 @@ class DesktopSession:
         if self._application_runtime is not None:
             deadline = time.monotonic() + runtime.SHUTDOWN_TIMEOUT
             try:
-                if self._runtime_start_failed:
-                    closed = self._application_runtime.cleanup_start_failure(deadline)
-                else:
-                    closed = self._application_runtime.shutdown(deadline)
+                closed = self._application_runtime.shutdown(deadline)
             except Exception:
                 closed = False
             if not closed:
