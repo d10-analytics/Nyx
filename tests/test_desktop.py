@@ -651,6 +651,39 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
     assert calls == ["start_runtime", "show", "close"]
 
 
+def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            created = []
+
+            class RuntimeWithUnfinishedCleanup:
+                def __init__(self, **_kwargs):
+                    created.append(self)
+
+                def start(self, **_kwargs):
+                    raise RuntimeError("injected startup failure")
+
+                def cleanup_start_failure(self, _deadline):
+                    return False
+
+                def shutdown(self, _deadline):
+                    return True
+
+            with patch.object(desktop, "ApplicationRuntime", RuntimeWithUnfinishedCleanup):
+                session = desktop.DesktopSession()
+                with pytest.raises(desktop.DesktopUnavailableError):
+                    session.start_runtime(static_ready=lambda: True)
+
+                assert created
+                assert session.runtime is created[0]
+                assert session.claims.held
+                session.close()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
     with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
