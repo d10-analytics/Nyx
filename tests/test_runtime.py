@@ -1470,6 +1470,71 @@ def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease
             assert not paths.runtime_directory.joinpath("instance.json").exists()
 
 
+def test_public_stop_waits_for_terminal_record_removal_and_original_lease_release():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", 0))
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        record_removed = threading.Event()
+        allow_terminal_release = threading.Event()
+        original_unlink = Path.unlink
+        result: list[str] = []
+        errors: list[BaseException] = []
+
+        def gate_terminal_removal(path, *args, **kwargs):
+            removed = original_unlink(path, *args, **kwargs)
+            if path == record:
+                record_removed.set()
+                assert allow_terminal_release.wait(timeout=3)
+            return removed
+
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            Path, "unlink", gate_terminal_removal
+        ):
+            daemon = runtime._Daemon(
+                lease_fd, int((time.monotonic() + 10) * 1_000_000_000)
+            )
+            daemon_thread = threading.Thread(target=daemon.run)
+            daemon_thread.start()
+            _wait_for_record(paths)
+
+            def public_stop() -> None:
+                try:
+                    result.append(runtime.stop())
+                except BaseException as error:  # noqa: BLE001 - asserted below
+                    errors.append(error)
+
+            stop_thread = threading.Thread(target=public_stop)
+            stop_thread.start()
+            try:
+                assert record_removed.wait(timeout=3)
+                assert not record.exists()
+                contender = runtime._lease_lock(paths, timeout=0.0)
+                assert not contender.acquire(blocking=False)
+                contender.close()
+                assert stop_thread.is_alive()
+                assert result == []
+                assert errors == []
+            finally:
+                allow_terminal_release.set()
+            stop_thread.join(timeout=5)
+            daemon_thread.join(timeout=5)
+
+        assert not stop_thread.is_alive()
+        assert not daemon_thread.is_alive()
+        assert errors == []
+        assert result == ["stopped"]
+        _assert_claim_available(paths.runtime_directory / "lease.lock")
+
+
 def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
@@ -2234,11 +2299,49 @@ def test_live_replaced_locator_is_rejected_before_stop_cleanup():
                 runtime.UnhealthyInstanceError, match="record changed"
             ):
                 runtime.stop()
+            assert record.read_bytes() == (
+                json.dumps(replacement.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            assert not contender.acquire(blocking=False)
+            contender.close()
         finally:
             os.close(lease_fd)
         assert record.read_bytes() == (
             json.dumps(replacement.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
+
+
+def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+
+        def complete_terminal_cleanup(instance, command, **_kwargs):
+            nonlocal lease_fd
+            assert instance == original
+            assert command == "stop"
+            record.unlink()
+            os.close(lease_fd)
+            lease_fd = -1
+            return {
+                "status": "stopping",
+                "instance_id": original.instance_id,
+                "url": runtime.URL,
+            }
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=complete_terminal_cleanup
+            ):
+                assert runtime.stop() == "stopped"
+        finally:
+            if lease_fd >= 0:
+                os.close(lease_fd)
+        assert not record.exists()
+        _assert_claim_available(paths.runtime_directory / "lease.lock")
 
 
 @pytest.mark.parametrize(
