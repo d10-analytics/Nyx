@@ -88,7 +88,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install -e '.[test]' build
+          python -m pip install -e '.[test,desktop]' build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m playwright install chromium
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -103,6 +103,15 @@ jobs:
             throw "Expected exactly one wheel, found $($wheels.Count)"
           }
           python -m pytest tests/test_wheel_install.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify native desktop source and session
+        shell: pwsh
+        env:
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pytest tests/test_desktop.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify documented installation commands
@@ -129,7 +138,7 @@ jobs:
           runner_python="$(command -v python)"
           "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
           "$runner_python" -m pip install --upgrade pip
-          "$runner_python" -m pip install -e '.[test]' build
+          "$runner_python" -m pip install -e '.[test,desktop]' build
           "$runner_python" -m playwright install chromium
           ruff check .
           "$runner_python" -m pytest tests/ -v
@@ -137,6 +146,13 @@ jobs:
           wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
           test "$wheel_count" -eq 1
           "$runner_python" -m pytest tests/test_wheel_install.py -v
+
+      - name: Verify native desktop source and session
+        env:
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_desktop.py -v
 
       - name: Verify documented installation commands
         shell: bash

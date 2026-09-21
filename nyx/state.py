@@ -65,6 +65,10 @@ class ConfigurationError(StateError):
     """A persisted configuration is missing, unsafe, or malformed."""
 
 
+class ConfigurationCommitVerificationError(ConfigurationError):
+    """The replacement committed, but its immediate verification failed."""
+
+
 class HiddenStageError(ConfigurationError):
     """A hidden-stage name is outside the admitted Unicode component domain."""
 
@@ -511,6 +515,7 @@ def _atomic_write_configuration(
     deadline_ns: int | None = None,
 ) -> None:
     temporary_name: str | None = None
+    replaced = False
     try:
         if not _admit_directory(paths.state_directory, create=False) or not _admit_directory(
             paths.config_directory, create=False
@@ -533,10 +538,15 @@ def _atomic_write_configuration(
         _check_deadline(deadline, deadline_ns)
         os.replace(temporary_name, paths.config_file)
         temporary_name = None
+        replaced = True
         _verify_record(paths.config_file)
         _sync_directory(paths.config_directory)
     except (OSError, ValueError, ConfigurationError) as error:
         if isinstance(error, ConfigurationError):
+            if replaced and not isinstance(error, ConfigurationCommitVerificationError):
+                raise ConfigurationCommitVerificationError(
+                    "Nyx configuration was replaced but could not be verified"
+                ) from error
             raise
         raise ConfigurationError("cannot replace Nyx configuration") from error
     finally:
@@ -563,6 +573,50 @@ def _save_configuration(
         paths, root, hidden_stages, deadline=deadline, deadline_ns=deadline_ns
     )
     return Configuration(root, hidden_stages)
+
+
+def save_configuration_owned(
+    specification_root: str | os.PathLike[str],
+    hidden_stages: Iterable[str] = (),
+    *,
+    paths: StatePaths | None = None,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
+) -> Configuration:
+    """Persist validated configuration for a caller holding lifecycle claims.
+
+    Desktop ownership already holds the account and recovery claims.  This
+    seam deliberately bypasses the public setup aliases, which would try to
+    acquire the account lease a second time, while retaining this module's
+    canonical root, hidden-stage, and atomic-write validation.
+    """
+
+    root = resolve_specification_root(specification_root)
+    validated_hidden_stages = _validate_hidden_stages(hidden_stages)
+    selected_paths = (
+        state_paths(create=True, deadline=deadline, deadline_ns=deadline_ns)
+        if paths is None
+        else paths
+    )
+    return _save_configuration(
+        selected_paths,
+        root,
+        validated_hidden_stages,
+        deadline=deadline,
+        deadline_ns=deadline_ns,
+    )
+
+
+def revalidate_configuration(paths: StatePaths | None = None) -> Configuration:
+    """Reload a committed record through the state owner's validation path."""
+
+    selected = state_paths() if paths is None else paths
+    before = _verify_record(selected.config_file)
+    configuration = load_configuration(selected)
+    after = _verify_record(selected.config_file)
+    if _record_identity(before) != _record_identity(after):
+        raise ConfigurationError("Nyx configuration changed during validation")
+    return configuration
 
 
 def save_configuration(
@@ -597,6 +651,7 @@ __all__ = [
     "CONFIGURATION_UNAVAILABLE",
     "AccountHomeError",
     "Configuration",
+    "ConfigurationCommitVerificationError",
     "ConfigurationError",
     "ConfigurationObservation",
     "HiddenStageError",
@@ -615,6 +670,8 @@ __all__ = [
     "resolve_account_home",
     "resolve_specification_root",
     "save_configuration",
+    "save_configuration_owned",
+    "revalidate_configuration",
     "setup",
     "state_paths",
 ]
