@@ -291,7 +291,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._status.setText(
                     self._session.pending_error or "Workspace configuration is unavailable."
                 )
-                self._save.setEnabled(not self._session.unverified)
+                self._save.setEnabled(False)
                 self._retry.setEnabled(self._session.unverified)
 
         def _save_selection(self) -> None:
