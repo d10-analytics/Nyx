@@ -4087,10 +4087,30 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
 def test_terminal_control_close_wakes_blocked_accept_before_completion():
     accept_entered = threading.Event()
     release_accept = threading.Event()
+    wakeup_connected = threading.Event()
     shutdown_called = threading.Event()
     close_called = threading.Event()
 
+    class Wakeup:
+        def settimeout(self, timeout):
+            assert timeout == 0.05
+
+        def connect(self, address):
+            assert address == ("127.0.0.1", 43210)
+            wakeup_connected.set()
+            release_accept.set()
+
+        def close(self):
+            return None
+
     class Control:
+        family = socket.AF_INET
+        type = socket.SOCK_STREAM
+        proto = 0
+
+        def getsockname(self):
+            return ("127.0.0.1", 43210)
+
         def accept(self):
             accept_entered.set()
             assert release_accept.wait(timeout=2)
@@ -4099,7 +4119,7 @@ def test_terminal_control_close_wakes_blocked_accept_before_completion():
         def shutdown(self, how):
             assert how == socket.SHUT_RDWR
             shutdown_called.set()
-            release_accept.set()
+            raise OSError("listener shutdown is not portable")
 
         def close(self):
             close_called.set()
@@ -4118,8 +4138,11 @@ def test_terminal_control_close_wakes_blocked_accept_before_completion():
             daemon.control_thread = control_thread
             control_thread.start()
             assert accept_entered.wait(timeout=1)
-            with patch.object(daemon.application, "shutdown", return_value=True):
+            with patch.object(daemon.application, "shutdown", return_value=True), patch.object(
+                runtime.socket, "socket", return_value=Wakeup()
+            ):
                 assert daemon.shutdown(deadline=time.monotonic() + 0.5) == "stopped"
+            assert wakeup_connected.is_set()
             assert shutdown_called.is_set()
             assert close_called.is_set()
             assert not control_thread.is_alive()
@@ -4127,6 +4150,72 @@ def test_terminal_control_close_wakes_blocked_accept_before_completion():
             release_accept.set()
             if control_thread is not None:
                 control_thread.join(timeout=2)
+            os.close(lease_fd)
+
+
+def test_authenticated_retry_renews_inflight_cleanup_without_serialized_gap():
+    first_cleanup_entered = threading.Event()
+    allow_first_cleanup_return = threading.Event()
+    retry_deadline_published = threading.Event()
+    cleanup_calls: list[tuple[int | None, float]] = []
+    results: dict[str, str] = {}
+
+    def cleanup(deadline):
+        cleanup_calls.append((threading.current_thread().ident, deadline))
+        if len(cleanup_calls) == 1:
+            first_cleanup_entered.set()
+            assert allow_first_cleanup_return.wait(timeout=2)
+            return False
+        return True
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(
+                lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+            )
+
+        def request(name, deadline):
+            results[name] = daemon.shutdown(deadline=deadline)
+
+        first_deadline = time.monotonic() + 0.1
+        retry_deadline = time.monotonic() + 1
+
+        original_extend_shutdown_deadline = daemon._extend_shutdown_deadline
+
+        def observe_deadline(deadline):
+            extended = original_extend_shutdown_deadline(deadline)
+            if deadline == retry_deadline:
+                retry_deadline_published.set()
+            return extended
+
+        first = threading.Thread(target=request, args=("first", first_deadline))
+        retry = threading.Thread(target=request, args=("retry", retry_deadline))
+        try:
+            with patch.object(
+                daemon, "_extend_shutdown_deadline", side_effect=observe_deadline
+            ), patch.object(daemon.application, "shutdown", side_effect=cleanup):
+                first.start()
+                assert first_cleanup_entered.wait(timeout=1)
+                retry.start()
+                assert retry_deadline_published.wait(timeout=1)
+                assert daemon._current_shutdown_deadline() >= retry_deadline
+                allow_first_cleanup_return.set()
+                first.join(timeout=2)
+                retry.join(timeout=2)
+            assert not first.is_alive()
+            assert not retry.is_alive()
+            assert results == {"first": "stopped", "retry": "stopped"}
+            assert len(cleanup_calls) == 2
+            assert cleanup_calls[0][0] == cleanup_calls[1][0]
+            assert cleanup_calls[1][1] >= retry_deadline
+        finally:
+            allow_first_cleanup_return.set()
+            if first.ident is not None:
+                first.join(timeout=2)
+            if retry.ident is not None:
+                retry.join(timeout=2)
             os.close(lease_fd)
 
 
