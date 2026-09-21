@@ -584,6 +584,36 @@ def test_unavailable_shell_disables_change_save_and_revalidation():
             window._quit.click()
 
 
+def test_close_failure_keeps_desktop_visible_with_retryable_cleanup():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+
+            class RuntimeThatCannotClose:
+                def shutdown(self, _deadline):
+                    return False
+
+            session._application_runtime = RuntimeThatCannotClose()
+            window = desktop._build_window(_fake_qt(), session)
+            event = SimpleNamespace(accepted=False, ignored=False)
+            event.accept = lambda: setattr(event, "accepted", True)
+            event.ignore = lambda: setattr(event, "ignored", True)
+
+            window.closeEvent(event)
+
+            assert not event.accepted
+            assert event.ignored
+            assert session.claims.held
+            assert window._retry.isEnabled()
+            assert "retry" in window._status.text().lower()
+            session._application_runtime = None
+            session.close()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
     with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
