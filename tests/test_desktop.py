@@ -614,6 +614,43 @@ def test_close_failure_keeps_desktop_visible_with_retryable_cleanup():
             session.close()
 
 
+def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
+    calls = []
+
+    class Session:
+        snapshot = SimpleNamespace(status="configured")
+
+        def start_runtime(self):
+            calls.append("start_runtime")
+
+        def close(self):
+            calls.append("close")
+
+    class Application:
+        @classmethod
+        def instance(cls):
+            return None
+
+        def __init__(self, *_):
+            pass
+
+        def exec(self):
+            return 0
+
+    class Widgets:
+        QApplication = Application
+
+    window = SimpleNamespace(show=lambda: calls.append("show"))
+    with (
+        patch.object(desktop, "DesktopSession", Session),
+        patch.object(desktop, "_load_qt", return_value={"QtWidgets": Widgets}),
+        patch.object(desktop, "_build_window", return_value=window),
+    ):
+        assert desktop.main([]) == 0
+
+    assert calls == ["start_runtime", "show", "close"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
     with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
