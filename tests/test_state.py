@@ -279,7 +279,7 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
                     raise OSError("post-replace verification failed")
 
             with patch.object(state, "_verify_record", side_effect=fail_after_replacement), pytest.raises(
-                state.ConfigurationError, match="cannot replace"
+                state.ConfigurationCommitVerificationError, match="replaced but could not be verified"
             ):
                 state.setup(second, ["Queue"])
 
@@ -288,6 +288,52 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
             "schema_version": 2,
             "specification_root": str(second.resolve()),
         }
+
+
+def test_owned_save_classifies_pre_replacement_failure_without_creating_first_record():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            with patch.object(state.os, "replace", side_effect=OSError("injected")), pytest.raises(
+                state.ConfigurationError
+            ):
+                state.save_configuration_owned(workspace, paths=paths)
+            assert not paths.config_file.exists()
+
+
+def test_owned_save_classifies_post_replacement_verification_and_revalidation():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            original_verify = state._verify_record
+            failed = False
+
+            def verify_once(path):
+                nonlocal failed
+                details = original_verify(path)
+                if path == paths.config_file and json.loads(path.read_text())["specification_root"] == str(
+                    second.resolve()
+                ) and not failed:
+                    failed = True
+                    raise OSError("injected post-replacement verification failure")
+                return details
+
+            with patch.object(state, "_verify_record", side_effect=verify_once), pytest.raises(
+                state.ConfigurationCommitVerificationError
+            ):
+                state.save_configuration_owned(second, ["Queue"], paths=paths)
+            assert state.load_configuration(paths).specification_root == second.resolve()
+            assert state.revalidate_configuration(paths) == state.Configuration(second.resolve(), ("Queue",))
 
 
 def test_atomic_replacement_failure_preserves_previous_configuration_bytes():

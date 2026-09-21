@@ -167,6 +167,10 @@ class DesktopSession:
             raise SelectionUnavailableError(
                 "Nyx configuration is unverified; revalidate before saving"
             )
+        if self.snapshot.status == "unavailable":
+            raise SelectionUnavailableError(
+                "Nyx configuration is unavailable; repair or revalidate it first"
+            )
         try:
             configuration = state.save_configuration_owned(
                 specification_root,

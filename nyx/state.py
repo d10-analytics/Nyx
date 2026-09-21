@@ -548,6 +548,10 @@ def _atomic_write_configuration(
                     "Nyx configuration was replaced but could not be verified"
                 ) from error
             raise
+        if replaced:
+            raise ConfigurationCommitVerificationError(
+                "Nyx configuration was replaced but could not be verified"
+            ) from error
         raise ConfigurationError("cannot replace Nyx configuration") from error
     finally:
         if temporary_name is not None:
