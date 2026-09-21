@@ -21,7 +21,7 @@ from typing import Any, Self
 
 from . import state
 from ._native_claim import NativeClaim, NativeDirectory
-from .app_runtime import ApplicationRuntime
+from .app_runtime import ApplicationReadinessError, ApplicationRuntime
 from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
 from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
@@ -1066,8 +1066,11 @@ class _Daemon:
             state.load_configuration(self.paths)
             _require_deadline(self._deadline())
             self.startup_failure_code = 24
-            self.application.start(static_ready=self._static_ready)
-            self.startup_failure_code = 25
+            try:
+                self.application.start(static_ready=self._static_ready)
+            except ApplicationReadinessError as error:
+                self.startup_failure_code = 25
+                raise StartupError("Nyx static server did not become ready") from error
             self.startup_failure_code = 26
             self.control = self._bind_control()
             self.instance = Instance(
@@ -1112,8 +1115,10 @@ class _Daemon:
         cleanup.join(timeout=max(0.0, self._deadline() - time.monotonic()))
 
     def _finish_start_failure_cleanup(self) -> None:
+        completed = False
         try:
-            self.application.cleanup_start_failure()
+            if not self.application.cleanup_start_failure(self._deadline()):
+                return
             try:
                 if self.published_record is not None and _record_unchanged(
                     _record_path(self.paths), self.published_record
@@ -1126,8 +1131,10 @@ class _Daemon:
                     self.control.close()
                 except OSError:
                     pass
+            completed = True
         finally:
-            self.shutdown_result = "stopped"
+            if completed:
+                self.shutdown_result = "stopped"
 
     def shutdown(self, deadline: float | None = None) -> str:
         try:

@@ -17,6 +17,10 @@ ServerFactory = Callable[..., TrackerServer]
 ThreadFactory = Callable[..., threading.Thread]
 
 
+class ApplicationReadinessError(RuntimeError):
+    """The application listener started but did not become ready in time."""
+
+
 class ApplicationRuntime:
     """Own the shared HTTP/provider/worker lifecycle for one application.
 
@@ -93,7 +97,9 @@ class ApplicationRuntime:
         while time.monotonic() < self._deadline() and not ready():
             time.sleep(0.01)
         if time.monotonic() >= self._deadline():
-            raise RuntimeError("application HTTP listener did not become ready")
+            raise ApplicationReadinessError(
+                "application HTTP listener did not become ready"
+            )
 
     def admit_catalog(self) -> None:
         """Open provider admission after control verification and publication."""
@@ -107,15 +113,17 @@ class ApplicationRuntime:
         if self.http_thread is not None:
             self.http_thread.join()
 
-    def cleanup_start_failure(self) -> None:
-        """Close application resources after startup fails before admission."""
+    def cleanup_start_failure(self, deadline: float) -> bool:
+        """Close failed-start resources, retaining ownership if work remains."""
 
         self.catalog_admitted = False
+        listener_closed = True
+        workers_closed = False
         try:
             try:
                 self.workers.close_admission()
             except Exception:
-                pass
+                listener_closed = False
             if self.server is not None:
                 for cleanup in (
                     self.server.shutdown,
@@ -125,9 +133,14 @@ class ApplicationRuntime:
                     try:
                         cleanup()
                     except Exception:
-                        pass
+                        listener_closed = False
+            try:
+                workers_closed = self.workers.close(deadline)
+            except Exception:
+                workers_closed = False
         finally:
             self.catalog_admitted = False
+        return listener_closed and workers_closed
 
     def shutdown(self, deadline: float) -> bool:
         """Close listener and workers before lifecycle ownership is released."""
@@ -149,4 +162,4 @@ class ApplicationRuntime:
         return self.workers.close(deadline) and time.monotonic() < deadline
 
 
-__all__ = ["ApplicationRuntime"]
+__all__ = ["ApplicationReadinessError", "ApplicationRuntime"]
