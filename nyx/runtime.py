@@ -464,6 +464,17 @@ def _read_instance(
         raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
 
 
+def _read_live_instance(paths: state.StatePaths) -> tuple[Instance, _Metadata]:
+    """Read a live locator and retain its publication identity for the call."""
+
+    record_path = _record_path(paths)
+    snapshot = _record_snapshot(record_path)
+    instance = _read_instance(paths)
+    if not _record_unchanged(record_path, snapshot):
+        raise UnhealthyInstanceError("Nyx instance record changed")
+    return instance, snapshot
+
+
 def _write_instance(
     paths: state.StatePaths,
     instance: Instance,
@@ -1416,8 +1427,10 @@ def start() -> str:
         _require_deadline(deadline)
         lease = _lease_lock(paths, timeout=0.0, deadline=deadline)
         if not lease.acquire(blocking=False):
-            instance = _read_instance(paths)
+            instance, record_snapshot = _read_live_instance(paths)
             response = _send_control(instance, "status", deadline=deadline)
+            if not _record_unchanged(_record_path(paths), record_snapshot):
+                raise UnhealthyInstanceError("Nyx instance record changed")
             if response.get("status") != "ready" or response.get("url") != URL:
                 raise UnhealthyInstanceError("Nyx instance is unhealthy")
             return URL
@@ -1481,13 +1494,15 @@ def stop() -> str:
             lease.close()
             _remove_stale_instance(paths, deadline=deadline)
             return "stopped"
-        instance = _read_instance(paths)
+        instance, record_snapshot = _read_live_instance(paths)
         _send_control(
             instance,
             "stop",
             deadline=deadline,
             deadline_ns=deadline_ns,
         )
+        if not _record_unchanged(_record_path(paths), record_snapshot):
+            raise UnhealthyInstanceError("Nyx instance record changed")
     # Waiting does not mutate lifecycle state, so release the operation claim.
     # Public status can then authenticate the retained daemon while cleanup is
     # in progress.  Each terminal probe reacquires the claim before inspecting
@@ -1498,6 +1513,8 @@ def stop() -> str:
             if not operation.acquire(blocking=False):
                 time.sleep(0.03)
                 continue
+            if not _record_unchanged(_record_path(paths), record_snapshot):
+                raise UnhealthyInstanceError("Nyx instance record changed")
             probe = _lease_lock(paths, timeout=0.0, deadline=deadline)
             if probe.acquire(blocking=False):
                 probe.close()
