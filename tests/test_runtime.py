@@ -2508,6 +2508,8 @@ def test_observe_runtime_rejects_native_runtime_junction_before_outside_iteratio
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         paths, _, _ = _fixture(root)
+        paths.runtime_directory.joinpath("operation.lock").unlink()
+        paths.runtime_directory.joinpath("lease.lock").unlink()
         paths.runtime_directory.rmdir()
         external = root / "external"
         external.mkdir()
@@ -2520,22 +2522,48 @@ def test_observe_runtime_rejects_native_runtime_junction_before_outside_iteratio
             text=True,
         )
         assert completed.returncode == 0, completed.stderr
-        iterated: list[Path] = []
-        original_iterdir = Path.iterdir
+        assert paths.runtime_directory.is_junction()
+        outside_before = outside_claim.read_bytes()
+        outside_accesses: list[tuple[str, Path]] = []
+        original_scandir = runtime.NativeDirectory.scandir
+        original_open_file = runtime.NativeDirectory.open_file
+        original_probe = runtime.NativeClaim.probe
 
-        def record_iteration(path: Path):
-            iterated.append(path)
-            return original_iterdir(path)
+        def record_iteration(directory):
+            if directory.path == paths.runtime_directory:
+                outside_accesses.append(("iteration", directory.path))
+            return original_scandir(directory)
 
-        with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
-            state, "_current_uid", return_value=state._current_uid()
-        ), patch.object(Path, "iterdir", record_iteration):
-            observed = runtime.observe_runtime()
+        def record_read(directory, name):
+            if directory.path == paths.runtime_directory:
+                outside_accesses.append(("read", directory.path / name))
+            return original_open_file(directory, name)
+
+        def record_claim_probe(path: Path, *, dir_fd=None):
+            if path.parent == paths.runtime_directory:
+                outside_accesses.append(("claim", path))
+            return original_probe(path, dir_fd=dir_fd)
+
+        try:
+            with patch.object(
+                state, "resolve_account_home", return_value=paths.account_home
+            ), patch.object(
+                state, "_current_uid", return_value=state._current_uid()
+            ), patch.object(
+                runtime.NativeDirectory, "scandir", record_iteration
+            ), patch.object(
+                runtime.NativeDirectory, "open_file", record_read
+            ), patch.object(
+                runtime.NativeClaim, "probe", side_effect=record_claim_probe
+            ):
+                observed = runtime.observe_runtime()
+        finally:
+            paths.runtime_directory.rmdir()
 
         assert observed.status == "unknown"
         assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
-        assert paths.runtime_directory not in iterated
-        assert outside_claim.read_bytes() == b"outside"
+        assert outside_accesses == []
+        assert outside_claim.read_bytes() == outside_before
 
 
 def test_observe_runtime_reports_operation_contention_without_mutation():
