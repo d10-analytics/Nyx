@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nyx import desktop, runtime, state
+from nyx import _native_claim, desktop, runtime, state
 from nyx._native_claim import NativeClaim
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
@@ -231,32 +231,72 @@ def test_separate_process_reports_busy_without_writing_or_starting_runtime():
         with _home_patches(home)[0]:
             first = desktop.DesktopSession()
             paths = state.state_paths()
-            before = {
-                path.name: path.read_bytes() for path in paths.runtime_directory.iterdir()
-            }
-            environment = os.environ.copy()
-            environment["HOME"] = str(home)
-            environment["USERPROFILE"] = str(home)
-            environment.pop("PYTHONHOME", None)
-            result = subprocess.run(
-                [sys.executable, "-m", "nyx.desktop"],
-                cwd=Path(__file__).parents[1],
-                env=environment,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            lease_path = paths.runtime_directory / desktop.APPLICATION_CLAIM_FILENAME
+            recovery_path = paths.runtime_directory / desktop.RECOVERY_CLAIM_FILENAME
+            operation_path = paths.runtime_directory / "operation.lock"
+
+            def snapshot_readable_runtime_state():
+                details = operation_path.lstat()
+                return {
+                    operation_path.name: (
+                        _native_claim._identity(details),
+                        operation_path.read_bytes(),
+                    )
+                }
+
+            try:
+                lease_fd = first.claims.application.fd
+                recovery_fd = first.claims.recovery.fd
+                assert lease_fd is not None
+                assert recovery_fd is not None
+                lease_before = _native_claim._identity(os.fstat(lease_fd))
+                recovery_before = _native_claim._identity(os.fstat(recovery_fd))
+                runtime_names_before = {
+                    path.name for path in paths.runtime_directory.iterdir()
+                }
+                readable_before = snapshot_readable_runtime_state()
+
+                environment = os.environ.copy()
+                environment["HOME"] = str(home)
+                environment["USERPROFILE"] = str(home)
+                environment.pop("PYTHONHOME", None)
+                result = subprocess.run(
+                    [sys.executable, "-m", "nyx.desktop"],
+                    cwd=Path(__file__).parents[1],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                lease_after = _native_claim._identity(os.fstat(lease_fd))
+                recovery_after = _native_claim._identity(os.fstat(recovery_fd))
+                runtime_names_after = {
+                    path.name for path in paths.runtime_directory.iterdir()
+                }
+                readable_after = snapshot_readable_runtime_state()
+            finally:
+                first.close()
+
             assert result.returncode == 1
             assert result.stdout == ""
-            assert result.stderr.strip() == desktop.ALREADY_OPEN_MESSAGE
+            assert result.stderr == f"{desktop.ALREADY_OPEN_MESSAGE}\n"
             assert not paths.config_file.exists()
             assert not paths.runtime_directory.joinpath("instance.json").exists()
-            assert {
-                path.name: path.read_bytes() for path in paths.runtime_directory.iterdir()
-            } == before
-            first.close()
+            assert lease_after == lease_before
+            assert recovery_after == recovery_before
+            assert runtime_names_after == runtime_names_before
+            assert readable_after == readable_before
+            assert _native_claim._identity(lease_path.lstat()) == lease_before
+            assert _native_claim._identity(recovery_path.lstat()) == recovery_before
+            assert lease_path.read_bytes() == b"\0"
+            assert recovery_path.read_bytes() == b"\0"
+            assert NativeClaim.probe(lease_path) == "free"
+            assert NativeClaim.probe(recovery_path) == "free"
             second = desktop.DesktopSession()
-            second.close()
+            try:
+                assert second.claims.held
+            finally:
+                second.close()
 
 
 def test_unsafe_runtime_ancestry_is_unavailable_not_already_open():
