@@ -1577,38 +1577,97 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
 
 
 @pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])
-def test_live_locator_damage_never_authorizes_setup_replacement(damage):
+def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damage):
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", 0))
+    except PermissionError:
+        pytest.skip("sandbox does not permit local control sockets")
+    else:
+        capability_probe.close()
+
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
-        paths, _, first = _fixture(root)
-        second = root / "second-specification"
-        second.mkdir()
-        original = _write_runtime_record(paths)
+        paths, home, first = _fixture(root)
         record = paths.runtime_directory / "instance.json"
-        if damage == "absent":
-            record.unlink()
-        elif damage == "malformed":
-            record.write_bytes(b"not-json\n")
-        else:
-            _write_runtime_record(paths, instance_id="replacement", capability="foreign")
-        before = paths.config_file.read_bytes()
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        daemon_thread: threading.Thread | None = None
+        daemon: runtime._Daemon | None = None
+        original_bytes: bytes | None = None
+        damaged_bytes: bytes | None = None
         try:
-            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
-                runtime.ActiveInstanceError
-            ):
-                runtime.setup(second)
-        finally:
-            os.close(lease_fd)
-        assert paths.config_file.read_bytes() == before
-        assert state.load_configuration(paths).specification_root == first.resolve()
-        if damage == "absent":
+            with patch.object(runtime, "_paths", return_value=paths):
+                daemon = runtime._Daemon(
+                    lease_fd,
+                    int((time.monotonic() + 10) * 1_000_000_000),
+                )
+                daemon_thread = threading.Thread(target=daemon.run)
+                daemon_thread.start()
+                instance = _wait_for_record(paths)
+            original_bytes = record.read_bytes()
+            if damage == "absent":
+                record.unlink()
+                damaged_bytes = None
+            elif damage == "malformed":
+                damaged_bytes = b"not-json\n"
+                record.write_bytes(damaged_bytes)
+            else:
+                foreign_port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                foreign_port_socket.bind(("127.0.0.1", 0))
+                foreign_port = foreign_port_socket.getsockname()[1]
+                foreign_port_socket.close()
+                damaged = runtime.Instance(
+                    "replacement",
+                    runtime.URL,
+                    "foreign-capability",
+                    runtime._control_endpoint(foreign_port),
+                )
+                damaged_bytes = (
+                    json.dumps(damaged.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode()
+                record.write_bytes(damaged_bytes)
+            configuration_before = paths.config_file.read_bytes()
+            with patch.object(
+                runtime, "_paths", return_value=paths
+            ), patch.object(state, "resolve_account_home", return_value=home):
+                assert runtime.setup(first).specification_root == first.resolve()
+                assert paths.config_file.read_bytes() == configuration_before
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime.start()
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime.stop()
+            if damage == "absent":
+                assert not record.exists()
+            else:
+                assert record.read_bytes() == damaged_bytes
+            assert paths.config_file.read_bytes() == configuration_before
+            assert instance == daemon.instance
+
+            # Restore only the originally published locator so the real
+            # authenticated control path can terminate the still-live daemon.
+            assert original_bytes is not None
+            record.write_bytes(original_bytes)
+            with patch.object(
+                runtime, "_paths", return_value=paths
+            ), patch.object(state, "resolve_account_home", return_value=home):
+                assert runtime.stop() == "stopped"
             assert not record.exists()
-        elif damage == "malformed":
-            assert record.read_bytes() == b"not-json\n"
-        else:
-            assert runtime._read_instance(paths).instance_id == "replacement"
-        assert original.instance_id == "instance"
+            assert daemon_thread is not None
+            daemon_thread.join(timeout=5)
+            assert not daemon_thread.is_alive()
+        finally:
+            if daemon_thread is not None and daemon_thread.is_alive():
+                try:
+                    assert original_bytes is not None
+                    record.write_bytes(original_bytes)
+                    with patch.object(
+                        runtime, "_paths", return_value=paths
+                    ), patch.object(state, "resolve_account_home", return_value=home):
+                        runtime.stop()
+                except (OSError, runtime.RuntimeErrorBase):
+                    pass
+                daemon_thread.join(timeout=3)
+            os.close(lease_fd)
 
 
 def test_live_replaced_locator_is_rejected_before_start_authorization():
