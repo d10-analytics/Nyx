@@ -305,6 +305,25 @@ def test_owned_save_classifies_pre_replacement_failure_without_creating_first_re
             assert not paths.config_file.exists()
 
 
+def test_owned_save_omission_defaults_empty_then_preserves_existing_policy():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        third = isolated_root(root, "third")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            initial = state.save_configuration_owned(first, paths=paths)
+            assert initial.hidden_stages == ()
+            state.save_configuration_owned(second, ["Queue"], paths=paths)
+            preserved = state.save_configuration_owned(third, paths=paths)
+            assert preserved.hidden_stages == ("Queue",)
+            cleared = state.save_configuration_owned(first, [], paths=paths)
+            assert cleared.hidden_stages == ()
+
+
 def test_owned_save_classifies_post_replacement_verification_and_revalidation():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)

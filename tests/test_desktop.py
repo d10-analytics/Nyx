@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,9 +18,10 @@ from nyx._native_claim import NativeClaim
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 try:
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtTest, QtWidgets
 except ImportError as _qt_error:  # Linux source collection remains dependency-light.
     QtCore = None
+    QtTest = None
     QtWidgets = None
     if _NATIVE_REQUIRED:
         pytest.fail(
@@ -42,6 +46,109 @@ def _home_patches(home: Path):
     return patch.object(Path, "home", return_value=home), patch.object(
         state, "_current_uid", return_value=state._current_uid()
     )
+
+
+class _Signal:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self):
+        for callback in self._callbacks:
+            callback()
+
+
+class _Widget:
+    def __init__(self, *_):
+        self._enabled = True
+
+    def isEnabled(self):
+        return self._enabled
+
+    def setEnabled(self, enabled):
+        self._enabled = enabled
+
+
+class _MainWindow(_Widget):
+    def __init__(self, *_):
+        super().__init__()
+        self._visible = False
+
+    def setWindowTitle(self, _):
+        pass
+
+    def resize(self, *_):
+        pass
+
+    def setCentralWidget(self, _):
+        pass
+
+    def show(self):
+        self._visible = True
+
+    def close(self):
+        event = SimpleNamespace(accept=lambda: None)
+        self.closeEvent(event)
+        self._visible = False
+
+
+class _LineEdit(_Widget):
+    def __init__(self, *_):
+        super().__init__()
+        self._text = ""
+
+    def setText(self, value):
+        self._text = value
+
+    def text(self):
+        return self._text
+
+
+class _Label(_LineEdit):
+    def setWordWrap(self, _):
+        pass
+
+
+class _Button(_Widget):
+    def __init__(self, *_):
+        super().__init__()
+        self.clicked = _Signal()
+
+    def click(self):
+        if self.isEnabled():
+            self.clicked.emit()
+
+
+class _Layout:
+    def __init__(self, *_):
+        pass
+
+    def addRow(self, *_):
+        pass
+
+    def addWidget(self, *_):
+        pass
+
+    def addLayout(self, *_):
+        pass
+
+
+def _fake_qt():
+    return {
+        "QtCore": SimpleNamespace(),
+        "QtWidgets": SimpleNamespace(
+            QFormLayout=_Layout,
+            QHBoxLayout=_Layout,
+            QLabel=_Label,
+            QLineEdit=_LineEdit,
+            QMainWindow=_MainWindow,
+            QPushButton=_Button,
+            QVBoxLayout=_Layout,
+            QWidget=_Widget,
+        ),
+    }
 
 
 def test_module_import_does_not_require_qt(monkeypatch):
@@ -117,14 +224,36 @@ def test_competing_legacy_setup_cannot_mutate_while_desktop_claim_is_held():
             assert state.load_configuration().specification_root == second.resolve()
 
 
-def test_second_process_reports_busy_only_for_held_application_claim():
+def test_separate_process_reports_busy_without_writing_or_starting_runtime():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
         with _home_patches(home)[0]:
             first = desktop.DesktopSession()
-            with pytest.raises(desktop.AlreadyOpenError, match="already open"):
-                desktop.DesktopSession()
+            paths = state.state_paths()
+            before = {
+                path.name: path.read_bytes() for path in paths.runtime_directory.iterdir()
+            }
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["USERPROFILE"] = str(home)
+            environment.pop("PYTHONHOME", None)
+            result = subprocess.run(
+                [sys.executable, "-m", "nyx.desktop"],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 1
+            assert result.stdout == ""
+            assert result.stderr.strip() == desktop.ALREADY_OPEN_MESSAGE
+            assert not paths.config_file.exists()
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+            assert {
+                path.name: path.read_bytes() for path in paths.runtime_directory.iterdir()
+            } == before
             first.close()
             second = desktop.DesktopSession()
             second.close()
@@ -217,6 +346,145 @@ def test_malformed_configuration_is_unavailable_and_cannot_be_overwritten_by_cho
             session.close()
 
 
+def test_configured_shell_change_action_saves_replacement_and_preserves_policy():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+            assert window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._root.isEnabled()
+
+            window._change.click()
+            assert not window._change.isEnabled()
+            assert window._save.isEnabled()
+            assert window._root.isEnabled()
+            window._root.setText(str(second))
+            window._save.click()
+
+            assert state.load_configuration() == state.Configuration(
+                second.resolve(), ("Queue",)
+            )
+            assert window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._root.isEnabled()
+            window._quit.click()
+            assert not session.claims.held
+
+
+def test_shell_pre_replacement_failure_preserves_prior_bytes_and_retry_state():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+            window._change.click()
+            window._root.setText(str(second))
+
+            with patch.object(state.os, "replace", side_effect=OSError("injected")):
+                window._save.click()
+
+            assert paths.config_file.read_bytes() == before
+            assert window._status.text() == "Nyx workspace could not be saved"
+            assert window._save.isEnabled()
+            assert not window._change.isEnabled()
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+            window._quit.click()
+            assert paths.config_file.read_bytes() == before
+
+
+def test_shell_post_replacement_failure_blocks_change_until_revalidation():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
+            paths = state.state_paths()
+            original_verify = state._verify_record
+            replacement_failed = False
+            allow_revalidation = False
+
+            def fail_until_revalidation_allowed(path):
+                nonlocal replacement_failed
+                details = original_verify(path)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    path == paths.config_file
+                    and payload["specification_root"] == str(second.resolve())
+                    and (not replacement_failed or not allow_revalidation)
+                ):
+                    replacement_failed = True
+                    raise OSError("injected post-replacement verification failure")
+                return details
+
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+            window._change.click()
+            window._root.setText(str(second))
+            with patch.object(
+                state, "_verify_record", side_effect=fail_until_revalidation_allowed
+            ):
+                window._save.click()
+                committed = paths.config_file.read_bytes()
+                assert json.loads(committed)["specification_root"] == str(second.resolve())
+                assert json.loads(committed)["hidden_stages"] == ["Queue"]
+                assert window._status.text() == "Nyx configuration was saved but is unverified"
+                assert not window._change.isEnabled()
+                assert not window._save.isEnabled()
+                assert not window._root.isEnabled()
+                assert window._retry.isEnabled()
+                window._change.click()
+                assert paths.config_file.read_bytes() == committed
+                window._retry.click()
+                assert session.snapshot.status == "unavailable"
+                assert session.unverified
+                assert window._status.text() == "Nyx configuration remains unavailable"
+                assert not window._save.isEnabled()
+                assert window._retry.isEnabled()
+                allow_revalidation = True
+                window._retry.click()
+
+            assert session.snapshot.status == "configured"
+            assert not session.unverified
+            assert window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._retry.isEnabled()
+            assert window._root.text() == str(second.resolve())
+            assert not paths.runtime_directory.joinpath("instance.json").exists()
+            window._quit.click()
+            assert paths.config_file.read_bytes() == committed
+
+
+def test_unavailable_shell_disables_change_save_and_revalidation():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        with _home_patches(home)[0]:
+            paths = state.state_paths(create=True)
+            paths.config_file.write_text("not json\n", encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._root.isEnabled()
+            assert not window._retry.isEnabled()
+            window._quit.click()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
     with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
@@ -228,30 +496,83 @@ def test_qt_is_optional_for_linux_source_collection():
     QtWidgets is None or not _NATIVE_REQUIRED,
     reason="required native session lane is not enabled",
 )
-def test_required_native_session_renders_and_delivers_close_event():
+def test_required_native_session_activates_existing_configured_shell_and_closes():
     if _NATIVE_REQUIRED and os.environ.get("QT_QPA_PLATFORM", "").lower() in {
         "offscreen",
         "minimal",
         "minimalegl",
     }:
         pytest.fail("required native desktop lane cannot use an offscreen Qt platform")
+    expected_host = os.environ.get("NYX_EXPECTED_NATIVE_HOST")
+    if expected_host == "windows-2025":
+        assert sys.platform == "win32"
+    elif expected_host == "macos-15":
+        assert sys.platform == "darwin"
+    else:
+        pytest.fail("required native desktop lane did not identify its hosted runner")
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
         with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
             session = desktop.DesktopSession()
             application = QtWidgets.QApplication.instance()
             owns_application = application is None
             if application is None:
                 application = QtWidgets.QApplication([])
-            window = desktop._build_window(
-                {"QtCore": QtCore, "QtWidgets": QtWidgets}, session
-            )
+            window = desktop._build_window({"QtCore": QtCore, "QtWidgets": QtWidgets}, session)
+            claims_identity = id(session.claims)
             window.show()
             application.processEvents()
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+            application.processEvents()
+            assert state.load_configuration() == state.Configuration(
+                second.resolve(), ("Queue",)
+            )
+
+            handle = window.windowHandle()
+            assert handle is not None
+            window.raise_()
+            window.activateWindow()
+            handle.requestActivate()
+            for _ in range(20):
+                application.processEvents()
+                QtTest.QTest.qWait(25)
+                if window.isActiveWindow():
+                    break
+            capabilities = {
+                "active_window": window.isActiveWindow(),
+                "application_state": int(application.applicationState().value),
+                "host": expected_host,
+                "image_os": os.environ.get("ImageOS"),
+                "image_version": os.environ.get("ImageVersion"),
+                "platform": application.platformName(),
+                "pyside_version": QtCore.__version__,
+                "qt_version": QtCore.qVersion(),
+                "screens": len(application.screens()),
+                "source_sha": os.environ.get("GITHUB_SHA"),
+                "visible": window.isVisible(),
+            }
             assert window.isVisible()
+            assert window.isActiveWindow()
+            assert (
+                application.applicationState()
+                == QtCore.Qt.ApplicationState.ApplicationActive
+            )
+            assert id(session.claims) == claims_identity
+            assert session.claims.held
             window.close()
             application.processEvents()
+            capabilities["close_delivered"] = not session.claims.held and not window.isVisible()
+            print(f"NYX_NATIVE_DESKTOP_CAPABILITIES={json.dumps(capabilities, sort_keys=True)}")
             assert not session.claims.held
+            assert not window.isVisible()
+            assert state.load_configuration() == state.Configuration(
+                second.resolve(), ("Queue",)
+            )
             if owns_application:
                 application.quit()
