@@ -87,6 +87,20 @@ def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stag
             session.close()
 
 
+def test_replacing_workspace_without_policy_input_preserves_hidden_stages():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
+            session = desktop.DesktopSession()
+            session.choose_workspace(second)
+            assert state.load_configuration().hidden_stages == ("Queue",)
+            session.close()
+
+
 def test_competing_legacy_setup_cannot_mutate_while_desktop_claim_is_held():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
