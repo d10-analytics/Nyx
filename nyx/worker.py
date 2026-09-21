@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import select
 import subprocess
 import sys
 import threading
@@ -35,6 +34,11 @@ class _ParentLossObserver:
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
+        # Python 3.12 supports non-blocking anonymous pipes on every supported
+        # Nyx platform, including Windows.  Keeping the read non-blocking lets
+        # normal worker completion stop and join this observer without closing
+        # a descriptor out from under a blocking read in another thread.
+        os.set_blocking(self.fd, False)
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._observe,
@@ -49,15 +53,10 @@ class _ParentLossObserver:
         try:
             while not self._stop.is_set():
                 try:
-                    readable, _, _ = select.select([self.fd], [], [], 0.1)
-                except (OSError, ValueError):
-                    # Windows pipes are not select()-able.  A blocking read is
-                    # safe there because stop is only used during process exit.
-                    readable = [self.fd]
-                if not readable:
+                    data = os.read(self.fd, 1)
+                except BlockingIOError:
+                    self._stop.wait(0.05)
                     continue
-                try:
-                    data = getattr(os, "read")(self.fd, 1)
                 except OSError:
                     return
                 if not data and not self._stop.is_set():
@@ -70,10 +69,7 @@ class _ParentLossObserver:
 
     def close(self) -> None:
         self._stop.set()
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
+        self._thread.join()
 
 
 def _receive_worker_inheritance(
