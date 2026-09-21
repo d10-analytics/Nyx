@@ -198,6 +198,39 @@ def test_replacement_holds_application_but_blocks_save_and_start_until_recovery_
             session.close()
 
 
+def test_desktop_starts_shared_runtime_with_worker_only_inheritance():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            observed = {}
+
+            class FakeApplicationRuntime:
+                def __init__(self, **kwargs):
+                    observed.update(kwargs)
+
+                def start(self, *, static_ready=None):
+                    assert static_ready is not None and static_ready()
+
+                def admit_catalog(self):
+                    observed["admitted"] = True
+
+                def shutdown(self, _deadline):
+                    return True
+
+            with patch.object(desktop, "ApplicationRuntime", FakeApplicationRuntime):
+                session = desktop.DesktopSession()
+                application = session.start_runtime(static_ready=lambda: True)
+                assert isinstance(application, FakeApplicationRuntime)
+                workers = observed["workers"]
+                assert workers._recovery_claim is session.claims.recovery
+                assert workers._parent_liveness_fd == session.claims.parent_liveness_read
+                assert observed["admitted"]
+                session.close()
+
+
 def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stages():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
