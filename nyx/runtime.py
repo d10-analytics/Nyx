@@ -958,6 +958,8 @@ class _Daemon:
         self.paths = _paths(create=True, deadline_ns=deadline_ns)
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
+        self.shutdown_deadline_lock = threading.Lock()
+        self.shutdown_deadline = 0.0
         self.shutdown_done = threading.Event()
         self.application = ApplicationRuntime(
             port=PORT,
@@ -1026,6 +1028,19 @@ class _Daemon:
 
         if self.control is None:
             return
+        wakeup: socket.socket | None = None
+        try:
+            wakeup = socket.socket(
+                self.control.family,
+                self.control.type,
+                self.control.proto,
+            )
+            wakeup.settimeout(0.05)
+            wakeup.connect(self.control.getsockname())
+        except (AttributeError, OSError, TypeError, ValueError):
+            if wakeup is not None:
+                wakeup.close()
+            wakeup = None
         shutdown = getattr(self.control, "shutdown", None)
         if shutdown is not None:
             try:
@@ -1038,6 +1053,19 @@ class _Daemon:
             # close() releases the Python-owned descriptor even when the
             # platform reports a close error.
             pass
+        if wakeup is not None:
+            wakeup.close()
+
+    def _extend_shutdown_deadline(self, deadline: float) -> float:
+        """Publish the latest authenticated cleanup deadline to its owner."""
+
+        with self.shutdown_deadline_lock:
+            self.shutdown_deadline = max(self.shutdown_deadline, deadline)
+            return self.shutdown_deadline
+
+    def _current_shutdown_deadline(self) -> float:
+        with self.shutdown_deadline_lock:
+            return self.shutdown_deadline
 
     def _static_ready(self) -> bool:
         return self.application._static_ready()
@@ -1173,31 +1201,39 @@ class _Daemon:
                     _record_path(self.paths).unlink()
             except OSError:
                 pass
-            self._close_control()
             completed = True
+            self.shutdown_result = "stopped"
+            self._close_control()
         finally:
             if completed:
                 self.shutdown_result = "stopped"
                 self.shutdown_done.set()
 
     def shutdown(self, deadline: float | None = None) -> str:
+        requested_deadline = (
+            time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
+        )
+        self._extend_shutdown_deadline(requested_deadline)
         try:
             with self.shutdown_lock:
                 if self.shutdown_result not in {"running", "timeout"}:
                     return self.shutdown_result
-                deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
-                if time.monotonic() >= deadline:
-                    self.shutdown_result = "timeout"
-                    return self.shutdown_result
                 self.stop_requested.set()
-                if not self.application.shutdown(deadline):
-                    self.shutdown_result = "timeout"
-                    return self.shutdown_result
+                while True:
+                    active_deadline = self._current_shutdown_deadline()
+                    if time.monotonic() >= active_deadline:
+                        self.shutdown_result = "timeout"
+                        return self.shutdown_result
+                    if self.application.shutdown(active_deadline):
+                        break
+                    if self._current_shutdown_deadline() <= active_deadline:
+                        self.shutdown_result = "timeout"
+                        return self.shutdown_result
                 try:
                     if self.published_record is not None and _record_unchanged(
                         _record_path(self.paths), self.published_record
                     ):
-                        _require_deadline(deadline)
+                        _require_deadline(active_deadline)
                         _record_path(self.paths).unlink()
                 except (OSError, _ControlTimeoutError):
                     self.shutdown_result = "timeout"
@@ -1206,11 +1242,11 @@ class _Daemon:
                 # allow the shared deadline to turn that committed transition
                 # back into an incomplete result with no public retry path.
                 # Listener closure is the other half of the same transition.
-                # On Linux, close() alone does not reliably wake an accept()
-                # blocked in another thread.  Wake it first so terminal control
-                # cleanup does not consume the caller's remaining deadline.
-                self._close_control()
+                # Closing or shutting down a listening socket does not wake a
+                # blocked accept() consistently on every host.  Publish the
+                # terminal state and wake it before joining the control thread.
                 self.shutdown_result = "stopped"
+                self._close_control()
                 # Closing the listener and publishing the terminal state must
                 # precede joining this thread.  During an incomplete cleanup
                 # the thread is the authenticated retry consumer, so joining
@@ -1218,7 +1254,9 @@ class _Daemon:
                 # retry budget waiting for a thread that is required to stay
                 # alive until this exact terminal point.
                 if self.control_thread is not None:
-                    self.control_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                    self.control_thread.join(
+                        timeout=max(0.0, active_deadline - time.monotonic())
+                    )
                 return self.shutdown_result
         finally:
             self.shutdown_done.set()
