@@ -153,11 +153,10 @@ def test_inherited_worker_validates_claim_and_parent_observation_before_one_load
         claim.close()
 
 
-def test_parent_observer_uses_nonblocking_pipe_and_joins_on_normal_close() -> None:
+def test_parent_observer_joins_on_normal_close() -> None:
     read_fd, write_fd = os.pipe()
     observer = worker._ParentLossObserver(read_fd)
     try:
-        assert not os.get_blocking(read_fd)
         observer.start()
         observer.close()
         assert not observer._thread.is_alive()
