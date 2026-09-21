@@ -786,6 +786,7 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
         contender.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM-resistant worker proof")
 def test_failed_start_cleanup_retains_resistant_worker_until_later_completion():
     with TemporaryDirectory() as temporary:
         marker = Path(temporary) / "worker-ready"
