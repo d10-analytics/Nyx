@@ -2344,6 +2344,77 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         _assert_claim_available(paths.runtime_directory / "lease.lock")
 
 
+def test_public_stop_does_not_accept_absence_while_original_lease_remains_held():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+
+        def remove_without_releasing(instance, command, **_kwargs):
+            assert instance == original
+            assert command == "stop"
+            record.unlink()
+            return {
+                "status": "stopping",
+                "instance_id": original.instance_id,
+                "url": runtime.URL,
+            }
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=remove_without_releasing
+            ), patch.object(runtime, "SHUTDOWN_TIMEOUT", 0.05), pytest.raises(
+                runtime.UnhealthyInstanceError, match="record changed"
+            ):
+                runtime.stop()
+            contender = runtime._lease_lock(paths, timeout=0.0)
+            assert not contender.acquire(blocking=False)
+            contender.close()
+        finally:
+            os.close(lease_fd)
+        assert not record.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits held-path replacement")
+def test_public_stop_rejects_replacement_of_original_terminal_lease_object():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, _, _ = _fixture(root)
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        lease_path = paths.runtime_directory / "lease.lock"
+        lease_fd = _transferred_claim_fd(lease_path)
+        replacement = root / "replacement-lease.lock"
+        replacement.write_bytes(b"replacement")
+
+        def substitute_terminal_lease(instance, command, **_kwargs):
+            nonlocal lease_fd
+            assert instance == original
+            assert command == "stop"
+            record.unlink()
+            os.replace(replacement, lease_path)
+            os.close(lease_fd)
+            lease_fd = -1
+            return {
+                "status": "stopping",
+                "instance_id": original.instance_id,
+                "url": runtime.URL,
+            }
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=substitute_terminal_lease
+            ), pytest.raises(runtime.UnhealthyInstanceError, match="lifetime lease changed"):
+                runtime.stop()
+        finally:
+            if lease_fd >= 0:
+                os.close(lease_fd)
+        assert not record.exists()
+        assert lease_path.read_bytes() == b"replacement"
+        _assert_claim_available(lease_path)
+
+
 @pytest.mark.parametrize(
     ("control", "label"),
     [
