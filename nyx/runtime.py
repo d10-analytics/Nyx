@@ -1021,6 +1021,24 @@ class _Daemon:
             raise StartupError("Nyx control endpoint is already occupied") from None
         return control
 
+    def _close_control(self) -> None:
+        """Wake a blocked control accept before releasing the listener."""
+
+        if self.control is None:
+            return
+        shutdown = getattr(self.control, "shutdown", None)
+        if shutdown is not None:
+            try:
+                shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            self.control.close()
+        except OSError:
+            # close() releases the Python-owned descriptor even when the
+            # platform reports a close error.
+            pass
+
     def _static_ready(self) -> bool:
         return self.application._static_ready()
 
@@ -1155,11 +1173,7 @@ class _Daemon:
                     _record_path(self.paths).unlink()
             except OSError:
                 pass
-            if self.control is not None:
-                try:
-                    self.control.close()
-                except OSError:
-                    pass
+            self._close_control()
             completed = True
         finally:
             if completed:
@@ -1192,14 +1206,10 @@ class _Daemon:
                 # allow the shared deadline to turn that committed transition
                 # back into an incomplete result with no public retry path.
                 # Listener closure is the other half of the same transition.
-                if self.control is not None:
-                    try:
-                        self.control.close()
-                    except OSError:
-                        # socket.close() releases the Python-owned descriptor
-                        # even when the platform reports a close error.  Once
-                        # the locator is gone, retry is no longer representable.
-                        pass
+                # On Linux, close() alone does not reliably wake an accept()
+                # blocked in another thread.  Wake it first so terminal control
+                # cleanup does not consume the caller's remaining deadline.
+                self._close_control()
                 self.shutdown_result = "stopped"
                 # Closing the listener and publishing the terminal state must
                 # precede joining this thread.  During an incomplete cleanup
