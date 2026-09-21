@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -150,6 +151,53 @@ def test_inherited_worker_validates_claim_and_parent_observation_before_one_load
         assert stdout.buffer.writes == [b"exact bytes"]
         assert claim.held
         claim.close()
+
+
+def test_parent_observer_uses_nonblocking_pipe_and_joins_on_normal_close() -> None:
+    read_fd, write_fd = os.pipe()
+    observer = worker._ParentLossObserver(read_fd)
+    try:
+        assert not os.get_blocking(read_fd)
+        observer.start()
+        observer.close()
+        assert not observer._thread.is_alive()
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        os.close(write_fd)
+
+
+def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        environment = {"HOME": str(home), "USERPROFILE": str(home)}
+        with patch.dict(os.environ, environment):
+            state.setup(workspace)
+            paths = state.state_paths()
+            claim = NativeClaim(paths.runtime_directory / "recovery.lock")
+            assert claim.acquire(blocking=False)
+            read_fd, write_fd = os.pipe()
+            manager = worker.CatalogWorkerManager(
+                timeout=2,
+                recovery_claim=claim,
+                recovery_path=claim.path,
+                parent_liveness_fd=read_fd,
+            )
+            try:
+                catalog = json.loads(manager.fetch_catalog())
+                assert catalog["schema_version"] == 4
+                assert manager.close(time.monotonic() + 2)
+                assert manager.active_count == 0
+                assert claim.held
+            finally:
+                manager.close(time.monotonic() + 2)
+                os.close(write_fd)
+                os.close(read_fd)
+                claim.close()
 
 
 def test_partial_inherited_worker_objects_are_rejected_without_loading_config() -> None:
