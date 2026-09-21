@@ -621,9 +621,14 @@ def revalidate_configuration(paths: StatePaths | None = None) -> Configuration:
     """Reload a committed record through the state owner's validation path."""
 
     selected = state_paths() if paths is None else paths
-    before = _verify_record(selected.config_file)
-    configuration = load_configuration(selected)
-    after = _verify_record(selected.config_file)
+    try:
+        before = _verify_record(selected.config_file)
+        configuration = load_configuration(selected)
+        after = _verify_record(selected.config_file)
+    except StateError:
+        raise
+    except (OSError, ValueError) as error:
+        raise ConfigurationError("Nyx configuration could not be revalidated") from error
     if _record_identity(before) != _record_identity(after):
         raise ConfigurationError("Nyx configuration changed during validation")
     return configuration
