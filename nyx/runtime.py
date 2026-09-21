@@ -1164,6 +1164,7 @@ class _Daemon:
         finally:
             if completed:
                 self.shutdown_result = "stopped"
+                self.shutdown_done.set()
 
     def shutdown(self, deadline: float | None = None) -> str:
         try:
@@ -1224,11 +1225,15 @@ class _Daemon:
         finally:
             if completed and self.stop_requested.is_set():
                 self.shutdown_done.wait()
-            if self.shutdown_result == "timeout":
-                # Ownership stays with this daemon while direct-child cleanup
-                # or connection shutdown is unresolved.
-                while self.shutdown_result == "timeout":
-                    time.sleep(1.0)
+            # Ownership stays with this daemon while direct-child cleanup or
+            # connection shutdown is unresolved.  A retained control request
+            # signals each later cleanup attempt, so wait for that state change
+            # instead of delaying lease release behind a polling interval that
+            # can outlive the retrying caller's shared deadline.
+            while self.shutdown_result == "timeout":
+                self.shutdown_done.clear()
+                if self.shutdown_result == "timeout":
+                    self.shutdown_done.wait()
             try:
                 os.close(self.lease_fd)
             except OSError:
