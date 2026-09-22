@@ -107,6 +107,18 @@ class ApplicationRuntime:
         self._require_deadline()
         self.catalog_admitted = True
 
+    def board_url(self) -> str:
+        """Return the loopback board URL, available only after admission.
+
+        A caller must not navigate a presentation surface before the owned
+        runtime has opened catalog admission, so the accessor refuses to
+        produce a URL while admission is closed (including after cleanup).
+        """
+
+        if not self.catalog_admitted:
+            raise RuntimeError("catalog is not admitted")
+        return f"http://127.0.0.1:{self.port}/"
+
     def wait(self) -> None:
         """Wait for the application listener to finish serving."""
 

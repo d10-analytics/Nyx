@@ -26,6 +26,9 @@ APPLICATION_CLAIM_FILENAME = "lease.lock"
 RECOVERY_CLAIM_FILENAME = "recovery.lock"
 ALREADY_OPEN_MESSAGE = "Nyx is already open"
 UNAVAILABLE_MESSAGE = "Nyx is unavailable"
+BOARD_FAILURE_MESSAGE = "Nyx board could not be displayed; retry"
+PRESENTATION_PROFILE_NAME = "nyx-presentation"
+PRESENTATION_DIRECTORY = "presentation"
 
 
 class DesktopError(RuntimeError):
@@ -596,17 +599,24 @@ def _load_qt() -> dict[str, Any]:
     """Load Qt only for the GUI entry, never during ordinary package import."""
 
     try:
-        from PySide6 import QtCore, QtWidgets
+        from PySide6 import QtCore, QtWebEngineCore, QtWebEngineWidgets, QtWidgets
     except ImportError as error:  # pragma: no cover - host dependency selection
         raise DesktopDependencyError(
-            "PySide6 is required; install the nyx[desktop] extra"
+            "PySide6 with QtWebEngine is required; install the nyx[desktop] extra"
         ) from error
-    return {"QtCore": QtCore, "QtWidgets": QtWidgets}
+    return {
+        "QtCore": QtCore,
+        "QtWidgets": QtWidgets,
+        "QtWebEngineCore": QtWebEngineCore,
+        "QtWebEngineWidgets": QtWebEngineWidgets,
+    }
 
 
 def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
     QtCore = qt["QtCore"]
     QtWidgets = qt["QtWidgets"]
+    QtWebEngineCore = qt["QtWebEngineCore"]
+    QtWebEngineWidgets = qt["QtWebEngineWidgets"]
 
     class DesktopWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
@@ -614,6 +624,8 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self.setWindowTitle("Nyx")
             self.resize(720, 460)
             self._session = session
+            self._board_failed = False
+            self._board_opened = False
             self._root = QtWidgets.QLineEdit(self)
             self._status = QtWidgets.QLabel(self)
             self._status.setWordWrap(True)
@@ -641,11 +653,78 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             layout.addWidget(self._status)
             layout.addLayout(form)
             layout.addLayout(actions)
+            self._profile = self._presentation_profile()
+            self._board = QtWebEngineWidgets.QWebEngineView(self)
+            self._page = QtWebEngineCore.QWebEnginePage(self._profile, self._board)
+            self._board.setPage(self._page)
+            self._board.loadFinished.connect(self._board_load_finished)
+            layout.addWidget(self._board)
             self.setCentralWidget(body)
             self._render()
 
+        def _presentation_profile(self) -> Any:
+            """Return the persistent presentation profile for this account.
+
+            The board's compact preference lives in page storage only; the
+            profile keeps that storage under the account state directory so a
+            normal reopen observes the same value.  This introduces no new
+            configuration authority and no account-level mutation.
+            """
+
+            presentation = self._session.paths.state_directory / PRESENTATION_DIRECTORY
+            presentation.mkdir(parents=True, exist_ok=True)
+            profile = QtWebEngineCore.QWebEngineProfile(PRESENTATION_PROFILE_NAME)
+            profile.setPersistentStoragePath(str(presentation))
+            profile.setCachePath(str(presentation / "cache"))
+            return profile
+
+        def _open_board(self) -> bool:
+            """Navigate to the board only from the admitted, owned runtime."""
+
+            board = getattr(self, "_board", None)
+            if board is None or not self._session.claims.held:
+                return False
+            application = self._session.runtime
+            accessor = getattr(application, "board_url", None)
+            if not callable(accessor):
+                return False
+            try:
+                url = accessor()
+            except RuntimeError:
+                return False
+            self._board_failed = False
+            self._board_opened = True
+            board.setUrl(QtCore.QUrl(url))
+            return True
+
+        def _board_load_finished(self, ok: bool) -> None:
+            if ok or self._board_failed:
+                return
+            if self._session.runtime is None:
+                return
+            self._board_failed = True
+            self._settle_board_failure()
+
+        def _settle_board_failure(self) -> None:
+            """Reap admitted work through the shared owner, retrying if needed."""
+
+            self._session.close()
+            if self._session.shutdown_blocked:
+                self._render()
+                return
+            self.close()
+
         def _render(self) -> None:
             snapshot = self._session.snapshot
+            if self._board_failed:
+                self._status.setText(
+                    self._session.pending_error or BOARD_FAILURE_MESSAGE
+                )
+                self._root.setEnabled(False)
+                self._change.setEnabled(False)
+                self._save.setEnabled(False)
+                self._retry.setEnabled(True)
+                return
             if snapshot.status == "configured" and snapshot.configuration is not None:
                 if not self._changing:
                     self._root.setText(str(snapshot.configuration.specification_root))
@@ -706,9 +785,14 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._status.setText(str(error))
             else:
                 self._changing = False
+                if not self._board_opened:
+                    self._open_board()
             self._render()
 
         def _revalidate(self) -> None:
+            if self._board_failed:
+                self._settle_board_failure()
+                return
             try:
                 if self._session.switch_retryable:
                     self._session.retry_workspace_switch()
@@ -726,6 +810,8 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._status.setText(str(error))
             else:
                 self._changing = False
+                if not self._board_opened:
+                    self._open_board()
             self._render()
 
         def closeEvent(self, event: Any) -> None:
@@ -774,6 +860,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
         window = _build_window(qt, session)
         window.show()
+        window._open_board()
         if not owns_application:
             return 0
         return int(application.exec())
