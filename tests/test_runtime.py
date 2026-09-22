@@ -2344,6 +2344,101 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         _assert_claim_available(paths.runtime_directory / "lease.lock")
 
 
+def test_public_stop_accepts_record_disappearance_during_terminal_snapshot():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        original_read_bytes = Path.read_bytes
+        terminal_read = False
+
+        def acknowledge_stop(instance, command, **_kwargs):
+            nonlocal terminal_read
+            assert instance == original
+            assert command == "stop"
+            terminal_read = True
+            return {
+                "status": "stopping",
+                "instance_id": original.instance_id,
+                "url": runtime.URL,
+            }
+
+        def remove_during_read(path):
+            nonlocal lease_fd, terminal_read
+            if path == record and terminal_read:
+                terminal_read = False
+                record.unlink()
+                os.close(lease_fd)
+                lease_fd = -1
+            return original_read_bytes(path)
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=acknowledge_stop
+            ), patch.object(Path, "read_bytes", remove_during_read):
+                assert runtime.stop() == "stopped"
+        finally:
+            if lease_fd >= 0:
+                os.close(lease_fd)
+        assert not record.exists()
+        _assert_claim_available(paths.runtime_directory / "lease.lock")
+
+
+def test_public_stop_waits_directly_for_original_lease_after_terminal_absence():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        original = _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        original_existing_lock = runtime._ExistingLock
+        blocking_wait_started = threading.Event()
+        release_thread = None
+
+        class ObservedExistingLock(original_existing_lock):
+            def acquire(self, *, blocking=False, deadline=None):
+                if blocking:
+                    blocking_wait_started.set()
+                return super().acquire(blocking=blocking, deadline=deadline)
+
+        def complete_terminal_record_removal(instance, command, **_kwargs):
+            nonlocal lease_fd, release_thread
+            assert instance == original
+            assert command == "stop"
+            record.unlink()
+
+            def release_original_lease():
+                nonlocal lease_fd
+                if blocking_wait_started.wait(timeout=1):
+                    os.close(lease_fd)
+                    lease_fd = -1
+
+            release_thread = threading.Thread(target=release_original_lease)
+            release_thread.start()
+            return {
+                "status": "stopping",
+                "instance_id": original.instance_id,
+                "url": runtime.URL,
+            }
+
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control", side_effect=complete_terminal_record_removal
+            ), patch.object(runtime, "_ExistingLock", ObservedExistingLock), patch.object(
+                runtime, "SHUTDOWN_TIMEOUT", 0.2
+            ):
+                assert runtime.stop() == "stopped"
+        finally:
+            if release_thread is not None:
+                release_thread.join(timeout=2)
+            if lease_fd >= 0:
+                os.close(lease_fd)
+        assert blocking_wait_started.is_set()
+        assert release_thread is not None and not release_thread.is_alive()
+        assert not record.exists()
+        _assert_claim_available(paths.runtime_directory / "lease.lock")
+
+
 def test_public_stop_does_not_accept_absence_while_original_lease_remains_held():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
