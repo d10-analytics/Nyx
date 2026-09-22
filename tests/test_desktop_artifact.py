@@ -14,7 +14,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -128,7 +127,7 @@ def _write_configuration(
     hidden_stages: tuple[str, ...] = _DELIVERED_HIDDEN_STAGES,
 ) -> Path:
     config_directory = home / ".nyx" / "config"
-    config_directory.mkdir(parents=True)
+    config_directory.mkdir(parents=True, exist_ok=True)
     config_file = config_directory / "config.json"
     payload = {
         "schema_version": state.CONFIG_SCHEMA_VERSION,
@@ -139,6 +138,14 @@ def _write_configuration(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     config_file.write_bytes(encoded)
+    return config_file
+
+
+def _write_raw_configuration(home: Path, payload: bytes) -> Path:
+    config_directory = home / ".nyx" / "config"
+    config_directory.mkdir(parents=True, exist_ok=True)
+    config_file = config_directory / "config.json"
+    config_file.write_bytes(payload)
     return config_file
 
 
@@ -198,12 +205,24 @@ class _RunningGui:
         except OSError:
             return "<no application log>"
 
-    def close(self, timeout: float = 30.0) -> int:
-        """Request the ordinary native close or quit, then require an exit."""
+    def close(self, timeout: float = 30.0, method: str = "quit") -> int:
+        """Request the ordinary native close or quit, then require an exit.
+
+        The window close and the explicit Quit share one visible, retryable
+        shutdown.  Each platform exposes the triggers it actually offers: a
+        window-manager close on Windows and either an application close or a
+        quit on macOS.  Both must reach the same owned cleanup.
+        """
 
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/PID", str(self.process.pid)],
+                capture_output=True,
+                check=False,
+            )
+        elif method == "close":
+            subprocess.run(
+                ["osascript", "-e", 'tell application "Nyx" to close window 1'],
                 capture_output=True,
                 check=False,
             )
@@ -253,20 +272,49 @@ def test_delivered_artifact_carries_application_worker_and_resources(artifact: A
     assert artifact.resource.read_bytes() == (_SOURCE_ROOT / "nyx" / "static" / "app.js").read_bytes()
 
 
-def test_delivered_environment_exposes_no_build_interpreter_or_checkout_path():
+def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
+    artifact: ArtifactLayout,
+):
+    """The delivered shell must resolve no checkout and no installed interpreter."""
+
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _inert_path(root)
+        # A decoy checkout would abort the import if the delivered application
+        # reached it instead of its bundled package.
+        decoy = root / "decoy-checkout"
+        (decoy / "nyx").mkdir(parents=True)
+        (decoy / "nyx" / "__init__.py").write_text(
+            "raise RuntimeError('the delivered application imported a checkout')\n",
+            encoding="utf-8",
+        )
+        # A decoy interpreter records any build-time interpreter invocation.
+        decoy_bin = root / "decoy-bin"
+        decoy_bin.mkdir()
+        marker = root / "decoy-interpreter-ran"
+        for name in ("python", "python3"):
+            interpreter = decoy_bin / name
+            interpreter.write_text(
+                f"#!/bin/sh\ntouch {marker}\nexit 127\n", encoding="utf-8"
+            )
+            interpreter.chmod(0o755)
         environment = _sanitized_environment(home, decoy)
+        environment["PATH"] = os.pathsep.join([str(decoy_bin), environment["PATH"]])
+        with _workspace(root) as workspace:
+            _write_configuration(home, workspace)
+            expected = json.loads(
+                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            )
+            with _running_gui(artifact, root, environment) as gui:
+                status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                assert status == 200
+                assert json.loads(body) == expected
+                assert gui.process.poll() is None, gui.diagnostics()
+                gui.close()
 
-    path_entries = environment["PATH"].split(os.pathsep)
-    assert str(Path(sys.executable).resolve().parent) not in path_entries
-    assert str(_SOURCE_ROOT) not in environment["PATH"]
-    assert "PYTHONHOME" not in environment
-    assert environment.get("VIRTUAL_ENV") is None
-    assert str(_SOURCE_ROOT) not in environment["PYTHONPATH"]
+    assert not marker.exists(), "the delivered application ran a build-time interpreter"
+    assert not (decoy / "nyx" / "__pycache__").exists(), "the checkout was imported"
 
 
 def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: ArtifactLayout):
@@ -332,9 +380,13 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
         with _workspace(root) as workspace:
             config_file = _write_configuration(home, workspace)
             environment = _sanitized_environment(home, decoy)
+            lease_path, recovery_path = _claim_paths(home)
             with _running_gui(artifact, root, environment) as gui:
                 _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
                 before = config_file.read_bytes()
+                runtime_before = sorted(
+                    path.name for path in lease_path.parent.iterdir()
+                )
                 second = subprocess.run(
                     [str(artifact.executable)],
                     cwd=str(root),
@@ -343,10 +395,192 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
                     timeout=60,
                 )
                 assert second.returncode == 1
+                # Only the held qualified application claim reports already
+                # open, and the refused launch changes no state and starts no
+                # competing work while the first application keeps serving.
+                assert NativeClaim.probe(lease_path) == "held"
+                assert NativeClaim.probe(recovery_path) == "held"
                 assert config_file.read_bytes() == before
+                assert (
+                    sorted(path.name for path in lease_path.parent.iterdir())
+                    == runtime_before
+                )
                 status, _, _ = _wait_for_board(time.monotonic() + 30, gui)
                 assert status == 200
-                gui.close()
+                assert gui.close() == 0, gui.diagnostics()
+            _assert_claims_released(home)
+
+
+@pytest.mark.parametrize("kind", ["malformed", "unsupported", "unverified"])
+def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
+    artifact: ArtifactLayout, kind: str
+):
+    """Every unusable persisted state stays visibly blocked and untouched."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        if kind == "malformed":
+            preserved = _write_raw_configuration(home, b"{ this is not json\n")
+        elif kind == "unsupported":
+            preserved = _write_raw_configuration(
+                home,
+                json.dumps(
+                    {
+                        "schema_version": 99,
+                        "hidden_stages": [],
+                        "specification_root": str(root),
+                    }
+                ).encode("utf-8"),
+            )
+        else:
+            committed = root / "committed.json"
+            committed.write_bytes(
+                json.dumps(
+                    {
+                        "schema_version": state.CONFIG_SCHEMA_VERSION,
+                        "hidden_stages": list(_DELIVERED_HIDDEN_STAGES),
+                        "specification_root": str(root),
+                    }
+                ).encode("utf-8")
+            )
+            config_directory = home / ".nyx" / "config"
+            config_directory.mkdir(parents=True)
+            (config_directory / "config.json").symlink_to(committed)
+            preserved = committed
+        before = preserved.read_bytes()
+        environment = _sanitized_environment(home, decoy)
+        with _running_gui(artifact, root, environment) as gui:
+            time.sleep(4)
+            with pytest.raises(OSError):
+                _request("/api/catalog")
+            assert gui.process.poll() is None, gui.diagnostics()
+            assert preserved.read_bytes() == before
+            # The platform's ordinary close or quit reaches the same owned
+            # cleanup, and the refused state is left byte-identical.
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+        assert preserved.read_bytes() == before
+
+
+def test_delivered_recovery_blocks_start_until_former_workers_exit(
+    artifact: ArtifactLayout,
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        with _workspace(root) as workspace:
+            config_file = _write_configuration(home, workspace)
+            before = config_file.read_bytes()
+            expected = json.loads(
+                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            )
+            environment = _sanitized_environment(home, decoy)
+            lease_path, recovery_path = _claim_paths(home)
+            recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            # A surviving former worker holds the recovery claim, so the
+            # replacement may not start or change anything.
+            former = NativeClaim(recovery_path)
+            assert former.acquire(blocking=False)
+            try:
+                with _running_gui(artifact, root, environment) as gui:
+                    time.sleep(4)
+                    with pytest.raises(OSError):
+                        _request("/api/catalog")
+                    assert gui.process.poll() is None, gui.diagnostics()
+                    assert config_file.read_bytes() == before
+                    assert gui.close() == 0, gui.diagnostics()
+                released = NativeClaim(lease_path)
+                assert released.acquire(blocking=False), "the application claim was retained"
+                released.close()
+            finally:
+                former.close()
+            _wait_port_free(time.monotonic() + 15)
+            # Once the former workers are terminal, a later launch acquires
+            # recovery and serves the same persisted selection.
+            with _running_gui(artifact, root, environment) as gui:
+                status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                assert status == 200
+                assert json.loads(body) == expected
+                assert config_file.read_bytes() == before
+                assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+
+
+def test_delivered_unverified_committed_state_revalidates_then_starts(
+    artifact: ArtifactLayout,
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        with _workspace(root) as workspace:
+            valid = _write_configuration(home, workspace)
+            committed = root / "committed.json"
+            committed.write_bytes(valid.read_bytes())
+            valid.unlink()
+            valid.symlink_to(committed)
+            before = committed.read_bytes()
+            environment = _sanitized_environment(home, decoy)
+            with _running_gui(artifact, root, environment) as gui:
+                time.sleep(4)
+                with pytest.raises(OSError):
+                    _request("/api/catalog")
+                assert gui.process.poll() is None, gui.diagnostics()
+                # The committed selection bytes stay untouched and are never
+                # rolled back.
+                assert committed.read_bytes() == before
+                assert gui.close() == 0, gui.diagnostics()
+            _wait_port_free(time.monotonic() + 15)
+            # Only a safely revalidated record admits a start.
+            valid.unlink()
+            valid.write_bytes(before)
+            expected = json.loads(
+                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            )
+            with _running_gui(artifact, root, environment) as gui:
+                status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                assert status == 200
+                assert json.loads(body) == expected
+                assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+
+
+def test_delivered_restart_serves_the_newly_saved_workspace(artifact: ArtifactLayout):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        first = root / "first"
+        second = root / "second"
+        shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", first)
+        shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", second)
+        shutil.rmtree(second / "Trail_API")
+        expected_first = scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        expected_second = scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        assert expected_first != expected_second
+        environment = _sanitized_environment(home, decoy)
+        _write_configuration(home, first)
+        with _running_gui(artifact, root, environment) as gui:
+            _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+            assert body.decode("utf-8") == expected_first
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+        _wait_port_free(time.monotonic() + 15)
+        # The replacement selection is saved only through the canonical owner
+        # and the next start serves that workspace's real catalog.
+        _write_configuration(home, second)
+        with _running_gui(artifact, root, environment) as gui:
+            _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+            assert body.decode("utf-8") == expected_second
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
 
 
 def test_delivered_chooser_state_starts_no_runtime_or_workers(artifact: ArtifactLayout):
