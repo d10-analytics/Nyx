@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
@@ -1551,8 +1552,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
         assert sys.platform == "darwin"
     else:
         pytest.fail("required native desktop lane did not identify its hosted runner")
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
+    with _native_temp_home() as root:
         home = _home(root)
         first = _workspace(root, "first")
         second = _workspace(root, "second")
@@ -1615,7 +1615,13 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             assert state.load_configuration() == state.Configuration(
                 second.resolve(), ("Queue",)
             )
-            _destroy_native_window(application, window)
+            released = _destroy_native_window(
+                application,
+                window,
+                store_path=session.paths.state_directory
+                / desktop.PRESENTATION_DIRECTORY,
+            )
+            assert released
             if owns_application:
                 application.quit()
 
@@ -1780,6 +1786,29 @@ def test_failed_runtime_start_leaves_the_board_unloaded():
             session.close()
 
 
+def test_presentation_release_is_idempotent_and_detaches_engine_objects():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+            released = (window._page, window._board, window._profile)
+            assert all(item is not None for item in released)
+
+            desktop._release_presentation(None, window)
+            assert window._page is None
+            assert window._board is None
+            assert window._profile is None
+            # Releasing twice, or after the objects are already gone, must not
+            # raise and must not reach back into the destroyed Qt objects.
+            desktop._release_presentation(None, window)
+            session.close()
+            assert not session.claims.held
+
+
 def test_board_load_failure_without_an_opened_board_keeps_the_chooser():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1876,6 +1905,40 @@ def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
             session.close()
 
 
+def test_board_diagnostic_names_url_load_and_renderer_observations():
+    class _FakeUrl:
+        def toString(self):
+            return "chrome-error://chromewebdata/"
+
+    class _FakePage:
+        def __init__(self):
+            self.loadStarted = _WebSignal()
+            self.loadProgress = _WebSignal()
+            self.loadFinished = _WebSignal()
+            self.renderProcessTerminated = _WebSignal()
+
+        def url(self):
+            return _FakeUrl()
+
+    class _TerminationStatus:
+        value = 1
+
+    page = _FakePage()
+    probe = _NavigationProbe(page, requested_url="http://127.0.0.1:1234/")
+    page.loadStarted.emit()
+    page.loadProgress.emit(100)
+    page.loadFinished.emit(False)
+    page.renderProcessTerminated.emit(_TerminationStatus(), 139)
+
+    message = _board_diagnostic("", probe)
+    assert "board did not load" in message
+    assert "http://127.0.0.1:1234/" in message
+    assert "chrome-error://chromewebdata/" in message
+    assert "load_finished" in message
+    assert "render_process_terminated" in message
+    assert "(1, 139)" in message
+
+
 def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
     assert desktop.ApplicationRuntime is app_runtime.ApplicationRuntime
     assert runtime.ApplicationRuntime is app_runtime.ApplicationRuntime
@@ -1920,14 +1983,36 @@ def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
 
 
 _BOARD_SNAPSHOT_SCRIPT = """
-(() => ({
-  status: document.querySelector('#status') ? document.querySelector('#status').textContent : '',
-  titles: [...document.querySelectorAll('.card-title')].map((node) => node.textContent),
-  rows: [...document.querySelectorAll('.board-row')].map((node) => node.dataset.lifecycle),
-  links: [...document.querySelectorAll('.card-links')].map((node) => node.textContent),
-  compact: document.querySelector('#compact-view') ? document.querySelector('#compact-view').checked : null,
-  stored: window.localStorage.getItem('spec-tracker-compact-view'),
-}))()
+(() => {
+  const result = {
+    href: null,
+    readyState: null,
+    origin: null,
+    hasStatus: false,
+    error: null,
+    status: '',
+    titles: [],
+    rows: [],
+    links: [],
+    compact: null,
+    stored: null,
+  };
+  try {
+    result.href = location.href;
+    result.readyState = document.readyState;
+    result.origin = location.origin;
+    result.hasStatus = !!document.querySelector('#status');
+    result.status = document.querySelector('#status') ? document.querySelector('#status').textContent : '';
+    result.titles = [...document.querySelectorAll('.card-title')].map((node) => node.textContent);
+    result.rows = [...document.querySelectorAll('.board-row')].map((node) => node.dataset.lifecycle);
+    result.links = [...document.querySelectorAll('.card-links')].map((node) => node.textContent);
+    result.compact = document.querySelector('#compact-view') ? document.querySelector('#compact-view').checked : null;
+    result.stored = window.localStorage.getItem('spec-tracker-compact-view');
+  } catch (error) {
+    result.error = error.name + ': ' + error.message;
+  }
+  return result;
+})()
 """
 
 
@@ -1947,6 +2032,85 @@ def _native_application():
     return application
 
 
+def _pump_native_events(application, milliseconds: int = 20) -> None:
+    """Process Qt events and explicitly yield the GIL to Python threads."""
+
+    application.processEvents()
+    QtTest.QTest.qWait(milliseconds)
+    time.sleep(0.01)
+
+
+class _NavigationProbe:
+    """Record QtWebEngine navigation and renderer signals for diagnosis.
+
+    The board proofs must report what the engine actually did rather than only
+    an empty snapshot.  ``renderProcessTerminated`` separates a crashed
+    renderer from a server or navigation problem, and the page URL shows
+    whether the main frame ever left the initial document.
+    """
+
+    def __init__(self, page, requested_url=None):
+        self.page = page
+        self.requested_url = requested_url
+        self.load_started = 0
+        self.load_progress = []
+        self.load_finished = []
+        self.renderer_terminations = []
+        self.hooks = []
+        for name, handler in (
+            ("loadStarted", self._on_load_started),
+            ("loadProgress", self._on_load_progress),
+            ("loadFinished", self._on_load_finished),
+            ("renderProcessTerminated", self._on_render_process_terminated),
+        ):
+            signal = getattr(page, name, None)
+            connect = getattr(signal, "connect", None)
+            if not callable(connect):
+                continue
+            try:
+                connect(handler)
+            except (TypeError, RuntimeError):
+                continue
+            self.hooks.append(name)
+
+    def _on_load_started(self, *_):
+        self.load_started += 1
+
+    def _on_load_progress(self, value):
+        try:
+            self.load_progress.append(int(value))
+        except (TypeError, ValueError):
+            self.load_progress.append(value)
+
+    def _on_load_finished(self, ok):
+        self.load_finished.append(bool(ok))
+
+    def _on_render_process_terminated(self, status, exit_code):
+        try:
+            self.renderer_terminations.append(
+                (int(getattr(status, "value", status)), int(exit_code))
+            )
+        except (TypeError, ValueError):
+            self.renderer_terminations.append((repr(status), repr(exit_code)))
+
+    def current_url(self):
+        try:
+            return self.page.url().toString()
+        except RuntimeError:
+            return None
+
+    def describe(self):
+        return {
+            "requested_url": self.requested_url,
+            "page_url": self.current_url(),
+            "load_started": self.load_started,
+            "last_load_progress": self.load_progress[-1] if self.load_progress else None,
+            "load_finished": list(self.load_finished),
+            "render_process_terminated": list(self.renderer_terminations),
+            "signal_hooks": list(self.hooks),
+        }
+
+
 def _eval_js(application, page, script, timeout: float = 30.0):
     outcome = {}
     done = threading.Event()
@@ -1955,24 +2119,38 @@ def _eval_js(application, page, script, timeout: float = 30.0):
         outcome["value"] = value
         done.set()
 
-    page.runJavaScript(script, finish)
+    try:
+        page.runJavaScript(script, finish)
+    except RuntimeError as error:
+        raise AssertionError(f"board JavaScript could not start: {error}") from error
     deadline = time.monotonic() + timeout
     while not done.is_set() and time.monotonic() < deadline:
-        application.processEvents()
-        QtTest.QTest.qWait(20)
+        _pump_native_events(application)
     assert done.is_set(), "board JavaScript did not complete"
     return outcome["value"]
 
 
-def _wait_for_board(application, page, timeout: float = 60.0):
+def _board_diagnostic(snapshot, probe=None) -> str:
+    parts = [f"snapshot={snapshot!r}"]
+    if probe is not None:
+        parts.append(f"navigation={probe.describe()!r}")
+    return "board did not load: " + " ".join(parts)
+
+
+def _wait_for_board(application, page, timeout: float = 60.0, probe=None):
     deadline = time.monotonic() + timeout
     snapshot = None
     while time.monotonic() < deadline:
-        snapshot = _eval_js(application, page, _BOARD_SNAPSHOT_SCRIPT, timeout=15.0)
-        if snapshot and str(snapshot.get("status", "")).startswith("Loaded"):
+        try:
+            snapshot = _eval_js(application, page, _BOARD_SNAPSHOT_SCRIPT, timeout=15.0)
+        except AssertionError as error:
+            raise AssertionError(_board_diagnostic(str(error), probe)) from error
+        if isinstance(snapshot, dict) and str(snapshot.get("status", "")).startswith(
+            "Loaded"
+        ):
             return snapshot
-        QtTest.QTest.qWait(50)
-    raise AssertionError(f"board did not load: {snapshot!r}")
+        _pump_native_events(application, 50)
+    raise AssertionError(_board_diagnostic(snapshot, probe))
 
 
 def _wait_for_status(application, page, prefix: str, timeout: float = 30.0):
@@ -1987,15 +2165,94 @@ def _wait_for_status(application, page, prefix: str, timeout: float = 30.0):
         )
         if isinstance(value, str) and value.startswith(prefix):
             return value
-        QtTest.QTest.qWait(50)
+        _pump_native_events(application, 50)
     raise AssertionError(f"board status never reached {prefix!r}: {value!r}")
 
 
-def _destroy_native_window(application, window) -> None:
+def _wait_for_engine_sanity(application, page, timeout: float = 30.0):
+    deadline = time.monotonic() + timeout
+    value = None
+    while time.monotonic() < deadline:
+        value = _eval_js(
+            application,
+            page,
+            "(() => { const node = document.querySelector('#engine-sanity');"
+            " return node ? node.textContent : null; })()",
+            timeout=10.0,
+        )
+        if value == "ready":
+            return value
+        _pump_native_events(application, 50)
+    raise AssertionError(f"engine sanity document never rendered: {value!r}")
+
+
+def _presentation_store_is_releasable(path: Path) -> bool:
+    """Report whether the persistent presentation store can be removed.
+
+    On Windows a directory rename fails while any process still holds a file
+    inside it, so a successful round-trip rename proves the profile released
+    the store without destroying the persisted preference.
+    """
+
+    probe = path.with_name(f"{path.name}.release-probe")
+    if not path.exists():
+        return not probe.exists()
+    if probe.exists():
+        # A previous probe was interrupted; restore the store before retrying.
+        try:
+            os.rename(probe, path)
+        except OSError:
+            return False
+    try:
+        os.rename(path, probe)
+    except OSError:
+        return False
+    try:
+        os.rename(probe, path)
+    except OSError:
+        return False
+    return True
+
+
+def _destroy_native_window(application, window, *, store_path=None, timeout: float = 10.0):
+    """Release the presentation profile and report whether its store freed."""
+
     desktop._release_presentation(application, window)
-    window.deleteLater()
-    QtTest.QTest.qWait(100)
-    application.processEvents()
+    try:
+        window.deleteLater()
+    except RuntimeError:
+        pass
+    desktop._flush_deferred_deletes(application)
+    QtTest.QTest.qWait(50)
+    if store_path is None:
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _presentation_store_is_releasable(store_path):
+            return True
+        _pump_native_events(application, 50)
+    return False
+
+
+@contextlib.contextmanager
+def _native_temp_home():
+    """Temporary home whose cleanup failure never masks a native failure."""
+
+    temporary = TemporaryDirectory()
+    try:
+        yield Path(temporary.name)
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError as cleanup_error:
+            if sys.exc_info()[0] is None:
+                raise
+            note = f"native temp home cleanup also failed: {cleanup_error!r}"
+            try:
+                sys.exception().add_note(note)
+            except Exception:
+                pass
+            print(note, file=sys.stderr)
 
 
 def _assert_native_host_has_no_offscreen_platform() -> None:
@@ -2007,12 +2264,88 @@ def _assert_native_host_has_no_offscreen_platform() -> None:
         pytest.fail("required native desktop lane cannot use an offscreen Qt platform")
 
 
+_ENGINE_SANITY_HTML = (
+    "<!doctype html><html><head><meta charset='utf-8'></head>"
+    "<body><div id='engine-sanity'>ready</div></body></html>"
+)
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_engine_sanity_separates_renderer_from_loopback_serving():
+    """Distinguish a broken renderer from a loopback server/navigation problem.
+
+    A self-contained document must evaluate on the same engine instance the
+    board proofs use.  When it does but the loopback board does not, the shared
+    runtime and its serving path are exonerated: the remaining limitation is
+    the engine or its network access.  The failure message names that
+    observation instead of asserting only an empty board snapshot.
+    """
+
+    _assert_native_host_has_no_offscreen_platform()
+    port = _free_loopback_port()
+    with _native_temp_home() as root:
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            shared = session.runtime
+            assert shared is not None and shared.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            released = None
+            try:
+                page = window._board.page()
+                sanity_probe = _NavigationProbe(page, requested_url="self-contained")
+                page.setHtml(_ENGINE_SANITY_HTML, QtCore.QUrl("http://127.0.0.1/"))
+                sanity = _wait_for_engine_sanity(application, page)
+                assert sanity == "ready", (
+                    "hosted QtWebEngine renderer could not evaluate a "
+                    f"self-contained document: {sanity!r} "
+                    f"{sanity_probe.describe()!r}"
+                )
+                status, payload = _request_catalog(port)
+                assert status == 200
+                assert any(
+                    entry["declared"]["title"] == "Alpha delivery"
+                    for entry in payload["entries"]
+                )
+                assert window._open_board()
+                board_probe = _NavigationProbe(page, requested_url=shared.board_url())
+                try:
+                    snapshot = _wait_for_board(application, page, probe=board_probe)
+                except AssertionError as error:
+                    raise AssertionError(
+                        "engine sanity and Python serving both succeeded "
+                        f"(catalog status {status}), but the loopback board did "
+                        "not complete navigation on this hosted image; the "
+                        "renderer or its network access is the limitation, not "
+                        f"the shared runtime: {error}"
+                    ) from error
+                assert "Alpha delivery" in snapshot["titles"]
+            finally:
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
+            assert released
+
+
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_embedded_board_renders_content_hidden_stage_and_dependency():
     _assert_native_host_has_no_offscreen_platform()
     port = _free_loopback_port()
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
+    with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
@@ -2028,7 +2361,10 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
             assert shared is not None and shared.catalog_admitted
             window = desktop._build_window(_native_qt(), session)
             window.show()
+            released = None
             try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=shared.board_url())
                 assert window._open_board()
                 assert window._board.url().toString() == shared.board_url()
                 status, payload = _request_catalog(port)
@@ -2036,8 +2372,7 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
                 assert "Alpha delivery" in [
                     entry["declared"]["title"] for entry in payload["entries"]
                 ]
-                page = window._board.page()
-                snapshot = _wait_for_board(application, page)
+                snapshot = _wait_for_board(application, page, probe=probe)
                 assert "Alpha delivery" in snapshot["titles"]
                 assert "Beta design" in snapshot["titles"]
                 assert "Hidden completed work" not in snapshot["titles"]
@@ -2055,17 +2390,22 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
                 _eval_js(application, page, "document.querySelector('#refresh').click()")
                 assert _wait_for_status(application, page, "Loaded").startswith("Loaded")
             finally:
-                _destroy_native_window(application, window)
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
                 session.close()
             assert not session.claims.held
+            assert released
 
 
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_compact_preference_survives_a_normal_reopen():
     _assert_native_host_has_no_offscreen_platform()
     port = _free_loopback_port()
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
+    with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
@@ -2077,12 +2417,17 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
             state.setup(workspace)
             session = desktop.DesktopSession()
             session.start_runtime()
+            shared = session.runtime
+            assert shared is not None
+            store_path = session.paths.state_directory / desktop.PRESENTATION_DIRECTORY
             window = desktop._build_window(_native_qt(), session)
             window.show()
+            first_released = None
             try:
-                assert window._open_board()
                 page = window._board.page()
-                _wait_for_board(application, page)
+                probe = _NavigationProbe(page, requested_url=shared.board_url())
+                assert window._open_board()
+                _wait_for_board(application, page, probe=probe)
                 assert not window._profile.isOffTheRecord()
                 expected_storage = session.paths.state_directory / "presentation"
                 assert Path(window._profile.persistentStoragePath()) == expected_storage
@@ -2096,23 +2441,34 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
                 assert stored == "false"
                 QtTest.QTest.qWait(500)
             finally:
-                _destroy_native_window(application, window)
+                first_released = _destroy_native_window(
+                    application, window, store_path=store_path
+                )
                 session.close()
             assert not session.claims.held
+            assert first_released
 
             reopened = desktop.DesktopSession()
             reopened.start_runtime()
+            reopened_board = reopened.runtime
+            assert reopened_board is not None
             window = desktop._build_window(_native_qt(), reopened)
             window.show()
+            second_released = None
             try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=reopened_board.board_url())
                 assert window._open_board()
-                snapshot = _wait_for_board(application, window._board.page())
+                snapshot = _wait_for_board(application, page, probe=probe)
                 assert snapshot["compact"] is False
                 assert snapshot["stored"] == "false"
             finally:
-                _destroy_native_window(application, window)
+                second_released = _destroy_native_window(
+                    application, window, store_path=store_path
+                )
                 reopened.close()
             assert not reopened.claims.held
+            assert second_released
 
 
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
@@ -2120,8 +2476,7 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
     _assert_native_host_has_no_offscreen_platform()
     dead_port = _free_loopback_port()
     port = _free_loopback_port()
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
+    with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
@@ -2135,14 +2490,16 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
             session.start_runtime()
             window = desktop._build_window(_native_qt(), session)
             window.show()
+            released = None
             try:
                 assert window._open_board()
-                _wait_for_board(application, window._board.page())
+                # Trigger the later view failure by sending the admitted board to
+                # a dead loopback port; a first successful board load is not
+                # required to exercise the post-admission cleanup obligation.
                 window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{dead_port}/"))
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline and session.runtime is not None:
-                    application.processEvents()
-                    QtTest.QTest.qWait(50)
+                    _pump_native_events(application, 50)
                 if session.shutdown_blocked:
                     assert session.claims.held
                     assert window.isVisible()
@@ -2152,5 +2509,11 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                     assert session.runtime is None
                     assert not window.isVisible()
             finally:
-                _destroy_native_window(application, window)
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
                 session.close()
+            assert released
