@@ -974,6 +974,50 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
             session.close()
 
 
+def test_repeated_incomplete_switch_retry_keeps_retry_visible():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def shutdown(self, _deadline):
+                return False
+
+            def cleanup_start_failure(self, _deadline):
+                return False
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime(static_ready=lambda: True)
+            window = desktop._build_window(_fake_qt(), session)
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+            assert session.switch_blocked
+            assert window._retry.isEnabled()
+
+            window._retry.click()
+
+            assert session.switch_blocked
+            assert session.snapshot.status == "switch_blocked"
+            assert window._retry.isEnabled()
+            session.close()
+
+
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
