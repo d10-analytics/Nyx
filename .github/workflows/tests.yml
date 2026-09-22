@@ -254,6 +254,8 @@ jobs:
           artifact="$PWD/dist/desktop/Nyx.app"
           test -d "$artifact"
           shasum -a 256 "$artifact/Contents/MacOS/NyxWorker/NyxWorker"
-          shasum -a 256 "$artifact/Contents/MacOS/Nyx"
+          gui_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+            "$artifact/Contents/Info.plist")"
+          shasum -a 256 "$artifact/Contents/MacOS/$gui_executable"
           export NYX_DESKTOP_ARTIFACT="$artifact"
           python -m pytest tests/test_desktop_artifact.py -v -s

@@ -27,7 +27,11 @@ DIST_ROOT = REPOSITORY_ROOT / "dist" / "desktop"
 BUILD_ROOT = REPOSITORY_ROOT / "build" / "desktop"
 
 APPLICATION_TITLE = "Nyx"
-GUI_ENTRY_NAME = "Nyx"
+# macOS keeps the executable beside the served package.  A bare ``Nyx`` name
+# would collide with the ``nyx`` package directory on its case-insensitive
+# filesystem, so the bundle executable uses a distinct name while the staged
+# bundle keeps the application title.
+MACOS_GUI_ENTRY_NAME = "NyxApp"
 WORKER_EXECUTABLE = "NyxWorker"
 WORKER_STAGE_DIRECTORY = "NyxWorker"
 STATIC_MEMBER = Path("nyx") / "static" / "app.js"
@@ -108,10 +112,17 @@ def _read_component_versions() -> dict[str, str]:
 
 def _platform_arguments() -> str:
     if sys.platform == "win32":
-        return "--windows-console-mode=disable"
+        return (
+            "--windows-console-mode=disable"
+            " --experimental=force-dependencies-pefile"
+        )
     if sys.platform == "darwin":
         return ""
     raise BuildError("standalone desktop artifacts are built only on Windows or macOS")
+
+
+def _gui_entry_name() -> str:
+    return MACOS_GUI_ENTRY_NAME if sys.platform == "darwin" else APPLICATION_TITLE
 
 
 def _render_spec(values: dict[str, str]) -> Path:
@@ -173,13 +184,17 @@ def _build_worker() -> Path:
         "nuitka",
         "--standalone",
         "--quiet",
-        "--noinclude-qt-translations",
         f"--output-dir={helper_output}",
         f"--output-filename={WORKER_EXECUTABLE}",
         str(entry),
     ]
     if sys.platform == "win32":
-        command.append("--windows-console-mode=force")
+        command.extend(
+            [
+                "--windows-console-mode=force",
+                "--experimental=force-dependencies-pefile",
+            ]
+        )
     _run(command, cwd=REPOSITORY_ROOT)
     return _find_standalone_component(helper_output, WORKER_EXECUTABLE, executable=True)
 
@@ -238,7 +253,8 @@ def build() -> dict[str, Any]:
     shutil.rmtree(DIST_ROOT, ignore_errors=True)
     DIST_ROOT.mkdir(parents=True)
 
-    gui_entry = BUILD_ROOT / f"{GUI_ENTRY_NAME}.py"
+    gui_entry_name = _gui_entry_name()
+    gui_entry = BUILD_ROOT / f"{gui_entry_name}.py"
     gui_entry.write_text(_GUI_ENTRY, encoding="utf-8")
     spec_path = _render_spec(
         {
@@ -259,7 +275,7 @@ def build() -> dict[str, Any]:
     resource = _verify_resources(application)
 
     executable = _find_standalone_component(
-        _application_root(application), APPLICATION_TITLE, executable=True
+        _application_root(application), gui_entry_name, executable=True
     )
     manifest = {
         "schema": "nyx-desktop-artifact/1",
