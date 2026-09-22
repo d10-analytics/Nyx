@@ -198,19 +198,30 @@ class _ExistingLock:
     def fd(self) -> int | None:
         return self._claim.fd
 
-    def acquire(self) -> str:
+    def acquire(
+        self,
+        *,
+        blocking: bool = False,
+        deadline: float | None = None,
+    ) -> str:
         result = NativeClaim.probe(
             self.path,
             dir_fd=None if self.directory is None else self.directory.dir_fd,
         )
-        if result != "free":
+        if result not in {"free", "held"} or (result == "held" and not blocking):
             return result
         try:
-            if not self._claim.acquire(create=False, blocking=False):
+            if not self._claim.acquire(
+                create=False,
+                blocking=blocking,
+                deadline=deadline,
+            ):
                 return "held"
             assert self._claim.fd is not None
             self.metadata = _metadata_from_stat(os.fstat(self._claim.fd))
             return "acquired"
+        except TimeoutError:
+            return "held"
         except OSError:
             return "unsafe"
 
@@ -332,6 +343,17 @@ def _record_transition(path: Path, original: _Metadata) -> str:
 
     try:
         current = _record_snapshot(path)
+    except FileNotFoundError:
+        # The daemon removes its locator during terminal cleanup.  It can
+        # disappear after metadata admission but before the byte read; confirm
+        # the resulting state instead of misclassifying that unlink as a
+        # replacement.
+        try:
+            current = _record_snapshot(path)
+        except FileNotFoundError:
+            return "absent"
+        except (OSError, RuntimeErrorBase):
+            return "changed"
     except (OSError, RuntimeErrorBase):
         return "changed"
     if current == original:
@@ -1614,6 +1636,33 @@ def stop() -> str:
                 raise UnhealthyInstanceError("Nyx instance record changed")
             if record_transition == "absent":
                 terminal_absence_seen = True
+                # Once authenticated terminal cleanup removes its locator,
+                # wait directly on the exact persistent lease rather than
+                # sampling it every polling interval.  This uses only the
+                # caller's existing deadline and closes the final scheduling
+                # gap without accepting absence while ownership is retained.
+                probe.close()
+                probe = _ExistingLock(lease_path)
+                probe_state = probe.acquire(blocking=True, deadline=deadline)
+                if probe_state == "acquired":
+                    if not _acquired_lock_is_original(
+                        lease_path, probe.fd, lease_snapshot
+                    ):
+                        raise UnhealthyInstanceError("Nyx lifetime lease changed")
+                    record_transition = _record_transition(
+                        _record_path(paths), record_snapshot
+                    )
+                    if record_transition == "changed":
+                        raise UnhealthyInstanceError("Nyx instance record changed")
+                    if record_transition == "absent":
+                        return "stopped"
+                    _remove_stale_instance(paths, deadline=deadline)
+                    return "stopped"
+                if probe_state != "held" or not _metadata_unchanged(
+                    lease_path, lease_snapshot
+                ):
+                    raise UnhealthyInstanceError("Nyx lifetime lease changed")
+                break
         except _ControlTimeoutError:
             break
         finally:
