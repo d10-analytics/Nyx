@@ -176,14 +176,61 @@ def _is_within(path: Path, directory: Path) -> bool:
     return True
 
 
+def _is_packaged_application() -> bool:
+    """Report whether this module runs inside a standalone application.
+
+    A standalone desktop build relocates the package and interpreter paths
+    into an application directory or bundle, so the admission footprints must
+    resolve the delivered roots instead of the build-time ones.
+    """
+
+    if getattr(sys, "frozen", False):
+        return True
+    compiled = globals().get("__compiled__")
+    return bool(getattr(compiled, "standalone", False))
+
+
+def _packaged_footprints() -> tuple[Path, ...]:
+    """Resolve the packaged application, helper, and resource subtrees.
+
+    The whole application installation is rejected so a workspace cannot be a
+    subdirectory of the delivered application, and the helper and resource
+    subtrees are named explicitly so admission stays correct even if the
+    bundle root is not otherwise recognizable.
+    """
+
+    if not _is_packaged_application():
+        return ()
+    try:
+        executable = Path(sys.executable).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ()
+    roots: list[Path] = [executable.parent]
+    bundle = next((parent for parent in executable.parents if parent.suffix == ".app"), None)
+    if bundle is None:
+        roots.append(executable.parent / "NyxWorker")
+    else:
+        roots.extend(
+            (
+                bundle,
+                bundle / "Contents",
+                bundle / "Contents" / "MacOS",
+                bundle / "Contents" / "Frameworks",
+                bundle / "Contents" / "Resources",
+            )
+        )
+    return tuple(dict.fromkeys(roots))
+
+
 def _installation_footprints() -> tuple[Path, ...]:
-    """Return resolved Nyx package and interpreter environments."""
+    """Return resolved Nyx package, interpreter, and packaged application roots."""
 
     candidates = [Path(__file__).resolve().parent]
     try:
         candidates.append(Path(sys.prefix).resolve(strict=True))
     except (OSError, RuntimeError):
         pass
+    candidates.extend(_packaged_footprints())
     return tuple(dict.fromkeys(candidates))
 
 

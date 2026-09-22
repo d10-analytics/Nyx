@@ -945,18 +945,45 @@ def _release_presentation(application: Any, window: Any) -> None:
     _destroy_presentation_object(profile, application)
 
 
+def _report_desktop_error(message: str) -> None:
+    """Write a bounded diagnostic when the windowed build owns no stream."""
+
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(message, file=stream)
+    except (OSError, ValueError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the optional GUI entry while retaining the console entry unchanged."""
 
     parser = argparse.ArgumentParser(prog="nyx-desktop")
-    parser.parse_args(argv)
+    parser.add_argument("--recovery-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--recovery-path", type=str, help=argparse.SUPPRESS)
+    parser.add_argument("--parent-liveness-fd", type=int, help=argparse.SUPPRESS)
+    options = parser.parse_args(argv)
+    if (
+        options.recovery_fd is not None
+        or options.recovery_path is not None
+        or options.parent_liveness_fd is not None
+    ):
+        # Inherited-object worker arguments belong to the private console
+        # helper.  Refusing them here keeps the GUI entry from ever answering
+        # a worker request with a second application window.
+        _report_desktop_error(
+            "nyx-desktop: worker inheritance must run through the private worker entry"
+        )
+        return 2
     try:
         session = DesktopSession()
     except AlreadyOpenError as error:
-        print(str(error), file=sys.stderr)
+        _report_desktop_error(str(error))
         return 1
     except DesktopError as error:
-        print(f"nyx-desktop: {error}", file=sys.stderr)
+        _report_desktop_error(f"nyx-desktop: {error}")
         return 1
     application: Any = None
     window: Any = None
@@ -964,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             qt = _load_qt()
         except DesktopError as error:
-            print(f"nyx-desktop: {error}", file=sys.stderr)
+            _report_desktop_error(f"nyx-desktop: {error}")
             return 1
         application = qt["QtWidgets"].QApplication.instance()
         owns_application = application is None

@@ -12,6 +12,16 @@ dependencies = []
 [project.optional-dependencies]
 test = ["pytest", "playwright", "ruff"]
 desktop = ["PySide6>=6.8"]
+# Pinned standalone-build inputs.  PySide6 is LGPL-3.0/GPL-3.0/commercial and
+# Nuitka is Apache-2.0; both are redistributable in the private internal
+# artifacts this extra builds.  The versions match the deployment tool's
+# default toolchain so a build does not silently select a different compiler.
+build = [
+    "PySide6==6.11.2",
+    "Nuitka==4.1.1",
+    "ordered-set==4.1.0",
+    "zstandard==0.25.0",
+]
 
 [project.scripts]
 nyx = "nyx.cli:main"

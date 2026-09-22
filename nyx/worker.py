@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import state
 from ._native_claim import NativeClaim
@@ -24,6 +25,66 @@ MAX_STDOUT_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 WORKER_TIMEOUT = 5.0
 _READ_CHUNK_BYTES = 64 * 1024
+WORKER_EXECUTABLE_NAME = "NyxWorker"
+WORKER_HELPER_DIRECTORY = "NyxWorker"
+
+
+def _is_packaged_application() -> bool:
+    """Report whether this module runs inside a standalone application.
+
+    A frozen interpreter no longer exposes a Python launcher, so the worker
+    command must not be reconstructed from ``sys.executable`` there.
+    """
+
+    if getattr(sys, "frozen", False):
+        return True
+    compiled = globals().get("__compiled__")
+    return bool(getattr(compiled, "standalone", False))
+
+
+def bundled_worker_command() -> list[str] | None:
+    """Return the packaged console helper command when one is staged.
+
+    The helper lives in a dedicated directory beside the application
+    executable (Windows) or beside the bundle executable (macOS).  Returning
+    ``None`` rather than a Python launcher keeps a missing helper from
+    re-entering the GUI the way a stray interpreter path would.
+    """
+
+    if not _is_packaged_application():
+        return None
+    try:
+        executable = Path(sys.executable).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    name = (
+        f"{WORKER_EXECUTABLE_NAME}.exe"
+        if os.name == "nt"
+        else WORKER_EXECUTABLE_NAME
+    )
+    candidates = (
+        executable.parent / WORKER_HELPER_DIRECTORY / name,
+        executable.parent / name,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return [str(candidate)]
+    return None
+
+
+def default_worker_command() -> list[str]:
+    """Select the catalog worker entry for the current runtime.
+
+    A standalone application must spawn its bundled console helper.  A source
+    or virtual-environment run keeps the module entry unchanged.
+    """
+
+    if _is_packaged_application():
+        bundled = bundled_worker_command()
+        if bundled is None:
+            raise WorkerError("producer_unavailable")
+        return bundled
+    return [sys.executable, "-m", "nyx.worker"]
 
 
 def _windows_parent_pipe_closed(fd: int) -> bool:
@@ -223,9 +284,7 @@ class CatalogWorkerManager:
         recovery_path: Path | None = None,
         parent_liveness_fd: int | None = None,
     ) -> None:
-        self._command_factory = command_factory or (
-            lambda: [sys.executable, "-m", "nyx.worker"]
-        )
+        self._command_factory = command_factory or default_worker_command
         self._timeout = timeout
         self._recovery_claim = recovery_claim
         self._recovery_path = recovery_path or (
@@ -549,21 +608,38 @@ class CatalogWorkerManager:
                 self._select_terminal_locked(child, "producer_cancelled")
 
 
-if __name__ == "__main__":
-    import argparse
+def add_worker_arguments(parser: Any) -> None:
+    """Register the inherited-object arguments shared by both worker entries."""
 
-    parser = argparse.ArgumentParser(prog="nyx.worker")
     parser.add_argument("--recovery-fd", type=int)
     parser.add_argument("--recovery-path", type=Path)
     parser.add_argument("--parent-liveness-fd", type=int)
-    options = parser.parse_args()
-    raise SystemExit(
-        _worker_main(
-            recovery_fd=options.recovery_fd,
-            recovery_path=options.recovery_path,
-            parent_liveness_fd=options.parent_liveness_fd,
-        )
+
+
+def worker_entrypoint(argv: list[str] | None = None) -> int:
+    """Run the catalog worker from either the module or packaged entry."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="nyx.worker")
+    add_worker_arguments(parser)
+    options = parser.parse_args(argv)
+    return _worker_main(
+        recovery_fd=options.recovery_fd,
+        recovery_path=options.recovery_path,
+        parent_liveness_fd=options.parent_liveness_fd,
     )
 
 
-__all__ = ["CatalogWorkerManager", "WorkerError"]
+if __name__ == "__main__":
+    raise SystemExit(worker_entrypoint())
+
+
+__all__ = [
+    "CatalogWorkerManager",
+    "WorkerError",
+    "add_worker_arguments",
+    "bundled_worker_command",
+    "default_worker_command",
+    "worker_entrypoint",
+]
