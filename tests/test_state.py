@@ -321,7 +321,25 @@ def test_owned_save_omission_defaults_empty_then_preserves_existing_policy():
             preserved = state.save_configuration_owned(third, paths=paths)
             assert preserved.hidden_stages == ("Queue",)
             cleared = state.save_configuration_owned(first, [], paths=paths)
-            assert cleared.hidden_stages == ()
+        assert cleared.hidden_stages == ()
+
+
+def test_candidate_validation_is_canonical_and_does_not_write_configuration():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        supplied = root / "second-link"
+        supplied.symlink_to(second, target_is_directory=True)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first, ["Queue"])
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            candidate = state.validate_configuration_candidate(supplied, paths=paths)
+            assert candidate == state.Configuration(second.resolve(), ("Queue",))
+            assert paths.config_file.read_bytes() == before
 
 
 def test_owned_save_classifies_post_replacement_verification_and_revalidation():

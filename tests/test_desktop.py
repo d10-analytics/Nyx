@@ -922,7 +922,160 @@ def test_shell_post_replacement_failure_blocks_change_until_revalidation():
             assert window._root.text() == str(second.resolve())
             assert not paths.runtime_directory.joinpath("instance.json").exists()
             window._quit.click()
-            assert paths.config_file.read_bytes() == committed
+
+
+def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        shutdown_results = iter((False, True, True))
+        instances = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                self.shutdown_calls = 0
+                instances.append(self)
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def shutdown(self, _deadline):
+                self.shutdown_calls += 1
+                return next(shutdown_results)
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first, ["Queue"])
+            session = desktop.DesktopSession()
+            session.start_runtime(static_ready=lambda: True)
+            before = state.state_paths().config_file.read_bytes()
+
+            with pytest.raises(desktop.SelectionUnavailableError):
+                session.choose_workspace(second)
+            assert state.state_paths().config_file.read_bytes() == before
+            assert session.snapshot.status == "switch_blocked"
+            assert session.switch_blocked
+            assert session.claims.held
+            assert session.retry_workspace_switch()
+            assert state.load_configuration() == state.Configuration(
+                second.resolve(), ("Queue",)
+            )
+            assert session.runtime is instances[1]
+            assert session.claims.held
+            session.close()
+
+
+def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first, ["Queue"])
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+
+            class FakeApplicationRuntime:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def start(self, *, static_ready=None):
+                    assert static_ready is None or static_ready()
+
+                def admit_catalog(self):
+                    pass
+
+                def shutdown(self, _deadline):
+                    return True
+
+                def cleanup_start_failure(self, _deadline):
+                    return True
+
+            session_start = patch.object(
+                desktop, "ApplicationRuntime", FakeApplicationRuntime
+            )
+            original_verify = state._verify_record
+            failed = False
+
+            def fail_after_replacement(path):
+                nonlocal failed
+                details = original_verify(path)
+                if (
+                    path == paths.config_file
+                    and json.loads(path.read_text(encoding="utf-8"))["specification_root"]
+                    == str(second.resolve())
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError("injected post-replacement verification failure")
+                return details
+
+            with session_start:
+                session.start_runtime(static_ready=lambda: True)
+                with patch.object(state, "_verify_record", side_effect=fail_after_replacement):
+                    with pytest.raises(desktop.SelectionUnavailableError):
+                        session.choose_workspace(second)
+                committed = paths.config_file.read_bytes()
+                assert json.loads(committed)["specification_root"] == str(second.resolve())
+                assert session.unverified
+                assert session.runtime is None
+                session.close()
+                assert paths.config_file.read_bytes() == committed
+                assert not session.claims.held
+
+
+def test_verified_switch_can_leave_saved_workspace_without_running_runtime():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+
+        class FakeApplicationRuntime:
+            created = 0
+
+            def __init__(self, **_kwargs):
+                self.index = FakeApplicationRuntime.created
+                FakeApplicationRuntime.created += 1
+
+            def start(self, *, static_ready=None):
+                if self.index == 1:
+                    raise RuntimeError("injected startup failure")
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def shutdown(self, _deadline):
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime(static_ready=lambda: True)
+            with pytest.raises(desktop.DesktopUnavailableError):
+                session.choose_workspace(second)
+            assert state.load_configuration() == state.Configuration(second.resolve(), ())
+            assert session.runtime is None
+            assert session.runtime_retryable
+            assert session.claims.held
+            session.close()
+            assert state.load_configuration() == state.Configuration(second.resolve(), ())
 
 
 def test_unavailable_shell_disables_change_save_and_revalidation():
