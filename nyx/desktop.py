@@ -673,7 +673,11 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
             presentation = self._session.paths.state_directory / PRESENTATION_DIRECTORY
             presentation.mkdir(parents=True, exist_ok=True)
-            profile = QtWebEngineCore.QWebEngineProfile(PRESENTATION_PROFILE_NAME)
+            # A named profile is persistent; parenting it to the window keeps a
+            # Python-object lifetime from outliving the shell.  Both storage
+            # paths must be overridden before the first page is created for the
+            # profile, which this ordering guarantees.
+            profile = QtWebEngineCore.QWebEngineProfile(PRESENTATION_PROFILE_NAME, self)
             profile.setPersistentStoragePath(str(presentation))
             profile.setCachePath(str(presentation / "cache"))
             return profile
@@ -828,36 +832,112 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
     return DesktopWindow()
 
 
+def _flush_deferred_deletes(application: Any) -> None:
+    """Drive queued deferred deletions so released Qt objects really die.
+
+    ``deleteLater`` only posts an event, and a plain ``processEvents`` call does
+    not dispatch posted deferred-deletion events.  A page, view, or profile
+    released with only ``processEvents`` can therefore stay alive, keeping its
+    on-disk storage locked, until process teardown.  Posting the deletion
+    explicitly with bounded event pumping makes the release observable.
+    """
+
+    try:
+        qt_core = _load_qt()["QtCore"]
+    except Exception:
+        qt_core = None
+    core_application = getattr(qt_core, "QCoreApplication", None)
+    q_event = getattr(qt_core, "QEvent", None)
+    deferred = getattr(getattr(q_event, "Type", None), "DeferredDelete", None)
+    if deferred is None:
+        deferred = getattr(q_event, "DeferredDelete", None)
+    pump = getattr(application, "processEvents", None)
+    for _ in range(8):
+        if core_application is not None and deferred is not None:
+            try:
+                core_application.sendPostedEvents(None, deferred)
+            except Exception:
+                pass
+        if callable(pump):
+            try:
+                pump()
+            except RuntimeError:
+                pass
+
+
+def _force_delete(obj: Any) -> None:
+    """Delete a Qt object synchronously when deferred deletion did not run."""
+
+    try:
+        import shiboken6
+    except ImportError:
+        return
+    try:
+        if shiboken6.isValid(obj):
+            shiboken6.delete(obj)
+    except Exception:
+        pass
+
+
+def _destroy_presentation_object(obj: Any, application: Any) -> None:
+    """Detach one presentation object and drive its deletion to completion."""
+
+    if obj is None:
+        return
+    try:
+        set_parent = getattr(obj, "setParent", None)
+        if callable(set_parent):
+            set_parent(None)
+    except RuntimeError:
+        return
+    try:
+        delete_later = getattr(obj, "deleteLater", None)
+        if callable(delete_later):
+            delete_later()
+    except RuntimeError:
+        return
+    _flush_deferred_deletes(application)
+    _force_delete(obj)
+
+
+def _safe_window_attribute(window: Any, name: str) -> Any:
+    """Read a window attribute without touching an already-deleted Qt object."""
+
+    try:
+        return getattr(window, name, None)
+    except RuntimeError:
+        return None
+
+
 def _release_presentation(application: Any, window: Any) -> None:
     """Tear down the presentation profile so its on-disk storage flushes.
 
     Qt WebEngine only guarantees that persistent page storage is written when
     the disk-based profile is destroyed, so the window's page, view, and
-    profile are released here instead of waiting for process teardown.
+    profile are destroyed here in child-before-owner order instead of waiting
+    for process teardown.  The release is idempotent: a repeated call, or Qt
+    objects that are already gone, are harmless.
     """
 
     if window is None:
         return
-    close = getattr(window, "close", None)
-    if callable(close):
-        close()
-    pump = getattr(application, "processEvents", None)
-    page = getattr(window, "_page", None)
-    board = getattr(window, "_board", None)
-    profile = getattr(window, "_profile", None)
-    delete_page = getattr(page, "deleteLater", None)
-    if callable(delete_page):
-        delete_page()
-    delete_board = getattr(board, "deleteLater", None)
-    if callable(delete_board):
-        delete_board()
-    if callable(pump):
-        pump()
-    delete_profile = getattr(profile, "deleteLater", None)
-    if callable(delete_profile):
-        delete_profile()
-    if callable(pump):
-        pump()
+    try:
+        close = getattr(window, "close", None)
+        if callable(close):
+            close()
+    except RuntimeError:
+        pass
+    page = _safe_window_attribute(window, "_page")
+    board = _safe_window_attribute(window, "_board")
+    profile = _safe_window_attribute(window, "_profile")
+    for attribute in ("_page", "_board", "_profile"):
+        try:
+            setattr(window, attribute, None)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+    _destroy_presentation_object(page, application)
+    _destroy_presentation_object(board, application)
+    _destroy_presentation_object(profile, application)
 
 
 def main(argv: list[str] | None = None) -> int:
