@@ -1110,7 +1110,11 @@ def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
             finally:
                 connection.close()
 
-        with _home_patches(home)[0], patch.object(runtime, "PORT", port):
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
             state.setup(first)
             session = desktop.DesktopSession()
             try:
@@ -1167,7 +1171,11 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
             finally:
                 connection.close()
 
-        with _home_patches(home)[0], patch.object(runtime, "PORT", port):
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
             state.setup(first)
             session = desktop.DesktopSession()
             try:
