@@ -2739,7 +2739,12 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                 timeout=30,
             )
             try:
-                catalog = json.loads(manager.fetch_catalog())
+                # The delivered helper resolves the account home in its own
+                # process, so the patched home must reach its environment.
+                with patch.dict(
+                    os.environ, {"HOME": str(home), "USERPROFILE": str(home)}
+                ):
+                    catalog = json.loads(manager.fetch_catalog())
             finally:
                 assert manager.close(time.monotonic() + 30)
         assert catalog["schema_version"] == 4
