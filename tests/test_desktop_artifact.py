@@ -51,13 +51,27 @@ class ArtifactLayout:
         self.artifact = artifact
         if artifact.suffix == ".app" or artifact.is_dir():
             self.application_root = artifact / "Contents" / "MacOS"
-            self.executable = self.application_root / "Nyx"
+            self.executable = self.application_root / _bundle_executable(artifact)
         else:
             self.executable = artifact
             self.application_root = artifact.parent
         worker_name = "NyxWorker.exe" if os.name == "nt" else "NyxWorker"
         self.helper = self.application_root / "NyxWorker" / worker_name
         self.resource = self.application_root / "nyx" / "static" / "app.js"
+
+
+def _bundle_executable(bundle: Path) -> str:
+    """Read the declared macOS bundle executable so the name stays authoritative."""
+
+    plist = bundle / "Contents" / "Info.plist"
+    try:
+        import plistlib
+
+        with plist.open("rb") as handle:
+            executable = plistlib.load(handle).get("CFBundleExecutable")
+    except (OSError, ValueError):
+        executable = None
+    return executable or "NyxApp"
 
 
 @pytest.fixture(scope="module")
