@@ -1780,6 +1780,29 @@ def test_failed_runtime_start_leaves_the_board_unloaded():
             session.close()
 
 
+def test_board_load_failure_without_an_opened_board_keeps_the_chooser():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            assert session.runtime is None
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            # No admitted work exists and no board navigation was issued, so a
+            # stray failed load (for example an internal blank navigation) must
+            # not be mistaken for an admitted-work failure and reap the chooser.
+            window._board.loadFinished.emit(False)
+            assert not window._board_failed
+            assert session.claims.held
+            assert window._visible
+            assert not session.shutdown_blocked
+            session.close()
+            assert not session.claims.held
+
+
 def test_post_admission_board_load_failure_reaps_shared_runtime():
     port = _free_loopback_port()
     with TemporaryDirectory() as temporary:
