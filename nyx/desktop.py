@@ -229,6 +229,10 @@ class DesktopSession:
     def switch_in_progress(self) -> bool:
         return self._switch_in_progress
 
+    @property
+    def switch_retryable(self) -> bool:
+        return self._pending_switch is not None
+
     def retry_recovery(self) -> bool:
         """Retry former-worker cleanup without changing persisted state."""
 
@@ -290,8 +294,18 @@ class DesktopSession:
         pending = self._pending_switch
         if pending is None:
             return False
-        self.revalidate()
+        recovering_committed = self._unverified
+        persisted = self.revalidate()
         self._switch_blocked = False
+        if recovering_committed and persisted == pending.configuration:
+            self._pending_switch = None
+            if not pending.runtime_expected:
+                return True
+            try:
+                self.start_runtime()
+            except DesktopError:
+                return False
+            return True
         try:
             self._switch_to(pending.configuration, pending.runtime_expected)
         except DesktopError:
@@ -696,12 +710,12 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
         def _revalidate(self) -> None:
             try:
-                if self._session.switch_blocked:
+                if self._session.switch_retryable:
                     self._session.retry_workspace_switch()
                 elif self._session.shutdown_blocked:
                     self.close()
                     return
-                if (
+                elif (
                     self._session.recovery_blocked
                     or self._session.runtime_retryable
                 ):
