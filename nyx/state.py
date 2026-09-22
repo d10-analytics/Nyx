@@ -190,13 +190,18 @@ def _is_packaged_application() -> bool:
     return bool(getattr(compiled, "standalone", False))
 
 
+_WORKER_HELPER_DIRECTORY = "NyxWorker"
+
+
 def _packaged_footprints() -> tuple[Path, ...]:
     """Resolve the packaged application, helper, and resource subtrees.
 
     The whole application installation is rejected so a workspace cannot be a
     subdirectory of the delivered application, and the helper and resource
     subtrees are named explicitly so admission stays correct even if the
-    bundle root is not otherwise recognizable.
+    bundle root is not otherwise recognizable.  The console helper runs one
+    directory below the application root, so its enclosing installation is
+    resolved there as well.
     """
 
     if not _is_packaged_application():
@@ -205,20 +210,26 @@ def _packaged_footprints() -> tuple[Path, ...]:
         executable = Path(sys.executable).resolve(strict=True)
     except (OSError, RuntimeError):
         return ()
-    roots: list[Path] = [executable.parent]
     bundle = next((parent for parent in executable.parents if parent.suffix == ".app"), None)
-    if bundle is None:
-        roots.append(executable.parent / "NyxWorker")
+    if bundle is not None:
+        roots = [
+            executable.parent,
+            bundle,
+            bundle / "Contents",
+            bundle / "Contents" / "MacOS",
+            bundle / "Contents" / "Frameworks",
+            bundle / "Contents" / "Resources",
+        ]
     else:
-        roots.extend(
-            (
-                bundle,
-                bundle / "Contents",
-                bundle / "Contents" / "MacOS",
-                bundle / "Contents" / "Frameworks",
-                bundle / "Contents" / "Resources",
-            )
-        )
+        if executable.parent.name == _WORKER_HELPER_DIRECTORY:
+            application_root = executable.parent.parent
+        else:
+            application_root = executable.parent
+        roots = [
+            application_root,
+            executable.parent,
+            application_root / _WORKER_HELPER_DIRECTORY,
+        ]
     return tuple(dict.fromkeys(roots))
 
 

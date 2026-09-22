@@ -132,7 +132,10 @@ def _render_spec(values: dict[str, str]) -> Path:
         _require(token in text, f"deployment configuration is missing {token}")
         text = text.replace(token, values[token])
     for line in text.splitlines():
-        _require("@", f"deployment configuration kept an unresolved placeholder: {line!r}")
+        _require(
+            "@" not in line,
+            f"deployment configuration kept an unresolved placeholder: {line!r}",
+        )
     rendered = BUILD_ROOT / SPEC_FILE.name
     rendered.write_text(text, encoding="utf-8")
     return rendered
