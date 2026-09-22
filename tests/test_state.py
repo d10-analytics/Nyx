@@ -960,3 +960,27 @@ def test_footprint_rejection_preserves_prior_configuration_bytes(tmp_path, monke
         with pytest.raises(state.SpecificationRootError):
             state.save_configuration_owned(inside, paths=paths)
         assert paths.config_file.read_bytes() == before
+
+
+def test_persisted_configuration_inside_a_packaged_footprint_stays_unavailable(
+    tmp_path, monkeypatch
+):
+    application, _ = _packaged_application(tmp_path, monkeypatch)
+    inside = application / "workspace"
+    inside.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    home = isolated_home(tmp_path)
+    home_patch, uid_patch = configure_home(home)
+    with home_patch, uid_patch:
+        paths = state.state_paths(create=True)
+        state._save_configuration(paths, external.resolve(), ())
+        assert state.load_configuration(paths).specification_root == external.resolve()
+        state._save_configuration(paths, inside.resolve(), ())
+        with pytest.raises(state.ConfigurationError):
+            state.load_configuration(paths)
+        with pytest.raises(state.ConfigurationError):
+            state.revalidate_configuration(paths)
+        observed = state.observe_configuration()
+    assert observed.status == "unavailable"
+    assert observed.specification_root is None
