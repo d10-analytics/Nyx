@@ -22,16 +22,27 @@ from nyx._native_claim import NativeClaim
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 try:
-    from PySide6 import QtCore, QtTest, QtWidgets
+    from PySide6 import (
+        QtCore,
+        QtTest,
+        QtWebEngineCore,
+        QtWebEngineWidgets,
+        QtWidgets,
+    )
 except ImportError as _qt_error:  # Linux source collection remains dependency-light.
     QtCore = None
     QtTest = None
+    QtWebEngineCore = None
+    QtWebEngineWidgets = None
     QtWidgets = None
     if _NATIVE_REQUIRED:
         pytest.fail(
             f"required native desktop dependency is unavailable: {_qt_error}",
             allow_module_level=True,
         )
+
+_NATIVE_BOARD = _NATIVE_REQUIRED and QtWebEngineWidgets is not None
+_NATIVE_BOARD_SKIP = "required native QtWebEngine board lane is not enabled"
 
 
 def _home(root: Path) -> Path:
@@ -139,9 +150,76 @@ class _Layout:
         pass
 
 
+class _WebSignal:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in self._callbacks:
+            callback(*args)
+
+
+class _WebEngineProfile:
+    def __init__(self, name=None, parent=None):
+        self._name = name
+        self._persistent_path = None
+        self._cache_path = None
+        self._off_the_record = name is None
+
+    def setPersistentStoragePath(self, path):
+        self._persistent_path = path
+
+    def persistentStoragePath(self):
+        return self._persistent_path
+
+    def setCachePath(self, path):
+        self._cache_path = path
+
+    def cachePath(self):
+        return self._cache_path
+
+    def isOffTheRecord(self):
+        return self._off_the_record
+
+
+class _WebEnginePage:
+    def __init__(self, profile=None, parent=None):
+        self._profile = profile
+
+    def profile(self):
+        return self._profile
+
+    def runJavaScript(self, script, callback=None, *_):
+        if callback is not None:
+            callback(None)
+
+
+class _WebEngineView(_Widget):
+    def __init__(self, *_):
+        super().__init__()
+        self.loadFinished = _WebSignal()
+        self._url = None
+        self._page = None
+
+    def setPage(self, page):
+        self._page = page
+
+    def page(self):
+        return self._page
+
+    def setUrl(self, url):
+        self._url = url
+
+    def url(self):
+        return self._url
+
+
 def _fake_qt():
     return {
-        "QtCore": SimpleNamespace(),
+        "QtCore": SimpleNamespace(QUrl=lambda value: value),
         "QtWidgets": SimpleNamespace(
             QFormLayout=_Layout,
             QHBoxLayout=_Layout,
@@ -152,6 +230,11 @@ def _fake_qt():
             QVBoxLayout=_Layout,
             QWidget=_Widget,
         ),
+        "QtWebEngineCore": SimpleNamespace(
+            QWebEnginePage=_WebEnginePage,
+            QWebEngineProfile=_WebEngineProfile,
+        ),
+        "QtWebEngineWidgets": SimpleNamespace(QWebEngineView=_WebEngineView),
     }
 
 
@@ -267,6 +350,16 @@ class Layout:
     def addRow(self, *args): pass
     def addWidget(self, *args): pass
     def addLayout(self, *args): pass
+class WebProfile:
+    def __init__(self, *args): pass
+    def setPersistentStoragePath(self, value): pass
+    def setCachePath(self, value): pass
+class WebPage:
+    def __init__(self, *args): pass
+class WebView(Widget):
+    def __init__(self, *args): super().__init__(*args); self.loadFinished = Signal()
+    def setPage(self, value): pass
+    def setUrl(self, value): pass
 class Application:
     @classmethod
     def instance(cls): return None
@@ -279,7 +372,14 @@ widgets = SimpleNamespace(
     QLabel=Label, QLineEdit=LineEdit, QMainWindow=MainWindow,
     QPushButton=Button, QVBoxLayout=Layout, QWidget=Widget,
 )
-desktop._load_qt = lambda: {"QtCore": SimpleNamespace(), "QtWidgets": widgets}
+web_widgets = SimpleNamespace(QWebEngineView=WebView)
+web_core = SimpleNamespace(QWebEnginePage=WebPage, QWebEngineProfile=WebProfile)
+desktop._load_qt = lambda: {
+    "QtCore": SimpleNamespace(QUrl=lambda value: value),
+    "QtWidgets": widgets,
+    "QtWebEngineCore": web_core,
+    "QtWebEngineWidgets": web_widgets,
+}
 raise SystemExit(desktop.main([]))
 """
 
@@ -1374,7 +1474,10 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
     class Widgets:
         QApplication = Application
 
-    window = SimpleNamespace(show=lambda: calls.append("show"))
+    window = SimpleNamespace(
+        show=lambda: calls.append("show"),
+        _open_board=lambda: calls.append("open_board"),
+    )
     with (
         patch.object(desktop, "DesktopSession", Session),
         patch.object(desktop, "_load_qt", return_value={"QtWidgets": Widgets}),
@@ -1382,7 +1485,9 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
     ):
         assert desktop.main([]) == 0
 
-    assert calls == ["start_runtime", "show", "close"]
+    assert calls[:2] == ["start_runtime", "show"]
+    assert calls[-1] == "close"
+    assert calls[2:-1] in ([], ["open_board"])
 
 
 def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
