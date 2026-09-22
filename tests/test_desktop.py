@@ -2341,6 +2341,101 @@ def test_required_native_engine_sanity_separates_renderer_from_loopback_serving(
             assert released
 
 
+_BOARD_JSON_SNAPSHOT_SCRIPT = (
+    "JSON.stringify({"
+    " href: String(location.href),"
+    " origin: String(location.origin),"
+    " hasStatus: !!document.querySelector('#status'),"
+    " status: document.querySelector('#status')"
+    " ? String(document.querySelector('#status').textContent) : '',"
+    " titles: [...document.querySelectorAll('.card-title')]"
+    ".map((node) => String(node.textContent))"
+    " })"
+)
+
+
+def _wait_for_json_board(application, page, timeout: float = 60.0, probe=None):
+    """Read the navigated board through a string result.
+
+    QtWebEngine's ``runJavaScript`` result reaches Python through a conversion
+    that carries only boolean, numeric, and string values; a JavaScript object
+    arrives as an empty string, so an object-returning snapshot cannot tell a
+    rendered board apart from a blank document.  ``JSON.stringify`` returns a
+    string and therefore survives the callback.
+    """
+
+    deadline = time.monotonic() + timeout
+    raw = None
+    snapshot = None
+    while time.monotonic() < deadline:
+        raw = _eval_js(application, page, _BOARD_JSON_SNAPSHOT_SCRIPT, timeout=15.0)
+        if isinstance(raw, str) and raw:
+            try:
+                snapshot = json.loads(raw)
+            except ValueError:
+                snapshot = None
+        if isinstance(snapshot, dict) and str(snapshot.get("status", "")).startswith(
+            "Loaded"
+        ):
+            return snapshot
+        _pump_native_events(application, 50)
+    navigation = probe.describe() if probe is not None else None
+    raise AssertionError(
+        "board JSON snapshot never observed a loaded catalog: "
+        f"raw={raw!r} navigation={navigation!r}"
+    )
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_board_json_snapshot_separates_rendering_from_observation():
+    """Prove the board renders using a string result the binding can deliver.
+
+    The self-contained engine-sanity document already shows that a string
+    result works on this engine instance, so an empty object snapshot cannot be
+    attributed to the shared runtime.  Reading the navigated DOM through
+    ``JSON.stringify`` fails only when the board document itself did not render
+    its catalog content, which is the distinction the native proof needs.
+    """
+
+    _assert_native_host_has_no_offscreen_platform()
+    port = _free_loopback_port()
+    with _native_temp_home() as root:
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace, ["Done"])
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            shared = session.runtime
+            assert shared is not None and shared.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            released = None
+            try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=shared.board_url())
+                assert window._open_board()
+                snapshot = _wait_for_json_board(application, page, probe=probe)
+                assert snapshot["origin"] == f"http://127.0.0.1:{port}"
+                assert snapshot["hasStatus"] is True
+                assert "Alpha delivery" in snapshot["titles"]
+            finally:
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
+            assert released
+
+
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_embedded_board_renders_content_hidden_stage_and_dependency():
     _assert_native_host_has_no_offscreen_platform()
