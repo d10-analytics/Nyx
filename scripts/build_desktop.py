@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -230,6 +231,42 @@ def _verify_resources(application: Path) -> Path:
     return matches[0]
 
 
+MACOS_FRAMEWORK_ROOT = Path("PySide6") / "Qt" / "lib"
+MACOS_FRAMEWORK_FLAT_ROOT = Path("PySide6")
+
+
+def _link_macos_qt_frameworks(macos_root: Path) -> None:
+    """Expose staged Qt frameworks where the engine's relative rpaths expect them.
+
+    The generated QtWebEngine host carries relative rpaths that do not land on
+    the ``PySide6/Qt/lib`` directory produced by staging.  Linking the
+    frameworks at those relative roots keeps the delivered renderer loading
+    only from inside the bundle instead of the build environment.
+    """
+
+    library_root = macos_root / MACOS_FRAMEWORK_ROOT
+    _require(library_root.is_dir(), f"the staged Qt framework root is missing: {library_root}")
+    frameworks = sorted(
+        path for path in library_root.glob("*.framework") if path.is_dir()
+    )
+    _require(bool(frameworks), f"the staged bundle carries no Qt frameworks: {library_root}")
+    for framework in frameworks:
+        flat = macos_root / MACOS_FRAMEWORK_FLAT_ROOT / framework.name
+        if not os.path.lexists(flat):
+            flat.symlink_to(Path("Qt") / "lib" / framework.name, target_is_directory=True)
+    host = library_root / "QtWebEngineCore.framework"
+    nested = host / "lib"
+    if host.is_dir() and not os.path.lexists(nested):
+        nested.symlink_to("..", target_is_directory=True)
+
+
+def _link_macos_frameworks(application: Path) -> None:
+    if sys.platform != "darwin":
+        return
+    _link_macos_qt_frameworks(_application_root(application))
+
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -277,6 +314,7 @@ def build() -> dict[str, Any]:
     executable = _find_standalone_component(
         _application_root(application), gui_entry_name, executable=True
     )
+    _link_macos_frameworks(application)
     manifest = {
         "schema": "nyx-desktop-artifact/1",
         "platform": sys.platform,
