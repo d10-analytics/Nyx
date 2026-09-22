@@ -1018,6 +1018,70 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
             session.close()
 
 
+def test_postcommit_switch_retry_revalidates_then_restarts_saved_workspace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                instances.append(self)
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def shutdown(self, _deadline):
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime(static_ready=lambda: True)
+            window = desktop._build_window(_fake_qt(), session)
+            window._change.click()
+            window._root.setText(str(second))
+            original_verify = state._verify_record
+            failed = False
+
+            def fail_once(path):
+                nonlocal failed
+                details = original_verify(path)
+                if (
+                    path == paths.config_file
+                    and json.loads(path.read_text(encoding="utf-8"))["specification_root"]
+                    == str(second.resolve())
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError("injected post-replacement verification failure")
+                return details
+
+            with patch.object(state, "_verify_record", side_effect=fail_once):
+                window._save.click()
+                assert session.unverified
+                assert session.runtime is None
+                assert window._retry.isEnabled()
+
+            window._retry.click()
+
+            assert not session.unverified
+            assert session.configuration == state.Configuration(second.resolve(), ())
+            assert session.runtime is instances[1]
+            session.close()
+
+
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
