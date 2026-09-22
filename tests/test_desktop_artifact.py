@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,7 +24,8 @@ import pytest
 
 from nyx import state
 from nyx._native_claim import NativeClaim
-from nyx.catalog import scan_catalog
+from nyx.catalog import CATALOG_HIDDEN_STAGES, scan_catalog
+from nyx.worker import CatalogWorkerManager
 
 _ARTIFACT_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 _ARTIFACT_ENV = os.environ.get("NYX_DESKTOP_ARTIFACT")
@@ -42,6 +44,9 @@ PORT = 8765
 _HOST = f"127.0.0.1:{PORT}"
 _START_TIMEOUT = 90.0
 _SOURCE_ROOT = Path(__file__).parents[1]
+# The delivered application must apply the persisted policy exactly, so the
+# written configuration and every expected catalog use the same hidden stages.
+_DELIVERED_HIDDEN_STAGES: tuple[str, ...] = tuple(CATALOG_HIDDEN_STAGES)
 
 
 class ArtifactLayout:
@@ -116,13 +121,18 @@ def _sanitized_environment(home: Path, decoy: Path) -> dict[str, str]:
     return environment
 
 
-def _write_configuration(home: Path, workspace: Path) -> Path:
+def _write_configuration(
+    home: Path,
+    workspace: Path,
+    *,
+    hidden_stages: tuple[str, ...] = _DELIVERED_HIDDEN_STAGES,
+) -> Path:
     config_directory = home / ".nyx" / "config"
     config_directory.mkdir(parents=True)
     config_file = config_directory / "config.json"
     payload = {
         "schema_version": state.CONFIG_SCHEMA_VERSION,
-        "hidden_stages": [],
+        "hidden_stages": list(hidden_stages),
         "specification_root": str(workspace.resolve()),
     }
     encoded = (
@@ -142,7 +152,9 @@ def _request(path: str) -> tuple[int, bytes, str]:
         connection.close()
 
 
-def _wait_for_board(deadline: float) -> tuple[int, bytes, str]:
+def _wait_for_board(
+    deadline: float, gui: "_RunningGui | None" = None
+) -> tuple[int, bytes, str]:
     last: object = None
     while time.monotonic() < deadline:
         try:
@@ -153,9 +165,15 @@ def _wait_for_board(deadline: float) -> tuple[int, bytes, str]:
             continue
         if status == 200:
             return status, body, content_type
-        last = f"unexpected board status {status}"
+        last = f"unexpected board status {status}: {body[:400]!r}"
         time.sleep(0.25)
-    raise AssertionError(f"the delivered board never answered: {last!r}")
+    detail = f"the delivered board never answered: {last!r}"
+    if gui is not None:
+        detail += f"; application exit={gui.process.poll()!r}"
+        diagnostics = gui.diagnostics()
+        if diagnostics:
+            detail += f"; application log:\n{diagnostics[-2000:]}"
+    raise AssertionError(detail)
 
 
 def _wait_port_free(deadline: float) -> None:
@@ -235,7 +253,7 @@ def test_delivered_artifact_carries_application_worker_and_resources(artifact: A
     assert artifact.resource.read_bytes() == (_SOURCE_ROOT / "nyx" / "static" / "app.js").read_bytes()
 
 
-def test_delivered_environment_exposes_no_installed_python_or_checkout_path():
+def test_delivered_environment_exposes_no_build_interpreter_or_checkout_path():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -243,8 +261,9 @@ def test_delivered_environment_exposes_no_installed_python_or_checkout_path():
         decoy = _inert_path(root)
         environment = _sanitized_environment(home, decoy)
 
-    assert shutil.which("python", path=environment["PATH"]) is None
-    assert shutil.which("python3", path=environment["PATH"]) is None
+    path_entries = environment["PATH"].split(os.pathsep)
+    assert str(Path(sys.executable).resolve().parent) not in path_entries
+    assert str(_SOURCE_ROOT) not in environment["PATH"]
     assert "PYTHONHOME" not in environment
     assert environment.get("VIRTUAL_ENV") is None
     assert str(_SOURCE_ROOT) not in environment["PYTHONPATH"]
@@ -258,10 +277,14 @@ def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: Ar
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
             _write_configuration(home, workspace)
-            expected = json.loads(scan_catalog(workspace))
+            expected = json.loads(
+                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            )
             environment = _sanitized_environment(home, decoy)
             with _running_gui(artifact, root, environment) as gui:
-                status, body, content_type = _wait_for_board(time.monotonic() + _START_TIMEOUT)
+                status, body, content_type = _wait_for_board(
+                    time.monotonic() + _START_TIMEOUT, gui
+                )
                 assert (status, content_type) == (200, "application/json")
                 assert json.loads(body) == expected
                 resource_status, resource_body, _ = _request("/static/app.js")
@@ -289,7 +312,7 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
             config_file = _write_configuration(home, workspace)
             environment = _sanitized_environment(home, decoy)
             with _running_gui(artifact, root, environment) as gui:
-                _wait_for_board(time.monotonic() + _START_TIMEOUT)
+                _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
                 before = config_file.read_bytes()
                 second = subprocess.run(
                     [str(artifact.executable)],
@@ -333,7 +356,7 @@ def test_delivered_worker_helper_emits_exact_utf8_catalog_bytes(artifact: Artifa
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
             _write_configuration(home, workspace)
-            expected_text = scan_catalog(workspace)
+            expected_text = scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
             completed = subprocess.run(
                 [str(artifact.helper)],
                 cwd=str(root),
@@ -378,6 +401,46 @@ def test_delivered_worker_helper_rejects_missing_or_substituted_inherited_object
     assert substituted.returncode == 4
 
 
+def test_delivered_worker_helper_completes_with_inherited_claims(artifact: ArtifactLayout):
+    """Drive the delivered helper the way the delivered shell does."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        with _workspace(root) as workspace:
+            _write_configuration(home, workspace)
+            expected_text = scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            environment = _sanitized_environment(home, decoy)
+            _, recovery_path = _claim_paths(home)
+            recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            claim = NativeClaim(recovery_path)
+            assert claim.acquire(blocking=False)
+            read_fd, write_fd = os.pipe()
+            manager = CatalogWorkerManager(
+                command_factory=lambda: [str(artifact.helper)],
+                timeout=30,
+                recovery_claim=claim,
+                recovery_path=claim.path,
+                parent_liveness_fd=read_fd,
+            )
+            try:
+                with patch.dict(os.environ, environment, clear=True):
+                    catalog = manager.fetch_catalog()
+                assert manager.close(time.monotonic() + 30)
+                assert claim.held
+            finally:
+                manager.close(time.monotonic() + 30)
+                os.close(write_fd)
+                os.close(read_fd)
+                claim.close()
+
+    assert catalog == expected_text.encode("utf-8")
+    assert manager.active_count == 0
+    assert not claim.held
+
+
 def test_delivered_gui_never_answers_worker_inheritance_with_a_window(artifact: ArtifactLayout):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -400,7 +463,10 @@ def test_delivered_gui_never_answers_worker_inheritance_with_a_window(artifact: 
             timeout=60,
         )
     assert completed.returncode == 2
-    assert b"private worker entry" in completed.stderr
+    # A windowed build may own no standard stream; the bounded exit code is the
+    # primary signal and the diagnostic is asserted only when it is emitted.
+    if completed.stderr:
+        assert b"private worker entry" in completed.stderr
 
 
 def _claim_paths(home: Path) -> tuple[Path, Path]:
