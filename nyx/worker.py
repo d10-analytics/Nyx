@@ -42,6 +42,40 @@ def _is_packaged_application() -> bool:
     return bool(getattr(compiled, "standalone", False))
 
 
+def _packaged_executable_roots() -> tuple[Path, ...]:
+    """Resolve the directories that can hold the staged console helper.
+
+    A standalone build may report its launcher through ``sys.executable`` or
+    ``sys.argv[0]``, and a windowed Windows build additionally exposes the
+    real image path through ``GetModuleFileNameW``.  Every candidate is
+    resolved so the helper is found beside whichever path describes the
+    running application.
+    """
+
+    candidates: list[str] = []
+    if sys.executable:
+        candidates.append(sys.executable)
+    if getattr(sys, "argv", None):
+        candidates.append(sys.argv[0])
+    if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            buffer = ctypes.create_unicode_buffer(32768)
+            if kernel32.GetModuleFileNameW(None, buffer, len(buffer)):
+                candidates.append(buffer.value)
+        except (OSError, AttributeError):
+            pass
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            roots.append(Path(candidate).resolve(strict=True).parent)
+        except (OSError, RuntimeError):
+            continue
+    return tuple(dict.fromkeys(roots))
+
+
 def bundled_worker_command() -> list[str] | None:
     """Return the packaged console helper command when one is staged.
 
@@ -53,22 +87,18 @@ def bundled_worker_command() -> list[str] | None:
 
     if not _is_packaged_application():
         return None
-    try:
-        executable = Path(sys.executable).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return None
     name = (
         f"{WORKER_EXECUTABLE_NAME}.exe"
         if os.name == "nt"
         else WORKER_EXECUTABLE_NAME
     )
-    candidates = (
-        executable.parent / WORKER_HELPER_DIRECTORY / name,
-        executable.parent / name,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return [str(candidate)]
+    for root in _packaged_executable_roots():
+        for candidate in (
+            root / WORKER_HELPER_DIRECTORY / name,
+            root / name,
+        ):
+            if candidate.is_file():
+                return [str(candidate)]
     return None
 
 
