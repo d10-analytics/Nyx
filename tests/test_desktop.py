@@ -1982,7 +1982,7 @@ def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
                 session.close()
 
 
-_BOARD_SNAPSHOT_SCRIPT = """
+_BOARD_JSON_SNAPSHOT_SCRIPT = """
 (() => {
   const result = {
     href: null,
@@ -1998,20 +1998,20 @@ _BOARD_SNAPSHOT_SCRIPT = """
     stored: null,
   };
   try {
-    result.href = location.href;
-    result.readyState = document.readyState;
-    result.origin = location.origin;
+    result.href = String(location.href);
+    result.readyState = String(document.readyState);
+    result.origin = String(location.origin);
     result.hasStatus = !!document.querySelector('#status');
-    result.status = document.querySelector('#status') ? document.querySelector('#status').textContent : '';
-    result.titles = [...document.querySelectorAll('.card-title')].map((node) => node.textContent);
-    result.rows = [...document.querySelectorAll('.board-row')].map((node) => node.dataset.lifecycle);
-    result.links = [...document.querySelectorAll('.card-links')].map((node) => node.textContent);
-    result.compact = document.querySelector('#compact-view') ? document.querySelector('#compact-view').checked : null;
+    result.status = document.querySelector('#status') ? String(document.querySelector('#status').textContent) : '';
+    result.titles = [...document.querySelectorAll('.card-title')].map((node) => String(node.textContent));
+    result.rows = [...document.querySelectorAll('.board-row')].map((node) => String(node.dataset.lifecycle));
+    result.links = [...document.querySelectorAll('.card-links')].map((node) => String(node.textContent));
+    result.compact = document.querySelector('#compact-view') ? !!document.querySelector('#compact-view').checked : null;
     result.stored = window.localStorage.getItem('spec-tracker-compact-view');
   } catch (error) {
     result.error = error.name + ': ' + error.message;
   }
-  return result;
+  return JSON.stringify(result);
 })()
 """
 
@@ -2130,27 +2130,79 @@ def _eval_js(application, page, script, timeout: float = 30.0):
     return outcome["value"]
 
 
-def _board_diagnostic(snapshot, probe=None) -> str:
-    parts = [f"snapshot={snapshot!r}"]
+def _board_diagnostic(snapshot, probe=None, raw=None) -> str:
+    parts = []
+    if raw is not None:
+        parts.append(f"raw={raw!r}")
+    parts.append(f"snapshot={snapshot!r}")
     if probe is not None:
         parts.append(f"navigation={probe.describe()!r}")
     return "board did not load: " + " ".join(parts)
 
 
-def _wait_for_board(application, page, timeout: float = 60.0, probe=None):
+def _parse_board_observation(raw, probe=None):
+    """Parse the string result of the board observation script.
+
+    ``runJavaScript`` reaches Python through a binding that carries only
+    boolean, numeric, and string results; a JavaScript object is converted to a
+    value whose string form is empty.  The board therefore observes itself by
+    returning ``JSON.stringify`` output.  A result that is not a non-empty JSON
+    object string is a hard, explicitly reported contract failure rather than a
+    silently empty snapshot.
+    """
+
+    if not isinstance(raw, str):
+        raise AssertionError(
+            "board observation was not delivered as a string result "
+            f"(binding returned {type(raw).__name__}): "
+            + _board_diagnostic(None, probe, raw)
+        )
+    if raw == "":
+        raise AssertionError(
+            "board observation was an empty string, so no JSON board state can "
+            "be read through this binding: " + _board_diagnostic(None, probe, raw)
+        )
+    try:
+        snapshot = json.loads(raw)
+    except ValueError as error:
+        raise AssertionError(
+            f"board observation was not valid JSON ({error}): "
+            + _board_diagnostic(None, probe, raw)
+        ) from error
+    if not isinstance(snapshot, dict):
+        raise AssertionError(
+            "board observation was not a JSON object: "
+            + _board_diagnostic(snapshot, probe, raw)
+        )
+    return snapshot
+
+
+def _wait_for_json_board(application, page, timeout: float = 60.0, probe=None):
+    """Read the navigated board through a string result.
+
+    ``_BOARD_JSON_SNAPSHOT_SCRIPT`` returns ``JSON.stringify`` output because
+    QtWebEngine's ``runJavaScript`` result conversion delivers only boolean,
+    numeric, and string values; an object-returning snapshot arrives as an
+    empty string and cannot tell a rendered board apart from a blank document.
+    A missing, empty, or malformed string result is a hard failure, and the
+    board is accepted only once its status reports a loaded catalog.
+    """
+
     deadline = time.monotonic() + timeout
+    raw = None
     snapshot = None
     while time.monotonic() < deadline:
         try:
-            snapshot = _eval_js(application, page, _BOARD_SNAPSHOT_SCRIPT, timeout=15.0)
+            raw = _eval_js(
+                application, page, _BOARD_JSON_SNAPSHOT_SCRIPT, timeout=15.0
+            )
         except AssertionError as error:
-            raise AssertionError(_board_diagnostic(str(error), probe)) from error
-        if isinstance(snapshot, dict) and str(snapshot.get("status", "")).startswith(
-            "Loaded"
-        ):
+            raise AssertionError(_board_diagnostic(snapshot, probe, raw)) from error
+        snapshot = _parse_board_observation(raw, probe)
+        if str(snapshot.get("status", "")).startswith("Loaded"):
             return snapshot
         _pump_native_events(application, 50)
-    raise AssertionError(_board_diagnostic(snapshot, probe))
+    raise AssertionError(_board_diagnostic(snapshot, probe, raw))
 
 
 def _wait_for_status(application, page, prefix: str, timeout: float = 30.0):
@@ -2180,10 +2232,13 @@ def _wait_for_engine_sanity(application, page, timeout: float = 30.0):
             " return node ? node.textContent : null; })()",
             timeout=10.0,
         )
-        if value == "ready":
+        if isinstance(value, str) and value == "ready":
             return value
         _pump_native_events(application, 50)
-    raise AssertionError(f"engine sanity document never rendered: {value!r}")
+    raise AssertionError(
+        "self-contained engine sanity string control never returned 'ready': "
+        f"{value!r}"
+    )
 
 
 def _presentation_store_is_releasable(path: Path) -> bool:
@@ -2272,13 +2327,15 @@ _ENGINE_SANITY_HTML = (
 
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_engine_sanity_separates_renderer_from_loopback_serving():
-    """Distinguish a broken renderer from a loopback server/navigation problem.
+    """Contrast a self-contained string probe with the navigated board.
 
-    A self-contained document must evaluate on the same engine instance the
-    board proofs use.  When it does but the loopback board does not, the shared
-    runtime and its serving path are exonerated: the remaining limitation is
-    the engine or its network access.  The failure message names that
-    observation instead of asserting only an empty board snapshot.
+    The self-contained document reports its marker from ``textContent``, a
+    JavaScript string, so it is a valid control for the string JSON observation
+    contract the board proofs use.  When the control returns its marker and
+    Python serving returns the catalog but the board string observation still
+    does not report a loaded catalog, the failure message reports both raw
+    observations and the binding fact instead of blaming the renderer or its
+    network access.
     """
 
     _assert_native_host_has_no_offscreen_platform()
@@ -2305,6 +2362,10 @@ def test_required_native_engine_sanity_separates_renderer_from_loopback_serving(
                 sanity_probe = _NavigationProbe(page, requested_url="self-contained")
                 page.setHtml(_ENGINE_SANITY_HTML, QtCore.QUrl("http://127.0.0.1/"))
                 sanity = _wait_for_engine_sanity(application, page)
+                assert isinstance(sanity, str), (
+                    "the self-contained engine sanity control did not return a "
+                    f"string result: {sanity!r} {sanity_probe.describe()!r}"
+                )
                 assert sanity == "ready", (
                     "hosted QtWebEngine renderer could not evaluate a "
                     f"self-contained document: {sanity!r} "
@@ -2319,14 +2380,17 @@ def test_required_native_engine_sanity_separates_renderer_from_loopback_serving(
                 assert window._open_board()
                 board_probe = _NavigationProbe(page, requested_url=shared.board_url())
                 try:
-                    snapshot = _wait_for_board(application, page, probe=board_probe)
+                    snapshot = _wait_for_json_board(application, page, probe=board_probe)
                 except AssertionError as error:
                     raise AssertionError(
-                        "engine sanity and Python serving both succeeded "
-                        f"(catalog status {status}), but the loopback board did "
-                        "not complete navigation on this hosted image; the "
-                        "renderer or its network access is the limitation, not "
-                        f"the shared runtime: {error}"
+                        f"the self-contained string control returned {sanity!r} "
+                        "and Python serving returned catalog status "
+                        f"{status}, but the board string observation did not "
+                        "report a loaded catalog; this contrast is a raw "
+                        "observation about the runJavaScript result binding, "
+                        "which carries only boolean/numeric/string results, not "
+                        "proof that the renderer or its network access is the "
+                        f"limitation: {error}"
                     ) from error
                 assert "Alpha delivery" in snapshot["titles"]
             finally:
@@ -2341,49 +2405,53 @@ def test_required_native_engine_sanity_separates_renderer_from_loopback_serving(
             assert released
 
 
-_BOARD_JSON_SNAPSHOT_SCRIPT = (
-    "JSON.stringify({"
-    " href: String(location.href),"
-    " origin: String(location.origin),"
-    " hasStatus: !!document.querySelector('#status'),"
-    " status: document.querySelector('#status')"
-    " ? String(document.querySelector('#status').textContent) : '',"
-    " titles: [...document.querySelectorAll('.card-title')]"
-    ".map((node) => String(node.textContent))"
-    " })"
-)
+def test_board_json_observation_parses_strings_and_rejects_missing_results():
+    """Pin the string JSON observation contract without a native engine."""
 
+    class _FakePage:
+        def __init__(self, results):
+            self._results = list(results)
+            self.scripts = []
 
-def _wait_for_json_board(application, page, timeout: float = 60.0, probe=None):
-    """Read the navigated board through a string result.
+        def runJavaScript(self, script, callback=None, *_):
+            self.scripts.append(script)
+            callback(self._results.pop(0))
 
-    QtWebEngine's ``runJavaScript`` result reaches Python through a conversion
-    that carries only boolean, numeric, and string values; a JavaScript object
-    arrives as an empty string, so an object-returning snapshot cannot tell a
-    rendered board apart from a blank document.  ``JSON.stringify`` returns a
-    string and therefore survives the callback.
-    """
-
-    deadline = time.monotonic() + timeout
-    raw = None
-    snapshot = None
-    while time.monotonic() < deadline:
-        raw = _eval_js(application, page, _BOARD_JSON_SNAPSHOT_SCRIPT, timeout=15.0)
-        if isinstance(raw, str) and raw:
-            try:
-                snapshot = json.loads(raw)
-            except ValueError:
-                snapshot = None
-        if isinstance(snapshot, dict) and str(snapshot.get("status", "")).startswith(
-            "Loaded"
-        ):
-            return snapshot
-        _pump_native_events(application, 50)
-    navigation = probe.describe() if probe is not None else None
-    raise AssertionError(
-        "board JSON snapshot never observed a loaded catalog: "
-        f"raw={raw!r} navigation={navigation!r}"
+    payload = json.dumps(
+        {
+            "status": "Loaded 3 packages",
+            "titles": ["Alpha delivery", "Beta design"],
+            "rows": ["in-progress", "planned"],
+            "links": ["needs: Beta design"],
+            "compact": False,
+            "stored": "false",
+        }
     )
+    page = _FakePage([payload])
+    snapshot = _wait_for_json_board(object(), page, timeout=1.0)
+    assert snapshot["titles"] == ["Alpha delivery", "Beta design"]
+    assert snapshot["rows"] == ["in-progress", "planned"]
+    assert snapshot["links"] == ["needs: Beta design"]
+    assert snapshot["compact"] is False
+    assert snapshot["stored"] == "false"
+    assert "JSON.stringify" in page.scripts[0], (
+        "the board observation must return a string result, not an object"
+    )
+
+    empty = _FakePage([""])
+    with pytest.raises(AssertionError) as empty_error:
+        _wait_for_json_board(object(), empty, timeout=1.0)
+    assert "empty string" in str(empty_error.value)
+
+    missing = _FakePage([None])
+    with pytest.raises(AssertionError) as missing_error:
+        _wait_for_json_board(object(), missing, timeout=1.0)
+    assert "string result" in str(missing_error.value)
+
+    malformed = _FakePage(["not json"])
+    with pytest.raises(AssertionError) as malformed_error:
+        _wait_for_json_board(object(), malformed, timeout=1.0)
+    assert "valid JSON" in str(malformed_error.value)
 
 
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
@@ -2467,7 +2535,7 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
                 assert "Alpha delivery" in [
                     entry["declared"]["title"] for entry in payload["entries"]
                 ]
-                snapshot = _wait_for_board(application, page, probe=probe)
+                snapshot = _wait_for_json_board(application, page, probe=probe)
                 assert "Alpha delivery" in snapshot["titles"]
                 assert "Beta design" in snapshot["titles"]
                 assert "Hidden completed work" not in snapshot["titles"]
@@ -2522,7 +2590,7 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
                 page = window._board.page()
                 probe = _NavigationProbe(page, requested_url=shared.board_url())
                 assert window._open_board()
-                _wait_for_board(application, page, probe=probe)
+                _wait_for_json_board(application, page, probe=probe)
                 assert not window._profile.isOffTheRecord()
                 expected_storage = session.paths.state_directory / "presentation"
                 assert Path(window._profile.persistentStoragePath()) == expected_storage
@@ -2554,7 +2622,7 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
                 page = window._board.page()
                 probe = _NavigationProbe(page, requested_url=reopened_board.board_url())
                 assert window._open_board()
-                snapshot = _wait_for_board(application, page, probe=probe)
+                snapshot = _wait_for_json_board(application, page, probe=probe)
                 assert snapshot["compact"] is False
                 assert snapshot["stored"] == "false"
             finally:
