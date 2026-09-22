@@ -872,9 +872,14 @@ def _force_delete(obj: Any) -> None:
         import shiboken6
     except ImportError:
         return
+    namespace = getattr(shiboken6, "Shiboken", shiboken6)
+    is_valid = getattr(shiboken6, "isValid", None) or getattr(namespace, "isValid", None)
+    delete = getattr(shiboken6, "delete", None) or getattr(namespace, "delete", None)
+    if is_valid is None or delete is None:
+        return
     try:
-        if shiboken6.isValid(obj):
-            shiboken6.delete(obj)
+        if is_valid(obj):
+            delete(obj)
     except Exception:
         pass
 
