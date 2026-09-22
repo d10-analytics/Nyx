@@ -2782,3 +2782,19 @@ def test_macos_staging_exposes_frameworks_at_the_engine_relative_roots(tmp_path)
     driver._link_macos_qt_frameworks(macos_root)
     assert flat.is_symlink()
     assert nested.is_symlink()
+
+
+def test_build_driver_rejects_a_leftover_deployment_placeholder(tmp_path, monkeypatch):
+    driver = _build_desktop_driver()
+    spec_path = tmp_path / "pysidedeploy.spec"
+    spec_path.write_text(
+        "\n".join(driver._SPEC_TOKENS) + "\n@UNRESOLVED_PLACEHOLDER@\n",
+        encoding="utf-8",
+    )
+    build_root = tmp_path / "build"
+    build_root.mkdir()
+    monkeypatch.setattr(driver, "SPEC_FILE", spec_path)
+    monkeypatch.setattr(driver, "BUILD_ROOT", build_root)
+
+    with pytest.raises(driver.BuildError):
+        driver._render_spec({token: "resolved" for token in driver._SPEC_TOKENS})
