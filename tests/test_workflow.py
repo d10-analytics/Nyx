@@ -70,6 +70,7 @@ DESKTOP_ARTIFACT_COMMAND = "python -m pytest tests/test_desktop_artifact.py -v -
 DESKTOP_BUILD_COMMAND = "python scripts/build_desktop.py"
 DESKTOP_EXTRA_INSTALL = "python -m pip install -e '.[test,desktop,build]'"
 PWSH_FAILURE_GUARD = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+POSIX_FAILURE_GUARD = "set -euo pipefail"
 
 BROWSER_INSTALL_COMMANDS = {
     "nyx": '"$runner_python" -m playwright install --with-deps chromium',
@@ -79,7 +80,11 @@ BROWSER_INSTALL_COMMANDS = {
 
 ONE_WHEEL_MARKERS = {
     "nyx": ("find dist -maxdepth 1 -type f -name '*.whl'", 'test "$wheel_count" -eq 1'),
-    "nyx-windows": ("Get-ChildItem -Path dist -Filter '*.whl' -File", "$wheels.Count -ne 1"),
+    "nyx-windows": (
+        "Get-ChildItem -Path dist -Filter '*.whl' -File",
+        "$wheels.Count -ne 1",
+        'throw "Expected exactly one wheel, found $($wheels.Count)"',
+    ),
     "nyx-macos": ("find dist -maxdepth 1 -type f -name '*.whl'", 'test "$wheel_count" -eq 1'),
 }
 
@@ -99,6 +104,8 @@ SESSION_PREFLIGHT_MARKERS = {
         "[Environment]::UserInteractive",
         "$interactive",
         "'amd64', 'x86_64'",
+        "if (-not $interactive)",
+        "does not expose an interactive desktop session",
     ),
     "nyx-desktop-macos": (
         "${ImageOS:-}",
@@ -383,6 +390,24 @@ def check_powershell_failure_propagation(workflow: dict[str, Any]) -> list[str]:
     return problems
 
 
+def check_posix_failure_propagation(workflow: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for name in POSIX_JOBS:
+        job = _job(workflow, name)
+        if job is None:
+            problems.append(f"{name}: job is missing")
+            continue
+        for step in _steps(job):
+            if not _run_text(step) or step.get("shell") == "pwsh":
+                continue
+            if POSIX_FAILURE_GUARD not in _run_text(step):
+                problems.append(
+                    f"{name}: step {step.get('name')!r} does not enable "
+                    f"{POSIX_FAILURE_GUARD!r} shell failure propagation"
+                )
+    return problems
+
+
 def check_native_environment(workflow: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     for name, spec in DESKTOP_JOBS.items():
@@ -559,6 +584,7 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "linux_service_lane": check_linux_service_lane,
     "documented_install_lane": check_documented_install_lane,
     "powershell_failure_propagation": check_powershell_failure_propagation,
+    "posix_failure_propagation": check_posix_failure_propagation,
     "native_environment": check_native_environment,
     "native_dependencies": check_native_dependencies,
     "native_source_lane": check_native_source_lane,
@@ -620,6 +646,14 @@ def _mutate_weaken_one_wheel_assertion(workflow: dict[str, Any]) -> None:
     step["run"] = _run_text(step).replace(
         'test "$wheel_count" -eq 1', 'test "$wheel_count" -ge 0', 1
     )
+
+
+def _mutate_weaken_windows_wheel_enforcement(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-windows", "Verify package and installed lifecycle")
+    text = _run_text(step)
+    throw = 'throw "Expected exactly one wheel, found $($wheels.Count)"'
+    assert throw in text
+    step["run"] = text.replace(throw, 'Write-Host "unexpected wheel count"', 1)
 
 
 def _mutate_remove_installed_wheel_test(workflow: dict[str, Any]) -> None:
@@ -698,6 +732,18 @@ def _mutate_weaken_session_preflight(workflow: dict[str, Any]) -> None:
     step["run"] = _run_text(step).replace('test "$session_manager" = "Aqua"', "true", 1)
 
 
+def _mutate_omit_windows_session_gate(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-windows", PREFLIGHT_STEP)
+    text = _run_text(step)
+    gate = (
+        "if (-not $interactive) {\n"
+        "  throw 'windows-2025 does not expose an interactive desktop session'\n"
+        "}\n"
+    )
+    assert gate in text
+    step["run"] = text.replace(gate, "", 1)
+
+
 def _mutate_remove_artifact_tests(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
     step["run"] = _run_text(step).replace(f"{DESKTOP_ARTIFACT_COMMAND}\n", "", 1)
@@ -756,11 +802,35 @@ def _mutate_omit_powershell_failure_propagation(workflow: dict[str, Any]) -> Non
     step["run"] = "\n".join(kept) + "\n"
 
 
+def _mutate_omit_posix_failure_propagation(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx", "Verify package and installed service")
+    text = _run_text(step)
+    assert f"{POSIX_FAILURE_GUARD}\n" in text
+    step["run"] = text.replace(f"{POSIX_FAILURE_GUARD}\n", "", 1)
+
+
 def _mutate_substitute_offscreen_platform(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", SOURCE_SESSION_STEP)
     env = dict(_step_env(step))
     env["QT_QPA_PLATFORM"] = "offscreen"
     step["env"] = env
+
+
+def _mutate_remove_push_trigger(workflow: dict[str, Any]) -> None:
+    for key in list(workflow):
+        if key is True or str(key).lower() in ("on", "true"):
+            assert "push" in _events(workflow)
+            del workflow[key]
+
+
+def _mutate_change_baseline_runner(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx")["runs-on"] = "ubuntu-22.04"
+
+
+def _mutate_remove_pwsh_shell_declaration(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-windows", "Verify package and installed lifecycle")
+    assert step.get("shell") == "pwsh"
+    step.pop("shell")
 
 
 MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict[str, Any]], None]]] = {
@@ -776,6 +846,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "weaken one-wheel assertion": (
         check_baseline_wheel,
         _mutate_weaken_one_wheel_assertion,
+    ),
+    "weaken windows one-wheel enforcement": (
+        check_baseline_wheel,
+        _mutate_weaken_windows_wheel_enforcement,
     ),
     "remove installed-wheel test": (
         check_baseline_installed_wheel,
@@ -821,6 +895,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_native_session_preflight,
         _mutate_weaken_session_preflight,
     ),
+    "omit windows session gate": (
+        check_native_session_preflight,
+        _mutate_omit_windows_session_gate,
+    ),
     "remove artifact tests": (
         check_native_artifact_lane,
         _mutate_remove_artifact_tests,
@@ -849,9 +927,19 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_powershell_failure_propagation,
         _mutate_omit_powershell_failure_propagation,
     ),
+    "omit POSIX failure propagation": (
+        check_posix_failure_propagation,
+        _mutate_omit_posix_failure_propagation,
+    ),
     "substitute offscreen platform": (
         check_no_offscreen_substitute,
         _mutate_substitute_offscreen_platform,
+    ),
+    "remove push trigger": (check_workflow_trigger, _mutate_remove_push_trigger),
+    "change baseline runner": (check_job_matrix, _mutate_change_baseline_runner),
+    "remove pwsh shell declaration": (
+        check_shell_matrix,
+        _mutate_remove_pwsh_shell_declaration,
     ),
 }
 
