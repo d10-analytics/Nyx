@@ -65,13 +65,16 @@ def _wait_for_record(paths: state.StatePaths) -> runtime.Instance:
     raise AssertionError("daemon did not publish instance record")
 
 
-def _subprocess_environment(home: Path, site_directory: Path) -> dict[str, str]:
+def _subprocess_environment(
+    home: Path, site_directory: Path, *, extra_sitecustomize: str = ""
+) -> dict[str, str]:
     site_directory.mkdir()
     (site_directory / "sitecustomize.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
         "from nyx import state\n"
-        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n",
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
+        + extra_sitecustomize,
         encoding="utf-8",
     )
     environment = os.environ.copy()
@@ -3807,14 +3810,35 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
     else:
         capability_probe.close()
 
-    with TemporaryDirectory() as temporary:
+    # A timed-out public stop leaves the detached daemon owning the share-zero
+    # lifetime lease, and Windows then refuses to remove the state tree while
+    # that handle is open.  Capture the daemon process id so teardown can always
+    # reclaim it, and keep cleanup from replacing the real stop error with a
+    # Windows file-lock error.
+    with TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
         specification_root = root / "spec"
         specification_root.mkdir()
         site_directory = root / "site"
-        environment = _subprocess_environment(home, site_directory)
+        owner_probe = root / "owner.json"
+        environment = _subprocess_environment(
+            home,
+            site_directory,
+            extra_sitecustomize=(
+                "import json\n"
+                "from nyx import app_runtime\n"
+                "probe = Path(os.environ['NYX_OWNER_PROBE'])\n"
+                "original_start = app_runtime.ApplicationRuntime.start\n"
+                "def start(self, **kwargs):\n"
+                "    result = original_start(self, **kwargs)\n"
+                "    probe.write_text(json.dumps({'daemon_pid': os.getpid()}), encoding='utf-8')\n"
+                "    return result\n"
+                "app_runtime.ApplicationRuntime.start = start\n"
+            ),
+        )
+        environment["NYX_OWNER_PROBE"] = str(owner_probe)
         with patch.object(state, "resolve_account_home", return_value=home):
             state.setup(specification_root)
             paths = state.state_paths()
@@ -3827,16 +3851,44 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
             timeout=10,
             check=False,
         )
+        daemon_pid: int | None = None
         try:
             assert launcher.returncode == 0, launcher.stderr
             assert launcher.stdout.strip() == runtime.URL
             _wait_for_record(paths)
+            daemon_deadline = time.monotonic() + 5
+            while daemon_pid is None and time.monotonic() < daemon_deadline:
+                try:
+                    daemon_pid = int(
+                        json.loads(owner_probe.read_text(encoding="utf-8"))["daemon_pid"]
+                    )
+                except (OSError, ValueError, KeyError):
+                    time.sleep(0.01)
+            assert daemon_pid is not None
             contender = runtime._lease_lock(paths, timeout=0.0)
             assert not contender.acquire(blocking=False)
             contender.close()
         finally:
-            with patch.object(runtime, "_paths", return_value=paths):
-                runtime.stop()
+            try:
+                # Public stop is retryable: a timed-out attempt retains
+                # ownership until a later authenticated stop converges.
+                with patch.object(runtime, "_paths", return_value=paths):
+                    for _ in range(2):
+                        try:
+                            if runtime.stop() == "stopped":
+                                break
+                        except runtime.RuntimeErrorBase:
+                            continue
+            finally:
+                if daemon_pid is not None:
+                    try:
+                        os.kill(daemon_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                    except OSError:
+                        pass
+        assert not paths.runtime_directory.joinpath("instance.json").exists(), (
+            "public stop did not converge after retry; the daemon was force-terminated"
+        )
+        _assert_claim_available(paths.runtime_directory / "lease.lock")
 
 
 def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit():
