@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest", "playwright", "ruff"]
+test = ["pytest", "playwright", "ruff", "PyYAML"]
 desktop = ["PySide6>=6.8"]
 # Pinned standalone-build inputs.  PySide6 is LGPL-3.0/GPL-3.0/commercial and
 # Nuitka is Apache-2.0; both are redistributable in the private internal
