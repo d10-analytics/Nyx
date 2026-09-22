@@ -828,6 +828,38 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
     return DesktopWindow()
 
 
+def _release_presentation(application: Any, window: Any) -> None:
+    """Tear down the presentation profile so its on-disk storage flushes.
+
+    Qt WebEngine only guarantees that persistent page storage is written when
+    the disk-based profile is destroyed, so the window's page, view, and
+    profile are released here instead of waiting for process teardown.
+    """
+
+    if window is None:
+        return
+    close = getattr(window, "close", None)
+    if callable(close):
+        close()
+    pump = getattr(application, "processEvents", None)
+    page = getattr(window, "_page", None)
+    board = getattr(window, "_board", None)
+    profile = getattr(window, "_profile", None)
+    delete_page = getattr(page, "deleteLater", None)
+    if callable(delete_page):
+        delete_page()
+    delete_board = getattr(board, "deleteLater", None)
+    if callable(delete_board):
+        delete_board()
+    if callable(pump):
+        pump()
+    delete_profile = getattr(profile, "deleteLater", None)
+    if callable(delete_profile):
+        delete_profile()
+    if callable(pump):
+        pump()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the optional GUI entry while retaining the console entry unchanged."""
 
@@ -841,6 +873,8 @@ def main(argv: list[str] | None = None) -> int:
     except DesktopError as error:
         print(f"nyx-desktop: {error}", file=sys.stderr)
         return 1
+    application: Any = None
+    window: Any = None
     try:
         try:
             qt = _load_qt()
@@ -865,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         return int(application.exec())
     finally:
+        _release_presentation(application, window)
         session.close()
 
 
