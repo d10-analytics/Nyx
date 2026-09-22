@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nyx import _native_claim, desktop, runtime, state
+from nyx import _native_claim, app_runtime, desktop, runtime, state
 from nyx._native_claim import NativeClaim
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
@@ -1487,7 +1487,7 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
 
     assert calls[:2] == ["start_runtime", "show"]
     assert calls[-1] == "close"
-    assert calls[2:-1] in ([], ["open_board"])
+    assert calls[2:-1] == ["open_board"]
 
 
 def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
@@ -1563,7 +1563,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             owns_application = application is None
             if application is None:
                 application = QtWidgets.QApplication([])
-            window = desktop._build_window({"QtCore": QtCore, "QtWidgets": QtWidgets}, session)
+            window = desktop._build_window(_native_qt(), session)
             claims_identity = id(session.claims)
             window.show()
             application.processEvents()
@@ -1615,5 +1615,519 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             assert state.load_configuration() == state.Configuration(
                 second.resolve(), ("Queue",)
             )
+            _destroy_native_window(application, window)
             if owns_application:
                 application.quit()
+
+
+def _free_loopback_port() -> int:
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    finally:
+        probe.close()
+
+
+def _request_catalog(port: int):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        connection.request(
+            "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{port}"}
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def _inert_application_runtime() -> desktop.ApplicationRuntime:
+    """A shared runtime with an idle listener for navigation-order checks."""
+
+    class _IdleServer:
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def close_active_connections(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class _IdleThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    return desktop.ApplicationRuntime(
+        port=45123,
+        deadline=time.monotonic() + 60,
+        server_factory=lambda **_kwargs: _IdleServer(),
+        thread_factory=_IdleThread,
+    )
+
+
+def _board_workspace(root: Path) -> Path:
+    """A sample workspace with visible content, a hidden stage, and an edge."""
+
+    workspace = _workspace(root, "board")
+    packages = {
+        ("Alpha", "Queue", "delivery"): (
+            "# Alpha delivery\n"
+            "Target repo: Alpha\n"
+            "Package ID: 11111111-1111-4111-8111-111111111111\n"
+            "Prerequisite: 22222222-2222-4222-8222-222222222222 | design-ready\n"
+        ),
+        ("Beta", "Under_Development", "design"): (
+            "# Beta design\n"
+            "Target repo: Beta\n"
+            "Package ID: 22222222-2222-4222-8222-222222222222\n"
+            "Claim: design-ready | satisfied | sha256:" + "f" * 64 + "\n"
+        ),
+        ("Gamma", "Done", "finished"): (
+            "# Hidden completed work\n"
+            "Target repo: Gamma\n"
+            "Package ID: 33333333-3333-4333-8333-333333333333\n"
+        ),
+    }
+    for (project, stage, package), body in packages.items():
+        directory = workspace / project / stage / package
+        directory.mkdir(parents=True)
+        (directory / "spec.md").write_text(body, encoding="utf-8")
+    return workspace
+
+
+def test_application_runtime_board_url_requires_catalog_admission():
+    application = _inert_application_runtime()
+    with pytest.raises(RuntimeError):
+        application.board_url()
+    application.start(static_ready=lambda: True)
+    with pytest.raises(RuntimeError):
+        application.board_url()
+    application.admit_catalog()
+    assert application.board_url() == f"http://127.0.0.1:{application.port}/"
+    assert application.shutdown(time.monotonic() + 5)
+    with pytest.raises(RuntimeError):
+        application.board_url()
+
+
+def test_shell_navigation_waits_for_owned_runtime_admission():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            application = _inert_application_runtime()
+            application.start(static_ready=lambda: True)
+            session._application_runtime = application
+            try:
+                window = desktop._build_window(_fake_qt(), session)
+                assert window._board.url() is None
+                assert not window._open_board()
+                assert not application.catalog_admitted
+                assert window._board.url() is None
+                application.admit_catalog()
+                assert window._open_board()
+                assert window._board.url() == application.board_url()
+            finally:
+                session._application_runtime = None
+                session.close()
+            assert application.shutdown(time.monotonic() + 5)
+
+
+def test_failed_runtime_start_leaves_the_board_unloaded():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+
+        class RuntimeThatCannotStart:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, **_kwargs):
+                raise RuntimeError("injected startup failure")
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+            def shutdown(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", RuntimeThatCannotStart
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            with pytest.raises(desktop.DesktopUnavailableError):
+                session.start_runtime(static_ready=lambda: True)
+            assert session.runtime is None
+            window = desktop._build_window(_fake_qt(), session)
+            assert not window._open_board()
+            assert window._board.url() is None
+            session.close()
+
+
+def test_post_admission_board_load_failure_reaps_shared_runtime():
+    port = _free_loopback_port()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            application = session.runtime
+            assert application is not None and application.catalog_admitted
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                assert window._board.url() == application.board_url()
+                window._board.loadFinished.emit(False)
+                assert not session.claims.held
+                assert session.runtime is None
+                assert not window._visible
+                with pytest.raises((OSError, http.client.HTTPException)):
+                    _request_catalog(port)
+            finally:
+                session.close()
+
+
+def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+
+        class RuntimeThatCannotStop:
+            catalog_admitted = True
+
+            def __init__(self):
+                self.allow_close = False
+
+            def board_url(self):
+                return "http://127.0.0.1:45124/"
+
+            def shutdown(self, _deadline):
+                return self.allow_close
+
+            def cleanup_start_failure(self, _deadline):
+                return self.allow_close
+
+        with _home_patches(home)[0]:
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            application = RuntimeThatCannotStop()
+            session._application_runtime = application
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._board.loadFinished.emit(False)
+            assert session.shutdown_blocked
+            assert session.claims.held
+            assert window._visible
+            assert window._retry.isEnabled()
+            assert "retry" in window._status.text().lower()
+            application.allow_close = True
+            window._retry.click()
+            assert not session.claims.held
+            assert not window._visible
+            session.close()
+
+
+def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
+    assert desktop.ApplicationRuntime is app_runtime.ApplicationRuntime
+    assert runtime.ApplicationRuntime is app_runtime.ApplicationRuntime
+    port = _free_loopback_port()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _board_workspace(root)
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace, ["Done"])
+            session = desktop.DesktopSession()
+            try:
+                application = session.start_runtime()
+                assert isinstance(application, app_runtime.ApplicationRuntime)
+                assert application is session.runtime
+                assert application.catalog_admitted
+                status, payload = _request_catalog(port)
+                assert status == 200
+                titles = [
+                    entry["declared"]["title"] for entry in payload["entries"]
+                ]
+                assert "Alpha delivery" in titles
+                assert "Beta design" in titles
+                assert "Hidden completed work" not in titles
+                assert payload["visibility"]["hidden_stages"] == ["Done"]
+                assert payload["visibility"]["hidden_entry_count"] == 1
+                assert all(entry["stage"] != "Done" for entry in payload["entries"])
+                alpha = next(
+                    entry
+                    for entry in payload["entries"]
+                    if entry["declared"]["title"] == "Alpha delivery"
+                )
+                edge = alpha["relationship"]["prerequisites"][0]
+                assert edge["target_package_id"] == "22222222-2222-4222-8222-222222222222"
+                assert edge["resolved_state"] == "satisfied"
+            finally:
+                session.close()
+
+
+_BOARD_SNAPSHOT_SCRIPT = """
+(() => ({
+  status: document.querySelector('#status') ? document.querySelector('#status').textContent : '',
+  titles: [...document.querySelectorAll('.card-title')].map((node) => node.textContent),
+  rows: [...document.querySelectorAll('.board-row')].map((node) => node.dataset.lifecycle),
+  links: [...document.querySelectorAll('.card-links')].map((node) => node.textContent),
+  compact: document.querySelector('#compact-view') ? document.querySelector('#compact-view').checked : null,
+  stored: window.localStorage.getItem('spec-tracker-compact-view'),
+}))()
+"""
+
+
+def _native_qt() -> dict[str, object]:
+    return {
+        "QtCore": QtCore,
+        "QtWidgets": QtWidgets,
+        "QtWebEngineCore": QtWebEngineCore,
+        "QtWebEngineWidgets": QtWebEngineWidgets,
+    }
+
+
+def _native_application():
+    application = QtWidgets.QApplication.instance()
+    if application is None:
+        application = QtWidgets.QApplication([])
+    return application
+
+
+def _eval_js(application, page, script, timeout: float = 30.0):
+    outcome = {}
+    done = threading.Event()
+
+    def finish(value):
+        outcome["value"] = value
+        done.set()
+
+    page.runJavaScript(script, finish)
+    deadline = time.monotonic() + timeout
+    while not done.is_set() and time.monotonic() < deadline:
+        application.processEvents()
+        QtTest.QTest.qWait(20)
+    assert done.is_set(), "board JavaScript did not complete"
+    return outcome["value"]
+
+
+def _wait_for_board(application, page, timeout: float = 60.0):
+    deadline = time.monotonic() + timeout
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = _eval_js(application, page, _BOARD_SNAPSHOT_SCRIPT, timeout=15.0)
+        if snapshot and str(snapshot.get("status", "")).startswith("Loaded"):
+            return snapshot
+        QtTest.QTest.qWait(50)
+    raise AssertionError(f"board did not load: {snapshot!r}")
+
+
+def _wait_for_status(application, page, prefix: str, timeout: float = 30.0):
+    deadline = time.monotonic() + timeout
+    value = None
+    while time.monotonic() < deadline:
+        value = _eval_js(
+            application,
+            page,
+            "document.querySelector('#status').textContent",
+            timeout=15.0,
+        )
+        if isinstance(value, str) and value.startswith(prefix):
+            return value
+        QtTest.QTest.qWait(50)
+    raise AssertionError(f"board status never reached {prefix!r}: {value!r}")
+
+
+def _destroy_native_window(application, window) -> None:
+    desktop._release_presentation(application, window)
+    window.deleteLater()
+    QtTest.QTest.qWait(100)
+    application.processEvents()
+
+
+def _assert_native_host_has_no_offscreen_platform() -> None:
+    if os.environ.get("QT_QPA_PLATFORM", "").lower() in {
+        "offscreen",
+        "minimal",
+        "minimalegl",
+    }:
+        pytest.fail("required native desktop lane cannot use an offscreen Qt platform")
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_embedded_board_renders_content_hidden_stage_and_dependency():
+    _assert_native_host_has_no_offscreen_platform()
+    port = _free_loopback_port()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace, ["Done"])
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            shared = session.runtime
+            assert shared is not None and shared.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                assert window._board.url().toString() == shared.board_url()
+                status, payload = _request_catalog(port)
+                assert status == 200
+                assert "Alpha delivery" in [
+                    entry["declared"]["title"] for entry in payload["entries"]
+                ]
+                page = window._board.page()
+                snapshot = _wait_for_board(application, page)
+                assert "Alpha delivery" in snapshot["titles"]
+                assert "Beta design" in snapshot["titles"]
+                assert "Hidden completed work" not in snapshot["titles"]
+                assert "done" not in snapshot["rows"]
+                assert any(
+                    "needs:" in link and "Beta design" in link
+                    for link in snapshot["links"]
+                )
+                shared.catalog_admitted = False
+                _eval_js(application, page, "document.querySelector('#refresh').click()")
+                assert _wait_for_status(application, page, "Refresh failed").startswith(
+                    "Refresh failed"
+                )
+                shared.catalog_admitted = True
+                _eval_js(application, page, "document.querySelector('#refresh').click()")
+                assert _wait_for_status(application, page, "Loaded").startswith("Loaded")
+            finally:
+                _destroy_native_window(application, window)
+                session.close()
+            assert not session.claims.held
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_compact_preference_survives_a_normal_reopen():
+    _assert_native_host_has_no_offscreen_platform()
+    port = _free_loopback_port()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                page = window._board.page()
+                _wait_for_board(application, page)
+                assert not window._profile.isOffTheRecord()
+                expected_storage = session.paths.state_directory / "presentation"
+                assert Path(window._profile.persistentStoragePath()) == expected_storage
+                stored = _eval_js(
+                    application,
+                    page,
+                    "(() => { const control = document.querySelector('#compact-view');"
+                    " control.checked = false; control.dispatchEvent(new Event('change'));"
+                    " return window.localStorage.getItem('spec-tracker-compact-view'); })()",
+                )
+                assert stored == "false"
+                QtTest.QTest.qWait(500)
+            finally:
+                _destroy_native_window(application, window)
+                session.close()
+            assert not session.claims.held
+
+            reopened = desktop.DesktopSession()
+            reopened.start_runtime()
+            window = desktop._build_window(_native_qt(), reopened)
+            window.show()
+            try:
+                assert window._open_board()
+                snapshot = _wait_for_board(application, window._board.page())
+                assert snapshot["compact"] is False
+                assert snapshot["stored"] == "false"
+            finally:
+                _destroy_native_window(application, window)
+                reopened.close()
+            assert not reopened.claims.held
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
+    _assert_native_host_has_no_offscreen_platform()
+    dead_port = _free_loopback_port()
+    port = _free_loopback_port()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                _wait_for_board(application, window._board.page())
+                window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{dead_port}/"))
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline and session.runtime is not None:
+                    application.processEvents()
+                    QtTest.QTest.qWait(50)
+                if session.shutdown_blocked:
+                    assert session.claims.held
+                    assert window.isVisible()
+                    assert window._retry.isEnabled()
+                else:
+                    assert not session.claims.held
+                    assert session.runtime is None
+                    assert not window.isVisible()
+            finally:
+                _destroy_native_window(application, window)
+                session.close()
