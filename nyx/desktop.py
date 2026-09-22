@@ -290,8 +290,7 @@ class DesktopSession:
         pending = self._pending_switch
         if pending is None:
             return False
-        if self._unverified:
-            self.revalidate()
+        self.revalidate()
         self._switch_blocked = False
         try:
             self._switch_to(pending.configuration, pending.runtime_expected)
