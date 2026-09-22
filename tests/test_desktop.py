@@ -974,6 +974,52 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
             session.close()
 
 
+def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    try:
+        capability_probe.bind(("127.0.0.1", 0))
+        port = capability_probe.getsockname()[1]
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    finally:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+
+        def request_catalog():
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{port}"})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        with _home_patches(home)[0], patch.object(runtime, "PORT", port):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            try:
+                session.start_runtime()
+                first_status, first_catalog = request_catalog()
+                assert first_status == 200
+                assert isinstance(first_catalog, dict)
+                session.choose_workspace(second)
+                second_status, second_catalog = request_catalog()
+                assert second_status == 200
+                assert isinstance(second_catalog, dict)
+                assert state.load_configuration().specification_root == second.resolve()
+                assert session.claims.held
+            finally:
+                session.close()
+
+
 def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
