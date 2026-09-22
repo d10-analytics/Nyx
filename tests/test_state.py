@@ -984,3 +984,23 @@ def test_persisted_configuration_inside_a_packaged_footprint_stays_unavailable(
         observed = state.observe_configuration()
     assert observed.status == "unavailable"
     assert observed.specification_root is None
+
+
+def test_packaged_worker_helper_rejects_a_workspace_elsewhere_in_the_application(
+    tmp_path, monkeypatch
+):
+    import sys
+
+    application = tmp_path / "Nyx"
+    application.mkdir()
+    helper_directory = application / "NyxWorker"
+    helper_directory.mkdir()
+    helper = helper_directory / ("NyxWorker.exe" if os.name == "nt" else "NyxWorker")
+    helper.write_text("", encoding="utf-8")
+    inside_application = application / "workspace"
+    inside_application.mkdir()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(helper))
+
+    with pytest.raises(state.SpecificationRootError):
+        state.resolve_specification_root(inside_application)
