@@ -579,6 +579,26 @@ def _save_configuration(
     return Configuration(root, hidden_stages)
 
 
+def validate_configuration_candidate(
+    specification_root: str | os.PathLike[str],
+    hidden_stages: Iterable[str] | object = _OMITTED,
+    *,
+    paths: StatePaths | None = None,
+) -> Configuration:
+    """Validate a prospective configuration without changing persisted state."""
+
+    selected_paths = state_paths() if paths is None else paths
+    root = resolve_specification_root(specification_root)
+    if hidden_stages is _OMITTED:
+        if _lstat(selected_paths.config_file) is None:
+            validated_hidden_stages = ()
+        else:
+            validated_hidden_stages = load_configuration(selected_paths).hidden_stages
+    else:
+        validated_hidden_stages = _validate_hidden_stages(hidden_stages)
+    return Configuration(root, validated_hidden_stages)
+
+
 def save_configuration_owned(
     specification_root: str | os.PathLike[str],
     hidden_stages: Iterable[str] | object = _OMITTED,
@@ -600,18 +620,15 @@ def save_configuration_owned(
         if paths is None
         else paths
     )
-    root = resolve_specification_root(specification_root)
-    if hidden_stages is _OMITTED:
-        if _lstat(selected_paths.config_file) is None:
-            validated_hidden_stages = ()
-        else:
-            validated_hidden_stages = load_configuration(selected_paths).hidden_stages
-    else:
-        validated_hidden_stages = _validate_hidden_stages(hidden_stages)
+    candidate = validate_configuration_candidate(
+        specification_root,
+        hidden_stages,
+        paths=selected_paths,
+    )
     return _save_configuration(
         selected_paths,
-        root,
-        validated_hidden_stages,
+        candidate.specification_root,
+        candidate.hidden_stages,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
@@ -686,6 +703,7 @@ __all__ = [
     "resolve_specification_root",
     "save_configuration",
     "save_configuration_owned",
+    "validate_configuration_candidate",
     "revalidate_configuration",
     "setup",
     "state_paths",

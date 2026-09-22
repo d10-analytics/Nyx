@@ -57,6 +57,12 @@ class DesktopSnapshot:
     diagnostic: str | None = None
 
 
+@dataclass(frozen=True)
+class _PendingSwitch:
+    configuration: state.Configuration
+    runtime_expected: bool
+
+
 class DesktopClaims:
     """Hold the account and recovery claims for one desktop application."""
 
@@ -177,6 +183,10 @@ class DesktopSession:
         self._application_runtime: ApplicationRuntime | None = None
         self._runtime_start_failed = False
         self._shutdown_blocked = False
+        self._switch_blocked = False
+        self._switch_in_progress = False
+        self._quit_requested = False
+        self._pending_switch: _PendingSwitch | None = None
         self.snapshot = self._observe()
         if self.claims.recovery_blocked:
             self.snapshot = DesktopSnapshot(
@@ -210,6 +220,14 @@ class DesktopSession:
     @property
     def shutdown_blocked(self) -> bool:
         return self._shutdown_blocked
+
+    @property
+    def switch_blocked(self) -> bool:
+        return self._switch_blocked
+
+    @property
+    def switch_in_progress(self) -> bool:
+        return self._switch_in_progress
 
     def retry_recovery(self) -> bool:
         """Retry former-worker cleanup without changing persisted state."""
@@ -263,6 +281,23 @@ class DesktopSession:
         except DesktopUnavailableError:
             return False
         return True
+
+    def retry_workspace_switch(self) -> bool:
+        """Retry a stopped or blocked workspace switch with retained claims."""
+
+        if self._closed:
+            raise DesktopUnavailableError("Nyx desktop session is closed")
+        pending = self._pending_switch
+        if pending is None:
+            return False
+        if self._unverified:
+            self.revalidate()
+        self._switch_blocked = False
+        try:
+            self._switch_to(pending.configuration, pending.runtime_expected)
+        except DesktopError:
+            return False
+        return not self._switch_blocked and not self._unverified
 
     def start_runtime(
         self,
@@ -333,6 +368,105 @@ class DesktopSession:
             return DesktopSnapshot("not_configured")
         return DesktopSnapshot("unavailable", diagnostic=UNAVAILABLE_MESSAGE)
 
+    def _stop_runtime_for_switch(self) -> bool:
+        application = self._application_runtime
+        if application is None:
+            return not self._runtime_start_failed
+        deadline = time.monotonic() + runtime.SHUTDOWN_TIMEOUT
+        try:
+            if self._runtime_start_failed:
+                stopped = application.cleanup_start_failure(deadline)
+            else:
+                stopped = application.shutdown(deadline)
+        except Exception:
+            stopped = False
+        if not stopped:
+            self._shutdown_blocked = True
+            return False
+        self._application_runtime = None
+        self._runtime_start_failed = False
+        self._shutdown_blocked = False
+        return True
+
+    def _finish_switch_failure(self, message: str) -> None:
+        self._switch_blocked = True
+        self._pending_error = message
+        configuration = self.snapshot.configuration or self._observe().configuration
+        self.snapshot = DesktopSnapshot("switch_blocked", configuration)
+
+    def _finish_switch_close(self) -> None:
+        self._switch_in_progress = False
+        self._pending_switch = None
+        self._switch_blocked = False
+        self._quit_requested = False
+        self.close()
+
+    def _switch_to(
+        self,
+        configuration: state.Configuration,
+        runtime_expected: bool,
+    ) -> state.Configuration:
+        self._switch_in_progress = True
+        self._switch_blocked = False
+        self._pending_switch = _PendingSwitch(configuration, runtime_expected)
+        try:
+            if not self._stop_runtime_for_switch():
+                self._switch_in_progress = False
+                self._finish_switch_failure(
+                    "Nyx workers are still stopping; retry workspace change"
+                )
+                raise SelectionUnavailableError(self._pending_error or UNAVAILABLE_MESSAGE)
+            if self._quit_requested:
+                self._finish_switch_close()
+                raise SelectionUnavailableError("Nyx workspace change canceled")
+            try:
+                committed = state.save_configuration_owned(
+                    configuration.specification_root,
+                    configuration.hidden_stages,
+                    paths=self.paths,
+                )
+            except state.ConfigurationCommitVerificationError as error:
+                self._unverified = True
+                self._switch_in_progress = False
+                self._pending_error = "Nyx configuration was saved but is unverified"
+                self.snapshot = DesktopSnapshot(
+                    "unavailable", diagnostic=UNAVAILABLE_MESSAGE
+                )
+                raise SelectionUnavailableError(self._pending_error) from error
+            except (state.ConfigurationError, state.StateError) as error:
+                self._switch_in_progress = False
+                if runtime_expected:
+                    self._finish_switch_failure("Nyx workspace could not be saved")
+                else:
+                    self._pending_switch = None
+                    self._switch_blocked = False
+                    self._pending_error = "Nyx workspace could not be saved"
+                    self.snapshot = self._observe()
+                raise SelectionUnavailableError(self._pending_error or UNAVAILABLE_MESSAGE) from error
+
+            self._pending_switch = None
+            self._switch_blocked = False
+            self._unverified = False
+            self._pending_error = None
+            self.snapshot = DesktopSnapshot("configured", committed)
+            if self._quit_requested:
+                self._finish_switch_close()
+                return committed
+            if runtime_expected:
+                try:
+                    self.start_runtime()
+                except DesktopError:
+                    if self._quit_requested:
+                        self._finish_switch_close()
+                    raise
+            self._switch_in_progress = False
+            if self._quit_requested:
+                self._finish_switch_close()
+            return committed
+        finally:
+            if self._switch_in_progress and self._pending_switch is None:
+                self._switch_in_progress = False
+
     def choose_workspace(
         self,
         specification_root: str | os.PathLike[str],
@@ -354,28 +488,32 @@ class DesktopSession:
             raise SelectionUnavailableError(
                 "Nyx configuration is unavailable; repair or revalidate it first"
             )
+        if self._switch_in_progress or self._switch_blocked:
+            raise SelectionUnavailableError(
+                "Nyx workspace change is awaiting cleanup; retry it first"
+            )
         try:
-            configuration = state.save_configuration_owned(
+            current = (
+                None
+                if self.snapshot.status == "not_configured"
+                else state.revalidate_configuration(self.paths)
+            )
+            configuration = state.validate_configuration_candidate(
                 specification_root,
                 hidden_stages,
                 paths=self.paths,
             )
-        except state.ConfigurationCommitVerificationError as error:
-            # The replacement has committed.  Preserve those bytes and keep
-            # the shell unavailable until state-owner revalidation succeeds.
-            self._unverified = True
-            self._pending_error = "Nyx configuration was saved but is unverified"
-            self.snapshot = DesktopSnapshot("unavailable", diagnostic=UNAVAILABLE_MESSAGE)
+        except state.StateError as error:
+            self._pending_error = "Nyx workspace could not be validated"
             raise SelectionUnavailableError(self._pending_error) from error
-        except (state.ConfigurationError, state.StateError) as error:
-            # Validation or a pre-replacement write failure leaves the old
-            # record (or first-launch absence) unchanged.
-            self._pending_error = "Nyx workspace could not be saved"
-            self.snapshot = self._observe()
-            raise SelectionUnavailableError(self._pending_error) from error
-        self._pending_error = None
-        self.snapshot = DesktopSnapshot("configured", configuration)
-        return configuration
+        runtime_expected = self._application_runtime is not None
+        if self._runtime_start_failed:
+            raise SelectionUnavailableError(
+                "Nyx runtime cleanup is incomplete; retry before changing workspace"
+            )
+        if current is not None and current != self.snapshot.configuration:
+            self.snapshot = DesktopSnapshot("configured", current)
+        return self._switch_to(configuration, runtime_expected)
 
     def revalidate(self) -> state.Configuration:
         """Retry state-owner validation after a committed verification failure."""
@@ -405,10 +543,18 @@ class DesktopSession:
     def close(self) -> None:
         if self._closed:
             return
+        if self._switch_in_progress:
+            self._quit_requested = True
+            return
+        self._pending_switch = None
+        self._switch_blocked = False
         if self._application_runtime is not None:
             deadline = time.monotonic() + runtime.SHUTDOWN_TIMEOUT
             try:
-                closed = self._application_runtime.shutdown(deadline)
+                if self._runtime_start_failed:
+                    closed = self._application_runtime.cleanup_start_failure(deadline)
+                else:
+                    closed = self._application_runtime.shutdown(deadline)
             except Exception:
                 closed = False
             if not closed:
@@ -511,6 +657,15 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._change.setEnabled(False)
                 self._save.setEnabled(True)
                 self._retry.setEnabled(False)
+            elif snapshot.status == "switch_blocked":
+                self._status.setText(
+                    self._session.pending_error
+                    or "Workspace change is waiting for runtime cleanup."
+                )
+                self._root.setEnabled(False)
+                self._change.setEnabled(False)
+                self._save.setEnabled(False)
+                self._retry.setEnabled(True)
             else:
                 self._status.setText(
                     self._session.pending_error
@@ -542,7 +697,9 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
         def _revalidate(self) -> None:
             try:
-                if self._session.shutdown_blocked:
+                if self._session.switch_blocked:
+                    self._session.retry_workspace_switch()
+                elif self._session.shutdown_blocked:
                     self.close()
                     return
                 if (
@@ -560,7 +717,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
 
         def closeEvent(self, event: Any) -> None:
             self._session.close()
-            if self._session.shutdown_blocked:
+            if self._session.shutdown_blocked or self._session.switch_in_progress:
                 self._render()
                 event.ignore()
             else:
