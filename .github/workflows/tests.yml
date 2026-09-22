@@ -211,6 +211,10 @@ jobs:
           $env:NYX_DESKTOP_ARTIFACT = $artifact
           python -m pytest tests/test_desktop_artifact.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Run the established desktop scenarios with the delivered
+          # artifact entry available.
+          python -m pytest tests/test_desktop.py -v -s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
     runs-on: macos-15
@@ -259,3 +263,6 @@ jobs:
           shasum -a 256 "$artifact/Contents/MacOS/$gui_executable"
           export NYX_DESKTOP_ARTIFACT="$artifact"
           python -m pytest tests/test_desktop_artifact.py -v -s
+          # Run the established desktop scenarios with the delivered
+          # artifact entry available.
+          python -m pytest tests/test_desktop.py -v -s
