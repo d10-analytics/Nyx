@@ -305,3 +305,73 @@ def test_parent_loss_terminates_a_scanning_desktop_worker_and_releases_recovery_
                 os.close(write_fd)
             os.close(read_fd)
             claim.close()
+
+
+def _packaged_layout(tmp_path: Path, *, with_helper: bool) -> tuple[Path, Path]:
+    application = tmp_path / "application"
+    application.mkdir()
+    executable = application / ("Nyx.exe" if os.name == "nt" else "Nyx")
+    executable.write_text("", encoding="utf-8")
+    helper_name = "NyxWorker.exe" if os.name == "nt" else "NyxWorker"
+    helper = application / "NyxWorker" / helper_name
+    if with_helper:
+        helper.parent.mkdir()
+        helper.write_text("", encoding="utf-8")
+    return executable, helper
+
+
+def test_packaged_application_selects_the_bundled_console_helper(tmp_path, monkeypatch):
+    executable, helper = _packaged_layout(tmp_path, with_helper=True)
+    monkeypatch.setattr(worker.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(worker.sys, "executable", str(executable))
+
+    assert worker.bundled_worker_command() == [str(helper)]
+    assert worker.default_worker_command() == [str(helper)]
+
+
+def test_packaged_application_without_helper_fails_closed_instead_of_reentering_gui(
+    tmp_path, monkeypatch
+):
+    executable, _ = _packaged_layout(tmp_path, with_helper=False)
+    monkeypatch.setattr(worker.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(worker.sys, "executable", str(executable))
+
+    assert worker.bundled_worker_command() is None
+    with pytest.raises(worker.WorkerError) as error:
+        worker.default_worker_command()
+    assert error.value.code == "producer_unavailable"
+
+
+def test_source_application_keeps_the_module_worker_entry(tmp_path, monkeypatch):
+    monkeypatch.delattr(worker.sys, "frozen", raising=False)
+    assert worker.bundled_worker_command() is None
+    assert worker.default_worker_command() == [worker.sys.executable, "-m", "nyx.worker"]
+
+
+def test_console_helper_entry_emits_the_same_exact_bytes_as_the_module_entry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        environment = {"HOME": str(home), "USERPROFILE": str(home)}
+        with patch.dict(os.environ, environment):
+            state.setup(workspace)
+        module_entry = subprocess.run(
+            [sys.executable, "-m", "nyx.worker"],
+            cwd=Path(__file__).parents[1],
+            env={**os.environ, **environment},
+            capture_output=True,
+        )
+        helper_entry = subprocess.run(
+            [sys.executable, "-m", "nyx.desktop_worker"],
+            cwd=Path(__file__).parents[1],
+            env={**os.environ, **environment},
+            capture_output=True,
+        )
+
+    assert module_entry.returncode == 0, module_entry.stderr
+    assert helper_entry.returncode == 0, helper_entry.stderr
+    assert helper_entry.stdout == module_entry.stdout
+    assert helper_entry.stdout.decode("utf-8")

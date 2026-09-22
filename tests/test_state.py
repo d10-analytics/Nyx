@@ -868,3 +868,95 @@ def test_runtime_observation_bounds_unavailable_controlled_home_as_unknown():
         observed = state.observe_runtime()
 
     assert observed == state.RuntimeObservation("unknown")
+
+
+def _packaged_application(tmp_path, monkeypatch, *, with_helper=True):
+    """Simulate a standalone application whose executable is relocated."""
+
+    import sys
+
+    application = tmp_path / "Nyx"
+    application.mkdir()
+    executable = application / ("Nyx.exe" if os.name == "nt" else "Nyx")
+    executable.write_text("", encoding="utf-8")
+    if with_helper:
+        helper = application / "NyxWorker"
+        helper.mkdir()
+        (helper / ("NyxWorker.exe" if os.name == "nt" else "NyxWorker")).write_text(
+            "", encoding="utf-8"
+        )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    return application, executable
+
+
+def test_packaged_application_footprints_reject_application_and_helper_subtrees(
+    tmp_path, monkeypatch
+):
+    application, executable = _packaged_application(tmp_path, monkeypatch)
+    workspaces = [application / "workspace", application / "NyxWorker" / "workspace"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+
+    footprints = state._packaged_footprints()
+    assert executable.parent in footprints
+    assert executable.parent / "NyxWorker" in footprints
+
+    for workspace in workspaces:
+        with pytest.raises(state.SpecificationRootError):
+            state.resolve_specification_root(workspace)
+    assert state.resolve_specification_root(external) == external.resolve()
+
+
+def test_packaged_macos_bundle_footprints_reject_bundle_subtrees(tmp_path, monkeypatch):
+    import sys
+
+    executable = tmp_path / "Nyx.app" / "Contents" / "MacOS" / "Nyx"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("", encoding="utf-8")
+    resources = tmp_path / "Nyx.app" / "Contents" / "Resources"
+    frameworks = tmp_path / "Nyx.app" / "Contents" / "Frameworks"
+    resources.mkdir()
+    frameworks.mkdir()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(executable))
+
+    footprints = state._packaged_footprints()
+    assert (tmp_path / "Nyx.app") in footprints
+    assert resources in footprints
+    assert frameworks in footprints
+    with pytest.raises(state.SpecificationRootError):
+        state.resolve_specification_root(resources)
+    external = tmp_path / "external"
+    external.mkdir()
+    assert state.resolve_specification_root(external) == external.resolve()
+
+
+def test_source_installation_footprints_do_not_add_application_roots(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    external = tmp_path / "external"
+    external.mkdir()
+    assert state._packaged_footprints() == ()
+    assert external.resolve() in state._installation_footprints() or state.resolve_specification_root(
+        external
+    ) == external.resolve()
+
+
+def test_footprint_rejection_preserves_prior_configuration_bytes(tmp_path, monkeypatch):
+    application, _ = _packaged_application(tmp_path, monkeypatch)
+    home = isolated_home(tmp_path)
+    external = isolated_root(tmp_path, "external")
+    inside = application / "workspace"
+    inside.mkdir()
+    home_patch, uid_patch = configure_home(home)
+    with home_patch, uid_patch:
+        paths = state.state_paths(create=True)
+        state.save_configuration_owned(external, paths=paths)
+        before = paths.config_file.read_bytes()
+        with pytest.raises(state.SpecificationRootError):
+            state.save_configuration_owned(inside, paths=paths)
+        assert paths.config_file.read_bytes() == before

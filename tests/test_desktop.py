@@ -2680,3 +2680,54 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                 )
                 session.close()
             assert released
+
+
+_ARTIFACT_ENTRY = os.environ.get("NYX_DESKTOP_ARTIFACT")
+
+
+def _delivered_entry_paths() -> tuple[Path, Path] | None:
+    """Resolve the staged application and helper when an artifact is supplied."""
+
+    if not _ARTIFACT_ENTRY:
+        return None
+    artifact = Path(_ARTIFACT_ENTRY).resolve()
+    if artifact.suffix == ".app" or artifact.is_dir():
+        application_root = artifact / "Contents" / "MacOS"
+        executable = application_root / "Nyx"
+    else:
+        executable = artifact
+        application_root = artifact.parent
+    worker_name = "NyxWorker.exe" if os.name == "nt" else "NyxWorker"
+    return executable, application_root / "NyxWorker" / worker_name
+
+
+@pytest.fixture
+def delivered_worker_helper() -> list[str]:
+    """Entry fixture that points the established process scenarios at the artifact."""
+
+    paths = _delivered_entry_paths()
+    if paths is None:
+        pytest.skip("the delivered desktop artifact is not staged on this host")
+    _, helper = paths
+    assert helper.is_file(), f"the bundled worker helper is missing: {helper}"
+    return [str(helper)]
+
+
+def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_worker_helper):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        home_patch, uid_patch = _home_patches(home)
+        with home_patch, uid_patch:
+            state.setup(workspace)
+            manager = desktop.CatalogWorkerManager(
+                command_factory=lambda: list(delivered_worker_helper),
+                timeout=30,
+            )
+            try:
+                catalog = json.loads(manager.fetch_catalog())
+            finally:
+                assert manager.close(time.monotonic() + 30)
+        assert catalog["schema_version"] == 4
+        assert manager.active_count == 0
