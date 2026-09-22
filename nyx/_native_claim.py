@@ -134,6 +134,42 @@ def _open_claim(path: Path, *, create: bool, dir_fd: int | None = None) -> int:
     return msvcrt.open_osfhandle(handle, os.O_RDWR)
 
 
+def open_existing_read(path: Path) -> int:
+    """Open an existing file for reading without blocking its deletion.
+
+    Windows refuses to delete a name while a reader holds it without
+    ``FILE_SHARE_DELETE``.  Terminal lifecycle cleanup removes the owned locator
+    while public observation may be reading the same bytes, so the read-open
+    must share deletion.  POSIX never had the restriction and only adds
+    close-on-exec and no-follow semantics.
+    """
+
+    if os.name != "nt":
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        return os.open(path, flags)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        wintypes.LPCWSTR(str(path)),
+        0x80000000,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x80 | 0x00200000,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        error = ctypes.get_last_error()
+        raise OSError(error, "CreateFileW existing read failed", str(path))
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
 class NativeDirectory:
     """A held existing directory used for race-safe relative observation."""
 
@@ -226,26 +262,7 @@ class NativeDirectory:
             return os.open(name, flags, dir_fd=self.fd)
         if os.name != "nt":
             raise OSError(errno.ENOTSUP, "directory-relative file open is unavailable")
-        path = self.path / name
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateFileW.restype = wintypes.HANDLE
-        handle = kernel32.CreateFileW(
-            wintypes.LPCWSTR(str(path)),
-            0x80000000,
-            0x1 | 0x2 | 0x4,
-            None,
-            3,
-            0x80 | 0x00200000,
-            None,
-        )
-        if handle == wintypes.HANDLE(-1).value:
-            error = ctypes.get_last_error()
-            raise OSError(error, "CreateFileW existing read failed", str(path))
-        try:
-            return msvcrt.open_osfhandle(handle, os.O_RDONLY)
-        except BaseException:
-            kernel32.CloseHandle(wintypes.HANDLE(handle))
-            raise
+        return open_existing_read(self.path / name)
 
     def scandir(self):
         return os.scandir(self.fd if self.fd is not None else self.path)

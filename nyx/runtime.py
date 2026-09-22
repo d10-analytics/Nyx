@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from . import state
-from ._native_claim import NativeClaim, NativeDirectory
+from ._native_claim import NativeClaim, NativeDirectory, open_existing_read
 from .app_runtime import ApplicationReadinessError, ApplicationRuntime
 from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
@@ -284,21 +284,22 @@ def _read_metadata(
         raise RuntimeErrorBase("unsafe Nyx runtime state")
     data: bytes | None = None
     if read_data:
-        if directory is None:
-            data = path.read_bytes()
-        else:
-            fd = directory.open_file(path.name)
-            try:
-                admitted = os.fstat(fd)
-                if not _safe_lock_metadata(admitted) or _metadata_identity(
-                    details
-                ) != _metadata_identity(admitted):
-                    raise RuntimeErrorBase("unsafe Nyx runtime state")
-                data = _read_descriptor(fd)
-                if _metadata_identity(admitted) != _metadata_identity(os.fstat(fd)):
-                    raise RuntimeErrorBase("Nyx runtime state changed during read")
-            finally:
-                os.close(fd)
+        fd = (
+            open_existing_read(path)
+            if directory is None
+            else directory.open_file(path.name)
+        )
+        try:
+            admitted = os.fstat(fd)
+            if not _safe_lock_metadata(admitted) or _metadata_identity(
+                details
+            ) != _metadata_identity(admitted):
+                raise RuntimeErrorBase("unsafe Nyx runtime state")
+            data = _read_descriptor(fd)
+            if _metadata_identity(admitted) != _metadata_identity(os.fstat(fd)):
+                raise RuntimeErrorBase("Nyx runtime state changed during read")
+        finally:
+            os.close(fd)
     return _metadata_from_stat(details, data)
 
 

@@ -2320,6 +2320,31 @@ def test_live_replaced_locator_is_rejected_before_stop_cleanup():
         ).encode()
 
 
+def test_record_snapshot_reads_without_exclusive_path_open():
+    with TemporaryDirectory() as temporary:
+        record = Path(temporary) / "instance.json"
+        record.write_bytes(b'{"schema_version": 1}\n')
+        with patch.object(
+            Path, "read_bytes", side_effect=AssertionError("exclusive path read")
+        ):
+            snapshot = runtime._record_snapshot(record)
+        assert snapshot.data == b'{"schema_version": 1}\n'
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows share-delete read proof")
+def test_shared_record_read_permits_terminal_unlink():
+    with TemporaryDirectory() as temporary:
+        record = Path(temporary) / "instance.json"
+        record.write_bytes(b'{"schema_version": 1}\n')
+        descriptor = _native_claim.open_existing_read(record)
+        try:
+            assert os.read(descriptor, 4096) == b'{"schema_version": 1}\n'
+            os.unlink(record)
+            assert not record.exists()
+        finally:
+            os.close(descriptor)
+
+
 def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -2358,7 +2383,7 @@ def test_public_stop_accepts_record_disappearance_during_terminal_snapshot():
         original = _write_runtime_record(paths)
         record = paths.runtime_directory / "instance.json"
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
-        original_read_bytes = Path.read_bytes
+        original_read_descriptor = runtime._read_descriptor
         terminal_read = False
 
         def acknowledge_stop(instance, command, **_kwargs):
@@ -2372,19 +2397,19 @@ def test_public_stop_accepts_record_disappearance_during_terminal_snapshot():
                 "url": runtime.URL,
             }
 
-        def remove_during_read(path):
+        def remove_during_read(fd):
             nonlocal lease_fd, terminal_read
-            if path == record and terminal_read:
+            if terminal_read:
                 terminal_read = False
                 record.unlink()
                 os.close(lease_fd)
                 lease_fd = -1
-            return original_read_bytes(path)
+            return original_read_descriptor(fd)
 
         try:
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "_send_control", side_effect=acknowledge_stop
-            ), patch.object(Path, "read_bytes", remove_during_read):
+            ), patch.object(runtime, "_read_descriptor", remove_during_read):
                 assert runtime.stop() == "stopped"
         finally:
             if lease_fd >= 0:
@@ -2728,6 +2753,7 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
         original_read_text = Path.read_text
         original_exists = Path.exists
         original_probe = runtime.NativeClaim.probe
+        original_open_read = runtime.open_existing_read
 
         def record_iteration(path: Path):
             if path.resolve() == external_runtime_resolved:
@@ -2754,6 +2780,11 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
                 outside_accesses.append(("claim", path))
             return original_probe(path, dir_fd=dir_fd)
 
+        def record_open_read(path: Path):
+            if path.resolve().is_relative_to(external_runtime_resolved):
+                outside_accesses.append(("read_open", path))
+            return original_open_read(path)
+
         with patch.object(state, "resolve_account_home", return_value=paths.account_home), patch.object(
             state, "_current_uid", return_value=state._current_uid()
         ), patch.object(
@@ -2770,6 +2801,8 @@ def test_observe_runtime_revalidates_ancestry_replaced_after_admission(
             Path, "exists", record_exists
         ), patch.object(
             runtime.NativeClaim, "probe", side_effect=record_claim_probe
+        ), patch.object(
+            runtime, "open_existing_read", record_open_read
         ):
             observed = runtime.observe_runtime()
 
