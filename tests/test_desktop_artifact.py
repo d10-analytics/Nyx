@@ -300,6 +300,27 @@ def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: Ar
             _assert_claims_released(home)
 
 
+def test_delivered_application_rejects_a_workspace_inside_its_installation(
+    artifact: ArtifactLayout,
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        inside = artifact.resource.parent
+        assert inside.is_dir(), f"a resource subtree is required inside {artifact.application_root}"
+        _write_configuration(home, inside)
+        environment = _sanitized_environment(home, decoy)
+        with _running_gui(artifact, root, environment) as gui:
+            time.sleep(5)
+            with pytest.raises(OSError):
+                _request("/api/catalog")
+            assert gui.process.poll() is None
+            gui.close()
+        _assert_claims_released(home)
+
+
 def test_delivered_second_process_reports_already_open_without_competing_writes(
     artifact: ArtifactLayout,
 ):

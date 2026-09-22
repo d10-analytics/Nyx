@@ -2693,12 +2693,25 @@ def _delivered_entry_paths() -> tuple[Path, Path] | None:
     artifact = Path(_ARTIFACT_ENTRY).resolve()
     if artifact.suffix == ".app" or artifact.is_dir():
         application_root = artifact / "Contents" / "MacOS"
-        executable = application_root / "Nyx"
+        executable = application_root / _delivered_bundle_executable(artifact)
     else:
         executable = artifact
         application_root = artifact.parent
     worker_name = "NyxWorker.exe" if os.name == "nt" else "NyxWorker"
     return executable, application_root / "NyxWorker" / worker_name
+
+
+def _delivered_bundle_executable(bundle: Path) -> str:
+    """Read the macOS bundle executable so the delivered name stays authoritative."""
+
+    try:
+        import plistlib
+
+        with (bundle / "Contents" / "Info.plist").open("rb") as handle:
+            executable = plistlib.load(handle).get("CFBundleExecutable")
+    except (OSError, ValueError):
+        executable = None
+    return executable or "NyxApp"
 
 
 @pytest.fixture
@@ -2731,3 +2744,41 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                 assert manager.close(time.monotonic() + 30)
         assert catalog["schema_version"] == 4
         assert manager.active_count == 0
+
+
+def _build_desktop_driver():
+    """Load the staging driver so its macOS linking stays covered off macOS."""
+
+    import importlib.util
+
+    path = Path(__file__).parents[1] / "scripts" / "build_desktop.py"
+    spec = importlib.util.spec_from_file_location("nyx_build_desktop_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_macos_staging_exposes_frameworks_at_the_engine_relative_roots(tmp_path):
+    driver = _build_desktop_driver()
+    macos_root = tmp_path / "Nyx.app" / "Contents" / "MacOS"
+    library_root = macos_root / "PySide6" / "Qt" / "lib"
+    for name in ("QtCore", "QtWebEngineCore"):
+        binary = library_root / f"{name}.framework" / "Versions" / "A" / name
+        binary.parent.mkdir(parents=True)
+        binary.write_text("", encoding="utf-8")
+
+    driver._link_macos_qt_frameworks(macos_root)
+
+    flat = macos_root / "PySide6" / "QtCore.framework"
+    assert flat.is_symlink()
+    assert (flat / "Versions" / "A" / "QtCore").is_file()
+    nested = library_root / "QtWebEngineCore.framework" / "lib"
+    assert nested.is_symlink()
+    assert (
+        nested / "QtWebEngineCore.framework" / "Versions" / "A" / "QtWebEngineCore"
+    ).is_file()
+
+    driver._link_macos_qt_frameworks(macos_root)
+    assert flat.is_symlink()
+    assert nested.is_symlink()
