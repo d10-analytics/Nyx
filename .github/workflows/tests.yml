@@ -180,9 +180,36 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip install -e '.[test,desktop]'
+          python -m pip install -e '.[test,desktop,build]'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest tests/test_desktop.py -v -s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and verify the native desktop artifact
+        shell: pwsh
+        env:
+          NYX_EXPECTED_NATIVE_HOST: windows-2025
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Nuitka needs the MSVC toolchain, and the deployment tool uses
+          # dumpbin to discover Qt module dependencies.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe is unavailable' }
+          $installation = & $vswhere -latest -products * -property installationPath
+          if (-not $installation) { throw 'a Visual Studio installation was not found' }
+          cmd /c "`"$installation\VC\Auxiliary\Build\vcvars64.bat`" && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          python scripts/build_desktop.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifact = (Resolve-Path 'dist/desktop/Nyx/Nyx.exe').Path
+          Get-FileHash -Algorithm SHA256 (Join-Path (Split-Path $artifact) 'NyxWorker/NyxWorker.exe')
+          Get-FileHash -Algorithm SHA256 $artifact
+          $env:NYX_DESKTOP_ARTIFACT = $artifact
+          python -m pytest tests/test_desktop_artifact.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
@@ -213,5 +240,20 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -e '.[test,desktop]'
+          python -m pip install -e '.[test,desktop,build]'
           python -m pytest tests/test_desktop.py -v -s
+
+      - name: Build and verify the native desktop artifact
+        shell: bash
+        env:
+          NYX_EXPECTED_NATIVE_HOST: macos-15
+          NYX_REQUIRE_NATIVE_DESKTOP: '1'
+        run: |
+          set -euo pipefail
+          python scripts/build_desktop.py
+          artifact="$PWD/dist/desktop/Nyx.app"
+          test -d "$artifact"
+          shasum -a 256 "$artifact/Contents/MacOS/NyxWorker/NyxWorker"
+          shasum -a 256 "$artifact/Contents/MacOS/Nyx"
+          export NYX_DESKTOP_ARTIFACT="$artifact"
+          python -m pytest tests/test_desktop_artifact.py -v -s
