@@ -4356,6 +4356,7 @@ def test_retained_shutdown_retry_wakes_owner_and_releases_original_claim():
                 os.close(lease_fd)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM-resistant worker proof")
 def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
