@@ -448,6 +448,12 @@ def _configuration_from_payload(payload: Any) -> Configuration:
         canonical = Path(root).resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as error:
         raise ConfigurationError("Nyx configuration root is invalid") from error
+    # A persisted record is admitted through the same installation-footprint
+    # rule as a freshly selected root, so a workspace that resolves inside the
+    # delivered application, its helper, or its resources stays unavailable
+    # instead of being served after a restart.
+    if any(_is_within(canonical, footprint) for footprint in _installation_footprints()):
+        raise ConfigurationError("Nyx configuration root is inside the Nyx installation")
     return Configuration(canonical, hidden_stages)
 
 
