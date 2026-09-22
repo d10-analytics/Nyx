@@ -246,7 +246,9 @@ def build() -> dict[str, Any]:
             "@INPUT_FILE@": str(gui_entry),
             "@EXEC_DIRECTORY@": str(BUILD_ROOT / "staged"),
             "@PYTHON_PATH@": sys.executable,
-            "@STATIC_SOURCE@": str(REPOSITORY_ROOT / "nyx" / "static"),
+            # The deployment tool splits extra arguments with a POSIX shell
+            # lexer, so the data source must stay free of Windows separators.
+            "@STATIC_SOURCE@": "nyx/static",
             "@PLATFORM_ARGS@": _platform_arguments(),
         }
     )
