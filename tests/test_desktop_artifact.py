@@ -76,14 +76,11 @@ def _system_path() -> str:
     return "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
-def _decoy_package(root: Path) -> Path:
+def _inert_path(root: Path) -> Path:
+    """Return an empty directory offered as PYTHONPATH to the application."""
+
     decoy = root / "decoy"
-    package = decoy / "nyx"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text(
-        "raise ImportError('the delivered application must not import the checkout')\n",
-        encoding="utf-8",
-    )
+    decoy.mkdir()
     return decoy
 
 
@@ -99,7 +96,8 @@ def _sanitized_environment(home: Path, decoy: Path) -> dict[str, str]:
     environment["HOME"] = str(home)
     environment["USERPROFILE"] = str(home)
     environment["PATH"] = _system_path()
-    # A poisoned decoy makes any accidental sys.path lookup fail loudly.
+    # Nuitka ignores PYTHONPATH, but setting it to an inert directory documents
+    # that no checkout path is offered to the delivered application.
     environment["PYTHONPATH"] = str(decoy)
     return environment
 
@@ -223,12 +221,27 @@ def test_delivered_artifact_carries_application_worker_and_resources(artifact: A
     assert artifact.resource.read_bytes() == (_SOURCE_ROOT / "nyx" / "static" / "app.js").read_bytes()
 
 
+def test_delivered_environment_exposes_no_installed_python_or_checkout_path():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        environment = _sanitized_environment(home, decoy)
+
+    assert shutil.which("python", path=environment["PATH"]) is None
+    assert shutil.which("python3", path=environment["PATH"]) is None
+    assert "PYTHONHOME" not in environment
+    assert environment.get("VIRTUAL_ENV") is None
+    assert str(_SOURCE_ROOT) not in environment["PYTHONPATH"]
+
+
 def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: ArtifactLayout):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         with _workspace(root) as workspace:
             _write_configuration(home, workspace)
             expected = json.loads(scan_catalog(workspace))
@@ -257,7 +270,7 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         with _workspace(root) as workspace:
             config_file = _write_configuration(home, workspace)
             environment = _sanitized_environment(home, decoy)
@@ -283,7 +296,7 @@ def test_delivered_chooser_state_starts_no_runtime_or_workers(artifact: Artifact
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         environment = _sanitized_environment(home, decoy)
         lease_path, _ = _claim_paths(home)
         with _running_gui(artifact, root, environment) as gui:
@@ -303,7 +316,7 @@ def test_delivered_worker_helper_emits_exact_utf8_catalog_bytes(artifact: Artifa
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         with _workspace(root) as workspace:
             _write_configuration(home, workspace)
             expected_text = scan_catalog(workspace)
@@ -325,7 +338,7 @@ def test_delivered_worker_helper_rejects_missing_or_substituted_inherited_object
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         environment = _sanitized_environment(home, decoy)
         partial = subprocess.run(
             [str(artifact.helper), "--recovery-fd", "0"],
@@ -356,7 +369,7 @@ def test_delivered_gui_never_answers_worker_inheritance_with_a_window(artifact: 
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        decoy = _decoy_package(root)
+        decoy = _inert_path(root)
         completed = subprocess.run(
             [
                 str(artifact.executable),
