@@ -562,14 +562,18 @@ def test_delivered_restart_serves_the_newly_saved_workspace(artifact: ArtifactLa
         shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", first)
         shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", second)
         shutil.rmtree(second / "Trail_API")
-        expected_first = scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        expected_second = scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        expected_first = json.loads(
+            scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        )
+        expected_second = json.loads(
+            scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        )
         assert expected_first != expected_second
         environment = _sanitized_environment(home, decoy)
         _write_configuration(home, first)
         with _running_gui(artifact, root, environment) as gui:
             _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
-            assert body.decode("utf-8") == expected_first
+            assert json.loads(body) == expected_first
             assert gui.close() == 0, gui.diagnostics()
         _assert_claims_released(home)
         _wait_port_free(time.monotonic() + 15)
@@ -578,7 +582,7 @@ def test_delivered_restart_serves_the_newly_saved_workspace(artifact: ArtifactLa
         _write_configuration(home, second)
         with _running_gui(artifact, root, environment) as gui:
             _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
-            assert body.decode("utf-8") == expected_second
+            assert json.loads(body) == expected_second
             assert gui.close() == 0, gui.diagnostics()
         _assert_claims_released(home)
 
