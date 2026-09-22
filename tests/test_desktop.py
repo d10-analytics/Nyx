@@ -983,7 +983,7 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
 
         class FakeApplicationRuntime:
             def __init__(self, **_kwargs):
-                pass
+                self.cleanup_allowed = False
 
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
@@ -992,7 +992,7 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
                 pass
 
             def shutdown(self, _deadline):
-                return False
+                return self.cleanup_allowed
 
             def cleanup_start_failure(self, _deadline):
                 return False
@@ -1002,7 +1002,7 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
         ):
             state.setup(first)
             session = desktop.DesktopSession()
-            session.start_runtime(static_ready=lambda: True)
+            application = session.start_runtime(static_ready=lambda: True)
             window = desktop._build_window(_fake_qt(), session)
             window._change.click()
             window._root.setText(str(second))
@@ -1015,7 +1015,9 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
             assert session.switch_blocked
             assert session.snapshot.status == "switch_blocked"
             assert window._retry.isEnabled()
+            application.cleanup_allowed = True
             session.close()
+            assert not session.claims.held
 
 
 def test_postcommit_switch_retry_revalidates_then_restarts_saved_workspace():
@@ -1394,13 +1396,14 @@ def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
 
             class RuntimeWithUnfinishedCleanup:
                 def __init__(self, **_kwargs):
+                    self.cleanup_allowed = False
                     created.append(self)
 
                 def start(self, **_kwargs):
                     raise RuntimeError("injected startup failure")
 
                 def cleanup_start_failure(self, _deadline):
-                    return False
+                    return self.cleanup_allowed
 
                 def shutdown(self, _deadline):
                     return True
@@ -1413,7 +1416,9 @@ def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
                 assert created
                 assert session.runtime is created[0]
                 assert session.claims.held
+                created[0].cleanup_allowed = True
                 session.close()
+                assert not session.claims.held
 
 
 @pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
