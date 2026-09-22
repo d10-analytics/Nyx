@@ -252,12 +252,17 @@ def test_daemon_rechecks_shared_deadline_after_configuration_admission():
             nonlocal lookup_delayed
             if not lookup_delayed:
                 lookup_delayed = True
-                time.sleep(0.03)
+                # The delay must exceed the shared deadline so the expiry is
+                # observed after configuration admission, not at the
+                # pre-admission check.
+                time.sleep(0.4)
             return original_lstat(path)
 
         try:
             with patch.object(runtime, "_paths", return_value=paths):
-                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 10_000_000)
+                # The deadline must survive daemon construction on a loaded
+                # runner so the pre-admission check cannot win the race.
+                daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 300_000_000)
             with patch.object(
                 state, "_lstat", side_effect=delayed_admission_lookup
             ), patch.object(runtime, "create_server") as create_server, pytest.raises(
@@ -2295,7 +2300,7 @@ def test_live_replaced_locator_is_rejected_before_stop_cleanup():
         try:
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "_send_control", side_effect=replace_before_response
-            ), patch.object(runtime, "SHUTDOWN_TIMEOUT", 0.1), pytest.raises(
+            ), patch.object(runtime, "SHUTDOWN_TIMEOUT", 1.0), pytest.raises(
                 runtime.UnhealthyInstanceError, match="record changed"
             ):
                 runtime.stop()
@@ -4372,6 +4377,7 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
         paths, _, _ = _fixture(Path(temporary))
         second_root = Path(temporary) / "second-specification"
         second_root.mkdir()
+        worker_ready = Path(temporary) / "resistant-worker-ready"
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         daemon = None
         daemon_thread = None
@@ -4380,7 +4386,14 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
             with patch.object(
                 state, "resolve_account_home", return_value=paths.account_home
             ), patch.object(runtime, "_paths", return_value=paths), patch.object(
-                runtime, "SHUTDOWN_TIMEOUT", 0.25
+                # Budget comfortably above the HTTP listener's 0.5 s
+                # serve_forever poll interval so the first stop times out
+                # because the SIGTERM-resistant worker refuses to die, and the
+                # retry never inherits a leftover poll tail that would make its
+                # convergence depend on scheduler jitter.
+                runtime,
+                "SHUTDOWN_TIMEOUT",
+                1.0,
             ):
                 daemon = runtime._Daemon(
                     lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
@@ -4389,8 +4402,9 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                     command_factory=lambda: [
                         sys.executable,
                         "-c",
-                        "import signal,time; "
+                        "import signal,time,pathlib; "
                         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        f"pathlib.Path({str(worker_ready)!r}).write_text('ready'); "
                         "time.sleep(30)",
                     ],
                     timeout=30,
@@ -4427,6 +4441,14 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
                 assert daemon.workers.active_count == 1
                 with daemon.workers._lock:
                     worker_child = daemon.workers._children[0]
+                # SIGTERM must be ignored before the stop tears the worker
+                # down; otherwise the interpreter's default disposition kills a
+                # child that has not yet installed its handler, and the premise
+                # of a resistant worker is never actually established.
+                ready_deadline = time.monotonic() + 5
+                while not worker_ready.exists() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                assert worker_ready.exists(), "resistant worker did not install its handler"
 
                 stop_errors: list[BaseException] = []
 
