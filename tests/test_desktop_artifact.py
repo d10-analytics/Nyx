@@ -323,7 +323,7 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
                 )
                 assert second.returncode == 1
                 assert config_file.read_bytes() == before
-                status, _, _ = _request("/api/catalog")
+                status, _, _ = _wait_for_board(time.monotonic() + 30, gui)
                 assert status == 200
                 gui.close()
 

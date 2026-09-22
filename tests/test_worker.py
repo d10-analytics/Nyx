@@ -329,6 +329,19 @@ def test_packaged_application_selects_the_bundled_console_helper(tmp_path, monke
     assert worker.default_worker_command() == [str(helper)]
 
 
+def test_packaged_application_resolves_the_console_helper_from_the_launcher_path(
+    tmp_path, monkeypatch
+):
+    executable, helper = _packaged_layout(tmp_path, with_helper=True)
+    missing = tmp_path / "relocated" / "python"
+    monkeypatch.setattr(worker.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(worker.sys, "executable", str(missing))
+    monkeypatch.setattr(worker.sys, "argv", [str(executable), *worker.sys.argv[1:]])
+
+    assert not missing.exists()
+    assert worker.bundled_worker_command() == [str(helper)]
+
+
 def test_packaged_application_without_helper_fails_closed_instead_of_reentering_gui(
     tmp_path, monkeypatch
 ):
