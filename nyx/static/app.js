@@ -627,7 +627,7 @@
       `${text(directPrerequisiteSummary(entry.relationship.direct_prerequisite_state, prerequisites.length))}</p>` +
       (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "");
     const itemIssues = (entry.diagnostics || []).length
-      ? `<details class="item-issues"><summary>Issues: ${entry.diagnostics.map((item) => item.code).join(", ")} (${entry.diagnostics.length})</summary>` +
+      ? `<details class="item-issues"><summary>Issues: ${text(entry.diagnostics.map((item) => item.code).join(", "))} (${entry.diagnostics.length})</summary>` +
         `<ul class="diagnostics">${entry.diagnostics.map((item) =>
           `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul></details>` : "";
     detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
