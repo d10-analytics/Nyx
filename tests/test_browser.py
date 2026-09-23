@@ -522,6 +522,21 @@ def test_selecting_a_card_shows_declared_values_and_diagnostics(open_page):
     assert "Human sanity decision" not in details.inner_text()
 
 
+def test_item_issue_summary_escapes_diagnostic_codes(open_page):
+    value = json.loads(board_payload())
+    value["entries"][1]["diagnostics"] = [{
+        "code": '<img src=x onerror="alert(1)">',
+        "message": "diagnostic message",
+    }]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
+
+    summary = page.locator("#details .item-issues summary")
+    assert '<img src=x onerror="alert(1)">' in summary.inner_text()
+    assert page.locator("#details .item-issues img").count() == 0
+
+
 def test_old_format_review_fields_stay_searchable_but_technical_id_is_on_demand(open_page):
     value = json.loads(board_payload())
     value["entries"][1]["declared"].update(
