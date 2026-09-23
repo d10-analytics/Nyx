@@ -479,7 +479,25 @@ def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stag
         workspace = _workspace(root, "workspace")
         supplied = root / "workspace-link"
         supplied.symlink_to(workspace, target_is_directory=True)
-        with _home_patches(home)[0]:
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def shutdown(self, _deadline):
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
             session = desktop.DesktopSession()
             result = session.choose_workspace(supplied, ["Done", "Queue", "Done"])
             paths = state.state_paths()
@@ -492,6 +510,120 @@ def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stag
                 "specification_root": str(workspace.resolve()),
             }
             session.close()
+
+
+def test_first_launch_save_starts_admitted_runtime_and_opens_board():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        created = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                self.started = False
+                self.catalog_admitted = False
+                self.shutdown_calls = 0
+                created.append(self)
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+                self.started = True
+
+            def admit_catalog(self):
+                assert self.started
+                self.catalog_admitted = True
+
+            def board_url(self):
+                if not self.catalog_admitted:
+                    raise RuntimeError("catalog has not been admitted")
+                return "http://127.0.0.1:45123/"
+
+            def shutdown(self, _deadline):
+                self.shutdown_calls += 1
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+
+            window._root.setText(str(workspace))
+            window._save.click()
+
+            assert state.load_configuration() == state.Configuration(workspace.resolve(), ())
+            assert len(created) == 1
+            assert session.runtime is created[0]
+            assert created[0].started
+            assert created[0].catalog_admitted
+            assert window._board_opened
+            assert window._board.url() == "http://127.0.0.1:45123/"
+
+            window._quit.click()
+            assert created[0].shutdown_calls == 1
+            assert not session.claims.held
+
+
+def test_first_launch_save_runtime_failure_preserves_selection_and_retries_board():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        created = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                self.catalog_admitted = False
+                self.cleanup_calls = 0
+                created.append(self)
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+                if len(created) == 1:
+                    raise RuntimeError("injected startup failure")
+
+            def admit_catalog(self):
+                self.catalog_admitted = True
+
+            def board_url(self):
+                if not self.catalog_admitted:
+                    raise RuntimeError("catalog has not been admitted")
+                return "http://127.0.0.1:45123/"
+
+            def cleanup_start_failure(self, _deadline):
+                self.cleanup_calls += 1
+                return True
+
+            def shutdown(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            session = desktop.DesktopSession()
+            window = desktop._build_window(_fake_qt(), session)
+
+            window._root.setText(str(workspace))
+            window._save.click()
+
+            assert state.load_configuration() == state.Configuration(workspace.resolve(), ())
+            assert created[0].cleanup_calls == 1
+            assert session.runtime is None
+            assert window._board.url() is None
+            assert window._retry.isEnabled()
+
+            window._retry.click()
+
+            assert len(created) == 2
+            assert session.runtime is created[1]
+            assert created[1].catalog_admitted
+            assert window._board_opened
+            assert window._board.url() == "http://127.0.0.1:45123/"
+            window._quit.click()
 
 
 def test_replacing_workspace_without_policy_input_preserves_hidden_stages():
