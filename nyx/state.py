@@ -104,7 +104,7 @@ class Configuration:
         if self.stage_orders is None:
             object.__setattr__(self, "stage_orders", {})
         else:
-            object.__setattr__(self, "stage_orders", dict(self.stage_orders))
+            object.__setattr__(self, "stage_orders", _validate_stage_orders(self.stage_orders))
 
     @property
     def stage_order(self) -> tuple[str, ...]:
