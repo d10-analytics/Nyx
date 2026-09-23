@@ -16,6 +16,7 @@ STEP_ONE = "123e4567-e89b-42d3-a456-426614174000"
 STEP_TWO = "123e4567-e89b-42d3-a456-426614174001"
 GATE = "123e4567-e89b-42d3-a456-426614174002"
 LOOSE = "123e4567-e89b-42d3-a456-426614174003"
+REVERSE = "123e4567-e89b-42d3-a456-426614174004"
 XSS_TITLE = '<img src=x onerror="alert(1)"> loose package'
 
 
@@ -684,9 +685,14 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
         if entry["stage"] == "Queue":
             entry["board_visible"] = False
     _reseal(hidden)
+    removed = json.loads(board_payload())
+    recreated = json.loads(json.dumps(added))
+    empty = json.loads(json.dumps(added))
+    empty["entries"] = []
+    _reseal(empty)
     refilled = json.loads(json.dumps(added))
     settings = BrowserSettings(order=["Queue", "Under_Development"])
-    client = SequenceClient([first, added, hidden, refilled])
+    client = SequenceClient([first, added, hidden, removed, recreated, empty, refilled])
     page = open_page(client, settings=settings)
     page.locator("#stage-order-editor").wait_for()
     assert row_labels(page) == ["Queue", "Under Development"]
@@ -699,8 +705,21 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     assert row_labels(page) == ["Under Development", "Review"]
     assert page.locator("[data-lifecycle='Queue']").count() == 0
     page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function(
+        "() => document.querySelector('.row-head')?.firstChild.textContent === 'Queue'"
+    )
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator("[data-lifecycle='Review']").count() == 0
+    page.get_by_role("button", name="Refresh view").click()
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    page.get_by_role("button", name="Refresh view").click()
+    page.locator("#board .board-empty").wait_for()
+    assert row_labels(page) == []
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    assert settings.order == ["Queue", "Under_Development"]
 
 
 def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
@@ -709,6 +728,7 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.locator("#stage-order-editor").wait_for()
     page.get_by_role("button", name="Move Under Development up").focus()
     page.keyboard.press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Under Development up")).to_be_focused()
     assert settings.calls == []
     page.get_by_role("button", name="Cancel").click()
     assert settings.calls == []
@@ -732,34 +752,84 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
 
 def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_page):
     settings = BrowserSettings()
-    page = open_page(StaticClient(board_payload()), settings=settings)
-    page.locator("#stage-order-editor").wait_for()
-    settings.fail_next = True
-    page.get_by_role("button", name="Move Under Development up").press("Enter")
-    page.get_by_role("button", name="Save").click()
-    page.get_by_text("Save failed: the board row order was not persisted.", exact=True).wait_for()
-    assert settings.order == []
-    assert page.get_by_role("button", name="Save").is_enabled()
+    stale_page = open_page(StaticClient(board_payload()), settings=settings)
+    winning_page = open_page(StaticClient(board_payload()), settings=settings)
+    stale_page.locator("#stage-order-editor").wait_for()
+    winning_page.locator("#stage-order-editor").wait_for()
 
-    settings.revision = "newer-writer"
-    page.get_by_role("button", name="Save").click()
-    page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
-    assert settings.order == []
-    assert page.get_by_role("button", name="Save").is_enabled()
+    winning_page.get_by_role("button", name="Move Under Development up").press("Enter")
+    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+
+    stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+    assert stale_page.get_by_role("button", name="Save").is_enabled()
+
+    settings.fail_next = True
+    winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
+    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_text(
+        "Save failed: the board row order was not persisted.", exact=True
+    ).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+    assert winning_page.get_by_role("button", name="Save").is_enabled()
 
 
 def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
+    first = json.loads(board_payload())
+    first["entries"].append(_entry(
+        REVERSE,
+        "Beta/Under_Development/reverse",
+        "under_development",
+        "Reverse dependent",
+        "Beta",
+        prerequisites=[_edge(GATE, "reverse")],
+    ))
+    first["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(first)
+    pending = json.loads(json.dumps(first))
+    for entry in pending["entries"]:
+        if entry["package_id"] == STEP_ONE:
+            entry["declared"]["title"] = "Pending foundation"
+    _reseal(pending)
     settings = BrowserSettings()
-    page = open_page(StaticClient(board_payload()), settings=settings)
+    page = open_page(SequenceClient([first, pending]), settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    page.fill("#filter", "dependent")
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    page.wait_for_selector("#refresh.pending", timeout=15000)
     page.get_by_role("button", name="Move Under Development up").press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Under Development up")).to_be_focused()
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
+    assert page.locator("#filter").input_value() == "dependent"
+    assert page.locator("#refresh").inner_text() == "Apply update"
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
-    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
+    assert page.locator("#filter").input_value() == "dependent"
+    assert page.locator("#refresh").inner_text() == "Apply update"
+    page.get_by_role("button", name="Apply update").click()
+    page.get_by_text("Pending foundation", exact=True).wait_for(state="attached")
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    assert page.locator("#filter").input_value() == "dependent"
+    page.fill("#filter", "")
+    assert connection_pairs(page) == {
+        (STEP_ONE, STEP_TWO),
+        (STEP_TWO, GATE),
+        (STEP_ONE, LOOSE),
+        (GATE, REVERSE),
+    }
+    reverse = page.locator(f'.connection[data-source="{GATE}"][data-dependent="{REVERSE}"]')
+    assert reverse.count() == 1
+    assert reverse.evaluate("""group => {
+      const source = document.querySelector(`[data-package-id="${group.dataset.source}"]`);
+      const dependent = document.querySelector(`[data-package-id="${group.dataset.dependent}"]`);
+      return source.getBoundingClientRect().top > dependent.getBoundingClientRect().top;
+    }""")
     assert_readable_arrows(page)
 
 
