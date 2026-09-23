@@ -81,7 +81,9 @@ def _default_provider() -> Catalog:
         raise CatalogError("producer_unavailable") from None
 
 
-def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
+def _handler_for(
+    provider: Provider, settings_provider: Any | None = None
+) -> type[BaseHTTPRequestHandler]:
     class TrackerHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -124,7 +126,7 @@ def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
             self._send(HTTPStatus.BAD_GATEWAY, _json_bytes({"error": code}), "application/json")
 
         def _settings_provider(self) -> Any | None:
-            return getattr(self.server, "settings_provider", None)
+            return settings_provider
 
         def _settings_get(self) -> None:
             settings = self._settings_provider()
@@ -305,26 +307,45 @@ class TrackerServer(ThreadingHTTPServer):
         self,
         provider: Provider | None = None,
         port: int = 0,
-        settings_provider: Any | None = None,
+        *,
+        _settings_provider: Any | None = None,
+        _capability: object | None = None,
     ) -> None:
+        if _settings_provider is not None and _capability is not _APPLICATION_SERVER_CAPABILITY:
+            raise TypeError("settings are owned by ApplicationRuntime")
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
-        self.settings_provider = settings_provider
         selected_provider = provider if provider is not None else _default_provider
-        super().__init__(("127.0.0.1", port), _handler_for(selected_provider))
-
-    def set_settings_provider(self, provider: Any | None) -> None:
-        """Attach the application-owned settings boundary after construction."""
-
-        self.settings_provider = provider
-
+        super().__init__(
+            ("127.0.0.1", port),
+            _handler_for(selected_provider, _settings_provider),
+        )
 
 def create_server(
     provider: Provider | None = None,
     port: int = 0,
-    settings_provider: Any | None = None,
 ) -> TrackerServer:
-    return TrackerServer(provider=provider, port=port, settings_provider=settings_provider)
+    """Create a standalone read-only catalog server."""
+
+    return TrackerServer(provider=provider, port=port)
+
+
+_APPLICATION_SERVER_CAPABILITY = object()
+
+
+def _create_application_server(
+    provider: Provider,
+    port: int,
+    settings_provider: Any,
+) -> TrackerServer:
+    """Create the settings-capable server used by ApplicationRuntime."""
+
+    return TrackerServer(
+        provider=provider,
+        port=port,
+        _settings_provider=settings_provider,
+        _capability=_APPLICATION_SERVER_CAPABILITY,
+    )
 
 
 def run_server(provider: Provider | None = None, port: int = 0) -> None:

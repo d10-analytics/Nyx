@@ -10,7 +10,11 @@ from typing import Any
 
 from . import state
 from .models import Catalog, ProtocolError, parse_catalog
-from .server import CatalogError, TrackerServer, create_server
+from .server import (
+    CatalogError,
+    TrackerServer,
+    _create_application_server,
+)
 from .worker import CatalogWorkerManager, WorkerError
 
 Deadline = float | Callable[[], float]
@@ -36,7 +40,7 @@ class ApplicationRuntime:
         *,
         port: int,
         deadline: Deadline,
-        server_factory: ServerFactory = create_server,
+        server_factory: ServerFactory = _create_application_server,
         thread_factory: ThreadFactory = threading.Thread,
         workers: CatalogWorkerManager | None = None,
     ) -> None:
@@ -229,10 +233,11 @@ class ApplicationRuntime:
         """Start the listener, leaving catalog admission closed."""
 
         self._require_deadline()
-        self.server = self._server_factory(provider=self._provider, port=self.port)
-        set_settings_provider = getattr(self.server, "set_settings_provider", None)
-        if set_settings_provider is not None:
-            set_settings_provider(self)
+        self.server = self._server_factory(
+            provider=self._provider,
+            port=self.port,
+            settings_provider=self,
+        )
         self.http_thread = self._thread_factory(
             target=self.server.serve_forever,
             daemon=True,

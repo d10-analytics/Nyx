@@ -987,7 +987,6 @@ class _Daemon:
         self.application = ApplicationRuntime(
             port=PORT,
             deadline=self._deadline,
-            server_factory=lambda **kwargs: create_server(**kwargs),
             thread_factory=lambda **kwargs: threading.Thread(**kwargs),
         )
         self.control: socket.socket | None = None
