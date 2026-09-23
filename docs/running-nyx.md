@@ -188,13 +188,17 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 
 ## Capture and review the fictional example
 
-The checked-in images use only the fictional community-event data from the
-[workspace guide](workspaces.md). To reproduce them, create that disposable
-workspace outside the repository, start Nyx through its normal local server,
-and configure the `Done` stage as hidden. Do not use a private workspace for a
-public example.
+The checked-in images use only the complete fictional community-event fixture
+listed in the [workspace guide](workspaces.md): four `spec.md` work items
+(Queue/festival, Done/permit, Needs_Fixes/cleanup, and
+Under_Development/event-site), two `.gitkeep` empty dimensions, and one
+malformed `Reference/Programs/.../program.md` that naturally produces the
+`invalid_package` workspace issue. Create that disposable workspace outside the
+repository, start Nyx through its normal local server and scanner, and configure
+the `Done` stage as hidden. Do not use a private workspace for a public example.
 
-Capture the views from the running browser at a fixed desktop width:
+Capture the views from the running browser at a `1600 × 1200` viewport. Use a
+fresh browser context so the compact preference starts checked:
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -206,6 +210,13 @@ Capture the views from the running browser at a fixed desktop width:
 3. Uncheck **Hide empty rows and columns**, open **Workspace issues** and
    **Dependencies** with the keyboard, and save the expanded view as
    `docs/images/sample-board-expanded.png`.
+
+The first image is light with the issue summary, selected festival card, and
+disclosures collapsed. The second is dark with compact view checked and the
+Dependencies disclosure opened by keyboard, showing the hidden permit title
+and both `venue-confirmed` and `permit-approved` outcomes. The third remains
+dark, unchecks compact view, and opens both Workspace issues and Dependencies by
+keyboard so the empty Planning row and Community_Resources column are visible.
 
 Review each file directly beside the running browser in both themes. Confirm
 that the selected card, hidden dependency context, multiple outcomes, empty

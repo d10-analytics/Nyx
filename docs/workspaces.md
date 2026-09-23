@@ -24,13 +24,14 @@ neighborhood festival can use this workspace layout:
 
 ```text
 community-planning/
-└── Community_Event/
-    ├── Queue/
-    │   └── festival/
-    │       └── spec.md
-    └── Done/
-        └── permit/
-            └── spec.md
+├── Community_Event/
+│   ├── Done/permit/spec.md
+│   ├── Needs_Fixes/cleanup/spec.md
+│   ├── Planning/.gitkeep
+│   ├── Queue/festival/spec.md
+│   ├── Reference/Programs/123e4567-e89b-42d3-a456-426614174101/program.md
+│   └── Under_Development/event-site/spec.md
+└── Community_Resources/.gitkeep
 ```
 
 The event plan can use the same metadata fields as a software specification:
@@ -47,9 +48,43 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 Coordinate volunteers, food, music, and a safe public event.
 ```
 
-The permit work item can record both outcomes with two `Claim` rows. If `Done`
-is hidden during setup, the permit card stays out of the board and the selected
-festival item still shows it as prerequisite context. The interface calls each
+The complete disposable fixture used by the checked-in captures adds these
+fictional files:
+
+```markdown
+# Confirm the community festival permit
+Package ID: 123e4567-e89b-42d3-a456-426614174102
+Status: ready
+Claim: venue-confirmed | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Claim: permit-approved | satisfied | sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+```markdown
+# Publish the event website
+Package ID: 123e4567-e89b-42d3-a456-426614174101
+Status: in-progress
+```
+
+```markdown
+# Confirm the cleanup plan
+Package ID: 123e4567-e89b-42d3-a456-426614174103
+Status: needs-fixes
+```
+
+The empty `Planning` stage and `Community_Resources` project each contain only
+`.gitkeep`. To make the captured **Workspace issues** disclosure deterministic,
+the fixture also contains the valid-UUID directory
+`Community_Event/Reference/Programs/123e4567-e89b-42d3-a456-426614174101/`
+with this intentionally malformed `program.md`:
+
+```text
+# This extra line makes the fictional descriptor invalid
+```
+
+The normal scanner reports that descriptor as `invalid_package` while retaining
+the four work items and resolving the hidden permit item. Configure the fixture
+with `nyx --setup <fixture-root> --hide-stage Done`; the capture procedure then
+uses the normal local server and scanner route. The interface calls each
 specification a **work item** and displays its directory stage as a board row;
 the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
 file contract. Use fresh UUIDs in a real workspace.
