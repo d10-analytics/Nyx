@@ -22,6 +22,8 @@
     "target_unreadable", "target_changed_during_read", "target_invalid_identity",
     "invalid_prerequisite", "self_edge",
   ]);
+  // These fields remain part of the wire contract and searchable index. They
+  // are intentionally not all ordinary visible details.
   const DECLARED_FIELDS = [
     ["title", "Title"], ["target_project", "Target project"], ["status", "Status"],
     ["closure", "Closure"], ["sanity_recommendation", "Sanity recommendation"],
@@ -54,6 +56,7 @@
   let railColumns = [];
   let railEdges = [];
   let compactView = true;
+  let refreshFailure = null;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -70,7 +73,7 @@
   }
 
   function projectOf(entry) {
-    return entry.project || "Unknown project";
+    return entry.project || "";
   }
 
   function indexByPackageId(entries) {
@@ -276,21 +279,41 @@
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 
+  function dependencyIndicator(entry) {
+    const state = entry.relationship.direct_prerequisite_state;
+    const edges = entry.relationship.prerequisites || [];
+    if (state === "no_declared_prerequisites" && edges.length === 0) return null;
+    if (state === "relationship_unavailable") {
+      return { state: "unavailable", label: "Dependencies unavailable", title: "Dependency information is unavailable." };
+    }
+    if (state === "unknown" || edges.some((edge) => edge.resolved_state === "unknown")) {
+      return { state: "unknown", label: "Dependencies unknown", title: "Dependency information is unknown." };
+    }
+    if (state === "unsatisfied" || edges.some((edge) => edge.resolved_state === "unsatisfied")) {
+      return { state: "waiting", label: "Waiting on dependencies", title: "Some dependencies are not satisfied." };
+    }
+    if (state === "satisfied" && edges.length > 0 &&
+        edges.every((edge) => edge.resolved_state === "satisfied")) {
+      return { state: "satisfied", label: "Dependencies satisfied", title: "Direct dependencies are satisfied." };
+    }
+    return { state: "unavailable", label: "Dependencies unavailable", title: "Dependency information is unavailable." };
+  }
+
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
-    const unblocked = ["no_declared_prerequisites", "satisfied"].includes(
-      entry.relationship.direct_prerequisite_state,
-    ) && (entry.relationship.prerequisites || []).every((edge) => edge.resolved_state === "satisfied");
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
-    return `<button class="card${unblocked ? " unblocked" : ""}${selected ? " selected" : ""}" ` +
+    const targetProject = entry.declared.target_project &&
+      entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
+    const dependency = dependencyIndicator(entry);
+    return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
       `${idAttribute} data-search="${text(searchText(entry))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
-      `<span class="card-project">${text(entry.declared.target_project || "Unknown project")}</span>` +
-      (unblocked ? '<span class="card-status" title="Direct prerequisites are clear; ' +
-        'this does not indicate implementation approval.">Unblocked</span>' : "") +
+      (targetProject ? `<span class="card-project">Target project: ${text(targetProject)}</span>` : "") +
+      (dependency ? `<span class="dependency-indicator dependency-${dependency.state}" ` +
+        `title="${text(dependency.title)}">${text(dependency.label)}</span>` : "") +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
 
@@ -359,15 +382,40 @@
 
   function dimensionNotice(dimension) {
     return dimension.availability === "incomplete"
-      ? '<span class="dimension-incomplete" title="Discovery is incomplete; this dimension may contain undiscovered packages">' +
+      ? '<span class="dimension-incomplete" title="Discovery is incomplete; this dimension may contain undiscovered work items">' +
         "incomplete / unavailable</span>"
       : "";
   }
 
+  function workspaceDiagnostics(snapshot) {
+    if (!snapshot) return [];
+    const diagnostics = [...(snapshot.discovery_diagnostics || [])];
+    [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
+      diagnostics.push(...(coverage?.diagnostics || []));
+    });
+    return diagnostics;
+  }
+
+  function boardIssueHtml(snapshot) {
+    const diagnostics = workspaceDiagnostics(snapshot);
+    if (!diagnostics.length && !refreshFailure) return "";
+    const summary = [
+      diagnostics.length
+        ? `Workspace issues: ${diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})` : "",
+      refreshFailure ? `Latest refresh issue: ${refreshFailure}` : "",
+    ].filter(Boolean).join(" · ");
+    const issueItems = diagnostics.map((item) =>
+      `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
+    const refreshItem = refreshFailure
+      ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
+    return `<details class="board-issues" id="board-issues"><summary>${text(summary)}</summary>` +
+      `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
+  }
+
   function emptyBoardHtml(axes, entries) {
-    if (!displayed) return '<p class="empty board-empty">No packages in the catalog.</p>';
+    if (!displayed) return '<p class="empty board-empty">No work items in the catalog.</p>';
     if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
-      return '<p class="empty board-empty">No packages in the catalog.</p>';
+      return '<p class="empty board-empty">No work items in the catalog.</p>';
     }
     const hiddenStages = new Set(displayed.visibility.hidden_stages || []);
     const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
@@ -386,9 +434,9 @@
       return '<p class="empty board-empty compact-hidden">Empty folders are hidden. Uncheck “Hide empty rows and columns” to show them.</p>';
     }
     if (!entries.length) {
-      return '<p class="empty board-empty admitted-empty">The catalog contains admitted folders but no packages.</p>';
+      return '<p class="empty board-empty admitted-empty">The catalog contains admitted folders but no work items.</p>';
     }
-    return '<p class="empty board-empty">No packages match the current board.</p>';
+    return '<p class="empty board-empty">No work items match the current board.</p>';
   }
 
   function renderBoard() {
@@ -396,19 +444,20 @@
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
     const axes = inventoryAxes(entries);
+    const issues = boardIssueHtml(displayed);
     const columns = axes.projects.map((project) => [project.key, project.project]);
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
     if (!axes.stages.length && axes.projects.length) {
       board.style.setProperty("--column-tracks", columns.map(() => "minmax(var(--card-min-width), 1fr)").join(" "));
-      board.innerHTML = '<h2 class="board-corner" aria-hidden="true"></h2>' +
+      board.innerHTML = issues + '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
         '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
       return;
     }
     if (!axes.stages.length || !axes.projects.length) {
-      board.innerHTML = emptyBoardHtml(axes, entries);
+      board.innerHTML = issues + emptyBoardHtml(axes, entries);
       return;
     }
     railEdges = planEdges(entries, byId);
@@ -432,10 +481,10 @@
       const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
       return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
     }).join(" "));
-    let html = (!entries.length
+    let html = issues + (!entries.length
       ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
-        ? "The catalog has incomplete dimensions; no packages are currently available."
-        : "The catalog contains admitted folders but no packages."}</p>` : "") +
+        ? "The catalog has incomplete dimensions; no work items are currently available."
+        : "The catalog contains admitted folders but no work items."}</p>` : "") +
       '<h2 class="board-corner" aria-hidden="true"></h2>' +
       axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("");
     axes.stages.forEach((stage) => {
@@ -553,14 +602,16 @@
     if (!entry) {
       const emptyCatalog = displayed && entries.length === 0;
       detailPanel.innerHTML = (emptyCatalog
-        ? "<h2>No packages available</h2><p>The catalog contains no package entries.</p>"
-        : "<h2>Select a package</h2><p>Choose a card to inspect its declared values.</p>") +
-        catalogDiagnosticsHtml(displayed);
+        ? "<h2>No work items available</h2><p>The catalog contains no work item entries.</p>"
+        : "<h2>Select a work item</h2><p>Choose a card to inspect its details.</p>");
       return;
     }
     const byId = indexByPackageId(entries);
-    const values = DECLARED_FIELDS.map(([field, label]) =>
-      `<dt>${label}</dt><dd>${text(entry.declared[field])}</dd>`).join("");
+    const targetProject = entry.declared.target_project &&
+      entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
+    const programTitle = entry.relationship.program.title;
+    const context = (targetProject ? `<dt>Target project</dt><dd>${text(targetProject)}</dd>` : "") +
+      (programTitle ? `<dt>Program</dt><dd>${text(programTitle)}</dd>` : "");
     // Claims remain distinct in the details view even when they share a target.
     const prerequisites = (entry.relationship.prerequisites || []).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
@@ -570,20 +621,22 @@
         `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
         `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
     });
-    const diagnostics = (entry.diagnostics || []).length
-      ? `<ul class="diagnostics">${entry.diagnostics.map((item) =>
-        `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul>`
-      : "<p>No package diagnostics.</p>";
-    detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
-      `<dt>Package path</dt><dd>${text(entry.package_path)}</dd>` +
-      `<dt>Stage</dt><dd>${text(entry.stage)}</dd>` +
-      `<dt>Program</dt><dd>${text(entry.relationship.program.title || "Ungrouped")}</dd>` +
-      `<dt>Package ID</dt><dd>${text(entry.package_id)}</dd>${values}</dl>` +
-      "<h3>Direct prerequisites</h3>" +
-      `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.relationship.direct_prerequisite_state)}">` +
+    const dependency = dependencyIndicator(entry);
+    const dependencySummary = dependency ? dependency.label : "No direct prerequisites";
+    const dependencyBody = `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.relationship.direct_prerequisite_state)}">` +
       `${text(directPrerequisiteSummary(entry.relationship.direct_prerequisite_state, prerequisites.length))}</p>` +
-      (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "") +
-      `<h3>Diagnostics</h3>${diagnostics}` + catalogDiagnosticsHtml(displayed);
+      (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "");
+    const itemIssues = (entry.diagnostics || []).length
+      ? `<details class="item-issues"><summary>Issues: ${text(entry.diagnostics.map((item) => item.code).join(", "))} (${entry.diagnostics.length})</summary>` +
+        `<ul class="diagnostics">${entry.diagnostics.map((item) =>
+          `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul></details>` : "";
+    detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
+      `<dt>Stage</dt><dd>${text(stageLabelOf(entry.stage))}</dd>${context}</dl>` +
+      `<details class="dependencies"><summary>Dependencies · ${text(dependencySummary)}</summary>${dependencyBody}</details>` +
+      `${itemIssues}` +
+      `<details class="technical-details"><summary>Technical details (Stable ID available)</summary><dl>` +
+      `<dt>Stable ID</dt><dd>${text(entry.package_id)}</dd>` +
+      `<dt>Package path</dt><dd>${text(entry.package_path)}</dd></dl></details>`;
   }
 
   function directPrerequisiteSummary(state, claimCount) {
@@ -596,15 +649,6 @@
       case "unknown": return "Direct prerequisite information is unknown.";
       default: return "Direct prerequisite information unavailable.";
     }
-  }
-
-  function catalogDiagnosticsHtml(snapshot) {
-    const diagnostics = snapshot?.discovery_diagnostics || [];
-    const contents = diagnostics.length
-      ? `<ul class="diagnostics">${diagnostics.map((item) =>
-        `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul>`
-      : "<p>No catalog diagnostics.</p>";
-    return `<section class="catalog-diagnostics"><h3>Catalog diagnostics</h3>${contents}</section>`;
   }
 
   function select(path) {
@@ -837,11 +881,11 @@
 
   function loadedStatus(snapshot) {
     const count = snapshot.entries.length;
-    const discoveryDiagnostics = (snapshot.discovery_diagnostics || []).length;
+    const discoveryDiagnostics = workspaceDiagnostics(snapshot).length;
     const packageDiagnostics = snapshot.entries.some((entry) => (entry.diagnostics || []).length);
-    return `Loaded ${count} package${count === 1 ? "" : "s"}` +
-      (discoveryDiagnostics ? " · catalog diagnostics available" :
-        packageDiagnostics ? " · select a package to view diagnostics" : "");
+    return `Loaded ${count} work item${count === 1 ? "" : "s"}` +
+      (discoveryDiagnostics ? " · workspace issues available" :
+        packageDiagnostics ? " · select a work item to view issues" : "");
   }
 
   function setPending(available) {
@@ -853,6 +897,7 @@
   function apply(snapshot) {
     displayed = snapshot;
     pending = null;
+    refreshFailure = null;
     setPending(false);
     if (selectedPath && !snapshot.entries.some((entry) =>
       entry.board_visible && entry.package_path === selectedPath)) {
@@ -895,7 +940,7 @@
       return;
     }
     busy = true;
-    if (kind === "manual") status.textContent = "Refreshing catalog…";
+    if (kind === "manual") status.textContent = "Refreshing work items…";
     fetch(CATALOG_ROUTE, { cache: "no-store" })
       .then(async (response) => {
         let payload;
@@ -907,6 +952,8 @@
         return validateSnapshot(payload);
       })
       .then((snapshot) => {
+        const hadRefreshFailure = Boolean(refreshFailure);
+        refreshFailure = null;
         if (kind === "manual" || !displayed) { apply(snapshot); return; }
         if (digestOf(snapshot) !== digestOf(displayed)) {
           pending = snapshot;
@@ -916,10 +963,17 @@
           setPending(false);
         }
         status.textContent = loadedStatus(displayed);
+        if (hadRefreshFailure) {
+          renderBoard();
+          renderDetails();
+        }
       })
       .catch((error) => {
+        refreshFailure = safeCategory(error);
         status.textContent = `${kind === "poll" ? "Update check failed" : "Refresh failed"}: ` +
-          safeCategory(error);
+          refreshFailure;
+        renderBoard();
+        renderDetails();
       })
       .finally(() => {
         busy = false;

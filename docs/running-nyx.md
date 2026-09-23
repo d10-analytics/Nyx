@@ -163,7 +163,7 @@ directory.
 
 ## Read and refresh the board
 
-Use **Find** to search visible card metadata, including package titles, projects,
+Use **Find** to search visible card metadata, including work item titles, projects,
 and program names. Select a card to inspect its recorded values, prerequisites,
 and diagnostics. A hidden prerequisite can still appear in those details.
 
@@ -186,12 +186,53 @@ retains the last valid displayed board and browser-local preference.
 
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 
+## Capture and review the fictional example
+
+The checked-in images use only the complete fictional community-event fixture
+listed in the [workspace guide](workspaces.md): four `spec.md` work items
+(Queue/festival, Done/permit, Needs_Fixes/cleanup, and
+Under_Development/event-site), two `.gitkeep` empty dimensions, and one
+malformed `Reference/Programs/.../program.md` that naturally produces the
+`invalid_package` workspace issue. Create that disposable workspace outside the
+repository, start Nyx through its normal local server and scanner, and configure
+the `Done` stage as hidden. Do not use a private workspace for a public example.
+
+Capture the views from the running browser at a `1600 × 1200` viewport. Use a
+fresh browser context so the compact preference starts checked:
+
+1. Choose **Light**, select **Organize the neighborhood festival**, and save the
+   minimal board view as `docs/images/sample-board.png`.
+2. Choose **Dark** and keep **Hide empty rows and columns** checked. Focus the
+   selected festival card with the keyboard and press **Enter** twice: the first
+   press deselects it and the second reselects it. Then focus the
+   **Dependencies** summary and press **Enter**. Save this compact view as
+   `docs/images/sample-board-compact.png`. The hidden permit work item and its
+   two outcomes should remain visible in the disclosure.
+3. Uncheck **Hide empty rows and columns**. This redraws the details panel, so
+   focus the **Dependencies** summary and press **Enter** to reopen it. Then
+   focus the **Workspace issues** summary and press **Enter**. Save this
+   expanded view as `docs/images/sample-board-expanded.png`.
+
+The first image is light with the issue summary, selected festival card, and
+disclosures collapsed. The second is dark with compact view checked and the
+Dependencies disclosure opened by keyboard, showing the hidden permit title
+and both `venue-confirmed` and `permit-approved` outcomes. The third remains
+dark, unchecks compact view, and opens both Workspace issues and Dependencies by
+keyboard so the empty Planning row and Community_Resources column are visible.
+
+Review each file directly beside the running browser in both themes. Confirm
+that the selected card, hidden dependency context, multiple outcomes, empty
+dimensions, workspace issue, disclosure states, labels, and controls match the
+browser. Reject a capture if it contains a private path or value, was drawn by
+hand, or no longer shows the named state. This procedure is intentionally a
+repeatable browser session; it does not add a permanent screenshot framework.
+
 ## If something looks wrong
 
 - **The board is empty:** check the workspace reported by `nyx --status` on
   Linux, or the workspace chosen in the desktop application, the
   [directory layout](workspaces.md), and whether the relevant stages are hidden.
-  If the catalog contains admitted folders but no packages, uncheck **Hide
+  If the catalog contains admitted folders but no work items, uncheck **Hide
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that
   a directory is empty.

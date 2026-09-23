@@ -11,11 +11,83 @@ You can keep it in version control if that fits your workflow.
 Setup resolves a supplied workspace path to its literal, readable directory
 before saving it. A catalog scan invoked directly with a symlink or Windows
 reparse point as its root rejects that root. The same literal-directory rule
-applies to discovered projects, stages, grouping directories, packages, and
-program directories; linked or reparse entries are skipped with bounded
+applies to discovered projects, stages, grouping directories, work item
+directories, and program directories; linked or reparse entries are skipped with bounded
 discovery information. This is a trusted-local workspace contract, not
 containment against a hostile process changing a pathname while a scan is in
 progress.
+
+## A small community-event example
+
+Nyx is useful for planning work outside software too. For example, a fictional
+neighborhood festival can use this workspace layout:
+
+```text
+community-planning/
+├── Community_Event/
+│   ├── Done/permit/spec.md
+│   ├── Needs_Fixes/cleanup/spec.md
+│   ├── Planning/.gitkeep
+│   ├── Queue/festival/spec.md
+│   ├── Reference/Programs/123e4567-e89b-42d3-a456-426614174101/program.md
+│   └── Under_Development/event-site/spec.md
+└── Community_Resources/.gitkeep
+```
+
+The event plan can use the same metadata fields as a software specification:
+
+```markdown
+# Organize the neighborhood festival
+Package ID: 123e4567-e89b-42d3-a456-426614174100
+Status: planning
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
+
+## Purpose
+
+Coordinate volunteers, food, music, and a safe public event.
+```
+
+The complete disposable fixture used by the checked-in captures adds these
+fictional files:
+
+```markdown
+# Confirm the community festival permit
+Package ID: 123e4567-e89b-42d3-a456-426614174102
+Status: ready
+Claim: venue-confirmed | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Claim: permit-approved | satisfied | sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+```markdown
+# Publish the event website
+Package ID: 123e4567-e89b-42d3-a456-426614174101
+Status: in-progress
+```
+
+```markdown
+# Confirm the cleanup plan
+Package ID: 123e4567-e89b-42d3-a456-426614174103
+Status: needs-fixes
+```
+
+The empty `Planning` stage and `Community_Resources` project each contain only
+`.gitkeep`. To make the captured **Workspace issues** disclosure deterministic,
+the fixture also contains the valid-UUID directory
+`Community_Event/Reference/Programs/123e4567-e89b-42d3-a456-426614174101/`
+with this intentionally malformed `program.md`:
+
+```text
+# This extra line makes the fictional descriptor invalid
+```
+
+The normal scanner reports that descriptor as `invalid_package` while retaining
+the four work items and resolving the hidden permit item. Configure the fixture
+with `nyx --setup <fixture-root> --hide-stage Done`; the capture procedure then
+uses the normal local server and scanner route. The interface calls each
+specification a **work item** and displays its directory stage as a board row;
+the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
+file contract. Use fresh UUIDs in a real workspace.
 
 ## Create your first specification
 
@@ -29,11 +101,10 @@ specifications/
             └── spec.md
 ```
 
-Each work item has its own directory containing `spec.md`. Nyx calls that
-directory a **package**. You can add grouping directories between a stage and
-its packages as the project grows.
+Each work item has its own directory containing `spec.md`. You can add grouping
+directories between a stage and its work item directories as the project grows.
 
-Generate a unique package ID:
+Generate a unique `Package ID` value:
 
 ```bash
 python3 -c 'import uuid; print(uuid.uuid4())'
@@ -73,9 +144,9 @@ Open **http://127.0.0.1:8765/** to find your new card under **Trail_Web** and
 
 ## Move work through development
 
-Move the package directory to another stage when your workflow calls for it.
+Move the work item directory to another stage when your workflow calls for it.
 For example, move `route-preview` from `Under_Development` to `Queue` when it
-is ready to be scheduled. Keep its package ID unchanged so dependency references
+is ready to be scheduled. Keep its `Package ID` unchanged so dependency references
 continue to identify the same work.
 
 These familiar stage directory names are used by the bundled examples:
@@ -94,7 +165,7 @@ These descriptions are suggested uses; Nyx displays directory placement rather
 than deciding when work can move. A safe direct child such as `Testing` or
 `Ready_For_Review` is also a stage, and its spelling is preserved on the board.
 You do not need to create every stage in advance. Direct files such as a tracked
-`.gitkeep` preserve an empty directory in version control but are not packages.
+`.gitkeep` preserve an empty directory in version control but are not work items.
 After moving files, request a refresh and apply the update.
 
 At the project level, names beginning with `.`, plus `Reference`, are reserved
@@ -109,7 +180,7 @@ every host can store both spellings.
 
 ## Move files yourself
 
-Nyx does not provide lifecycle buttons. Move a package directory with your
+Nyx does not provide lifecycle buttons. Move a work item directory with your
 editor or existing file tools while Nyx is running, then choose **Refresh view**
 when no update is waiting. If the refreshed catalog differs, the button becomes
 **Apply update**; the new inventory, cards, and diagnostics remain pending until
@@ -137,3 +208,7 @@ already proceed from the API contract.
 Dependencies and program membership are optional. Start with titles, stable IDs,
 and stages, then use the [specification reference](specification-reference.md)
 when those relationships help you track the work.
+
+The [running guide](running-nyx.md) describes the fictional event captures in
+light and dark themes, including compact view, hidden prerequisite context, and
+keyboard-opened disclosures.

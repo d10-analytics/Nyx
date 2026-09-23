@@ -283,7 +283,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
         assert running.returncode == 0, running.stderr
         assert running.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             "Hidden stages: []",
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',
@@ -315,7 +315,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
         assert after_stop.returncode == 0, after_stop.stderr
         assert after_stop.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             "Hidden stages: []",
             "Runtime: not running",
         ]

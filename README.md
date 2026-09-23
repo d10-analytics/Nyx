@@ -1,9 +1,9 @@
 # Nyx
 
-Nyx is a project management and tracking tool for software development that
-brings your plans, progress, and dependencies together in a local browser view.
-When work spans several features or repositories, it helps you see where each
-effort stands, which pieces depend on one another, and what needs attention next.
+Nyx is a work item viewer for plans, progress, and dependencies in a local
+browser view. A work item is one specification in its own directory. When work
+spans several features or repositories, Nyx helps you see where each item
+stands, which pieces depend on one another, and what needs attention next.
 
 Your specifications remain ordinary Markdown files, where you can develop an
 idea, describe the intended behavior, and keep the context needed to carry it
@@ -17,12 +17,14 @@ files remain the shared record of the work, and Nyx provides a consistent place
 to follow it. Nyx reads your specifications and displays the result; it does
 not edit specifications or move them for you.
 
-![Nyx showing a fictional trail-planning app, with web work linked to an API contract and the route preview selected.](docs/images/sample-board.png)
+![Nyx showing a fictional community event, with the festival plan selected and its permit outcomes available.](docs/images/sample-board.png)
 
-*The route preview can be designed from the completed API contract, but building
-it still depends on an API implementation. Other web work needs fixes or review.*
+*This fictional community-event view shows the board and selected work item in
+the light theme. The compact and expanded disclosure views are documented in
+[running Nyx](docs/running-nyx.md). The bundled trail-planning software sample
+remains available in the [sample walkthrough](examples/sample-specifications/README.md).*
 
-## Following your projects
+## Following your work items
 
 The board brings work from multiple projects into one view, with project columns
 and rows for planning, queued work, implementation, fixes, review, completion,
@@ -60,7 +62,10 @@ python3.12 -m venv .venv
 Open **http://127.0.0.1:8765/**. Select **Build the route preview** to see why
 its prerequisite is not yet satisfied, then compare it with **Plan the route
 preview**. The [sample walkthrough](examples/sample-specifications/README.md)
-explains the fictional project, its custom stage, and the compact-view workflow.
+explains the fictional software project, its custom stage, and the compact-view
+workflow. For a non-programming example, the [workspace guide](docs/workspaces.md)
+also shows a fictional community event with a hidden permit work item and two
+recorded outcomes.
 
 Throughout the linked guides, bare `nyx` is shorthand for the console installed
 above: `.venv/bin/nyx`. That relative path works from the repository root. When
@@ -126,8 +131,11 @@ project and stage; its contents supply its title and other recorded information.
 The [workspace guide](docs/workspaces.md) walks through your first specification,
 moving work between stages, and adding dependencies when you need them.
 
-Progress and dependency information comes from your specification files.
-“Unblocked” means the recorded prerequisites are satisfied or none are listed.
+Progress and dependency information comes from your specification files. A card
+with declared direct prerequisites identifies them as satisfied, waiting, unknown,
+or unavailable; a card with none has no dependency marker. These labels report
+only recorded prerequisites and do not imply implementation approval or
+completion.
 
 ## Working with coding agents
 

@@ -218,7 +218,7 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
         status = _run_command(commands[4], root=root, environment=environment)
         assert status.stdout.splitlines() == [
             "Configuration: configured",
-            f"Specification root: {json.dumps(str(sample))}",
+            f"Workspace: {json.dumps(str(sample))}",
             "Hidden stages: []",
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',

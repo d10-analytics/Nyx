@@ -20,7 +20,11 @@ _DESKTOP_LIFECYCLE_REFUSAL = (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nyx")
     commands = parser.add_mutually_exclusive_group()
-    commands.add_argument("--setup", metavar="SPEC_ROOT")
+    commands.add_argument(
+        "--setup",
+        metavar="SPEC_ROOT",
+        help="configure the Workspace at SPEC_ROOT",
+    )
     commands.add_argument("--stop", action="store_true")
     commands.add_argument("--status", action="store_true")
     policy = parser.add_mutually_exclusive_group()
@@ -77,21 +81,21 @@ def _status_snapshot() -> int:
         hidden_stages = configuration.hidden_stages
         configuration_lines = [
             "Configuration: configured",
-            f"Specification root: {_json_literal(str(root))}",
+            f"Workspace: {_json_literal(str(root))}",
             "Hidden stages: " + _json_literal(list(hidden_stages or ())),
         ]
         configuration_diagnostic = None
     elif configuration_status == "not_configured":
         configuration_lines = [
             "Configuration: not configured",
-            "Specification root: not configured",
+            "Workspace: not configured",
             "Hidden stages: not configured",
         ]
         configuration_diagnostic = None
     else:
         configuration_lines = [
             "Configuration: unavailable",
-            "Specification root: unavailable",
+            "Workspace: unavailable",
             "Hidden stages: unavailable",
         ]
         configuration_diagnostic = "configuration unavailable"
