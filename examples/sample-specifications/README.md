@@ -8,13 +8,13 @@ but the API implementation is not ready for the web feature to use. Meanwhile,
 an existing navigation feature needs a fix and the route-search work is ready
 for review.
 
-This small workspace shows how Nyx brings those efforts together. Nyx calls
-each specification package a **work item**; the package directory and `spec.md`
+This small workspace shows how Nyx brings those efforts together. Nyx displays
+each specification as a **work item**; the work item directory and `spec.md`
 remain the on-disk file contract. All names,
 identifiers, and evidence values are fictional. `Trail_Web/Testing` is a custom
 stage, `Trail_Web/Ready_For_Review` is an admitted empty stage, and the tracked
 `Trail_Mobile/.gitkeep` preserves an admitted empty project without creating a
-package.
+work item.
 
 ## Open the board
 
@@ -71,7 +71,7 @@ nyx --setup examples/sample-specifications --hide-stage Done
 nyx
 ```
 
-There are now five visible package records. Select **Verify the route preview**:
+There are now five visible work items. Select **Verify the route preview**:
 the API contract is a configured-hidden prerequisite, but it remains available
 in the selected card's details. Select **Build the route preview** as well to
 compare its unsatisfied implementation prerequisite. The API contract remains
@@ -82,10 +82,10 @@ The configured `Done` policy is separate from compact view. The checkbox can
 hide confirmed-empty rows and columns, but it cannot reveal a configured-hidden
 stage or its cards.
 
-## Move a package and apply the update
+## Move a work item and apply the update
 
-Nyx reads directory placement; it does not move packages. From the repository
-root, move the fictional verification package manually:
+Nyx reads directory placement; it does not move work items. From the repository
+root, move the fictional verification work item manually:
 
 ```bash
 mv examples/sample-specifications/Trail_Web/Testing/verify \
@@ -96,7 +96,7 @@ Wait for Nyx's automatic update check (it runs every ten seconds). The changed
 catalog is held as a pending snapshot and the button becomes **Apply update**;
 click it to adopt the new stage and card location together. When no update is
 pending, **Refresh view** requests an immediate check and applies that response
-directly. Move the package back to `Testing`, wait for the next automatic check,
+directly. Move the work item back to `Testing`, wait for the next automatic check,
 and apply it again so the checked-in sample returns to its documented starting
 state:
 
@@ -110,7 +110,7 @@ board rather than partially applying the result.
 
 ## Compare compact and expanded views
 
-With `Done` hidden and the sample package restored to `Testing`, leave **Hide
+With `Done` hidden and the sample work item restored to `Testing`, leave **Hide
 empty rows and columns** checked for the compact view. Then uncheck it to show
 the admitted empty `Ready_For_Review` row and `Trail_Mobile` column alongside
 the populated dimensions. Search filters cards but leaves the axes unchanged.
@@ -128,7 +128,7 @@ can depend on different claims from the same
 [program descriptor](Trail_Web/Reference/Programs/99999999-9999-4999-8999-999999999999/program.md)
 gives the related work a shared name.
 
-The package IDs make those links stable when a specification moves between
+The `Package ID` values make those links stable when a specification moves between
 stages. The repeated-f hash in the API contract is a synthetic evidence reference
 for this demonstration; use a reference to your actual evidence in your own work.
 

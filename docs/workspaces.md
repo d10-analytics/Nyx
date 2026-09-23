@@ -11,8 +11,8 @@ You can keep it in version control if that fits your workflow.
 Setup resolves a supplied workspace path to its literal, readable directory
 before saving it. A catalog scan invoked directly with a symlink or Windows
 reparse point as its root rejects that root. The same literal-directory rule
-applies to discovered projects, stages, grouping directories, packages, and
-program directories; linked or reparse entries are skipped with bounded
+applies to discovered projects, stages, grouping directories, work item
+directories, and program directories; linked or reparse entries are skipped with bounded
 discovery information. This is a trusted-local workspace contract, not
 containment against a hostile process changing a pathname while a scan is in
 progress.
@@ -101,11 +101,10 @@ specifications/
             └── spec.md
 ```
 
-Each work item has its own directory containing `spec.md`. Nyx calls that
-directory a **package**. You can add grouping directories between a stage and
-its packages as the project grows.
+Each work item has its own directory containing `spec.md`. You can add grouping
+directories between a stage and its work item directories as the project grows.
 
-Generate a unique package ID:
+Generate a unique `Package ID` value:
 
 ```bash
 python3 -c 'import uuid; print(uuid.uuid4())'
@@ -145,9 +144,9 @@ Open **http://127.0.0.1:8765/** to find your new card under **Trail_Web** and
 
 ## Move work through development
 
-Move the package directory to another stage when your workflow calls for it.
+Move the work item directory to another stage when your workflow calls for it.
 For example, move `route-preview` from `Under_Development` to `Queue` when it
-is ready to be scheduled. Keep its package ID unchanged so dependency references
+is ready to be scheduled. Keep its `Package ID` unchanged so dependency references
 continue to identify the same work.
 
 These familiar stage directory names are used by the bundled examples:
@@ -166,7 +165,7 @@ These descriptions are suggested uses; Nyx displays directory placement rather
 than deciding when work can move. A safe direct child such as `Testing` or
 `Ready_For_Review` is also a stage, and its spelling is preserved on the board.
 You do not need to create every stage in advance. Direct files such as a tracked
-`.gitkeep` preserve an empty directory in version control but are not packages.
+`.gitkeep` preserve an empty directory in version control but are not work items.
 After moving files, request a refresh and apply the update.
 
 At the project level, names beginning with `.`, plus `Reference`, are reserved
@@ -181,7 +180,7 @@ every host can store both spellings.
 
 ## Move files yourself
 
-Nyx does not provide lifecycle buttons. Move a package directory with your
+Nyx does not provide lifecycle buttons. Move a work item directory with your
 editor or existing file tools while Nyx is running, then choose **Refresh view**
 when no update is waiting. If the refreshed catalog differs, the button becomes
 **Apply update**; the new inventory, cards, and diagnostics remain pending until

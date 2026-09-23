@@ -163,7 +163,7 @@ directory.
 
 ## Read and refresh the board
 
-Use **Find** to search visible card metadata, including package titles, projects,
+Use **Find** to search visible card metadata, including work item titles, projects,
 and program names. Select a card to inspect its recorded values, prerequisites,
 and diagnostics. A hidden prerequisite can still appear in those details.
 
@@ -232,7 +232,7 @@ repeatable browser session; it does not add a permanent screenshot framework.
 - **The board is empty:** check the workspace reported by `nyx --status` on
   Linux, or the workspace chosen in the desktop application, the
   [directory layout](workspaces.md), and whether the relevant stages are hidden.
-  If the catalog contains admitted folders but no packages, uncheck **Hide
+  If the catalog contains admitted folders but no work items, uncheck **Hide
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that
   a directory is empty.

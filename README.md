@@ -1,7 +1,7 @@
 # Nyx
 
 Nyx is a work item viewer for plans, progress, and dependencies in a local
-browser view. A work item is one specification package on the board. When work
+browser view. A work item is one specification in its own directory. When work
 spans several features or repositories, Nyx helps you see where each item
 stands, which pieces depend on one another, and what needs attention next.
 
