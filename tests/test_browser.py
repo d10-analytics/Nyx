@@ -686,7 +686,11 @@ def test_saved_stage_order_projects_rows_without_phantom_or_catalog_changes(open
     assert row_labels(page) == ["Under Development", "Queue"]
     assert page.locator(".row-head").all_inner_texts() == ["Under Development", "Queue"]
     assert page.locator("#stage-order-list .stage-order-item").count() == 4
-    assert page.locator("#stage-order-list").inner_text().count("Missing") == 1
+    missing_editor_row = page.locator(
+        "#stage-order-list .stage-order-item[data-stage='Missing']"
+    )
+    assert missing_editor_row.count() == 1
+    assert "not currently available" in missing_editor_row.inner_text()
     assert value["catalog_digest"] == digest
     assert page.locator("[data-lifecycle='Missing']").count() == 0
 
@@ -750,7 +754,9 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.locator("#stage-order-editor").wait_for()
     page.get_by_role("button", name="Move Under Development up").focus()
     page.keyboard.press("Enter")
-    playwright.expect(page.get_by_role("button", name="Move Under Development up")).to_be_focused()
+    playwright.expect(
+        page.get_by_role("button", name="Move Under Development down")
+    ).to_be_focused()
     assert settings.calls == []
     page.get_by_role("button", name="Cancel").click()
     assert settings.calls == []
@@ -825,7 +831,9 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     page.wait_for_selector("#refresh.pending", timeout=15000)
     page.get_by_role("button", name="Move Under Development up").press("Enter")
-    playwright.expect(page.get_by_role("button", name="Move Under Development up")).to_be_focused()
+    playwright.expect(
+        page.get_by_role("button", name="Move Under Development down")
+    ).to_be_focused()
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
     assert page.locator("#filter").input_value() == "dependent"
     assert page.locator("#refresh").inner_text() == "Apply update"
