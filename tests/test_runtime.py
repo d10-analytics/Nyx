@@ -1057,8 +1057,8 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         capability_probe.bind(("127.0.0.1", runtime.PORT))
-    except OSError as error:
-        pytest.skip(f"host cannot provide the fixed loopback service port: {error}")
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
     else:
         capability_probe.close()
 
