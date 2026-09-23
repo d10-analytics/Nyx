@@ -549,6 +549,26 @@ def test_application_settings_route_returns_conflict_without_replacement():
     assert settings.calls == []
 
 
+def test_application_settings_put_returns_safe_error_when_admission_closes():
+    class UnavailableSettings:
+        def save_settings(self, revision, order):
+            raise CatalogError("settings_unavailable")
+
+    with RunningServer(
+        StubClient(catalog=valid_catalog()), UnavailableSettings()
+    ) as port:
+        status, content_type, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
+        )
+
+    assert status == 503
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "settings_unavailable"}
+
+
 @pytest.mark.parametrize(
     "category",
     [
