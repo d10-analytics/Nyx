@@ -307,18 +307,21 @@ class TrackerServer(ThreadingHTTPServer):
         self,
         provider: Provider | None = None,
         port: int = 0,
-        *,
-        _settings_provider: Any | None = None,
-        _capability: object | None = None,
     ) -> None:
-        if _settings_provider is not None and _capability is not _APPLICATION_SERVER_CAPABILITY:
-            raise TypeError("settings are owned by ApplicationRuntime")
+        self._initialize(provider, port, None)
+
+    def _initialize(
+        self,
+        provider: Provider | None,
+        port: int,
+        settings_provider: Any | None,
+    ) -> None:
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
         selected_provider = provider if provider is not None else _default_provider
         super().__init__(
             ("127.0.0.1", port),
-            _handler_for(selected_provider, _settings_provider),
+            _handler_for(selected_provider, settings_provider),
         )
 
 def create_server(
@@ -330,7 +333,16 @@ def create_server(
     return TrackerServer(provider=provider, port=port)
 
 
-_APPLICATION_SERVER_CAPABILITY = object()
+class _ApplicationTrackerServer(TrackerServer):
+    """Settings-capable server constructed only by the application owner."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        port: int,
+        settings_provider: Any,
+    ) -> None:
+        self._initialize(provider, port, settings_provider)
 
 
 def _create_application_server(
@@ -340,11 +352,10 @@ def _create_application_server(
 ) -> TrackerServer:
     """Create the settings-capable server used by ApplicationRuntime."""
 
-    return TrackerServer(
+    return _ApplicationTrackerServer(
         provider=provider,
         port=port,
-        _settings_provider=settings_provider,
-        _capability=_APPLICATION_SERVER_CAPABILITY,
+        settings_provider=settings_provider,
     )
 
 
