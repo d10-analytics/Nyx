@@ -245,7 +245,7 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
             _run_command(commands[5], root=root, environment=environment)
 
 
-def _documented_desktop_artifact() -> Path:
+def _documented_desktop_artifact() -> ArtifactLayout:
     staged = os.environ.get("NYX_DESKTOP_ARTIFACT")
     if not staged:
         pytest.skip(
@@ -283,11 +283,11 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         assert gui.close() == 0, gui.diagnostics()
     _assert_claims_released(home)
 
-    # Open a configured workspace, serve the board, then Quit.
-    with _workspace(root) as first:
-        _write_configuration(home, first)
+    with _workspace(root) as workspace:
+        # Open a configured workspace, serve the board, then Quit.
+        _write_configuration(home, workspace)
         expected_first = json.loads(
-            scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
         )
         with _running_gui(artifact, root, environment) as gui:
             status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
@@ -299,7 +299,7 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
 
         # Change workspace: the replacement selection is served after restart.
         second = root / "second"
-        shutil.copytree(first, second)
+        shutil.copytree(workspace, second)
         shutil.rmtree(second / "Trail_API")
         expected_second = json.loads(
             scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
@@ -312,10 +312,9 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
             assert json.loads(body) == expected_second
             assert gui.close() == 0, gui.diagnostics()
         _assert_claims_released(home)
-    _wait_port_free(time.monotonic() + 15)
+        _wait_port_free(time.monotonic() + 15)
 
-    # Recovery: a surviving former worker blocks the start until it exits.
-    with _workspace(root) as workspace:
+        # Recovery: a surviving former worker blocks the start until it exits.
         config_file = _write_configuration(home, workspace)
         before = config_file.read_bytes()
         _, recovery_path = _claim_paths(home)
