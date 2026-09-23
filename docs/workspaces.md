@@ -17,6 +17,43 @@ discovery information. This is a trusted-local workspace contract, not
 containment against a hostile process changing a pathname while a scan is in
 progress.
 
+## A small community-event example
+
+Nyx is useful for planning work outside software too. For example, a fictional
+neighborhood festival can use this workspace layout:
+
+```text
+community-planning/
+└── Community_Event/
+    ├── Queue/
+    │   └── festival/
+    │       └── spec.md
+    └── Done/
+        └── permit/
+            └── spec.md
+```
+
+The event plan can use the same metadata fields as a software specification:
+
+```markdown
+# Organize the neighborhood festival
+Package ID: 123e4567-e89b-42d3-a456-426614174100
+Status: planning
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
+
+## Purpose
+
+Coordinate volunteers, food, music, and a safe public event.
+```
+
+The permit work item can record both outcomes with two `Claim` rows. If `Done`
+is hidden during setup, the permit card stays out of the board and the selected
+festival item still shows it as prerequisite context. The interface calls each
+specification a **work item** and displays its directory stage as a board row;
+the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
+file contract. Use fresh UUIDs in a real workspace.
+
 ## Create your first specification
 
 For a fictional trail-planning app, start with this layout:
@@ -137,3 +174,7 @@ already proceed from the API contract.
 Dependencies and program membership are optional. Start with titles, stable IDs,
 and stages, then use the [specification reference](specification-reference.md)
 when those relationships help you track the work.
+
+The [running guide](running-nyx.md) describes the fictional event captures in
+light and dark themes, including compact view, hidden prerequisite context, and
+keyboard-opened disclosures.

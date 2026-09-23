@@ -21,6 +21,28 @@ Put metadata in that header, one field per line.
 | `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
 | `Superseded By: UUID` | Optional reference to a replacement specification. |
 
+## File syntax and displayed terms
+
+The field spellings above are the stable `spec.md` file contract. Keep writing
+`Package ID`, `Target repo`, `Claim`, and `Prerequisite` exactly as shown, even
+when the browser uses friendlier labels. Nyx presents a package as a **work
+item**, its directory as a stage, and a `Target repo` value as **Target project**
+when that context is useful. The stable package ID is available under the
+technical disclosure rather than occupying the everyday card view.
+
+For example, a community-event item can point to two outcomes from one permit
+item by repeating the `Prerequisite` field:
+
+```text
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
+Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
+```
+
+The providing item records those outcomes with separate `Claim` rows. The file
+syntax remains unchanged while the selected work item shows each prerequisite
+in its Dependencies disclosure. A configured-hidden provider can still appear
+there as context.
+
 Nyx also reads `Closure`, `Sanity Recommendation`, and `Human Sanity Decision`
 as reported text. These fields are optional; they do not trigger actions.
 Project and stage come from the package's directory location.

@@ -186,6 +186,34 @@ retains the last valid displayed board and browser-local preference.
 
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 
+## Capture and review the fictional example
+
+The checked-in images use only the fictional community-event data from the
+[workspace guide](workspaces.md). To reproduce them, create that disposable
+workspace outside the repository, start Nyx through its normal local server,
+and configure the `Done` stage as hidden. Do not use a private workspace for a
+public example.
+
+Capture the views from the running browser at a fixed desktop width:
+
+1. Choose **Light**, select **Organize the neighborhood festival**, and save the
+   minimal board view as `docs/images/sample-board.png`.
+2. Choose **Dark**, keep **Hide empty rows and columns** checked, focus the
+   selected card with the keyboard, press **Enter**, then focus the
+   **Dependencies** summary and press **Enter**. Save this compact view as
+   `docs/images/sample-board-compact.png`. The hidden permit work item and its
+   two outcomes should remain visible in the disclosure.
+3. Uncheck **Hide empty rows and columns**, open **Workspace issues** and
+   **Dependencies** with the keyboard, and save the expanded view as
+   `docs/images/sample-board-expanded.png`.
+
+Review each file directly beside the running browser in both themes. Confirm
+that the selected card, hidden dependency context, multiple outcomes, empty
+dimensions, workspace issue, disclosure states, labels, and controls match the
+browser. Reject a capture if it contains a private path or value, was drawn by
+hand, or no longer shows the named state. This procedure is intentionally a
+repeatable browser session; it does not add a permanent screenshot framework.
+
 ## If something looks wrong
 
 - **The board is empty:** check the workspace reported by `nyx --status` on

@@ -8,7 +8,9 @@ but the API implementation is not ready for the web feature to use. Meanwhile,
 an existing navigation feature needs a fix and the route-search work is ready
 for review.
 
-This small workspace shows how Nyx brings those efforts together. All names,
+This small workspace shows how Nyx brings those efforts together. Nyx calls
+each specification package a **work item**; the package directory and `spec.md`
+remain the on-disk file contract. All names,
 identifiers, and evidence values are fictional. `Trail_Web/Testing` is a custom
 stage, `Trail_Web/Ready_For_Review` is an admitted empty stage, and the tracked
 `Trail_Mobile/.gitkeep` preserves an admitted empty project without creating a
@@ -27,7 +29,7 @@ nyx
 ```
 
 Open **http://127.0.0.1:8765/**. With all stages shown, the catalog contains
-three projects and six package records. The package records are:
+three projects and six work items. The work items are:
 
 | Project | Stage | Work |
 | --- | --- | --- |
@@ -129,6 +131,9 @@ gives the related work a shared name.
 The package IDs make those links stable when a specification moves between
 stages. The repeated-f hash in the API contract is a synthetic evidence reference
 for this demonstration; use a reference to your actual evidence in your own work.
+
+For a non-programming example using the same `Claim` and `Prerequisite` file
+syntax, see the fictional community-event item in the [workspace guide](../../docs/workspaces.md).
 
 Keep this bundled sample as a reference and create your own workspace using the
 [workspace guide](../../docs/workspaces.md). The sample directory contains only
