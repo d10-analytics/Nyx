@@ -18,6 +18,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 CONFIG_SCHEMA_VERSION = 2
@@ -96,15 +97,19 @@ class Configuration:
 
     specification_root: Path
     hidden_stages: tuple[str, ...] = ()
-    stage_orders: dict[str, tuple[str, ...]] | None = None
+    stage_orders: Mapping[str, tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         # Keep the public object immutable at the field level while ensuring a
         # caller cannot mutate the root-order map behind a saved revision.
         if self.stage_orders is None:
-            object.__setattr__(self, "stage_orders", {})
+            object.__setattr__(self, "stage_orders", MappingProxyType({}))
         else:
-            object.__setattr__(self, "stage_orders", _validate_stage_orders(self.stage_orders))
+            object.__setattr__(
+                self,
+                "stage_orders",
+                MappingProxyType(_validate_stage_orders(self.stage_orders)),
+            )
 
     @property
     def stage_order(self) -> tuple[str, ...]:
@@ -141,7 +146,7 @@ class ConfigurationObservation:
     specification_root: Path | None = None
     hidden_stages: tuple[str, ...] | None = None
     diagnostic: str | None = None
-    stage_orders: dict[str, tuple[str, ...]] | None = None
+    stage_orders: Mapping[str, tuple[str, ...]] | None = None
 
     @property
     def state(self) -> str:
@@ -735,7 +740,7 @@ def _save_configuration(
     paths: StatePaths,
     root: Path,
     hidden_stages: tuple[str, ...],
-    stage_orders: Mapping[str, Iterable[str]] | None = None,
+    stage_orders: Mapping[str, Iterable[str]] | None | object = _OMITTED,
     *,
     deadline: float | None = None,
     deadline_ns: int | None = None,
@@ -744,7 +749,13 @@ def _save_configuration(
 
     if _lstat(paths.config_file) is not None:
         _verify_record(paths.config_file)
-    validated_orders = {} if stage_orders is None else _validate_stage_orders(stage_orders)
+        current = load_configuration(paths) if stage_orders is _OMITTED else None
+    else:
+        current = None
+    if stage_orders is _OMITTED:
+        validated_orders = {} if current is None else dict(current.stage_orders or {})
+    else:
+        validated_orders = {} if stage_orders is None else _validate_stage_orders(stage_orders)
     _atomic_write_configuration(
         paths,
         root,
