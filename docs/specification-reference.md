@@ -14,7 +14,7 @@ Put metadata in that header, one field per line.
 | --- | --- |
 | `# Title` | The first top-level heading supplies the card title. |
 | `Package ID: UUID` | A stable, unique identity for the specification. |
-| `Status: text` | A reported status shown in details; it does not change the stage. |
+| `Status: text` | Optional reported text retained for search; it does not change the stage or appear in ordinary item details. |
 | `Target repo: path` | The final path component supplies the displayed target project. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
@@ -106,11 +106,15 @@ Prerequisite: 55555555-5555-4555-8555-555555555555 | contract-ready
 This points to the API contract in the [sample workspace](../examples/sample-specifications/README.md).
 In your workspace, replace the ID and claim name with those of the outcome you need.
 
-Progress and dependency information comes from your specification files.
-“Unblocked” means the recorded prerequisites are satisfied or none are listed.
-The indicator concerns direct prerequisites. Missing, ambiguous, or malformed
-information can leave a relationship unknown or unavailable; it is not treated
-as satisfied. Moving a work item to `Done` does not satisfy its claims automatically.
+Progress and dependency information comes from your specification files. A card
+with declared direct prerequisites shows **Dependencies satisfied**, **Waiting on
+dependencies**, **Dependencies unknown**, or **Dependencies unavailable**. A
+work item with no declared direct prerequisites has no dependency marker. The
+indicator concerns direct prerequisites only; it reports recorded information and
+does not imply implementation approval or completion. Missing, ambiguous, or
+malformed information can leave a relationship unknown or unavailable; it is not
+treated as satisfied. Moving a work item to `Done` does not satisfy its claims
+automatically.
 
 ## Programs
 

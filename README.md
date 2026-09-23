@@ -131,8 +131,11 @@ project and stage; its contents supply its title and other recorded information.
 The [workspace guide](docs/workspaces.md) walks through your first specification,
 moving work between stages, and adding dependencies when you need them.
 
-Progress and dependency information comes from your specification files.
-“Unblocked” means the recorded prerequisites are satisfied or none are listed.
+Progress and dependency information comes from your specification files. A card
+with declared direct prerequisites identifies them as satisfied, waiting, unknown,
+or unavailable; a card with none has no dependency marker. These labels report
+only recorded prerequisites and do not imply implementation approval or
+completion.
 
 ## Working with coding agents
 
