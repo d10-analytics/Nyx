@@ -522,7 +522,10 @@ class DesktopSession:
         except state.StateError as error:
             self._pending_error = "Nyx workspace could not be validated"
             raise SelectionUnavailableError(self._pending_error) from error
-        runtime_expected = self._application_runtime is not None
+        runtime_expected = (
+            self.snapshot.status == "not_configured"
+            or self._application_runtime is not None
+        )
         if self._runtime_start_failed:
             raise SelectionUnavailableError(
                 "Nyx runtime cleanup is incomplete; retry before changing workspace"
