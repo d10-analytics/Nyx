@@ -766,7 +766,7 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
-    assert settings.calls == [([], ["Under_Development", "Queue"])]
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
     assert row_labels(page) == ["Under Development", "Queue"]
 
     page2 = open_page(StaticClient(board_payload()), settings=settings)
@@ -843,7 +843,9 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     assert page.locator("#filter").input_value() == "dependent"
     assert page.locator("#refresh").inner_text() == "Apply update"
     page.get_by_role("button", name="Apply update").click()
-    page.get_by_text("Pending foundation", exact=True).wait_for(state="attached")
+    page.locator("#board").get_by_text(
+        "Pending foundation", exact=True
+    ).wait_for(state="attached")
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
     page.fill("#filter", "")
