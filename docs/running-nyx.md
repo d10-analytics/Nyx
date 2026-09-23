@@ -202,14 +202,16 @@ fresh browser context so the compact preference starts checked:
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
-2. Choose **Dark**, keep **Hide empty rows and columns** checked, focus the
-   selected card with the keyboard, press **Enter**, then focus the
+2. Choose **Dark** and keep **Hide empty rows and columns** checked. Focus the
+   selected festival card with the keyboard and press **Enter** twice: the first
+   press deselects it and the second reselects it. Then focus the
    **Dependencies** summary and press **Enter**. Save this compact view as
    `docs/images/sample-board-compact.png`. The hidden permit work item and its
    two outcomes should remain visible in the disclosure.
-3. Uncheck **Hide empty rows and columns**, open **Workspace issues** and
-   **Dependencies** with the keyboard, and save the expanded view as
-   `docs/images/sample-board-expanded.png`.
+3. Uncheck **Hide empty rows and columns**. This redraws the details panel, so
+   focus the **Dependencies** summary and press **Enter** to reopen it. Then
+   focus the **Workspace issues** summary and press **Enter**. Save this
+   expanded view as `docs/images/sample-board-expanded.png`.
 
 The first image is light with the issue summary, selected festival card, and
 disclosures collapsed. The second is dark with compact view checked and the
