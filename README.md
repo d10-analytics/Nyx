@@ -34,20 +34,27 @@ related specifications. You can hide stages to focus on active work and still
 inspect a hidden prerequisite through a visible card's details.
 
 Your plans stay in files you can edit, keep in version control, and use with
-other tools. Nyx runs locally on Linux and opens in your browser. Setup and
-runtime commands save account-local configuration and runtime state, but the
-board itself remains a read-only view of the workspace.
+other tools. On Linux, Nyx runs locally as a background service and opens in
+your browser. On Windows and macOS it runs as a self-contained desktop
+application that owns its runtime and shows the same board in the application
+window. Setup and runtime state stay account-local, and the board itself
+remains a read-only view of the workspace.
 
 ## Try the sample
 
-You need Linux and Python 3.12 or newer. From a checkout of this repository:
+On Linux you need Python 3.12. From the repository root, use the commands below;
+virtual environment activation is not required. After starting Nyx, explore the
+board before running the final stop command.
+
+Linux (POSIX shell):
 
 ```bash
 python3.12 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-nyx --setup examples/sample-specifications --show-all-stages
-nyx
+.venv/bin/python -m pip install .
+.venv/bin/nyx --setup examples/sample-specifications --show-all-stages
+.venv/bin/nyx
+.venv/bin/nyx --status
+.venv/bin/nyx --stop
 ```
 
 Open **http://127.0.0.1:8765/**. Select **Build the route preview** to see why
@@ -55,16 +62,59 @@ its prerequisite is not yet satisfied, then compare it with **Plan the route
 preview**. The [sample walkthrough](examples/sample-specifications/README.md)
 explains the fictional project, its custom stage, and the compact-view workflow.
 
+Throughout the linked guides, bare `nyx` is shorthand for the console installed
+above: `.venv/bin/nyx`. That relative path works from the repository root. When
+a guide runs commands from another directory, use the absolute path to that same
+console, and quote paths containing spaces.
+
 When files change, Nyx checks for an update every ten seconds. Click **Apply
 update** when it appears to load the new view. **Refresh view** checks immediately
-when no update is waiting. Run `nyx --stop` when you are finished.
+when no update is waiting. Use the stop command above when you are finished.
 
 Setup saves the workspace location and configured stage visibility for your
-Linux account. These setup choices are separate from the browser's personal
+account on this host. These setup choices are separate from the browser's personal
 **Hide empty rows and columns** preference, which is stored only in that
 browser. If Nyx is already running with a different setup, stop it before
 changing the account-local settings. See [running Nyx](docs/running-nyx.md) for
 status and configuration options.
+
+Nyx stores configuration and runtime state in `.nyx` inside your home directory.
+This is intentionally a fresh state root: legacy Linux state is neither read nor
+migrated, and Nyx does not copy, remove, or fall back to it. Stop Nyx with your
+existing installation before upgrading, then rerun setup with the new installation.
+Setup saves an absolute workspace path local to that host; rerun setup on each
+host using its local workspace location.
+
+## Windows and macOS: the private desktop application
+
+Windows and macOS run Nyx as a self-contained desktop application instead of the
+Linux background service. It is a private internal feasibility build, not a
+public release, and no support is promised beyond the hosts that were actually
+exercised: a hosted Windows Server x64 image and Apple Silicon macOS. Your
+operating system may ask you to trust or open the build the first time you run
+it.
+
+Build the private artifact from the repository root with the pinned desktop and
+build extras:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install '.[desktop,build]'
+.\.venv\Scripts\python.exe scripts\build_desktop.py
+```
+
+The build stages `dist\desktop\Nyx\Nyx.exe` on Windows and
+`dist/desktop/Nyx.app` on macOS; macOS uses the same three commands with
+`python3.12` and `.venv/bin/python`. Opening the staged application does not
+need a separate Python installation or virtual environment, and there is no
+offline-install guarantee.
+
+The first launch shows a workspace chooser. Nyx starts its own runtime and shows
+the board in the application window; **Quit**, or closing the only window, stops
+that work and exits only after cleanup completes. Use **Change workspace** to
+stop, save, and restart, and **Retry** when an incomplete stop or an unexpected
+crash recovery is still blocked. See [running Nyx](docs/running-nyx.md) for the
+desktop actions and their limits.
 
 ## Track your own work
 
@@ -97,5 +147,5 @@ Nyx itself does not launch agents or execute the work described by a specificati
 - [Running Nyx](docs/running-nyx.md): start, stop, check status, and choose visible stages.
 - [Specification reference](docs/specification-reference.md): metadata, programs, and dependencies.
 
-Nyx currently serves one Linux account on the local loopback address. The browser
+Nyx serves one local account on the fixed loopback address. The browser
 is read-only; shared or remote hosting is not supported.

@@ -2,20 +2,135 @@
 
 from __future__ import annotations
 
+import os
+import select
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from . import state
+from ._native_claim import NativeClaim
 from .catalog import scan_catalog
+
+if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+    import ctypes
+    from ctypes import wintypes
 
 MAX_STDOUT_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 WORKER_TIMEOUT = 5.0
 _READ_CHUNK_BYTES = 64 * 1024
+WORKER_EXECUTABLE_NAME = "NyxWorker"
+WORKER_HELPER_DIRECTORY = "NyxWorker"
+
+
+def _is_packaged_application() -> bool:
+    """Report whether this module runs inside a standalone application.
+
+    A frozen interpreter no longer exposes a Python launcher, so the worker
+    command must not be reconstructed from ``sys.executable`` there.
+    """
+
+    if getattr(sys, "frozen", False):
+        return True
+    compiled = globals().get("__compiled__")
+    return bool(getattr(compiled, "standalone", False))
+
+
+def _packaged_executable_roots() -> tuple[Path, ...]:
+    """Resolve the directories that can hold the staged console helper.
+
+    A standalone build may report its launcher through ``sys.executable`` or
+    ``sys.argv[0]``, and a windowed Windows build additionally exposes the
+    real image path through ``GetModuleFileNameW``.  Every candidate is
+    resolved so the helper is found beside whichever path describes the
+    running application.
+    """
+
+    candidates: list[str] = []
+    if sys.executable:
+        candidates.append(sys.executable)
+    if getattr(sys, "argv", None):
+        candidates.append(sys.argv[0])
+    if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            buffer = ctypes.create_unicode_buffer(32768)
+            if kernel32.GetModuleFileNameW(None, buffer, len(buffer)):
+                candidates.append(buffer.value)
+        except (OSError, AttributeError):
+            pass
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            roots.append(Path(candidate).resolve(strict=True).parent)
+        except (OSError, RuntimeError):
+            continue
+    return tuple(dict.fromkeys(roots))
+
+
+def bundled_worker_command() -> list[str] | None:
+    """Return the packaged console helper command when one is staged.
+
+    The helper lives in a dedicated directory beside the application
+    executable (Windows) or beside the bundle executable (macOS).  Returning
+    ``None`` rather than a Python launcher keeps a missing helper from
+    re-entering the GUI the way a stray interpreter path would.
+    """
+
+    if not _is_packaged_application():
+        return None
+    name = (
+        f"{WORKER_EXECUTABLE_NAME}.exe"
+        if os.name == "nt"
+        else WORKER_EXECUTABLE_NAME
+    )
+    for root in _packaged_executable_roots():
+        for candidate in (
+            root / WORKER_HELPER_DIRECTORY / name,
+            root / name,
+        ):
+            if candidate.is_file():
+                return [str(candidate)]
+    return None
+
+
+def default_worker_command() -> list[str]:
+    """Select the catalog worker entry for the current runtime.
+
+    A standalone application must spawn its bundled console helper.  A source
+    or virtual-environment run keeps the module entry unchanged.
+    """
+
+    if _is_packaged_application():
+        bundled = bundled_worker_command()
+        if bundled is None:
+            raise WorkerError("producer_unavailable")
+        return bundled
+    return [sys.executable, "-m", "nyx.worker"]
+
+
+def _windows_parent_pipe_closed(fd: int) -> bool:
+    """Observe Windows anonymous-pipe closure without a blocking read."""
+
+    if os.name != "nt":
+        raise RuntimeError("Windows pipe observation is unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(NativeClaim.transfer_handle(fd))
+    if kernel32.PeekNamedPipe(handle, None, 0, None, None, None):
+        return False
+    error = ctypes.get_last_error()
+    if error in {109, 233}:
+        return True
+    raise OSError(error, "PeekNamedPipe failed")
 
 
 class WorkerError(RuntimeError):
@@ -26,8 +141,116 @@ class WorkerError(RuntimeError):
         super().__init__(code)
 
 
-def _worker_main() -> int:
-    """Run the installed catalog engine using the persisted private config."""
+class _ParentLossObserver:
+    """Terminate a desktop worker when its shell closes or disappears."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._observe,
+            daemon=True,
+            name="nyx-worker-parent-observer",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _observe(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if os.name == "nt":
+                    try:
+                        parent_closed = _windows_parent_pipe_closed(self.fd)
+                    except OSError:
+                        return
+                    if parent_closed and not self._stop.is_set():
+                        os._exit(7)
+                    self._stop.wait(0.05)
+                    continue
+                try:
+                    readable, _, _ = select.select([self.fd], [], [], 0.1)
+                except (OSError, ValueError):
+                    return
+                if not readable:
+                    continue
+                try:
+                    data = getattr(os, "read")(self.fd, 1)
+                except OSError:
+                    return
+                if not data and not self._stop.is_set():
+                    os._exit(7)
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
+def _receive_worker_inheritance(
+    recovery_fd: int | None,
+    recovery_path: Path | None,
+    parent_liveness_fd: int | None,
+) -> tuple[NativeClaim | None, _ParentLossObserver | None] | None:
+    """Validate desktop inheritance before configuration can be loaded."""
+
+    if recovery_fd is None and recovery_path is None and parent_liveness_fd is None:
+        return (None, None)
+    if recovery_fd is None or recovery_path is None or parent_liveness_fd is None:
+        return None
+    received_fd: int | None = None
+    liveness_fd: int | None = None
+    claim: NativeClaim | None = None
+    observer: _ParentLossObserver | None = None
+    succeeded = False
+    try:
+        received_fd = NativeClaim.receive_handle(recovery_fd)
+        liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
+        claim = NativeClaim(recovery_path)
+        if not claim.adopt_received(received_fd):
+            return None
+        received_fd = None
+        observer = _ParentLossObserver(liveness_fd)
+        observer.start()
+        liveness_fd = None
+        succeeded = True
+        return claim, observer
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if not succeeded and claim is not None:
+            claim.close()
+        for fd in (received_fd, liveness_fd):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _worker_main(
+    *,
+    recovery_fd: int | None = None,
+    recovery_path: Path | None = None,
+    parent_liveness_fd: int | None = None,
+) -> int:
+    """Run the catalog engine using the persisted private configuration."""
+
+    inherited = _receive_worker_inheritance(
+        recovery_fd, recovery_path, parent_liveness_fd
+    )
+    if inherited is None:
+        if recovery_fd is not None or recovery_path is not None or parent_liveness_fd is not None:
+            return 4
+        claim = None
+        observer = None
+    else:
+        claim, observer = inherited
 
     try:
         configuration = state.load_configuration()
@@ -47,6 +270,11 @@ def _worker_main() -> int:
         return 5
     except Exception:  # noqa: BLE001 - worker boundary has a category-safe envelope
         return 6
+    finally:
+        if observer is not None:
+            observer.close()
+        if claim is not None:
+            claim.close()
 
 
 @dataclass
@@ -82,11 +310,17 @@ class CatalogWorkerManager:
         *,
         command_factory: Callable[[], list[str]] | None = None,
         timeout: float = WORKER_TIMEOUT,
+        recovery_claim: NativeClaim | None = None,
+        recovery_path: Path | None = None,
+        parent_liveness_fd: int | None = None,
     ) -> None:
-        self._command_factory = command_factory or (
-            lambda: [sys.executable, "-m", "nyx.worker"]
-        )
+        self._command_factory = command_factory or default_worker_command
         self._timeout = timeout
+        self._recovery_claim = recovery_claim
+        self._recovery_path = recovery_path or (
+            None if recovery_claim is None else recovery_claim.path
+        )
+        self._parent_liveness_fd = parent_liveness_fd
         self._lock = threading.RLock()
         self._closing = False
         self._children: list[_Child] = []
@@ -106,17 +340,43 @@ class CatalogWorkerManager:
                 raise WorkerError("producer_cancelled")
             self._reservations.append(reservation)
         try:
+            spawn_kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "close_fds": True,
+            }
+            inherited_handles: list[int] = []
+            if self._recovery_claim is not None:
+                if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
+                    raise WorkerError("producer_unavailable")
+                if os.name != "nt":
+                    spawn_kwargs["pass_fds"] = (
+                        self._recovery_claim.fd,
+                        self._parent_liveness_fd,
+                    )
+                else:  # pragma: no cover - exercised by the native Windows lane
+                    inherited_handles = [
+                        NativeClaim.transfer_handle(self._recovery_claim.fd),
+                        NativeClaim.transfer_handle(self._parent_liveness_fd),
+                    ]
+                    for handle in inherited_handles:
+                        os.set_handle_inheritable(handle, True)
+                    startup = subprocess.STARTUPINFO()
+                    startup.lpAttributeList = {"handle_list": inherited_handles}
+                    spawn_kwargs["startupinfo"] = startup
             process = subprocess.Popen(
-                self._command_factory(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
+                self._worker_command(),
+                **spawn_kwargs,
             )
         except BaseException:
             with self._lock:
                 self._reservations.remove(reservation)
             raise
+        finally:
+            if os.name == "nt":  # pragma: no cover - native Windows lane
+                for handle in inherited_handles:
+                    os.set_handle_inheritable(handle, False)
 
         child = _Child(process)
         with self._lock:
@@ -139,6 +399,36 @@ class CatalogWorkerManager:
                     self._select_terminal_locked(child, "producer_failed")
                 else:
                     self._start_finalizer_locked(child)
+
+    def _worker_command(self) -> list[str]:
+        """Add only the catalog worker's inherited desktop objects."""
+
+        command = list(self._command_factory())
+        if self._recovery_claim is None:
+            return command
+        if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
+            raise WorkerError("producer_unavailable")
+        if self._recovery_path is None:
+            raise WorkerError("producer_unavailable")
+        command.extend(
+            [
+                "--recovery-fd",
+                str(
+                    self._recovery_claim.fd
+                    if os.name != "nt"
+                    else NativeClaim.transfer_handle(self._recovery_claim.fd)
+                ),
+                "--recovery-path",
+                str(self._recovery_path),
+                "--parent-liveness-fd",
+                str(
+                    self._parent_liveness_fd
+                    if os.name != "nt"
+                    else NativeClaim.transfer_handle(self._parent_liveness_fd)
+                ),
+            ]
+        )
+        return command
 
     def _start_readers_locked(self, child: _Child) -> None:
         """Start one blocking reader per pipe while the child is registered."""
@@ -348,8 +638,38 @@ class CatalogWorkerManager:
                 self._select_terminal_locked(child, "producer_cancelled")
 
 
+def add_worker_arguments(parser: Any) -> None:
+    """Register the inherited-object arguments shared by both worker entries."""
+
+    parser.add_argument("--recovery-fd", type=int)
+    parser.add_argument("--recovery-path", type=Path)
+    parser.add_argument("--parent-liveness-fd", type=int)
+
+
+def worker_entrypoint(argv: list[str] | None = None) -> int:
+    """Run the catalog worker from either the module or packaged entry."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="nyx.worker")
+    add_worker_arguments(parser)
+    options = parser.parse_args(argv)
+    return _worker_main(
+        recovery_fd=options.recovery_fd,
+        recovery_path=options.recovery_path,
+        parent_liveness_fd=options.parent_liveness_fd,
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(_worker_main())
+    raise SystemExit(worker_entrypoint())
 
 
-__all__ = ["CatalogWorkerManager", "WorkerError"]
+__all__ = [
+    "CatalogWorkerManager",
+    "WorkerError",
+    "add_worker_arguments",
+    "bundled_worker_command",
+    "default_worker_command",
+    "worker_entrypoint",
+]

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -10,6 +12,36 @@ from unittest.mock import patch
 import pytest
 
 from nyx import cli, runtime, state
+
+REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
+DESKTOP_REFUSAL = cli._DESKTOP_LIFECYCLE_REFUSAL
+DESKTOP_ONLY = pytest.mark.skipif(
+    not runtime.desktop_host(),
+    reason="the desktop console dispatch is selected on Windows and macOS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _linux_dispatch(monkeypatch):
+    """Keep the established lifecycle checks on the Linux service dispatch.
+
+    The desktop branch is exercised explicitly below; without this selector the
+    same checks would refuse the lifecycle options on Windows and macOS.
+    """
+
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+
+
+def _subprocess_environment(home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    return environment
+
 
 
 def test_setup_dispatches_to_runtime_and_reports_canonical_root(capsys):
@@ -31,6 +63,42 @@ def test_start_and_stop_are_terminal_commands(capsys):
     start.assert_called_once_with()
     stop.assert_called_once_with()
     assert capsys.readouterr().out.splitlines() == [runtime.URL, "stopped"]
+
+
+def test_real_setup_cli_uses_portable_state_layout(capsys):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification = root / "spec"
+        specification.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            assert cli.main(["--setup", str(specification)]) == 0
+        paths = state.StatePaths(
+            account_home=home,
+            config_directory=home / ".nyx" / "config",
+            config_file=home / ".nyx" / "config" / "config.json",
+            state_directory=home / ".nyx",
+            deployment_file=home / ".nyx" / "runtime" / "deployment.json",
+            runtime_directory=home / ".nyx" / "runtime",
+        )
+        assert paths.config_file.is_file()
+        assert paths.runtime_directory.is_dir()
+        assert not (home / ".config" / "nyx").exists()
+        assert not (home / ".local" / "state" / "nyx").exists()
+        assert capsys.readouterr().out == f"configured {specification.resolve()}\n"
+
+
+def test_expired_start_cli_reports_bounded_error_without_creating_state(capsys):
+    with TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        home.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+            runtime, "STARTUP_TIMEOUT", 0.0
+        ):
+            assert cli.main([]) == 1
+        assert not (home / ".nyx").exists()
+        assert capsys.readouterr().err == "nyx: Nyx startup timed out\n"
 
 
 def test_setup_replaces_hidden_stage_policy_from_repeated_options(capsys):
@@ -71,7 +139,7 @@ def test_active_setup_rejects_changed_root_or_policy_without_cli_mutation(capsys
         second = root / "second"
         second.mkdir()
         with patch.object(state, "resolve_account_home", return_value=home), patch.object(
-            state, "_current_uid", return_value=os.getuid()
+            state, "_current_uid", return_value=state._current_uid()
         ):
             state.setup(first, ["Queue"])
             paths = state.state_paths()
@@ -114,7 +182,7 @@ def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifec
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: configured",
-        'Specification root: "/private/spec\\n-root\\u001b[31m\\u0085"',
+        f"Specification root: {cli._json_literal(str(configuration.specification_root))}",
         'Hidden stages: ["Done", "Queue\\n\\u0085"]',
         "Runtime: not running",
     ]
@@ -175,7 +243,7 @@ def test_status_collapses_malformed_persisted_root_and_preserves_runtime_sibling
         home = root / "home"
         home.mkdir()
         home_patch = patch.object(state, "resolve_account_home", return_value=home)
-        uid_patch = patch.object(state, "_current_uid", return_value=os.getuid())
+        uid_patch = patch.object(state, "_current_uid", return_value=state._current_uid())
         with home_patch, uid_patch:
             paths = state.state_paths(create=True)
             paths.config_file.write_text(
@@ -216,7 +284,7 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: configured",
-        'Specification root: "/private/spec"',
+        f"Specification root: {cli._json_literal(str(configuration.specification_root))}",
         "Hidden stages: []",
         "Runtime: unknown",
         "Diagnostic: runtime state unavailable",
@@ -279,3 +347,94 @@ def test_status_orders_configuration_and_runtime_diagnostics_after_both_observat
         "Diagnostic: runtime control timed out",
     ]
     assert captured.err == ""
+
+
+def test_desktop_console_launches_the_owned_application(monkeypatch):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: True)
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "_launch_desktop", lambda: launched.append("app") or 0)
+    with patch.object(runtime, "setup") as setup, patch.object(
+        runtime, "start"
+    ) as start, patch.object(runtime, "stop") as stop:
+        assert cli.main([]) == 0
+    assert launched == ["app"]
+    setup.assert_not_called()
+    start.assert_not_called()
+    stop.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--setup", "/tmp/spec"],
+        ["--status"],
+        ["--stop"],
+        ["--setup", "/tmp/spec", "--hide-stage", "Queue"],
+        ["--setup", "/tmp/spec", "--show-all-stages"],
+        ["--hide-stage", "Queue"],
+        ["--show-all-stages"],
+    ],
+)
+def test_desktop_console_refuses_retired_commands_before_any_lifecycle(
+    monkeypatch, capsys, arguments
+):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: True)
+    with patch.object(runtime, "setup") as setup, patch.object(
+        runtime, "start"
+    ) as start, patch.object(runtime, "stop") as stop, patch.object(
+        state, "observe_configuration"
+    ) as observe_config, patch.object(
+        runtime, "observe_runtime"
+    ) as observe_runtime, patch.object(cli, "_launch_desktop") as launch:
+        assert cli.main(arguments) == 2
+    for operation in (setup, start, stop, observe_config, observe_runtime, launch):
+        operation.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"nyx: {DESKTOP_REFUSAL}\n"
+
+
+def test_desktop_console_refusal_leaves_configuration_and_state_untouched(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: True)
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification = root / "spec"
+        specification.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ):
+            state.setup(specification)
+            paths = state.state_paths()
+        before = paths.config_file.read_bytes()
+        assert cli.main(["--setup", str(specification), "--show-all-stages"]) == 2
+        assert cli.main(["--status"]) == 2
+        assert cli.main(["--stop"]) == 2
+        assert paths.config_file.read_bytes() == before
+        assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"nyx: {DESKTOP_REFUSAL}\n" * 3
+
+
+@DESKTOP_ONLY
+def test_module_launch_refuses_retired_options_on_a_desktop_host(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    completed = subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "--status"],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(home),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == f"nyx: {DESKTOP_REFUSAL}\n"
+    assert not (home / ".nyx").exists()

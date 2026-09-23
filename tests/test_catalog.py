@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -149,16 +149,41 @@ class CatalogTests(TestCase):
             link_package.joinpath("spec.md").unlink()
             link_package.joinpath("spec.md").symlink_to(outside)
             nonregular.joinpath("spec.md").unlink()
-            os.mkfifo(nonregular / "spec.md")
-            unreadable.joinpath("spec.md").chmod(0)
 
+            if sys.platform == "win32":
+                nonregular.joinpath("spec.md").mkdir()
+                original_open = catalog.Path.open
+
+                def deny_unreadable(path, *args, **kwargs):
+                    if path == unreadable / "spec.md":
+                        raise PermissionError("injected unreadable anchor")
+                    return original_open(path, *args, **kwargs)
+
+                open_patch = patch.object(
+                    catalog.Path,
+                    "open",
+                    autospec=True,
+                    side_effect=deny_unreadable,
+                )
+            else:
+                os.mkfifo(nonregular / "spec.md")
+                unreadable.joinpath("spec.md").chmod(0)
+                open_patch = nullcontext()
+
+            changed_info = (root / "Fictional" / "Queue" / "changed" / "spec.md").lstat()
+            changed_key = catalog._catalog_identity(changed_info)
+            original_identity = catalog._catalog_identity
             identity_count = 0
+
             def changed_identity(info):
                 nonlocal identity_count
+                identity = original_identity(info)
+                if identity != changed_key:
+                    return identity
                 identity_count += 1
                 return (identity_count, 1, 1, 1, 1, 1, 1)
 
-            with patch.object(catalog, "_catalog_identity", side_effect=changed_identity):
+            with open_patch, patch.object(catalog, "_catalog_identity", side_effect=changed_identity):
                 values = [
                     json.loads(producer(root))
                     for producer in (catalog.build_catalog, catalog.scan_catalog)
@@ -231,11 +256,11 @@ class CatalogTests(TestCase):
             ), patch.object(catalog.os, "chmod", side_effect=reject_write_operation), patch.object(
                 catalog.os, "truncate", side_effect=reject_write_operation
             ), patch.object(catalog.os, "write", side_effect=reject_write_operation), patch.object(
-                catalog.os, "mknod", side_effect=reject_write_operation
+                catalog.os, "mknod", side_effect=reject_write_operation, create=True
             ), patch.object(catalog.os, "link", side_effect=reject_write_operation), patch.object(
                 catalog.os, "rmdir", side_effect=reject_write_operation
             ), patch.object(catalog.os, "remove", side_effect=reject_write_operation), patch.object(
-                catalog.os, "fchmod", side_effect=reject_write_operation
+                catalog.os, "fchmod", side_effect=reject_write_operation, create=True
             ), patch.object(catalog.os, "ftruncate", side_effect=reject_write_operation), patch.object(
                 catalog.os, "utime", side_effect=reject_write_operation
             ):
@@ -648,9 +673,28 @@ class CatalogTests(TestCase):
             root = Path(temporary)
             malformed = package(root, "Queue", "malformed", "# Malformed\nPackage ID: nope\n")
             unreadable = package(root, "Queue", "unreadable", V1)
-            unreadable.joinpath("spec.md").chmod(0)
-            value = json.loads(catalog.scan_catalog(root))
-            unreadable.joinpath("spec.md").chmod(0o600)
+            unreadable_anchor = unreadable / "spec.md"
+            if sys.platform == "win32":
+                original_open = catalog.Path.open
+
+                def deny_unreadable(path, *args, **kwargs):
+                    if path == unreadable_anchor:
+                        raise PermissionError("injected unreadable anchor")
+                    return original_open(path, *args, **kwargs)
+
+                open_patch = patch.object(
+                    catalog.Path,
+                    "open",
+                    autospec=True,
+                    side_effect=deny_unreadable,
+                )
+            else:
+                unreadable_anchor.chmod(0)
+                open_patch = nullcontext()
+            with open_patch:
+                value = json.loads(catalog.scan_catalog(root))
+            if sys.platform != "win32":
+                unreadable_anchor.chmod(0o600)
             entries = {entry["package_path"]: entry for entry in value["entries"]}
             self.assertEqual("invalid_package_id",
                              entries["Fictional/Queue/malformed"]["diagnostics"][0]["code"])
@@ -814,6 +858,8 @@ class CatalogTests(TestCase):
                             "truncate", "write", "mknod", "link", "rmdir", "remove",
                             "fchmod", "ftruncate", "utime",
                         ):
+                            if not hasattr(catalog.os, name):
+                                continue
                             stack.enter_context(
                                 patch.object(catalog.os, name, side_effect=reject_write_operation)
                             )

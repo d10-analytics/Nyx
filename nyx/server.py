@@ -9,6 +9,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any, Protocol
 
 from .catalog import scan_catalog
@@ -190,6 +191,12 @@ class TrackerServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # The listener is already numeric loopback; reverse DNS adds no useful
+        # identity and can block construction before the server starts listening.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def get_request(self) -> tuple[Any, Any]:
         connection, address = super().get_request()

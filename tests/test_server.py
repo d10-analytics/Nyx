@@ -1,5 +1,6 @@
 import http.client
 import json
+import socket
 import threading
 from dataclasses import replace
 from unittest.mock import patch
@@ -188,6 +189,65 @@ def request(port, method, path, host=None):
     body = response.read()
     connection.close()
     return response.status, response.getheader("Content-Type"), body
+
+
+def test_numeric_loopback_bind_serves_and_closes_without_reverse_dns():
+    client = StubClient(catalog=valid_catalog())
+    with patch.object(socket, "getfqdn", side_effect=AssertionError("reverse DNS forbidden")) as fqdn, patch.object(
+        socket, "gethostbyaddr", side_effect=AssertionError("reverse DNS forbidden")
+    ) as reverse:
+        running = RunningServer(client)
+        with running as port:
+            assert port > 0
+            assert running.server.server_address == ("127.0.0.1", port)
+            assert running.server.server_name == "127.0.0.1"
+            status, content_type, body = request(port, "GET", "/")
+            assert status == 200 and content_type == "text/html; charset=utf-8"
+            assert body == server._STATIC_ROOT.joinpath("index.html").read_bytes()
+            assert request(port, "GET", "/", host=f"localhost:{port}")[0] == 200
+            assert request(port, "GET", "/api/catalog", host=f"outside.invalid:{port}")[0] == 404
+            assert request(port, "GET", "/api/catalog", host=f"127.0.0.1:{port + 1}")[0] == 404
+            assert client.calls == 0
+            status, _, body = request(port, "GET", "/api/catalog")
+            assert status == 200
+            assert json.loads(body) == client.catalog.as_dict()
+            assert client.calls == 1
+        assert not running.thread.is_alive()
+        assert running.server.socket.fileno() == -1
+        replacement = create_server(client, port=port)
+        try:
+            assert replacement.server_address == ("127.0.0.1", port)
+            assert replacement.server_port == port
+        finally:
+            replacement.server_close()
+        fqdn.assert_not_called()
+        reverse.assert_not_called()
+
+
+def test_occupied_numeric_bind_closes_failed_socket_without_reverse_dns():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupant:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            occupant.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        occupant.bind(("127.0.0.1", 0))
+        occupant.listen(1)
+        port = occupant.getsockname()[1]
+        created = []
+        original_socket = socket.socket
+
+        def capture_socket(*args, **kwargs):
+            result = original_socket(*args, **kwargs)
+            created.append(result)
+            return result
+
+        with patch.object(socket, "socket", side_effect=capture_socket), patch.object(
+            socket, "getfqdn", side_effect=AssertionError("reverse DNS forbidden")
+        ), patch.object(
+            socket, "gethostbyaddr", side_effect=AssertionError("reverse DNS forbidden")
+        ), pytest.raises(OSError):
+            create_server(port=port)
+        assert len(created) == 1
+        assert created[0].fileno() == -1
+        assert occupant.getsockname() == ("127.0.0.1", port)
 
 
 def test_catalog_route_returns_the_projection_and_uses_one_fetch():

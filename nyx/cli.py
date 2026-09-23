@@ -8,6 +8,14 @@ import sys
 
 from . import runtime, state
 
+# The desktop hosts own their runtime through the application window.  The
+# detached Linux service commands do not exist there, so their options are
+# refused before any configuration, runtime record, or inherited handle changes.
+_DESKTOP_LIFECYCLE_REFUSAL = (
+    "the desktop application does not provide lifecycle commands; "
+    "open Nyx and use its workspace controls"
+)
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nyx")
@@ -19,6 +27,30 @@ def _parser() -> argparse.ArgumentParser:
     policy.add_argument("--hide-stage", action="append", metavar="NAME")
     policy.add_argument("--show-all-stages", action="store_true")
     return parser
+
+
+def _launch_desktop() -> int:
+    """Route the desktop console to the shared application entry."""
+
+    from . import desktop
+
+    return desktop.main([])
+
+
+def _retired_arguments(args: argparse.Namespace) -> list[str]:
+    retired: list[str] = []
+    if args.setup is not None:
+        retired.append("--setup")
+    if args.stop:
+        retired.append("--stop")
+    if args.status:
+        retired.append("--status")
+    if args.hide_stage is not None:
+        retired.append("--hide-stage")
+    if args.show_all_stages:
+        retired.append("--show-all-stages")
+    return retired
+
 
 
 def _json_literal(value: object) -> str:
@@ -101,6 +133,11 @@ def _status_snapshot() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if runtime.desktop_host():
+        if _retired_arguments(args):
+            print(f"nyx: {_DESKTOP_LIFECYCLE_REFUSAL}", file=sys.stderr)
+            return 2
+        return _launch_desktop()
     if (args.hide_stage is not None or args.show_all_stages) and args.setup is None:
         _parser().error("--hide-stage and --show-all-stages require --setup")
     try:

@@ -5,20 +5,24 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import threading
+from importlib import import_module
 from pathlib import Path
 
 import pytest
 
-if Path(__file__).resolve().parent != Path("/opt/nyx-verify/exercise"):
+if sys.platform != "linux" or Path(__file__).resolve().parent != Path("/opt/nyx-verify/exercise"):
     pytest.skip(
         "installed service proof runs only from the disposable CI exercise directory",
         allow_module_level=True,
     )
+
+
+pwd = import_module("pwd")
 
 
 ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
@@ -271,6 +275,32 @@ def _account_snapshot() -> dict[str, tuple[str, bytes | str | None, int, int, in
     return snapshot
 
 
+def _create_legacy_sentinels() -> dict[str, tuple[int, int, int, bytes | None]]:
+    sentinels = {
+        ACCOUNT_HOME / ".config" / "nyx" / "sentinel.bin": b"legacy-config\x00bytes",
+        ACCOUNT_HOME / ".local" / "state" / "nyx" / "sentinel.bin": b"legacy-state\x00bytes",
+    }
+    for path, content in sentinels.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return _legacy_snapshot()
+
+
+def _legacy_snapshot() -> dict[str, tuple[int, int, int, bytes | None]]:
+    snapshot: dict[str, tuple[int, int, int, bytes | None]] = {}
+    for relative in (
+        Path(".config/nyx"),
+        Path(".config/nyx/sentinel.bin"),
+        Path(".local/state/nyx"),
+        Path(".local/state/nyx/sentinel.bin"),
+    ):
+        path = ACCOUNT_HOME / relative
+        details = path.lstat()
+        content = path.read_bytes() if stat.S_ISREG(details.st_mode) else None
+        snapshot[str(relative)] = (details.st_dev, details.st_ino, details.st_mode, content)
+    return snapshot
+
+
 def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     assert os.environ.get("HOME") == str(ACCOUNT_HOME)
     command_path = subprocess.check_output(
@@ -284,6 +314,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     )
     assert SYMLINK.readlink() == VENV_COMMAND
 
+    legacy_before = _create_legacy_sentinels()
     before_status = _account_snapshot()
     unconfigured = _run_nyx("--status")
     assert unconfigured.returncode == 0, unconfigured.stderr
@@ -295,6 +326,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     ]
     assert unconfigured.stderr == ""
     assert _account_snapshot() == before_status
+    assert _legacy_snapshot() == legacy_before
 
     specification_root = ACCOUNT_HOME / "fictional-specifications"
     _write_fictional_stages(specification_root)
@@ -303,7 +335,8 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         configured = _run_nyx("--setup", str(specification_root), "--hide-stage", "Done")
         assert configured.returncode == 0, configured.stderr
         assert configured.stdout.strip() == f"configured {specification_root.resolve()}"
-        config_file = ACCOUNT_HOME / ".config" / "nyx" / "config.json"
+        assert _legacy_snapshot() == legacy_before
+        config_file = ACCOUNT_HOME / ".nyx" / "config" / "config.json"
         assert config_file.is_relative_to(ACCOUNT_HOME)
         assert config_file.exists()
         configuration_bytes = config_file.read_bytes()
@@ -320,12 +353,14 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert configured_stopped.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
         assert _account_snapshot() == before_configured_stopped
+        assert _legacy_snapshot() == legacy_before
 
         first = _run_nyx()
         assert first.returncode == 0, first.stderr
         assert first.stdout.strip() == "http://127.0.0.1:8765/"
+        assert _legacy_snapshot() == legacy_before
         started = True
-        instance_file = ACCOUNT_HOME / ".local" / "state" / "nyx" / "runtime" / "instance.json"
+        instance_file = ACCOUNT_HOME / ".nyx" / "runtime" / "instance.json"
         first_instance = json.loads(instance_file.read_text(encoding="utf-8"))
         assert instance_file.is_relative_to(ACCOUNT_HOME)
         instance_bytes = instance_file.read_bytes()
@@ -344,6 +379,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert config_file.read_bytes() == configuration_bytes
         assert instance_file.read_bytes() == instance_bytes
         assert _account_snapshot() == before_running_status
+        assert _legacy_snapshot() == legacy_before
 
         connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
         connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
@@ -365,18 +401,21 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         )
         assert config_file.read_bytes() == configuration_bytes
         assert instance_file.read_bytes() == instance_bytes
+        assert _legacy_snapshot() == legacy_before
 
         reused = _run_nyx()
         assert reused.returncode == 0, reused.stderr
         assert reused.stdout.strip() == "http://127.0.0.1:8765/"
         second_instance = json.loads(instance_file.read_text(encoding="utf-8"))
         assert second_instance["instance_id"] == first_instance["instance_id"]
+        assert _legacy_snapshot() == legacy_before
 
         stopped = _run_nyx("--stop")
         assert stopped.returncode == 0, stopped.stderr
         assert stopped.stdout.strip() == "stopped"
         started = False
         assert not instance_file.exists()
+        assert _legacy_snapshot() == legacy_before
 
         before_post_stop = _account_snapshot()
         post_stop = _run_nyx("--status")
@@ -390,10 +429,12 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert post_stop.stderr == ""
         assert config_file.read_bytes() == configuration_bytes
         assert _account_snapshot() == before_post_stop
+        assert _legacy_snapshot() == legacy_before
 
         show_all = _run_nyx("--setup", str(specification_root), "--show-all-stages")
         assert show_all.returncode == 0, show_all.stderr
         assert show_all.stdout.strip() == f"configured {specification_root.resolve()}"
+        assert _legacy_snapshot() == legacy_before
         show_all_config_bytes = config_file.read_bytes()
         before_show_all_stopped = _account_snapshot()
         show_all_stopped = _run_nyx("--status")
@@ -407,10 +448,12 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert show_all_stopped.stderr == ""
         assert config_file.read_bytes() == show_all_config_bytes
         assert _account_snapshot() == before_show_all_stopped
+        assert _legacy_snapshot() == legacy_before
 
         second = _run_nyx()
         assert second.returncode == 0, second.stderr
         assert second.stdout.strip() == "http://127.0.0.1:8765/"
+        assert _legacy_snapshot() == legacy_before
         started = True
         second_instance_bytes = instance_file.read_bytes()
         before_second_running_status = _account_snapshot()
@@ -427,6 +470,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert config_file.read_bytes() == show_all_config_bytes
         assert instance_file.read_bytes() == second_instance_bytes
         assert _account_snapshot() == before_second_running_status
+        assert _legacy_snapshot() == legacy_before
         second_payload = _fetch_catalog(second.stdout.strip())
         _assert_catalog(second_payload, [])
         _assert_show_all_browser(second.stdout.strip())
@@ -434,6 +478,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         final_stop = _run_nyx("--stop")
         assert final_stop.returncode == 0, final_stop.stderr
         assert final_stop.stdout.strip() == "stopped"
+        assert _legacy_snapshot() == legacy_before
         started = False
     finally:
         if started:

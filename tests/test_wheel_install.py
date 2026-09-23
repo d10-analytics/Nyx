@@ -18,9 +18,13 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 EXPECTED_MODULES = {
     "nyx/__init__.py",
+    "nyx/app_runtime.py",
     "nyx/catalog.py",
     "nyx/cli.py",
     "nyx/models.py",
+    "nyx/_native_claim.py",
+    "nyx/desktop.py",
+    "nyx/desktop_worker.py",
     "nyx/runtime.py",
     "nyx/server.py",
     "nyx/state.py",
@@ -62,6 +66,84 @@ def _wheel_path() -> Path:
     return wheels[0]
 
 
+def _venv_executable(venv: Path, name: str) -> Path:
+    directory = venv / ("Scripts" if os.name == "nt" else "bin")
+    candidates = [directory / name]
+    if os.name == "nt" and not name.endswith(".exe"):
+        candidates.insert(0, directory / f"{name}.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(f"virtual environment executable is missing: {candidates}")
+
+
+def _installed_environment(home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    return environment
+
+
+def _desktop_host() -> bool:
+    """Match the production desktop selection for the installed console."""
+
+    return os.name == "nt" or sys.platform == "darwin"
+
+
+def _run_installed_console(
+    console: Path, arguments: list[str], *, root: Path, home: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(console), *arguments],
+        cwd=root,
+        env=_installed_environment(home),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _native_claim_probe(interpreter: Path, claim: Path, *, root: Path, home: Path) -> str:
+    probe = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        from nyx._native_claim import NativeClaim
+
+        claim = NativeClaim(Path(sys.argv[1]))
+        print("busy" if not claim.acquire(create=False, blocking=False) else "free")
+        claim.close()
+        """
+    )
+    result = subprocess.run(
+        [str(interpreter), "-c", probe, str(claim)],
+        cwd=root,
+        env=_installed_environment(home),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_venv_executable_selects_windows_scripts_and_exe(tmp_path, monkeypatch):
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    python = scripts / "python.exe"
+    console = scripts / "nyx.exe"
+    python.touch()
+    console.touch()
+    monkeypatch.setattr(os, "name", "nt")
+
+    assert _venv_executable(tmp_path, "python") == python
+    assert _venv_executable(tmp_path, "nyx") == console
+
+
 def test_wheel_contains_every_module_and_frontend_asset():
     wheel = _wheel_path()
     with zipfile.ZipFile(wheel) as archive:
@@ -89,9 +171,12 @@ def test_built_wheel_python_and_static_members_have_current_terms():
         _assert_packaged_wording_clean(archive)
 
 
+@pytest.mark.skipif(
+    _desktop_host(),
+    reason="the desktop hosts replace the detached console lifecycle with artifact proof",
+)
 def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():
     wheel = _wheel_path()
-    pytest.importorskip("playwright.sync_api")
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         venv = root / "venv"
@@ -99,13 +184,141 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             [sys.executable, "-m", "venv", str(venv)],
             check=True,
         )
-        interpreter = venv / "bin" / "python"
+        interpreter = _venv_executable(venv, "python")
         subprocess.run(
             [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
             check=True,
             capture_output=True,
             text=True,
         )
+        console = _venv_executable(venv, "nyx")
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        package = specification_root / "Fictional" / "Queue" / "installed-demo"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text(
+            "# Installed catalog entry\nStatus: approved\nClosure: approved\n",
+            encoding="utf-8",
+        )
+        provenance = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                "import nyx, nyx.app_runtime; print(nyx.__file__); print(nyx.app_runtime.__file__)",
+            ],
+            cwd=root,
+            env=_installed_environment(home),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert provenance.returncode == 0, provenance.stderr
+        provenance_lines = provenance.stdout.splitlines()
+        assert len(provenance_lines) == 2
+        installed_module = Path(provenance_lines[0]).resolve()
+        installed_app_runtime = Path(provenance_lines[1]).resolve()
+        assert installed_module.is_relative_to(venv.resolve())
+        assert not installed_module.is_relative_to(REPOSITORY_ROOT)
+        assert installed_app_runtime.is_relative_to(venv.resolve())
+        assert not installed_app_runtime.is_relative_to(REPOSITORY_ROOT)
+
+        setup = _run_installed_console(
+            console, ["--setup", str(specification_root)], root=root, home=home
+        )
+        assert setup.returncode == 0, setup.stderr
+        assert setup.stdout.strip() == f"configured {specification_root.resolve()}"
+        instance_file = home / ".nyx" / "runtime" / "instance.json"
+        claim_file = home / ".nyx" / "runtime" / "lease.lock"
+        launcher_code = textwrap.dedent(
+            """
+            import json
+            import subprocess
+            import sys
+
+            result = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=False)
+            print(
+                json.dumps({
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }),
+                flush=True,
+            )
+            sys.stdin.buffer.read()
+            """
+        )
+        launcher_kwargs: dict[str, object] = {
+            "cwd": root,
+            "env": _installed_environment(home),
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == "nt":
+            launcher_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        else:
+            launcher_kwargs["start_new_session"] = True
+        launcher = subprocess.Popen(
+            [str(interpreter), "-c", launcher_code, str(console)], **launcher_kwargs
+        )
+        try:
+            assert launcher.stdout is not None
+            line = launcher.stdout.readline()
+            assert line, launcher.stderr.read() if launcher.stderr is not None else ""
+            launcher_result = json.loads(line)
+            assert launcher_result == {
+                "returncode": 0,
+                "stdout": "http://127.0.0.1:8765/\n",
+                "stderr": "",
+            }
+        finally:
+            launcher.terminate()
+            launcher.wait(timeout=10)
+
+        first_instance = json.loads(instance_file.read_text(encoding="utf-8"))
+        assert first_instance["url"] == "http://127.0.0.1:8765/"
+        running = _run_installed_console(console, ["--status"], root=root, home=home)
+        assert running.returncode == 0, running.stderr
+        assert running.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: running",
+            'URL: "http://127.0.0.1:8765/"',
+        ]
+        assert _native_claim_probe(interpreter, claim_file, root=root, home=home) == "busy"
+        connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
+        connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        assert response.status == 200
+        payload = json.loads(body)
+        assert [entry["package_path"] for entry in payload["entries"]] == [
+            "Fictional/Queue/installed-demo"
+        ]
+
+        reused = _run_installed_console(console, [], root=root, home=home)
+        assert reused.returncode == 0, reused.stderr
+        assert reused.stdout.strip() == "http://127.0.0.1:8765/"
+        assert json.loads(instance_file.read_text(encoding="utf-8"))["instance_id"] == (
+            first_instance["instance_id"]
+        )
+        stopped = _run_installed_console(console, ["--stop"], root=root, home=home)
+        assert stopped.returncode == 0, stopped.stderr
+        assert stopped.stdout.strip() == "stopped"
+        assert not instance_file.exists()
+        assert _native_claim_probe(interpreter, claim_file, root=root, home=home) == "free"
+        after_stop = _run_installed_console(console, ["--status"], root=root, home=home)
+        assert after_stop.returncode == 0, after_stop.stderr
+        assert after_stop.stdout.splitlines() == [
+            "Configuration: configured",
+            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            "Hidden stages: []",
+            "Runtime: not running",
+        ]
         rejection = subprocess.run(
             [
                 str(interpreter),
@@ -176,7 +389,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             capture_output=True,
             text=True,
             cwd=root,
-            env={key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}},
+            env=_installed_environment(home),
         )
         assert rejection.returncode == 0, rejection.stderr
         probe = root / "probe.py"
@@ -261,11 +474,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             ),
             encoding="utf-8",
         )
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in {"PYTHONPATH", "PYTHONHOME"}
-        }
+        environment = _installed_environment(home)
         process = subprocess.Popen(
             [str(interpreter), str(probe)],
             cwd=root,
@@ -280,9 +489,9 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             line = process.stdout.readline()
             assert line, process.stderr.read() if process.stderr is not None else ""
             details = json.loads(line)
-            installed_module = Path(details["module"])
+            installed_module = Path(details["module"]).resolve()
             port = int(details["port"])
-            assert installed_module.is_relative_to(venv)
+            assert installed_module.is_relative_to(venv.resolve())
             assert not installed_module.is_relative_to(REPOSITORY_ROOT)
 
             connection = http.client.HTTPConnection("127.0.0.1", port)
@@ -293,6 +502,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             assert response.status == 200
             assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/installed-demo"
 
+            pytest.importorskip("playwright.sync_api")
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as api:
@@ -331,3 +541,88 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 process.stdin.write("\n")
                 process.stdin.close()
             process.wait(timeout=10)
+
+
+@pytest.mark.skipif(
+    not _desktop_host(),
+    reason="the installed desktop console is selected on Windows and macOS",
+)
+def test_installed_wheel_desktop_console_refuses_lifecycle_and_routes_to_the_app():
+    wheel = _wheel_path()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        venv = root / "venv"
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        interpreter = _venv_executable(venv, "python")
+        subprocess.run(
+            [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        console = _venv_executable(venv, "nyx")
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        package = specification_root / "Fictional" / "Queue" / "installed-demo"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text(
+            "# Installed catalog entry\nStatus: approved\nClosure: approved\n",
+            encoding="utf-8",
+        )
+        # The wheel keeps its runtime/import coverage on the desktop hosts even
+        # though the console no longer drives the detached service.
+        provenance = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                "import importlib, json; "
+                "print(json.dumps({name: importlib.import_module(name).__file__ for name in "
+                "('nyx', 'nyx.app_runtime', 'nyx.catalog', 'nyx.models', 'nyx.server', "
+                "'nyx.worker')}))",
+            ],
+            cwd=root,
+            env=_installed_environment(home),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert provenance.returncode == 0, provenance.stderr
+        imported = json.loads(provenance.stdout)
+        assert set(imported) == {
+            "nyx",
+            "nyx.app_runtime",
+            "nyx.catalog",
+            "nyx.models",
+            "nyx.server",
+            "nyx.worker",
+        }
+        for name, location in imported.items():
+            module_path = Path(location).resolve()
+            assert module_path.is_relative_to(venv.resolve()), (name, module_path)
+            assert not module_path.is_relative_to(REPOSITORY_ROOT), (name, module_path)
+
+        # Retired lifecycle options fail bounded and leave no state behind,
+        # before any configuration or runtime record is written.
+        for arguments in (
+            ["--setup", str(specification_root)],
+            ["--status"],
+            ["--stop"],
+            ["--setup", str(specification_root), "--show-all-stages"],
+        ):
+            completed = _run_installed_console(console, arguments, root=root, home=home)
+            assert completed.returncode == 2, (arguments, completed.stderr)
+            assert completed.stdout == ""
+            assert completed.stderr.startswith("nyx: ")
+            assert "desktop application" in completed.stderr
+        assert not (home / ".nyx").exists()
+
+        # Empty arguments enter the owned application, never the detached
+        # daemon: this isolated environment installs no GUI dependency, so the
+        # application reports its bounded dependency error instead of serving.
+        launched = _run_installed_console(console, [], root=root, home=home)
+        assert launched.returncode == 1, launched.stderr
+        assert launched.stdout == ""
+        assert "nyx-desktop:" in launched.stderr
+        assert "http://127.0.0.1:8765/" not in launched.stderr
+        assert not (home / ".nyx" / "runtime" / "instance.json").exists()
