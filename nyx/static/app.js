@@ -287,7 +287,7 @@
     if (focusStage) {
       const item = [...stageOrderList.children].find((candidate) =>
         candidate.dataset.stage === focusStage);
-      item?.querySelector("[data-stage-move]")?.focus();
+      item?.querySelector("[data-stage-move]:not(:disabled)")?.focus();
     }
   }
 
