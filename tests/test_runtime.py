@@ -928,6 +928,130 @@ def test_failed_start_cleanup_retains_resistant_worker_until_later_completion():
         assert application.workers.active_count == 0
 
 
+def test_application_settings_save_conflict_and_restart_persistence():
+    with TemporaryDirectory() as temporary:
+        paths, _, specification_root = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        saved = application.save_settings(initial.revision, ["Done", "Queue"])
+        assert saved["outcome"] == "success"
+        assert saved["order"] == ["Done", "Queue"]
+        assert application.save_settings(initial.revision, ["Archive"])["outcome"] == "conflict"
+        assert state.load_configuration(paths).stage_order == ("Done", "Queue")
+        assert application.shutdown(time.monotonic() + 2)
+
+        restarted = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        restarted.capture_configuration(state.load_configuration(paths), paths)
+        restarted.admit_catalog()
+        current = restarted.get_settings()
+        assert current["order"] == ["Done", "Queue"]
+        assert current["revision"] == state.configuration_revision(paths)
+        assert str(specification_root) not in current
+        assert restarted.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_pre_replace_failure_and_preserves_order():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        with patch.object(state.os, "replace", side_effect=OSError("injected")):
+            result = application.save_settings(initial.revision, ["Queue"])
+        assert result["outcome"] == "failure"
+        assert result["order"] == []
+        assert state.load_configuration(paths).stage_order == ()
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_revalidates_after_post_replace_failure():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        original_verify = state._verify_record
+        failed = False
+
+        def fail_once(path):
+            nonlocal failed
+            details = original_verify(path)
+            if (
+                path == paths.config_file
+                and not failed
+                and json.loads(path.read_text(encoding="utf-8")).get("stage_orders", {}).values()
+                and ["Queue", "Done"]
+                in json.loads(path.read_text(encoding="utf-8")).get("stage_orders", {}).values()
+            ):
+                failed = True
+                raise OSError("injected post-replacement verification failure")
+            return details
+
+        with patch.object(state, "_verify_record", side_effect=fail_once):
+            result = application.save_settings(initial.revision, ["Queue", "Done"])
+        assert result["outcome"] == "success"
+        assert result["order"] == ["Queue", "Done"]
+        assert state.load_configuration(paths).stage_order == ("Queue", "Done")
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_admission():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        entered = threading.Event()
+        release = threading.Event()
+        saved: list[dict[str, object]] = []
+        shutdown_result: list[bool] = []
+        original_save = state.save_configuration_owned
+
+        def blocked_save(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=3)
+            return original_save(*args, **kwargs)
+
+        with patch.object(state, "save_configuration_owned", side_effect=blocked_save):
+            save_thread = threading.Thread(
+                target=lambda: saved.append(application.save_settings(initial.revision, ["Queue"]))
+            )
+            save_thread.start()
+            assert entered.wait(timeout=2)
+            shutdown_thread = threading.Thread(
+                target=lambda: shutdown_result.append(application.shutdown(time.monotonic() + 3))
+            )
+            shutdown_thread.start()
+            time.sleep(0.05)
+            assert shutdown_thread.is_alive()
+            release.set()
+            save_thread.join(timeout=3)
+            shutdown_thread.join(timeout=3)
+        assert saved == [{
+            "order": ["Queue"],
+            "revision": saved[0]["revision"],
+            "outcome": "success",
+        }]
+        assert shutdown_result == [True]
+        with pytest.raises(runtime.CatalogError, match="settings_unavailable"):
+            application.get_settings()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup():
     try:

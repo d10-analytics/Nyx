@@ -167,8 +167,8 @@ def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
 
 
 class RunningServer:
-    def __init__(self, client):
-        self.server = create_server(client)
+    def __init__(self, client, settings=None):
+        self.server = create_server(client, settings_provider=settings)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -181,14 +181,32 @@ class RunningServer:
         self.server.server_close()
 
 
-def request(port, method, path, host=None):
+def request(port, method, path, host=None, body=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     headers = {} if host is None else {"Host": host}
-    connection.request(method, path, headers=headers)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     body = response.read()
     connection.close()
     return response.status, response.getheader("Content-Type"), body
+
+
+class SettingsStub:
+    def __init__(self):
+        self.value = {"order": ["Queue", "Done"], "revision": "opaque"}
+        self.calls = []
+
+    def get_settings(self):
+        return dict(self.value)
+
+    def save_settings(self, revision, order):
+        self.calls.append((revision, order))
+        if revision != self.value["revision"]:
+            return {**self.value, "outcome": "conflict"}
+        self.value = {"order": list(order), "revision": "new-opaque"}
+        return {**self.value, "outcome": "success"}
 
 
 def test_numeric_loopback_bind_serves_and_closes_without_reverse_dns():
@@ -470,6 +488,65 @@ def test_loopback_host_aliases_are_accepted():
             host = host_template.format(port=port)
             status, _, _ = request(port, "GET", "/api/catalog", host=host)
         assert status == 200
+
+
+def test_standalone_server_keeps_settings_route_read_only_and_hidden():
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        assert request(port, "GET", "/api/settings")[0] == 404
+        status, _, _ = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
+        )
+        assert status == 404
+
+
+def test_application_settings_route_enforces_host_methods_payload_and_opaque_result():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        status, content_type, body = request(port, "GET", "/api/settings")
+        assert status == 200
+        assert content_type == "application/json"
+        assert json.loads(body) == {"order": ["Queue", "Done"], "revision": "opaque"}
+
+        status, _, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Done", "Queue"]}),
+        )
+        assert status == 200
+        assert json.loads(body) == {
+            "order": ["Done", "Queue"],
+            "revision": "new-opaque",
+            "outcome": "success",
+        }
+        assert settings.calls == [("opaque", ["Done", "Queue"])]
+
+        assert request(port, "POST", "/api/settings")[0] == 405
+        assert request(port, "GET", "/api/settings", host=f"outside.invalid:{port}")[0] == 404
+        assert request(port, "PUT", "/api/settings", body=b"not-json")[0] == 400
+        assert request(port, "PUT", "/api/settings", body=json.dumps({"revision": "new-opaque", "order": []}), host=f"127.0.0.1:{port + 1}")[0] == 404
+
+
+def test_application_settings_route_returns_conflict_without_replacement():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        status, content_type, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "stale", "order": ["Archive"]}),
+        )
+    assert status == 409
+    assert content_type == "application/json"
+    assert json.loads(body) == {
+        "order": ["Queue", "Done"],
+        "revision": "opaque",
+        "outcome": "conflict",
+    }
+    assert settings.calls == []
 
 
 @pytest.mark.parametrize(
