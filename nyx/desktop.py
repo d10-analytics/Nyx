@@ -451,7 +451,7 @@ class DesktopSession:
                 raise SelectionUnavailableError(self._pending_error) from error
             except (state.ConfigurationError, state.StateError) as error:
                 self._switch_in_progress = False
-                if runtime_expected:
+                if runtime_expected and self.snapshot.status != "not_configured":
                     self._finish_switch_failure("Nyx workspace could not be saved")
                 else:
                     self._pending_switch = None
