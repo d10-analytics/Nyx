@@ -1058,10 +1058,14 @@
     }).then(async (response) => {
       let payload = null;
       try { payload = await response.json(); } catch (_) { /* handled below */ }
-      if (!response.ok || !payload || payload.error) {
+      if (!payload || payload.error) {
         throw new Error((payload && payload.error) || "settings_unavailable");
       }
-      return parseSettings(payload, true);
+      const outcome = parseSettings(payload, true);
+      if (!response.ok && !["conflict", "failure", "reload-needed"].includes(outcome.outcome)) {
+        throw new Error("settings_unavailable");
+      }
+      return outcome;
     }).then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
