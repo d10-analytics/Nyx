@@ -242,6 +242,104 @@ def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates()
         }
 
 
+def test_root_keyed_stage_orders_migrate_and_preserve_each_literal_workspace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        marker = first / "source.txt"
+        marker.write_bytes(b"source remains unchanged")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first, ["Queue"])
+            paths = state.state_paths()
+            legacy = {
+                "schema_version": 1,
+                "specification_root": str(first.resolve()),
+            }
+            paths.config_file.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+            assert state.load_configuration(paths).stage_orders == {}
+            first_saved = state.save_configuration_owned(
+                first,
+                stage_order=["Testing", "testing", "Booking"],
+                paths=paths,
+            )
+            second_saved = state.save_configuration_owned(
+                second,
+                ["Queue"],
+                stage_order=["Event", "Idea"],
+                paths=paths,
+            )
+            reloaded = state.load_configuration(paths)
+            payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
+
+        assert first_saved.stage_order == ("Testing", "testing", "Booking")
+        assert second_saved.stage_order == ("Event", "Idea")
+        assert reloaded.stage_orders == {
+            str(first.resolve()): ("Testing", "testing", "Booking"),
+            str(second.resolve()): ("Event", "Idea"),
+        }
+        assert payload["stage_orders"] == {
+            str(first.resolve()): ["Testing", "testing", "Booking"],
+            str(second.resolve()): ["Event", "Idea"],
+        }
+        assert reloaded.hidden_stages == ("Queue",)
+        assert marker.read_bytes() == b"source remains unchanged"
+
+
+@pytest.mark.parametrize(
+    "invalid_order",
+    [["Queue", "Queue"], ["Queue", "bad/name"], ["Queue", "bad\\name"], ["Queue", ""]],
+)
+def test_invalid_stage_order_fails_before_replacement_and_preserves_policy(invalid_order):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(workspace, ["Queue"])
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            with pytest.raises(state.StageOrderError):
+                state.save_configuration_owned(workspace, stage_order=invalid_order, paths=paths)
+            assert paths.config_file.read_bytes() == before
+            loaded = state.revalidate_configuration(paths)
+
+        assert loaded.hidden_stages == ("Queue",)
+        assert loaded.stage_orders == {}
+
+
+def test_stage_order_revision_changes_only_for_validated_configuration_bytes():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            initial = state.setup(workspace, ["Queue"])
+            paths = state.state_paths()
+            first_revision = state.configuration_revision(initial)
+            saved = state.save_configuration_owned(
+                workspace,
+                stage_order=["Testing", "testing"],
+                paths=paths,
+            )
+            assert saved.revision != first_revision
+            assert state.configuration_revision(paths) == saved.revision
+            assert state.revalidate_configuration(paths) == saved
+
+            before = paths.config_file.read_bytes()
+            with pytest.raises(state.StageOrderError):
+                state.save_configuration_owned(
+                    workspace,
+                    stage_orders={str(workspace.resolve()): ["Testing", "Testing"]},
+                    paths=paths,
+                )
+            assert paths.config_file.read_bytes() == before
+
+
 def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
