@@ -401,14 +401,38 @@ class RawSequenceClient:
         return RawCatalog(payload)
 
 
+class BrowserSettings:
+    """Small application-settings seam used by the browser behavior tests."""
+
+    def __init__(self, order=(), revision="revision-1"):
+        self.order = list(order)
+        self.revision = revision
+        self.calls = []
+        self.fail_next = False
+
+    def get_settings(self):
+        return {"order": list(self.order), "revision": self.revision}
+
+    def save_settings(self, revision, order):
+        self.calls.append((revision, list(order)))
+        if self.fail_next:
+            self.fail_next = False
+            return {"order": list(self.order), "revision": self.revision, "outcome": "failure"}
+        if revision != self.revision:
+            return {"order": list(self.order), "revision": self.revision, "outcome": "conflict"}
+        self.order = list(order)
+        self.revision = f"revision-{len(self.calls) + 1}"
+        return {"order": list(self.order), "revision": self.revision, "outcome": "success"}
+
+
 @pytest.fixture
 def open_page():
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
         created = []
 
-        def launch(client, *, color_scheme="light", init_script=None):
-            server = create_server(client)
+        def launch(client, *, color_scheme="light", init_script=None, settings=None):
+            server = create_server(client, settings_provider=settings)
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
             context = browser.new_context(color_scheme=color_scheme)
@@ -627,6 +651,116 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     page.wait_for_selector("#board .card", timeout=15000)
     assert "Renamed foundation" in page.locator("#board").inner_text()
     assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def test_saved_stage_order_projects_rows_without_phantom_or_catalog_changes(open_page):
+    settings = BrowserSettings(order=["Missing", "Under_Development", "Hidden", "Queue"])
+    value = json.loads(board_payload())
+    digest = value["catalog_digest"]
+    page = open_page(StaticClient(value), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+
+    assert row_labels(page) == ["Under Development", "Queue"]
+    assert page.locator(".row-head").all_inner_texts() == ["Under Development", "Queue"]
+    assert page.locator("#stage-order-list .stage-order-item").count() == 4
+    assert page.locator("#stage-order-list").inner_text().count("Missing") == 1
+    assert value["catalog_digest"] == digest
+    assert page.locator("[data-lifecycle='Missing']").count() == 0
+
+
+def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_page):
+    first = json.loads(board_payload())
+    added = json.loads(board_payload())
+    _admit_inventory_stage(added, "Alpha", "Review")
+    added["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    added["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(added)
+    hidden = json.loads(json.dumps(added))
+    hidden["visibility"]["hidden_stages"].append("Queue")
+    for entry in hidden["entries"]:
+        if entry["stage"] == "Queue":
+            entry["board_visible"] = False
+    _reseal(hidden)
+    refilled = json.loads(json.dumps(added))
+    settings = BrowserSettings(order=["Queue", "Under_Development"])
+    client = SequenceClient([first, added, hidden, refilled])
+    page = open_page(client, settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    assert row_labels(page) == ["Queue", "Under Development"]
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
+    assert row_labels(page) == ["Under Development", "Review"]
+    assert page.locator("[data-lifecycle='Queue']").count() == 0
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+
+
+def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    page.get_by_role("button", name="Move Under Development up").focus()
+    page.keyboard.press("Enter")
+    assert settings.calls == []
+    page.get_by_role("button", name="Cancel").click()
+    assert settings.calls == []
+    assert page.locator("#stage-order-status").inner_text() == (
+        "Unsaved board row order changes cancelled."
+    )
+    page.get_by_role("button", name="Move Under Development up").press("Enter")
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [([], ["Under_Development", "Queue"])]
+    assert row_labels(page) == ["Under Development", "Queue"]
+
+    page2 = open_page(StaticClient(board_payload()), settings=settings)
+    page2.locator("#stage-order-editor").wait_for()
+    assert row_labels(page2) == ["Under Development", "Queue"]
+    page2.get_by_role("button", name="Reset").click()
+    page2.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.order == []
+    assert row_labels(page2) == ["Queue", "Under Development"]
+
+
+def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    settings.fail_next = True
+    page.get_by_role("button", name="Move Under Development up").press("Enter")
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Save failed: the board row order was not persisted.", exact=True).wait_for()
+    assert settings.order == []
+    assert page.get_by_role("button", name="Save").is_enabled()
+
+    settings.revision = "newer-writer"
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    assert settings.order == []
+    assert page.get_by_role("button", name="Save").is_enabled()
+
+
+def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    page.get_by_role("button", name="Move Under Development up").press("Enter")
+    assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
+    assert_readable_arrows(page)
 
 
 def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(open_page):
