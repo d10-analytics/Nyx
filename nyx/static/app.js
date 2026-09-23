@@ -38,6 +38,7 @@
   const RAIL_INSET = 20;
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
+  const SETTINGS_ROUTE = "/api/settings";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
 
   const board = document.querySelector("#board");
@@ -46,6 +47,12 @@
   const filter = document.querySelector("#filter");
   const compactControl = document.querySelector("#compact-view");
   const refreshButton = document.querySelector("#refresh");
+  const stageOrderEditor = document.querySelector("#stage-order-editor");
+  const stageOrderList = document.querySelector("#stage-order-list");
+  const stageOrderSave = document.querySelector("#stage-order-save");
+  const stageOrderCancel = document.querySelector("#stage-order-cancel");
+  const stageOrderReset = document.querySelector("#stage-order-reset");
+  const stageOrderStatus = document.querySelector("#stage-order-status");
 
   let displayed = null;
   let pending = null;
@@ -57,6 +64,12 @@
   let railEdges = [];
   let compactView = true;
   let refreshFailure = null;
+  let savedStageOrder = [];
+  let editorStageOrder = [];
+  let settingsRevision = null;
+  let settingsAvailable = false;
+  let settingsBusy = false;
+  let settingsRequestSerial = 0;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -201,6 +214,81 @@
 
   function stageLabelOf(stage) {
     return BOARD_LABELS.get(BOARD_STAGES.get(stage)) || stage;
+  }
+
+  function canonicalStageNames(snapshot = displayed) {
+    if (!snapshot) return [];
+    const hidden = new Set(snapshot.visibility.hidden_stages || []);
+    const names = [];
+    const seen = new Set();
+    (snapshot.inventory.stages || []).forEach((record) => {
+      if (hidden.has(record.stage) || seen.has(record.stage)) return;
+      seen.add(record.stage);
+      names.push(record.stage);
+    });
+    return names;
+  }
+
+  function projectedStageNames(snapshot = displayed) {
+    const eligible = canonicalStageNames(snapshot);
+    const available = new Set(eligible);
+    const result = [];
+    const seen = new Set();
+    savedStageOrder.forEach((stage) => {
+      if (!available.has(stage) || seen.has(stage)) return;
+      seen.add(stage);
+      result.push(stage);
+    });
+    eligible.forEach((stage) => {
+      if (seen.has(stage)) return;
+      seen.add(stage);
+      result.push(stage);
+    });
+    return result;
+  }
+
+  function editorNames(snapshot = displayed) {
+    const result = [];
+    const seen = new Set();
+    [...savedStageOrder, ...canonicalStageNames(snapshot)].forEach((stage) => {
+      if (seen.has(stage)) return;
+      seen.add(stage);
+      result.push(stage);
+    });
+    return result;
+  }
+
+  function hasUnsavedStageOrder() {
+    return JSON.stringify(editorStageOrder) !== JSON.stringify(editorNames());
+  }
+
+  function renderStageOrderEditor({focusStage = null} = {}) {
+    if (!settingsAvailable) {
+      stageOrderEditor.hidden = true;
+      return;
+    }
+    if (!editorStageOrder.length) editorStageOrder = editorNames();
+    stageOrderEditor.hidden = false;
+    stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
+      const label = stageLabelOf(stage);
+      const dormant = canonicalStageNames().includes(stage) ? "" :
+        '<span class="stage-order-dormant">(not currently available)</span>';
+      return `<li class="stage-order-item" data-stage="${text(stage)}">` +
+        `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
+        `<button type="button" class="stage-order-move" data-stage-move="up" ` +
+        `aria-label="Move ${text(label)} up"${index === 0 ? " disabled" : ""}>Move up</button>` +
+        `<button type="button" class="stage-order-move" data-stage-move="down" ` +
+        `aria-label="Move ${text(label)} down"${index === editorStageOrder.length - 1 ? " disabled" : ""}>Move down</button>` +
+        `</li>`;
+    }).join("");
+    stageOrderSave.disabled = settingsBusy || !hasUnsavedStageOrder();
+    stageOrderCancel.disabled = settingsBusy || !hasUnsavedStageOrder();
+    stageOrderReset.disabled = settingsBusy;
+    if (focusStage) {
+      const item = [...stageOrderList.children].find((candidate) =>
+        candidate.dataset.stage === focusStage);
+      item?.querySelector("[data-stage-move]")?.focus();
+    }
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -372,6 +460,10 @@
     const visibleStages = compactView
       ? stages.filter((stage) => stage.availability === "incomplete" || populatedStages.has(stage.key))
       : stages;
+    const order = new Map(projectedStageNames().map((stage, index) => [stage, index]));
+    visibleStages.sort((first, second) =>
+      (order.get(first.key) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(second.key) ?? Number.MAX_SAFE_INTEGER));
     const visibleProjects = compactView
       ? projects.filter((project) =>
         project.availability === "incomplete" || project.incompleteStage ||
@@ -894,11 +986,115 @@
     refreshButton.textContent = available ? "Apply update" : "Refresh view";
   }
 
+  function settingsErrorMessage(error) {
+    return error instanceof Error && error.message ? error.message : "settings_unavailable";
+  }
+
+  function parseSettings(payload, allowOutcome = false) {
+    protocol(payload && typeof payload === "object" && !Array.isArray(payload));
+    const expected = allowOutcome ? ["order", "outcome", "revision"] : ["order", "revision"];
+    protocol(exactKeys(payload, expected));
+    protocol(Array.isArray(payload.order) && payload.order.every((stage) => component(stage)));
+    protocol(new Set(payload.order).size === payload.order.length);
+    protocol((allowOutcome && payload.revision === null) ||
+      (typeof payload.revision === "string" && payload.revision.length > 0));
+    if (allowOutcome) {
+      protocol(["success", "conflict", "failure", "reload-needed"].includes(payload.outcome));
+    }
+    return payload;
+  }
+
+  function settingsStatus(message, isError = false) {
+    stageOrderStatus.textContent = message;
+    stageOrderStatus.classList.toggle("error", isError);
+  }
+
+  function loadSettings() {
+    const serial = ++settingsRequestSerial;
+    fetch(SETTINGS_ROUTE, {cache: "no-store"})
+      .then(async (response) => {
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { /* handled below */ }
+        if (response.status === 404) return null;
+        if (!response.ok || !payload || payload.error) {
+          throw new Error((payload && payload.error) || "settings_unavailable");
+        }
+        return parseSettings(payload);
+      })
+      .then((payload) => {
+        if (serial !== settingsRequestSerial) return;
+        if (!payload) {
+          settingsAvailable = false;
+          stageOrderEditor.hidden = true;
+          return;
+        }
+        settingsAvailable = true;
+        savedStageOrder = [...payload.order];
+        settingsRevision = payload.revision;
+        editorStageOrder = editorNames();
+        settingsStatus("Current board row order loaded.");
+        renderStageOrderEditor();
+        if (displayed) renderBoard();
+      })
+      .catch((error) => {
+        if (serial !== settingsRequestSerial) return;
+        settingsAvailable = true;
+        stageOrderEditor.hidden = false;
+        settingsStatus(`Could not load board row order: ${settingsErrorMessage(error)}`, true);
+        renderStageOrderEditor();
+      });
+  }
+
+  function saveStageOrder(order) {
+    if (!settingsAvailable || settingsBusy) return;
+    settingsBusy = true;
+    settingsStatus("Saving board row order…");
+    renderStageOrderEditor();
+    fetch(SETTINGS_ROUTE, {
+      method: "PUT",
+      cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({revision: settingsRevision, order}),
+    }).then(async (response) => {
+      let payload = null;
+      try { payload = await response.json(); } catch (_) { /* handled below */ }
+      if (!response.ok || !payload || payload.error) {
+        throw new Error((payload && payload.error) || "settings_unavailable");
+      }
+      return parseSettings(payload, true);
+    }).then((payload) => {
+      if (payload.outcome !== "success") {
+        const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
+          ? `Save not applied: ${payload.outcome}. Reload the current order and try again.`
+          : "Save failed: the board row order was not persisted.";
+        settingsStatus(message, true);
+        return;
+      }
+      savedStageOrder = [...payload.order];
+      settingsRevision = payload.revision;
+      editorStageOrder = editorNames();
+      settingsStatus("Board row order saved.");
+      renderBoard();
+      renderStageOrderEditor();
+    }).catch((error) => {
+      settingsStatus(`Save failed: ${settingsErrorMessage(error)}`, true);
+      renderStageOrderEditor();
+    }).finally(() => {
+      settingsBusy = false;
+      renderStageOrderEditor();
+    });
+  }
+
   function apply(snapshot) {
     displayed = snapshot;
     pending = null;
     refreshFailure = null;
     setPending(false);
+    const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
+    editorStageOrder = [...new Set([
+      ...(hasUnsavedStageOrder() ? priorEditor : editorNames(snapshot)),
+      ...canonicalStageNames(snapshot),
+    ])];
     if (selectedPath && !snapshot.entries.some((entry) =>
       entry.board_visible && entry.package_path === selectedPath)) {
       selectedPath = null;
@@ -906,6 +1102,7 @@
     status.textContent = loadedStatus(snapshot);
     renderBoard();
     renderDetails();
+    renderStageOrderEditor();
   }
 
   function readCompactPreference() {
@@ -991,6 +1188,27 @@
     if (pending) apply(pending);
     else request("manual");
   });
+  stageOrderList.addEventListener("click", (event) => {
+    const move = event.target.closest("[data-stage-move]");
+    const item = event.target.closest("[data-stage]");
+    if (!move || !item) return;
+    const stage = item.dataset.stage;
+    const index = editorStageOrder.indexOf(stage);
+    const target = move.dataset.stageMove === "up" ? index - 1 : index + 1;
+    if (index < 0 || target < 0 || target >= editorStageOrder.length) return;
+    [editorStageOrder[index], editorStageOrder[target]] =
+      [editorStageOrder[target], editorStageOrder[index]];
+    renderStageOrderEditor({focusStage: stage});
+    settingsStatus("Unsaved board row order changes.");
+  });
+  stageOrderSave.addEventListener("click", () => saveStageOrder([...editorStageOrder]));
+  stageOrderCancel.addEventListener("click", () => {
+    if (settingsBusy) return;
+    editorStageOrder = editorNames();
+    settingsStatus("Unsaved board row order changes cancelled.");
+    renderStageOrderEditor();
+  });
+  stageOrderReset.addEventListener("click", () => saveStageOrder([]));
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   if (typeof ResizeObserver === "function") {
@@ -1005,6 +1223,7 @@
   }
 
   readCompactPreference();
+  loadSettings();
   request("manual");
   window.setInterval(() => request("poll"), POLL_INTERVAL);
 })();
