@@ -340,6 +340,24 @@ def test_stage_order_revision_changes_only_for_validated_configuration_bytes():
             assert paths.config_file.read_bytes() == before
 
 
+def test_validated_stage_orders_cannot_be_mutated_after_configuration_creation():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        workspace = isolated_root(root, "workspace").resolve()
+        configuration = state.Configuration(
+            workspace,
+            stage_orders={str(workspace): ("A", "B")},
+        )
+        before_revision = configuration.revision
+        before_payload = configuration.as_dict()
+
+        with pytest.raises(TypeError):
+            configuration.stage_orders[str(workspace)] = ("A", "A")
+
+        assert configuration.revision == before_revision
+        assert configuration.as_dict() == before_payload
+
+
 def test_empty_current_stage_order_resets_only_that_workspace():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
