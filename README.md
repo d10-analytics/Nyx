@@ -79,9 +79,15 @@ when no update is waiting. Use the stop command above when you are finished.
 Setup saves the workspace location and configured stage visibility for your
 account on this host. These setup choices are separate from the browser's personal
 **Hide empty rows and columns** preference, which is stored only in that
-browser. If Nyx is already running with a different setup, stop it before
-changing the account-local settings. See [running Nyx](docs/running-nyx.md) for
-status and configuration options.
+browser. The **Board row order** editor saves its order in the same account-local
+configuration, shared by that account's browser and desktop views. The saved order
+survives browser reload and a supported Nyx restart, and is keyed by workspace root:
+switching from workspace A to workspace B does not apply A's order, while returning
+to A restores it. Reordering changes presentation only; it does not rename or move
+folders, change completion, approval, claims, dependencies, or execution. If Nyx is
+already running with a different setup, stop it before changing the account-local
+settings. See [running Nyx](docs/running-nyx.md) for status and configuration
+options.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor
