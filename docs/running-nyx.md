@@ -2,12 +2,17 @@
 
 [Return to Nyx](../README.md).
 
-Nyx supports Linux, Windows, and macOS with Python 3.12. From the repository
-root, install and try the sample with the commands for your host. These use the
-installed console directly and require no virtual environment activation.
-Explore the board after starting Nyx, before running the final stop command.
+Linux runs Nyx as a background service driven by the installed console. Windows
+and macOS run a self-contained desktop application that owns its runtime; that
+application is a private internal feasibility build, not a public release, and
+this guide makes no support promise beyond the hosts that were actually
+exercised. The sections below cover both.
 
-Linux or macOS (POSIX shell):
+## Linux: install and try the sample
+
+You need Python 3.12. From the repository root, these commands use the installed
+console directly and require no virtual environment activation. Explore the
+board after starting Nyx, before running the final stop command.
 
 ```bash
 python3.12 -m venv .venv
@@ -18,22 +23,9 @@ python3.12 -m venv .venv
 .venv/bin/nyx --stop
 ```
 
-Windows PowerShell:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
-.\.venv\Scripts\nyx.exe --setup .\examples\sample-specifications --show-all-stages
-.\.venv\Scripts\nyx.exe
-.\.venv\Scripts\nyx.exe --status
-.\.venv\Scripts\nyx.exe --stop
-```
-
-Throughout this guide and the linked guides, bare `nyx` means `.venv/bin/nyx`
-on Linux or macOS, or `.\.venv\Scripts\nyx.exe` in Windows PowerShell. These
-relative paths work from the repository root. From another directory, use the
-absolute path to that same installed console; quote paths containing spaces
-and use PowerShell's `&` before a quoted executable path.
+Throughout the Linux sections, bare `nyx` means `.venv/bin/nyx`. That relative
+path works from the repository root. From another directory, use the absolute
+path to the same installed console and quote paths containing spaces.
 
 Nyx reads and displays specifications; it does not edit them or move them
 between directories. Setup and runtime commands write account-local configuration
@@ -75,6 +67,8 @@ nyx --stop
 
 Status reports the configured workspace, hidden stages, and runtime state. It
 does not start or reconfigure Nyx. Stopping an already stopped instance is safe.
+Both commands are Linux service commands; the desktop application does not
+provide them.
 
 ## Choose visible stages
 
@@ -103,6 +97,70 @@ The visibility flags are setup options; they cannot be used alone or combined
 with each other. An active instance rejects changes to its workspace or policy.
 Use an explicit visibility option when setting up so the intended board is clear.
 
+## Windows and macOS: the private desktop application
+
+The desktop application is a self-contained build; it does not require users to
+install Python or create a virtual environment. It is a private internal
+feasibility build, not a public release, and there is no offline-install
+guarantee. It has been exercised on a hosted Windows Server x64 image and on
+Apple Silicon macOS; it is not a claim about every Windows or Intel Mac client.
+Your operating system may ask you to trust or open the build the first time you
+run it.
+
+### Build the private artifact
+
+From the repository root, install the pinned desktop and build extras and run
+the build driver. Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install '.[desktop,build]'
+.\.venv\Scripts\python.exe scripts\build_desktop.py
+```
+
+macOS (POSIX shell):
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install '.[desktop,build]'
+.venv/bin/python scripts/build_desktop.py
+```
+
+The driver stages `dist\desktop\Nyx\Nyx.exe` on Windows and
+`dist/desktop/Nyx.app` on macOS, together with the private worker helper and the
+board resources. Open the staged executable or application bundle directly; the
+staged build resolves its own dependencies and does not run from the source
+checkout.
+
+### Open, change, recover, and quit
+
+The first launch shows a workspace chooser. Select the workspace directory and
+save it; Nyx starts its own runtime and displays the board in the application
+window's embedded web view. There is no detached daemon behind the window and
+no `nyx --setup`, `nyx --status`, or `nyx --stop` on these hosts; those options
+report that the desktop application has no lifecycle commands.
+
+- **Change workspace** stops the current work, saves the new workspace, and
+  restarts. An incomplete stop keeps the previously saved workspace and shows a
+  visible **Retry** rather than mixing the two workspaces.
+- **Quit**, and closing the only window, request the same visible shutdown. The
+  window exits only after its owned cleanup has finished.
+- One application owns the account on this host. A separately launched second
+  process reports that Nyx is already open and exits without changing state;
+  normal operating-system activation of the running application still works.
+- After an unexpected crash, reopening visibly blocks the runtime start and
+  workspace changes until the former workers have terminated, then permits
+  **Retry**. An incomplete recovery stays visibly blocked rather than reported
+  as successful.
+
+### Desktop limits
+
+The application serves one local account through the fixed loopback address and
+does not edit specifications. It has no automatic startup, auto-update, remote
+or shared hosting, cross-host configuration synchronization, or agent
+execution. Configuration and runtime state still live under `.nyx` in your home
+directory.
+
 ## Read and refresh the board
 
 Use **Find** to search visible card metadata, including package titles, projects,
@@ -130,7 +188,8 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 
 ## If something looks wrong
 
-- **The board is empty:** check the workspace reported by `nyx --status`, the
+- **The board is empty:** check the workspace reported by `nyx --status` on
+  Linux, or the workspace chosen in the desktop application, the
   [directory layout](workspaces.md), and whether the relevant stages are hidden.
   If the catalog contains admitted folders but no packages, uncheck **Hide
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
@@ -142,7 +201,13 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 - **An edit has not appeared:** request a refresh and apply any pending update.
   If the catalog cannot be refreshed, the browser reports the problem; do not
   treat the retained view as confirmation of the latest file contents.
-- **Setup rejects a change:** stop the running instance, repeat setup, then start it.
+- **Setup rejects a change:** on Linux, stop the running instance, repeat setup,
+  then start it. In the desktop application, choose **Change workspace**, then
+  **Retry** if the stop is incomplete.
+- **The desktop application will not start:** an unexpected crash blocks the
+  start until the former workers have stopped; use **Retry** once they do. If
+  the operating system blocked the private build, allow it to open and try
+  again.
 
 Nyx reads specification files without modifying them. Setup and runtime commands
 do write account-local configuration and runtime state. The service is intended

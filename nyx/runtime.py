@@ -1676,6 +1676,69 @@ def stop() -> str:
     raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
 
 
+def desktop_host() -> bool:
+    """Return whether this host owns its runtime through the desktop application.
+
+    Linux keeps the detached background service and its internal daemon module
+    entry.  Windows and macOS start the standalone application instead, so a
+    stray module launch there must be refused before any inherited handle is
+    opened or converted.
+    """
+
+    return os.name == "nt" or sys.platform == "darwin"
+
+
+# Legacy internal daemon options.  The detached service passes exactly these
+# when it re-enters the module, and the desktop application never does.
+_DAEMON_ENTRY_ARGUMENTS = (
+    "--daemon-fd",
+    "--daemon-handle",
+    "--ack-fd",
+    "--ack-handle",
+    "--deadline-ns",
+    "--claim-path",
+)
+
+_DESKTOP_DAEMON_REFUSAL = (
+    "nyx: the desktop application does not provide the internal daemon entry point"
+)
+
+
+def _module_entry(arguments: list[str]) -> int:
+    """Dispatch a direct ``nyx.runtime`` module launch.
+
+    The detached Linux service calls this with inherited handles; the desktop
+    hosts refuse that launch before converting any handle.  A launch without any
+    daemon option is never a supported entry point on any host.
+    """
+
+    if desktop_host() and any(option in arguments for option in _DAEMON_ENTRY_ARGUMENTS):
+        print(_DESKTOP_DAEMON_REFUSAL, file=sys.stderr)
+        return 2
+    if "--daemon-fd" not in arguments and "--daemon-handle" not in arguments:
+        raise SystemExit("internal lifecycle entry point")
+    try:
+        deadline = int(arguments[arguments.index("--deadline-ns") + 1])
+        if "--daemon-handle" in arguments:
+            fd, ack = _receive_daemon_handles(
+                int(arguments[arguments.index("--daemon-handle") + 1]),
+                int(arguments[arguments.index("--ack-handle") + 1])
+                if "--ack-handle" in arguments
+                else None,
+            )
+        else:
+            fd = int(arguments[arguments.index("--daemon-fd") + 1])
+            ack = int(arguments[arguments.index("--ack-fd") + 1]) if "--ack-fd" in arguments else None
+        claim = (
+            Path(arguments[arguments.index("--claim-path") + 1])
+            if "--claim-path" in arguments
+            else None
+        )
+    except (ValueError, IndexError):
+        raise SystemExit("invalid lifecycle arguments") from None
+    return _daemon_entry(fd, deadline, ack_fd=ack, claim_path=claim)
+
+
 def _daemon_entry(
     fd: int,
     deadline_ns: int,
@@ -1710,24 +1773,7 @@ def _receive_daemon_handles(claim_handle: int, ack_handle: int | None) -> tuple[
 
 
 if __name__ == "__main__":
-    if "--daemon-fd" not in sys.argv and "--daemon-handle" not in sys.argv:
-        raise SystemExit("internal lifecycle entry point")
-    try:
-        deadline = int(sys.argv[sys.argv.index("--deadline-ns") + 1])
-        if "--daemon-handle" in sys.argv:
-            fd, ack = _receive_daemon_handles(
-                int(sys.argv[sys.argv.index("--daemon-handle") + 1]),
-                int(sys.argv[sys.argv.index("--ack-handle") + 1])
-                if "--ack-handle" in sys.argv
-                else None,
-            )
-        else:
-            fd = int(sys.argv[sys.argv.index("--daemon-fd") + 1])
-            ack = int(sys.argv[sys.argv.index("--ack-fd") + 1]) if "--ack-fd" in sys.argv else None
-        claim = Path(sys.argv[sys.argv.index("--claim-path") + 1]) if "--claim-path" in sys.argv else None
-    except (ValueError, IndexError):
-        raise SystemExit("invalid lifecycle arguments") from None
-    raise SystemExit(_daemon_entry(fd, deadline, ack_fd=ack, claim_path=claim))
+    raise SystemExit(_module_entry(sys.argv))
 
 
 __all__ = [
@@ -1752,6 +1798,7 @@ __all__ = [
     "ShutdownTimeoutError",
     "StartupError",
     "UnhealthyInstanceError",
+    "desktop_host",
     "observe_runtime",
     "observe_runtime_paths",
     "setup",

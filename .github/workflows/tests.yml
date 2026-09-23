@@ -190,6 +190,7 @@ jobs:
         env:
           NYX_EXPECTED_NATIVE_HOST: windows-2025
           NYX_REQUIRE_NATIVE_DESKTOP: '1'
+          NYX_VERIFY_DOCUMENTED_INSTALL: '1'
         run: |
           $ErrorActionPreference = 'Stop'
           # Nuitka needs the MSVC toolchain, and the deployment tool uses
@@ -214,6 +215,10 @@ jobs:
           # Run the established desktop scenarios with the delivered
           # artifact entry available.
           python -m pytest tests/test_desktop.py -v -s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Exercise the published desktop acquisition path and actions against
+          # the staged artifact instead of the retired detached console lifecycle.
+          python -m pytest tests/test_documented_install.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
@@ -252,6 +257,7 @@ jobs:
         env:
           NYX_EXPECTED_NATIVE_HOST: macos-15
           NYX_REQUIRE_NATIVE_DESKTOP: '1'
+          NYX_VERIFY_DOCUMENTED_INSTALL: '1'
         run: |
           set -euo pipefail
           python scripts/build_desktop.py
@@ -266,3 +272,6 @@ jobs:
           # Run the established desktop scenarios with the delivered
           # artifact entry available.
           python -m pytest tests/test_desktop.py -v -s
+          # Exercise the published desktop acquisition path and actions against
+          # the staged artifact instead of the retired detached console lifecycle.
+          python -m pytest tests/test_documented_install.py -v -s
