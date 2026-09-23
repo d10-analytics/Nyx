@@ -165,6 +165,13 @@ def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 result = settings.save_settings(payload["revision"], payload["order"])
+            except CatalogError as error:
+                self._send(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    _json_bytes({"error": error.code}),
+                    "application/json",
+                )
+                return
             except (ValueError, ProtocolError, TypeError):
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
                 return
