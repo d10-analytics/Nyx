@@ -348,6 +348,10 @@ class DesktopSession:
         )
         self._application_runtime = application
         try:
+            configuration = self.snapshot.configuration
+            if configuration is None:
+                raise DesktopUnavailableError(UNAVAILABLE_MESSAGE)
+            application.capture_configuration(configuration, self.paths)
             application.start(static_ready=static_ready)
             application.admit_catalog()
         except BaseException as error:
