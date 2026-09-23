@@ -781,10 +781,19 @@ def validate_configuration_candidate(
         validated_orders = {} if current is None else dict(current.stage_orders or {})
     else:
         validated_orders = {} if current is None else dict(current.stage_orders or {})
-        validated_orders.update(_validate_stage_orders(stage_orders))
+        for order_root, order in _validate_stage_orders(stage_orders).items():
+            if order:
+                validated_orders[order_root] = order
+            else:
+                # An empty current-root sequence is the persisted Reset
+                # operation.  It removes only that workspace's preference.
+                validated_orders.pop(order_root, None)
     if stage_order is not _OMITTED:
         validated_order = _validate_stage_order(stage_order)
-        validated_orders[str(root)] = validated_order
+        if validated_order:
+            validated_orders[str(root)] = validated_order
+        else:
+            validated_orders.pop(str(root), None)
     return Configuration(root, validated_hidden_stages, validated_orders)
 
 
