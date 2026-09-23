@@ -212,11 +212,15 @@ def _assert_hidden_browser(url: str) -> None:
             queue.click()
             assert queue.locator(".card-links").count() == 0
             assert page.locator('.connection[data-source="%s"]' % PACKAGE_IDS["Done"]).count() == 0
-            assert page.locator("#details .prerequisite-target").inner_text() == "Done package"
-            assert page.locator("#details .direct-prerequisite-state").inner_text() == (
+            dependencies = page.locator("#details .dependencies")
+            assert dependencies.get_attribute("open") is None
+            dependencies.locator("summary").click()
+            assert dependencies.get_attribute("open") == ""
+            assert dependencies.locator(".prerequisite-target").inner_text() == "Done package"
+            assert dependencies.locator(".direct-prerequisite-state").inner_text() == (
                 "Reported direct prerequisite state: satisfied."
             )
-            assert page.locator("#details .reported-state").inner_text() == "Reported state: satisfied"
+            assert dependencies.locator(".reported-state").inner_text() == "Reported state: satisfied"
         finally:
             browser.close()
 
