@@ -473,7 +473,7 @@ def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     )
     page.locator("#board .card").first.wait_for(timeout=15000)
     assert page.locator("#board .card").count() == 4
-    assert page.locator("#status").inner_text().startswith("Loaded 4 packages")
+    assert page.locator("#status").inner_text().startswith("Loaded 4 work items")
     assert client.calls == 2
 
 
@@ -502,9 +502,77 @@ def test_selecting_a_card_shows_declared_values_and_diagnostics(open_page):
     page.locator('.card[data-package-path="Alpha/Under_Development/step-two"]').click()
     details = page.locator("#details")
     assert details.locator("h2").inner_text() == "Dependent step"
-    assert details.get_by_text("Direct prerequisites", exact=True).count() == 1
+    assert details.locator(".dependencies").get_attribute("open") is None
+    assert "Waiting on dependencies" in details.locator(".dependencies summary").inner_text()
+    assert "Foundation step" not in details.inner_text()
+    assert details.locator(".item-issues").get_attribute("open") is None
+    assert details.get_by_text("example diagnostic", exact=False).count() == 0
+    details.locator(".dependencies summary").click()
     assert "Foundation step" in details.inner_text()
+    details.locator(".item-issues summary").click()
     assert details.get_by_text("example diagnostic", exact=False).count() == 1
+    assert details.locator(".technical-details").get_attribute("open") is None
+    assert details.locator(".technical-details summary").inner_text() == (
+        "Technical details (Stable ID available)"
+    )
+    details.locator(".technical-details summary").click()
+    assert details.get_by_text(STEP_TWO, exact=True).count() == 1
+    assert "Closure" not in details.inner_text()
+    assert "Sanity recommendation" not in details.inner_text()
+    assert "Human sanity decision" not in details.inner_text()
+
+
+def test_old_format_review_fields_stay_searchable_but_technical_id_is_on_demand(open_page):
+    value = json.loads(board_payload())
+    value["entries"][1]["declared"].update(
+        closure="approved", sanity_recommendation="PROCEED_TO_DESIGN",
+        human_sanity_decision="AFFIRMED", status="ready",
+    )
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    page.fill("#filter", "proceed_to_design")
+    assert page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').count() == 1
+    page.fill("#filter", "")
+    card = page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]')
+    card.focus()
+    page.keyboard.press("Enter")
+    details = page.locator("#details")
+    assert "PROCEED_TO_DESIGN" not in details.inner_text()
+    assert STEP_ONE not in details.inner_text()
+    details.locator(".technical-details summary").press("Enter")
+    assert details.get_by_text(STEP_ONE, exact=True).count() == 1
+
+
+def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(open_page):
+    value = json.loads(board_payload())
+    value["entries"][1]["declared"]["target_project"] = None
+    value["entries"][3]["declared"]["target_project"] = "Declared target"
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    foundation = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
+    assert foundation.locator(".card-project").count() == 0
+    assert loose.locator(".card-project").inner_text() == "Target project: Declared target"
+    foundation.click()
+    assert page.locator("#details h2").inner_text() == "Foundation step"
+    assert page.locator("#details dt").all_inner_texts() == ["Stage"]
+    loose.click()
+    assert page.locator("#details dt").all_inner_texts() == ["Stage", "Target project"]
+
+
+def test_keyboard_opens_dependency_disclosure_and_keeps_hidden_target_context(open_page):
+    page = open_page(StaticClient(compact_payload()))
+    dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
+    dependent.focus()
+    page.keyboard.press("Enter")
+    disclosure = page.locator("#details .dependencies")
+    assert disclosure.get_attribute("open") is None
+    assert "Waiting on dependencies" in disclosure.locator("summary").inner_text()
+    disclosure.locator("summary").press("Enter")
+    assert disclosure.locator(".prerequisite-claim").count() == 2
+    assert disclosure.locator(".prerequisite-target").all_inner_texts() == [
+        "Custom stage card", "Hidden prerequisite"
+    ]
 
 
 def test_card_titles_are_escaped_and_never_render_markup(open_page):
@@ -591,11 +659,14 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     )
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
     assert page.locator("#refresh").inner_text() == "Apply update"
+    assert "producer_protocol_error" in page.locator("#board-issues summary").inner_text()
+    assert page.locator("#board-issues").get_attribute("open") is None
 
     # The failed response did not erase B, the most recent successful candidate.
     page.click("#refresh")
     page.locator("#board").get_by_text("B", exact=True).wait_for(timeout=15000)
     assert client.calls == 3
+    assert page.locator("#board-issues").count() == 0
 
 
 def test_details_list_every_claim_while_the_graph_deduplicates_the_package_pair(open_page):
@@ -617,6 +688,7 @@ def test_details_list_every_claim_while_the_graph_deduplicates_the_package_pair(
 
     page.locator(f'.card[data-package-id="{LOOSE}"]').click()
     details = page.locator("#details")
+    details.locator(".dependencies summary").click()
     claims = details.locator(".prerequisite-claim")
     assert claims.count() == 2
     assert claims.nth(0).locator(".prerequisite-target").inner_text() == "Foundation step"
@@ -635,13 +707,13 @@ def test_details_list_every_claim_while_the_graph_deduplicates_the_package_pair(
 @pytest.mark.parametrize(
     ("participation", "state", "message", "unblocked"),
     [
-        ("available", "no_declared_prerequisites", "No direct prerequisites.", True),
-        ("available", "unknown", "Direct prerequisite information is unknown.", False),
+        ("available", "no_declared_prerequisites", "No direct prerequisites.", False),
+        ("available", "unknown", "Direct prerequisite information is unknown.", True),
         (
             "legacy",
             "relationship_unavailable",
             "Direct prerequisite information unavailable.",
-            False,
+            True,
         ),
     ],
 )
@@ -668,7 +740,9 @@ def test_details_distinguish_confirmed_empty_from_unknown_or_unavailable_prerequ
         "relationship_unavailable" if participation == "legacy" else state
     )
     assert state_message.inner_text() == message
-    assert card.locator(".card-status").count() == int(unblocked)
+    assert card.locator(".dependency-indicator").count() == int(unblocked)
+    if unblocked:
+        assert "Dependencies" in card.locator(".dependency-indicator").inner_text()
 
 
 def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_refresh(open_page):
@@ -685,36 +759,37 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
 
-    assert "first catalog discovery failure" in page.locator("#details").inner_text()
-    catalog_diagnostics = page.locator("#details .catalog-diagnostics")
-    assert catalog_diagnostics.locator("li").inner_text() == (
+    board_issues = page.locator("#board-issues")
+    assert "discovery_unavailable" in board_issues.locator("summary").inner_text()
+    assert "workspace issues available" in page.locator("#status").inner_text().lower()
+    board_issues.locator("summary").click()
+    assert board_issues.locator("li").inner_text() == (
         "discovery_unavailable first catalog discovery failure"
     )
-    assert "catalog diagnostics available" in page.locator("#status").inner_text().lower()
-    assert "select a package" not in page.locator("#status").inner_text().lower()
 
     page.locator(f'.card[data-package-id="{GATE}"]').click()
     page.fill("#filter", "not a package")
     assert page.locator("#board .card:visible").count() == 0
-    assert catalog_diagnostics.locator("li").inner_text() == (
+    assert board_issues.locator("li").inner_text() == (
         "discovery_unavailable first catalog discovery failure"
     )
     page.fill("#filter", "")
     page.click("#refresh")
-    page.locator("#details h2").get_by_text("No packages available", exact=True).wait_for(
+    page.locator("#details h2").get_by_text("No work items available", exact=True).wait_for(
         timeout=15000
     )
-    assert page.locator("#details .catalog-diagnostics li").inner_text() == (
+    page.locator("#board-issues summary").click()
+    assert page.locator("#board-issues li").inner_text() == (
         "discovery_unavailable refreshed catalog discovery failure"
     )
     assert page.locator(".card.selected").count() == 0
-    assert "select a package" not in page.locator("#status").inner_text().lower()
+    assert "select a work item" not in page.locator("#status").inner_text().lower()
 
 
 def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open_page):
     value = json.loads(board_payload())
     value["entries"] = []
-    discovery_message = '<img src=x onerror="alert(1)"> all package discovery failed'
+    discovery_message = '<img src=x onerror="alert(1)"> all work item discovery failed'
     value["discovery_diagnostics"] = [
         {"code": "discovery_unavailable", "message": discovery_message}
     ]
@@ -723,18 +798,19 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
 
     assert page.locator("#board .card").count() == 0
     assert "Empty folders are hidden" in page.locator("#board .board-empty").inner_text()
-    assert discovery_message in page.locator("#details").inner_text()
-    assert page.locator("#details h2").inner_text() == "No packages available"
-    assert page.locator("#details .catalog-diagnostics li").inner_text() == (
+    assert page.locator("#details h2").inner_text() == "No work items available"
+    page.locator("#board-issues summary").click()
+    assert discovery_message in page.locator("#board-issues").inner_text()
+    assert page.locator("#board-issues li").inner_text() == (
         f"discovery_unavailable {discovery_message}"
     )
-    assert page.locator("#details .catalog-diagnostics img").count() == 0
-    assert "catalog diagnostics available" in page.locator("#status").inner_text().lower()
-    assert "select a package" not in page.locator("#status").inner_text().lower()
+    assert page.locator("#board-issues img").count() == 0
+    assert "workspace issues available" in page.locator("#status").inner_text().lower()
+    assert "select a work item" not in page.locator("#status").inner_text().lower()
 
 
 @pytest.mark.parametrize("participation,state,edge_states,unblocked", [
-    ("available", "no_declared_prerequisites", [], True),
+    ("available", "no_declared_prerequisites", [], False),
     ("available", "satisfied", ["satisfied", "satisfied"], True),
     ("available", "unsatisfied", ["satisfied", "unsatisfied"], False),
     ("available", "unknown", ["satisfied", "unknown"], False),
@@ -763,15 +839,11 @@ def test_unblocked_cards_require_confirmed_clear_prerequisites(
     _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
-    assert card.locator(".card-status").all_text_contents() == (["Unblocked"] if unblocked else [])
-    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == (
-        "rgb(20, 61, 43)" if unblocked else "rgb(27, 37, 51)"
-    )
+    assert card.locator(".dependency-indicator").count() == int(unblocked)
+    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
     card.click()
     assert "selected" in card.get_attribute("class").split()
-    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == (
-        "rgb(20, 61, 43)" if unblocked else "rgb(27, 37, 51)"
-    )
+    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
     direct_state = page.locator("#details .direct-prerequisite-state").inner_text()
     if state == "no_declared_prerequisites" and not edge_states:
         assert direct_state == "No direct prerequisites."
@@ -788,9 +860,10 @@ def test_refresh_removes_unblocked_indicator_when_a_prerequisite_becomes_unknown
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
-    assert card.locator(".card-status").inner_text() == "Unblocked"
+    assert card.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
     page.click("#refresh")
-    playwright.expect(card.locator(".card-status")).to_have_count(0)
+    playwright.expect(card.locator(".dependency-indicator")).to_have_count(1)
+    assert card.locator(".dependency-indicator").inner_text() == "Dependencies unknown"
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
 
 
@@ -866,7 +939,7 @@ def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(ope
     assert "emphasized" in cross.get_attribute("class").split()
     assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').evaluate(
         "c => getComputedStyle(c).backgroundColor"
-    ) == "rgb(20, 61, 43)"
+    ) == "rgb(27, 37, 51)"
     page.locator(f'.card[data-package-id="{STEP_ONE}"]').click()
     assert page.locator(".connection.emphasized, .connection.muted").count() == 0
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
@@ -989,18 +1062,18 @@ def contrast_ratio(first, second):
     return (lighter + 0.05) / (darker + 0.05)
 
 
-@pytest.mark.parametrize("theme,page_color,card_color,green_color", [
-    ("dark", "rgb(17, 24, 33)", "rgb(27, 37, 51)", "rgb(20, 61, 43)"),
-    ("light", "rgb(244, 246, 248)", "rgb(255, 255, 255)", "rgb(220, 252, 231)"),
+@pytest.mark.parametrize("theme,page_color,card_color", [
+    ("dark", "rgb(17, 24, 33)", "rgb(27, 37, 51)"),
+    ("light", "rgb(244, 246, 248)", "rgb(255, 255, 255)"),
 ])
 def test_native_themes_preserve_readable_cards_arrows_and_selection(
-    open_page, theme, page_color, card_color, green_color
+    open_page, theme, page_color, card_color
 ):
     page = open_page(StaticClient(board_payload()))
     page.get_by_label("Theme", exact=True).select_option(theme)
     source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     neutral = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    assert source.evaluate("c => getComputedStyle(c).backgroundColor") == green_color
+    assert source.evaluate("c => getComputedStyle(c).backgroundColor") == card_color
     assert neutral.evaluate("c => getComputedStyle(c).backgroundColor") == card_color
     assert page.locator("html").evaluate("el => getComputedStyle(el).backgroundColor") == page_color
     assert page.locator("html").evaluate("el => getComputedStyle(el).colorScheme") == theme
@@ -1026,7 +1099,7 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
       const pairs = [...document.querySelectorAll(
         '.row-head, .column-head, .empty')].map(el => [color(el), root]);
       document.querySelectorAll('.card').forEach(card => {
-        card.querySelectorAll('.card-title, .card-project, .card-status, .link, .link em')
+        card.querySelectorAll('.card-title, .card-project, .dependency-indicator, .link, .link em')
           .forEach(el => pairs.push([color(el), background(card)]));
       });
       document.querySelectorAll('input, select, #refresh, .details').forEach(el =>
@@ -1209,7 +1282,7 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
     page.get_by_text("Update check failed: producer_timeout", exact=True).wait_for(timeout=15000)
     page.wait_for_selector("#refresh.pending", timeout=15000)
     assert page.locator("#status").inner_text() == (
-        "Loaded 4 packages · select a package to view diagnostics"
+        "Loaded 4 work items · select a work item to view issues"
     )
     assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
     assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 0
@@ -1245,6 +1318,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     assert hidden_page.locator(
         f'.connection[data-source="{STAGE_IDS["Done"]}"]'
     ).count() == 0
+    hidden_page.locator("#details .dependencies summary").click()
     assert hidden_page.locator("#details .prerequisite-target").inner_text() == "Done target"
 
 
@@ -1261,6 +1335,7 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
     dependent.click()
     details = page.locator("#details")
+    details.locator(".dependencies summary").click()
     assert details.locator(".prerequisite-target").all_text_contents() == [
         "Custom stage card", "Hidden prerequisite"
     ]
@@ -1347,7 +1422,7 @@ def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
     compact = admitted_page.get_by_label("Hide empty rows and columns", exact=True)
     compact.uncheck()
     assert admitted_page.locator(".board-empty").inner_text() == (
-        "The catalog contains admitted folders but no packages."
+        "The catalog contains admitted folders but no work items."
     )
 
     incomplete = json.loads(compact_payload())
@@ -1355,7 +1430,7 @@ def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
     _reseal(incomplete)
     incomplete_page = open_page(StaticClient(incomplete))
     assert incomplete_page.locator(".board-empty").inner_text() == (
-        "The catalog has incomplete dimensions; no packages are currently available."
+        "The catalog has incomplete dimensions; no work items are currently available."
     )
 
     empty = json.loads(lifecycle_payload())
@@ -1363,7 +1438,7 @@ def test_admitted_incomplete_and_truly_empty_states_remain_distinct(open_page):
     empty["entries"] = []
     _reseal(empty)
     empty_page = open_page(StaticClient(empty))
-    assert empty_page.locator(".board-empty").inner_text() == "No packages in the catalog."
+    assert empty_page.locator(".board-empty").inner_text() == "No work items in the catalog."
 
 
 def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
@@ -1467,7 +1542,7 @@ def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_pag
     )
     assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 0
-    assert page.locator("#details h2").inner_text() == "Select a package"
+    assert page.locator("#details h2").inner_text() == "Select a work item"
 
 
 def test_real_producer_scalar_policy_paths_and_diagnostics_are_displayed(open_page):
@@ -1489,6 +1564,7 @@ def test_real_producer_scalar_policy_paths_and_diagnostics_are_displayed(open_pa
     for marker, path in zip((UNICODE_LOW, UNICODE_HIGH), expected_paths):
         card = page.locator(f'.card[data-package-path="{path}"]')
         card.click()
+        page.locator("#details .item-issues summary").click()
         assert f"invalid package identity: {path}" in page.locator("#details").inner_text()
         assert f"Diagnostic {marker}" in page.locator("#details h2").inner_text()
 

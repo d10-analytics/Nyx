@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Catalog viewer</title>
+    <title>Work item viewer</title>
     <meta name="color-scheme" content="dark light">
     <script src="/static/theme.js"></script>
     <link rel="stylesheet" href="/static/style.css">
@@ -11,8 +11,8 @@
   <body>
     <header class="toolbar">
       <div>
-        <h1>Catalog viewer</h1>
-        <p id="status" role="status">Loading catalog…</p>
+        <h1>Work item viewer</h1>
+        <p id="status" role="status">Loading work items…</p>
       </div>
       <div class="controls">
         <label for="theme">Theme</label>
@@ -21,8 +21,8 @@
           <option value="light">Light</option>
           <option value="dark" selected>Dark</option>
         </select>
-        <label for="filter">Find</label>
-        <input id="filter" type="search" placeholder="Find a package, project, or program…" autocomplete="off">
+        <label for="filter">Find work items</label>
+        <input id="filter" type="search" placeholder="Find a work item, project, or program…" autocomplete="off">
         <label class="compact-control" for="compact-view">
           <input id="compact-view" type="checkbox" checked>
           Hide empty rows and columns
@@ -31,9 +31,9 @@
       </div>
     </header>
     <main id="board" aria-live="polite"></main>
-    <aside id="details" class="details" aria-label="Selected package details">
-      <h2>Select a package</h2>
-      <p>Choose a card to inspect its declared values.</p>
+    <aside id="details" class="details" aria-label="Selected work item details">
+      <h2>Select a work item</h2>
+      <p>Choose a card to inspect its details.</p>
     </aside>
     <script src="/static/app.js" defer></script>
   </body>

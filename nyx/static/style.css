@@ -16,8 +16,10 @@
   --emphasis: #76b7ff;
   --focus-border: #76b7ff;
   --focus-ring: #4889ce;
-  --unblocked: #143d2b;
-  --unblocked-text: #91e8ae;
+  --dependency-satisfied: #9bd6b0;
+  --dependency-waiting: #ffd18c;
+  --dependency-unknown: #c7b6ff;
+  --dependency-unavailable: #ff9f9f;
   --link: #9ebcff;
   --warning: #ffd18c;
   --pending: #785b1b;
@@ -45,8 +47,10 @@
   --emphasis: #164f91;
   --focus-border: #2463a5;
   --focus-ring: #8db9e7;
-  --unblocked: #dcfce7;
-  --unblocked-text: #166534;
+  --dependency-satisfied: #166534;
+  --dependency-waiting: #825000;
+  --dependency-unknown: #5b3f91;
+  --dependency-unavailable: #9b2c2c;
   --link: #3e5790;
   --warning: #825000;
   --pending: #ffd97a;
@@ -97,6 +101,17 @@ button.pending {
   padding: 1.5rem 2rem 1rem;
 }
 .board-empty { grid-column: 1 / -1; }
+.board-issues {
+  grid-column: 1 / -1;
+  padding: .55rem .75rem;
+  border: 1px solid var(--border);
+  border-radius: .4rem;
+  background: var(--surface);
+}
+.board-issues summary, .details summary {
+  cursor: pointer;
+  font-weight: 700;
+}
 .board-empty.compact-hidden, .board-empty.admitted-empty, .board-empty.no-eligible-stages {
   padding: 1.25rem;
   border: 1px dashed var(--border);
@@ -170,11 +185,20 @@ button.pending {
   box-shadow: 0 1px 2px var(--shadow);
 }
 .card[hidden] { display: none; }
-.card.unblocked { background: var(--unblocked); }
+.dependency-indicator {
+  display: block;
+  margin-top: .35rem;
+  font-size: .82rem;
+  font-weight: 700;
+}
+.dependency-satisfied { color: var(--dependency-satisfied); }
+.dependency-waiting { color: var(--dependency-waiting); }
+.dependency-unknown { color: var(--dependency-unknown); }
+.dependency-unavailable { color: var(--dependency-unavailable); }
 .card-status {
   display: block;
   margin-top: .35rem;
-  color: var(--unblocked-text);
+  color: var(--muted);
   font-size: .82rem;
   font-weight: 700;
 }
@@ -197,6 +221,9 @@ button.pending {
 }
 .details h2 { font-size: 1.15rem; }
 .details h3 { font-size: 1rem; margin: 1rem 0 .4rem; }
+.details > details { margin-top: .9rem; }
+.details > details > summary { padding: .2rem 0; }
+.details > details[open] > summary { margin-bottom: .55rem; }
 .details dl { display: grid; grid-template-columns: minmax(10rem, 18rem) 1fr; gap: .3rem .8rem; }
 .details dt { font-weight: 700; }
 .details dd { margin: 0; overflow-wrap: anywhere; }
