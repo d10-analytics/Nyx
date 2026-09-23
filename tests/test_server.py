@@ -14,7 +14,7 @@ import pytest
 from nyx import server, state
 from nyx.app_runtime import ApplicationRuntime
 from nyx.models import canonical_digest, parse_catalog
-from nyx.server import CatalogError, create_server
+from nyx.server import CatalogError, _create_application_server, create_server
 
 
 class StubClient:
@@ -172,14 +172,45 @@ def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
 
 class RunningServer:
     def __init__(self, client, settings=None):
-        self.server = create_server(client, settings_provider=settings)
-        self.thread = threading.Thread(target=self.server.serve_forever)
-        self.thread.start()
+        self.application = None
+        if settings is None:
+            self.server = create_server(client)
+            self.thread = threading.Thread(target=self.server.serve_forever)
+            self.thread.start()
+            return
+
+        if isinstance(settings, ApplicationRuntime):
+            self.application = settings
+        else:
+            self.application = ApplicationRuntime(
+                port=0,
+                deadline=time.monotonic() + 5,
+            )
+            if hasattr(settings, "get_settings"):
+                self.application.get_settings = settings.get_settings
+            if hasattr(settings, "save_settings"):
+                self.application.save_settings = settings.save_settings
+
+        def application_server_factory(**kwargs):
+            return _create_application_server(
+                provider=client,
+                port=kwargs["port"],
+                settings_provider=kwargs["settings_provider"],
+            )
+
+        self.application._server_factory = application_server_factory
+        self.application.start(static_ready=lambda: True)
+        self.server = self.application.server
+        self.thread = self.application.http_thread
 
     def __enter__(self):
         return self.server.server_port
 
     def __exit__(self, *exc):
+        if self.application is not None:
+            assert self.application.shutdown(time.monotonic() + 2)
+            self.application.server = None
+            return
         self.server.shutdown()
         self.thread.join()
         self.server.server_close()
@@ -206,9 +237,9 @@ class SettingsStub:
         return dict(self.value)
 
     def save_settings(self, revision, order):
-        self.calls.append((revision, order))
         if revision != self.value["revision"]:
             return {**self.value, "outcome": "conflict"}
+        self.calls.append((revision, order))
         self.value = {"order": list(order), "revision": "new-opaque"}
         return {**self.value, "outcome": "success"}
 
@@ -495,6 +526,7 @@ def test_loopback_host_aliases_are_accepted():
 
 
 def test_standalone_server_keeps_settings_route_read_only_and_hidden():
+    settings = SettingsStub()
     with RunningServer(StubClient(catalog=valid_catalog())) as port:
         assert request(port, "GET", "/api/settings")[0] == 404
         status, _, _ = request(
@@ -504,6 +536,13 @@ def test_standalone_server_keeps_settings_route_read_only_and_hidden():
             body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
         )
         assert status == 404
+    assert settings.calls == []
+    with pytest.raises(TypeError, match="settings_provider"):
+        create_server(StubClient(catalog=valid_catalog()), settings_provider=settings)
+    with pytest.raises(TypeError, match="settings_provider"):
+        server.TrackerServer(
+            StubClient(catalog=valid_catalog()), settings_provider=settings
+        )
 
 
 def test_application_settings_route_enforces_host_methods_payload_and_opaque_result():

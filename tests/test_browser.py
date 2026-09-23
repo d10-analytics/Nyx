@@ -1,14 +1,16 @@
 import json
 import re
 import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 
+from nyx.app_runtime import ApplicationRuntime
 from nyx.catalog import scan_catalog
 from nyx.models import canonical_digest, parse_catalog
-from nyx.server import CatalogError, create_server
+from nyx.server import CatalogError, _create_application_server, create_server
 
 playwright = pytest.importorskip("playwright.sync_api")
 
@@ -433,9 +435,26 @@ def open_page():
         created = []
 
         def launch(client, *, color_scheme="light", init_script=None, settings=None):
-            server = create_server(client, settings_provider=settings)
-            thread = threading.Thread(target=server.serve_forever)
-            thread.start()
+            application = None
+            if settings is None:
+                server = create_server(client)
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+            else:
+                application = ApplicationRuntime(
+                    port=0,
+                    deadline=time.monotonic() + 5,
+                    server_factory=lambda **kwargs: _create_application_server(
+                        provider=client,
+                        port=kwargs["port"],
+                        settings_provider=kwargs["settings_provider"],
+                    ),
+                )
+                application.get_settings = settings.get_settings
+                application.save_settings = settings.save_settings
+                application.start(static_ready=lambda: True)
+                server = application.server
+                thread = application.http_thread
             context = browser.new_context(color_scheme=color_scheme)
             page = context.new_page()
             if init_script:
@@ -447,17 +466,20 @@ def open_page():
                 timeout=15000,
             )
             page.wait_for_timeout(150)
-            created.append((server, thread, page))
+            created.append((application, server, thread, page))
             return page
 
         try:
             yield launch
         finally:
-            for server, thread, page in created:
+            for application, server, thread, page in created:
                 page.context.close()
-                server.shutdown()
-                thread.join()
-                server.server_close()
+                if application is None:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                else:
+                    assert application.shutdown(time.monotonic() + 2)
             browser.close()
 
 
