@@ -83,6 +83,40 @@ DESKTOP_GUIDANCE_MARKERS = (
     "already open",
     "Retry",
 )
+STAGE_ORDER_GUIDANCE_MARKERS = {
+    "README.md": (
+        "Board row order",
+        "account-local",
+        "browser and desktop views",
+        "workspace root",
+        "presentation only",
+        "does not rename or move",
+    ),
+    "docs/running-nyx.md": (
+        "Board row order",
+        "Move up",
+        "Move down",
+        "Cancel",
+        "performs no write",
+        "Reset",
+        "canonical inventory order",
+        "hidden or absent",
+        "survives browser reload",
+        "supported Nyx",
+        "failed Save",
+    ),
+    "docs/workspaces.md": (
+        "root-keyed order map",
+        "browser and desktop views",
+        "Cancel",
+        "performs no write",
+        "Reset",
+        "Unlisted eligible stages",
+        "hidden or absent",
+        "falls back to canonical inventory order",
+        "never renames or moves",
+    ),
+}
 _START_TIMEOUT = 90.0
 
 
@@ -129,6 +163,13 @@ def test_documents_publish_the_private_desktop_guidance():
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     for marker in DESKTOP_GUIDANCE_MARKERS:
         assert marker in guide, marker
+
+
+def test_documents_publish_the_saved_stage_order_contract():
+    for name, markers in STAGE_ORDER_GUIDANCE_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert marker in document, (name, marker)
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
