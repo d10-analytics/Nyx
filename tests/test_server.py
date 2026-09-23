@@ -2,13 +2,17 @@ import http.client
 import json
 import socket
 import threading
+import time
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
-from nyx import server
+from nyx import server, state
+from nyx.app_runtime import ApplicationRuntime
 from nyx.models import canonical_digest, parse_catalog
 from nyx.server import CatalogError, create_server
 
@@ -567,6 +571,155 @@ def test_application_settings_put_returns_safe_error_when_admission_closes():
     assert status == 503
     assert content_type == "application/json"
     assert json.loads(body) == {"error": "settings_unavailable"}
+
+
+def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_preserves_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            initial = state.setup(specification_root)
+            paths = state.state_paths()
+
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                status, content_type, body = request(port, "GET", "/api/settings")
+                first = json.loads(body)
+                assert status == 200
+                assert content_type == "application/json"
+                assert first == {"order": [], "revision": initial.revision}
+                assert str(specification_root) not in body.decode("utf-8")
+
+                status, _, body = request(
+                    port,
+                    "PUT",
+                    "/api/settings",
+                    body=json.dumps(
+                        {"revision": first["revision"], "order": ["Queue"]}
+                    ),
+                )
+                saved = json.loads(body)
+                assert status == 200
+                assert saved["outcome"] == "success"
+                assert saved["order"] == ["Queue"]
+                assert saved["revision"] != first["revision"]
+
+                with patch.object(
+                    state.os,
+                    "replace",
+                    side_effect=AssertionError("stale write reached replacement"),
+                ) as replace_record:
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": first["revision"], "order": ["Archive"]}
+                        ),
+                    )
+                assert status == 409
+                assert json.loads(body) == {**saved, "outcome": "conflict"}
+                replace_record.assert_not_called()
+
+                for invalid_order in (["Queue", "Queue"], ["Queue/Done"]):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": saved["revision"], "order": invalid_order}
+                        ),
+                    )
+                    assert status == 400
+                    assert json.loads(body) == {"error": "invalid_order"}
+
+                with patch.object(state.os, "replace", side_effect=OSError("injected")):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": saved["revision"], "order": ["Done"]}
+                        ),
+                    )
+                assert status == 500
+                assert json.loads(body) == {**saved, "outcome": "failure"}
+                assert state.load_configuration(paths).stage_order == ("Queue",)
+        finally:
+            assert application.shutdown(time.monotonic() + 2)
+
+        restarted = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        restarted.capture_configuration(state.load_configuration(paths), paths)
+        restarted.admit_catalog()
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), restarted) as port:
+                status, _, body = request(port, "GET", "/api/settings")
+            assert status == 200
+            assert json.loads(body) == {
+                "order": ["Queue"],
+                "revision": state.configuration_revision(paths),
+            }
+        finally:
+            assert restarted.shutdown(time.monotonic() + 2)
+
+
+def test_real_application_settings_http_revalidates_after_commit_verification_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            initial = state.setup(specification_root)
+            paths = state.state_paths()
+
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        original_verify = state._verify_record
+        failed = False
+
+        def fail_first_commit_verification(path):
+            nonlocal failed
+            details = original_verify(path)
+            if path == paths.config_file and not failed:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if ["Queue", "Done"] in payload.get("stage_orders", {}).values():
+                    failed = True
+                    raise OSError("injected post-replacement verification failure")
+            return details
+
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                with patch.object(
+                    state, "_verify_record", side_effect=fail_first_commit_verification
+                ):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {
+                                "revision": initial.revision,
+                                "order": ["Queue", "Done"],
+                            }
+                        ),
+                    )
+            result = json.loads(body)
+            assert failed is True
+            assert status == 200
+            assert result["outcome"] == "success"
+            assert result["order"] == ["Queue", "Done"]
+            assert result["revision"] == state.configuration_revision(paths)
+        finally:
+            assert application.shutdown(time.monotonic() + 2)
 
 
 @pytest.mark.parametrize(

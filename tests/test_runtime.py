@@ -1053,6 +1053,112 @@ def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_a
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
+def test_normal_service_settings_survive_terminal_stop_and_restart():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", runtime.PORT))
+    except OSError as error:
+        pytest.skip(f"host cannot provide the fixed loopback service port: {error}")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+
+        with patch.object(state, "resolve_account_home", return_value=home):
+            runtime.setup(specification_root)
+            paths = state.state_paths()
+
+            def settings_request(
+                method: str, body: dict[str, object] | None = None
+            ) -> tuple[int, dict[str, object]]:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", runtime.PORT, timeout=5
+                )
+                try:
+                    headers = {"Host": f"127.0.0.1:{runtime.PORT}"}
+                    encoded = None if body is None else json.dumps(body)
+                    if encoded is not None:
+                        headers["Content-Type"] = "application/json"
+                    connection.request(
+                        method, "/api/settings", body=encoded, headers=headers
+                    )
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            def start_daemon() -> tuple[runtime._Daemon, threading.Thread, list[int]]:
+                lease_fd = _transferred_claim_fd(
+                    paths.runtime_directory / "lease.lock"
+                )
+                daemon = runtime._Daemon(
+                    lease_fd, time.monotonic_ns() + 20_000_000_000
+                )
+                result: list[int] = []
+                thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                thread.start()
+                _wait_for_record(paths)
+                deadline = time.monotonic() + 5
+                while True:
+                    status, current = settings_request("GET")
+                    if status == 200:
+                        return daemon, thread, result
+                    assert status == 503
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("service settings did not become ready")
+                    time.sleep(0.01)
+
+            running: tuple[runtime._Daemon, threading.Thread, list[int]] | None = None
+            try:
+                running = start_daemon()
+                first_status, first = settings_request("GET")
+                assert first_status == 200
+                assert first == {
+                    "order": [],
+                    "revision": state.configuration_revision(paths),
+                }
+
+                saved_status, saved = settings_request(
+                    "PUT",
+                    {
+                        "revision": first["revision"],
+                        "order": ["Done", "Queue"],
+                    },
+                )
+                assert saved_status == 200
+                assert saved["outcome"] == "success"
+                assert saved["order"] == ["Done", "Queue"]
+                assert saved["revision"] == state.configuration_revision(paths)
+
+                assert runtime.stop() == "stopped"
+                running[1].join(timeout=5)
+                assert not running[1].is_alive()
+                assert running[2] == [0]
+
+                running = start_daemon()
+                restarted_status, restarted = settings_request("GET")
+                assert restarted_status == 200
+                assert restarted == {
+                    "order": ["Done", "Queue"],
+                    "revision": state.configuration_revision(paths),
+                }
+
+                assert runtime.stop() == "stopped"
+                running[1].join(timeout=5)
+                assert not running[1].is_alive()
+                assert running[2] == [0]
+            finally:
+                if running is not None and running[1].is_alive():
+                    running[0].shutdown(time.monotonic() + 3)
+                    running[1].join(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
