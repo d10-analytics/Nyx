@@ -1667,6 +1667,66 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
                 session.close()
 
 
+def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order():
+    port = _free_loopback_port()
+
+    def request_settings(method="GET", payload=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            body = None if payload is None else json.dumps(payload).encode()
+            headers = {"Host": f"127.0.0.1:{port}"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = str(len(body))
+            connection.request(method, "/api/settings", body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            try:
+                session.start_runtime()
+                status, first_settings = request_settings()
+                assert status == 200
+                assert first_settings["order"] == []
+                first_saved_status, first_saved = request_settings(
+                    "PUT",
+                    {"revision": first_settings["revision"], "order": ["Done", "Queue"]},
+                )
+                assert first_saved_status == 200
+                assert first_saved["outcome"] == "success"
+
+                session.choose_workspace(second)
+                status, second_settings = request_settings()
+                assert status == 200
+                assert second_settings["order"] == []
+                second_saved_status, second_saved = request_settings(
+                    "PUT",
+                    {"revision": second_settings["revision"], "order": ["Archive"]},
+                )
+                assert second_saved_status == 200
+                assert second_saved["outcome"] == "success"
+
+                session.choose_workspace(first)
+                status, restored = request_settings()
+                assert status == 200
+                assert restored["order"] == ["Done", "Queue"]
+            finally:
+                session.close()
+
+
 def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
