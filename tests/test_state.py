@@ -340,6 +340,25 @@ def test_stage_order_revision_changes_only_for_validated_configuration_bytes():
             assert paths.config_file.read_bytes() == before
 
 
+def test_empty_current_stage_order_resets_only_that_workspace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            state.save_configuration_owned(first, stage_order=["A"], paths=paths)
+            state.save_configuration_owned(second, stage_order=["B"], paths=paths)
+            reset = state.save_configuration_owned(first, stage_order=[], paths=paths)
+            loaded = state.load_configuration(paths)
+
+        assert reset.stage_orders == {str(second.resolve()): ("B",)}
+        assert loaded.stage_orders == {str(second.resolve()): ("B",)}
+
+
 def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
