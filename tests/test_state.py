@@ -359,6 +359,23 @@ def test_empty_current_stage_order_resets_only_that_workspace():
         assert loaded.stage_orders == {str(second.resolve()): ("B",)}
 
 
+def test_runtime_setup_preserves_saved_stage_orders_when_reapplying_existing_configuration():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(workspace)
+            paths = state.state_paths()
+            state.save_configuration_owned(workspace, stage_order=["A", "B"], paths=paths)
+
+            state.setup(workspace)
+            reloaded = state.load_configuration(paths)
+
+        assert reloaded.stage_orders == {str(workspace.resolve()): ("A", "B")}
+
+
 def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
