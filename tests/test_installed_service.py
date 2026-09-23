@@ -320,7 +320,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
     assert unconfigured.returncode == 0, unconfigured.stderr
     assert unconfigured.stdout.splitlines() == [
         "Configuration: not configured",
-        "Specification root: not configured",
+        "Workspace: not configured",
         "Hidden stages: not configured",
         "Runtime: not running",
     ]
@@ -346,7 +346,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert configured_stopped.returncode == 0, configured_stopped.stderr
         assert configured_stopped.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             'Hidden stages: ["Done"]',
             "Runtime: not running",
         ]
@@ -370,7 +370,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert running_status.returncode == 0, running_status.stderr
         assert running_status.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             'Hidden stages: ["Done"]',
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',
@@ -422,7 +422,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert post_stop.returncode == 0, post_stop.stderr
         assert post_stop.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             'Hidden stages: ["Done"]',
             "Runtime: not running",
         ]
@@ -441,7 +441,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert show_all_stopped.returncode == 0, show_all_stopped.stderr
         assert show_all_stopped.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             "Hidden stages: []",
             "Runtime: not running",
         ]
@@ -461,7 +461,7 @@ def test_bare_installed_command_owns_setup_start_reuse_and_stop():
         assert second_running_status.returncode == 0, second_running_status.stderr
         assert second_running_status.stdout.splitlines() == [
             "Configuration: configured",
-            f'Specification root: {json.dumps(str(specification_root.resolve()))}',
+            f'Workspace: {json.dumps(str(specification_root.resolve()))}',
             "Hidden stages: []",
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',

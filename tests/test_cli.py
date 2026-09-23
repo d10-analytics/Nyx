@@ -128,6 +128,19 @@ def test_hidden_stage_options_are_setup_only():
         cli.main(["--hide-stage", "Queue"])
 
 
+def test_help_names_the_configured_location_workspace_and_preserves_spec_root(
+    capsys,
+):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--help"])
+
+    assert error.value.code == 0
+    captured = capsys.readouterr()
+    assert "--setup SPEC_ROOT" in captured.out
+    assert "configure the Workspace at SPEC_ROOT" in captured.out
+    assert captured.err == ""
+
+
 @pytest.mark.parametrize("requested", ["root", "policy"])
 def test_active_setup_rejects_changed_root_or_policy_without_cli_mutation(capsys, requested):
     with TemporaryDirectory() as temporary:
@@ -182,7 +195,7 @@ def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifec
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: configured",
-        f"Specification root: {cli._json_literal(str(configuration.specification_root))}",
+        f"Workspace: {cli._json_literal(str(configuration.specification_root))}",
         'Hidden stages: ["Done", "Queue\\n\\u0085"]',
         "Runtime: not running",
     ]
@@ -204,7 +217,7 @@ def test_status_running_prints_verified_url_after_runtime(capsys):
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: not configured",
-        "Specification root: not configured",
+        "Workspace: not configured",
         "Hidden stages: not configured",
         "Runtime: running",
         'URL: "http://127.0.0.1:8765/\\n"',
@@ -227,7 +240,7 @@ def test_status_keeps_runtime_result_when_configuration_is_unavailable(capsys):
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: unavailable",
-        "Specification root: unavailable",
+        "Workspace: unavailable",
         "Hidden stages: unavailable",
         "Runtime: running",
         f'URL: "{runtime.URL}"',
@@ -258,7 +271,7 @@ def test_status_collapses_malformed_persisted_root_and_preserves_runtime_sibling
         captured = capsys.readouterr()
         assert captured.out.splitlines() == [
             "Configuration: unavailable",
-            "Specification root: unavailable",
+            "Workspace: unavailable",
             "Hidden stages: unavailable",
             "Runtime: not running",
             "Diagnostic: configuration unavailable",
@@ -284,7 +297,7 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: configured",
-        f"Specification root: {cli._json_literal(str(configuration.specification_root))}",
+        f"Workspace: {cli._json_literal(str(configuration.specification_root))}",
         "Hidden stages: []",
         "Runtime: unknown",
         "Diagnostic: runtime state unavailable",
@@ -340,7 +353,7 @@ def test_status_orders_configuration_and_runtime_diagnostics_after_both_observat
     captured = capsys.readouterr()
     assert captured.out.splitlines() == [
         "Configuration: unavailable",
-        "Specification root: unavailable",
+        "Workspace: unavailable",
         "Hidden stages: unavailable",
         "Runtime: unknown",
         "Diagnostic: configuration unavailable",
