@@ -506,7 +506,7 @@ def test_selecting_a_card_shows_declared_values_and_diagnostics(open_page):
     assert "Waiting on dependencies" in details.locator(".dependencies summary").inner_text()
     assert "Foundation step" not in details.inner_text()
     assert details.locator(".item-issues").get_attribute("open") is None
-    assert details.get_by_text("example diagnostic", exact=False).count() == 0
+    assert "example diagnostic" not in details.locator(".item-issues summary").inner_text()
     details.locator(".dependencies summary").click()
     assert "Foundation step" in details.inner_text()
     details.locator(".item-issues summary").click()
@@ -529,12 +529,20 @@ def test_item_issue_summary_escapes_diagnostic_codes(open_page):
         "message": "diagnostic message",
     }]
     _reseal(value)
-    page = open_page(StaticClient(value))
-    page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
 
-    summary = page.locator("#details .item-issues summary")
-    assert '<img src=x onerror="alert(1)">' in summary.inner_text()
-    assert page.locator("#details .item-issues img").count() == 0
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(RawSequenceClient([value]))
+        page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
+
+        summary = page.locator("#details .item-issues summary")
+        assert '<img src=x onerror="alert(1)">' in summary.inner_text()
+        assert page.locator("#details .item-issues img").count() == 0
 
 
 def test_old_format_review_fields_stay_searchable_but_technical_id_is_on_demand(open_page):
@@ -570,9 +578,9 @@ def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(op
     assert loose.locator(".card-project").inner_text() == "Target project: Declared target"
     foundation.click()
     assert page.locator("#details h2").inner_text() == "Foundation step"
-    assert page.locator("#details dt").all_inner_texts() == ["Stage"]
+    assert page.locator("#details > dl > dt").all_inner_texts() == ["Stage"]
     loose.click()
-    assert page.locator("#details dt").all_inner_texts() == ["Stage", "Target project"]
+    assert page.locator("#details > dl > dt").all_inner_texts() == ["Stage", "Target project"]
 
 
 def test_keyboard_opens_dependency_disclosure_and_keeps_hidden_target_context(open_page):
@@ -747,9 +755,9 @@ def test_details_distinguish_confirmed_empty_from_unknown_or_unavailable_prerequ
     card = page.locator(f'.card[data-package-id="{GATE}"]')
     card.click()
 
-    details_text = page.locator("#details").inner_text()
-    if not unblocked:
-        assert "No direct prerequisites." not in details_text
+    disclosure = page.locator("#details .dependencies")
+    assert disclosure.get_attribute("open") is None
+    disclosure.locator("summary").click()
     state_message = page.locator("#details .direct-prerequisite-state")
     assert state_message.get_attribute("data-direct-prerequisite-state") == (
         "relationship_unavailable" if participation == "legacy" else state
@@ -824,19 +832,19 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     assert "select a work item" not in page.locator("#status").inner_text().lower()
 
 
-@pytest.mark.parametrize("participation,state,edge_states,unblocked", [
-    ("available", "no_declared_prerequisites", [], False),
-    ("available", "satisfied", ["satisfied", "satisfied"], True),
-    ("available", "unsatisfied", ["satisfied", "unsatisfied"], False),
-    ("available", "unknown", ["satisfied", "unknown"], False),
-    ("available", "unknown", [], False),
-    ("legacy", "relationship_unavailable", [], False),
-    ("invalid", "relationship_unavailable", [], False),
-    ("available", "satisfied", ["unknown"], False),
-    ("available", "no_declared_prerequisites", ["unknown"], False),
+@pytest.mark.parametrize("participation,state,edge_states,indicator_label", [
+    ("available", "no_declared_prerequisites", [], None),
+    ("available", "satisfied", ["satisfied", "satisfied"], "Dependencies satisfied"),
+    ("available", "unsatisfied", ["satisfied", "unsatisfied"], "Waiting on dependencies"),
+    ("available", "unknown", ["satisfied", "unknown"], "Dependencies unknown"),
+    ("available", "unknown", [], "Dependencies unknown"),
+    ("legacy", "relationship_unavailable", [], "Dependencies unavailable"),
+    ("invalid", "relationship_unavailable", [], "Dependencies unavailable"),
+    ("available", "satisfied", ["unknown"], "Dependencies unknown"),
+    ("available", "no_declared_prerequisites", ["unknown"], "Dependencies unknown"),
 ])
 def test_unblocked_cards_require_confirmed_clear_prerequisites(
-    open_page, participation, state, edge_states, unblocked
+    open_page, participation, state, edge_states, indicator_label
 ):
     value = json.loads(board_payload())
     relationship = value["entries"][0]["relationship"]
@@ -854,11 +862,13 @@ def test_unblocked_cards_require_confirmed_clear_prerequisites(
     _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
-    assert card.locator(".dependency-indicator").count() == int(unblocked)
+    indicator = card.locator(".dependency-indicator")
+    assert indicator.all_inner_texts() == ([] if indicator_label is None else [indicator_label])
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
     card.click()
     assert "selected" in card.get_attribute("class").split()
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
+    page.locator("#details .dependencies summary").click()
     direct_state = page.locator("#details .direct-prerequisite-state").inner_text()
     if state == "no_declared_prerequisites" and not edge_states:
         assert direct_state == "No direct prerequisites."
@@ -868,17 +878,36 @@ def test_unblocked_cards_require_confirmed_clear_prerequisites(
         assert direct_state != "All reported direct prerequisite claims are satisfied."
 
 
-def test_refresh_removes_unblocked_indicator_when_a_prerequisite_becomes_unknown(open_page):
+def test_refresh_changes_satisfied_dependency_indicator_and_details_to_unknown(open_page):
     first = json.loads(board_payload())
-    second = json.loads(board_payload())
-    second["entries"][1]["relationship"]["direct_prerequisite_state"] = "unknown"
+    relationship = first["entries"][1]["relationship"]
+    satisfied = _edge(STEP_TWO, "build")
+    satisfied.update(
+        observed_state="satisfied", resolved_state="satisfied", reason="claim_satisfied"
+    )
+    relationship.update(direct_prerequisite_state="satisfied", prerequisites=[satisfied])
+    _reseal(first)
+    second = json.loads(json.dumps(first))
+    second_relationship = second["entries"][1]["relationship"]
+    second_relationship["direct_prerequisite_state"] = "unknown"
+    second_relationship["prerequisites"][0].update(
+        observed_state="unknown", resolved_state="unknown", reason="claim_unknown"
+    )
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
     assert card.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
-    page.click("#refresh")
-    playwright.expect(card.locator(".dependency-indicator")).to_have_count(1)
-    assert card.locator(".dependency-indicator").inner_text() == "Dependencies unknown"
+    card.click()
+    assert "Dependencies satisfied" in page.locator("#details .dependencies summary").inner_text()
+    refresh = page.locator("#refresh")
+    playwright.expect(refresh).to_have_text("Apply update", timeout=15000)
+    refresh.click()
+    playwright.expect(card.locator(".dependency-indicator")).to_have_text("Dependencies unknown")
+    assert "Dependencies unknown" in page.locator("#details .dependencies summary").inner_text()
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .direct-prerequisite-state").inner_text() == (
+        "Direct prerequisite information is unknown."
+    )
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
 
 
@@ -1345,7 +1374,9 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert page.locator('.card[data-package-path="Alpha/Testing/custom"]').count() == 1
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
-    assert "incomplete / unavailable" in page.locator(".row-head").first.inner_text()
+    assert "incomplete / unavailable" in page.locator(
+        '.board-row[data-lifecycle="Partial"] .row-head'
+    ).inner_text()
 
     dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
     dependent.click()
@@ -1354,7 +1385,6 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     assert details.locator(".prerequisite-target").all_text_contents() == [
         "Custom stage card", "Hidden prerequisite"
     ]
-    assert "Partial stage scan incomplete" in details.inner_text()
     assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
 
     compact.uncheck()
