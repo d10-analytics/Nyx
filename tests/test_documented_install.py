@@ -1,4 +1,11 @@
-"""Exercise the published installation commands in their native shell."""
+"""Exercise the published installation commands in their native shell.
+
+Linux keeps the documented console installation and its browser/service
+lifecycle.  Windows and macOS publish the private desktop artifact instead, so
+the same consumer parses that guidance and, in the desktop artifact lane,
+exercises the documented application actions against the staged build rather
+than a detached console daemon.
+"""
 
 from __future__ import annotations
 
@@ -10,16 +17,34 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
 import pytest
+from test_desktop_artifact import (
+    _DELIVERED_HIDDEN_STAGES,
+    ArtifactLayout,
+    _assert_claims_released,
+    _claim_paths,
+    _inert_path,
+    _request,
+    _running_gui,
+    _sanitized_environment,
+    _wait_for_board,
+    _wait_port_free,
+    _workspace,
+    _write_configuration,
+)
 from test_wheel_install import (
     _installed_environment,
     _native_claim_probe,
     _venv_executable,
 )
+
+from nyx._native_claim import NativeClaim
+from nyx.catalog import scan_catalog
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 DOCUMENTS = ("README.md", "docs/running-nyx.md")
@@ -34,13 +59,31 @@ EXPECTED = {
     ),
     "powershell": (
         "py -3.12 -m venv .venv",
-        r".\.venv\Scripts\python.exe -m pip install .",
-        r".\.venv\Scripts\nyx.exe --setup .\examples\sample-specifications --show-all-stages",
-        r".\.venv\Scripts\nyx.exe",
-        r".\.venv\Scripts\nyx.exe --status",
-        r".\.venv\Scripts\nyx.exe --stop",
+        r".\.venv\Scripts\python.exe -m pip install '.[desktop,build]'",
+        r".\.venv\Scripts\python.exe scripts\build_desktop.py",
     ),
 }
+# The documented private artifacts and the application actions the guide
+# promises.  The desktop lane consumes these paths against the staged build.
+DESKTOP_ARTIFACT_PATHS = {
+    "windows": r"dist\desktop\Nyx\Nyx.exe",
+    "macos": "dist/desktop/Nyx.app",
+}
+DESKTOP_ARTIFACT_MARKERS = (
+    r"dist\desktop\Nyx\Nyx.exe",
+    "dist/desktop/Nyx.app",
+    "build_desktop.py",
+)
+DESKTOP_GUIDANCE_MARKERS = (
+    "private internal feasibility build",
+    "not a public release",
+    "workspace chooser",
+    "Change workspace",
+    "Quit",
+    "already open",
+    "Retry",
+)
+_START_TIMEOUT = 90.0
 
 
 def _documented_commands(document: str, language: str) -> tuple[str, ...]:
@@ -60,8 +103,14 @@ def test_both_documents_publish_exact_installation_commands(language):
     assert blocks[0] == blocks[1]
 
 
-@pytest.mark.parametrize("language", EXPECTED)
-@pytest.mark.parametrize("index", range(6))
+@pytest.mark.parametrize(
+    ("language", "index"),
+    [
+        (language, index)
+        for language, commands in EXPECTED.items()
+        for index in range(len(commands))
+    ],
+)
 def test_document_contract_rejects_changed_or_deleted_commands(language, index):
     commands = list(EXPECTED[language])
     for replacement in ("", "echo substituted command"):
@@ -70,6 +119,16 @@ def test_document_contract_rejects_changed_or_deleted_commands(language, index):
         document = f"```{language}\n" + "\n".join(changed) + "\n```\n"
         with pytest.raises(AssertionError, match="changed"):
             _documented_commands(document, language)
+
+
+def test_documents_publish_the_private_desktop_guidance():
+    for name in DOCUMENTS:
+        document = (REPOSITORY_ROOT / name).read_text(encoding="utf-8")
+        for marker in DESKTOP_ARTIFACT_MARKERS:
+            assert marker in document, (name, marker)
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    for marker in DESKTOP_GUIDANCE_MARKERS:
+        assert marker in guide, marker
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
@@ -98,11 +157,9 @@ def test_native_shell_propagates_failed_command(tmp_path):
         _run_command(command, root=tmp_path, environment=_installed_environment(tmp_path))
 
 
-@pytest.mark.skipif(
-    os.environ.get("NYX_VERIFY_DOCUMENTED_INSTALL") != "1",
-    reason="documented installation runs in its dedicated native hosted lane",
-)
-def test_documented_native_installation_and_lifecycle(tmp_path):
+def _exercise_documented_linux_installation(tmp_path: Path) -> None:
+    """Run the published Linux commands exactly as written."""
+
     language = "powershell" if os.name == "nt" else "bash"
     blocks = [
         _documented_commands((REPOSITORY_ROOT / name).read_text(encoding="utf-8"), language)
@@ -186,3 +243,104 @@ def test_documented_native_installation_and_lifecycle(tmp_path):
         # Only the isolated home can authorize cleanup of this test's instance.
         if locator.exists():
             _run_command(commands[5], root=root, environment=environment)
+
+
+def _documented_desktop_artifact() -> Path:
+    staged = os.environ.get("NYX_DESKTOP_ARTIFACT")
+    if not staged:
+        pytest.skip(
+            "the private desktop artifact is staged only in the desktop artifact lane"
+        )
+    artifact = ArtifactLayout(Path(staged).resolve())
+    assert artifact.executable.is_file(), f"staged application is missing: {artifact.executable}"
+    documented = (
+        DESKTOP_ARTIFACT_PATHS["windows"]
+        if os.name == "nt"
+        else DESKTOP_ARTIFACT_PATHS["macos"]
+    )
+    normalized = str(artifact.artifact).replace("\\", "/")
+    assert documented.replace("\\", "/") in normalized, (documented, normalized)
+    return artifact
+
+
+def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
+    """Run the published desktop actions against the staged private artifact."""
+
+    artifact = _documented_desktop_artifact()
+    root = tmp_path / "documented"
+    root.mkdir()
+    home = root / "home"
+    home.mkdir()
+    decoy = _inert_path(root)
+    environment = _sanitized_environment(home, decoy)
+
+    # First launch: the chooser owns the account but serves no board.
+    with _running_gui(artifact, root, environment) as gui:
+        time.sleep(3)
+        with pytest.raises(OSError):
+            _request("/api/catalog")
+        assert gui.process.poll() is None, gui.diagnostics()
+        assert gui.close() == 0, gui.diagnostics()
+    _assert_claims_released(home)
+
+    # Open a configured workspace, serve the board, then Quit.
+    with _workspace(root) as first:
+        _write_configuration(home, first)
+        expected_first = json.loads(
+            scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        )
+        with _running_gui(artifact, root, environment) as gui:
+            status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+            assert status == 200
+            assert json.loads(body) == expected_first
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+        _wait_port_free(time.monotonic() + 15)
+
+        # Change workspace: the replacement selection is served after restart.
+        second = root / "second"
+        shutil.copytree(first, second)
+        shutil.rmtree(second / "Trail_API")
+        expected_second = json.loads(
+            scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+        )
+        assert expected_first != expected_second
+        _write_configuration(home, second)
+        with _running_gui(artifact, root, environment) as gui:
+            status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+            assert status == 200
+            assert json.loads(body) == expected_second
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+    _wait_port_free(time.monotonic() + 15)
+
+    # Recovery: a surviving former worker blocks the start until it exits.
+    with _workspace(root) as workspace:
+        config_file = _write_configuration(home, workspace)
+        before = config_file.read_bytes()
+        _, recovery_path = _claim_paths(home)
+        recovery_path.parent.mkdir(parents=True, exist_ok=True)
+        former = NativeClaim(recovery_path)
+        assert former.acquire(blocking=False)
+        try:
+            with _running_gui(artifact, root, environment) as gui:
+                time.sleep(4)
+                with pytest.raises(OSError):
+                    _request("/api/catalog")
+                assert gui.process.poll() is None, gui.diagnostics()
+                assert config_file.read_bytes() == before
+                assert gui.close() == 0, gui.diagnostics()
+        finally:
+            former.close()
+        _wait_port_free(time.monotonic() + 15)
+
+
+@pytest.mark.skipif(
+    os.environ.get("NYX_VERIFY_DOCUMENTED_INSTALL") != "1",
+    reason="documented installation runs in its dedicated native hosted lane",
+)
+def test_documented_native_installation_and_lifecycle(tmp_path):
+    if os.name == "nt" or sys.platform == "darwin":
+        _exercise_documented_desktop_actions(tmp_path)
+    else:
+        _exercise_documented_linux_installation(tmp_path)

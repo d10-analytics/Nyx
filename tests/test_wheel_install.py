@@ -88,6 +88,12 @@ def _installed_environment(home: Path) -> dict[str, str]:
     return environment
 
 
+def _desktop_host() -> bool:
+    """Match the production desktop selection for the installed console."""
+
+    return os.name == "nt" or sys.platform == "darwin"
+
+
 def _run_installed_console(
     console: Path, arguments: list[str], *, root: Path, home: Path
 ) -> subprocess.CompletedProcess[str]:
@@ -165,6 +171,10 @@ def test_built_wheel_python_and_static_members_have_current_terms():
         _assert_packaged_wording_clean(archive)
 
 
+@pytest.mark.skipif(
+    _desktop_host(),
+    reason="the desktop hosts replace the detached console lifecycle with artifact proof",
+)
 def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():
     wheel = _wheel_path()
     with TemporaryDirectory() as temporary:
@@ -531,3 +541,88 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 process.stdin.write("\n")
                 process.stdin.close()
             process.wait(timeout=10)
+
+
+@pytest.mark.skipif(
+    not _desktop_host(),
+    reason="the installed desktop console is selected on Windows and macOS",
+)
+def test_installed_wheel_desktop_console_refuses_lifecycle_and_routes_to_the_app():
+    wheel = _wheel_path()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        venv = root / "venv"
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        interpreter = _venv_executable(venv, "python")
+        subprocess.run(
+            [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        console = _venv_executable(venv, "nyx")
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        package = specification_root / "Fictional" / "Queue" / "installed-demo"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text(
+            "# Installed catalog entry\nStatus: approved\nClosure: approved\n",
+            encoding="utf-8",
+        )
+        # The wheel keeps its runtime/import coverage on the desktop hosts even
+        # though the console no longer drives the detached service.
+        provenance = subprocess.run(
+            [
+                str(interpreter),
+                "-c",
+                "import importlib, json; "
+                "print(json.dumps({name: importlib.import_module(name).__file__ for name in "
+                "('nyx', 'nyx.app_runtime', 'nyx.catalog', 'nyx.models', 'nyx.server', "
+                "'nyx.worker')}))",
+            ],
+            cwd=root,
+            env=_installed_environment(home),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert provenance.returncode == 0, provenance.stderr
+        imported = json.loads(provenance.stdout)
+        assert set(imported) == {
+            "nyx",
+            "nyx.app_runtime",
+            "nyx.catalog",
+            "nyx.models",
+            "nyx.server",
+            "nyx.worker",
+        }
+        for name, location in imported.items():
+            module_path = Path(location).resolve()
+            assert module_path.is_relative_to(venv.resolve()), (name, module_path)
+            assert not module_path.is_relative_to(REPOSITORY_ROOT), (name, module_path)
+
+        # Retired lifecycle options fail bounded and leave no state behind,
+        # before any configuration or runtime record is written.
+        for arguments in (
+            ["--setup", str(specification_root)],
+            ["--status"],
+            ["--stop"],
+            ["--setup", str(specification_root), "--show-all-stages"],
+        ):
+            completed = _run_installed_console(console, arguments, root=root, home=home)
+            assert completed.returncode == 2, (arguments, completed.stderr)
+            assert completed.stdout == ""
+            assert completed.stderr.startswith("nyx: ")
+            assert "desktop application" in completed.stderr
+        assert not (home / ".nyx").exists()
+
+        # Empty arguments enter the owned application, never the detached
+        # daemon: this isolated environment installs no GUI dependency, so the
+        # application reports its bounded dependency error instead of serving.
+        launched = _run_installed_console(console, [], root=root, home=home)
+        assert launched.returncode == 1, launched.stderr
+        assert launched.stdout == ""
+        assert "nyx-desktop:" in launched.stderr
+        assert "http://127.0.0.1:8765/" not in launched.stderr
+        assert not (home / ".nyx" / "runtime" / "instance.json").exists()

@@ -437,6 +437,10 @@ def test_startup_diagnostic_notes_preserve_public_message_and_hide_child_details
     ]
 
 
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
 def test_public_start_reports_sanitized_detached_child_failure():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -483,6 +487,82 @@ def test_daemon_entry_rejects_unvalidated_inherited_object_before_initialization
         assert os.read(ack_read, 1) == b"0"
         daemon.assert_not_called()
         os.close(ack_read)
+
+
+def test_module_entry_refuses_desktop_daemon_arguments_before_handle_conversion(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: True)
+    with patch.object(runtime, "_receive_daemon_handles") as receive, patch.object(
+        runtime, "_daemon_entry"
+    ) as entry:
+        for arguments in (
+            ["nyx/runtime.py", "--daemon-fd", "7", "--deadline-ns", "1"],
+            [
+                "nyx/runtime.py",
+                "--daemon-handle",
+                "9",
+                "--ack-handle",
+                "8",
+                "--deadline-ns",
+                "1",
+            ],
+            ["nyx/runtime.py", "--claim-path", "/tmp/lease.lock", "--deadline-ns", "1"],
+        ):
+            assert runtime._module_entry(arguments) == 2
+    receive.assert_not_called()
+    entry.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{runtime._DESKTOP_DAEMON_REFUSAL}\n" * 3
+
+
+def test_module_entry_preserves_the_linux_daemon_dispatch(monkeypatch):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+    with patch.object(runtime, "_daemon_entry", return_value=25) as entry:
+        assert (
+            runtime._module_entry(["nyx/runtime.py", "--daemon-fd", "7", "--deadline-ns", "1234"])
+            == 25
+        )
+    entry.assert_called_once_with(7, 1234, ack_fd=None, claim_path=None)
+
+
+def test_module_entry_still_rejects_a_launch_without_daemon_arguments(monkeypatch):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+    with pytest.raises(SystemExit) as error:
+        runtime._module_entry(["nyx/runtime.py"])
+    assert error.value.code == "internal lifecycle entry point"
+
+
+@pytest.mark.skipif(
+    not runtime.desktop_host(),
+    reason="the internal daemon module is refused on Windows and macOS",
+)
+def test_desktop_module_launch_refuses_legacy_daemon_arguments(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = _subprocess_environment(home, tmp_path / "site")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "nyx.runtime",
+            "--daemon-fd",
+            "0",
+            "--deadline-ns",
+            "1",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == f"{runtime._DESKTOP_DAEMON_REFUSAL}\n"
+    assert not (home / ".nyx").exists()
 
 
 def test_control_is_verified_before_locator_publication_and_catalog_admission():
@@ -3741,6 +3821,10 @@ def test_close_between_real_spawn_and_registration_reaps_the_child():
     assert manager.active_count == 0
 
 
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
 def test_simultaneous_start_processes_share_one_authenticated_instance():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -3800,6 +3884,10 @@ def test_simultaneous_start_processes_share_one_authenticated_instance():
                     process.wait(timeout=3)
 
 
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
 def test_actual_daemon_spawn_retains_lease_after_launcher_death():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -3835,6 +3923,10 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
             assert runtime.stop() == "stopped"
 
 
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
 def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
