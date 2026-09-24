@@ -953,11 +953,15 @@ def test_application_settings_save_conflict_and_restart_persistence():
         )
         application.capture_configuration(initial, paths)
         application.admit_catalog()
-        saved = application.save_settings(initial.revision, ["Done", "Queue"])
+        saved = application.save_settings(
+            initial.revision, ["Done", "Queue"], ["Done"]
+        )
         assert saved["outcome"] == "success"
         assert saved["order"] == ["Done", "Queue"]
+        assert saved["completed"] == ["Done"]
         assert application.save_settings(initial.revision, ["Archive"])["outcome"] == "conflict"
         assert state.load_configuration(paths).stage_order == ("Done", "Queue")
+        assert state.load_configuration(paths).completed_stage_names == ("Done",)
         assert application.shutdown(time.monotonic() + 2)
 
         restarted = runtime.ApplicationRuntime(
@@ -967,6 +971,7 @@ def test_application_settings_save_conflict_and_restart_persistence():
         restarted.admit_catalog()
         current = restarted.get_settings()
         assert current["order"] == ["Done", "Queue"]
+        assert current["completed"] == ["Done"]
         assert current["revision"] == state.configuration_revision(paths)
         assert str(specification_root) not in current
         assert restarted.shutdown(time.monotonic() + 2)
@@ -1060,6 +1065,7 @@ def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_a
             shutdown_thread.join(timeout=3)
         assert saved == [{
             "order": ["Queue"],
+            "completed": [],
             "revision": saved[0]["revision"],
             "outcome": "success",
         }]

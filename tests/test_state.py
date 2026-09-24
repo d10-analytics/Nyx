@@ -377,6 +377,93 @@ def test_empty_current_stage_order_resets_only_that_workspace():
         assert loaded.stage_orders == {str(second.resolve()): ("B",)}
 
 
+def test_root_keyed_completed_stages_are_optional_canonical_and_root_local():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            legacy = {"schema_version": 1, "specification_root": str(first.resolve())}
+            paths.config_file.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+            before = paths.config_file.read_bytes()
+            assert state.load_configuration(paths).completed_stages == {}
+            assert paths.config_file.read_bytes() == before
+
+            first_saved = state.save_configuration_owned(
+                first,
+                paths=paths,
+                stage_order=["Queue", "Done"],
+                completed_stage_names=["Done", "Queue"],
+            )
+            second_saved = state.save_configuration_owned(
+                second,
+                paths=paths,
+                stage_order=["Archive"],
+                completed_stage_names=["Review"],
+            )
+            loaded = state.load_configuration(paths)
+            payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
+
+        assert first_saved.completed_stage_names == ("Done", "Queue")
+        assert second_saved.completed_stage_names == ("Review",)
+        assert loaded.completed_stages == {
+            str(first.resolve()): ("Done", "Queue"),
+            str(second.resolve()): ("Review",),
+        }
+        assert payload["completed_stages"] == {
+            str(first.resolve()): ["Done", "Queue"],
+            str(second.resolve()): ["Review"],
+        }
+
+
+@pytest.mark.parametrize("invalid", [["Done", "Done"], ["bad/name"], ["bad\\name"], [""]])
+def test_invalid_completed_stage_policy_fails_before_replacement(invalid):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(workspace)
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            with pytest.raises(state.CompletedStageError):
+                state.save_configuration_owned(
+                    workspace,
+                    paths=paths,
+                    completed_stage_names=invalid,
+                )
+            assert paths.config_file.read_bytes() == before
+
+
+def test_clearing_completed_stages_removes_only_the_active_root():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            state.save_configuration_owned(
+                first, paths=paths, completed_stage_names=["Done"]
+            )
+            state.save_configuration_owned(
+                second, paths=paths, completed_stage_names=["Archive"]
+            )
+            cleared = state.save_configuration_owned(
+                first, paths=paths, completed_stage_names=[]
+            )
+
+        assert cleared.completed_stages == {str(second.resolve()): ("Archive",)}
+        assert state.load_configuration(paths).completed_stage_names == ()
+
+
 def test_runtime_setup_preserves_saved_stage_orders_when_reapplying_existing_configuration():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)

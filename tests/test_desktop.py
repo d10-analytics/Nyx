@@ -1701,9 +1701,14 @@ def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order
                 status, first_settings = request_settings()
                 assert status == 200
                 assert first_settings["order"] == []
+                assert first_settings["completed"] == []
                 first_saved_status, first_saved = request_settings(
                     "PUT",
-                    {"revision": first_settings["revision"], "order": ["Done", "Queue"]},
+                    {
+                        "revision": first_settings["revision"],
+                        "order": ["Done", "Queue"],
+                        "completed": ["Done"],
+                    },
                 )
                 assert first_saved_status == 200
                 assert first_saved["outcome"] == "success"
@@ -1712,9 +1717,14 @@ def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order
                 status, second_settings = request_settings()
                 assert status == 200
                 assert second_settings["order"] == []
+                assert second_settings["completed"] == []
                 second_saved_status, second_saved = request_settings(
                     "PUT",
-                    {"revision": second_settings["revision"], "order": ["Archive"]},
+                    {
+                        "revision": second_settings["revision"],
+                        "order": ["Archive"],
+                        "completed": ["Archive"],
+                    },
                 )
                 assert second_saved_status == 200
                 assert second_saved["outcome"] == "success"
@@ -1723,6 +1733,7 @@ def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order
                 status, restored = request_settings()
                 assert status == 200
                 assert restored["order"] == ["Done", "Queue"]
+                assert restored["completed"] == ["Done"]
             finally:
                 session.close()
 
