@@ -35,8 +35,10 @@ class _Stdout:
         self.buffer = _Buffer()
 
 
-def test_worker_main_loads_once_and_transports_configuration_by_identity() -> None:
-    root = Path("/sentinel/specification-root")
+def test_worker_main_loads_once_and_transports_configuration_by_identity(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "specification-root").resolve()
     hidden_stages = tuple(["Done", "In_Progress"])
     configuration = state.Configuration(
         root,

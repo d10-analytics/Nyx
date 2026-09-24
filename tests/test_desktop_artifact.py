@@ -125,20 +125,31 @@ def _write_configuration(
     workspace: Path,
     *,
     hidden_stages: tuple[str, ...] = _DELIVERED_HIDDEN_STAGES,
-) -> Path:
+) -> tuple[Path, state.Configuration]:
+    configuration = state.Configuration(workspace.resolve(), hidden_stages)
     config_directory = home / ".nyx" / "config"
     config_directory.mkdir(parents=True, exist_ok=True)
     config_file = config_directory / "config.json"
-    payload = {
-        "schema_version": state.CONFIG_SCHEMA_VERSION,
-        "hidden_stages": list(hidden_stages),
-        "specification_root": str(workspace.resolve()),
-    }
     encoded = (
-        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        json.dumps(
+            configuration.as_dict(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
     ).encode("utf-8")
     config_file.write_bytes(encoded)
-    return config_file
+    return config_file, configuration
+
+
+def _expected_catalog(configuration: state.Configuration) -> str:
+    return scan_catalog(
+        configuration.specification_root,
+        hidden_stages=configuration.hidden_stages,
+        completed_stage_names=configuration.completed_stage_names,
+        configuration_revision=configuration.revision,
+    )
 
 
 def _write_raw_configuration(home: Path, payload: bytes) -> Path:
@@ -302,10 +313,8 @@ def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
         environment = _sanitized_environment(home, decoy)
         environment["PATH"] = os.pathsep.join([str(decoy_bin), environment["PATH"]])
         with _workspace(root) as workspace:
-            _write_configuration(home, workspace)
-            expected = json.loads(
-                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-            )
+            _, configuration = _write_configuration(home, workspace)
+            expected = json.loads(_expected_catalog(configuration))
             with _running_gui(artifact, root, environment) as gui:
                 status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
                 assert status == 200
@@ -324,10 +333,8 @@ def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: Ar
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            _write_configuration(home, workspace)
-            expected = json.loads(
-                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-            )
+            _, configuration = _write_configuration(home, workspace)
+            expected = json.loads(_expected_catalog(configuration))
             environment = _sanitized_environment(home, decoy)
             with _running_gui(artifact, root, environment) as gui:
                 status, body, content_type = _wait_for_board(
@@ -378,7 +385,7 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            config_file = _write_configuration(home, workspace)
+            config_file, _ = _write_configuration(home, workspace)
             environment = _sanitized_environment(home, decoy)
             lease_path, recovery_path = _claim_paths(home)
             with _running_gui(artifact, root, environment) as gui:
@@ -474,11 +481,9 @@ def test_delivered_recovery_blocks_start_until_former_workers_exit(
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            config_file = _write_configuration(home, workspace)
+            config_file, configuration = _write_configuration(home, workspace)
             before = config_file.read_bytes()
-            expected = json.loads(
-                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-            )
+            expected = json.loads(_expected_catalog(configuration))
             environment = _sanitized_environment(home, decoy)
             lease_path, recovery_path = _claim_paths(home)
             recovery_path.parent.mkdir(parents=True, exist_ok=True)
@@ -520,7 +525,7 @@ def test_delivered_unverified_committed_state_revalidates_then_starts(
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            valid = _write_configuration(home, workspace)
+            valid, configuration = _write_configuration(home, workspace)
             committed = root / "committed.json"
             committed.write_bytes(valid.read_bytes())
             valid.unlink()
@@ -540,9 +545,7 @@ def test_delivered_unverified_committed_state_revalidates_then_starts(
             # Only a safely revalidated record admits a start.
             valid.unlink()
             valid.write_bytes(before)
-            expected = json.loads(
-                scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-            )
+            expected = json.loads(_expected_catalog(configuration))
             with _running_gui(artifact, root, environment) as gui:
                 status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
                 assert status == 200
@@ -562,15 +565,9 @@ def test_delivered_restart_serves_the_newly_saved_workspace(artifact: ArtifactLa
         shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", first)
         shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", second)
         shutil.rmtree(second / "Trail_API")
-        expected_first = json.loads(
-            scan_catalog(first, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
-        expected_second = json.loads(
-            scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
-        assert expected_first != expected_second
         environment = _sanitized_environment(home, decoy)
-        _write_configuration(home, first)
+        _, first_configuration = _write_configuration(home, first)
+        expected_first = json.loads(_expected_catalog(first_configuration))
         with _running_gui(artifact, root, environment) as gui:
             _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert json.loads(body) == expected_first
@@ -579,7 +576,9 @@ def test_delivered_restart_serves_the_newly_saved_workspace(artifact: ArtifactLa
         _wait_port_free(time.monotonic() + 15)
         # The replacement selection is saved only through the canonical owner
         # and the next start serves that workspace's real catalog.
-        _write_configuration(home, second)
+        _, second_configuration = _write_configuration(home, second)
+        expected_second = json.loads(_expected_catalog(second_configuration))
+        assert expected_first != expected_second
         with _running_gui(artifact, root, environment) as gui:
             _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert json.loads(body) == expected_second
@@ -614,8 +613,8 @@ def test_delivered_worker_helper_emits_exact_utf8_catalog_bytes(artifact: Artifa
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            _write_configuration(home, workspace)
-            expected_text = scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            _, configuration = _write_configuration(home, workspace)
+            expected_text = _expected_catalog(configuration)
             completed = subprocess.run(
                 [str(artifact.helper)],
                 cwd=str(root),
@@ -669,8 +668,8 @@ def test_delivered_worker_helper_completes_with_inherited_claims(artifact: Artif
         home.mkdir()
         decoy = _inert_path(root)
         with _workspace(root) as workspace:
-            _write_configuration(home, workspace)
-            expected_text = scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
+            _, configuration = _write_configuration(home, workspace)
+            expected_text = _expected_catalog(configuration)
             environment = _sanitized_environment(home, decoy)
             _, recovery_path = _claim_paths(home)
             recovery_path.parent.mkdir(parents=True, exist_ok=True)
