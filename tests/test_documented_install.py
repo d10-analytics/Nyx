@@ -121,6 +121,46 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "never renames or moves",
     ),
 }
+COMPLETION_GUIDANCE_MARKERS = {
+    "README.md": (
+        "Completion Prerequisite: UUID",
+        "literal set of stage names",
+        "Board settings",
+        "workspace root",
+        "evidence verification",
+        "Prerequisite: UUID | claim-name",
+    ),
+    "docs/running-nyx.md": (
+        "collapsed **Board settings**",
+        "Counts as finished",
+        "**Save** to persist the row order and completion policy together",
+        "**Cancel** drops both kinds of unsaved change",
+        "**Reset** clears the current root's row order and completed-stage set",
+        "hidden stages",
+        "Reload board settings",
+        "configuration revision",
+        "moving it out reopens it",
+        "recorded workflow assertion",
+    ),
+    "docs/workspaces.md": (
+        "no implicit `Done` or `Archive` rule",
+        "Completion Prerequisite: UUID",
+        "missing policy leaves the requirement **unknown**",
+        "saved per canonical workspace root",
+        "root with no saved names reports unknown",
+        "A cancelled or archived item",
+        "hidden completed stage",
+        "mixed dependent item",
+    ),
+    "docs/specification-reference.md": (
+        "one exact completion grammar",
+        "one-part `Prerequisite: UUID` is not",
+        "never uses a magic claim name",
+        "collapsed **Board settings**",
+        "temporarily absent names",
+        "recorded workflow assertion",
+    ),
+}
 _START_TIMEOUT = 90.0
 
 
@@ -182,6 +222,13 @@ def test_documents_publish_the_saved_stage_order_contract():
         "canonical inventory order and keeps the last saved order unchanged."
     )
     assert obsolete_fallback not in normalized_documents["docs/workspaces.md"]
+
+
+def test_documents_publish_the_explicit_completion_contract():
+    for name, markers in COMPLETION_GUIDANCE_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert marker in document, (name, marker)
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):

@@ -117,7 +117,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     }
     assert delivery["relationship"]["program"] == plan["relationship"]["program"]
     assert plan["relationship"]["direct_prerequisite_state"] == "satisfied"
-    assert delivery["relationship"]["direct_prerequisite_state"] == "unsatisfied"
+    assert delivery["relationship"]["direct_prerequisite_state"] == "unknown"
     assert plan["relationship"]["prerequisites"] == [
         {
             "kind": "claim",
@@ -138,7 +138,14 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "observed_evidence_ref": None,
             "resolved_state": "unsatisfied",
             "reason": "claim_unsatisfied",
-        }
+        },
+        {
+            "kind": "completion",
+            "target_package_id": PREREQUISITE_ID,
+            "observed_stage": "Done",
+            "resolved_state": "unknown",
+            "reason": "completion_policy_needed",
+        },
     ]
     verify = _entry_by_path(value, "Trail_Web/Testing/verify")
     assert verify["relationship"]["program"] == plan["relationship"]["program"]
@@ -185,3 +192,41 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     legacy["catalog_digest"] = canonical_digest(legacy)
     with pytest.raises(ValueError):
         parse_catalog(legacy)
+
+
+@pytest.mark.parametrize(
+    ("completed_stage_names", "completion_state", "completion_reason", "direct_state"),
+    [
+        (None, "unknown", "completion_policy_needed", "unknown"),
+        (("Done",), "satisfied", "completion_satisfied", "unsatisfied"),
+    ],
+    ids=["without-completion-policy", "with-done-completion-policy"],
+)
+def test_sample_mixed_relationships_follow_explicit_completion_policy(
+    completed_stage_names, completion_state, completion_reason, direct_state
+) -> None:
+    kwargs = {}
+    if completed_stage_names is not None:
+        kwargs["completed_stage_names"] = completed_stage_names
+    value = json.loads(catalog.build_catalog(SAMPLE_ROOT, **kwargs))
+    delivery = _entry_by_path(value, "Trail_Web/Queue/delivery")
+
+    assert delivery["relationship"]["direct_prerequisite_state"] == direct_state
+    assert delivery["relationship"]["prerequisites"] == [
+        {
+            "kind": "claim",
+            "target_package_id": PREREQUISITE_ID,
+            "claim_name": "implementation-ready",
+            "observed_state": "unsatisfied",
+            "observed_evidence_ref": None,
+            "resolved_state": "unsatisfied",
+            "reason": "claim_unsatisfied",
+        },
+        {
+            "kind": "completion",
+            "target_package_id": PREREQUISITE_ID,
+            "observed_stage": "Done",
+            "resolved_state": completion_state,
+            "reason": completion_reason,
+        },
+    ]
