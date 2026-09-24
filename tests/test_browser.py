@@ -684,6 +684,9 @@ def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_s
 
     page_a.get_by_role("checkbox", name="Counts as finished: Under Development").check()
     page_a.get_by_role("button", name="Save").click()
+    page_b.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+    page_b.get_by_role("button", name="Save").click()
+    page_b.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     page_b.get_by_role("button", name="Reload board settings").click()
     page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
@@ -695,6 +698,10 @@ def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_s
 
     page_b.get_by_text("Board row order saved.", exact=True).wait_for()
     page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page_a.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % GATE
+    )
     assert page_a.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
         "Dependencies satisfied"
     )
@@ -769,6 +776,10 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
     page.get_by_text("Board row order saved.", exact=True).wait_for()
 
     gate = page.locator(f'.card[data-package-id="{GATE}"]')
+    page.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % GATE
+    )
     assert gate.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert "blocks:" in step_two.locator(".card-links").inner_text()
@@ -790,8 +801,8 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     source = page.locator(f'.card[data-package-id="{source_id}"]')
     target = page.locator(f'.card[data-package-id="{target_id}"]')
     assert source.locator(".dependency-indicator").inner_text() == "Dependencies unknown"
-    assert "needs: target" in source.inner_text()
-    assert "blocks: dependent" in target.inner_text()
+    assert "needs: Target Alpha" in source.inner_text()
+    assert "blocks: Dependent Beta" in target.inner_text()
     assert connection_pairs(page) == {(target_id, source_id)}
 
     source.click()
@@ -811,6 +822,10 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % source_id
+    )
     assert source.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
     assert page.locator("#details .prerequisite-completion .completion-reason").inner_text() == (
         "Reason: completion_satisfied"
@@ -829,7 +844,7 @@ def test_real_producer_hidden_completion_target_keeps_context_without_card_or_ra
     assert connection_pairs(page) == set()
     page.locator(f'.card[data-package-id="{source_id}"]').click()
     page.locator("#details .dependencies summary").click()
-    assert page.locator("#details .prerequisite-target").all_inner_texts() == ["target", "target"]
+    assert page.locator("#details .prerequisite-target").all_inner_texts() == ["Target", "Target"]
     assert page.locator("#details .prerequisite-completion .observed-stage").inner_text() == (
         "Observed stage: Done"
     )
@@ -978,6 +993,7 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         client = BlockingRawSequenceClient([valid, invalid], blocked_call=2)
         page = open_page(client)
+        page.get_by_role("button", name="Refresh view").click()
         assert client.started.wait(timeout=5)
         assert page.locator("#board .card").count() == 4
         assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
@@ -1368,6 +1384,10 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+    page.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Under Development', 'Queue'])"
+    )
     assert row_labels(page) == ["Under Development", "Queue"]
 
     page2 = open_page(StaticClient(board_payload()), settings=settings)
@@ -1429,7 +1449,7 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
 
     reload.click()
     stale_page.get_by_text("Current board row order loaded.", exact=True).wait_for()
-    assert settings.get_calls == 3
+    assert settings.get_calls == 4
     assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
     stale_page.get_by_role("button", name="Move Under Development up").click()
     stale_page.get_by_role("button", name="Save").click()
@@ -1454,6 +1474,10 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     winning_page.get_by_role("button", name="Save").click()
     winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
+    winning_page.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Under Development', 'Queue'])"
+    )
     assert row_labels(winning_page) == ["Under Development", "Queue"]
 
     stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
@@ -1504,6 +1528,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     page.fill("#filter", "dependent")
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    page.get_by_role("button", name="Refresh view").click()
     page.wait_for_selector("#refresh.pending", timeout=15000)
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     playwright.expect(
@@ -1516,8 +1541,10 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
-    assert page.locator("#refresh").inner_text() == "Apply update"
-    page.get_by_role("button", name="Apply update").click()
+    page.wait_for_function(
+        "() => document.querySelector('#board')?.textContent.includes('Pending foundation')"
+    )
+    assert page.locator("#refresh").inner_text() == "Refresh view"
     page.locator("#board").get_by_text(
         "Pending foundation", exact=True
     ).wait_for(state="attached")
@@ -2814,6 +2841,8 @@ def _malformed_browser_inventory(case):
     value = json.loads(lifecycle_payload())
     if case == "schema-3":
         value["schema_version"] = 3
+        value["catalog_digest"] = canonical_digest(value)
+        return value
     elif case == "unknown-inventory-key":
         value["inventory"]["extra"] = []
     elif case == "projects-type":
@@ -2876,6 +2905,7 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_role("button", name="Refresh view").click()
         page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
