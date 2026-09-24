@@ -9,7 +9,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import threading
 from importlib import import_module
 from pathlib import Path
 
@@ -102,7 +101,8 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     entries = value["entries"]
-    assert value["schema_version"] == 4
+    assert value["schema_version"] == 5
+    assert value["configuration_revision"] is not None
     assert value["inventory"] == {
         "projects": [{"name": "Fictional", "availability": "complete"}],
         "stages": [
@@ -123,6 +123,7 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
     prerequisite = queue["relationship"]["prerequisites"][0]
     assert prerequisite == {
+        "kind": "claim",
         "claim_name": "release",
         "observed_evidence_ref": "sha256:" + "a" * 64,
         "observed_state": "satisfied",
@@ -134,13 +135,13 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     assert done["declared"]["title"] == "Done package"
 
 
-@pytest.mark.parametrize("case", ["schema-3", "duplicate-project"])
+@pytest.mark.parametrize("case", ["schema-3", "schema-4", "malformed-revision", "duplicate-project"])
 def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: str) -> None:
     from nyx.models import canonical_digest
-    from nyx.server import create_server
 
     value = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
             "stages": [],
@@ -156,31 +157,50 @@ def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: st
         "entries": [],
         "programs": [],
     }
-    if case == "schema-3":
-        value["schema_version"] = 3
+    if case in {"schema-3", "schema-4"}:
+        value["schema_version"] = 3 if case == "schema-3" else 4
+    elif case == "malformed-revision":
+        value["configuration_revision"] = []
     else:
         value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
     value["catalog_digest"] = canonical_digest(value)
 
-    service = create_server(lambda: value, port=0)
-    thread = threading.Thread(target=service.serve_forever)
-    thread.start()
-    try:
-        connection = http.client.HTTPConnection("127.0.0.1", service.server_port, timeout=5)
-        connection.request(
-            "GET",
-            "/api/catalog",
-            headers={"Host": f"127.0.0.1:{service.server_port}"},
-        )
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        assert response.status == 502
-        assert json.loads(body) == {"error": "producer_protocol_error"}
-    finally:
-        service.shutdown()
-        thread.join(timeout=5)
-        service.server_close()
+    probe = subprocess.run(
+        [str(VERIFY_ROOT / "venv" / "bin" / "python"), "-c", """
+import http.client
+import json
+import sys
+import threading
+from nyx.server import create_server
+
+value = json.load(sys.stdin)
+service = create_server(lambda: value, port=0)
+thread = threading.Thread(target=service.serve_forever)
+thread.start()
+try:
+    connection = http.client.HTTPConnection("127.0.0.1", service.server_port, timeout=5)
+    connection.request("GET", "/api/catalog", headers={"Host": f"127.0.0.1:{service.server_port}"})
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    print(json.dumps({"status": response.status, "body": json.loads(body)}))
+finally:
+    service.shutdown()
+    thread.join(timeout=5)
+    service.server_close()
+"""],
+        cwd=EXERCISE,
+        input=json.dumps(value),
+        capture_output=True,
+        text=True,
+        check=True,
+        env={key: item for key, item in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}},
+    )
+    result = json.loads(probe.stdout)
+    assert result == {
+        "status": 502,
+        "body": {"error": "producer_protocol_error"},
+    }
 
 
 def _assert_hidden_browser(url: str) -> None:

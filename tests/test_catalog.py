@@ -26,9 +26,13 @@ COMPLETE_ORACLE_BYTES = '{"catalog_digest":"f1040b4367b54ea507ff91e667a8ca623780
 
 
 def _migrate_oracle(legacy: str) -> str:
-    """Keep the historical graph assertions exact while adding the v4 inventory."""
+    """Keep the historical graph assertions exact while adding the v5 fields."""
     value = json.loads(legacy)
-    value["schema_version"] = 4
+    value["schema_version"] = 5
+    value["configuration_revision"] = None
+    for entry in value["entries"]:
+        for edge in entry["relationship"]["prerequisites"]:
+            edge["kind"] = "claim"
     projects = sorted({entry["project"] for entry in value["entries"]})
     stages = sorted({(entry["project"], entry["stage"]) for entry in value["entries"]})
     if len(value["entries"]) >= 5 and projects == ["Fictional"]:
@@ -286,7 +290,7 @@ class CatalogTests(TestCase):
             value = json.loads(first)
             self.assertEqual(["Fictional/Queue/zeta", "Fictional/Under_Development/alpha"],
                              [entry["package_path"] for entry in value["entries"]])
-            self.assertEqual(4, value["schema_version"])
+            self.assertEqual(5, value["schema_version"])
             self.assertEqual(
                 {"projects": [{"name": "Fictional", "availability": "complete"}],
                  "stages": [
@@ -596,6 +600,7 @@ class CatalogTests(TestCase):
 
         mutations = (
             lambda value: value.update(schema_version=3),
+            lambda value: value.update(schema_version=4),
             lambda value: value["inventory"].update(extra=[]),
             lambda value: value["inventory"].update(projects={}),
             lambda value: value["inventory"]["projects"].append(value["inventory"]["projects"][0]),
@@ -756,11 +761,11 @@ class CatalogTests(TestCase):
             signature = inspect.signature(producer)
             rendered = str(signature).replace(str(catalog._OMITTED), "<omitted>")
             self.assertEqual(
-                "(spec_root: 'Path', *, hidden_stages: 'Iterable[str] | object' = <omitted>) -> 'str'",
+                "(spec_root: 'Path', *, hidden_stages: 'Iterable[str] | object' = <omitted>, completed_stage_names: 'Iterable[str] | None' = None, configuration_revision: 'str | None' = None) -> 'str'",
                 rendered,
             )
             self.assertEqual(
-                ["spec_root", "hidden_stages"], list(signature.parameters)
+                ["spec_root", "hidden_stages", "completed_stage_names", "configuration_revision"], list(signature.parameters)
             )
             self.assertEqual(
                 inspect.Parameter.KEYWORD_ONLY,
@@ -868,7 +873,7 @@ class CatalogTests(TestCase):
                     self.assertEqual(16, scans.call_count)
                     renders.append(rendered)
                     value = json.loads(rendered)
-                    self.assertEqual(4, value["schema_version"])
+                    self.assertEqual(5, value["schema_version"])
                     self.assertEqual(4, value["visibility"]["visible_entry_count"])
                     self.assertEqual(3, value["visibility"]["hidden_entry_count"])
                     digest_input = dict(value)
@@ -1014,6 +1019,107 @@ class CatalogTests(TestCase):
                 value["catalog_digest"],
             )
 
+    def test_completion_edges_follow_literal_policy_and_folder_moves(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_id = "11111111-1111-4111-8111-111111111111"
+            target_id = "22222222-2222-4222-8222-222222222222"
+            package(
+                root,
+                "Queue",
+                "source",
+                f"# Source\nPackage ID: {source_id}\n"
+                f"Completion Prerequisite: {target_id}\n"
+                f"Claim: release | unsatisfied\n",
+            )
+            target = package(
+                root,
+                "Ready",
+                "target",
+                f"# Target\nPackage ID: {target_id}\n"
+                f"Claim: release | satisfied | sha256:{'a' * 64}\n",
+            )
+
+            def source_entry():
+                value = json.loads(
+                    catalog.scan_catalog(
+                        root,
+                        completed_stage_names=["Done"],
+                        configuration_revision="revision-1",
+                    )
+                )
+                return value, next(
+                    entry for entry in value["entries"] if entry["package_id"] == source_id
+                )
+
+            value, source_entry_value = source_entry()
+            edge = source_entry_value["relationship"]["prerequisites"][0]
+            self.assertEqual(5, value["schema_version"])
+            self.assertEqual("revision-1", value["configuration_revision"])
+            self.assertEqual(
+                {
+                    "kind": "completion",
+                    "target_package_id": target_id,
+                    "observed_stage": "Ready",
+                    "resolved_state": "unsatisfied",
+                    "reason": "completion_unsatisfied",
+                },
+                edge,
+            )
+            self.assertEqual("unsatisfied", source_entry_value["relationship"]["direct_prerequisite_state"])
+
+            (root / "Fictional" / "Done").mkdir()
+            target.rename(root / "Fictional" / "Done" / "target")
+            value, source_entry_value = source_entry()
+            edge = source_entry_value["relationship"]["prerequisites"][0]
+            self.assertEqual("Done", edge["observed_stage"])
+            self.assertEqual("satisfied", edge["resolved_state"])
+            self.assertEqual("completion_satisfied", edge["reason"])
+            self.assertEqual("satisfied", source_entry_value["relationship"]["direct_prerequisite_state"])
+            self.assertEqual("release", next(iter(source_entry_value["relationship"]["claims"]))["name"])
+
+            (root / "Fictional" / "Done" / "target").rename(target)
+            _, source_entry_value = source_entry()
+            edge = source_entry_value["relationship"]["prerequisites"][0]
+            self.assertEqual("Ready", edge["observed_stage"])
+            self.assertEqual("unsatisfied", edge["resolved_state"])
+
+    def test_completion_policy_and_typed_schema_are_strict_and_safe(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target_id = "22222222-2222-4222-8222-222222222222"
+            source_id = "11111111-1111-4111-8111-111111111111"
+            package(
+                root,
+                "Queue",
+                "source",
+                f"# Source\nPackage ID: {source_id}\nCompletion Prerequisite: {target_id}\n",
+            )
+            package(root, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
+            missing_policy = json.loads(catalog.scan_catalog(root))
+            missing_edge = missing_policy["entries"][-1]["relationship"]["prerequisites"][0]
+            self.assertEqual("completion_policy_needed", missing_edge["reason"])
+            self.assertEqual("unknown", missing_edge["resolved_state"])
+            invalid_policy = json.loads(
+                catalog.scan_catalog(root, completed_stage_names=["Done", "Done"])
+            )
+            invalid_edge = invalid_policy["entries"][-1]["relationship"]["prerequisites"][0]
+            self.assertEqual("completion_policy_invalid", invalid_edge["reason"])
+            self.assertEqual("unknown", invalid_edge["resolved_state"])
+
+            parsed = parse_catalog(missing_policy)
+            self.assertIsNone(parsed.configuration_revision)
+            schema_four = dict(missing_policy, schema_version=4)
+            schema_four["catalog_digest"] = canonical_digest(schema_four)
+            with self.assertRaises(ValueError):
+                parse_catalog(schema_four)
+            malformed = json.loads(catalog.scan_catalog(root, completed_stage_names=["Done"]))
+            typed_edge = malformed["entries"][-1]["relationship"]["prerequisites"][0]
+            typed_edge["kind"] = "claim"
+            malformed["catalog_digest"] = canonical_digest(malformed)
+            with self.assertRaises(ValueError):
+                parse_catalog(malformed)
+
 ORACLE_IDS = [
     "11111111-1111-4111-8111-111111111111",
     "22222222-2222-4222-8222-222222222222",
@@ -1062,9 +1168,9 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         root = make_baseline_graph(Path(temporary))
         rendered = catalog.build_catalog(root)
         value = json.loads(rendered)
-        assert value["schema_version"] == 4
+        assert value["schema_version"] == 5
         assert set(value) == {
-            "schema_version", "catalog_digest", "visibility", "identity_coverage",
+            "schema_version", "catalog_digest", "configuration_revision", "visibility", "identity_coverage",
             "program_coverage", "discovery_diagnostics", "entries", "programs", "inventory",
         }
         assert value["inventory"] == {

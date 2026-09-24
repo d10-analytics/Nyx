@@ -332,7 +332,8 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     from nyx.server import create_server
 
                     baseline = {
-                        "schema_version": 4,
+                        "schema_version": 5,
+                        "configuration_revision": None,
                         "inventory": {
                             "projects": [{"name": "Fictional", "availability": "complete"}],
                             "stages": [],
@@ -353,6 +354,10 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     legacy["schema_version"] = 3
                     legacy["catalog_digest"] = canonical_digest(legacy)
                     malformed.append(legacy)
+                    schema_four = json.loads(json.dumps(baseline))
+                    schema_four["schema_version"] = 4
+                    schema_four["catalog_digest"] = canonical_digest(schema_four)
+                    malformed.append(schema_four)
                     duplicate = json.loads(json.dumps(baseline))
                     duplicate["inventory"]["projects"].append(
                         dict(duplicate["inventory"]["projects"][0])
@@ -439,7 +444,8 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 4,
+                    "schema_version": 5,
+                    "configuration_revision": None,
                     "inventory": {
                         "projects": [{"name": "Fictional", "availability": "complete"}],
                         "stages": [

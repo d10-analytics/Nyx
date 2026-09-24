@@ -35,12 +35,18 @@ class _Stdout:
         self.buffer = _Buffer()
 
 
-def test_worker_main_loads_once_and_transports_configuration_by_identity() -> None:
-    root = Path("/sentinel/specification-root")
+def test_worker_main_loads_once_and_transports_configuration_by_identity(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "specification-root").resolve()
     hidden_stages = tuple(["Done", "In_Progress"])
-    configuration = state.Configuration(root, hidden_stages)
+    configuration = state.Configuration(
+        root,
+        hidden_stages,
+        completed_stages={str(root): ("Done",)},
+    )
     load_count = 0
-    scanner_arguments: list[tuple[object, object]] = []
+    scanner_arguments: list[tuple[object, object, object, object]] = []
     stdout = _Stdout()
 
     def load_configuration() -> state.Configuration:
@@ -48,8 +54,16 @@ def test_worker_main_loads_once_and_transports_configuration_by_identity() -> No
         load_count += 1
         return configuration
 
-    def scan_catalog(received_root: object, *, hidden_stages: object) -> str:
-        scanner_arguments.append((received_root, hidden_stages))
+    def scan_catalog(
+        received_root: object,
+        *,
+        hidden_stages: object,
+        completed_stage_names: object,
+        configuration_revision: object,
+    ) -> str:
+        scanner_arguments.append(
+            (received_root, hidden_stages, completed_stage_names, configuration_revision)
+        )
         return "catalog ✓"
 
     with (
@@ -61,9 +75,11 @@ def test_worker_main_loads_once_and_transports_configuration_by_identity() -> No
 
     assert load_count == 1
     assert len(scanner_arguments) == 1
-    received_root, received_hidden_stages = scanner_arguments[0]
+    received_root, received_hidden_stages, received_completed, received_revision = scanner_arguments[0]
     assert received_root is root
     assert received_hidden_stages is hidden_stages
+    assert received_completed is configuration.completed_stage_names
+    assert received_revision == configuration.revision
     assert stdout.buffer.writes == ["catalog ✓".encode("utf-8")]
     assert stdout.buffer.flush_count == 1
 
@@ -188,7 +204,7 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
             )
             try:
                 catalog = json.loads(manager.fetch_catalog())
-                assert catalog["schema_version"] == 4
+                assert catalog["schema_version"] == 5
                 assert manager.close(time.monotonic() + 2)
                 assert manager.active_count == 0
                 assert claim.held
@@ -197,6 +213,45 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
                 os.close(write_fd)
                 os.close(read_fd)
                 claim.close()
+
+
+def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() -> None:
+    with TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        home.mkdir()
+        workspace = base / "workspace"
+        source = workspace / "Fictional" / "Queue" / "source"
+        target = workspace / "Fictional" / "Done" / "target"
+        target.mkdir(parents=True)
+        source.mkdir(parents=True)
+        source.joinpath("spec.md").write_text(
+            "# Source\nPackage ID: 11111111-1111-4111-8111-111111111111\n"
+            "Completion Prerequisite: 22222222-2222-4222-8222-222222222222\n",
+            encoding="utf-8",
+        )
+        target.joinpath("spec.md").write_text(
+            "# Target\nPackage ID: 22222222-2222-4222-8222-222222222222\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            state.setup(workspace)
+            paths = state.state_paths()
+            saved = state.save_configuration_owned(
+                workspace,
+                paths=paths,
+                completed_stage_names=["Done"],
+            )
+            stdout = _Stdout()
+            with patch.object(worker.sys, "stdout", stdout):
+                assert worker._worker_main() == 0
+        payload = json.loads(stdout.buffer.writes[0])
+        assert payload["schema_version"] == 5
+        assert payload["configuration_revision"] == saved.revision
+        source_entry = next(
+            item for item in payload["entries"] if item["package_id"] == "11111111-1111-4111-8111-111111111111"
+        )
+        assert source_entry["relationship"]["prerequisites"][0]["reason"] == "completion_satisfied"
 
 
 def test_partial_inherited_worker_objects_are_rejected_without_loading_config() -> None:

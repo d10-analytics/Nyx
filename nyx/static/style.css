@@ -85,13 +85,16 @@ h1 { margin-bottom: .25rem; font-size: 1.5rem; }
   background: var(--surface);
   color: var(--heading);
 }
-.stage-order-editor h2 { margin: 0; font-size: 1rem; }
+.stage-order-editor summary { cursor: pointer; font-weight: 700; }
+.stage-order-content { margin-top: .55rem; }
 .stage-order-editor p { margin: .2rem 0 .55rem; color: var(--muted); font-size: .85rem; }
 .stage-order-list { display: grid; gap: .35rem; margin: 0; padding-left: 1.5rem; }
 .stage-order-item { display: flex; align-items: center; gap: .35rem; min-width: 0; }
 .stage-order-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .stage-order-name code { color: var(--muted); font-size: .78rem; }
 .stage-order-dormant { display: block; color: var(--muted); font-size: .75rem; }
+.stage-completed { display: inline-flex; align-items: center; gap: .25rem; white-space: nowrap; font-size: .82rem; }
+.stage-completed input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
 .stage-order-move { padding: .25rem .45rem; font-size: .82rem; }
 .stage-order-actions { display: flex; gap: .4rem; margin-top: .65rem; }
 .stage-order-status { min-height: 1.25em; }
@@ -259,4 +262,5 @@ button.pending {
   .stage-order-editor { min-width: 0; }
   .stage-order-item { align-items: stretch; flex-wrap: wrap; }
   .stage-order-name { flex-basis: 100%; }
+  .stage-completed { margin-left: 0; }
 }

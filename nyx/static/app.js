@@ -22,6 +22,20 @@
     "target_unreadable", "target_changed_during_read", "target_invalid_identity",
     "invalid_prerequisite", "self_edge",
   ]);
+  const CLAIM_EDGE_REASONS = new Set([
+    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
+    "invalid_claim", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable",
+    "target_changed_during_read", "target_invalid_identity", "self_edge",
+    "invalid_prerequisite",
+  ]);
+  const COMPLETION_EDGE_REASONS = new Set([
+    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
+    "completion_policy_invalid", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable",
+    "target_changed_during_read", "target_invalid_identity", "self_edge",
+    "invalid_prerequisite",
+  ]);
   // These fields remain part of the wire contract and searchable index. They
   // are intentionally not all ordinary visible details.
   const DECLARED_FIELDS = [
@@ -66,12 +80,15 @@
   let compactView = true;
   let refreshFailure = null;
   let savedStageOrder = [];
+  let savedCompletedStages = [];
   let editorStageOrder = [];
+  let editorCompletedStages = [];
   let settingsRevision = null;
   let settingsAvailable = false;
   let settingsReloadAvailable = false;
   let settingsBusy = false;
   let settingsRequestSerial = 0;
+  let queuedSettingsRefresh = null;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -231,6 +248,18 @@
     return names;
   }
 
+  function inventoryStageNames(snapshot = displayed) {
+    if (!snapshot) return [];
+    const names = [];
+    const seen = new Set();
+    (snapshot.inventory.stages || []).forEach((record) => {
+      if (seen.has(record.stage)) return;
+      seen.add(record.stage);
+      names.push(record.stage);
+    });
+    return names;
+  }
+
   function projectedStageNames(snapshot = displayed) {
     const eligible = canonicalStageNames(snapshot);
     const available = new Set(eligible);
@@ -252,7 +281,7 @@
   function editorNames(snapshot = displayed) {
     const result = [];
     const seen = new Set();
-    [...savedStageOrder, ...canonicalStageNames(snapshot)].forEach((stage) => {
+    [...savedStageOrder, ...savedCompletedStages, ...inventoryStageNames(snapshot)].forEach((stage) => {
       if (seen.has(stage)) return;
       seen.add(stage);
       result.push(stage);
@@ -261,7 +290,9 @@
   }
 
   function hasUnsavedStageOrder() {
-    return JSON.stringify(editorStageOrder) !== JSON.stringify(editorNames());
+    return JSON.stringify(editorStageOrder) !== JSON.stringify(editorNames()) ||
+      JSON.stringify([...editorCompletedStages].sort(scalarCompare)) !==
+        JSON.stringify([...savedCompletedStages].sort(scalarCompare));
   }
 
   function renderStageOrderEditor({focusStage = null} = {}) {
@@ -274,10 +305,15 @@
     const controlsDisabled = !settingsAvailable || settingsBusy;
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
-      const dormant = canonicalStageNames().includes(stage) ? "" :
+      const dormant = inventoryStageNames().includes(stage) ? "" :
         '<span class="stage-order-dormant">(not currently available)</span>';
+      const completed = editorCompletedStages.includes(stage);
       return `<li class="stage-order-item" data-stage="${text(stage)}">` +
         `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
+        `<label class="stage-completed"><input type="checkbox" class="stage-completed-toggle" ` +
+        `aria-label="Counts as finished: ${text(label)}" data-stage="${text(stage)}"` +
+        `${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
+        `Counts as finished</label>` +
         `<button type="button" class="stage-order-move" data-stage-move="up" ` +
         `aria-label="Move ${text(label)} up"${controlsDisabled || index === 0 ? " disabled" : ""}>Move up</button>` +
         `<button type="button" class="stage-order-move" data-stage-move="down" ` +
@@ -709,14 +745,22 @@
     const programTitle = entry.relationship.program.title;
     const context = (targetProject ? `<dt>Target project</dt><dd>${text(targetProject)}</dd>` : "") +
       (programTitle ? `<dt>Program</dt><dd>${text(programTitle)}</dd>` : "");
-    // Claims remain distinct in the details view even when they share a target.
+    // Keep every relationship visible even when several edges share a target.
     const prerequisites = (entry.relationship.prerequisites || []).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
-      return '<li class="prerequisite-claim">' +
-        `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span> · ` +
-        `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
-        `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
-        `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
+      const targetHtml = `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span>`;
+      if (edge.kind === "claim") {
+        return '<li class="prerequisite-claim prerequisite-claim-kind">' +
+          `${targetHtml} · ` +
+          `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
+          `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
+          `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
+      }
+      return '<li class="prerequisite-claim prerequisite-completion">' +
+        `${targetHtml} · ` +
+        `<span class="completion-kind">Whole-item completion</span> · ` +
+        `<span class="observed-stage">Observed stage: ${text(edge.observed_stage)}</span> · ` +
+        `<span class="completion-reason">Reason: ${text(edge.reason)}</span></li>`;
     });
     const dependency = dependencyIndicator(entry);
     const dependencySummary = dependency ? dependency.label : "No direct prerequisites";
@@ -848,14 +892,24 @@
     protocol(value.claims.every((claim, index) => index === 0 || claim.name >= value.claims[index - 1].name));
     protocol(Array.isArray(value.prerequisites));
     value.prerequisites.forEach((edge) => {
-      protocol(exactKeys(edge, ["claim_name", "observed_evidence_ref", "observed_state",
-        "reason", "resolved_state", "target_package_id"]));
-      uuid(edge.target_package_id, true);
-      protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
-      protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
-      provenance(edge.observed_evidence_ref, true);
+      protocol(typeof edge.kind === "string");
+      if (edge.kind === "claim") {
+        protocol(exactKeys(edge, ["kind", "claim_name", "observed_evidence_ref", "observed_state",
+          "reason", "resolved_state", "target_package_id"]));
+        uuid(edge.target_package_id, true);
+        protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
+        protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
+        provenance(edge.observed_evidence_ref, true);
+        protocol(CLAIM_EDGE_REASONS.has(edge.reason));
+      } else if (edge.kind === "completion") {
+        protocol(exactKeys(edge, ["kind", "observed_stage", "reason", "resolved_state", "target_package_id"]));
+        uuid(edge.target_package_id, true);
+        protocol(edge.observed_stage === null || component(edge.observed_stage));
+        protocol(COMPLETION_EDGE_REASONS.has(edge.reason));
+      } else {
+        protocol(false);
+      }
       protocol(["satisfied", "unsatisfied", "unknown"].includes(edge.resolved_state));
-      protocol(typeof edge.reason === "string" && edge.reason.length > 0);
     });
     protocol(exactKeys(value.program, ["diagnostics", "program_id", "resolution", "title"]));
     uuid(value.program.program_id, true);
@@ -892,11 +946,12 @@
   }
 
   function validateSnapshot(snapshot) {
-    const top = ["catalog_digest", "discovery_diagnostics", "entries", "identity_coverage",
+    const top = ["catalog_digest", "configuration_revision", "discovery_diagnostics", "entries", "identity_coverage",
       "inventory", "program_coverage", "programs", "schema_version", "visibility"];
-    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 4 &&
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 5 &&
       /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
       Array.isArray(snapshot.programs));
+    protocol(snapshot.configuration_revision === null || safeText(snapshot.configuration_revision));
     protocol(exactKeys(snapshot.inventory, ["projects", "stages"]) &&
       Array.isArray(snapshot.inventory.projects) && Array.isArray(snapshot.inventory.stages));
     const inventoryProjects = new Set();
@@ -997,10 +1052,14 @@
 
   function parseSettings(payload, allowOutcome = false) {
     protocol(payload && typeof payload === "object" && !Array.isArray(payload));
-    const expected = allowOutcome ? ["order", "outcome", "revision"] : ["order", "revision"];
+    const expected = allowOutcome
+      ? ["completed", "order", "outcome", "revision"]
+      : ["completed", "order", "revision"];
     protocol(exactKeys(payload, expected));
     protocol(Array.isArray(payload.order) && payload.order.every((stage) => component(stage)));
     protocol(new Set(payload.order).size === payload.order.length);
+    protocol(Array.isArray(payload.completed) && payload.completed.every((stage) => component(stage)));
+    protocol(new Set(payload.completed).size === payload.completed.length);
     protocol((allowOutcome && payload.revision === null) ||
       (typeof payload.revision === "string" && payload.revision.length > 0));
     if (allowOutcome) {
@@ -1014,7 +1073,7 @@
     stageOrderStatus.classList.toggle("error", isError);
   }
 
-  function loadSettings() {
+  function loadSettings({refreshCatalog = false} = {}) {
     const serial = ++settingsRequestSerial;
     settingsBusy = true;
     settingsAvailable = false;
@@ -1042,11 +1101,14 @@
         settingsAvailable = true;
         settingsReloadAvailable = false;
         savedStageOrder = [...payload.order];
+        savedCompletedStages = [...payload.completed];
         settingsRevision = payload.revision;
         editorStageOrder = editorNames();
+        editorCompletedStages = [...savedCompletedStages];
         settingsStatus("Current board row order loaded.");
         renderStageOrderEditor();
         if (displayed) renderBoard();
+        if (refreshCatalog) request("manual");
       })
       .catch((error) => {
         if (serial !== settingsRequestSerial) return;
@@ -1062,7 +1124,7 @@
       });
   }
 
-  function saveStageOrder(order) {
+  function saveStageOrder(order, completed) {
     if (!settingsAvailable || !settingsRevision || settingsBusy) return;
     settingsBusy = true;
     settingsStatus("Saving board row order…");
@@ -1071,7 +1133,7 @@
       method: "PUT",
       cache: "no-store",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({revision: settingsRevision, order}),
+      body: JSON.stringify({revision: settingsRevision, order, completed}),
     }).then(async (response) => {
       let payload = null;
       try { payload = await response.json(); } catch (_) { /* handled below */ }
@@ -1097,11 +1159,13 @@
         return;
       }
       savedStageOrder = [...payload.order];
+      savedCompletedStages = [...payload.completed];
       settingsRevision = payload.revision;
       editorStageOrder = editorNames();
+      editorCompletedStages = [...savedCompletedStages];
       settingsStatus("Board row order saved.");
-      renderBoard();
       renderStageOrderEditor();
+      request("settings", payload.revision);
     }).catch((error) => {
       settingsStatus(`Save failed: ${settingsErrorMessage(error)}`, true);
       renderStageOrderEditor();
@@ -1120,8 +1184,9 @@
     setPending(false);
     editorStageOrder = [...new Set([
       ...(retainDraft ? priorEditor : editorNames(snapshot)),
-      ...canonicalStageNames(snapshot),
+      ...inventoryStageNames(snapshot),
     ])];
+    if (!retainDraft) editorCompletedStages = [...savedCompletedStages];
     if (selectedPath && !snapshot.entries.some((entry) =>
       entry.board_visible && entry.package_path === selectedPath)) {
       selectedPath = null;
@@ -1158,9 +1223,10 @@
     return SAFE_CATEGORIES.includes(error.message) ? error.message : "producer_unavailable";
   }
 
-  function request(kind) {
+  function request(kind, expectedRevision = null) {
     if (busy) {
       if (kind === "manual") queued = "manual";
+      if (kind === "settings") queuedSettingsRefresh = expectedRevision;
       return;
     }
     busy = true;
@@ -1176,9 +1242,30 @@
         return validateSnapshot(payload);
       })
       .then((snapshot) => {
+        if (kind !== "settings") return snapshot;
+        if (snapshot.configuration_revision !== expectedRevision) {
+          throw new Error("settings_refresh_mismatch");
+        }
+        return fetch(SETTINGS_ROUTE, {cache: "no-store"})
+          .then(async (response) => {
+            let payload = null;
+            try { payload = await response.json(); } catch (_) { /* handled below */ }
+            if (!response.ok || !payload || payload.error) {
+              throw new Error((payload && payload.error) || "settings_unavailable");
+            }
+            return parseSettings(payload);
+          })
+          .then((settings) => {
+            if (settings.revision !== expectedRevision) {
+              throw new Error("settings_refresh_mismatch");
+            }
+            return snapshot;
+          });
+      })
+      .then((snapshot) => {
         const hadRefreshFailure = Boolean(refreshFailure);
         refreshFailure = null;
-        if (kind === "manual" || !displayed) { apply(snapshot); return; }
+        if (kind === "manual" || kind === "settings" || !displayed) { apply(snapshot); return; }
         if (digestOf(snapshot) !== digestOf(displayed)) {
           pending = snapshot;
           setPending(true);
@@ -1193,6 +1280,15 @@
         }
       })
       .catch((error) => {
+        if (kind === "settings") {
+          settingsAvailable = false;
+          settingsReloadAvailable = true;
+          settingsRevision = null;
+          settingsStatus("Saved board settings could not be matched to a fresh catalog; reloading current settings.", true);
+          renderStageOrderEditor();
+          loadSettings({refreshCatalog: true});
+          return;
+        }
         refreshFailure = safeCategory(error);
         status.textContent = `${kind === "poll" ? "Update check failed" : "Refresh failed"}: ` +
           refreshFailure;
@@ -1204,6 +1300,11 @@
         const next = queued;
         queued = null;
         if (next) request(next);
+        else if (queuedSettingsRefresh) {
+          const revision = queuedSettingsRefresh;
+          queuedSettingsRefresh = null;
+          request("settings", revision);
+        }
       });
   }
 
@@ -1228,14 +1329,27 @@
     renderStageOrderEditor({focusStage: stage});
     settingsStatus("Unsaved board row order changes.");
   });
-  stageOrderSave.addEventListener("click", () => saveStageOrder([...editorStageOrder]));
+  stageOrderList.addEventListener("change", (event) => {
+    const checkbox = event.target.closest(".stage-completed-toggle");
+    if (!settingsAvailable || settingsBusy || !checkbox) return;
+    const stage = checkbox.dataset.stage;
+    const selected = new Set(editorCompletedStages);
+    if (checkbox.checked) selected.add(stage);
+    else selected.delete(stage);
+    editorCompletedStages = editorStageOrder.filter((name) => selected.has(name));
+    settingsStatus("Unsaved board settings changes.");
+    renderStageOrderEditor();
+  });
+  stageOrderSave.addEventListener("click", () =>
+    saveStageOrder([...editorStageOrder], [...editorCompletedStages].sort(scalarCompare)));
   stageOrderCancel.addEventListener("click", () => {
     if (settingsBusy) return;
     editorStageOrder = editorNames();
+    editorCompletedStages = [...savedCompletedStages];
     settingsStatus("Unsaved board row order changes cancelled.");
     renderStageOrderEditor();
   });
-  stageOrderReset.addEventListener("click", () => saveStageOrder([]));
+  stageOrderReset.addEventListener("click", () => saveStageOrder([], []));
   stageOrderReload.addEventListener("click", () => {
     if (!settingsBusy) loadSettings();
   });

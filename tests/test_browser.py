@@ -36,12 +36,24 @@ def _declared(title, project):
 
 def _edge(target_id, name):
     return {
+        "kind": "claim",
         "target_package_id": target_id,
         "claim_name": name,
         "observed_state": "unsatisfied",
         "observed_evidence_ref": None,
         "resolved_state": "unsatisfied",
         "reason": "claim_unsatisfied",
+    }
+
+
+def _completion_edge(target_id, *, observed_stage=None, resolved_state="unknown",
+                     reason="completion_policy_needed"):
+    return {
+        "kind": "completion",
+        "target_package_id": target_id,
+        "observed_stage": observed_stage,
+        "resolved_state": resolved_state,
+        "reason": reason,
     }
 
 
@@ -76,6 +88,8 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
 
 
 def _reseal(value):
+    value["schema_version"] = 5
+    value.setdefault("configuration_revision", "revision-1")
     entries = value["entries"]
     value["visibility"]["visible_entry_count"] = sum(
         entry["board_visible"] for entry in entries
@@ -160,6 +174,51 @@ def board_payload(*, titles=None):
     }
     _reseal(value)
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+def _write_package(root, project, stage, name, package_id, body):
+    package_path = root / project / stage / name
+    package_path.mkdir(parents=True)
+    package_path.joinpath("spec.md").write_text(body, encoding="utf-8")
+
+
+def mixed_producer_root(tmp_path, *, target_stage="Queue"):
+    root = tmp_path / "workspace"
+    target_id = "123e4567-e89b-42d3-a456-426614174010"
+    source_id = "123e4567-e89b-42d3-a456-426614174011"
+    _write_package(
+        root, "Alpha", target_stage, "target", target_id,
+        f"# Target\nPackage ID: {target_id}\n"
+        "Claim: release | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    )
+    _write_package(
+        root, "Beta", "Under_Development", "dependent", source_id,
+        f"# Dependent\nPackage ID: {source_id}\n"
+        f"Prerequisite: {target_id} | release\n"
+        f"Completion Prerequisite: {target_id}\n",
+    )
+    return root, target_id, source_id
+
+
+class ScanningClient:
+    """Use the real catalog producer for each browser request."""
+
+    def __init__(self, root, *, hidden_stages=()):
+        self.root = root
+        self.hidden_stages = hidden_stages
+        self.settings = None
+        self.calls = 0
+
+    def fetch_catalog(self):
+        self.calls += 1
+        completed = self.settings.completed if self.settings is not None else None
+        revision = self.settings.revision if self.settings is not None else None
+        return parse_catalog(scan_catalog(
+            self.root,
+            hidden_stages=self.hidden_stages,
+            completed_stage_names=completed,
+            configuration_revision=revision,
+        ))
 
 
 STAGE_ROWS = (
@@ -362,15 +421,22 @@ def reversed_unicode_payload(payload, kind):
 class StaticClient:
     def __init__(self, payload):
         self.payload = payload
+        self.settings = None
 
     def fetch_catalog(self):
-        return parse_catalog(self.payload)
+        payload = self.payload
+        if self.settings is not None:
+            payload = json.loads(payload) if isinstance(payload, (bytes, str)) else json.loads(json.dumps(payload))
+            payload["configuration_revision"] = self.settings.revision
+            _reseal(payload)
+        return parse_catalog(payload)
 
 
 class SequenceClient:
     def __init__(self, payloads):
         self.payloads = list(payloads)
         self.calls = 0
+        self.settings = None
 
     def fetch_catalog(self):
         index = min(self.calls, len(self.payloads) - 1)
@@ -378,7 +444,36 @@ class SequenceClient:
         payload = self.payloads[index]
         if isinstance(payload, Exception):
             raise payload
+        if self.settings is not None:
+            payload = json.loads(payload) if isinstance(payload, (bytes, str)) else json.loads(json.dumps(payload))
+            payload["configuration_revision"] = self.settings.revision
+            _reseal(payload)
         return parse_catalog(payload)
+
+
+class BlockingSequenceClient(SequenceClient):
+    """Delay one post-save catalog so a competing settings write can win."""
+
+    def __init__(self, payloads, blocked_call=3):
+        super().__init__(payloads)
+        self.blocked_call = blocked_call
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def fetch_catalog(self):
+        if self.calls == self.blocked_call - 1:
+            self.calls += 1
+            self.started.set()
+            self.release.wait(timeout=10)
+            payload = self.payloads[min(self.calls - 1, len(self.payloads) - 1)]
+            if isinstance(payload, Exception):
+                raise payload
+            if self.settings is not None:
+                payload = json.loads(payload) if isinstance(payload, (bytes, str)) else json.loads(json.dumps(payload))
+                payload["configuration_revision"] = self.settings.revision
+                _reseal(payload)
+            return parse_catalog(payload)
+        return super().fetch_catalog()
 
 
 class RawCatalog:
@@ -405,11 +500,28 @@ class RawSequenceClient:
         return RawCatalog(payload)
 
 
+class BlockingRawSequenceClient(RawSequenceClient):
+    """Delay one deliberately malformed wire snapshot for an interim-state assertion."""
+
+    def __init__(self, payloads, blocked_call=2):
+        super().__init__(payloads)
+        self.blocked_call = blocked_call
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def fetch_catalog(self):
+        if self.calls == self.blocked_call - 1:
+            self.started.set()
+            self.release.wait(timeout=10)
+        return super().fetch_catalog()
+
+
 class BrowserSettings:
     """Small application-settings seam used by the browser behavior tests."""
 
-    def __init__(self, order=(), revision="revision-1"):
+    def __init__(self, order=(), completed=(), revision="revision-1"):
         self.order = list(order)
+        self.completed = list(completed)
         self.revision = revision
         self.calls = []
         self.get_calls = 0
@@ -421,18 +533,28 @@ class BrowserSettings:
         if self.fail_next_load:
             self.fail_next_load = False
             raise CatalogError("producer_unavailable")
-        return {"order": list(self.order), "revision": self.revision}
+        return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision}
 
-    def save_settings(self, revision, order):
-        self.calls.append((revision, list(order)))
+    def save_settings(self, revision, order, completed):
+        self.calls.append((revision, list(order), list(completed)))
         if self.fail_next:
             self.fail_next = False
-            return {"order": list(self.order), "revision": self.revision, "outcome": "failure"}
+            return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "failure"}
         if revision != self.revision:
-            return {"order": list(self.order), "revision": self.revision, "outcome": "conflict"}
+            return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "conflict"}
         self.order = list(order)
+        self.completed = list(completed)
         self.revision = f"revision-{len(self.calls) + 1}"
-        return {"order": list(self.order), "revision": self.revision, "outcome": "success"}
+        return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "success"}
+
+
+class RootSwitchSettings(BrowserSettings):
+    """Change the active workspace while a saved catalog response is delayed."""
+
+    def switch_root(self):
+        self.order = ["Queue"]
+        self.completed = ["Done"]
+        self.revision = "root-b-revision"
 
 
 @pytest.fixture
@@ -459,6 +581,7 @@ def open_page():
                 )
                 application.get_settings = settings.get_settings
                 application.save_settings = settings.save_settings
+                client.settings = settings
                 application.start(static_ready=lambda: True)
                 server = application.server
                 thread = application.http_thread
@@ -507,6 +630,445 @@ def stage_editor_order(page):
     return page.locator("#stage-order-list .stage-order-item").evaluate_all(
         "items => items.map(item => item.dataset.stage)"
     )
+
+
+def open_stage_editor(page):
+    editor = page.locator("#stage-order-editor")
+    if editor.get_attribute("open") is None:
+        editor.locator("summary").click()
+
+
+def dependency_state_payload(state):
+    value = json.loads(board_payload())
+    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
+    edge = gate["relationship"]["prerequisites"][0]
+    edge.update(observed_state=state, resolved_state=state, reason=f"claim_{state}")
+    gate["relationship"]["direct_prerequisite_state"] = state
+    _reseal(value)
+    return value
+
+
+def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_targets(open_page):
+    settings = BrowserSettings(order=["Missing", "Done"], completed=["Done", "Absent"])
+    page = open_page(StaticClient(lifecycle_payload(hidden_stages=("Done",))), settings=settings)
+    editor = page.locator("#stage-order-editor")
+    editor.wait_for()
+    assert editor.get_attribute("open") is None
+    editor.locator("summary").press("Enter")
+    assert page.get_by_role("checkbox", name="Counts as finished: Done").is_checked()
+    assert page.get_by_role("checkbox", name="Counts as finished: Absent").is_checked()
+    assert page.locator("#stage-order-list .stage-order-item[data-stage='Done']").count() == 1
+    assert page.locator("#stage-order-list .stage-order-item[data-stage='Absent']").count() == 1
+    assert "not currently available" in page.locator(
+        "#stage-order-list .stage-order-item[data-stage='Absent']"
+    ).inner_text()
+    assert page.get_by_role("checkbox", name="Counts as finished: Done").is_enabled()
+    page.get_by_role("checkbox", name="Counts as finished: Done").uncheck()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.completed == ["Absent"]
+
+
+def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_snapshot(open_page):
+    first = dependency_state_payload("unsatisfied")
+    stale = dependency_state_payload("unsatisfied")
+    fresh = dependency_state_payload("satisfied")
+    client = BlockingSequenceClient([first, first, stale, fresh, fresh], blocked_call=3)
+    settings = BrowserSettings()
+    page_a = open_page(client, settings=settings)
+    page_b = open_page(client, settings=settings)
+    for page in (page_a, page_b):
+        page.locator("#stage-order-editor").wait_for()
+        open_stage_editor(page)
+        page.locator(f'.card[data-package-id="{GATE}"]').click()
+
+    page_a.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+    page_a.get_by_role("button", name="Save").click()
+    page_b.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+    page_b.get_by_role("button", name="Save").click()
+    page_b.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    page_b.get_by_role("button", name="Reload board settings").click()
+    page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
+    page_b.get_by_role("button", name="Save").click()
+    assert page_a.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Waiting on dependencies"
+    )
+    client.release.set()
+
+    page_b.get_by_text("Board row order saved.", exact=True).wait_for()
+    page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page_a.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % GATE
+    )
+    assert page_a.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Dependencies satisfied"
+    )
+    assert settings.completed == []
+
+
+@pytest.mark.parametrize("case", ["stale", "null", "malformed", "schema-4"])
+def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_page, case):
+    valid = dependency_state_payload("unsatisfied")
+    bad = dependency_state_payload("satisfied")
+    if case == "stale":
+        bad["configuration_revision"] = "revision-before-save"
+    elif case == "null":
+        bad["configuration_revision"] = None
+    elif case == "malformed":
+        bad["configuration_revision"] = {"revision": "bad"}
+    else:
+        bad["schema_version"] = 4
+    bad["catalog_digest"] = canonical_digest(bad)
+    fresh = dependency_state_payload("unknown")
+    fresh["configuration_revision"] = "revision-2"
+    fresh["catalog_digest"] = canonical_digest(fresh)
+    client = BlockingRawSequenceClient([valid, bad, fresh])
+    settings = BrowserSettings()
+
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        page = open_page(client, settings=settings)
+        page.locator("#stage-order-editor").wait_for()
+        open_stage_editor(page)
+        page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+        page.get_by_role("button", name="Save").click()
+        assert client.started.wait(timeout=5)
+        assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+            "Waiting on dependencies"
+        )
+        client.release.set()
+        page.wait_for_function(
+            "() => document.querySelector('.dependency-indicator')?.textContent === 'Dependencies unknown'",
+            timeout=15000,
+        )
+
+    assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Dependencies unknown"
+    )
+
+
+def coherent_refresh_payload():
+    value = dependency_state_payload("satisfied")
+    loose = next(entry for entry in value["entries"] if entry["package_id"] == LOOSE)
+    edge = loose["relationship"]["prerequisites"][0]
+    edge.update(target_package_id=STEP_TWO, observed_state="satisfied",
+                resolved_state="satisfied", reason="claim_satisfied")
+    _reseal(value)
+    return value
+
+
+def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_together(open_page):
+    client = SequenceClient([dependency_state_payload("unsatisfied"), coherent_refresh_payload()])
+    settings = BrowserSettings()
+    page = open_page(client, settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
+    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+
+    gate = page.locator(f'.card[data-package-id="{GATE}"]')
+    page.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % GATE
+    )
+    assert gate.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
+    step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    assert "blocks:" in step_two.locator(".card-links").inner_text()
+    assert "loose package" in step_two.locator(".card-links").inner_text()
+    loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
+    assert "needs: Dependent step" in loose.locator(".card-links").inner_text()
+    assert loose.get_attribute("aria-pressed") == "true"
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-target").all_inner_texts() == ["Dependent step"]
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
+
+
+def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_page, tmp_path):
+    root, target_id, source_id = mixed_producer_root(tmp_path)
+    settings = BrowserSettings()
+    client = ScanningClient(root)
+    page = open_page(client, settings=settings)
+
+    source = page.locator(f'.card[data-package-id="{source_id}"]')
+    target = page.locator(f'.card[data-package-id="{target_id}"]')
+    assert source.locator(".dependency-indicator").inner_text() == "Dependencies unknown"
+    assert "needs: Target Alpha" in source.inner_text()
+    assert "blocks: Dependent Beta" in target.inner_text()
+    assert connection_pairs(page) == {(target_id, source_id)}
+
+    source.click()
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-claim-kind").count() == 1
+    assert page.locator("#details .prerequisite-completion").count() == 1
+    assert page.locator("#details .claim-name").inner_text() == "Claim: release"
+    assert page.locator("#details .reported-state").inner_text() == "Reported state: satisfied"
+    completion = page.locator("#details .prerequisite-completion")
+    assert completion.locator(".completion-kind").inner_text() == "Whole-item completion"
+    assert completion.locator(".observed-stage").inner_text() == "Observed stage: Queue"
+    assert completion.locator(".claim-name").count() == 0
+    assert completion.locator(".reported-state").count() == 0
+    assert completion.locator(".completion-reason").inner_text() == "Reason: completion_policy_needed"
+
+    open_stage_editor(page)
+    page.get_by_role("checkbox", name="Counts as finished: Queue").check()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.wait_for_function(
+        "() => document.querySelector(`[data-package-id=\"%s\"] .dependency-indicator`)?.textContent === 'Dependencies satisfied'"
+        % source_id
+    )
+    assert source.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
+    assert source.get_attribute("aria-pressed") == "true"
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-completion .completion-reason").inner_text() == (
+        "Reason: completion_satisfied"
+    )
+    assert connection_pairs(page) == {(target_id, source_id)}
+
+
+def test_real_producer_hidden_completion_target_keeps_context_without_card_or_rail(open_page, tmp_path):
+    root, target_id, source_id = mixed_producer_root(tmp_path, target_stage="Done")
+    settings = BrowserSettings(completed=["Done"])
+    client = ScanningClient(root, hidden_stages=("Done",))
+    page = open_page(client, settings=settings)
+
+    assert page.locator(f'.card[data-package-id="{target_id}"]').count() == 0
+    assert page.locator(f'.card[data-package-id="{source_id}"]').count() == 1
+    assert connection_pairs(page) == set()
+    page.locator(f'.card[data-package-id="{source_id}"]').click()
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-target").all_inner_texts() == ["Target", "Target"]
+    assert page.locator("#details .prerequisite-completion .observed-stage").inner_text() == (
+        "Observed stage: Done"
+    )
+    assert page.locator("#details .prerequisite-completion .completion-kind").inner_text() == (
+        "Whole-item completion"
+    )
+
+
+def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_page, tmp_path):
+    root = tmp_path / "workspace"
+    source_id = "123e4567-e89b-42d3-a456-426614174012"
+    missing_id = "123e4567-e89b-42d3-a456-426614174013"
+    _write_package(
+        root, "Alpha", "Queue", "invalid", source_id,
+        f"# Invalid\nPackage ID: {source_id}\nCompletion Prerequisite: malformed | value\n",
+    )
+    _write_package(
+        root, "Alpha", "Under_Development", "dependent", "123e4567-e89b-42d3-a456-426614174014",
+        f"# Dependent\nPackage ID: 123e4567-e89b-42d3-a456-426614174014\n"
+        f"Completion Prerequisite: {missing_id}\n",
+    )
+    value = json.loads(scan_catalog(root, configuration_revision="revision-1"))
+    invalid_entry = next(item for item in value["entries"] if item["package_id"] == source_id)
+    missing_entry = next(
+        item for item in value["entries"] if item["package_id"] == "123e4567-e89b-42d3-a456-426614174014"
+    )
+    invalid_edge = invalid_entry["relationship"]["prerequisites"][0]
+    missing_edge = missing_entry["relationship"]["prerequisites"][0]
+    assert (invalid_edge["kind"], invalid_edge["reason"]) == ("completion", "invalid_prerequisite")
+    assert (missing_edge["kind"], missing_edge["reason"]) == ("completion", "missing_target")
+    assert parse_catalog(value).schema_version == 5
+
+    page = open_page(StaticClient(value))
+    for package_id, reason in ((source_id, "invalid_prerequisite"),
+                               ("123e4567-e89b-42d3-a456-426614174014", "missing_target")):
+        page.locator(f'.card[data-package-id="{package_id}"]').click()
+        page.locator("#details .dependencies summary").click()
+        row = page.locator("#details .prerequisite-completion")
+        assert row.locator(".completion-kind").inner_text() == "Whole-item completion"
+        assert row.locator(".completion-reason").inner_text() == f"Reason: {reason}"
+        assert row.locator(".claim-name").count() == 0
+
+
+CLAIM_EDGE_REASONS = [
+    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
+    "invalid_claim", "missing_target", "duplicate_target", "identity_coverage_incomplete",
+    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+    "self_edge", "invalid_prerequisite",
+]
+COMPLETION_EDGE_REASONS = [
+    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
+    "completion_policy_invalid", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable", "target_changed_during_read",
+    "target_invalid_identity", "self_edge", "invalid_prerequisite",
+]
+
+
+def admitted_reason_payload(kind, reason):
+    value = json.loads(board_payload())
+    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
+    if kind == "claim":
+        edge = _edge(None if reason in {
+            "missing_target", "duplicate_target", "identity_coverage_incomplete",
+            "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+            "self_edge", "invalid_prerequisite",
+        } else STEP_ONE, None if reason == "invalid_prerequisite" else "release")
+        edge.update(observed_state=None, observed_evidence_ref=None,
+                    resolved_state="unknown", reason=reason)
+    else:
+        edge = _completion_edge(
+            None if reason in {
+                "missing_target", "duplicate_target", "identity_coverage_incomplete",
+                "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+                "self_edge", "invalid_prerequisite",
+            } else STEP_ONE,
+            observed_stage=None if reason not in {"completion_satisfied", "completion_unsatisfied"} else "Queue",
+            resolved_state="unknown" if reason not in {"completion_satisfied", "completion_unsatisfied"} else (
+                "satisfied" if reason == "completion_satisfied" else "unsatisfied"
+            ),
+            reason=reason,
+        )
+    gate["relationship"]["prerequisites"] = [edge]
+    gate["relationship"]["direct_prerequisite_state"] = edge["resolved_state"]
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize(("kind", "reason"),
+                         [("claim", reason) for reason in CLAIM_EDGE_REASONS] +
+                         [("completion", reason) for reason in COMPLETION_EDGE_REASONS])
+def test_browser_admits_every_python_valid_typed_edge_reason(open_page, kind, reason):
+    value = admitted_reason_payload(kind, reason)
+    assert parse_catalog(value).entries
+    page = open_page(StaticClient(value))
+    page.locator(f'.card[data-package-id="{GATE}"]').click()
+    page.locator("#details .dependencies summary").click()
+    row = page.locator("#details .prerequisite-claim")
+    assert row.count() == 1
+    assert f"Reason: {reason}" in row.inner_text()
+    if kind == "claim":
+        assert row.locator(".claim-name").count() == 1
+    else:
+        assert row.locator(".completion-kind").inner_text() == "Whole-item completion"
+        assert row.locator(".claim-name").count() == 0
+
+
+def malformed_typed_edge_payload(case):
+    value = json.loads(board_payload())
+    edge = next(entry for entry in value["entries"] if entry["package_id"] == GATE)[
+        "relationship"
+    ]["prerequisites"][0]
+    if case == "missing-kind":
+        del edge["kind"]
+    elif case == "invalid-kind":
+        edge["kind"] = "unknown"
+    elif case == "extra-key":
+        edge["extra"] = "unexpected"
+    elif case == "cross-kind":
+        edge.clear()
+        edge.update(_completion_edge(STEP_ONE, observed_stage=None,
+                                     resolved_state="unknown", reason="claim_unknown"))
+    elif case == "unsafe-stage":
+        edge.clear()
+        edge.update(_completion_edge(STEP_ONE, observed_stage="../unsafe",
+                                     resolved_state="unknown", reason="completion_policy_needed"))
+    elif case == "mismatched-reason":
+        edge["reason"] = "completion_satisfied"
+    else:  # pragma: no cover - the parameter list owns the cases
+        raise AssertionError(case)
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize("case", [
+    "missing-kind", "invalid-kind", "extra-key", "cross-kind", "unsafe-stage", "mismatched-reason",
+])
+def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page, case):
+    valid = json.loads(board_payload())
+    invalid = malformed_typed_edge_payload(case)
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        client = BlockingRawSequenceClient([valid, invalid], blocked_call=2)
+        page = open_page(client)
+        page.get_by_role("button", name="Refresh view").click()
+        assert client.started.wait(timeout=5)
+        assert page.locator("#board .card").count() == 4
+        assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
+        client.release.set()
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 4
+    assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
+
+
+def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_page):
+    client = BlockingSequenceClient(
+        [dependency_state_payload("unsatisfied"), dependency_state_payload("satisfied"),
+         dependency_state_payload("unknown")],
+        blocked_call=2,
+    )
+    settings = RootSwitchSettings()
+    page = open_page(client, settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
+    page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
+    page.get_by_role("button", name="Save").click()
+    assert client.started.wait(timeout=5)
+    settings.switch_root()
+    assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Waiting on dependencies"
+    )
+    assert page.locator("#stage-order-list .stage-order-item[data-stage='Under_Development']").locator(
+        ".stage-completed-toggle"
+    ).is_checked()
+    client.release.set()
+    page.wait_for_function(
+        """() => {
+          const done = document.querySelector("[data-stage='Done'] .stage-completed-toggle");
+          const underDevelopment = document.querySelector(
+            "[data-stage='Under_Development'] .stage-completed-toggle"
+          );
+          return done?.checked === true && underDevelopment?.checked === false;
+        }""",
+        timeout=15000,
+    )
+    assert page.locator("#stage-order-list .stage-order-item[data-stage='Queue']").count() == 1
+    assert page.locator("#stage-order-list .stage-order-item[data-stage='Done']").locator(
+        ".stage-completed-toggle"
+    ).is_checked()
+    assert not page.locator("#stage-order-list .stage-order-item[data-stage='Under_Development']").locator(
+        ".stage-completed-toggle"
+    ).is_checked()
+
+
+def test_markup_shaped_stage_names_are_escaped_with_independent_controls(open_page):
+    markup_stage = '<img src=x onerror="alert(1)">'
+    value = json.loads(board_payload())
+    value["inventory"]["stages"].append({
+        "project": "Alpha", "stage": markup_stage, "availability": "complete",
+    })
+    value["inventory"]["stages"].sort(key=lambda item: (item["project"], item["stage"]))
+    _reseal(value)
+    settings = BrowserSettings(order=[markup_stage], completed=[markup_stage])
+    page = open_page(StaticClient(value), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
+    row = page.locator("#stage-order-list .stage-order-item").filter(has_text=markup_stage)
+    assert row.count() == 1
+    assert row.locator("img").count() == 0
+    assert row.locator("code").inner_text() == markup_stage
+    checkbox = row.get_by_role("checkbox")
+    assert checkbox.count() == 1
+    assert checkbox.get_attribute("aria-label") == f"Counts as finished: {markup_stage}"
+    assert row.get_by_role("button", name=f"Move {markup_stage} up").count() == 1
+    assert row.get_by_role("button", name=f"Move {markup_stage} down").count() == 1
 
 
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
@@ -695,6 +1257,7 @@ def test_saved_stage_order_projects_rows_without_phantom_or_catalog_changes(open
     digest = value["catalog_digest"]
     page = open_page(StaticClient(value), settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
 
     assert row_labels(page) == ["Under Development", "Queue"]
     assert page.locator(".row-head").all_inner_texts() == ["Under Development", "Queue"]
@@ -734,6 +1297,7 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     client = SequenceClient([first, added, hidden, removed, recreated, empty, refilled])
     page = open_page(client, settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
     assert row_labels(page) == ["Queue", "Under Development"]
 
     page.get_by_role("button", name="Refresh view").click()
@@ -781,6 +1345,7 @@ def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
     settings = BrowserSettings(order=["Queue", "Under_Development"])
     page = open_page(SequenceClient([first, added, removed]), settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
 
     page.get_by_role("button", name="Refresh view").click()
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
@@ -805,6 +1370,7 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     settings = BrowserSettings()
     page = open_page(StaticClient(board_payload()), settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
     page.get_by_role("button", name="Move Under Development up").focus()
     page.keyboard.press("Enter")
     playwright.expect(
@@ -819,15 +1385,24 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
-    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+    page.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Under Development', 'Queue'])"
+    )
     assert row_labels(page) == ["Under Development", "Queue"]
 
     page2 = open_page(StaticClient(board_payload()), settings=settings)
     page2.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page2)
     assert row_labels(page2) == ["Under Development", "Queue"]
     page2.get_by_role("button", name="Reset").click()
     page2.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.order == []
+    page2.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Queue', 'Under Development'])"
+    )
     assert row_labels(page2) == ["Queue", "Under Development"]
 
 
@@ -835,13 +1410,15 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     settings = BrowserSettings()
     settings.fail_next_load = True
     page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
 
     page.get_by_text(
         "Could not load board row order: producer_unavailable", exact=True
     ).wait_for()
     assert settings.get_calls == 1
     assert page.get_by_role("button", name="Save").is_disabled()
-    retry = page.get_by_role("button", name="Reload board row order")
+    retry = page.get_by_role("button", name="Reload board settings")
     assert retry.is_visible()
 
     retry.click()
@@ -851,7 +1428,7 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     page.get_by_role("button", name="Move Under Development up").click()
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
-    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
 
 
 def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_reload(open_page):
@@ -860,31 +1437,33 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
     winning_page = open_page(StaticClient(board_payload()), settings=settings)
     stale_page.locator("#stage-order-editor").wait_for()
     winning_page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(stale_page)
+    open_stage_editor(winning_page)
     assert settings.get_calls == 2
 
     winning_page.get_by_role("button", name="Reset").click()
     winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
-    assert settings.calls == [("revision-1", [])]
+    assert settings.calls == [("revision-1", [], [])]
 
     stale_page.get_by_role("button", name="Move Under Development up").click()
     stale_page.get_by_role("button", name="Save").click()
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
     assert stale_page.get_by_role("button", name="Save").is_disabled()
-    reload = stale_page.get_by_role("button", name="Reload board row order")
+    reload = stale_page.get_by_role("button", name="Reload board settings")
     assert reload.is_visible()
 
     reload.click()
     stale_page.get_by_text("Current board row order loaded.", exact=True).wait_for()
-    assert settings.get_calls == 3
+    assert settings.get_calls == 4
     assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
     stale_page.get_by_role("button", name="Move Under Development up").click()
     stale_page.get_by_role("button", name="Save").click()
     stale_page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.calls == [
-        ("revision-1", []),
-        ("revision-1", ["Under_Development", "Queue"]),
-        ("revision-2", ["Under_Development", "Queue"]),
+        ("revision-1", [], []),
+        ("revision-1", ["Under_Development", "Queue"], []),
+        ("revision-2", ["Under_Development", "Queue"], []),
     ]
 
 
@@ -894,11 +1473,17 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     winning_page = open_page(StaticClient(board_payload()), settings=settings)
     stale_page.locator("#stage-order-editor").wait_for()
     winning_page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(stale_page)
+    open_stage_editor(winning_page)
 
     winning_page.get_by_role("button", name="Move Under Development up").press("Enter")
     winning_page.get_by_role("button", name="Save").click()
     winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
+    winning_page.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Under Development', 'Queue'])"
+    )
     assert row_labels(winning_page) == ["Under Development", "Queue"]
 
     stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
@@ -906,7 +1491,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
     assert stale_page.get_by_role("button", name="Save").is_disabled()
-    assert stale_page.get_by_role("button", name="Reload board row order").is_visible()
+    assert stale_page.get_by_role("button", name="Reload board settings").is_visible()
 
     settings.fail_next = True
     winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
@@ -945,23 +1530,24 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     settings = BrowserSettings()
     page = open_page(SequenceClient([first, pending]), settings=settings)
     page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
     page.fill("#filter", "dependent")
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
-    page.wait_for_selector("#refresh.pending", timeout=15000)
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     playwright.expect(
         page.get_by_role("button", name="Move Under Development down")
     ).to_be_focused()
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
     assert page.locator("#filter").input_value() == "dependent"
-    assert page.locator("#refresh").inner_text() == "Apply update"
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
-    assert page.locator("#refresh").inner_text() == "Apply update"
-    page.get_by_role("button", name="Apply update").click()
+    page.wait_for_function(
+        "() => document.querySelector('#board')?.textContent.includes('Pending foundation')"
+    )
+    assert page.locator("#refresh").inner_text() == "Refresh view"
     page.locator("#board").get_by_text(
         "Pending foundation", exact=True
     ).wait_for(state="attached")
@@ -2258,6 +2844,8 @@ def _malformed_browser_inventory(case):
     value = json.loads(lifecycle_payload())
     if case == "schema-3":
         value["schema_version"] = 3
+        value["catalog_digest"] = canonical_digest(value)
+        return value
     elif case == "unknown-inventory-key":
         value["inventory"]["extra"] = []
     elif case == "projects-type":
@@ -2320,6 +2908,7 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_role("button", name="Refresh view").click()
         page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )

@@ -40,6 +40,7 @@ The event plan can use the same metadata fields as a software specification:
 # Organize the neighborhood festival
 Package ID: 123e4567-e89b-42d3-a456-426614174100
 Status: planning
+Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102
 Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
 Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 
@@ -47,6 +48,12 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 
 Coordinate volunteers, food, music, and a safe public event.
 ```
+
+The completion row is the event plan's whole-item requirement: it becomes
+satisfied only when this workspace explicitly marks the literal `Done` stage as
+finished. The two `Prerequisite` rows remain separate named outcomes with their
+own recorded claim and evidence state, so the event can show both a completed
+permit item and the individual outcomes it provides.
 
 The complete disposable fixture used by the checked-in captures adds these
 fictional files:
@@ -168,6 +175,37 @@ You do not need to create every stage in advance. Direct files such as a tracked
 `.gitkeep` preserve an empty directory in version control but are not work items.
 After moving files, request a refresh and apply the update.
 
+### Define whole-item completion
+
+Completion is an explicit, literal policy for this workspace. Open the collapsed
+**Board settings** panel, select **Counts as finished** beside each stage whose
+literal name should count, and choose **Save**. There is no implicit `Done` or
+`Archive` rule: row order, visual position, hidden status, cancellation, and
+the spelling of a stage never infer completion. A cancelled or archived item
+therefore remains outside the completion policy unless you deliberately select
+that exact literal stage name.
+
+Declare the requirement in the dependent `spec.md` with exactly one whole-item
+header:
+
+```text
+Completion Prerequisite: 55555555-5555-4555-8555-555555555555
+```
+
+When the target moves into a selected stage, this whole-item requirement becomes
+satisfied; moving it out reopens the requirement. A missing policy leaves the
+requirement **unknown** and asks you to configure completed stages. A target in a
+hidden completed stage still appears as dependency context. This assertion records
+workflow completion; it does not verify evidence, approve work, or satisfy a
+named outcome.
+
+The selected stage names are saved per canonical workspace root and shared by
+all projects in that root. Switching roots keeps each root's own policy, and a
+root with no saved names reports unknown for its simple completion dependencies.
+Hidden stages and names that are temporarily absent remain retained in the Board
+settings panel so they can be used again when available. **Cancel** leaves the
+saved policy unchanged; **Reset** removes the current root's completion policy.
+
 At the project level, names beginning with `.`, plus `Reference`, are reserved
 and are not project columns. At the stage level, names beginning with `.`, plus
 `Reference` and `.pipeline`, are reserved and are not stage rows. Nyx ignores
@@ -212,6 +250,12 @@ the prior saved order and retains the unsaved editor draft so you can retry.
 Changing row order never renames or moves a project, stage, or work item
 directory, and never changes completion, approval, claims, prerequisites,
 dependencies, or execution behavior.
+
+Completion and named outcomes are separate relationships. Use the exact
+`Completion Prerequisite: UUID` header for a whole-item requirement. Keep
+`Prerequisite: UUID | claim-name` for an individual claim; it still depends on
+that claim's recorded state and evidence even when the provider is in a selected
+completed stage. A mixed dependent item may declare both forms.
 
 ## Add another project or a dependency
 

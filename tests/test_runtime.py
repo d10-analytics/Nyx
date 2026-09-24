@@ -20,7 +20,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from nyx import _native_claim, runtime, state, worker
+from nyx import _native_claim, catalog, runtime, state, worker
+from nyx.models import canonical_digest
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
@@ -34,6 +35,38 @@ def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
         state.setup(spec)
         paths = state.state_paths()
     return paths, home, spec
+
+
+def test_application_runtime_provider_admits_schema_five_and_rejects_schema_four():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        package = root / "Fictional" / "Queue" / "entry"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text("# Entry\n", encoding="utf-8")
+        payload = catalog.scan_catalog(root)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.catalog_admitted = True
+
+        class Workers:
+            def __init__(self, value: bytes):
+                self.value = value
+
+            def fetch_catalog(self) -> bytes:
+                return self.value
+
+        application.workers = Workers(payload.encode("utf-8"))
+        admitted = application._provider()
+        assert admitted.schema_version == 5
+        assert admitted.configuration_revision is None
+
+        legacy = json.loads(payload)
+        legacy["schema_version"] = 4
+        legacy["catalog_digest"] = canonical_digest(legacy)
+        application.workers = Workers(json.dumps(legacy).encode("utf-8"))
+        with pytest.raises(runtime.CatalogError, match="producer_protocol_error"):
+            application._provider()
 
 
 def _transferred_claim_fd(path: Path) -> int:
@@ -953,11 +986,15 @@ def test_application_settings_save_conflict_and_restart_persistence():
         )
         application.capture_configuration(initial, paths)
         application.admit_catalog()
-        saved = application.save_settings(initial.revision, ["Done", "Queue"])
+        saved = application.save_settings(
+            initial.revision, ["Done", "Queue"], ["Done"]
+        )
         assert saved["outcome"] == "success"
         assert saved["order"] == ["Done", "Queue"]
+        assert saved["completed"] == ["Done"]
         assert application.save_settings(initial.revision, ["Archive"])["outcome"] == "conflict"
         assert state.load_configuration(paths).stage_order == ("Done", "Queue")
+        assert state.load_configuration(paths).completed_stage_names == ("Done",)
         assert application.shutdown(time.monotonic() + 2)
 
         restarted = runtime.ApplicationRuntime(
@@ -967,6 +1004,7 @@ def test_application_settings_save_conflict_and_restart_persistence():
         restarted.admit_catalog()
         current = restarted.get_settings()
         assert current["order"] == ["Done", "Queue"]
+        assert current["completed"] == ["Done"]
         assert current["revision"] == state.configuration_revision(paths)
         assert str(specification_root) not in current
         assert restarted.shutdown(time.monotonic() + 2)
@@ -1060,6 +1098,7 @@ def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_a
             shutdown_thread.join(timeout=3)
         assert saved == [{
             "order": ["Queue"],
+            "completed": [],
             "revision": saved[0]["revision"],
             "outcome": "success",
         }]
@@ -1136,6 +1175,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 assert first_status == 200
                 assert first == {
                     "order": [],
+                    "completed": [],
                     "revision": state.configuration_revision(paths),
                 }
 
@@ -1144,11 +1184,13 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                     {
                         "revision": first["revision"],
                         "order": ["Done", "Queue"],
+                        "completed": ["Done"],
                     },
                 )
                 assert saved_status == 200
                 assert saved["outcome"] == "success"
                 assert saved["order"] == ["Done", "Queue"]
+                assert saved["completed"] == ["Done"]
                 assert saved["revision"] == state.configuration_revision(paths)
 
                 assert runtime.stop() == "stopped"
@@ -1161,6 +1203,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 assert restarted_status == 200
                 assert restarted == {
                     "order": ["Done", "Queue"],
+                    "completed": ["Done"],
                     "revision": state.configuration_revision(paths),
                 }
 

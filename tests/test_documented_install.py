@@ -24,10 +24,10 @@ from urllib.request import url2pathname
 
 import pytest
 from test_desktop_artifact import (
-    _DELIVERED_HIDDEN_STAGES,
     ArtifactLayout,
     _assert_claims_released,
     _claim_paths,
+    _expected_catalog,
     _inert_path,
     _request,
     _running_gui,
@@ -44,7 +44,6 @@ from test_wheel_install import (
 )
 
 from nyx._native_claim import NativeClaim
-from nyx.catalog import scan_catalog
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 DOCUMENTS = ("README.md", "docs/running-nyx.md")
@@ -121,6 +120,54 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "never renames or moves",
     ),
 }
+COMPLETION_GUIDANCE_MARKERS = {
+    "README.md": (
+        "Completion Prerequisite: UUID",
+        "literal set of stage names",
+        "Board settings",
+        "workspace root",
+        "evidence verification",
+        "Prerequisite: UUID | claim-name",
+    ),
+    "docs/running-nyx.md": (
+        "collapsed **Board settings**",
+        "Counts as finished",
+        "**Save** to persist the row order and completion policy together",
+        "**Cancel** drops both kinds of unsaved change",
+        "**Reset** clears the current root's row order and completed-stage set",
+        "hidden stages",
+        "Reload board settings",
+        "configuration revision",
+        "moving it out reopens it",
+        "recorded workflow assertion",
+    ),
+    "docs/workspaces.md": (
+        "no implicit `Done` or `Archive` rule",
+        "Completion Prerequisite: UUID",
+        "missing policy leaves the requirement **unknown**",
+        "saved per canonical workspace root",
+        "root with no saved names reports unknown",
+        "A cancelled or archived item",
+        "hidden completed stage",
+        "mixed dependent item",
+    ),
+    "docs/specification-reference.md": (
+        "one exact completion grammar",
+        "one-part `Prerequisite: UUID` is not",
+        "never uses a magic claim name",
+        "collapsed **Board settings**",
+        "temporarily absent names",
+        "recorded workflow assertion",
+    ),
+}
+EVENT_COMPLETION_EXAMPLE = (
+    "# Organize the neighborhood festival\n"
+    "Package ID: 123e4567-e89b-42d3-a456-426614174100\n"
+    "Status: planning\n"
+    "Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102\n"
+    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed\n"
+    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved"
+)
 _START_TIMEOUT = 90.0
 
 
@@ -182,6 +229,21 @@ def test_documents_publish_the_saved_stage_order_contract():
         "canonical inventory order and keeps the last saved order unchanged."
     )
     assert obsolete_fallback not in normalized_documents["docs/workspaces.md"]
+
+
+def test_documents_publish_the_explicit_completion_contract():
+    for name, markers in COMPLETION_GUIDANCE_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert marker in document, (name, marker)
+
+
+def test_event_walkthrough_shows_whole_item_and_named_outcomes():
+    document = (REPOSITORY_ROOT / "docs" / "workspaces.md").read_text(encoding="utf-8")
+    assert EVENT_COMPLETION_EXAMPLE in document
+    assert "event plan's whole-item requirement" in document
+    assert "literal `Done` stage" in document
+    assert "separate named outcomes" in document
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
@@ -338,10 +400,8 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
 
     with _workspace(root) as workspace:
         # Open a configured workspace, serve the board, then Quit.
-        _write_configuration(home, workspace)
-        expected_first = json.loads(
-            scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
+        _, first_configuration = _write_configuration(home, workspace)
+        expected_first = json.loads(_expected_catalog(first_configuration))
         with _running_gui(artifact, root, environment) as gui:
             status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert status == 200
@@ -354,11 +414,9 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         second = root / "second"
         shutil.copytree(workspace, second)
         shutil.rmtree(second / "Trail_API")
-        expected_second = json.loads(
-            scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
+        _, second_configuration = _write_configuration(home, second)
+        expected_second = json.loads(_expected_catalog(second_configuration))
         assert expected_first != expected_second
-        _write_configuration(home, second)
         with _running_gui(artifact, root, environment) as gui:
             status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert status == 200
@@ -368,7 +426,7 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         _wait_port_free(time.monotonic() + 15)
 
         # Recovery: a surviving former worker blocks the start until it exits.
-        config_file = _write_configuration(home, workspace)
+        config_file, _ = _write_configuration(home, workspace)
         before = config_file.read_bytes()
         _, recovery_path = _claim_paths(home)
         recovery_path.parent.mkdir(parents=True, exist_ok=True)

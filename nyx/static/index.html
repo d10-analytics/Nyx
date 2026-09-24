@@ -29,18 +29,20 @@
         </label>
         <button id="refresh" type="button">Refresh view</button>
       </div>
-      <section id="stage-order-editor" class="stage-order-editor" hidden aria-labelledby="stage-order-heading">
-        <h2 id="stage-order-heading">Board row order</h2>
-        <p id="stage-order-help">Choose the order of stage rows. Changes apply after Save.</p>
-        <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
-        <div class="stage-order-actions">
-          <button id="stage-order-save" type="button">Save</button>
-          <button id="stage-order-cancel" type="button">Cancel</button>
-          <button id="stage-order-reset" type="button">Reset</button>
-          <button id="stage-order-reload" type="button" hidden>Reload board row order</button>
+      <details id="stage-order-editor" class="stage-order-editor" hidden>
+        <summary id="stage-order-heading">Board settings</summary>
+        <div class="stage-order-content">
+          <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Changes apply after Save.</p>
+          <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
+          <div class="stage-order-actions">
+            <button id="stage-order-save" type="button">Save</button>
+            <button id="stage-order-cancel" type="button">Cancel</button>
+            <button id="stage-order-reset" type="button">Reset</button>
+            <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+          </div>
+          <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
         </div>
-        <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
-      </section>
+      </details>
     </header>
     <main id="board" aria-live="polite"></main>
     <aside id="details" class="details" aria-label="Selected work item details">

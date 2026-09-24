@@ -32,7 +32,8 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
             "stages": [
@@ -85,6 +86,7 @@ def raw_catalog():
         ],
         "prerequisites": [
             {
+                "kind": "claim",
                 "target_package_id": second["package_id"],
                 "claim_name": "release",
                 "observed_state": "satisfied",
@@ -134,14 +136,18 @@ def test_default_provider_uses_unselected_scanner():
     "mutate",
     [
         lambda value: value.update(schema_version=3),
+        lambda value: value.update(schema_version=4),
+        lambda value: value.pop("configuration_revision"),
+        lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
         lambda value: value["entries"][0].update(board_visible="true"),
         lambda value: value["entries"][0].update(stage="Done"),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(kind="completion"),
         lambda value: value["entries"][0].update(
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
+    ids=["schema-3", "schema-4", "missing-revision", "malformed-revision", "unknown-key", "nonboolean-visibility", "policy-mismatch", "cross-kind-edge", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
@@ -230,17 +236,25 @@ def request(port, method, path, host=None, body=None):
 
 class SettingsStub:
     def __init__(self):
-        self.value = {"order": ["Queue", "Done"], "revision": "opaque"}
+        self.value = {
+            "order": ["Queue", "Done"],
+            "completed": ["Done"],
+            "revision": "opaque",
+        }
         self.calls = []
 
     def get_settings(self):
         return dict(self.value)
 
-    def save_settings(self, revision, order):
+    def save_settings(self, revision, order, completed):
         if revision != self.value["revision"]:
             return {**self.value, "outcome": "conflict"}
-        self.calls.append((revision, order))
-        self.value = {"order": list(order), "revision": "new-opaque"}
+        self.calls.append((revision, order, completed))
+        self.value = {
+            "order": list(order),
+            "completed": list(completed),
+            "revision": "new-opaque",
+        }
         return {**self.value, "outcome": "success"}
 
 
@@ -420,6 +434,7 @@ def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
             {
                 "prerequisites": [
                     {
+                        "kind": "claim",
                         "target_package_id": None,
                         "claim_name": None,
                         "observed_state": "invalid",
@@ -551,26 +566,45 @@ def test_application_settings_route_enforces_host_methods_payload_and_opaque_res
         status, content_type, body = request(port, "GET", "/api/settings")
         assert status == 200
         assert content_type == "application/json"
-        assert json.loads(body) == {"order": ["Queue", "Done"], "revision": "opaque"}
+        assert json.loads(body) == {
+            "order": ["Queue", "Done"],
+            "completed": ["Done"],
+            "revision": "opaque",
+        }
 
         status, _, body = request(
             port,
             "PUT",
             "/api/settings",
-            body=json.dumps({"revision": "opaque", "order": ["Done", "Queue"]}),
+            body=json.dumps(
+                {
+                    "revision": "opaque",
+                    "order": ["Done", "Queue"],
+                    "completed": ["Queue"],
+                }
+            ),
         )
         assert status == 200
         assert json.loads(body) == {
             "order": ["Done", "Queue"],
+            "completed": ["Queue"],
             "revision": "new-opaque",
             "outcome": "success",
         }
-        assert settings.calls == [("opaque", ["Done", "Queue"])]
+        assert settings.calls == [("opaque", ["Done", "Queue"], ["Queue"])]
 
         assert request(port, "POST", "/api/settings")[0] == 405
         assert request(port, "GET", "/api/settings", host=f"outside.invalid:{port}")[0] == 404
         assert request(port, "PUT", "/api/settings", body=b"not-json")[0] == 400
-        assert request(port, "PUT", "/api/settings", body=json.dumps({"revision": "new-opaque", "order": []}), host=f"127.0.0.1:{port + 1}")[0] == 404
+        assert request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps(
+                {"revision": "new-opaque", "order": [], "completed": []}
+            ),
+            host=f"127.0.0.1:{port + 1}",
+        )[0] == 404
 
 
 def test_application_settings_route_returns_conflict_without_replacement():
@@ -580,12 +614,19 @@ def test_application_settings_route_returns_conflict_without_replacement():
             port,
             "PUT",
             "/api/settings",
-            body=json.dumps({"revision": "stale", "order": ["Archive"]}),
+            body=json.dumps(
+                {
+                    "revision": "stale",
+                    "order": ["Archive"],
+                    "completed": ["Archive"],
+                }
+            ),
         )
     assert status == 409
     assert content_type == "application/json"
     assert json.loads(body) == {
         "order": ["Queue", "Done"],
+        "completed": ["Done"],
         "revision": "opaque",
         "outcome": "conflict",
     }
@@ -594,7 +635,7 @@ def test_application_settings_route_returns_conflict_without_replacement():
 
 def test_application_settings_put_returns_safe_error_when_admission_closes():
     class UnavailableSettings:
-        def save_settings(self, revision, order):
+        def save_settings(self, revision, order, completed):
             raise CatalogError("settings_unavailable")
 
     with RunningServer(
@@ -604,7 +645,9 @@ def test_application_settings_put_returns_safe_error_when_admission_closes():
             port,
             "PUT",
             "/api/settings",
-            body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
+            body=json.dumps(
+                {"revision": "opaque", "order": ["Queue"], "completed": ["Queue"]}
+            ),
         )
 
     assert status == 503
@@ -632,7 +675,11 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                 first = json.loads(body)
                 assert status == 200
                 assert content_type == "application/json"
-                assert first == {"order": [], "revision": initial.revision}
+                assert first == {
+                    "order": [],
+                    "completed": [],
+                    "revision": initial.revision,
+                }
                 assert str(specification_root) not in body.decode("utf-8")
 
                 status, _, body = request(
@@ -640,7 +687,11 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                     "PUT",
                     "/api/settings",
                     body=json.dumps(
-                        {"revision": first["revision"], "order": ["Queue"]}
+                        {
+                            "revision": first["revision"],
+                            "order": ["Queue"],
+                            "completed": ["Queue"],
+                        }
                     ),
                 )
                 saved = json.loads(body)
@@ -659,7 +710,11 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                         "PUT",
                         "/api/settings",
                         body=json.dumps(
-                            {"revision": first["revision"], "order": ["Archive"]}
+                            {
+                                "revision": first["revision"],
+                                "order": ["Archive"],
+                                "completed": ["Archive"],
+                            }
                         ),
                     )
                 assert status == 409
@@ -672,7 +727,11 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                         "PUT",
                         "/api/settings",
                         body=json.dumps(
-                            {"revision": saved["revision"], "order": invalid_order}
+                            {
+                                "revision": saved["revision"],
+                                "order": invalid_order,
+                                "completed": [],
+                            }
                         ),
                     )
                     assert status == 400
@@ -684,7 +743,11 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                         "PUT",
                         "/api/settings",
                         body=json.dumps(
-                            {"revision": saved["revision"], "order": ["Done"]}
+                            {
+                                "revision": saved["revision"],
+                                "order": ["Done"],
+                                "completed": ["Done"],
+                            }
                         ),
                     )
                 assert status == 500
@@ -702,6 +765,7 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
             assert status == 200
             assert json.loads(body) == {
                 "order": ["Queue"],
+                "completed": ["Queue"],
                 "revision": state.configuration_revision(paths),
             }
         finally:
@@ -748,6 +812,7 @@ def test_real_application_settings_http_revalidates_after_commit_verification_fa
                             {
                                 "revision": initial.revision,
                                 "order": ["Queue", "Done"],
+                                "completed": ["Done"],
                             }
                         ),
                     )
