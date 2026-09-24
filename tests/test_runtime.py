@@ -268,7 +268,9 @@ def test_daemon_rechecks_shared_deadline_after_configuration_admission():
                 daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 300_000_000)
             with patch.object(
                 state, "_lstat", side_effect=delayed_admission_lookup
-            ), patch.object(runtime, "create_server") as create_server, pytest.raises(
+            ), patch.object(
+                daemon.application, "_server_factory"
+            ) as create_server, pytest.raises(
                 runtime.UnhealthyInstanceError, match="deadline expired"
             ):
                 daemon.start()
@@ -311,9 +313,11 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 20_000_000
                 )
-            with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=False):
+            with patch.object(
+                daemon.application, "_server_factory", return_value=Server()
+            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=False
+            ):
                 assert daemon.run() == 25
         finally:
             try:
@@ -447,10 +451,14 @@ def test_public_start_reports_sanitized_detached_child_failure():
         paths, home, _ = _fixture(root)
         environment = _subprocess_environment(home, root / "site")
         script = (
-            "import errno, runpy; from nyx import server\n"
+            "import errno, runpy; from nyx import app_runtime\n"
             "def fail(**kwargs):\n"
             "    raise OSError(errno.EADDRINUSE, 'private-child-detail')\n"
-            "server.create_server=fail\n"
+            "class FailingApplicationRuntime(app_runtime.ApplicationRuntime):\n"
+            "    def __init__(self, **kwargs):\n"
+            "        super().__init__(**kwargs)\n"
+            "        self._server_factory=fail\n"
+            "app_runtime.ApplicationRuntime=FailingApplicationRuntime\n"
             "runpy.run_module('nyx.runtime', run_name='__main__')\n"
         )
         with patch.dict(os.environ, environment), patch.object(
@@ -611,9 +619,11 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 5_000_000_000
                 )
-            with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            with patch.object(
+                daemon.application, "_server_factory", return_value=Server()
+            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=True
+            ), patch.object(
                 daemon, "_bind_control", return_value=Control()
             ), patch.object(
                 runtime,
@@ -641,7 +651,7 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
 
 
 def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owner():
-    created: list[tuple[object, int]] = []
+    created: list[tuple[object, int, object]] = []
 
     class Server:
         def serve_forever(self):
@@ -677,8 +687,8 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
         def is_alive(self):
             return False
 
-    def make_server(*, provider, port):
-        created.append((provider, port))
+    def make_server(*, provider, port, settings_provider):
+        created.append((provider, port, settings_provider))
         return Server()
 
     with TemporaryDirectory() as temporary:
@@ -689,9 +699,11 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 5_000_000_000
                 )
-            with patch.object(runtime, "create_server", side_effect=make_server), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            with patch.object(
+                daemon.application, "_server_factory", side_effect=make_server
+            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=True
+            ), patch.object(
                 daemon, "_bind_control", return_value=Control()
             ), patch.object(
                 runtime,
@@ -705,9 +717,10 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
             os.close(lease_fd)
 
     assert len(created) == 1
-    provider, port = created[0]
+    provider, port, settings_provider = created[0]
     assert port == runtime.PORT
     assert getattr(provider, "__self__", None) is daemon.application
+    assert settings_provider is daemon.application
     assert daemon.application.server is daemon.server
     assert daemon.application.workers is daemon.workers
     assert daemon.application.catalog_admitted is False
@@ -774,9 +787,11 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
         ):
             daemon._provider()
         fetch.assert_not_called()
-        with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-            runtime.threading, "Thread", Thread
-        ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+        with patch.object(
+            daemon.application, "_server_factory", return_value=Server()
+        ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+            daemon, "_static_ready", return_value=True
+        ), patch.object(
             daemon, "_bind_control", return_value=Control()
         ), patch.object(
             runtime,
@@ -1678,11 +1693,11 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
         assert lease.fd is not None
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 50_000_000)
-        with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-            daemon, "_static_ready", return_value=True
-        ), patch.object(daemon, "_bind_control", return_value=Control()), patch.object(
-            daemon, "_serve_control", return_value=None
-        ), patch.object(
+        with patch.object(
+            daemon.application, "_server_factory", return_value=Server()
+        ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            daemon, "_bind_control", return_value=Control()
+        ), patch.object(daemon, "_serve_control", return_value=None), patch.object(
             runtime,
             "_send_control",
             return_value={"status": "ready", "url": runtime.URL},
