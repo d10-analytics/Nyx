@@ -1289,9 +1289,10 @@ def rail_failure_context(result, predicate):
 
 
 def assert_readable_arrows(page):
-    results = page.locator(".rail").evaluate_all("""paths => paths.map(path => {
-      const svg = path.ownerSVGElement;
+    results = page.evaluate("""() => {
       const board = document.querySelector('#board');
+      const svg = board.querySelector(':scope > .rail-layer');
+      return [...svg.querySelectorAll('.rail')].map(path => {
       const boardViewport = board.getBoundingClientRect();
       const svgViewport = svg.getBoundingClientRect();
       const svgStyle = getComputedStyle(svg);
@@ -1337,7 +1338,7 @@ def assert_readable_arrows(page):
             sample.y > r.top && sample.y < r.bottom)) intersects = true;
       }
       const markerId = path.getAttribute('marker-end').slice(5, -1);
-      const marker = document.getElementById(markerId);
+      const marker = svg.querySelector(`marker[id="${markerId}"]`);
       const arrowShape = marker.querySelector('path').getAttribute('d');
       const arrowTipAtEnd = marker.refX.baseVal.value === marker.viewBox.baseVal.width;
       const arrowWidth = marker.markerWidth.baseVal.value;
@@ -1425,7 +1426,8 @@ def assert_readable_arrows(page):
           },
         },
       };
-    })""")
+      });
+    }""")
     for result in results:
         assert result["leavesSource"], rail_failure_context(result, "leavesSource")
         assert result["entersDependent"], rail_failure_context(result, "entersDependent")
