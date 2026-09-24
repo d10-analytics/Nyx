@@ -1969,7 +1969,8 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
             before = snapshot()
             lease_before = _native_claim._identity(os.fstat(lease.fd))
             original_admit_directory = state._admit_directory
-            original_monotonic = runtime.time.monotonic
+            startup_timeout = 0.01
+            clock_ns = 1_000_000_000_000
             configuration_admitted = False
             deadline_checked_after_admission = False
 
@@ -1987,24 +1988,35 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
                     configuration_admitted = True
                 return result
 
-            def monotonic_after_configuration_admission():
+            def controlled_clock_ns():
+                if configuration_admitted:
+                    return clock_ns + int(startup_timeout * 1_000_000_000) + 1
+                return clock_ns
+
+            def controlled_monotonic_ns():
+                return controlled_clock_ns()
+
+            def controlled_monotonic():
                 nonlocal deadline_checked_after_admission
-                value = original_monotonic()
+                value = controlled_clock_ns()
                 if configuration_admitted:
                     deadline_checked_after_admission = True
-                    return value + 3600
-                return value
+                return value / 1_000_000_000
 
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
-                runtime, "STARTUP_TIMEOUT", 0.01
+                runtime, "STARTUP_TIMEOUT", startup_timeout
             ), patch.object(
                 state,
                 "_admit_directory",
                 side_effect=admitting_configuration,
             ), patch.object(
                 runtime.time,
+                "monotonic_ns",
+                side_effect=controlled_monotonic_ns,
+            ), patch.object(
+                runtime.time,
                 "monotonic",
-                side_effect=monotonic_after_configuration_admission,
+                side_effect=controlled_monotonic,
             ), patch.object(
                 state, "_save_configuration", wraps=state._save_configuration
             ) as save_configuration, pytest.raises(
