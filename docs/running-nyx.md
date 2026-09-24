@@ -113,8 +113,10 @@ canonical inventory order. A hidden or absent saved stage name stays in the edit
 as a retained literal, marked as unavailable, but it produces no board row. A new
 eligible stage that is not yet saved follows the saved names and is appended in
 canonical inventory order. If the settings service cannot load, the board remains
-usable in canonical inventory order and reports the problem so you can retry; a
-failed Save likewise leaves the prior saved order in place.
+usable in canonical inventory order and shows **Reload board row order** so you
+can retry. A conflict or reload-needed Save requires that reload, which replaces
+the unsaved draft with the current saved order. Any other failed Save leaves the
+prior saved order and unsaved draft in place so you can retry.
 
 ## Windows and macOS: the private desktop application
 

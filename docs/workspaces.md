@@ -205,8 +205,10 @@ you save them. Saved names remain literal even when their stage is hidden or
 absent; they retain their place for a later return but do not produce a row while
 hidden or absent. If loading account settings fails, no saved order is available,
 so the board uses canonical inventory order and reports the problem for retry.
-If Save fails, the board keeps displaying the prior saved order and retains the
-unsaved editor draft so you can retry.
+Choose **Reload board row order** to retry. A conflict or reload-needed Save
+requires that reload, which replaces the stale unsaved draft with the current
+saved order. For other Save failures: If Save fails, the board keeps displaying
+the prior saved order and retains the unsaved editor draft so you can retry.
 Changing row order never renames or moves a project, stage, or work item
 directory, and never changes completion, approval, claims, prerequisites,
 dependencies, or execution behavior.
