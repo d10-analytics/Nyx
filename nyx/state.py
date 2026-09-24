@@ -637,6 +637,10 @@ def _configuration_from_payload(payload: Any) -> Configuration:
         raw_completed_stages = payload.get("completed_stages", {})
         if not isinstance(raw_completed_stages, dict):
             raise ConfigurationError("Nyx configuration completed stages are invalid")
+        if any(not isinstance(root, str) for root in raw_completed_stages):
+            raise ConfigurationError("Nyx configuration completed stages are invalid")
+        if list(raw_completed_stages) != sorted(raw_completed_stages):
+            raise ConfigurationError("Nyx configuration completed stages are not canonical")
         if any(not isinstance(names, list) for names in raw_completed_stages.values()):
             raise ConfigurationError("Nyx configuration completed stages are invalid")
         try:
