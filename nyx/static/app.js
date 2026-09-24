@@ -22,6 +22,20 @@
     "target_unreadable", "target_changed_during_read", "target_invalid_identity",
     "invalid_prerequisite", "self_edge",
   ]);
+  const CLAIM_EDGE_REASONS = new Set([
+    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
+    "invalid_claim", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable",
+    "target_changed_during_read", "target_invalid_identity", "self_edge",
+    "invalid_prerequisite",
+  ]);
+  const COMPLETION_EDGE_REASONS = new Set([
+    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
+    "completion_policy_invalid", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable",
+    "target_changed_during_read", "target_invalid_identity", "self_edge",
+    "invalid_prerequisite",
+  ]);
   // These fields remain part of the wire contract and searchable index. They
   // are intentionally not all ordinary visible details.
   const DECLARED_FIELDS = [
@@ -731,14 +745,22 @@
     const programTitle = entry.relationship.program.title;
     const context = (targetProject ? `<dt>Target project</dt><dd>${text(targetProject)}</dd>` : "") +
       (programTitle ? `<dt>Program</dt><dd>${text(programTitle)}</dd>` : "");
-    // Claims remain distinct in the details view even when they share a target.
+    // Keep every relationship visible even when several edges share a target.
     const prerequisites = (entry.relationship.prerequisites || []).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
-      return '<li class="prerequisite-claim">' +
-        `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span> · ` +
-        `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
-        `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
-        `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
+      const targetHtml = `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span>`;
+      if (edge.kind === "claim") {
+        return '<li class="prerequisite-claim prerequisite-claim-kind">' +
+          `${targetHtml} · ` +
+          `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
+          `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
+          `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
+      }
+      return '<li class="prerequisite-claim prerequisite-completion">' +
+        `${targetHtml} · ` +
+        `<span class="completion-kind">Whole-item completion</span> · ` +
+        `<span class="observed-stage">Observed stage: ${text(edge.observed_stage)}</span> · ` +
+        `<span class="completion-reason">Reason: ${text(edge.reason)}</span></li>`;
     });
     const dependency = dependencyIndicator(entry);
     const dependencySummary = dependency ? dependency.label : "No direct prerequisites";
@@ -870,14 +892,24 @@
     protocol(value.claims.every((claim, index) => index === 0 || claim.name >= value.claims[index - 1].name));
     protocol(Array.isArray(value.prerequisites));
     value.prerequisites.forEach((edge) => {
-      protocol(exactKeys(edge, ["claim_name", "observed_evidence_ref", "observed_state",
-        "reason", "resolved_state", "target_package_id"]));
-      uuid(edge.target_package_id, true);
-      protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
-      protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
-      provenance(edge.observed_evidence_ref, true);
+      protocol(typeof edge.kind === "string");
+      if (edge.kind === "claim") {
+        protocol(exactKeys(edge, ["kind", "claim_name", "observed_evidence_ref", "observed_state",
+          "reason", "resolved_state", "target_package_id"]));
+        uuid(edge.target_package_id, true);
+        protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
+        protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
+        provenance(edge.observed_evidence_ref, true);
+        protocol(CLAIM_EDGE_REASONS.has(edge.reason));
+      } else if (edge.kind === "completion") {
+        protocol(exactKeys(edge, ["kind", "observed_stage", "reason", "resolved_state", "target_package_id"]));
+        uuid(edge.target_package_id, true);
+        protocol(edge.observed_stage === null || component(edge.observed_stage));
+        protocol(COMPLETION_EDGE_REASONS.has(edge.reason));
+      } else {
+        protocol(false);
+      }
       protocol(["satisfied", "unsatisfied", "unknown"].includes(edge.resolved_state));
-      protocol(typeof edge.reason === "string" && edge.reason.length > 0);
     });
     protocol(exactKeys(value.program, ["diagnostics", "program_id", "resolution", "title"]));
     uuid(value.program.program_id, true);
