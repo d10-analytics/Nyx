@@ -113,7 +113,11 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "Reset",
         "Unlisted eligible stages",
         "hidden or absent",
-        "falls back to canonical inventory order",
+        "If loading account settings fails, no saved order is available, "
+        "so the board uses canonical inventory order",
+        "reports the problem for retry",
+        "If Save fails, the board keeps displaying the prior saved order "
+        "and retains the unsaved editor draft",
         "never renames or moves",
     ),
 }
@@ -166,10 +170,18 @@ def test_documents_publish_the_private_desktop_guidance():
 
 
 def test_documents_publish_the_saved_stage_order_contract():
+    normalized_documents = {}
     for name, markers in STAGE_ORDER_GUIDANCE_MARKERS.items():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        normalized_documents[name] = document
         for marker in markers:
             assert marker in document, (name, marker)
+
+    obsolete_fallback = (
+        "If loading or saving account settings fails, the board falls back to "
+        "canonical inventory order and keeps the last saved order unchanged."
+    )
+    assert obsolete_fallback not in normalized_documents["docs/workspaces.md"]
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):

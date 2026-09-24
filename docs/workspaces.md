@@ -203,8 +203,10 @@ another. **Move up** and **Move down** change the draft; **Save** persists it,
 order. Unlisted eligible stages are appended in canonical inventory order until
 you save them. Saved names remain literal even when their stage is hidden or
 absent; they retain their place for a later return but do not produce a row while
-hidden or absent. If loading or saving account settings fails, the board falls
-back to canonical inventory order and keeps the last saved order unchanged.
+hidden or absent. If loading account settings fails, no saved order is available,
+so the board uses canonical inventory order and reports the problem for retry.
+If Save fails, the board keeps displaying the prior saved order and retains the
+unsaved editor draft so you can retry.
 Changing row order never renames or moves a project, stage, or work item
 directory, and never changes completion, approval, claims, prerequisites,
 dependencies, or execution behavior.
