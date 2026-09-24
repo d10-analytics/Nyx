@@ -161,6 +161,14 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
+EVENT_COMPLETION_EXAMPLE = (
+    "# Organize the neighborhood festival\n"
+    "Package ID: 123e4567-e89b-42d3-a456-426614174100\n"
+    "Status: planning\n"
+    "Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102\n"
+    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed\n"
+    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved"
+)
 _START_TIMEOUT = 90.0
 
 
@@ -229,6 +237,14 @@ def test_documents_publish_the_explicit_completion_contract():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
         for marker in markers:
             assert marker in document, (name, marker)
+
+
+def test_event_walkthrough_shows_whole_item_and_named_outcomes():
+    document = (REPOSITORY_ROOT / "docs" / "workspaces.md").read_text(encoding="utf-8")
+    assert EVENT_COMPLETION_EXAMPLE in document
+    assert "event plan's whole-item requirement" in document
+    assert "literal `Done` stage" in document
+    assert "separate named outcomes" in document
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
