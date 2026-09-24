@@ -40,6 +40,7 @@ The event plan can use the same metadata fields as a software specification:
 # Organize the neighborhood festival
 Package ID: 123e4567-e89b-42d3-a456-426614174100
 Status: planning
+Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102
 Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
 Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 
@@ -47,6 +48,12 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 
 Coordinate volunteers, food, music, and a safe public event.
 ```
+
+The completion row is the event plan's whole-item requirement: it becomes
+satisfied only when this workspace explicitly marks the literal `Done` stage as
+finished. The two `Prerequisite` rows remain separate named outcomes with their
+own recorded claim and evidence state, so the event can show both a completed
+permit item and the individual outcomes it provides.
 
 The complete disposable fixture used by the checked-in captures adds these
 fictional files:
