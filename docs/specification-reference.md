@@ -19,6 +19,7 @@ Put metadata in that header, one field per line.
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
 | `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
+| `Completion Prerequisite: UUID` | A whole-item requirement satisfied only when the target's literal stage is in this workspace's explicit completed-stage policy. |
 | `Superseded By: UUID` | Optional reference to a replacement specification. |
 
 ## File syntax and displayed terms
@@ -106,6 +107,19 @@ Prerequisite: 55555555-5555-4555-8555-555555555555 | contract-ready
 This points to the API contract in the [sample workspace](../examples/sample-specifications/README.md).
 In your workspace, replace the ID and claim name with those of the outcome you need.
 
+For a whole-item completion requirement, use the distinct header below and no
+claim name:
+
+```text
+Completion Prerequisite: 55555555-5555-4555-8555-555555555555
+```
+
+`Completion Prerequisite: UUID` is the one exact completion grammar. A one-part
+`Prerequisite: UUID` is not an alternate spelling and remains invalid. Keep
+`Prerequisite: UUID | claim-name` for named outcomes; the two relationships may
+appear together on one dependent item. Completion never uses a magic claim name,
+does not rewrite claim state, and does not verify the claim's evidence.
+
 Progress and dependency information comes from your specification files. A card
 with declared direct prerequisites shows **Dependencies satisfied**, **Waiting on
 dependencies**, **Dependencies unknown**, or **Dependencies unavailable**. A
@@ -115,6 +129,14 @@ does not imply implementation approval or completion. Missing, ambiguous, or
 malformed information can leave a relationship unknown or unavailable; it is not
 treated as satisfied. Moving a work item to `Done` does not satisfy its claims
 automatically.
+
+The completion policy is configured in the collapsed **Board settings** panel by
+selecting literal stage names beside **Counts as finished**. It is saved per
+canonical workspace root and can include hidden or temporarily absent names.
+Without a configured policy, a completion dependency is **unknown** with an
+actionable configuration explanation. Row order, hidden status, stage spelling,
+`Cancelled`, and `Archive` do not infer completion. A completed stage is a
+recorded workflow assertion rather than evidence verification.
 
 ## Programs
 

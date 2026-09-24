@@ -89,6 +89,17 @@ already running with a different setup, stop it before changing the account-loca
 settings. See [running Nyx](docs/running-nyx.md) for status and configuration
 options.
 
+Simple completion dependencies use an explicit `Completion Prerequisite: UUID`
+header and a literal set of stage names that you choose in **Board settings**.
+For example, selecting `Done` makes a work item in the literal `Done` stage
+count as finished for this workspace. Nyx does not infer completion from a row
+name, row order, hidden status, cancellation, or Archive, and it never treats a
+completed stage as evidence verification. The setting is saved in the
+account-local configuration for the current workspace root, so another root can
+use a different policy and returning to this root restores its own choice.
+Named outcomes still use `Prerequisite: UUID | claim-name` and keep their own
+claim and evidence semantics.
+
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor
 migrated, and Nyx does not copy, remove, or fall back to it. Stop Nyx with your

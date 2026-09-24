@@ -118,6 +118,18 @@ can retry. A conflict or reload-needed Save requires that reload, which replaces
 the unsaved draft with the current saved order. Any other failed Save leaves the
 prior saved order and unsaved draft in place so you can retry.
 
+The same collapsed **Board settings** panel also lists **Counts as finished**
+beside every literal stage name. Select the stages whose names define whole-item
+completion, then choose **Save** to persist the row order and completion policy
+together. **Cancel** drops both kinds of unsaved change; **Reset** clears the
+current root's row order and completed-stage set. Hidden stages and saved names
+that are temporarily absent remain available in the panel as literal settings,
+marked as unavailable when appropriate. If settings cannot be loaded, choose
+**Reload board settings** to retry. After a successful save, Nyx refreshes the
+catalog only when its configuration revision matches the saved settings before
+showing changed dependency results; a conflict or failed refresh keeps the last
+valid board and tells you to reload or retry.
+
 ## Windows and macOS: the private desktop application
 
 The desktop application is a self-contained build; it does not require users to
@@ -191,6 +203,14 @@ and diagnostics. A hidden prerequisite can still appear in those details.
 Nyx checks for changed information every ten seconds. **Apply update** loads the
 waiting snapshot; **Refresh view** requests an immediate check when no update is
 waiting. Changes are not applied automatically while you are reading a snapshot.
+
+An explicit completion policy affects only whole-item `Completion Prerequisite`
+relationships. Moving a work item into a selected stage can satisfy that
+relationship; moving it out reopens it. Hidden completed targets remain available
+as dependency context, and the details identify whole-item completion separately
+from a named outcome. No stage is completed automatically because it is called
+`Done`, `Cancelled`, or `Archive`, and a completed stage is a recorded workflow
+assertion rather than evidence verification.
 
 The **Hide empty rows and columns** checkbox starts checked. It compacts only
 the currently displayed catalog, and its value is persisted in browser local

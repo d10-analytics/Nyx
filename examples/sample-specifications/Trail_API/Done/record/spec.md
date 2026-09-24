@@ -11,3 +11,7 @@ not its implementation: contract-ready is satisfied, while implementation-ready
 remains unsatisfied. Its stage does not make every claim satisfied.
 
 The repeated-f hash is fictional evidence for this demonstration only.
+The API contract is in the literal `Done` stage, so it can satisfy the web
+feature's whole-item completion prerequisite only when the workspace explicitly
+marks `Done` as a completed stage. That setting is separate from this item's
+named claims and does not turn the fictional evidence into verified proof.
