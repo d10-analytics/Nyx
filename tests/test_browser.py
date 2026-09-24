@@ -995,7 +995,7 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     ).wait_for()
     assert settings.get_calls == 1
     assert page.get_by_role("button", name="Save").is_disabled()
-    retry = page.get_by_role("button", name="Reload board row order")
+    retry = page.get_by_role("button", name="Reload board settings")
     assert retry.is_visible()
 
     retry.click()
@@ -1027,7 +1027,7 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
     assert stale_page.get_by_role("button", name="Save").is_disabled()
-    reload = stale_page.get_by_role("button", name="Reload board row order")
+    reload = stale_page.get_by_role("button", name="Reload board settings")
     assert reload.is_visible()
 
     reload.click()
@@ -1064,7 +1064,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
     assert stale_page.get_by_role("button", name="Save").is_disabled()
-    assert stale_page.get_by_role("button", name="Reload board row order").is_visible()
+    assert stale_page.get_by_role("button", name="Reload board settings").is_visible()
 
     settings.fail_next = True
     winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
