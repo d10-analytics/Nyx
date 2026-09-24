@@ -1090,13 +1090,14 @@
   }
 
   function apply(snapshot) {
+    const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
+    const retainDraft = priorEditor.length > 0 && hasUnsavedStageOrder();
     displayed = snapshot;
     pending = null;
     refreshFailure = null;
     setPending(false);
-    const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
     editorStageOrder = [...new Set([
-      ...(hasUnsavedStageOrder() ? priorEditor : editorNames(snapshot)),
+      ...(retainDraft ? priorEditor : editorNames(snapshot)),
       ...canonicalStageNames(snapshot),
     ])];
     if (selectedPath && !snapshot.entries.some((entry) =>
