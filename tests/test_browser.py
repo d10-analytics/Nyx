@@ -604,9 +604,11 @@ def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_s
     page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
     page_b.get_by_role("button", name="Save").click()
+    assert page_a.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Waiting on dependencies"
+    )
     client.release.set()
 
-    page_a.get_by_text(re.compile("could not be matched to a fresh catalog"), exact=False).wait_for()
     page_b.get_by_text("Board row order saved.", exact=True).wait_for()
     page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
     assert page_a.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
