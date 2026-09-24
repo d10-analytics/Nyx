@@ -789,6 +789,7 @@ def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_pag
     winning_page.get_by_role("button", name="Save").click()
     winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
+    assert row_labels(winning_page) == ["Under Development", "Queue"]
 
     stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
     stale_page.get_by_role("button", name="Save").click()
@@ -803,6 +804,13 @@ def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_pag
         "Save failed: the board row order was not persisted.", exact=True
     ).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
+    assert row_labels(winning_page) == ["Under Development", "Queue"]
+    assert winning_page.locator(
+        "#stage-order-list .stage-order-item"
+    ).evaluate_all("items => items.map(item => item.dataset.stage)") == [
+        "Queue",
+        "Under_Development",
+    ]
     assert winning_page.get_by_role("button", name="Save").is_enabled()
 
 
