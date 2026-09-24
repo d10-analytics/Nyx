@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import threading
 import time
@@ -496,6 +497,12 @@ def row_labels(page):
     )
 
 
+def stage_editor_order(page):
+    return page.locator("#stage-order-list .stage-order-item").evaluate_all(
+        "items => items.map(item => item.dataset.stage)"
+    )
+
+
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
     assert page.locator(".column-head").all_inner_texts() == ["Alpha", "Beta"]
@@ -726,6 +733,9 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     page.get_by_role("button", name="Refresh view").click()
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
+    assert page.get_by_role("button", name="Save").is_disabled()
+    assert settings.calls == []
     page.get_by_role("button", name="Refresh view").click()
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
     assert row_labels(page) == ["Under Development", "Review"]
@@ -736,6 +746,9 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     )
     assert row_labels(page) == ["Queue", "Under Development"]
     assert page.locator("[data-lifecycle='Review']").count() == 0
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    assert page.get_by_role("button", name="Save").is_disabled()
+    assert settings.calls == []
     page.get_by_role("button", name="Refresh view").click()
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
@@ -746,6 +759,40 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
     assert settings.order == ["Queue", "Under_Development"]
+
+
+def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
+    first = json.loads(board_payload())
+    added = json.loads(board_payload())
+    _admit_inventory_stage(added, "Alpha", "Review")
+    added["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    added["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(added)
+    removed = json.loads(board_payload())
+    settings = BrowserSettings(order=["Queue", "Under_Development"])
+    page = open_page(SequenceClient([first, added, removed]), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
+    page.get_by_role("button", name="Move Review up").press("Enter")
+    assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
+    assert page.get_by_role("button", name="Save").is_enabled()
+    assert settings.calls == []
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
+    assert "not currently available" in page.locator(
+        "#stage-order-list .stage-order-item[data-stage='Review']"
+    ).inner_text()
+    assert page.get_by_role("button", name="Save").is_enabled()
+    assert settings.calls == []
 
 
 def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
@@ -1163,10 +1210,29 @@ def connection_pairs(page):
     }
 
 
+def rail_failure_context(result, predicate):
+    diagnostic = dict(result["diagnostic"])
+    diagnostic["predicate"] = predicate
+    diagnostic["runner"] = {
+        "githubActions": os.environ.get("GITHUB_ACTIONS"),
+        "runnerName": os.environ.get("RUNNER_NAME"),
+        "runnerOS": os.environ.get("RUNNER_OS"),
+        "runnerArch": os.environ.get("RUNNER_ARCH"),
+        "imageOS": os.environ.get("ImageOS"),
+        "imageVersion": os.environ.get("ImageVersion"),
+    }
+    return f"rail assertion failed: {json.dumps(diagnostic, sort_keys=True)}"
+
+
 def assert_readable_arrows(page):
     results = page.locator(".rail").evaluate_all("""paths => paths.map(path => {
       const matrix = path.getScreenCTM();
       const at = length => path.getPointAtLength(length).matrixTransform(matrix);
+      const point = value => ({x: value.x, y: value.y});
+      const rectangle = value => ({
+        left: value.left, top: value.top, right: value.right, bottom: value.bottom,
+        width: value.width, height: value.height,
+      });
       const length = path.getTotalLength();
       const start = at(0), end = at(length), beforeEnd = at(length - 1);
       const cards = [...document.querySelectorAll('.card:not([hidden])')];
@@ -1194,16 +1260,60 @@ def assert_readable_arrows(page):
         arrowTipAtEnd: marker.refX.baseVal.value === marker.viewBox.baseVal.width,
         arrowWidth: marker.markerWidth.baseVal.value,
         strokeWidth: parseFloat(getComputedStyle(path).strokeWidth),
+        diagnostic: {
+          edge: {
+            source: path.parentNode.dataset.source,
+            dependent: path.parentNode.dataset.dependent,
+          },
+          path: {
+            d: path.getAttribute('d'), length,
+            start: point(start), beforeEnd: point(beforeEnd), end: point(end),
+          },
+          rectangles: {source: rectangle(source), dependent: rectangle(dependent)},
+          browser: {userAgent: navigator.userAgent, platform: navigator.platform},
+          viewport: {
+            width: window.innerWidth, height: window.innerHeight,
+            devicePixelRatio: window.devicePixelRatio,
+          },
+          evaluation: {
+            performanceNow: performance.now(), readyState: document.readyState,
+            visibilityState: document.visibilityState,
+            fontsStatus: document.fonts ? document.fonts.status : 'unsupported',
+          },
+        },
       };
     })""")
     for result in results:
-        assert result["leavesSource"]
-        assert result["entersDependent"]
-        assert not result["intersects"]
-        assert result["arrowShape"] == "M0 0L10 5L0 10Z"
-        assert result["arrowTipAtEnd"]
-        assert result["arrowWidth"] >= 10
-        assert result["strokeWidth"] >= 2.5
+        assert result["leavesSource"], rail_failure_context(result, "leavesSource")
+        assert result["entersDependent"], rail_failure_context(result, "entersDependent")
+        assert not result["intersects"], rail_failure_context(result, "avoidsObstacles")
+        assert result["arrowShape"] == "M0 0L10 5L0 10Z", rail_failure_context(
+            result, "arrowShape"
+        )
+        assert result["arrowTipAtEnd"], rail_failure_context(result, "arrowTipAtEnd")
+        assert result["arrowWidth"] >= 10, rail_failure_context(result, "arrowWidth")
+        assert result["strokeWidth"] >= 2.5, rail_failure_context(result, "strokeWidth")
+
+
+def test_readable_arrow_failures_report_context_only_on_failure(open_page, capsys):
+    page = open_page(StaticClient(board_payload()))
+    assert_readable_arrows(page)
+    passing_output = capsys.readouterr()
+    assert passing_output.out == ""
+    assert passing_output.err == ""
+
+    page.locator(".rail").first.evaluate(
+        "path => path.setAttribute('d', 'M 0 0 L 1 1')"
+    )
+    with pytest.raises(AssertionError) as failure:
+        assert_readable_arrows(page)
+    message = str(failure.value)
+    for field in (
+        "leavesSource", "edge", "source", "dependent", "path", "start", "end",
+        "rectangles", "browser", "runner", "runnerOS", "viewport", "devicePixelRatio",
+        "evaluation", "performanceNow", "readyState", "fontsStatus",
+    ):
+        assert field in message
 
 
 def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(open_page):
