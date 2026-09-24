@@ -443,6 +443,22 @@ class RawSequenceClient:
         return RawCatalog(payload)
 
 
+class BlockingRawSequenceClient(RawSequenceClient):
+    """Delay one deliberately malformed wire snapshot for an interim-state assertion."""
+
+    def __init__(self, payloads, blocked_call=2):
+        super().__init__(payloads)
+        self.blocked_call = blocked_call
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def fetch_catalog(self):
+        if self.calls == self.blocked_call - 1:
+            self.started.set()
+            self.release.wait(timeout=10)
+        return super().fetch_catalog()
+
+
 class BrowserSettings:
     """Small application-settings seam used by the browser behavior tests."""
 
@@ -644,7 +660,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
     fresh = dependency_state_payload("unknown")
     fresh["configuration_revision"] = "revision-2"
     fresh["catalog_digest"] = canonical_digest(fresh)
-    client = RawSequenceClient([valid, bad, fresh])
+    client = BlockingRawSequenceClient([valid, bad, fresh])
     settings = BrowserSettings()
 
     from nyx import server as server_module
@@ -657,40 +673,6 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         page = open_page(client, settings=settings)
         page.locator("#stage-order-editor").wait_for()
         open_stage_editor(page)
-        page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-        page.get_by_role("button", name="Save").click()
-        page.wait_for_function(
-            "() => document.querySelector('.dependency-indicator')?.textContent === 'Dependencies unknown'",
-            timeout=15000,
-        )
-
-    assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
-        "Dependencies unknown"
-    )
-
-
-def test_invalid_post_save_catalog_keeps_last_accepted_board_until_recovery(open_page):
-    valid = dependency_state_payload("unsatisfied")
-    invalid = dependency_state_payload("satisfied")
-    invalid["configuration_revision"] = None
-    invalid["catalog_digest"] = canonical_digest(invalid)
-    fresh = dependency_state_payload("unknown")
-    fresh["configuration_revision"] = "revision-2"
-    fresh["catalog_digest"] = canonical_digest(fresh)
-    client = BlockingSequenceClient([valid, invalid, fresh], blocked_call=2)
-    settings = BrowserSettings()
-
-    from nyx import server as server_module
-
-    def passthrough_catalog(candidate):
-        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
-        page = open_page(client, settings=settings)
-        page.locator("#stage-order-editor").wait_for()
-        open_stage_editor(page)
-        page.locator(f'.card[data-package-id="{GATE}"]').click()
         page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
         page.get_by_role("button", name="Save").click()
         assert client.started.wait(timeout=5)
@@ -702,6 +684,10 @@ def test_invalid_post_save_catalog_keeps_last_accepted_board_until_recovery(open
             "() => document.querySelector('.dependency-indicator')?.textContent === 'Dependencies unknown'",
             timeout=15000,
         )
+
+    assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Dependencies unknown"
+    )
 
 
 def coherent_refresh_payload():
@@ -752,6 +738,9 @@ def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_p
     page.get_by_role("button", name="Save").click()
     assert client.started.wait(timeout=5)
     settings.switch_root()
+    assert page.locator(f'.card[data-package-id="{GATE}"] .dependency-indicator').inner_text() == (
+        "Waiting on dependencies"
+    )
     assert page.locator("#stage-order-list .stage-order-item[data-stage='Under_Development']").locator(
         ".stage-completed-toggle"
     ).is_checked()
