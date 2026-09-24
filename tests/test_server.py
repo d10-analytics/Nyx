@@ -805,6 +805,7 @@ def test_real_application_settings_http_revalidates_after_commit_verification_fa
                             {
                                 "revision": initial.revision,
                                 "order": ["Queue", "Done"],
+                                "completed": ["Done"],
                             }
                         ),
                     )

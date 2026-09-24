@@ -1142,6 +1142,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 assert first_status == 200
                 assert first == {
                     "order": [],
+                    "completed": [],
                     "revision": state.configuration_revision(paths),
                 }
 
@@ -1150,11 +1151,13 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                     {
                         "revision": first["revision"],
                         "order": ["Done", "Queue"],
+                        "completed": ["Done"],
                     },
                 )
                 assert saved_status == 200
                 assert saved["outcome"] == "success"
                 assert saved["order"] == ["Done", "Queue"]
+                assert saved["completed"] == ["Done"]
                 assert saved["revision"] == state.configuration_revision(paths)
 
                 assert runtime.stop() == "stopped"
@@ -1167,6 +1170,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 assert restarted_status == 200
                 assert restarted == {
                     "order": ["Done", "Queue"],
+                    "completed": ["Done"],
                     "revision": state.configuration_revision(paths),
                 }
 
