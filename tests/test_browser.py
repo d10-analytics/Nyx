@@ -1292,8 +1292,8 @@ def assert_readable_arrows(page):
         rootAtBoardOrigin: svgViewport.left === boardViewport.left &&
           svgViewport.top === boardViewport.top,
         zeroOriginViewBox: viewBox.x === 0 && viewBox.y === 0,
-        viewBoxMatchesLayerDimensions: viewBox.width === parseFloat(svgStyle.width) &&
-          viewBox.height === parseFloat(svgStyle.height),
+        viewBoxMatchesLayerDimensions: viewBox.width === svgViewport.width &&
+          viewBox.height === svgViewport.height,
         endpointsMeetCards: Math.abs(mappedStart.x - sourceViewport.left) < 2 &&
           mappedStart.y > sourceViewport.top && mappedStart.y < sourceViewport.bottom &&
           mappedEnd.x < dependentViewport.left &&
