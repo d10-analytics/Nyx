@@ -36,12 +36,24 @@ def _declared(title, project):
 
 def _edge(target_id, name):
     return {
+        "kind": "claim",
         "target_package_id": target_id,
         "claim_name": name,
         "observed_state": "unsatisfied",
         "observed_evidence_ref": None,
         "resolved_state": "unsatisfied",
         "reason": "claim_unsatisfied",
+    }
+
+
+def _completion_edge(target_id, *, observed_stage=None, resolved_state="unknown",
+                     reason="completion_policy_needed"):
+    return {
+        "kind": "completion",
+        "target_package_id": target_id,
+        "observed_stage": observed_stage,
+        "resolved_state": resolved_state,
+        "reason": reason,
     }
 
 
@@ -162,6 +174,51 @@ def board_payload(*, titles=None):
     }
     _reseal(value)
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+def _write_package(root, project, stage, name, package_id, body):
+    package_path = root / project / stage / name
+    package_path.mkdir(parents=True)
+    package_path.joinpath("spec.md").write_text(body, encoding="utf-8")
+
+
+def mixed_producer_root(tmp_path, *, target_stage="Queue"):
+    root = tmp_path / "workspace"
+    target_id = "123e4567-e89b-42d3-a456-426614174010"
+    source_id = "123e4567-e89b-42d3-a456-426614174011"
+    _write_package(
+        root, "Alpha", target_stage, "target", target_id,
+        f"# Target\nPackage ID: {target_id}\n"
+        "Claim: release | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    )
+    _write_package(
+        root, "Beta", "Under_Development", "dependent", source_id,
+        f"# Dependent\nPackage ID: {source_id}\n"
+        f"Prerequisite: {target_id} | release\n"
+        f"Completion Prerequisite: {target_id}\n",
+    )
+    return root, target_id, source_id
+
+
+class ScanningClient:
+    """Use the real catalog producer for each browser request."""
+
+    def __init__(self, root, *, hidden_stages=()):
+        self.root = root
+        self.hidden_stages = hidden_stages
+        self.settings = None
+        self.calls = 0
+
+    def fetch_catalog(self):
+        self.calls += 1
+        completed = self.settings.completed if self.settings is not None else None
+        revision = self.settings.revision if self.settings is not None else None
+        return parse_catalog(scan_catalog(
+            self.root,
+            hidden_stages=self.hidden_stages,
+            completed_stage_names=completed,
+            configuration_revision=revision,
+        ))
 
 
 STAGE_ROWS = (
@@ -722,6 +779,213 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
     page.locator("#details .dependencies summary").click()
     assert page.locator("#details .prerequisite-target").all_inner_texts() == ["Dependent step"]
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
+
+
+def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_page, tmp_path):
+    root, target_id, source_id = mixed_producer_root(tmp_path)
+    settings = BrowserSettings()
+    client = ScanningClient(root)
+    page = open_page(client, settings=settings)
+
+    source = page.locator(f'.card[data-package-id="{source_id}"]')
+    target = page.locator(f'.card[data-package-id="{target_id}"]')
+    assert source.locator(".dependency-indicator").inner_text() == "Dependencies unknown"
+    assert "needs: target" in source.inner_text()
+    assert "blocks: dependent" in target.inner_text()
+    assert connection_pairs(page) == {(target_id, source_id)}
+
+    source.click()
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-claim-kind").count() == 1
+    assert page.locator("#details .prerequisite-completion").count() == 1
+    assert page.locator("#details .claim-name").inner_text() == "Claim: release"
+    assert page.locator("#details .reported-state").inner_text() == "Reported state: satisfied"
+    completion = page.locator("#details .prerequisite-completion")
+    assert completion.locator(".completion-kind").inner_text() == "Whole-item completion"
+    assert completion.locator(".observed-stage").inner_text() == "Observed stage: Queue"
+    assert completion.locator(".claim-name").count() == 0
+    assert completion.locator(".reported-state").count() == 0
+    assert completion.locator(".completion-reason").inner_text() == "Reason: completion_policy_needed"
+
+    open_stage_editor(page)
+    page.get_by_role("checkbox", name="Counts as finished: Queue").check()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert source.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
+    assert page.locator("#details .prerequisite-completion .completion-reason").inner_text() == (
+        "Reason: completion_satisfied"
+    )
+    assert connection_pairs(page) == {(target_id, source_id)}
+
+
+def test_real_producer_hidden_completion_target_keeps_context_without_card_or_rail(open_page, tmp_path):
+    root, target_id, source_id = mixed_producer_root(tmp_path, target_stage="Done")
+    settings = BrowserSettings(completed=["Done"])
+    client = ScanningClient(root, hidden_stages=("Done",))
+    page = open_page(client, settings=settings)
+
+    assert page.locator(f'.card[data-package-id="{target_id}"]').count() == 0
+    assert page.locator(f'.card[data-package-id="{source_id}"]').count() == 1
+    assert connection_pairs(page) == set()
+    page.locator(f'.card[data-package-id="{source_id}"]').click()
+    page.locator("#details .dependencies summary").click()
+    assert page.locator("#details .prerequisite-target").all_inner_texts() == ["target", "target"]
+    assert page.locator("#details .prerequisite-completion .observed-stage").inner_text() == (
+        "Observed stage: Done"
+    )
+    assert page.locator("#details .prerequisite-completion .completion-kind").inner_text() == (
+        "Whole-item completion"
+    )
+
+
+def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_page, tmp_path):
+    root = tmp_path / "workspace"
+    source_id = "123e4567-e89b-42d3-a456-426614174012"
+    missing_id = "123e4567-e89b-42d3-a456-426614174013"
+    _write_package(
+        root, "Alpha", "Queue", "invalid", source_id,
+        f"# Invalid\nPackage ID: {source_id}\nCompletion Prerequisite: malformed | value\n",
+    )
+    _write_package(
+        root, "Alpha", "Under_Development", "dependent", "123e4567-e89b-42d3-a456-426614174014",
+        f"# Dependent\nPackage ID: 123e4567-e89b-42d3-a456-426614174014\n"
+        f"Completion Prerequisite: {missing_id}\n",
+    )
+    value = json.loads(scan_catalog(root, configuration_revision="revision-1"))
+    invalid_entry = next(item for item in value["entries"] if item["package_id"] == source_id)
+    missing_entry = next(
+        item for item in value["entries"] if item["package_id"] == "123e4567-e89b-42d3-a456-426614174014"
+    )
+    invalid_edge = invalid_entry["relationship"]["prerequisites"][0]
+    missing_edge = missing_entry["relationship"]["prerequisites"][0]
+    assert (invalid_edge["kind"], invalid_edge["reason"]) == ("completion", "invalid_prerequisite")
+    assert (missing_edge["kind"], missing_edge["reason"]) == ("completion", "missing_target")
+    assert parse_catalog(value).schema_version == 5
+
+    page = open_page(StaticClient(value))
+    for package_id, reason in ((source_id, "invalid_prerequisite"),
+                               ("123e4567-e89b-42d3-a456-426614174014", "missing_target")):
+        page.locator(f'.card[data-package-id="{package_id}"]').click()
+        page.locator("#details .dependencies summary").click()
+        row = page.locator("#details .prerequisite-completion")
+        assert row.locator(".completion-kind").inner_text() == "Whole-item completion"
+        assert row.locator(".completion-reason").inner_text() == f"Reason: {reason}"
+        assert row.locator(".claim-name").count() == 0
+
+
+CLAIM_EDGE_REASONS = [
+    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
+    "invalid_claim", "missing_target", "duplicate_target", "identity_coverage_incomplete",
+    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+    "self_edge", "invalid_prerequisite",
+]
+COMPLETION_EDGE_REASONS = [
+    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
+    "completion_policy_invalid", "missing_target", "duplicate_target",
+    "identity_coverage_incomplete", "target_unreadable", "target_changed_during_read",
+    "target_invalid_identity", "self_edge", "invalid_prerequisite",
+]
+
+
+def admitted_reason_payload(kind, reason):
+    value = json.loads(board_payload())
+    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
+    if kind == "claim":
+        edge = _edge(None if reason in {
+            "missing_target", "duplicate_target", "identity_coverage_incomplete",
+            "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+            "self_edge", "invalid_prerequisite",
+        } else STEP_ONE, "release")
+        edge.update(observed_state=None, observed_evidence_ref=None,
+                    resolved_state="unknown", reason=reason)
+    else:
+        edge = _completion_edge(
+            None if reason in {
+                "missing_target", "duplicate_target", "identity_coverage_incomplete",
+                "target_unreadable", "target_changed_during_read", "target_invalid_identity",
+                "self_edge", "invalid_prerequisite",
+            } else STEP_ONE,
+            observed_stage=None if reason not in {"completion_satisfied", "completion_unsatisfied"} else "Queue",
+            resolved_state="unknown" if reason not in {"completion_satisfied", "completion_unsatisfied"} else (
+                "satisfied" if reason == "completion_satisfied" else "unsatisfied"
+            ),
+            reason=reason,
+        )
+    gate["relationship"]["prerequisites"] = [edge]
+    gate["relationship"]["direct_prerequisite_state"] = edge["resolved_state"]
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize(("kind", "reason"),
+                         [("claim", reason) for reason in CLAIM_EDGE_REASONS] +
+                         [("completion", reason) for reason in COMPLETION_EDGE_REASONS])
+def test_browser_admits_every_python_valid_typed_edge_reason(open_page, kind, reason):
+    value = admitted_reason_payload(kind, reason)
+    assert parse_catalog(value).entries
+    page = open_page(StaticClient(value))
+    page.locator(f'.card[data-package-id="{GATE}"]').click()
+    page.locator("#details .dependencies summary").click()
+    row = page.locator("#details .prerequisite-claim")
+    assert row.count() == 1
+    assert f"Reason: {reason}" in row.inner_text()
+    if kind == "claim":
+        assert row.locator(".claim-name").count() == 1
+    else:
+        assert row.locator(".completion-kind").inner_text() == "Whole-item completion"
+        assert row.locator(".claim-name").count() == 0
+
+
+def malformed_typed_edge_payload(case):
+    value = json.loads(board_payload())
+    edge = next(entry for entry in value["entries"] if entry["package_id"] == GATE)[
+        "relationship"
+    ]["prerequisites"][0]
+    if case == "missing-kind":
+        del edge["kind"]
+    elif case == "extra-key":
+        edge["extra"] = "unexpected"
+    elif case == "cross-kind":
+        edge.clear()
+        edge.update(_completion_edge(STEP_ONE, observed_stage=None,
+                                     resolved_state="unknown", reason="claim_unknown"))
+    elif case == "unsafe-stage":
+        edge.clear()
+        edge.update(_completion_edge(STEP_ONE, observed_stage="../unsafe",
+                                     resolved_state="unknown", reason="completion_policy_needed"))
+    elif case == "mismatched-reason":
+        edge["reason"] = "completion_satisfied"
+    else:  # pragma: no cover - the parameter list owns the cases
+        raise AssertionError(case)
+    _reseal(value)
+    return value
+
+
+@pytest.mark.parametrize("case", [
+    "missing-kind", "extra-key", "cross-kind", "unsafe-stage", "mismatched-reason",
+])
+def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page, case):
+    valid = json.loads(board_payload())
+    invalid = malformed_typed_edge_payload(case)
+    from nyx import server as server_module
+
+    def passthrough_catalog(candidate):
+        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
+        client = BlockingRawSequenceClient([valid, invalid], blocked_call=2)
+        page = open_page(client)
+        assert client.started.wait(timeout=5)
+        assert page.locator("#board .card").count() == 4
+        assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
+        client.release.set()
+        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+            timeout=15000
+        )
+
+    assert page.locator("#board .card").count() == 4
+    assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
 
 
 def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_page):
