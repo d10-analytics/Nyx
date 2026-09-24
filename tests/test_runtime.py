@@ -315,10 +315,11 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
                 )
             with patch.object(
                 daemon.application, "_server_factory", return_value=Server()
-            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+            ) as create_server, patch.object(runtime.threading, "Thread", Thread), patch.object(
                 daemon, "_static_ready", return_value=False
             ):
                 assert daemon.run() == 25
+            create_server.assert_called_once()
         finally:
             try:
                 os.close(lease_fd)
