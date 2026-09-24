@@ -786,7 +786,7 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
     assert "loose package" in step_two.locator(".card-links").inner_text()
     loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
     assert "needs: Dependent step" in loose.locator(".card-links").inner_text()
-    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    assert loose.get_attribute("aria-pressed") == "true"
     page.locator("#details .dependencies summary").click()
     assert page.locator("#details .prerequisite-target").all_inner_texts() == ["Dependent step"]
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
@@ -827,6 +827,8 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
         % source_id
     )
     assert source.locator(".dependency-indicator").inner_text() == "Dependencies satisfied"
+    assert source.get_attribute("aria-pressed") == "true"
+    page.locator("#details .dependencies summary").click()
     assert page.locator("#details .prerequisite-completion .completion-reason").inner_text() == (
         "Reason: completion_satisfied"
     )
@@ -1397,6 +1399,10 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page2.get_by_role("button", name="Reset").click()
     page2.get_by_text("Board row order saved.", exact=True).wait_for()
     assert settings.order == []
+    page2.wait_for_function(
+        "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
+        "JSON.stringify(['Queue', 'Under Development'])"
+    )
     assert row_labels(page2) == ["Queue", "Under Development"]
 
 
@@ -1528,15 +1534,12 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     page.fill("#filter", "dependent")
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
-    page.get_by_role("button", name="Refresh view").click()
-    page.wait_for_selector("#refresh.pending", timeout=15000)
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     playwright.expect(
         page.get_by_role("button", name="Move Under Development down")
     ).to_be_focused()
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
     assert page.locator("#filter").input_value() == "dependent"
-    assert page.locator("#refresh").inner_text() == "Apply update"
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
