@@ -1295,7 +1295,19 @@ def assert_readable_arrows(page):
         assert result["strokeWidth"] >= 2.5, rail_failure_context(result, "strokeWidth")
 
 
-def test_readable_arrow_failures_report_context_only_on_failure(open_page, capsys):
+def test_readable_arrow_failures_report_context_only_on_failure(
+    open_page, capsys, monkeypatch
+):
+    runner_context = {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_NAME": "diagnostic-runner",
+        "RUNNER_OS": "DiagnosticOS",
+        "RUNNER_ARCH": "diagnostic-arch",
+        "ImageOS": "diagnostic-image",
+        "ImageVersion": "diagnostic-version",
+    }
+    for name, value in runner_context.items():
+        monkeypatch.setenv(name, value)
     page = open_page(StaticClient(board_payload()))
     assert_readable_arrows(page)
     passing_output = capsys.readouterr()
@@ -1308,12 +1320,42 @@ def test_readable_arrow_failures_report_context_only_on_failure(open_page, capsy
     with pytest.raises(AssertionError) as failure:
         assert_readable_arrows(page)
     message = str(failure.value)
-    for field in (
-        "leavesSource", "edge", "source", "dependent", "path", "start", "end",
-        "rectangles", "browser", "runner", "runnerOS", "viewport", "devicePixelRatio",
-        "evaluation", "performanceNow", "readyState", "fontsStatus",
-    ):
-        assert field in message
+    prefix = "rail assertion failed: "
+    assert message.startswith(prefix)
+    diagnostic = json.loads(message[len(prefix):].splitlines()[0])
+
+    assert diagnostic["predicate"] == "leavesSource"
+    assert diagnostic["edge"] == {"source": STEP_ONE, "dependent": STEP_TWO}
+    assert diagnostic["path"]["d"] == "M 0 0 L 1 1"
+    assert diagnostic["path"]["length"] == pytest.approx(2 ** 0.5)
+    for endpoint in ("start", "beforeEnd", "end"):
+        point = diagnostic["path"][endpoint]
+        assert isinstance(point["x"], (int, float))
+        assert isinstance(point["y"], (int, float))
+    assert diagnostic["path"]["start"] != diagnostic["path"]["end"]
+
+    for rectangle in diagnostic["rectangles"].values():
+        assert rectangle["width"] > 0
+        assert rectangle["height"] > 0
+        assert rectangle["right"] > rectangle["left"]
+        assert rectangle["bottom"] > rectangle["top"]
+    assert diagnostic["browser"]["userAgent"]
+    assert diagnostic["browser"]["platform"]
+    assert diagnostic["runner"] == {
+        "githubActions": "true",
+        "runnerName": "diagnostic-runner",
+        "runnerOS": "DiagnosticOS",
+        "runnerArch": "diagnostic-arch",
+        "imageOS": "diagnostic-image",
+        "imageVersion": "diagnostic-version",
+    }
+    assert diagnostic["viewport"]["width"] > 0
+    assert diagnostic["viewport"]["height"] > 0
+    assert diagnostic["viewport"]["devicePixelRatio"] > 0
+    assert diagnostic["evaluation"]["performanceNow"] >= 0
+    assert diagnostic["evaluation"]["readyState"] == "complete"
+    assert diagnostic["evaluation"]["visibilityState"] == "visible"
+    assert diagnostic["evaluation"]["fontsStatus"] in {"loaded", "loading"}
 
 
 def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(open_page):
