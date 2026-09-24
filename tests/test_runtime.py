@@ -1968,20 +1968,43 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
         try:
             before = snapshot()
             lease_before = _native_claim._identity(os.fstat(lease.fd))
-            original_lstat = state._lstat
-            lookup_delayed = False
+            original_admit_directory = state._admit_directory
+            original_monotonic = runtime.time.monotonic
+            configuration_admitted = False
+            deadline_checked_after_admission = False
 
-            def delayed_admission_lookup(path):
-                nonlocal lookup_delayed
-                if not lookup_delayed:
-                    lookup_delayed = True
-                    time.sleep(0.03)
-                return original_lstat(path)
+            def admitting_configuration(
+                path, *, create, deadline=None, deadline_ns=None
+            ):
+                nonlocal configuration_admitted
+                result = original_admit_directory(
+                    path,
+                    create=create,
+                    deadline=deadline,
+                    deadline_ns=deadline_ns,
+                )
+                if path == paths.config_directory and not create:
+                    configuration_admitted = True
+                return result
+
+            def monotonic_after_configuration_admission():
+                nonlocal deadline_checked_after_admission
+                value = original_monotonic()
+                if configuration_admitted:
+                    deadline_checked_after_admission = True
+                    return value + 3600
+                return value
 
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "STARTUP_TIMEOUT", 0.01
             ), patch.object(
-                state, "_lstat", side_effect=delayed_admission_lookup
+                state,
+                "_admit_directory",
+                side_effect=admitting_configuration,
+            ), patch.object(
+                runtime.time,
+                "monotonic",
+                side_effect=monotonic_after_configuration_admission,
             ), patch.object(
                 state, "_save_configuration", wraps=state._save_configuration
             ) as save_configuration, pytest.raises(
@@ -1989,7 +2012,8 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
             ):
                 runtime.setup(first)
             save_configuration.assert_not_called()
-            assert lookup_delayed
+            assert configuration_admitted
+            assert deadline_checked_after_admission
             assert snapshot() == before
             assert _native_claim._identity(os.fstat(lease.fd)) == lease_before
         finally:
