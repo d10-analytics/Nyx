@@ -268,7 +268,9 @@ def test_daemon_rechecks_shared_deadline_after_configuration_admission():
                 daemon = runtime._Daemon(lease_fd, time.monotonic_ns() + 300_000_000)
             with patch.object(
                 state, "_lstat", side_effect=delayed_admission_lookup
-            ), patch.object(runtime, "create_server") as create_server, pytest.raises(
+            ), patch.object(
+                daemon.application, "_server_factory"
+            ) as create_server, pytest.raises(
                 runtime.UnhealthyInstanceError, match="deadline expired"
             ):
                 daemon.start()
@@ -311,10 +313,13 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 20_000_000
                 )
-            with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=False):
+            with patch.object(
+                daemon.application, "_server_factory", return_value=Server()
+            ) as create_server, patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=False
+            ):
                 assert daemon.run() == 25
+            create_server.assert_called_once()
         finally:
             try:
                 os.close(lease_fd)
@@ -447,10 +452,14 @@ def test_public_start_reports_sanitized_detached_child_failure():
         paths, home, _ = _fixture(root)
         environment = _subprocess_environment(home, root / "site")
         script = (
-            "import errno, runpy; from nyx import server\n"
+            "import errno, runpy; from nyx import app_runtime\n"
             "def fail(**kwargs):\n"
             "    raise OSError(errno.EADDRINUSE, 'private-child-detail')\n"
-            "server.create_server=fail\n"
+            "class FailingApplicationRuntime(app_runtime.ApplicationRuntime):\n"
+            "    def __init__(self, **kwargs):\n"
+            "        super().__init__(**kwargs)\n"
+            "        self._server_factory=fail\n"
+            "app_runtime.ApplicationRuntime=FailingApplicationRuntime\n"
             "runpy.run_module('nyx.runtime', run_name='__main__')\n"
         )
         with patch.dict(os.environ, environment), patch.object(
@@ -611,9 +620,11 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 5_000_000_000
                 )
-            with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            with patch.object(
+                daemon.application, "_server_factory", return_value=Server()
+            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=True
+            ), patch.object(
                 daemon, "_bind_control", return_value=Control()
             ), patch.object(
                 runtime,
@@ -641,7 +652,7 @@ def test_control_is_verified_before_locator_publication_and_catalog_admission():
 
 
 def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owner():
-    created: list[tuple[object, int]] = []
+    created: list[tuple[object, int, object]] = []
 
     class Server:
         def serve_forever(self):
@@ -677,8 +688,8 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
         def is_alive(self):
             return False
 
-    def make_server(*, provider, port):
-        created.append((provider, port))
+    def make_server(*, provider, port, settings_provider):
+        created.append((provider, port, settings_provider))
         return Server()
 
     with TemporaryDirectory() as temporary:
@@ -689,9 +700,11 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
                 daemon = runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 5_000_000_000
                 )
-            with patch.object(runtime, "create_server", side_effect=make_server), patch.object(
-                runtime.threading, "Thread", Thread
-            ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            with patch.object(
+                daemon.application, "_server_factory", side_effect=make_server
+            ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+                daemon, "_static_ready", return_value=True
+            ), patch.object(
                 daemon, "_bind_control", return_value=Control()
             ), patch.object(
                 runtime,
@@ -705,9 +718,10 @@ def test_linux_daemon_wires_http_provider_and_workers_to_shared_application_owne
             os.close(lease_fd)
 
     assert len(created) == 1
-    provider, port = created[0]
+    provider, port, settings_provider = created[0]
     assert port == runtime.PORT
     assert getattr(provider, "__self__", None) is daemon.application
+    assert settings_provider is daemon.application
     assert daemon.application.server is daemon.server
     assert daemon.application.workers is daemon.workers
     assert daemon.application.catalog_admitted is False
@@ -774,9 +788,11 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
         ):
             daemon._provider()
         fetch.assert_not_called()
-        with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-            runtime.threading, "Thread", Thread
-        ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+        with patch.object(
+            daemon.application, "_server_factory", return_value=Server()
+        ), patch.object(runtime.threading, "Thread", Thread), patch.object(
+            daemon, "_static_ready", return_value=True
+        ), patch.object(
             daemon, "_bind_control", return_value=Control()
         ), patch.object(
             runtime,
@@ -926,6 +942,236 @@ def test_failed_start_cleanup_retains_resistant_worker_until_later_completion():
         assert isinstance(request_errors[0], runtime.CatalogError)
         assert application.cleanup_start_failure(time.monotonic() + 2) is True
         assert application.workers.active_count == 0
+
+
+def test_application_settings_save_conflict_and_restart_persistence():
+    with TemporaryDirectory() as temporary:
+        paths, _, specification_root = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        saved = application.save_settings(initial.revision, ["Done", "Queue"])
+        assert saved["outcome"] == "success"
+        assert saved["order"] == ["Done", "Queue"]
+        assert application.save_settings(initial.revision, ["Archive"])["outcome"] == "conflict"
+        assert state.load_configuration(paths).stage_order == ("Done", "Queue")
+        assert application.shutdown(time.monotonic() + 2)
+
+        restarted = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        restarted.capture_configuration(state.load_configuration(paths), paths)
+        restarted.admit_catalog()
+        current = restarted.get_settings()
+        assert current["order"] == ["Done", "Queue"]
+        assert current["revision"] == state.configuration_revision(paths)
+        assert str(specification_root) not in current
+        assert restarted.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_pre_replace_failure_and_preserves_order():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        with patch.object(state.os, "replace", side_effect=OSError("injected")):
+            result = application.save_settings(initial.revision, ["Queue"])
+        assert result["outcome"] == "failure"
+        assert result["order"] == []
+        assert state.load_configuration(paths).stage_order == ()
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_revalidates_after_post_replace_failure():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        original_verify = state._verify_record
+        failed = False
+
+        def fail_once(path):
+            nonlocal failed
+            details = original_verify(path)
+            if (
+                path == paths.config_file
+                and not failed
+                and json.loads(path.read_text(encoding="utf-8")).get("stage_orders", {}).values()
+                and ["Queue", "Done"]
+                in json.loads(path.read_text(encoding="utf-8")).get("stage_orders", {}).values()
+            ):
+                failed = True
+                raise OSError("injected post-replacement verification failure")
+            return details
+
+        with patch.object(state, "_verify_record", side_effect=fail_once):
+            result = application.save_settings(initial.revision, ["Queue", "Done"])
+        assert result["outcome"] == "success"
+        assert result["order"] == ["Queue", "Done"]
+        assert state.load_configuration(paths).stage_order == ("Queue", "Done")
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_admission():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial = state.load_configuration(paths)
+        application = runtime.ApplicationRuntime(
+            port=runtime.PORT, deadline=time.monotonic() + 5
+        )
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        entered = threading.Event()
+        release = threading.Event()
+        saved: list[dict[str, object]] = []
+        shutdown_result: list[bool] = []
+        original_save = state.save_configuration_owned
+
+        def blocked_save(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=3)
+            return original_save(*args, **kwargs)
+
+        with patch.object(state, "save_configuration_owned", side_effect=blocked_save):
+            save_thread = threading.Thread(
+                target=lambda: saved.append(application.save_settings(initial.revision, ["Queue"]))
+            )
+            save_thread.start()
+            assert entered.wait(timeout=2)
+            shutdown_thread = threading.Thread(
+                target=lambda: shutdown_result.append(application.shutdown(time.monotonic() + 3))
+            )
+            shutdown_thread.start()
+            time.sleep(0.05)
+            assert shutdown_thread.is_alive()
+            release.set()
+            save_thread.join(timeout=3)
+            shutdown_thread.join(timeout=3)
+        assert saved == [{
+            "order": ["Queue"],
+            "revision": saved[0]["revision"],
+            "outcome": "success",
+        }]
+        assert shutdown_result == [True]
+        with pytest.raises(runtime.CatalogError, match="settings_unavailable"):
+            application.get_settings()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
+def test_normal_service_settings_survive_terminal_stop_and_restart():
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        capability_probe.bind(("127.0.0.1", runtime.PORT))
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+
+        with patch.object(state, "resolve_account_home", return_value=home):
+            runtime.setup(specification_root)
+            paths = state.state_paths()
+
+            def settings_request(
+                method: str, body: dict[str, object] | None = None
+            ) -> tuple[int, dict[str, object]]:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", runtime.PORT, timeout=5
+                )
+                try:
+                    headers = {"Host": f"127.0.0.1:{runtime.PORT}"}
+                    encoded = None if body is None else json.dumps(body)
+                    if encoded is not None:
+                        headers["Content-Type"] = "application/json"
+                    connection.request(
+                        method, "/api/settings", body=encoded, headers=headers
+                    )
+                    response = connection.getresponse()
+                    return response.status, json.loads(response.read())
+                finally:
+                    connection.close()
+
+            def start_daemon() -> tuple[runtime._Daemon, threading.Thread, list[int]]:
+                lease_fd = _transferred_claim_fd(
+                    paths.runtime_directory / "lease.lock"
+                )
+                daemon = runtime._Daemon(
+                    lease_fd, time.monotonic_ns() + 20_000_000_000
+                )
+                result: list[int] = []
+                thread = threading.Thread(target=lambda: result.append(daemon.run()))
+                thread.start()
+                _wait_for_record(paths)
+                deadline = time.monotonic() + 5
+                while True:
+                    status, current = settings_request("GET")
+                    if status == 200:
+                        return daemon, thread, result
+                    assert status == 503
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("service settings did not become ready")
+                    time.sleep(0.01)
+
+            running: tuple[runtime._Daemon, threading.Thread, list[int]] | None = None
+            try:
+                running = start_daemon()
+                first_status, first = settings_request("GET")
+                assert first_status == 200
+                assert first == {
+                    "order": [],
+                    "revision": state.configuration_revision(paths),
+                }
+
+                saved_status, saved = settings_request(
+                    "PUT",
+                    {
+                        "revision": first["revision"],
+                        "order": ["Done", "Queue"],
+                    },
+                )
+                assert saved_status == 200
+                assert saved["outcome"] == "success"
+                assert saved["order"] == ["Done", "Queue"]
+                assert saved["revision"] == state.configuration_revision(paths)
+
+                assert runtime.stop() == "stopped"
+                running[1].join(timeout=5)
+                assert not running[1].is_alive()
+                assert running[2] == [0]
+
+                running = start_daemon()
+                restarted_status, restarted = settings_request("GET")
+                assert restarted_status == 200
+                assert restarted == {
+                    "order": ["Done", "Queue"],
+                    "revision": state.configuration_revision(paths),
+                }
+
+                assert runtime.stop() == "stopped"
+                running[1].join(timeout=5)
+                assert not running[1].is_alive()
+                assert running[2] == [0]
+            finally:
+                if running is not None and running[1].is_alive():
+                    running[0].shutdown(time.monotonic() + 3)
+                    running[1].join(timeout=5)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
@@ -1448,11 +1694,11 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
         assert lease.fd is not None
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 50_000_000)
-        with patch.object(runtime, "create_server", return_value=Server()), patch.object(
-            daemon, "_static_ready", return_value=True
-        ), patch.object(daemon, "_bind_control", return_value=Control()), patch.object(
-            daemon, "_serve_control", return_value=None
-        ), patch.object(
+        with patch.object(
+            daemon.application, "_server_factory", return_value=Server()
+        ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
+            daemon, "_bind_control", return_value=Control()
+        ), patch.object(daemon, "_serve_control", return_value=None), patch.object(
             runtime,
             "_send_control",
             return_value={"status": "ready", "url": runtime.URL},
@@ -1722,20 +1968,55 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
         try:
             before = snapshot()
             lease_before = _native_claim._identity(os.fstat(lease.fd))
-            original_lstat = state._lstat
-            lookup_delayed = False
+            original_admit_directory = state._admit_directory
+            startup_timeout = 0.01
+            clock_ns = 1_000_000_000_000
+            configuration_admitted = False
+            deadline_checked_after_admission = False
 
-            def delayed_admission_lookup(path):
-                nonlocal lookup_delayed
-                if not lookup_delayed:
-                    lookup_delayed = True
-                    time.sleep(0.03)
-                return original_lstat(path)
+            def admitting_configuration(
+                path, *, create, deadline=None, deadline_ns=None
+            ):
+                nonlocal configuration_admitted
+                result = original_admit_directory(
+                    path,
+                    create=create,
+                    deadline=deadline,
+                    deadline_ns=deadline_ns,
+                )
+                if path == paths.config_directory and not create:
+                    configuration_admitted = True
+                return result
+
+            def controlled_clock_ns():
+                if configuration_admitted:
+                    return clock_ns + int(startup_timeout * 1_000_000_000) + 1
+                return clock_ns
+
+            def controlled_monotonic_ns():
+                return controlled_clock_ns()
+
+            def controlled_monotonic():
+                nonlocal deadline_checked_after_admission
+                value = controlled_clock_ns()
+                if configuration_admitted:
+                    deadline_checked_after_admission = True
+                return value / 1_000_000_000
 
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
-                runtime, "STARTUP_TIMEOUT", 0.01
+                runtime, "STARTUP_TIMEOUT", startup_timeout
             ), patch.object(
-                state, "_lstat", side_effect=delayed_admission_lookup
+                state,
+                "_admit_directory",
+                side_effect=admitting_configuration,
+            ), patch.object(
+                runtime.time,
+                "monotonic_ns",
+                side_effect=controlled_monotonic_ns,
+            ), patch.object(
+                runtime.time,
+                "monotonic",
+                side_effect=controlled_monotonic,
             ), patch.object(
                 state, "_save_configuration", wraps=state._save_configuration
             ) as save_configuration, pytest.raises(
@@ -1743,7 +2024,8 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
             ):
                 runtime.setup(first)
             save_configuration.assert_not_called()
-            assert lookup_delayed
+            assert configuration_admitted
+            assert deadline_checked_after_admission
             assert snapshot() == before
             assert _native_claim._identity(os.fstat(lease.fd)) == lease_before
         finally:

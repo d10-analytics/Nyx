@@ -452,6 +452,10 @@ def test_desktop_starts_shared_runtime_with_worker_only_inheritance():
                 def __init__(self, **kwargs):
                     observed.update(kwargs)
 
+                def capture_configuration(self, configuration, paths):
+                    observed["configuration"] = configuration
+                    observed["paths"] = paths
+
                 def start(self, *, static_ready=None):
                     assert static_ready is not None and static_ready()
 
@@ -481,6 +485,9 @@ def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stag
         supplied.symlink_to(workspace, target_is_directory=True)
         class FakeApplicationRuntime:
             def __init__(self, **_kwargs):
+                pass
+
+            def capture_configuration(self, _configuration, _paths):
                 pass
 
             def start(self, *, static_ready=None):
@@ -525,6 +532,10 @@ def test_first_launch_save_starts_admitted_runtime_and_opens_board():
                 self.catalog_admitted = False
                 self.shutdown_calls = 0
                 created.append(self)
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
 
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
@@ -580,6 +591,10 @@ def test_first_launch_save_runtime_failure_preserves_selection_and_retries_board
                 self.catalog_admitted = False
                 self.cleanup_calls = 0
                 created.append(self)
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
 
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
@@ -1171,6 +1186,10 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
                 self.shutdown_calls = 0
                 instances.append(self)
 
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
+
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
 
@@ -1207,6 +1226,216 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
             session.close()
 
 
+def test_active_workspace_switch_preserves_each_root_stage_order():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                self.configuration = None
+                self.paths = None
+                instances.append(self)
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+
+            def admit_catalog(self):
+                pass
+
+            def save_settings(self, revision, order):
+                assert self.configuration is not None
+                assert revision == self.configuration.revision
+                self.configuration = state.save_configuration_owned(
+                    self.configuration.specification_root,
+                    paths=self.paths,
+                    stage_order=order,
+                )
+                return {
+                    "order": list(self.configuration.stage_order),
+                    "revision": self.configuration.revision,
+                    "outcome": "success",
+                }
+
+            def shutdown(self, _deadline):
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            first_runtime = session.start_runtime(static_ready=lambda: True)
+            first_saved = first_runtime.save_settings(
+                first_runtime.configuration.revision, ["Done", "Queue"]
+            )
+            assert first_saved["order"] == ["Done", "Queue"]
+
+            session.choose_workspace(second)
+            second_runtime = session.runtime
+            assert second_runtime is instances[1]
+            assert second_runtime.configuration.specification_root == second.resolve()
+            assert second_runtime.configuration.stage_order == ()
+            second_saved = second_runtime.save_settings(
+                second_runtime.configuration.revision, ["Archive"]
+            )
+            assert second_saved["order"] == ["Archive"]
+
+            session.choose_workspace(first)
+            third_runtime = session.runtime
+            assert third_runtime is instances[2]
+            assert third_runtime.configuration.specification_root == first.resolve()
+            assert third_runtime.configuration.stage_order == ("Done", "Queue")
+            persisted = state.load_configuration()
+            assert persisted.stage_order == ("Done", "Queue")
+            assert persisted.stage_orders == {
+                str(first.resolve()): ("Done", "Queue"),
+                str(second.resolve()): ("Archive",),
+            }
+            session.close()
+
+
+def test_workspace_switch_drains_admitted_write_before_starting_new_root():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        shutdown_entered = threading.Event()
+        started_roots = []
+        switch_result = []
+        switch_errors = []
+        write_result = []
+        write_errors = []
+        saved_orders = []
+
+        class FakeApplicationRuntime:
+            def __init__(self, **_kwargs):
+                self.configuration = None
+                self.paths = None
+                self.accepting = False
+                self.active = 0
+                self.condition = threading.Condition()
+                instances.append(self)
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
+
+            def start(self, *, static_ready=None):
+                assert static_ready is None or static_ready()
+                started_roots.append(self.configuration.specification_root)
+
+            def admit_catalog(self):
+                with self.condition:
+                    self.accepting = True
+
+            def get_settings(self):
+                with self.condition:
+                    if not self.accepting:
+                        raise RuntimeError("settings_unavailable")
+                    return self.configuration.stage_order
+
+            def save_settings(self, revision, order):
+                with self.condition:
+                    if not self.accepting:
+                        raise RuntimeError("settings_unavailable")
+                    assert revision == self.configuration.revision
+                    self.active += 1
+                    write_entered.set()
+                try:
+                    assert release_write.wait(timeout=3)
+                    self.configuration = state.save_configuration_owned(
+                        self.configuration.specification_root,
+                        paths=self.paths,
+                        stage_order=order,
+                    )
+                    saved_orders.append(self.configuration.stage_order)
+                    return {"outcome": "success"}
+                finally:
+                    with self.condition:
+                        self.active -= 1
+                        self.condition.notify_all()
+
+            def shutdown(self, deadline):
+                with self.condition:
+                    self.accepting = False
+                    shutdown_entered.set()
+                    while self.active:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        self.condition.wait(timeout=remaining)
+                return True
+
+            def cleanup_start_failure(self, _deadline):
+                return True
+
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FakeApplicationRuntime
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            first_runtime = session.start_runtime(static_ready=lambda: True)
+
+            def write_settings():
+                try:
+                    write_result.append(
+                        first_runtime.save_settings(
+                            first_runtime.configuration.revision, ["Done"]
+                        )
+                    )
+                except BaseException as error:  # noqa: BLE001 - surfaced below
+                    write_errors.append(error)
+
+            writer = threading.Thread(target=write_settings)
+            writer.start()
+            assert write_entered.wait(timeout=2)
+
+            def switch_workspace():
+                try:
+                    switch_result.append(session.choose_workspace(second))
+                except BaseException as error:  # noqa: BLE001 - surfaced below
+                    switch_errors.append(error)
+
+            switcher = threading.Thread(target=switch_workspace)
+            switcher.start()
+            assert shutdown_entered.wait(timeout=2)
+            assert switcher.is_alive()
+            assert state.load_configuration().specification_root == first.resolve()
+            with pytest.raises(RuntimeError, match="settings_unavailable"):
+                first_runtime.get_settings()
+
+            release_write.set()
+            writer.join(timeout=3)
+            switcher.join(timeout=3)
+            assert not writer.is_alive()
+            assert not switcher.is_alive()
+            assert not write_errors
+            assert not switch_errors
+            assert len(write_result) == 1
+            assert write_result[0]["outcome"] == "success"
+            assert len(switch_result) == 1
+            assert switch_result[0].specification_root == second.resolve()
+            assert saved_orders == [("Done",)]
+            assert started_roots == [first.resolve(), second.resolve()]
+            assert state.load_configuration().specification_root == second.resolve()
+            session.close()
+
+
 def test_repeated_incomplete_switch_retry_keeps_retry_visible():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1217,6 +1446,10 @@ def test_repeated_incomplete_switch_retry_keeps_retry_visible():
         class FakeApplicationRuntime:
             def __init__(self, **_kwargs):
                 self.cleanup_allowed = False
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
 
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
@@ -1264,6 +1497,10 @@ def test_postcommit_switch_retry_revalidates_then_restarts_saved_workspace():
         class FakeApplicationRuntime:
             def __init__(self, **_kwargs):
                 instances.append(self)
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
 
             def start(self, *, static_ready=None):
                 assert static_ready is None or static_ready()
@@ -1430,6 +1667,66 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
                 session.close()
 
 
+def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order():
+    port = _free_loopback_port()
+
+    def request_settings(method="GET", payload=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            body = None if payload is None else json.dumps(payload).encode()
+            headers = {"Host": f"127.0.0.1:{port}"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = str(len(body))
+            connection.request(method, "/api/settings", body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            try:
+                session.start_runtime()
+                status, first_settings = request_settings()
+                assert status == 200
+                assert first_settings["order"] == []
+                first_saved_status, first_saved = request_settings(
+                    "PUT",
+                    {"revision": first_settings["revision"], "order": ["Done", "Queue"]},
+                )
+                assert first_saved_status == 200
+                assert first_saved["outcome"] == "success"
+
+                session.choose_workspace(second)
+                status, second_settings = request_settings()
+                assert status == 200
+                assert second_settings["order"] == []
+                second_saved_status, second_saved = request_settings(
+                    "PUT",
+                    {"revision": second_settings["revision"], "order": ["Archive"]},
+                )
+                assert second_saved_status == 200
+                assert second_saved["outcome"] == "success"
+
+                session.choose_workspace(first)
+                status, restored = request_settings()
+                assert status == 200
+                assert restored["order"] == ["Done", "Queue"]
+            finally:
+                session.close()
+
+
 def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1443,6 +1740,9 @@ def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
 
             class FakeApplicationRuntime:
                 def __init__(self, **_kwargs):
+                    pass
+
+                def capture_configuration(self, _configuration, _paths):
                     pass
 
                 def start(self, *, static_ready=None):
@@ -1503,6 +1803,10 @@ def test_verified_switch_can_leave_saved_workspace_without_running_runtime():
             def __init__(self, **_kwargs):
                 self.index = FakeApplicationRuntime.created
                 FakeApplicationRuntime.created += 1
+
+            def capture_configuration(self, configuration, paths):
+                self.configuration = configuration
+                self.paths = paths
 
             def start(self, *, static_ready=None):
                 if self.index == 1:

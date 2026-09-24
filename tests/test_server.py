@@ -2,15 +2,19 @@ import http.client
 import json
 import socket
 import threading
+import time
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
-from nyx import server
+from nyx import server, state
+from nyx.app_runtime import ApplicationRuntime
 from nyx.models import canonical_digest, parse_catalog
-from nyx.server import CatalogError, create_server
+from nyx.server import CatalogError, _create_application_server, create_server
 
 
 class StubClient:
@@ -167,28 +171,77 @@ def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
 
 
 class RunningServer:
-    def __init__(self, client):
-        self.server = create_server(client)
-        self.thread = threading.Thread(target=self.server.serve_forever)
-        self.thread.start()
+    def __init__(self, client, settings=None):
+        self.application = None
+        if settings is None:
+            self.server = create_server(client)
+            self.thread = threading.Thread(target=self.server.serve_forever)
+            self.thread.start()
+            return
+
+        if isinstance(settings, ApplicationRuntime):
+            self.application = settings
+        else:
+            self.application = ApplicationRuntime(
+                port=0,
+                deadline=time.monotonic() + 5,
+            )
+            if hasattr(settings, "get_settings"):
+                self.application.get_settings = settings.get_settings
+            if hasattr(settings, "save_settings"):
+                self.application.save_settings = settings.save_settings
+
+        def application_server_factory(**kwargs):
+            return _create_application_server(
+                provider=client,
+                port=kwargs["port"],
+                settings_provider=kwargs["settings_provider"],
+            )
+
+        self.application._server_factory = application_server_factory
+        self.application.start(static_ready=lambda: True)
+        self.server = self.application.server
+        self.thread = self.application.http_thread
 
     def __enter__(self):
         return self.server.server_port
 
     def __exit__(self, *exc):
+        if self.application is not None:
+            assert self.application.shutdown(time.monotonic() + 2)
+            self.application.server = None
+            return
         self.server.shutdown()
         self.thread.join()
         self.server.server_close()
 
 
-def request(port, method, path, host=None):
+def request(port, method, path, host=None, body=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     headers = {} if host is None else {"Host": host}
-    connection.request(method, path, headers=headers)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     body = response.read()
     connection.close()
     return response.status, response.getheader("Content-Type"), body
+
+
+class SettingsStub:
+    def __init__(self):
+        self.value = {"order": ["Queue", "Done"], "revision": "opaque"}
+        self.calls = []
+
+    def get_settings(self):
+        return dict(self.value)
+
+    def save_settings(self, revision, order):
+        if revision != self.value["revision"]:
+            return {**self.value, "outcome": "conflict"}
+        self.calls.append((revision, order))
+        self.value = {"order": list(order), "revision": "new-opaque"}
+        return {**self.value, "outcome": "success"}
 
 
 def test_numeric_loopback_bind_serves_and_closes_without_reverse_dns():
@@ -470,6 +523,242 @@ def test_loopback_host_aliases_are_accepted():
             host = host_template.format(port=port)
             status, _, _ = request(port, "GET", "/api/catalog", host=host)
         assert status == 200
+
+
+def test_standalone_server_keeps_settings_route_read_only_and_hidden():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        assert request(port, "GET", "/api/settings")[0] == 404
+        status, _, _ = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
+        )
+        assert status == 404
+    assert settings.calls == []
+    with pytest.raises(TypeError, match="settings_provider"):
+        create_server(StubClient(catalog=valid_catalog()), settings_provider=settings)
+    with pytest.raises(TypeError, match="settings_provider"):
+        server.TrackerServer(
+            StubClient(catalog=valid_catalog()), settings_provider=settings
+        )
+
+
+def test_application_settings_route_enforces_host_methods_payload_and_opaque_result():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        status, content_type, body = request(port, "GET", "/api/settings")
+        assert status == 200
+        assert content_type == "application/json"
+        assert json.loads(body) == {"order": ["Queue", "Done"], "revision": "opaque"}
+
+        status, _, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Done", "Queue"]}),
+        )
+        assert status == 200
+        assert json.loads(body) == {
+            "order": ["Done", "Queue"],
+            "revision": "new-opaque",
+            "outcome": "success",
+        }
+        assert settings.calls == [("opaque", ["Done", "Queue"])]
+
+        assert request(port, "POST", "/api/settings")[0] == 405
+        assert request(port, "GET", "/api/settings", host=f"outside.invalid:{port}")[0] == 404
+        assert request(port, "PUT", "/api/settings", body=b"not-json")[0] == 400
+        assert request(port, "PUT", "/api/settings", body=json.dumps({"revision": "new-opaque", "order": []}), host=f"127.0.0.1:{port + 1}")[0] == 404
+
+
+def test_application_settings_route_returns_conflict_without_replacement():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        status, content_type, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "stale", "order": ["Archive"]}),
+        )
+    assert status == 409
+    assert content_type == "application/json"
+    assert json.loads(body) == {
+        "order": ["Queue", "Done"],
+        "revision": "opaque",
+        "outcome": "conflict",
+    }
+    assert settings.calls == []
+
+
+def test_application_settings_put_returns_safe_error_when_admission_closes():
+    class UnavailableSettings:
+        def save_settings(self, revision, order):
+            raise CatalogError("settings_unavailable")
+
+    with RunningServer(
+        StubClient(catalog=valid_catalog()), UnavailableSettings()
+    ) as port:
+        status, content_type, body = request(
+            port,
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"revision": "opaque", "order": ["Queue"]}),
+        )
+
+    assert status == 503
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "settings_unavailable"}
+
+
+def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_preserves_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            initial = state.setup(specification_root)
+            paths = state.state_paths()
+
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                status, content_type, body = request(port, "GET", "/api/settings")
+                first = json.loads(body)
+                assert status == 200
+                assert content_type == "application/json"
+                assert first == {"order": [], "revision": initial.revision}
+                assert str(specification_root) not in body.decode("utf-8")
+
+                status, _, body = request(
+                    port,
+                    "PUT",
+                    "/api/settings",
+                    body=json.dumps(
+                        {"revision": first["revision"], "order": ["Queue"]}
+                    ),
+                )
+                saved = json.loads(body)
+                assert status == 200
+                assert saved["outcome"] == "success"
+                assert saved["order"] == ["Queue"]
+                assert saved["revision"] != first["revision"]
+
+                with patch.object(
+                    state.os,
+                    "replace",
+                    side_effect=AssertionError("stale write reached replacement"),
+                ) as replace_record:
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": first["revision"], "order": ["Archive"]}
+                        ),
+                    )
+                assert status == 409
+                assert json.loads(body) == {**saved, "outcome": "conflict"}
+                replace_record.assert_not_called()
+
+                for invalid_order in (["Queue", "Queue"], ["Queue/Done"]):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": saved["revision"], "order": invalid_order}
+                        ),
+                    )
+                    assert status == 400
+                    assert json.loads(body) == {"error": "invalid_order"}
+
+                with patch.object(state.os, "replace", side_effect=OSError("injected")):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": saved["revision"], "order": ["Done"]}
+                        ),
+                    )
+                assert status == 500
+                assert json.loads(body) == {**saved, "outcome": "failure"}
+                assert state.load_configuration(paths).stage_order == ("Queue",)
+        finally:
+            assert application.shutdown(time.monotonic() + 2)
+
+        restarted = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        restarted.capture_configuration(state.load_configuration(paths), paths)
+        restarted.admit_catalog()
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), restarted) as port:
+                status, _, body = request(port, "GET", "/api/settings")
+            assert status == 200
+            assert json.loads(body) == {
+                "order": ["Queue"],
+                "revision": state.configuration_revision(paths),
+            }
+        finally:
+            assert restarted.shutdown(time.monotonic() + 2)
+
+
+def test_real_application_settings_http_revalidates_after_commit_verification_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            initial = state.setup(specification_root)
+            paths = state.state_paths()
+
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        original_verify = state._verify_record
+        failed = False
+
+        def fail_first_commit_verification(path):
+            nonlocal failed
+            details = original_verify(path)
+            if path == paths.config_file and not failed:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if ["Queue", "Done"] in payload.get("stage_orders", {}).values():
+                    failed = True
+                    raise OSError("injected post-replacement verification failure")
+            return details
+
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                with patch.object(
+                    state, "_verify_record", side_effect=fail_first_commit_verification
+                ):
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {
+                                "revision": initial.revision,
+                                "order": ["Queue", "Done"],
+                            }
+                        ),
+                    )
+            result = json.loads(body)
+            assert failed is True
+            assert status == 200
+            assert result["outcome"] == "success"
+            assert result["order"] == ["Queue", "Done"]
+            assert result["revision"] == state.configuration_revision(paths)
+        finally:
+            assert application.shutdown(time.monotonic() + 2)
 
 
 @pytest.mark.parametrize(

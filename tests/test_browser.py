@@ -1,14 +1,17 @@
 import json
+import os
 import re
 import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 
+from nyx.app_runtime import ApplicationRuntime
 from nyx.catalog import scan_catalog
 from nyx.models import canonical_digest, parse_catalog
-from nyx.server import CatalogError, create_server
+from nyx.server import CatalogError, _create_application_server, create_server
 
 playwright = pytest.importorskip("playwright.sync_api")
 
@@ -16,6 +19,7 @@ STEP_ONE = "123e4567-e89b-42d3-a456-426614174000"
 STEP_TWO = "123e4567-e89b-42d3-a456-426614174001"
 GATE = "123e4567-e89b-42d3-a456-426614174002"
 LOOSE = "123e4567-e89b-42d3-a456-426614174003"
+REVERSE = "123e4567-e89b-42d3-a456-426614174004"
 XSS_TITLE = '<img src=x onerror="alert(1)"> loose package'
 
 
@@ -401,16 +405,63 @@ class RawSequenceClient:
         return RawCatalog(payload)
 
 
+class BrowserSettings:
+    """Small application-settings seam used by the browser behavior tests."""
+
+    def __init__(self, order=(), revision="revision-1"):
+        self.order = list(order)
+        self.revision = revision
+        self.calls = []
+        self.get_calls = 0
+        self.fail_next = False
+        self.fail_next_load = False
+
+    def get_settings(self):
+        self.get_calls += 1
+        if self.fail_next_load:
+            self.fail_next_load = False
+            raise CatalogError("producer_unavailable")
+        return {"order": list(self.order), "revision": self.revision}
+
+    def save_settings(self, revision, order):
+        self.calls.append((revision, list(order)))
+        if self.fail_next:
+            self.fail_next = False
+            return {"order": list(self.order), "revision": self.revision, "outcome": "failure"}
+        if revision != self.revision:
+            return {"order": list(self.order), "revision": self.revision, "outcome": "conflict"}
+        self.order = list(order)
+        self.revision = f"revision-{len(self.calls) + 1}"
+        return {"order": list(self.order), "revision": self.revision, "outcome": "success"}
+
+
 @pytest.fixture
 def open_page():
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
         created = []
 
-        def launch(client, *, color_scheme="light", init_script=None):
-            server = create_server(client)
-            thread = threading.Thread(target=server.serve_forever)
-            thread.start()
+        def launch(client, *, color_scheme="light", init_script=None, settings=None):
+            application = None
+            if settings is None:
+                server = create_server(client)
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+            else:
+                application = ApplicationRuntime(
+                    port=0,
+                    deadline=time.monotonic() + 5,
+                    server_factory=lambda **kwargs: _create_application_server(
+                        provider=client,
+                        port=kwargs["port"],
+                        settings_provider=kwargs["settings_provider"],
+                    ),
+                )
+                application.get_settings = settings.get_settings
+                application.save_settings = settings.save_settings
+                application.start(static_ready=lambda: True)
+                server = application.server
+                thread = application.http_thread
             context = browser.new_context(color_scheme=color_scheme)
             page = context.new_page()
             if init_script:
@@ -422,17 +473,20 @@ def open_page():
                 timeout=15000,
             )
             page.wait_for_timeout(150)
-            created.append((server, thread, page))
+            created.append((application, server, thread, page))
             return page
 
         try:
             yield launch
         finally:
-            for server, thread, page in created:
+            for application, server, thread, page in created:
                 page.context.close()
-                server.shutdown()
-                thread.join()
-                server.server_close()
+                if application is None:
+                    server.shutdown()
+                    thread.join()
+                    server.server_close()
+                else:
+                    assert application.shutdown(time.monotonic() + 2)
             browser.close()
 
 
@@ -446,6 +500,12 @@ def card_titles(page, column=1, row="Under Development"):
 def row_labels(page):
     return page.locator(".row-head").evaluate_all(
         "rows => rows.map(row => row.firstChild.textContent)"
+    )
+
+
+def stage_editor_order(page):
+    return page.locator("#stage-order-list .stage-order-item").evaluate_all(
+        "items => items.map(item => item.dataset.stage)"
     )
 
 
@@ -627,6 +687,301 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     page.wait_for_selector("#board .card", timeout=15000)
     assert "Renamed foundation" in page.locator("#board").inner_text()
     assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+def test_saved_stage_order_projects_rows_without_phantom_or_catalog_changes(open_page):
+    settings = BrowserSettings(order=["Missing", "Under_Development", "Hidden", "Queue"])
+    value = json.loads(board_payload())
+    digest = value["catalog_digest"]
+    page = open_page(StaticClient(value), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+
+    assert row_labels(page) == ["Under Development", "Queue"]
+    assert page.locator(".row-head").all_inner_texts() == ["Under Development", "Queue"]
+    assert page.locator("#stage-order-list .stage-order-item").count() == 4
+    missing_editor_row = page.locator(
+        "#stage-order-list .stage-order-item[data-stage='Missing']"
+    )
+    assert missing_editor_row.count() == 1
+    assert "not currently available" in missing_editor_row.inner_text()
+    assert value["catalog_digest"] == digest
+    assert page.locator("[data-lifecycle='Missing']").count() == 0
+
+
+def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_page):
+    first = json.loads(board_payload())
+    added = json.loads(board_payload())
+    _admit_inventory_stage(added, "Alpha", "Review")
+    added["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    added["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(added)
+    hidden = json.loads(json.dumps(added))
+    hidden["visibility"]["hidden_stages"].append("Queue")
+    for entry in hidden["entries"]:
+        if entry["stage"] == "Queue":
+            entry["board_visible"] = False
+    _reseal(hidden)
+    removed = json.loads(board_payload())
+    recreated = json.loads(json.dumps(added))
+    empty = json.loads(json.dumps(added))
+    empty["entries"] = []
+    _reseal(empty)
+    refilled = json.loads(json.dumps(added))
+    settings = BrowserSettings(order=["Queue", "Under_Development"])
+    client = SequenceClient([first, added, hidden, removed, recreated, empty, refilled])
+    page = open_page(client, settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    assert row_labels(page) == ["Queue", "Under Development"]
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
+    assert page.get_by_role("button", name="Save").is_disabled()
+    assert settings.calls == []
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
+    assert row_labels(page) == ["Under Development", "Review"]
+    assert page.locator("[data-lifecycle='Queue']").count() == 0
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function(
+        "() => document.querySelector('.row-head')?.firstChild.textContent === 'Queue'"
+    )
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator("[data-lifecycle='Review']").count() == 0
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    assert page.get_by_role("button", name="Save").is_disabled()
+    assert settings.calls == []
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    page.get_by_role("button", name="Refresh view").click()
+    page.locator("#board .board-empty").wait_for()
+    assert row_labels(page) == []
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert row_labels(page) == ["Queue", "Under Development", "Review"]
+    assert settings.order == ["Queue", "Under_Development"]
+
+
+def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
+    first = json.loads(board_payload())
+    added = json.loads(board_payload())
+    _admit_inventory_stage(added, "Alpha", "Review")
+    added["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    added["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(added)
+    removed = json.loads(board_payload())
+    settings = BrowserSettings(order=["Queue", "Under_Development"])
+    page = open_page(SequenceClient([first, added, removed]), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
+    assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
+    page.get_by_role("button", name="Move Review up").press("Enter")
+    assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
+    assert page.get_by_role("button", name="Save").is_enabled()
+    assert settings.calls == []
+
+    page.get_by_role("button", name="Refresh view").click()
+    page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
+    assert "not currently available" in page.locator(
+        "#stage-order-list .stage-order-item[data-stage='Review']"
+    ).inner_text()
+    assert page.get_by_role("button", name="Save").is_enabled()
+    assert settings.calls == []
+
+
+def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    page.get_by_role("button", name="Move Under Development up").focus()
+    page.keyboard.press("Enter")
+    playwright.expect(
+        page.get_by_role("button", name="Move Under Development down")
+    ).to_be_focused()
+    assert settings.calls == []
+    page.get_by_role("button", name="Cancel").click()
+    assert settings.calls == []
+    assert page.locator("#stage-order-status").inner_text() == (
+        "Unsaved board row order changes cancelled."
+    )
+    page.get_by_role("button", name="Move Under Development up").press("Enter")
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
+    assert row_labels(page) == ["Under Development", "Queue"]
+
+    page2 = open_page(StaticClient(board_payload()), settings=settings)
+    page2.locator("#stage-order-editor").wait_for()
+    assert row_labels(page2) == ["Under Development", "Queue"]
+    page2.get_by_role("button", name="Reset").click()
+    page2.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.order == []
+    assert row_labels(page2) == ["Queue", "Under Development"]
+
+
+def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
+    settings = BrowserSettings()
+    settings.fail_next_load = True
+    page = open_page(StaticClient(board_payload()), settings=settings)
+
+    page.get_by_text(
+        "Could not load board row order: producer_unavailable", exact=True
+    ).wait_for()
+    assert settings.get_calls == 1
+    assert page.get_by_role("button", name="Save").is_disabled()
+    retry = page.get_by_role("button", name="Reload board row order")
+    assert retry.is_visible()
+
+    retry.click()
+    page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    assert settings.get_calls == 2
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    page.get_by_role("button", name="Move Under Development up").click()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
+
+
+def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_reload(open_page):
+    settings = BrowserSettings()
+    stale_page = open_page(StaticClient(board_payload()), settings=settings)
+    winning_page = open_page(StaticClient(board_payload()), settings=settings)
+    stale_page.locator("#stage-order-editor").wait_for()
+    winning_page.locator("#stage-order-editor").wait_for()
+    assert settings.get_calls == 2
+
+    winning_page.get_by_role("button", name="Reset").click()
+    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [("revision-1", [])]
+
+    stale_page.get_by_role("button", name="Move Under Development up").click()
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
+    assert stale_page.get_by_role("button", name="Save").is_disabled()
+    reload = stale_page.get_by_role("button", name="Reload board row order")
+    assert reload.is_visible()
+
+    reload.click()
+    stale_page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    assert settings.get_calls == 3
+    assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
+    stale_page.get_by_role("button", name="Move Under Development up").click()
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [
+        ("revision-1", []),
+        ("revision-1", ["Under_Development", "Queue"]),
+        ("revision-2", ["Under_Development", "Queue"]),
+    ]
+
+
+def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_requires_reload(open_page):
+    settings = BrowserSettings()
+    stale_page = open_page(StaticClient(board_payload()), settings=settings)
+    winning_page = open_page(StaticClient(board_payload()), settings=settings)
+    stale_page.locator("#stage-order-editor").wait_for()
+    winning_page.locator("#stage-order-editor").wait_for()
+
+    winning_page.get_by_role("button", name="Move Under Development up").press("Enter")
+    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+    assert row_labels(winning_page) == ["Under Development", "Queue"]
+
+    stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+    assert stale_page.get_by_role("button", name="Save").is_disabled()
+    assert stale_page.get_by_role("button", name="Reload board row order").is_visible()
+
+    settings.fail_next = True
+    winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
+    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_text(
+        "Save failed: the board row order was not persisted.", exact=True
+    ).wait_for()
+    assert settings.order == ["Under_Development", "Queue"]
+    assert row_labels(winning_page) == ["Under Development", "Queue"]
+    assert winning_page.locator(
+        "#stage-order-list .stage-order-item"
+    ).evaluate_all("items => items.map(item => item.dataset.stage)") == [
+        "Queue",
+        "Under_Development",
+    ]
+    assert winning_page.get_by_role("button", name="Save").is_enabled()
+
+
+def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
+    first = json.loads(board_payload())
+    first["entries"].append(_entry(
+        REVERSE,
+        "Beta/Under_Development/reverse",
+        "under_development",
+        "Reverse dependent",
+        "Beta",
+        prerequisites=[_edge(GATE, "reverse")],
+    ))
+    first["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(first)
+    pending = json.loads(json.dumps(first))
+    for entry in pending["entries"]:
+        if entry["package_id"] == STEP_ONE:
+            entry["declared"]["title"] = "Pending foundation"
+    _reseal(pending)
+    settings = BrowserSettings()
+    page = open_page(SequenceClient([first, pending]), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    page.fill("#filter", "dependent")
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    page.get_by_role("button", name="Move Under Development up").press("Enter")
+    playwright.expect(
+        page.get_by_role("button", name="Move Under Development down")
+    ).to_be_focused()
+    assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
+    assert page.locator("#filter").input_value() == "dependent"
+    assert page.locator("#refresh").inner_text() == "Apply update"
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    assert page.locator("#filter").input_value() == "dependent"
+    assert page.locator("#refresh").inner_text() == "Apply update"
+    page.get_by_role("button", name="Apply update").click()
+    page.locator("#board").get_by_text(
+        "Pending foundation", exact=True
+    ).wait_for(state="attached")
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
+    assert page.locator("#filter").input_value() == "dependent"
+    page.fill("#filter", "")
+    assert connection_pairs(page) == {
+        (STEP_ONE, STEP_TWO),
+        (STEP_TWO, GATE),
+        (STEP_ONE, LOOSE),
+        (GATE, REVERSE),
+    }
+    reverse = page.locator(f'.connection[data-source="{GATE}"][data-dependent="{REVERSE}"]')
+    assert reverse.count() == 1
+    assert reverse.evaluate("""group => {
+      const source = document.querySelector(`[data-package-id="${group.dataset.source}"]`);
+      const dependent = document.querySelector(`[data-package-id="${group.dataset.dependent}"]`);
+      return source.getBoundingClientRect().top > dependent.getBoundingClientRect().top;
+    }""")
+    assert_readable_arrows(page)
 
 
 def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(open_page):
@@ -919,47 +1274,252 @@ def connection_pairs(page):
     }
 
 
+def rail_failure_context(result, predicate):
+    diagnostic = dict(result["diagnostic"])
+    diagnostic["predicate"] = predicate
+    diagnostic["runner"] = {
+        "githubActions": os.environ.get("GITHUB_ACTIONS"),
+        "runnerName": os.environ.get("RUNNER_NAME"),
+        "runnerOS": os.environ.get("RUNNER_OS"),
+        "runnerArch": os.environ.get("RUNNER_ARCH"),
+        "imageOS": os.environ.get("ImageOS"),
+        "imageVersion": os.environ.get("ImageVersion"),
+    }
+    return f"rail assertion failed: {json.dumps(diagnostic, sort_keys=True)}"
+
+
 def assert_readable_arrows(page):
-    results = page.locator(".rail").evaluate_all("""paths => paths.map(path => {
-      const matrix = path.getScreenCTM();
-      const at = length => path.getPointAtLength(length).matrixTransform(matrix);
+    results = page.evaluate("""() => {
+      const board = document.querySelector('#board');
+      const svg = board.querySelector(':scope > .rail-layer');
+      return [...svg.querySelectorAll('.rail')].map(path => {
+      const boardViewport = board.getBoundingClientRect();
+      const svgViewport = svg.getBoundingClientRect();
+      const svgStyle = getComputedStyle(svg);
+      const viewBox = svg.viewBox.baseVal;
+      const at = length => path.getPointAtLength(length);
+      const point = value => ({x: value.x, y: value.y});
+      const rectangle = value => ({
+        left: value.left, top: value.top, right: value.right, bottom: value.bottom,
+        width: value.width, height: value.height,
+      });
+      const boardLocalRectangle = element => {
+        const value = element.getBoundingClientRect();
+        return {
+          left: value.left - boardViewport.left,
+          top: value.top - boardViewport.top,
+          right: value.right - boardViewport.left,
+          bottom: value.bottom - boardViewport.top,
+          width: value.width,
+          height: value.height,
+        };
+      };
+      const toViewport = value => ({
+        x: svgViewport.left + (value.x - viewBox.x) * svgViewport.width / viewBox.width,
+        y: svgViewport.top + (value.y - viewBox.y) * svgViewport.height / viewBox.height,
+      });
       const length = path.getTotalLength();
       const start = at(0), end = at(length), beforeEnd = at(length - 1);
       const cards = [...document.querySelectorAll('.card:not([hidden])')];
-      const source = cards.find(c => c.dataset.packageId === path.parentNode.dataset.source)
-        .getBoundingClientRect();
-      const dependent = cards.find(c => c.dataset.packageId === path.parentNode.dataset.dependent)
-        .getBoundingClientRect();
+      const sourceElement = cards.find(
+        c => c.dataset.packageId === path.parentNode.dataset.source
+      );
+      const dependentElement = cards.find(
+        c => c.dataset.packageId === path.parentNode.dataset.dependent
+      );
+      const source = boardLocalRectangle(sourceElement);
+      const dependent = boardLocalRectangle(dependentElement);
       const obstacles = [...cards, ...document.querySelectorAll('.row-head, .column-head')]
-        .map(c => c.getBoundingClientRect());
+        .map(boardLocalRectangle);
       let intersects = false;
       for (let distance = 0; distance <= length; distance += 2) {
-        const point = at(distance);
-        if (obstacles.some(r => point.x > r.left && point.x < r.right &&
-            point.y > r.top && point.y < r.bottom)) intersects = true;
+        const sample = at(distance);
+        if (obstacles.some(r => sample.x > r.left && sample.x < r.right &&
+            sample.y > r.top && sample.y < r.bottom)) intersects = true;
       }
       const markerId = path.getAttribute('marker-end').slice(5, -1);
-      const marker = document.getElementById(markerId);
-      return {
-        leavesSource: Math.abs(start.x - source.left) < 2 &&
-          start.y > source.top && start.y < source.bottom,
-        entersDependent: end.x < dependent.left && dependent.left - end.x <= 8 &&
-          end.y > dependent.top && end.y < dependent.bottom && beforeEnd.x < end.x,
-        intersects,
-        arrowShape: marker.querySelector('path').getAttribute('d'),
-        arrowTipAtEnd: marker.refX.baseVal.value === marker.viewBox.baseVal.width,
-        arrowWidth: marker.markerWidth.baseVal.value,
-        strokeWidth: parseFloat(getComputedStyle(path).strokeWidth),
+      const marker = svg.querySelector(`marker[id="${markerId}"]`);
+      const arrowShape = marker.querySelector('path').getAttribute('d');
+      const arrowTipAtEnd = marker.refX.baseVal.value === marker.viewBox.baseVal.width;
+      const arrowWidth = marker.markerWidth.baseVal.value;
+      const strokeWidth = parseFloat(getComputedStyle(path).strokeWidth);
+      const leavesSource = Math.abs(start.x - source.left) < 2 &&
+        start.y > source.top && start.y < source.bottom;
+      const entersDependent = end.x < dependent.left && dependent.left - end.x <= 8 &&
+        end.y > dependent.top && end.y < dependent.bottom && beforeEnd.x < end.x;
+      const mappedStart = toViewport(start);
+      const mappedEnd = toViewport(end);
+      const sourceViewport = sourceElement.getBoundingClientRect();
+      const dependentViewport = dependentElement.getBoundingClientRect();
+      const placement = {
+        absoluteTopLeft: svgStyle.position === 'absolute' &&
+          parseFloat(svgStyle.left) === 0 && parseFloat(svgStyle.top) === 0,
+        rootAtBoardOrigin: svgViewport.left === boardViewport.left &&
+          svgViewport.top === boardViewport.top,
+        zeroOriginViewBox: viewBox.x === 0 && viewBox.y === 0,
+        viewBoxMatchesLayerDimensions: viewBox.width === svgViewport.width &&
+          viewBox.height === svgViewport.height,
+        endpointsMeetCards: Math.abs(mappedStart.x - sourceViewport.left) < 2 &&
+          mappedStart.y > sourceViewport.top && mappedStart.y < sourceViewport.bottom &&
+          mappedEnd.x < dependentViewport.left &&
+          dependentViewport.left - mappedEnd.x <= 8 &&
+          mappedEnd.y > dependentViewport.top && mappedEnd.y < dependentViewport.bottom,
       };
-    })""")
+      return {
+        leavesSource,
+        entersDependent,
+        intersects,
+        arrowShape,
+        arrowTipAtEnd,
+        arrowWidth,
+        strokeWidth,
+        layerPlacement: Object.values(placement).every(Boolean),
+        diagnostic: {
+          edge: {
+            source: path.parentNode.dataset.source,
+            dependent: path.parentNode.dataset.dependent,
+          },
+          path: {
+            d: path.getAttribute('d'), length,
+            start: point(start), beforeEnd: point(beforeEnd), end: point(end),
+            mappedStart: point(mappedStart), mappedEnd: point(mappedEnd),
+          },
+          predicates: {
+            route: {
+              leavesSource,
+              entersDependent,
+              avoidsObstacles: !intersects,
+              arrowShape: arrowShape === 'M0 0L10 5L0 10Z',
+              arrowTipAtEnd,
+              arrowWidth: arrowWidth >= 10,
+              strokeWidth: strokeWidth >= 2.5,
+            },
+            placement,
+          },
+          rectangles: {
+            boardViewport: rectangle(boardViewport),
+            svgViewport: rectangle(svgViewport),
+            sourceBoardLocal: source,
+            dependentBoardLocal: dependent,
+            sourceViewport: rectangle(sourceViewport),
+            dependentViewport: rectangle(dependentViewport),
+          },
+          layer: {
+            computedPosition: svgStyle.position,
+            computedLeft: svgStyle.left,
+            computedTop: svgStyle.top,
+            computedWidth: svgStyle.width,
+            computedHeight: svgStyle.height,
+            viewBox: {
+              x: viewBox.x, y: viewBox.y, width: viewBox.width, height: viewBox.height,
+            },
+          },
+          browser: {userAgent: navigator.userAgent, platform: navigator.platform},
+          viewport: {
+            width: window.innerWidth, height: window.innerHeight,
+            devicePixelRatio: window.devicePixelRatio,
+          },
+          evaluation: {
+            performanceNow: performance.now(), readyState: document.readyState,
+            visibilityState: document.visibilityState,
+            fontsStatus: document.fonts ? document.fonts.status : 'unsupported',
+          },
+        },
+      };
+      });
+    }""")
     for result in results:
-        assert result["leavesSource"]
-        assert result["entersDependent"]
-        assert not result["intersects"]
-        assert result["arrowShape"] == "M0 0L10 5L0 10Z"
-        assert result["arrowTipAtEnd"]
-        assert result["arrowWidth"] >= 10
-        assert result["strokeWidth"] >= 2.5
+        assert result["leavesSource"], rail_failure_context(result, "leavesSource")
+        assert result["entersDependent"], rail_failure_context(result, "entersDependent")
+        assert not result["intersects"], rail_failure_context(result, "avoidsObstacles")
+        assert result["arrowShape"] == "M0 0L10 5L0 10Z", rail_failure_context(
+            result, "arrowShape"
+        )
+        assert result["arrowTipAtEnd"], rail_failure_context(result, "arrowTipAtEnd")
+        assert result["arrowWidth"] >= 10, rail_failure_context(result, "arrowWidth")
+        assert result["strokeWidth"] >= 2.5, rail_failure_context(result, "strokeWidth")
+    for result in results:
+        assert result["layerPlacement"], rail_failure_context(result, "layerPlacement")
+
+
+def test_readable_arrow_failures_report_context_only_on_failure(
+    open_page, capsys, monkeypatch
+):
+    runner_context = {
+        "GITHUB_ACTIONS": "true",
+        "RUNNER_NAME": "diagnostic-runner",
+        "RUNNER_OS": "DiagnosticOS",
+        "RUNNER_ARCH": "diagnostic-arch",
+        "ImageOS": "diagnostic-image",
+        "ImageVersion": "diagnostic-version",
+    }
+    for name, value in runner_context.items():
+        monkeypatch.setenv(name, value)
+    page = open_page(StaticClient(board_payload()))
+    assert_readable_arrows(page)
+    passing_output = capsys.readouterr()
+    assert passing_output.out == ""
+    assert passing_output.err == ""
+
+    first_rail = page.locator(".rail").first
+    valid_path = first_rail.get_attribute("d")
+    first_rail.evaluate("path => path.setAttribute('d', 'M 0 0 L 1 1')")
+    with pytest.raises(AssertionError) as failure:
+        assert_readable_arrows(page)
+    message = str(failure.value)
+    prefix = "rail assertion failed: "
+    assert message.startswith(prefix)
+    diagnostic = json.loads(message[len(prefix):].splitlines()[0])
+
+    assert diagnostic["predicate"] == "leavesSource"
+    assert diagnostic["edge"] == {"source": STEP_ONE, "dependent": STEP_TWO}
+    assert diagnostic["path"]["d"] == "M 0 0 L 1 1"
+    assert diagnostic["path"]["length"] == pytest.approx(2 ** 0.5)
+    for endpoint in ("start", "beforeEnd", "end"):
+        point = diagnostic["path"][endpoint]
+        assert isinstance(point["x"], (int, float))
+        assert isinstance(point["y"], (int, float))
+    assert diagnostic["path"]["start"] != diagnostic["path"]["end"]
+
+    for rectangle in diagnostic["rectangles"].values():
+        assert rectangle["width"] > 0
+        assert rectangle["height"] > 0
+        assert rectangle["right"] > rectangle["left"]
+        assert rectangle["bottom"] > rectangle["top"]
+    assert diagnostic["browser"]["userAgent"]
+    assert diagnostic["browser"]["platform"]
+    assert diagnostic["runner"] == {
+        "githubActions": "true",
+        "runnerName": "diagnostic-runner",
+        "runnerOS": "DiagnosticOS",
+        "runnerArch": "diagnostic-arch",
+        "imageOS": "diagnostic-image",
+        "imageVersion": "diagnostic-version",
+    }
+    assert diagnostic["viewport"]["width"] > 0
+    assert diagnostic["viewport"]["height"] > 0
+    assert diagnostic["viewport"]["devicePixelRatio"] > 0
+    assert diagnostic["evaluation"]["performanceNow"] >= 0
+    assert diagnostic["evaluation"]["readyState"] == "complete"
+    assert diagnostic["evaluation"]["visibilityState"] == "visible"
+    assert diagnostic["evaluation"]["fontsStatus"] in {"loaded", "loading"}
+
+    first_rail.evaluate("(path, value) => path.setAttribute('d', value)", valid_path)
+    assert_readable_arrows(page)
+    page.locator(".rail-layer").evaluate("svg => { svg.style.left = '32px'; }")
+    with pytest.raises(AssertionError) as shifted_failure:
+        assert_readable_arrows(page)
+    shifted_message = str(shifted_failure.value)
+    assert shifted_message.startswith(prefix)
+    shifted = json.loads(shifted_message[len(prefix):].splitlines()[0])
+
+    assert shifted["predicate"] == "layerPlacement"
+    assert all(shifted["predicates"]["route"].values())
+    assert not shifted["predicates"]["placement"]["absoluteTopLeft"]
+    assert not shifted["predicates"]["placement"]["rootAtBoardOrigin"]
+    assert not shifted["predicates"]["placement"]["endpointsMeetCards"]
+    assert shifted["predicates"]["placement"]["zeroOriginViewBox"]
+    assert shifted["predicates"]["placement"]["viewBoxMatchesLayerDimensions"]
 
 
 def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(open_page):

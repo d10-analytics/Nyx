@@ -97,6 +97,27 @@ The visibility flags are setup options; they cannot be used alone or combined
 with each other. An active instance rejects changes to its workspace or policy.
 Use an explicit visibility option when setting up so the intended board is clear.
 
+## Choose board row order
+
+When account settings are available, the toolbar includes a **Board row order**
+editor. It lists the literal stage names known to the current workspace. Use
+**Move up** and **Move down** to arrange them, then choose **Save**. Save writes
+the order to this account's configuration and the board applies it without moving
+any folders or changing work item state. The saved order is shared by this
+account's browser and desktop views, survives browser reload and a supported Nyx
+restart, and is kept separately for each workspace root.
+
+**Cancel** discards the editor's unsaved moves and performs no write. **Reset**
+clears the saved order for the current workspace only; the board then follows the
+canonical inventory order. A hidden or absent saved stage name stays in the editor
+as a retained literal, marked as unavailable, but it produces no board row. A new
+eligible stage that is not yet saved follows the saved names and is appended in
+canonical inventory order. If the settings service cannot load, the board remains
+usable in canonical inventory order and shows **Reload board row order** so you
+can retry. A conflict or reload-needed Save requires that reload, which replaces
+the unsaved draft with the current saved order. Any other failed Save leaves the
+prior saved order and unsaved draft in place so you can retry.
+
 ## Windows and macOS: the private desktop application
 
 The desktop application is a self-contained build; it does not require users to
@@ -198,7 +219,9 @@ repository, start Nyx through its normal local server and scanner, and configure
 the `Done` stage as hidden. Do not use a private workspace for a public example.
 
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
-fresh browser context so the compact preference starts checked:
+fresh browser context so the compact preference starts checked. Before saving the
+first image, use **Board row order** to move **Queue** above **Needs Fixes** and
+choose **Save**; keep that saved account-local order for all three images:
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -213,9 +236,9 @@ fresh browser context so the compact preference starts checked:
    focus the **Workspace issues** summary and press **Enter**. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 
-The first image is light with the issue summary, selected festival card, and
-disclosures collapsed. The second is dark with compact view checked and the
-Dependencies disclosure opened by keyboard, showing the hidden permit title
+The first image is light with the saved row order, issue summary, selected festival
+card, and disclosures collapsed. The second is dark with compact view checked and
+the Dependencies disclosure opened by keyboard, showing the hidden permit title
 and both `venue-confirmed` and `permit-approved` outcomes. The third remains
 dark, unchecks compact view, and opens both Workspace issues and Dependencies by
 keyboard so the empty Planning row and Community_Resources column are visible.

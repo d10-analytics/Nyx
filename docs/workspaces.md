@@ -194,6 +194,25 @@ its prerequisite can remain visible in a selected card's details. The browser's
 dimensions from the displayed snapshot; unchecking it restores confirmed-empty
 rows and columns without changing the workspace or configuration.
 
+The **Board row order** editor is another presentation control. It saves a
+root-keyed order map in the current account's configuration, so browser and
+desktop views for that account share the order and a supported restart restores
+it. Switching between workspace roots does not carry one root's order into
+another. **Move up** and **Move down** change the draft; **Save** persists it,
+**Cancel** performs no write, and **Reset** clears only the current root's saved
+order. Unlisted eligible stages are appended in canonical inventory order until
+you save them. Saved names remain literal even when their stage is hidden or
+absent; they retain their place for a later return but do not produce a row while
+hidden or absent. If loading account settings fails, no saved order is available,
+so the board uses canonical inventory order and reports the problem for retry.
+Choose **Reload board row order** to retry. A conflict or reload-needed Save
+requires that reload, which replaces the stale unsaved draft with the current
+saved order. For other Save failures: If Save fails, the board keeps displaying
+the prior saved order and retains the unsaved editor draft so you can retry.
+Changing row order never renames or moves a project, stage, or work item
+directory, and never changes completion, approval, claims, prerequisites,
+dependencies, or execution behavior.
+
 ## Add another project or a dependency
 
 Create another project directory alongside `Trail_Web` for work in a separate

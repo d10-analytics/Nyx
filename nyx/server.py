@@ -14,6 +14,7 @@ from typing import Any, Protocol
 
 from .catalog import scan_catalog
 from .models import Catalog, ProtocolError, parse_catalog
+from .state import ConfigurationError, StageOrderError, StateError
 
 _STATIC_ROOT = Path(__file__).with_name("static")
 _STATIC = {
@@ -22,7 +23,7 @@ _STATIC = {
     "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
     "/static/style.css": ("style.css", "text/css; charset=utf-8"),
 }
-_API_ROUTES = frozenset({"/api/catalog"})
+_API_ROUTES = frozenset({"/api/catalog", "/api/settings"})
 _SAFE_ERRORS = frozenset(
     {
         "producer_unavailable",
@@ -31,6 +32,7 @@ _SAFE_ERRORS = frozenset(
         "producer_output_too_large",
         "producer_protocol_error",
         "producer_cancelled",
+        "settings_unavailable",
     }
 )
 
@@ -79,7 +81,9 @@ def _default_provider() -> Catalog:
         raise CatalogError("producer_unavailable") from None
 
 
-def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
+def _handler_for(
+    provider: Provider, settings_provider: Any | None = None
+) -> type[BaseHTTPRequestHandler]:
     class TrackerHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -121,9 +125,85 @@ def _handler_for(provider: Provider) -> type[BaseHTTPRequestHandler]:
         def _error(self, code: str) -> None:
             self._send(HTTPStatus.BAD_GATEWAY, _json_bytes({"error": code}), "application/json")
 
+        def _settings_provider(self) -> Any | None:
+            return settings_provider
+
+        def _settings_get(self) -> None:
+            settings = self._settings_provider()
+            if settings is None or not hasattr(settings, "get_settings"):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            try:
+                body = settings.get_settings()
+            except CatalogError as error:
+                self._send(HTTPStatus.SERVICE_UNAVAILABLE, _json_bytes({"error": error.code}), "application/json")
+                return
+            self._send(HTTPStatus.OK, _json_bytes(body), "application/json")
+
+        def _settings_put(self) -> None:
+            settings = self._settings_provider()
+            if settings is None or not hasattr(settings, "save_settings"):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                length = -1
+            if length < 0 or length > 1024 * 1024:
+                self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
+                return
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"revision", "order"}
+                or not isinstance(payload.get("revision"), str)
+                or not isinstance(payload.get("order"), list)
+            ):
+                self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
+                return
+            try:
+                result = settings.save_settings(payload["revision"], payload["order"])
+            except CatalogError as error:
+                self._send(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    _json_bytes({"error": error.code}),
+                    "application/json",
+                )
+                return
+            except (ValueError, ProtocolError, TypeError):
+                self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
+                return
+            except StageOrderError:
+                self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_order"}), "application/json")
+                return
+            except (ConfigurationError, StateError):
+                self._send(HTTPStatus.SERVICE_UNAVAILABLE, _json_bytes({"error": "settings_unavailable"}), "application/json")
+                return
+            outcome = result.get("outcome")
+            status = HTTPStatus.CONFLICT if outcome in {"conflict", "reload-needed"} else HTTPStatus.OK
+            if outcome == "failure":
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+            self._send(status, _json_bytes(result), "application/json")
+
         def _dispatch(self) -> None:
             if not self._host_allowed():
                 self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            if self.path == "/api/settings":
+                if self.command in {"GET", "HEAD"}:
+                    self._settings_get()
+                elif self.command == "PUT":
+                    self._settings_put()
+                else:
+                    self._send(
+                        HTTPStatus.METHOD_NOT_ALLOWED,
+                        b"Method not allowed\n",
+                        "text/plain; charset=utf-8",
+                    )
                 return
             if self.command not in {"GET", "HEAD"}:
                 self._send(
@@ -228,14 +308,55 @@ class TrackerServer(ThreadingHTTPServer):
         provider: Provider | None = None,
         port: int = 0,
     ) -> None:
+        self._initialize(provider, port, None)
+
+    def _initialize(
+        self,
+        provider: Provider | None,
+        port: int,
+        settings_provider: Any | None,
+    ) -> None:
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
         selected_provider = provider if provider is not None else _default_provider
-        super().__init__(("127.0.0.1", port), _handler_for(selected_provider))
+        super().__init__(
+            ("127.0.0.1", port),
+            _handler_for(selected_provider, settings_provider),
+        )
 
+def create_server(
+    provider: Provider | None = None,
+    port: int = 0,
+) -> TrackerServer:
+    """Create a standalone read-only catalog server."""
 
-def create_server(provider: Provider | None = None, port: int = 0) -> TrackerServer:
     return TrackerServer(provider=provider, port=port)
+
+
+class _ApplicationTrackerServer(TrackerServer):
+    """Settings-capable server constructed only by the application owner."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        port: int,
+        settings_provider: Any,
+    ) -> None:
+        self._initialize(provider, port, settings_provider)
+
+
+def _create_application_server(
+    provider: Provider,
+    port: int,
+    settings_provider: Any,
+) -> TrackerServer:
+    """Create the settings-capable server used by ApplicationRuntime."""
+
+    return _ApplicationTrackerServer(
+        provider=provider,
+        port=port,
+        settings_provider=settings_provider,
+    )
 
 
 def run_server(provider: Provider | None = None, port: int = 0) -> None:

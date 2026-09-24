@@ -987,7 +987,6 @@ class _Daemon:
         self.application = ApplicationRuntime(
             port=PORT,
             deadline=self._deadline,
-            server_factory=lambda **kwargs: create_server(**kwargs),
             thread_factory=lambda **kwargs: threading.Thread(**kwargs),
         )
         self.control: socket.socket | None = None
@@ -1161,7 +1160,8 @@ class _Daemon:
             raise StartupError("Nyx startup timed out")
         try:
             self.startup_failure_code = 23
-            state.load_configuration(self.paths)
+            configuration = state.load_configuration(self.paths)
+            self.application.capture_configuration(configuration, self.paths)
             _require_deadline(self._deadline())
             self.startup_failure_code = 24
             try:

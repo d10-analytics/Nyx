@@ -83,6 +83,44 @@ DESKTOP_GUIDANCE_MARKERS = (
     "already open",
     "Retry",
 )
+STAGE_ORDER_GUIDANCE_MARKERS = {
+    "README.md": (
+        "Board row order",
+        "account-local",
+        "browser and desktop views",
+        "workspace root",
+        "presentation only",
+        "does not rename or move",
+    ),
+    "docs/running-nyx.md": (
+        "Board row order",
+        "Move up",
+        "Move down",
+        "Cancel",
+        "performs no write",
+        "Reset",
+        "canonical inventory order",
+        "hidden or absent",
+        "survives browser reload",
+        "supported Nyx",
+        "failed Save",
+    ),
+    "docs/workspaces.md": (
+        "root-keyed order map",
+        "browser and desktop views",
+        "Cancel",
+        "performs no write",
+        "Reset",
+        "Unlisted eligible stages",
+        "hidden or absent",
+        "If loading account settings fails, no saved order is available, "
+        "so the board uses canonical inventory order",
+        "reports the problem for retry",
+        "If Save fails, the board keeps displaying the prior saved order "
+        "and retains the unsaved editor draft",
+        "never renames or moves",
+    ),
+}
 _START_TIMEOUT = 90.0
 
 
@@ -129,6 +167,21 @@ def test_documents_publish_the_private_desktop_guidance():
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     for marker in DESKTOP_GUIDANCE_MARKERS:
         assert marker in guide, marker
+
+
+def test_documents_publish_the_saved_stage_order_contract():
+    normalized_documents = {}
+    for name, markers in STAGE_ORDER_GUIDANCE_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        normalized_documents[name] = document
+        for marker in markers:
+            assert marker in document, (name, marker)
+
+    obsolete_fallback = (
+        "If loading or saving account settings fails, the board falls back to "
+        "canonical inventory order and keeps the last saved order unchanged."
+    )
+    assert obsolete_fallback not in normalized_documents["docs/workspaces.md"]
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
