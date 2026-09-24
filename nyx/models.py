@@ -280,8 +280,8 @@ class Catalog:
     program_coverage: dict[str, Any]
     programs: tuple[dict[str, Any], ...]
     inventory: dict[str, Any]
-    configuration_revision: str | None = None
     schema_version: int = SCHEMA_VERSION
+    configuration_revision: str | None = None
 
     def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
