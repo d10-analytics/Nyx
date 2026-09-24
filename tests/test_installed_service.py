@@ -189,6 +189,7 @@ finally:
     thread.join(timeout=5)
     service.server_close()
 """],
+        cwd=EXERCISE,
         input=json.dumps(value),
         capture_output=True,
         text=True,
