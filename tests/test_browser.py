@@ -412,9 +412,15 @@ class BrowserSettings:
         self.order = list(order)
         self.revision = revision
         self.calls = []
+        self.get_calls = 0
         self.fail_next = False
+        self.fail_next_load = False
 
     def get_settings(self):
+        self.get_calls += 1
+        if self.fail_next_load:
+            self.fail_next_load = False
+            raise CatalogError("producer_unavailable")
         return {"order": list(self.order), "revision": self.revision}
 
     def save_settings(self, revision, order):
@@ -825,7 +831,64 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     assert row_labels(page2) == ["Queue", "Under Development"]
 
 
-def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_page):
+def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
+    settings = BrowserSettings()
+    settings.fail_next_load = True
+    page = open_page(StaticClient(board_payload()), settings=settings)
+
+    page.get_by_text(
+        "Could not load board row order: producer_unavailable", exact=True
+    ).wait_for()
+    assert settings.get_calls == 1
+    assert page.get_by_role("button", name="Save").is_disabled()
+    retry = page.get_by_role("button", name="Reload board row order")
+    assert retry.is_visible()
+
+    retry.click()
+    page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    assert settings.get_calls == 2
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    page.get_by_role("button", name="Move Under Development up").click()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"])]
+
+
+def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_reload(open_page):
+    settings = BrowserSettings()
+    stale_page = open_page(StaticClient(board_payload()), settings=settings)
+    winning_page = open_page(StaticClient(board_payload()), settings=settings)
+    stale_page.locator("#stage-order-editor").wait_for()
+    winning_page.locator("#stage-order-editor").wait_for()
+    assert settings.get_calls == 2
+
+    winning_page.get_by_role("button", name="Reset").click()
+    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [("revision-1", [])]
+
+    stale_page.get_by_role("button", name="Move Under Development up").click()
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
+    assert stale_page.get_by_role("button", name="Save").is_disabled()
+    reload = stale_page.get_by_role("button", name="Reload board row order")
+    assert reload.is_visible()
+
+    reload.click()
+    stale_page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    assert settings.get_calls == 3
+    assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
+    stale_page.get_by_role("button", name="Move Under Development up").click()
+    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    assert settings.calls == [
+        ("revision-1", []),
+        ("revision-1", ["Under_Development", "Queue"]),
+        ("revision-2", ["Under_Development", "Queue"]),
+    ]
+
+
+def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_requires_reload(open_page):
     settings = BrowserSettings()
     stale_page = open_page(StaticClient(board_payload()), settings=settings)
     winning_page = open_page(StaticClient(board_payload()), settings=settings)
@@ -842,7 +905,8 @@ def test_stage_order_save_failure_and_stale_response_keep_editor_usable(open_pag
     stale_page.get_by_role("button", name="Save").click()
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
-    assert stale_page.get_by_role("button", name="Save").is_enabled()
+    assert stale_page.get_by_role("button", name="Save").is_disabled()
+    assert stale_page.get_by_role("button", name="Reload board row order").is_visible()
 
     settings.fail_next = True
     winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
