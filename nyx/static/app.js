@@ -295,9 +295,10 @@
         '<span class="stage-order-dormant">(not currently available)</span>';
       const completed = editorCompletedStages.includes(stage);
       return `<li class="stage-order-item" data-stage="${text(stage)}">` +
-      `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
+        `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
         `<label class="stage-completed"><input type="checkbox" class="stage-completed-toggle" ` +
-        `data-stage="${text(stage)}"${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
+        `aria-label="Counts as finished: ${text(label)}" data-stage="${text(stage)}"` +
+        `${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
         `Counts as finished</label>` +
         `<button type="button" class="stage-order-move" data-stage-move="up" ` +
         `aria-label="Move ${text(label)} up"${controlsDisabled || index === 0 ? " disabled" : ""}>Move up</button>` +
