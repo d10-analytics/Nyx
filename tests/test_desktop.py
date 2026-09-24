@@ -942,7 +942,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                 )
                 response = connection.getresponse()
                 assert response.status == 200
-                assert json.loads(response.read())["schema_version"] == 4
+                assert json.loads(response.read())["schema_version"] == 5
                 connection.close()
                 assert application is replacement.runtime
                 replacement.close()
@@ -3194,7 +3194,7 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                     catalog = json.loads(manager.fetch_catalog())
             finally:
                 assert manager.close(time.monotonic() + 30)
-        assert catalog["schema_version"] == 4
+        assert catalog["schema_version"] == 5
         assert manager.active_count == 0
 
 

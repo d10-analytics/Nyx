@@ -32,7 +32,8 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
             "stages": [
@@ -85,6 +86,7 @@ def raw_catalog():
         ],
         "prerequisites": [
             {
+                "kind": "claim",
                 "target_package_id": second["package_id"],
                 "claim_name": "release",
                 "observed_state": "satisfied",
@@ -134,14 +136,18 @@ def test_default_provider_uses_unselected_scanner():
     "mutate",
     [
         lambda value: value.update(schema_version=3),
+        lambda value: value.update(schema_version=4),
+        lambda value: value.pop("configuration_revision"),
+        lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
         lambda value: value["entries"][0].update(board_visible="true"),
         lambda value: value["entries"][0].update(stage="Done"),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(kind="completion"),
         lambda value: value["entries"][0].update(
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-2", "unknown-key", "nonboolean-visibility", "policy-mismatch", "transitive-reference"],
+    ids=["schema-3", "schema-4", "missing-revision", "malformed-revision", "unknown-key", "nonboolean-visibility", "policy-mismatch", "cross-kind-edge", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
@@ -428,6 +434,7 @@ def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
             {
                 "prerequisites": [
                     {
+                        "kind": "claim",
                         "target_package_id": None,
                         "claim_name": None,
                         "observed_state": "invalid",

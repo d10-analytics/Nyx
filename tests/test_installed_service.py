@@ -102,7 +102,7 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     entries = value["entries"]
-    assert value["schema_version"] == 4
+    assert value["schema_version"] == 5
     assert value["inventory"] == {
         "projects": [{"name": "Fictional", "availability": "complete"}],
         "stages": [
@@ -123,6 +123,7 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
     prerequisite = queue["relationship"]["prerequisites"][0]
     assert prerequisite == {
+        "kind": "claim",
         "claim_name": "release",
         "observed_evidence_ref": "sha256:" + "a" * 64,
         "observed_state": "satisfied",
@@ -134,13 +135,14 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     assert done["declared"]["title"] == "Done package"
 
 
-@pytest.mark.parametrize("case", ["schema-3", "duplicate-project"])
+@pytest.mark.parametrize("case", ["schema-3", "schema-4", "malformed-revision", "duplicate-project"])
 def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: str) -> None:
     from nyx.models import canonical_digest
     from nyx.server import create_server
 
     value = {
-        "schema_version": 4,
+        "schema_version": 5,
+        "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
             "stages": [],
@@ -156,8 +158,10 @@ def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: st
         "entries": [],
         "programs": [],
     }
-    if case == "schema-3":
-        value["schema_version"] = 3
+    if case in {"schema-3", "schema-4"}:
+        value["schema_version"] = 3 if case == "schema-3" else 4
+    elif case == "malformed-revision":
+        value["configuration_revision"] = []
     else:
         value["inventory"]["projects"].append(dict(value["inventory"]["projects"][0]))
     value["catalog_digest"] = canonical_digest(value)

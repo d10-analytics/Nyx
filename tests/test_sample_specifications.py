@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from nyx import catalog
+from nyx.models import canonical_digest, parse_catalog
 
 SAMPLE_ROOT = Path(__file__).parents[1] / "examples" / "sample-specifications"
 PROGRAM_ID = "99999999-9999-4999-8999-999999999999"
@@ -24,7 +25,8 @@ def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, obj
 def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages) -> None:
     value = json.loads(catalog.build_catalog(SAMPLE_ROOT, hidden_stages=hidden_stages))
 
-    assert value["schema_version"] == 4
+    assert value["schema_version"] == 5
+    assert value["configuration_revision"] is None
     assert value["inventory"] == {
         "projects": [
             {"name": "Trail_API", "availability": "complete"},
@@ -118,6 +120,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     assert delivery["relationship"]["direct_prerequisite_state"] == "unsatisfied"
     assert plan["relationship"]["prerequisites"] == [
         {
+            "kind": "claim",
             "target_package_id": PREREQUISITE_ID,
             "claim_name": "contract-ready",
             "observed_state": "satisfied",
@@ -128,6 +131,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     ]
     assert delivery["relationship"]["prerequisites"] == [
         {
+            "kind": "claim",
             "target_package_id": PREREQUISITE_ID,
             "claim_name": "implementation-ready",
             "observed_state": "unsatisfied",
@@ -141,6 +145,7 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     assert verify["relationship"]["direct_prerequisite_state"] == "satisfied"
     assert verify["relationship"]["prerequisites"] == [
         {
+            "kind": "claim",
             "target_package_id": PREREQUISITE_ID,
             "claim_name": "contract-ready",
             "observed_state": "satisfied",
@@ -175,3 +180,8 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "diagnostics": [],
         }
     ]
+
+    legacy = dict(value, schema_version=4)
+    legacy["catalog_digest"] = canonical_digest(legacy)
+    with pytest.raises(ValueError):
+        parse_catalog(legacy)
