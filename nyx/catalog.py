@@ -10,7 +10,11 @@ from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
 
-from .state import _validate_completed_stage_names, _validate_hidden_stages
+from .state import (
+    CompletedStageError,
+    _validate_completed_stage_names,
+    _validate_hidden_stages,
+)
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _OMITTED = object()
@@ -89,7 +93,7 @@ def _completion_policy(
         return None
     try:
         return _validate_completed_stage_names(values)
-    except (TypeError, ValueError):
+    except (CompletedStageError, TypeError, ValueError):
         return _INVALID_POLICY
 
 
