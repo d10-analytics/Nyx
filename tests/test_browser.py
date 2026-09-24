@@ -895,7 +895,7 @@ def admitted_reason_payload(kind, reason):
             "missing_target", "duplicate_target", "identity_coverage_incomplete",
             "target_unreadable", "target_changed_during_read", "target_invalid_identity",
             "self_edge", "invalid_prerequisite",
-        } else STEP_ONE, "release")
+        } else STEP_ONE, None if reason == "invalid_prerequisite" else "release")
         edge.update(observed_state=None, observed_evidence_ref=None,
                     resolved_state="unknown", reason=reason)
     else:
@@ -943,6 +943,8 @@ def malformed_typed_edge_payload(case):
     ]["prerequisites"][0]
     if case == "missing-kind":
         del edge["kind"]
+    elif case == "invalid-kind":
+        edge["kind"] = "unknown"
     elif case == "extra-key":
         edge["extra"] = "unexpected"
     elif case == "cross-kind":
@@ -962,7 +964,7 @@ def malformed_typed_edge_payload(case):
 
 
 @pytest.mark.parametrize("case", [
-    "missing-kind", "extra-key", "cross-kind", "unsafe-stage", "mismatched-reason",
+    "missing-kind", "invalid-kind", "extra-key", "cross-kind", "unsafe-stage", "mismatched-reason",
 ])
 def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page, case):
     valid = json.loads(board_payload())
