@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 from .catalog import scan_catalog
 from .models import Catalog, ProtocolError, parse_catalog
-from .state import ConfigurationError, StageOrderError, StateError
+from .state import CompletedStageError, ConfigurationError, StageOrderError, StateError
 
 _STATIC_ROOT = Path(__file__).with_name("static")
 _STATIC = {
@@ -159,14 +159,17 @@ def _handler_for(
                 return
             if (
                 not isinstance(payload, dict)
-                or set(payload) != {"revision", "order"}
+                or set(payload) != {"revision", "order", "completed"}
                 or not isinstance(payload.get("revision"), str)
                 or not isinstance(payload.get("order"), list)
+                or not isinstance(payload.get("completed"), list)
             ):
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
                 return
             try:
-                result = settings.save_settings(payload["revision"], payload["order"])
+                result = settings.save_settings(
+                    payload["revision"], payload["order"], payload["completed"]
+                )
             except CatalogError as error:
                 self._send(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -177,7 +180,7 @@ def _handler_for(
             except (ValueError, ProtocolError, TypeError):
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
                 return
-            except StageOrderError:
+            except (StageOrderError, CompletedStageError):
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_order"}), "application/json")
                 return
             except (ConfigurationError, StateError):

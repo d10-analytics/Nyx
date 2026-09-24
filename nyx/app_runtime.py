@@ -95,11 +95,15 @@ class ApplicationRuntime:
         outcome: str,
         *,
         order: tuple[str, ...] | None = None,
+        completed: tuple[str, ...] | None = None,
     ) -> dict[str, object]:
         if order is None:
             order = () if configuration is None else configuration.stage_order
+        if completed is None:
+            completed = () if configuration is None else configuration.completed_stage_names
         return {
             "order": list(order),
+            "completed": list(completed),
             "revision": None if configuration is None else configuration.revision,
             "outcome": outcome,
         }
@@ -115,15 +119,16 @@ class ApplicationRuntime:
                     raise CatalogError("settings_unavailable")
                 return {
                     "order": list(configuration.stage_order),
+                    "completed": list(configuration.completed_stage_names),
                     "revision": configuration.revision,
                 }
         finally:
             self._settings_release()
 
     def save_settings(
-        self, revision: str, order: object
+        self, revision: str, order: object, completed: object = state._OMITTED
     ) -> dict[str, object]:
-        """Compare and atomically save the captured root's stage order.
+        """Compare and atomically save the captured root's settings.
 
         The account configuration remains the state owner's source of truth.
         A commit verification failure is immediately revalidated so callers can
@@ -142,22 +147,28 @@ class ApplicationRuntime:
                     raise ValueError("settings revision must be text")
                 if revision != current.revision:
                     return self._settings_result(current, "conflict")
+                requested_completed = (
+                    current.completed_stage_names
+                    if completed is state._OMITTED
+                    else completed
+                )
                 try:
                     committed = state.save_configuration_owned(
                         current.specification_root,
                         paths=paths,
                         stage_order=order,
+                        completed_stage_names=requested_completed,
                     )
-                except state.StageOrderError:
+                except (state.StageOrderError, state.CompletedStageError):
                     raise
                 except state.ConfigurationCommitVerificationError:
-                    return self._reconcile_settings_write(current, order)
+                    return self._reconcile_settings_write(current, order, requested_completed)
                 except state.ConfigurationError:
                     # A pre-replacement error leaves the old record in place.
                     try:
                         reloaded = state.revalidate_configuration(paths)
                     except state.StateError:
-                        return self._settings_result(None, "reload-needed", order=())
+                        return self._settings_result(None, "reload-needed", order=(), completed=())
                     self._configuration = reloaded
                     return self._settings_result(reloaded, "failure")
                 self._configuration = committed
@@ -166,21 +177,32 @@ class ApplicationRuntime:
             self._settings_release()
 
     def _reconcile_settings_write(
-        self, previous: state.Configuration, requested_order: object
+        self,
+        previous: state.Configuration,
+        requested_order: object,
+        requested_completed: object,
     ) -> dict[str, object]:
         paths = self._settings_paths
         if paths is None:
-            return self._settings_result(None, "reload-needed", order=())
+            return self._settings_result(None, "reload-needed", order=(), completed=())
         try:
             reloaded = state.revalidate_configuration(paths)
         except state.StateError:
-            return self._settings_result(None, "reload-needed", order=())
+            return self._settings_result(None, "reload-needed", order=(), completed=())
         self._configuration = reloaded
         try:
             requested = tuple(requested_order)  # validation already happened before replacement
         except TypeError:
             requested = ()
-        if reloaded.specification_root == previous.specification_root and reloaded.stage_order == requested:
+        try:
+            requested_completed_tuple = tuple(requested_completed)
+        except TypeError:
+            requested_completed_tuple = ()
+        if (
+            reloaded.specification_root == previous.specification_root
+            and reloaded.stage_order == requested
+            and reloaded.completed_stage_names == tuple(sorted(requested_completed_tuple))
+        ):
             return self._settings_result(reloaded, "success")
         return self._settings_result(reloaded, "conflict")
 

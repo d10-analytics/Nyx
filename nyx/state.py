@@ -79,6 +79,10 @@ class StageOrderError(ConfigurationError):
     """A saved stage order is malformed or contains duplicate names."""
 
 
+class CompletedStageError(ConfigurationError):
+    """A saved completed-stage policy is malformed or contains duplicate names."""
+
+
 @dataclass(frozen=True)
 class StatePaths:
     """The fixed paths belonging to the current user's home."""
@@ -98,6 +102,7 @@ class Configuration:
     specification_root: Path
     hidden_stages: tuple[str, ...] = ()
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
+    completed_stages: Mapping[str, tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         # Keep the public object immutable at the field level while ensuring a
@@ -110,6 +115,14 @@ class Configuration:
                 "stage_orders",
                 MappingProxyType(_validate_stage_orders(self.stage_orders)),
             )
+        if self.completed_stages is None:
+            object.__setattr__(self, "completed_stages", MappingProxyType({}))
+        else:
+            object.__setattr__(
+                self,
+                "completed_stages",
+                MappingProxyType(_validate_completed_stages(self.completed_stages)),
+            )
 
     @property
     def stage_order(self) -> tuple[str, ...]:
@@ -117,6 +130,13 @@ class Configuration:
 
         assert self.stage_orders is not None
         return self.stage_orders.get(str(self.specification_root), ())
+
+    @property
+    def completed_stage_names(self) -> tuple[str, ...]:
+        """Return the active workspace's optional completion policy."""
+
+        assert self.completed_stages is not None
+        return self.completed_stages.get(str(self.specification_root), ())
 
     @property
     def revision(self) -> str:
@@ -135,6 +155,11 @@ class Configuration:
                 root: list(order)
                 for root, order in sorted(self.stage_orders.items())
             }
+        if self.completed_stages:
+            payload["completed_stages"] = {
+                root: list(names)
+                for root, names in sorted(self.completed_stages.items())
+            }
         return payload
 
 
@@ -147,6 +172,7 @@ class ConfigurationObservation:
     hidden_stages: tuple[str, ...] | None = None
     diagnostic: str | None = None
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
+    completed_stages: Mapping[str, tuple[str, ...]] | None = None
 
     @property
     def state(self) -> str:
@@ -162,7 +188,12 @@ class ConfigurationObservation:
             return None
         assert self.specification_root is not None
         assert self.hidden_stages is not None
-        return Configuration(self.specification_root, self.hidden_stages, self.stage_orders or {})
+        return Configuration(
+            self.specification_root,
+            self.hidden_stages,
+            self.stage_orders or {},
+            self.completed_stages or {},
+        )
 
 
 @dataclass(frozen=True)
@@ -519,6 +550,48 @@ def _validate_stage_orders(values: Mapping[str, Iterable[str]]) -> dict[str, tup
     return dict(sorted(result.items()))
 
 
+def _validate_completed_stage_names(values: Iterable[str]) -> tuple[str, ...]:
+    """Validate and canonically sort one literal completed-stage set."""
+
+    if isinstance(values, (str, bytes)):
+        raise CompletedStageError("completed stages must be a sequence of names")
+    try:
+        names = tuple(values)
+    except (TypeError, ValueError) as error:
+        raise CompletedStageError("completed stages must be a sequence of names") from error
+    seen: set[str] = set()
+    for name in names:
+        if not isinstance(name, str):
+            raise CompletedStageError("completed stage names must be text")
+        if (
+            not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+            or any(0xD800 <= ord(character) <= 0xDFFF for character in name)
+        ):
+            raise CompletedStageError(f"invalid completed stage name: {name!r}")
+        if name in seen:
+            raise CompletedStageError(f"duplicate completed stage name: {name!r}")
+        seen.add(name)
+    return tuple(sorted(names))
+
+
+def _validate_completed_stages(
+    values: Mapping[str, Iterable[str]],
+) -> dict[str, tuple[str, ...]]:
+    if not isinstance(values, Mapping):
+        raise CompletedStageError("completed stages must be a root-keyed map")
+    result: dict[str, tuple[str, ...]] = {}
+    for root, names in values.items():
+        canonical_root = _canonical_order_root(root)
+        validated = _validate_completed_stage_names(names)
+        if validated:
+            result[canonical_root] = validated
+    return dict(sorted(result.items()))
+
+
 def _configuration_from_payload(payload: Any) -> Configuration:
     if not isinstance(payload, dict) or "schema_version" not in payload:
         raise ConfigurationError("Nyx configuration schema is invalid")
@@ -530,8 +603,15 @@ def _configuration_from_payload(payload: Any) -> Configuration:
             raise ConfigurationError("Nyx configuration schema is invalid")
         hidden_stages: tuple[str, ...] = ()
         stage_orders: dict[str, tuple[str, ...]] = {}
+        completed_stages: dict[str, tuple[str, ...]] = {}
     elif schema_version == CONFIG_SCHEMA_VERSION:
-        allowed = {"schema_version", "hidden_stages", "specification_root", "stage_orders"}
+        allowed = {
+            "schema_version",
+            "hidden_stages",
+            "specification_root",
+            "stage_orders",
+            "completed_stages",
+        }
         if not set(payload).issubset(allowed) or set(payload) < {
             "schema_version", "hidden_stages", "specification_root"
         }:
@@ -554,6 +634,19 @@ def _configuration_from_payload(payload: Any) -> Configuration:
             stage_orders = _validate_stage_orders(raw_stage_orders)
         except StageOrderError as error:
             raise ConfigurationError("Nyx configuration stage orders are invalid") from error
+        raw_completed_stages = payload.get("completed_stages", {})
+        if not isinstance(raw_completed_stages, dict):
+            raise ConfigurationError("Nyx configuration completed stages are invalid")
+        if any(not isinstance(names, list) for names in raw_completed_stages.values()):
+            raise ConfigurationError("Nyx configuration completed stages are invalid")
+        try:
+            completed_stages = _validate_completed_stages(raw_completed_stages)
+        except CompletedStageError as error:
+            raise ConfigurationError("Nyx configuration completed stages are invalid") from error
+        if raw_completed_stages != {
+            root: list(names) for root, names in completed_stages.items()
+        }:
+            raise ConfigurationError("Nyx configuration completed stages are not canonical")
     else:
         raise ConfigurationError("Nyx configuration schema version is unsupported")
     root = payload.get("specification_root")
@@ -569,7 +662,7 @@ def _configuration_from_payload(payload: Any) -> Configuration:
     # instead of being served after a restart.
     if any(_is_within(canonical, footprint) for footprint in _installation_footprints()):
         raise ConfigurationError("Nyx configuration root is inside the Nyx installation")
-    return Configuration(canonical, hidden_stages, stage_orders)
+    return Configuration(canonical, hidden_stages, stage_orders, completed_stages)
 
 
 def load_configuration(paths: StatePaths | None = None) -> Configuration:
@@ -615,6 +708,7 @@ def observe_configuration() -> ConfigurationObservation:
         specification_root=configuration.specification_root,
         hidden_stages=configuration.hidden_stages,
         stage_orders=configuration.stage_orders,
+        completed_stages=configuration.completed_stages,
     )
 
 
@@ -653,11 +747,13 @@ def _configuration_bytes(
     root: Path,
     hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None = None,
+    completed_stages: Mapping[str, Iterable[str]] | None = None,
 ) -> bytes:
     orders = {} if stage_orders is None else _validate_stage_orders(stage_orders)
+    completed = {} if completed_stages is None else _validate_completed_stages(completed_stages)
     return (
         json.dumps(
-            Configuration(root, hidden_stages, orders).as_dict(),
+            Configuration(root, hidden_stages, orders, completed).as_dict(),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -685,6 +781,7 @@ def _atomic_write_configuration(
     root: Path,
     hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None = None,
+    completed_stages: Mapping[str, Iterable[str]] | None = None,
     *,
     deadline: float | None = None,
     deadline_ns: int | None = None,
@@ -701,7 +798,7 @@ def _atomic_write_configuration(
             prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
         )
         try:
-            data = _configuration_bytes(root, hidden_stages, stage_orders)
+            data = _configuration_bytes(root, hidden_stages, stage_orders, completed_stages)
             written = 0
             while written < len(data):
                 _check_deadline(deadline, deadline_ns)
@@ -741,6 +838,7 @@ def _save_configuration(
     root: Path,
     hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None | object = _OMITTED,
+    completed_stages: Mapping[str, Iterable[str]] | None | object = _OMITTED,
     *,
     deadline: float | None = None,
     deadline_ns: int | None = None,
@@ -749,22 +847,31 @@ def _save_configuration(
 
     if _lstat(paths.config_file) is not None:
         _verify_record(paths.config_file)
-        current = load_configuration(paths) if stage_orders is _OMITTED else None
+        current = load_configuration(paths) if (
+            stage_orders is _OMITTED or completed_stages is _OMITTED
+        ) else None
     else:
         current = None
     if stage_orders is _OMITTED:
         validated_orders = {} if current is None else dict(current.stage_orders or {})
     else:
         validated_orders = {} if stage_orders is None else _validate_stage_orders(stage_orders)
+    if completed_stages is _OMITTED:
+        validated_completed = {} if current is None else dict(current.completed_stages or {})
+    else:
+        validated_completed = (
+            {} if completed_stages is None else _validate_completed_stages(completed_stages)
+        )
     _atomic_write_configuration(
         paths,
         root,
         hidden_stages,
         validated_orders,
+        validated_completed,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
-    return Configuration(root, hidden_stages, validated_orders)
+    return Configuration(root, hidden_stages, validated_orders, validated_completed)
 
 
 def validate_configuration_candidate(
@@ -774,6 +881,8 @@ def validate_configuration_candidate(
     paths: StatePaths | None = None,
     stage_orders: Mapping[str, Iterable[str]] | object = _OMITTED,
     stage_order: Iterable[str] | object = _OMITTED,
+    completed_stages: Mapping[str, Iterable[str]] | object = _OMITTED,
+    completed_stage_names: Iterable[str] | object = _OMITTED,
 ) -> Configuration:
     """Validate a prospective configuration without changing persisted state."""
 
@@ -788,6 +897,8 @@ def validate_configuration_candidate(
         validated_hidden_stages = _validate_hidden_stages(hidden_stages)
     if stage_orders is not _OMITTED and stage_order is not _OMITTED:
         raise StageOrderError("provide stage_orders or stage_order, not both")
+    if completed_stages is not _OMITTED and completed_stage_names is not _OMITTED:
+        raise CompletedStageError("provide completed_stages or completed_stage_names, not both")
     if stage_orders is _OMITTED:
         validated_orders = {} if current is None else dict(current.stage_orders or {})
     else:
@@ -805,7 +916,23 @@ def validate_configuration_candidate(
             validated_orders[str(root)] = validated_order
         else:
             validated_orders.pop(str(root), None)
-    return Configuration(root, validated_hidden_stages, validated_orders)
+    if completed_stages is _OMITTED:
+        validated_completed = {} if current is None else dict(current.completed_stages or {})
+    else:
+        validated_completed = {} if current is None else dict(current.completed_stages or {})
+        assert isinstance(completed_stages, Mapping)
+        for policy_root, names in _validate_completed_stages(completed_stages).items():
+            validated_completed[policy_root] = names
+        for policy_root, names in completed_stages.items():
+            if not _validate_completed_stage_names(names):
+                validated_completed.pop(_canonical_order_root(policy_root), None)
+    if completed_stage_names is not _OMITTED:
+        validated_names = _validate_completed_stage_names(completed_stage_names)
+        if validated_names:
+            validated_completed[str(root)] = validated_names
+        else:
+            validated_completed.pop(str(root), None)
+    return Configuration(root, validated_hidden_stages, validated_orders, validated_completed)
 
 
 def save_configuration_owned(
@@ -817,6 +944,8 @@ def save_configuration_owned(
     deadline_ns: int | None = None,
     stage_orders: Mapping[str, Iterable[str]] | object = _OMITTED,
     stage_order: Iterable[str] | object = _OMITTED,
+    completed_stages: Mapping[str, Iterable[str]] | object = _OMITTED,
+    completed_stage_names: Iterable[str] | object = _OMITTED,
 ) -> Configuration:
     """Persist validated configuration for a caller holding lifecycle claims.
 
@@ -837,12 +966,15 @@ def save_configuration_owned(
         paths=selected_paths,
         stage_orders=stage_orders,
         stage_order=stage_order,
+        completed_stages=completed_stages,
+        completed_stage_names=completed_stage_names,
     )
     return _save_configuration(
         selected_paths,
         candidate.specification_root,
         candidate.hidden_stages,
         candidate.stage_orders,
+        candidate.completed_stages,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
@@ -871,6 +1003,7 @@ def _configuration_revision(configuration: Configuration) -> str:
             configuration.specification_root,
             configuration.hidden_stages,
             configuration.stage_orders,
+            configuration.completed_stages,
         )
     ).hexdigest()
 
@@ -931,6 +1064,7 @@ __all__ = [
     "ConfigurationCommitVerificationError",
     "ConfigurationError",
     "ConfigurationObservation",
+    "CompletedStageError",
     "HiddenStageError",
     "StageOrderError",
     "LEGACY_CONFIG_SCHEMA_VERSION",
