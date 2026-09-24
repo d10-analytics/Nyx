@@ -1226,40 +1226,89 @@ def rail_failure_context(result, predicate):
 
 def assert_readable_arrows(page):
     results = page.locator(".rail").evaluate_all("""paths => paths.map(path => {
-      const matrix = path.getScreenCTM();
-      const at = length => path.getPointAtLength(length).matrixTransform(matrix);
+      const svg = path.ownerSVGElement;
+      const board = document.querySelector('#board');
+      const boardViewport = board.getBoundingClientRect();
+      const svgViewport = svg.getBoundingClientRect();
+      const svgStyle = getComputedStyle(svg);
+      const viewBox = svg.viewBox.baseVal;
+      const at = length => path.getPointAtLength(length);
       const point = value => ({x: value.x, y: value.y});
       const rectangle = value => ({
         left: value.left, top: value.top, right: value.right, bottom: value.bottom,
         width: value.width, height: value.height,
       });
+      const boardLocalRectangle = element => {
+        const value = element.getBoundingClientRect();
+        return {
+          left: value.left - boardViewport.left,
+          top: value.top - boardViewport.top,
+          right: value.right - boardViewport.left,
+          bottom: value.bottom - boardViewport.top,
+          width: value.width,
+          height: value.height,
+        };
+      };
+      const toViewport = value => ({
+        x: svgViewport.left + (value.x - viewBox.x) * svgViewport.width / viewBox.width,
+        y: svgViewport.top + (value.y - viewBox.y) * svgViewport.height / viewBox.height,
+      });
       const length = path.getTotalLength();
       const start = at(0), end = at(length), beforeEnd = at(length - 1);
       const cards = [...document.querySelectorAll('.card:not([hidden])')];
-      const source = cards.find(c => c.dataset.packageId === path.parentNode.dataset.source)
-        .getBoundingClientRect();
-      const dependent = cards.find(c => c.dataset.packageId === path.parentNode.dataset.dependent)
-        .getBoundingClientRect();
+      const sourceElement = cards.find(
+        c => c.dataset.packageId === path.parentNode.dataset.source
+      );
+      const dependentElement = cards.find(
+        c => c.dataset.packageId === path.parentNode.dataset.dependent
+      );
+      const source = boardLocalRectangle(sourceElement);
+      const dependent = boardLocalRectangle(dependentElement);
       const obstacles = [...cards, ...document.querySelectorAll('.row-head, .column-head')]
-        .map(c => c.getBoundingClientRect());
+        .map(boardLocalRectangle);
       let intersects = false;
       for (let distance = 0; distance <= length; distance += 2) {
-        const point = at(distance);
-        if (obstacles.some(r => point.x > r.left && point.x < r.right &&
-            point.y > r.top && point.y < r.bottom)) intersects = true;
+        const sample = at(distance);
+        if (obstacles.some(r => sample.x > r.left && sample.x < r.right &&
+            sample.y > r.top && sample.y < r.bottom)) intersects = true;
       }
       const markerId = path.getAttribute('marker-end').slice(5, -1);
       const marker = document.getElementById(markerId);
+      const arrowShape = marker.querySelector('path').getAttribute('d');
+      const arrowTipAtEnd = marker.refX.baseVal.value === marker.viewBox.baseVal.width;
+      const arrowWidth = marker.markerWidth.baseVal.value;
+      const strokeWidth = parseFloat(getComputedStyle(path).strokeWidth);
+      const leavesSource = Math.abs(start.x - source.left) < 2 &&
+        start.y > source.top && start.y < source.bottom;
+      const entersDependent = end.x < dependent.left && dependent.left - end.x <= 8 &&
+        end.y > dependent.top && end.y < dependent.bottom && beforeEnd.x < end.x;
+      const mappedStart = toViewport(start);
+      const mappedEnd = toViewport(end);
+      const sourceViewport = sourceElement.getBoundingClientRect();
+      const dependentViewport = dependentElement.getBoundingClientRect();
+      const placement = {
+        absoluteTopLeft: svgStyle.position === 'absolute' &&
+          parseFloat(svgStyle.left) === 0 && parseFloat(svgStyle.top) === 0,
+        rootAtBoardOrigin: svgViewport.left === boardViewport.left &&
+          svgViewport.top === boardViewport.top,
+        zeroOriginViewBox: viewBox.x === 0 && viewBox.y === 0,
+        viewBoxMatchesLayerDimensions: viewBox.width === parseFloat(svgStyle.width) &&
+          viewBox.height === parseFloat(svgStyle.height),
+        endpointsMeetCards: Math.abs(mappedStart.x - sourceViewport.left) < 2 &&
+          mappedStart.y > sourceViewport.top && mappedStart.y < sourceViewport.bottom &&
+          mappedEnd.x < dependentViewport.left &&
+          dependentViewport.left - mappedEnd.x <= 8 &&
+          mappedEnd.y > dependentViewport.top && mappedEnd.y < dependentViewport.bottom,
+      };
       return {
-        leavesSource: Math.abs(start.x - source.left) < 2 &&
-          start.y > source.top && start.y < source.bottom,
-        entersDependent: end.x < dependent.left && dependent.left - end.x <= 8 &&
-          end.y > dependent.top && end.y < dependent.bottom && beforeEnd.x < end.x,
+        leavesSource,
+        entersDependent,
         intersects,
-        arrowShape: marker.querySelector('path').getAttribute('d'),
-        arrowTipAtEnd: marker.refX.baseVal.value === marker.viewBox.baseVal.width,
-        arrowWidth: marker.markerWidth.baseVal.value,
-        strokeWidth: parseFloat(getComputedStyle(path).strokeWidth),
+        arrowShape,
+        arrowTipAtEnd,
+        arrowWidth,
+        strokeWidth,
+        layerPlacement: Object.values(placement).every(Boolean),
         diagnostic: {
           edge: {
             source: path.parentNode.dataset.source,
@@ -1268,8 +1317,38 @@ def assert_readable_arrows(page):
           path: {
             d: path.getAttribute('d'), length,
             start: point(start), beforeEnd: point(beforeEnd), end: point(end),
+            mappedStart: point(mappedStart), mappedEnd: point(mappedEnd),
           },
-          rectangles: {source: rectangle(source), dependent: rectangle(dependent)},
+          predicates: {
+            route: {
+              leavesSource,
+              entersDependent,
+              avoidsObstacles: !intersects,
+              arrowShape: arrowShape === 'M0 0L10 5L0 10Z',
+              arrowTipAtEnd,
+              arrowWidth: arrowWidth >= 10,
+              strokeWidth: strokeWidth >= 2.5,
+            },
+            placement,
+          },
+          rectangles: {
+            boardViewport: rectangle(boardViewport),
+            svgViewport: rectangle(svgViewport),
+            sourceBoardLocal: source,
+            dependentBoardLocal: dependent,
+            sourceViewport: rectangle(sourceViewport),
+            dependentViewport: rectangle(dependentViewport),
+          },
+          layer: {
+            computedPosition: svgStyle.position,
+            computedLeft: svgStyle.left,
+            computedTop: svgStyle.top,
+            computedWidth: svgStyle.width,
+            computedHeight: svgStyle.height,
+            viewBox: {
+              x: viewBox.x, y: viewBox.y, width: viewBox.width, height: viewBox.height,
+            },
+          },
           browser: {userAgent: navigator.userAgent, platform: navigator.platform},
           viewport: {
             width: window.innerWidth, height: window.innerHeight,
@@ -1293,6 +1372,8 @@ def assert_readable_arrows(page):
         assert result["arrowTipAtEnd"], rail_failure_context(result, "arrowTipAtEnd")
         assert result["arrowWidth"] >= 10, rail_failure_context(result, "arrowWidth")
         assert result["strokeWidth"] >= 2.5, rail_failure_context(result, "strokeWidth")
+    for result in results:
+        assert result["layerPlacement"], rail_failure_context(result, "layerPlacement")
 
 
 def test_readable_arrow_failures_report_context_only_on_failure(
@@ -1314,9 +1395,9 @@ def test_readable_arrow_failures_report_context_only_on_failure(
     assert passing_output.out == ""
     assert passing_output.err == ""
 
-    page.locator(".rail").first.evaluate(
-        "path => path.setAttribute('d', 'M 0 0 L 1 1')"
-    )
+    first_rail = page.locator(".rail").first
+    valid_path = first_rail.get_attribute("d")
+    first_rail.evaluate("path => path.setAttribute('d', 'M 0 0 L 1 1')")
     with pytest.raises(AssertionError) as failure:
         assert_readable_arrows(page)
     message = str(failure.value)
@@ -1356,6 +1437,23 @@ def test_readable_arrow_failures_report_context_only_on_failure(
     assert diagnostic["evaluation"]["readyState"] == "complete"
     assert diagnostic["evaluation"]["visibilityState"] == "visible"
     assert diagnostic["evaluation"]["fontsStatus"] in {"loaded", "loading"}
+
+    first_rail.evaluate("(path, value) => path.setAttribute('d', value)", valid_path)
+    assert_readable_arrows(page)
+    page.locator(".rail-layer").evaluate("svg => { svg.style.left = '32px'; }")
+    with pytest.raises(AssertionError) as shifted_failure:
+        assert_readable_arrows(page)
+    shifted_message = str(shifted_failure.value)
+    assert shifted_message.startswith(prefix)
+    shifted = json.loads(shifted_message[len(prefix):].splitlines()[0])
+
+    assert shifted["predicate"] == "layerPlacement"
+    assert all(shifted["predicates"]["route"].values())
+    assert not shifted["predicates"]["placement"]["absoluteTopLeft"]
+    assert not shifted["predicates"]["placement"]["rootAtBoardOrigin"]
+    assert not shifted["predicates"]["placement"]["endpointsMeetCards"]
+    assert shifted["predicates"]["placement"]["zeroOriginViewBox"]
+    assert shifted["predicates"]["placement"]["viewBoxMatchesLayerDimensions"]
 
 
 def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(open_page):
