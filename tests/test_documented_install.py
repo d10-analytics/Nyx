@@ -24,10 +24,10 @@ from urllib.request import url2pathname
 
 import pytest
 from test_desktop_artifact import (
-    _DELIVERED_HIDDEN_STAGES,
     ArtifactLayout,
     _assert_claims_released,
     _claim_paths,
+    _expected_catalog,
     _inert_path,
     _request,
     _running_gui,
@@ -44,7 +44,6 @@ from test_wheel_install import (
 )
 
 from nyx._native_claim import NativeClaim
-from nyx.catalog import scan_catalog
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 DOCUMENTS = ("README.md", "docs/running-nyx.md")
@@ -401,10 +400,8 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
 
     with _workspace(root) as workspace:
         # Open a configured workspace, serve the board, then Quit.
-        _write_configuration(home, workspace)
-        expected_first = json.loads(
-            scan_catalog(workspace, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
+        _, first_configuration = _write_configuration(home, workspace)
+        expected_first = json.loads(_expected_catalog(first_configuration))
         with _running_gui(artifact, root, environment) as gui:
             status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert status == 200
@@ -417,11 +414,9 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         second = root / "second"
         shutil.copytree(workspace, second)
         shutil.rmtree(second / "Trail_API")
-        expected_second = json.loads(
-            scan_catalog(second, hidden_stages=_DELIVERED_HIDDEN_STAGES)
-        )
+        _, second_configuration = _write_configuration(home, second)
+        expected_second = json.loads(_expected_catalog(second_configuration))
         assert expected_first != expected_second
-        _write_configuration(home, second)
         with _running_gui(artifact, root, environment) as gui:
             status, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
             assert status == 200
