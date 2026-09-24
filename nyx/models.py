@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 LIFECYCLES = frozenset(
     {
@@ -71,6 +71,7 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "catalog_digest",
+        "configuration_revision",
         "inventory",
         "visibility",
         "identity_coverage",
@@ -106,10 +107,31 @@ _RELATIONSHIP_KEYS = frozenset(
 )
 _EDGE_KEYS = frozenset(
     {
+        "kind",
         "target_package_id",
         "claim_name",
         "observed_state",
         "observed_evidence_ref",
+        "resolved_state",
+        "reason",
+    }
+)
+_CLAIM_EDGE_KEYS = frozenset(
+    {
+        "kind",
+        "target_package_id",
+        "claim_name",
+        "observed_state",
+        "observed_evidence_ref",
+        "resolved_state",
+        "reason",
+    }
+)
+_COMPLETION_EDGE_KEYS = frozenset(
+    {
+        "kind",
+        "target_package_id",
+        "observed_stage",
         "resolved_state",
         "reason",
     }
@@ -138,6 +160,32 @@ _EDGE_REASONS = frozenset(
         "claim_unknown",
         "missing_claim",
         "invalid_claim",
+        "missing_target",
+        "duplicate_target",
+        "identity_coverage_incomplete",
+        "target_unreadable",
+        "target_changed_during_read",
+        "target_invalid_identity",
+        "self_edge",
+        "invalid_prerequisite",
+        "completion_satisfied",
+        "completion_unsatisfied",
+        "completion_policy_needed",
+        "completion_policy_invalid",
+    }
+)
+_CLAIM_EDGE_REASONS = _EDGE_REASONS - {
+    "completion_satisfied",
+    "completion_unsatisfied",
+    "completion_policy_needed",
+    "completion_policy_invalid",
+}
+_COMPLETION_EDGE_REASONS = frozenset(
+    {
+        "completion_satisfied",
+        "completion_unsatisfied",
+        "completion_policy_needed",
+        "completion_policy_invalid",
         "missing_target",
         "duplicate_target",
         "identity_coverage_incomplete",
@@ -232,11 +280,13 @@ class Catalog:
     program_coverage: dict[str, Any]
     programs: tuple[dict[str, Any], ...]
     inventory: dict[str, Any]
+    configuration_revision: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     def as_dict(self, *, include_digest: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
             "catalog_digest": self.catalog_digest if include_digest else None,
+            "configuration_revision": self.configuration_revision,
             "discovery_diagnostics": [
                 item.as_dict() for item in self.discovery_diagnostics
             ],
@@ -522,24 +572,57 @@ def _transitive_diagnostics(value: Any, name: str) -> None:
 
 def _edge(value: Any, name: str) -> dict[str, Any]:
     item = _object(value, name)
-    _keys(item, _EDGE_KEYS, name)
+    kind = _string(item.get("kind"), f"{name}.kind")
+    if kind == "claim":
+        _keys(item, _CLAIM_EDGE_KEYS, name)
+    elif kind == "completion":
+        _keys(item, _COMPLETION_EDGE_KEYS, name)
+    else:
+        raise ProtocolError(f"{name}.kind is invalid")
     target = _uuid4(item["target_package_id"], f"{name}.target_package_id", nullable=True)
-    claim_name = _claim_name(item["claim_name"], f"{name}.claim_name", nullable=True)
-    observed_state = _string(item["observed_state"], f"{name}.observed_state", nullable=True)
-    if observed_state is not None and observed_state not in _OBSERVED_STATES:
-        raise ProtocolError(f"{name}.observed_state is invalid")
-    _provenance(item["observed_evidence_ref"], f"{name}.observed_evidence_ref", nullable=True)
     resolved_state = _string(item["resolved_state"], f"{name}.resolved_state")
     if resolved_state not in _OBSERVED_STATES:
         raise ProtocolError(f"{name}.resolved_state is invalid")
     reason = _string(item["reason"], f"{name}.reason")
     if reason not in _EDGE_REASONS:
         raise ProtocolError(f"{name}.reason is invalid")
+    if kind == "claim":
+        claim_name = _claim_name(item["claim_name"], f"{name}.claim_name", nullable=True)
+        observed_state = _string(item["observed_state"], f"{name}.observed_state", nullable=True)
+        if observed_state is not None and observed_state not in _OBSERVED_STATES:
+            raise ProtocolError(f"{name}.observed_state is invalid")
+        evidence_ref = _provenance(
+            item["observed_evidence_ref"],
+            f"{name}.observed_evidence_ref",
+            nullable=True,
+        )
+        if reason not in _CLAIM_EDGE_REASONS:
+            raise ProtocolError(f"{name}.reason does not match kind")
+        return {
+            "kind": "claim",
+            "target_package_id": target,
+            "claim_name": claim_name,
+            "observed_state": observed_state,
+            "observed_evidence_ref": evidence_ref,
+            "resolved_state": resolved_state,
+            "reason": reason,
+        }
+    observed_stage = _string(item["observed_stage"], f"{name}.observed_stage", nullable=True)
+    if observed_stage is not None and (
+        not observed_stage
+        or len(observed_stage) > 1024
+        or observed_stage in {".", ".."}
+        or "/" in observed_stage
+        or "\\" in observed_stage
+        or any(ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF for character in observed_stage)
+    ):
+        raise ProtocolError(f"{name}.observed_stage is invalid")
+    if reason not in _COMPLETION_EDGE_REASONS:
+        raise ProtocolError(f"{name}.reason does not match kind")
     return {
+        "kind": "completion",
         "target_package_id": target,
-        "claim_name": claim_name,
-        "observed_state": observed_state,
-        "observed_evidence_ref": item["observed_evidence_ref"],
+        "observed_stage": observed_stage,
         "resolved_state": resolved_state,
         "reason": reason,
     }
@@ -587,7 +670,12 @@ def _relationship(
         for edge_index, raw in enumerate(prerequisites_value)
     )
     edge_sort = [
-        (edge["target_package_id"] or "", edge["claim_name"] or "")
+        (
+            edge["target_package_id"] or "",
+            edge["kind"],
+            edge.get("claim_name") or "",
+            edge.get("observed_stage") or "",
+        )
         for edge in prerequisites
     ]
     if edge_sort != sorted(edge_sort):
@@ -686,6 +774,11 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         c not in "0123456789abcdef" for c in digest
     ):
         raise ProtocolError("invalid catalog digest")
+    configuration_revision = _string(
+        catalog["configuration_revision"],
+        "configuration_revision",
+        nullable=True,
+    )
     hidden_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
     inventory, _project_names, inventory_pairs = _inventory(catalog["inventory"])
     for name in ("identity_coverage", "program_coverage"):
@@ -728,4 +821,5 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         program_coverage=dict(catalog["program_coverage"]),
         programs=tuple(dict(program) for program in catalog["programs"]),
         inventory=inventory,
+        configuration_revision=configuration_revision,
     )

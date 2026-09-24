@@ -10,10 +10,11 @@ from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
 
-from .state import _validate_hidden_stages
+from .state import _validate_completed_stage_names, _validate_hidden_stages
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _OMITTED = object()
+_INVALID_POLICY = object()
 
 CATALOG_LIFECYCLE_DIRECTORIES = {
     "Under_Development": "under_development",
@@ -69,7 +70,7 @@ _PROVENANCE = re.compile(
     r"^(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$"
 )
 _HEADER_FIELD = re.compile(
-    r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
+    r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Completion Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
 )
 
 
@@ -78,6 +79,18 @@ def _catalog_policy(hidden_stages: Iterable[str] | object) -> tuple[str, ...]:
     if hidden_stages is _OMITTED:
         return tuple(CATALOG_HIDDEN_STAGES)
     return _validate_hidden_stages(hidden_stages)
+
+
+def _completion_policy(
+    values: Iterable[str] | None,
+) -> tuple[str, ...] | None | object:
+    """Validate one optional literal completion policy without exposing input."""
+    if values is None:
+        return None
+    try:
+        return _validate_completed_stage_names(values)
+    except (TypeError, ValueError):
+        return _INVALID_POLICY
 
 
 def _metadata_value(lines: list[str], label: str) -> str | None:
@@ -290,6 +303,7 @@ def _parse_header(
         "Superseded By": [],
     }
     prereq_rows: list[str] = []
+    completion_rows: list[str] = []
     claim_rows: list[str] = []
     diagnostics: list[dict[str, str]] = []
     for line in lines:
@@ -301,6 +315,8 @@ def _parse_header(
             scalar_values[label].append(value)
         elif label == "Prerequisite":
             prereq_rows.append(value)
+        elif label == "Completion Prerequisite":
+            completion_rows.append(value)
         else:
             claim_rows.append(value)
 
@@ -392,8 +408,27 @@ def _parse_header(
             diagnostics.extend(row_diagnostics)
         parsed_prerequisites.append(
             {
+                "kind": "claim",
                 "target_package_id": target_id,
                 "claim_name": claim_name,
+                "valid": len(parts) == 2 and target_id is not None and claim_name is not None,
+                "diagnostics": row_diagnostics,
+            }
+        )
+
+    for value in completion_rows:
+        target_id = _uuid(value.strip()) if "|" not in value else None
+        valid = len(value.strip()) > 0 and target_id is not None and "|" not in value
+        row_diagnostics: list[dict[str, str]] = []
+        if not valid:
+            malformed_prerequisite = True
+            row_diagnostics.append(_diagnostic("invalid_prerequisite", package_path))
+            diagnostics.extend(row_diagnostics)
+        parsed_prerequisites.append(
+            {
+                "kind": "completion",
+                "target_package_id": target_id,
+                "valid": valid,
                 "diagnostics": row_diagnostics,
             }
         )
@@ -719,7 +754,7 @@ def _transitive_diagnostics(
             continue
         for row in reversed(relationship["prerequisites"]):
             target_id = row["target_package_id"]
-            edge = _edge(current, row, index, identity_complete)
+            edge = _edge(current, row, index, identity_complete, None, True)
             edge_reason = str(edge["reason"])
             edge_path = path + ((str(target_id),) if target_id is not None else ())
             if edge_reason not in {"claim_satisfied", "claim_unsatisfied"}:
@@ -838,18 +873,31 @@ def _edge(
     row: dict[str, object],
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
+    completion_policy: tuple[str, ...] | None,
+    completion_policy_valid: bool,
 ) -> dict[str, object]:
+    kind = row.get("kind")
     target_id = row["target_package_id"]
-    claim_name = row["claim_name"]
-    edge: dict[str, object] = {
-        "target_package_id": target_id,
-        "claim_name": claim_name,
-        "observed_state": None,
-        "observed_evidence_ref": None,
-        "resolved_state": "unknown",
-        "reason": "invalid_prerequisite",
-    }
-    if target_id is None or claim_name is None:
+    if kind == "completion":
+        edge: dict[str, object] = {
+            "kind": "completion",
+            "target_package_id": target_id,
+            "observed_stage": None,
+            "resolved_state": "unknown",
+            "reason": "invalid_prerequisite",
+        }
+    else:
+        claim_name = row.get("claim_name")
+        edge = {
+            "kind": "claim",
+            "target_package_id": target_id,
+            "claim_name": claim_name,
+            "observed_state": None,
+            "observed_evidence_ref": None,
+            "resolved_state": "unknown",
+            "reason": "invalid_prerequisite",
+        }
+    if not row.get("valid", False) or target_id is None:
         return edge
     candidates = index.get(target_id, [])
     if not candidates:
@@ -873,42 +921,60 @@ def _edge(
     elif target.get("package_id") != target_id or not target_relationship:
         edge["reason"] = "target_invalid_identity"
     elif target is source:
-        claim = next(
-            (
-                item
-                for item in target_relationship["claims"]
-                if item["name"] == claim_name
-            ),
-            None,
-        )
-        if claim is not None:
-            edge["observed_state"] = claim["state"]
-            edge["observed_evidence_ref"] = claim["evidence_ref"]
+        if kind == "completion":
+            edge["observed_stage"] = target["stage"]
+        else:
+            claim_name = row["claim_name"]
+            claim = next(
+                (
+                    item
+                    for item in target_relationship["claims"]
+                    if item["name"] == claim_name
+                ),
+                None,
+            )
+            if claim is not None:
+                edge["observed_state"] = claim["state"]
+                edge["observed_evidence_ref"] = claim["evidence_ref"]
         edge["reason"] = "self_edge"
     else:
-        claim = next(
-            (
-                item
-                for item in target_relationship["claims"]
-                if item["name"] == claim_name
-            ),
-            None,
-        )
-        if claim is None:
-            edge["reason"] = "missing_claim"
-        else:
-            edge["observed_state"] = claim["state"]
-            edge["observed_evidence_ref"] = claim["evidence_ref"]
-            if claim["diagnostics"]:
-                edge["reason"] = "invalid_claim"
-            elif claim["state"] == "satisfied":
+        if kind == "completion":
+            edge["observed_stage"] = target["stage"]
+            if not completion_policy_valid:
+                edge["reason"] = "completion_policy_invalid"
+            elif completion_policy is None or not completion_policy:
+                edge["reason"] = "completion_policy_needed"
+            elif target["stage"] in completion_policy:
                 edge["resolved_state"] = "satisfied"
-                edge["reason"] = "claim_satisfied"
-            elif claim["state"] == "unsatisfied":
-                edge["resolved_state"] = "unsatisfied"
-                edge["reason"] = "claim_unsatisfied"
+                edge["reason"] = "completion_satisfied"
             else:
-                edge["reason"] = "claim_unknown"
+                edge["resolved_state"] = "unsatisfied"
+                edge["reason"] = "completion_unsatisfied"
+        else:
+            claim_name = row["claim_name"]
+            claim = next(
+                (
+                    item
+                    for item in target_relationship["claims"]
+                    if item["name"] == claim_name
+                ),
+                None,
+            )
+            if claim is None:
+                edge["reason"] = "missing_claim"
+            else:
+                edge["observed_state"] = claim["state"]
+                edge["observed_evidence_ref"] = claim["evidence_ref"]
+                if claim["diagnostics"]:
+                    edge["reason"] = "invalid_claim"
+                elif claim["state"] == "satisfied":
+                    edge["resolved_state"] = "satisfied"
+                    edge["reason"] = "claim_satisfied"
+                elif claim["state"] == "unsatisfied":
+                    edge["resolved_state"] = "unsatisfied"
+                    edge["reason"] = "claim_unsatisfied"
+                else:
+                    edge["reason"] = "claim_unknown"
     return edge
 
 
@@ -919,6 +985,8 @@ def _render_entry(
     program_index: dict[str, list[dict[str, object]]],
     program_coverage_complete: bool,
     hidden_stages: tuple[str, ...],
+    completion_policy: tuple[str, ...] | None,
+    completion_policy_valid: bool,
 ) -> dict[str, object]:
     relationship = record["relationship"]
     if relationship is None:
@@ -954,12 +1022,18 @@ def _render_entry(
     )
     prerequisites = relationship["prerequisites"]
     rendered_edges = [
-        _edge(record, row, index, identity_complete) for row in prerequisites
+        _edge(
+            record, row, index, identity_complete,
+            completion_policy, completion_policy_valid,
+        )
+        for row in prerequisites
     ]
     rendered_edges.sort(
         key=lambda edge: (
             str(edge["target_package_id"] or ""),
-            str(edge["claim_name"] or ""),
+            str(edge["kind"]),
+            str(edge.get("claim_name") or ""),
+            str(edge.get("observed_stage") or ""),
         )
     )
     if relationship["participation"] != "available":
@@ -1018,9 +1092,20 @@ def _build_catalog(
     spec_root: Path,
     *,
     hidden_stages: Iterable[str] | object = _OMITTED,
+    completed_stage_names: Iterable[str] | None = None,
+    configuration_revision: str | None = None,
 ) -> str:
     """Build the relationship catalog from one captured scan."""
     policy = _catalog_policy(hidden_stages)
+    completion_policy_value = _completion_policy(completed_stage_names)
+    completion_policy_valid = completion_policy_value is not _INVALID_POLICY
+    completion_policy = (
+        completion_policy_value
+        if completion_policy_valid and completion_policy_value is not None
+        else None
+    )
+    if configuration_revision is not None and not isinstance(configuration_revision, str):
+        raise ValueError("configuration revision must be text or null")
     records: list[dict[str, object]] = []
     discovery_diagnostics: list[dict[str, str]] = []
     program_descriptors: list[dict[str, object]] = []
@@ -1203,6 +1288,8 @@ def _build_catalog(
             program_index,
             program_coverage_complete,
             policy,
+            completion_policy,
+            completion_policy_valid,
         )
         for record in projected
     ]
@@ -1236,8 +1323,9 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "catalog_digest": None,
+        "configuration_revision": configuration_revision,
         "inventory": {
             "projects": inventory_projects,
             "stages": inventory_stages,
@@ -1271,17 +1359,31 @@ def build_catalog(
     spec_root: Path,
     *,
     hidden_stages: Iterable[str] | object = _OMITTED,
+    completed_stage_names: Iterable[str] | None = None,
+    configuration_revision: str | None = None,
 ) -> str:
     """Build the deterministic catalog without shared validation hooks."""
     policy = _catalog_policy(hidden_stages)
-    return _build_catalog(spec_root, hidden_stages=policy)
+    return _build_catalog(
+        spec_root,
+        hidden_stages=policy,
+        completed_stage_names=completed_stage_names,
+        configuration_revision=configuration_revision,
+    )
 
 
 def scan_catalog(
     spec_root: Path,
     *,
     hidden_stages: Iterable[str] | object = _OMITTED,
+    completed_stage_names: Iterable[str] | None = None,
+    configuration_revision: str | None = None,
 ) -> str:
     """Build the deterministic catalog."""
     policy = _catalog_policy(hidden_stages)
-    return _build_catalog(spec_root, hidden_stages=policy)
+    return _build_catalog(
+        spec_root,
+        hidden_stages=policy,
+        completed_stage_names=completed_stage_names,
+        configuration_revision=configuration_revision,
+    )
