@@ -52,6 +52,7 @@
   const stageOrderSave = document.querySelector("#stage-order-save");
   const stageOrderCancel = document.querySelector("#stage-order-cancel");
   const stageOrderReset = document.querySelector("#stage-order-reset");
+  const stageOrderReload = document.querySelector("#stage-order-reload");
   const stageOrderStatus = document.querySelector("#stage-order-status");
 
   let displayed = null;
@@ -68,6 +69,7 @@
   let editorStageOrder = [];
   let settingsRevision = null;
   let settingsAvailable = false;
+  let settingsReloadAvailable = false;
   let settingsBusy = false;
   let settingsRequestSerial = 0;
 
@@ -263,12 +265,13 @@
   }
 
   function renderStageOrderEditor({focusStage = null} = {}) {
-    if (!settingsAvailable) {
+    if (!settingsAvailable && !settingsReloadAvailable) {
       stageOrderEditor.hidden = true;
       return;
     }
-    if (!editorStageOrder.length) editorStageOrder = editorNames();
+    if (settingsAvailable && !editorStageOrder.length) editorStageOrder = editorNames();
     stageOrderEditor.hidden = false;
+    const controlsDisabled = !settingsAvailable || settingsBusy;
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
       const dormant = canonicalStageNames().includes(stage) ? "" :
@@ -276,15 +279,17 @@
       return `<li class="stage-order-item" data-stage="${text(stage)}">` +
         `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
         `<button type="button" class="stage-order-move" data-stage-move="up" ` +
-        `aria-label="Move ${text(label)} up"${index === 0 ? " disabled" : ""}>Move up</button>` +
+        `aria-label="Move ${text(label)} up"${controlsDisabled || index === 0 ? " disabled" : ""}>Move up</button>` +
         `<button type="button" class="stage-order-move" data-stage-move="down" ` +
-        `aria-label="Move ${text(label)} down"${index === editorStageOrder.length - 1 ? " disabled" : ""}>Move down</button>` +
+        `aria-label="Move ${text(label)} down"${controlsDisabled || index === editorStageOrder.length - 1 ? " disabled" : ""}>Move down</button>` +
         `</li>`;
     }).join("");
-    stageOrderSave.disabled = settingsBusy || !hasUnsavedStageOrder();
-    stageOrderCancel.disabled = settingsBusy || !hasUnsavedStageOrder();
-    stageOrderReset.disabled = settingsBusy;
-    if (focusStage) {
+    stageOrderSave.disabled = controlsDisabled || !hasUnsavedStageOrder();
+    stageOrderCancel.disabled = controlsDisabled || !hasUnsavedStageOrder();
+    stageOrderReset.disabled = controlsDisabled;
+    stageOrderReload.hidden = !settingsReloadAvailable;
+    stageOrderReload.disabled = settingsBusy;
+    if (focusStage && settingsAvailable) {
       const item = [...stageOrderList.children].find((candidate) =>
         candidate.dataset.stage === focusStage);
       item?.querySelector("[data-stage-move]:not(:disabled)")?.focus();
@@ -1011,6 +1016,10 @@
 
   function loadSettings() {
     const serial = ++settingsRequestSerial;
+    settingsBusy = true;
+    settingsAvailable = false;
+    settingsRevision = null;
+    renderStageOrderEditor();
     fetch(SETTINGS_ROUTE, {cache: "no-store"})
       .then(async (response) => {
         let payload = null;
@@ -1025,10 +1034,13 @@
         if (serial !== settingsRequestSerial) return;
         if (!payload) {
           settingsAvailable = false;
-          stageOrderEditor.hidden = true;
+          settingsReloadAvailable = false;
+          settingsRevision = null;
+          renderStageOrderEditor();
           return;
         }
         settingsAvailable = true;
+        settingsReloadAvailable = false;
         savedStageOrder = [...payload.order];
         settingsRevision = payload.revision;
         editorStageOrder = editorNames();
@@ -1038,15 +1050,20 @@
       })
       .catch((error) => {
         if (serial !== settingsRequestSerial) return;
-        settingsAvailable = true;
-        stageOrderEditor.hidden = false;
+        settingsAvailable = false;
+        settingsReloadAvailable = true;
+        settingsRevision = null;
         settingsStatus(`Could not load board row order: ${settingsErrorMessage(error)}`, true);
+        renderStageOrderEditor();
+      }).finally(() => {
+        if (serial !== settingsRequestSerial) return;
+        settingsBusy = false;
         renderStageOrderEditor();
       });
   }
 
   function saveStageOrder(order) {
-    if (!settingsAvailable || settingsBusy) return;
+    if (!settingsAvailable || !settingsRevision || settingsBusy) return;
     settingsBusy = true;
     settingsStatus("Saving board row order…");
     renderStageOrderEditor();
@@ -1069,8 +1086,13 @@
     }).then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
-          ? `Save not applied: ${payload.outcome}. Reload the current order and try again.`
+          ? `Save not applied: ${payload.outcome}. Reload the current board row order to replace this unsaved draft and try again.`
           : "Save failed: the board row order was not persisted.";
+        if (payload.outcome === "conflict" || payload.outcome === "reload-needed") {
+          settingsAvailable = false;
+          settingsReloadAvailable = true;
+          settingsRevision = null;
+        }
         settingsStatus(message, true);
         return;
       }
@@ -1196,7 +1218,7 @@
   stageOrderList.addEventListener("click", (event) => {
     const move = event.target.closest("[data-stage-move]");
     const item = event.target.closest("[data-stage]");
-    if (!move || !item) return;
+    if (!settingsAvailable || settingsBusy || !move || !item) return;
     const stage = item.dataset.stage;
     const index = editorStageOrder.indexOf(stage);
     const target = move.dataset.stageMove === "up" ? index - 1 : index + 1;
@@ -1214,6 +1236,9 @@
     renderStageOrderEditor();
   });
   stageOrderReset.addEventListener("click", () => saveStageOrder([]));
+  stageOrderReload.addEventListener("click", () => {
+    if (!settingsBusy) loadSettings();
+  });
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   if (typeof ResizeObserver === "function") {
