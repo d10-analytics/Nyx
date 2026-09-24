@@ -20,6 +20,7 @@ import pytest
 
 from nyx import _native_claim, app_runtime, desktop, runtime, state
 from nyx._native_claim import NativeClaim
+from nyx.models import canonical_digest, parse_catalog
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 try:
@@ -942,8 +943,31 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                 )
                 response = connection.getresponse()
                 assert response.status == 200
-                assert json.loads(response.read())["schema_version"] == 5
+                payload = json.loads(response.read())
+                assert payload["schema_version"] == 5
+                assert payload["configuration_revision"] == state.load_configuration(paths).revision
                 connection.close()
+                legacy = dict(payload, schema_version=4)
+                legacy["catalog_digest"] = canonical_digest(legacy)
+                with patch.object(
+                    application.workers,
+                    "fetch_catalog",
+                    return_value=json.dumps(legacy).encode("utf-8"),
+                ):
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", port, timeout=5
+                    )
+                    connection.request(
+                        "GET",
+                        "/api/catalog",
+                        headers={"Host": f"127.0.0.1:{port}"},
+                    )
+                    rejected = connection.getresponse()
+                    assert rejected.status == 502
+                    assert json.loads(rejected.read()) == {
+                        "error": "producer_protocol_error"
+                    }
+                    connection.close()
                 assert application is replacement.runtime
                 replacement.close()
                 assert not replacement.claims.held
@@ -3180,7 +3204,7 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
         workspace = _workspace(root, "workspace")
         home_patch, uid_patch = _home_patches(home)
         with home_patch, uid_patch:
-            state.setup(workspace)
+            configuration = state.setup(workspace)
             manager = desktop.CatalogWorkerManager(
                 command_factory=lambda: list(delivered_worker_helper),
                 timeout=30,
@@ -3195,7 +3219,12 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
             finally:
                 assert manager.close(time.monotonic() + 30)
         assert catalog["schema_version"] == 5
+        assert catalog["configuration_revision"] == configuration.revision
         assert manager.active_count == 0
+        legacy = dict(catalog, schema_version=4)
+        legacy["catalog_digest"] = canonical_digest(legacy)
+        with pytest.raises(ValueError):
+            parse_catalog(legacy)
 
 
 def _build_desktop_driver():
