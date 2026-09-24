@@ -426,7 +426,7 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         _wait_port_free(time.monotonic() + 15)
 
         # Recovery: a surviving former worker blocks the start until it exits.
-        config_file = _write_configuration(home, workspace)
+        config_file, _ = _write_configuration(home, workspace)
         before = config_file.read_bytes()
         _, recovery_path = _claim_paths(home)
         recovery_path.parent.mkdir(parents=True, exist_ok=True)
