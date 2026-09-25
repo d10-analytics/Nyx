@@ -584,14 +584,24 @@
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
+    const setBoardColumns = (gutters) => {
+      const widths = gutters.map((gutter) => `calc(var(--card-min-width) + ${gutter}px)`);
+      board.style.setProperty("--column-tracks", widths.map((width) =>
+        `minmax(${width}, 1fr)`).join(" "));
+      board.style.setProperty("--board-min-width", widths.length
+        ? `calc(var(--label-min-width) + ${widths.join(" + ")} + ` +
+          `${columns.length * .9}rem + var(--board-horizontal-padding))`
+        : "100vw");
+    };
     if (!axes.stages.length && axes.projects.length) {
-      board.style.setProperty("--column-tracks", columns.map(() => "minmax(var(--card-min-width), 1fr)").join(" "));
+      setBoardColumns(columns.map(() => 0));
       board.innerHTML = issues + '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
         '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
       return;
     }
     if (!axes.stages.length || !axes.projects.length) {
+      setBoardColumns([]);
       board.innerHTML = issues + emptyBoardHtml(axes, entries);
       return;
     }
@@ -611,11 +621,10 @@
       railPlan.set(key, { edges });
       return [key, { depth, reserved: edges.length }];
     }));
-    board.style.setProperty("--column-tracks", columns.map(([key]) => {
+    setBoardColumns(columns.map(([key]) => {
       const reserved = plans.get(key).reserved;
-      const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
-      return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
-    }).join(" "));
+      return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
+    }));
     let html = issues + (!entries.length
       ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
         ? "The catalog has incomplete dimensions; no work items are currently available."
