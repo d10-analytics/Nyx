@@ -1144,6 +1144,26 @@ def test_selecting_a_card_shows_declared_values_and_diagnostics(open_page):
     assert "Human sanity decision" not in details.inner_text()
 
 
+def test_work_item_details_expand_in_top_bar_and_can_be_collapsed(open_page):
+    page = open_page(StaticClient(board_payload()))
+    panel = page.locator("#work-item-panel")
+    details = panel.locator("#details")
+    assert panel.get_attribute("open") is None
+    assert not details.is_visible()
+    assert page.locator("header.toolbar #work-item-panel").count() == 1
+
+    page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
+    assert details.is_visible()
+    assert details.locator("h2").inner_text() == "Foundation step"
+    assert details.bounding_box()["y"] < page.locator("#board").bounding_box()["y"]
+
+    panel.locator("summary").first.click()
+    assert not details.is_visible()
+    page.locator('.card[data-package-path="Alpha/Under_Development/step-two"]').click()
+    assert details.is_visible()
+    assert details.locator("h2").inner_text() == "Dependent step"
+
+
 def test_item_issue_summary_escapes_diagnostic_codes(open_page):
     value = json.loads(board_payload())
     value["entries"][1]["diagnostics"] = [{
