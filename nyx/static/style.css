@@ -66,6 +66,7 @@ body { margin: 0; }
   gap: 2rem;
   align-items: end;
   justify-content: space-between;
+  flex-wrap: wrap;
   padding: 1.1rem 2rem;
   background: var(--toolbar);
   color: var(--toolbar-text);
@@ -76,7 +77,7 @@ h1 { margin-bottom: .25rem; font-size: 1.5rem; }
 .controls { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
 .compact-control { display: inline-flex; align-items: center; gap: .35rem; color: var(--toolbar-text); }
 .compact-control input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
-.stage-order-editor {
+.stage-order-editor, .work-item-panel {
   min-width: min(100%, 28rem);
   max-width: 42rem;
   padding: .7rem .9rem;
@@ -85,7 +86,8 @@ h1 { margin-bottom: .25rem; font-size: 1.5rem; }
   background: var(--surface);
   color: var(--heading);
 }
-.stage-order-editor summary { cursor: pointer; font-weight: 700; }
+.stage-order-editor summary, .work-item-panel > summary { cursor: pointer; font-weight: 700; }
+.work-item-panel[open] { flex-basis: 100%; max-width: none; }
 .stage-order-content { margin-top: .55rem; }
 .stage-order-editor p { margin: .2rem 0 .55rem; color: var(--muted); font-size: .85rem; }
 .stage-order-list { display: grid; gap: .35rem; margin: 0; padding-left: 1.5rem; }
@@ -236,12 +238,12 @@ button.pending {
 .cell.filtered-empty .empty { display: none; }
 
 .details {
-  margin: 1rem 2rem 2rem;
-  padding: 1rem 1.25rem;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: .45rem;
+  margin-top: .75rem;
+  padding-top: .75rem;
+  border-top: 1px solid var(--border);
+  color: var(--text);
 }
+.details p { color: var(--muted); }
 .details h2 { font-size: 1.15rem; }
 .details h3 { font-size: 1rem; margin: 1rem 0 .4rem; }
 .details > details { margin-top: .9rem; }
@@ -256,10 +258,10 @@ button.pending {
 
 @media (max-width: 700px) {
   .toolbar { align-items: stretch; flex-direction: column; gap: 1rem; }
-  #board, .details { padding-left: 1rem; padding-right: 1rem; }
+  #board { padding-left: 1rem; padding-right: 1rem; }
   #board { --card-min-width: 12rem; --label-width: minmax(6rem, 8rem); }
   .details dl { grid-template-columns: 1fr; }
-  .stage-order-editor { min-width: 0; }
+  .stage-order-editor, .work-item-panel { min-width: 0; }
   .stage-order-item { align-items: stretch; flex-wrap: wrap; }
   .stage-order-name { flex-basis: 100%; }
   .stage-completed { margin-left: 0; }

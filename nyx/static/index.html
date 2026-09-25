@@ -43,12 +43,15 @@
           <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
         </div>
       </details>
+      <details id="work-item-panel" class="work-item-panel">
+        <summary>Work item</summary>
+        <aside id="details" class="details" aria-label="Selected work item details">
+          <h2>Select a work item</h2>
+          <p>Choose a card to inspect its details.</p>
+        </aside>
+      </details>
     </header>
     <main id="board" aria-live="polite"></main>
-    <aside id="details" class="details" aria-label="Selected work item details">
-      <h2>Select a work item</h2>
-      <p>Choose a card to inspect its details.</p>
-    </aside>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

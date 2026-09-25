@@ -57,6 +57,7 @@
 
   const board = document.querySelector("#board");
   const detailPanel = document.querySelector("#details");
+  const workItemPanel = document.querySelector("#work-item-panel");
   const status = document.querySelector("#status");
   const filter = document.querySelector("#filter");
   const compactControl = document.querySelector("#compact-view");
@@ -794,6 +795,7 @@
 
   function select(path) {
     selectedPath = selectedPath === path ? null : path;
+    if (selectedPath) workItemPanel.open = true;
     board.querySelectorAll(".card").forEach((card) => {
       const selected = card.dataset.packagePath === selectedPath;
       card.classList.toggle("selected", selected);
