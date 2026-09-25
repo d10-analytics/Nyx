@@ -56,6 +56,7 @@
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
 
   const board = document.querySelector("#board");
+  const toolbar = document.querySelector(".toolbar");
   const detailPanel = document.querySelector("#details");
   const workItemPanel = document.querySelector("#work-item-panel");
   const status = document.querySelector("#status");
@@ -674,7 +675,7 @@
     const bands = new Map([...board.querySelectorAll(".board-row")].map((row) =>
       [row.dataset.lifecycle, row.querySelector(".connection-band")]));
     const laneX = (key, edge) => {
-      const columnLeft = heads[railColumns.indexOf(key)].getBoundingClientRect().left - boardRect.left;
+      const columnLeft = heads[railColumns.indexOf(key)].offsetLeft;
       return columnLeft + (railPlan.get(key).edges.indexOf(edge) + .5) * RAIL_PITCH;
     };
     const port = (id, edge) => {
@@ -1358,6 +1359,10 @@
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   if (typeof ResizeObserver === "function") {
+    const updateToolbarHeight = () =>
+      document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
+    updateToolbarHeight();
+    new ResizeObserver(updateToolbarHeight).observe(toolbar);
     let resizeFrame = null;
     new ResizeObserver(() => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
