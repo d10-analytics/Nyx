@@ -199,9 +199,12 @@ button.pending {
   position: sticky;
   left: 0;
   z-index: 10;
+  align-self: stretch;
   background: var(--page);
-  margin: .4rem 0 0;
-  padding-top: .4rem;
+  box-shadow: .9rem 0 0 var(--page), calc(.9rem + 1px) 0 0 var(--border);
+  margin: 0;
+  padding: .8rem .4rem;
+  overflow-wrap: anywhere;
   font-size: 1.15rem;
   font-weight: 750;
   color: var(--heading);
