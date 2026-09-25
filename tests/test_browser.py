@@ -1192,6 +1192,8 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
     assert abs(toolbar["x"]) < 2 and abs(toolbar["y"]) < 2
     assert abs(column["y"] - toolbar["height"]) < 2
     assert abs(row["x"]) < 2
+    assert row["height"] >= page.locator(".board-row").last.locator(".cell").last.bounding_box()["height"]
+    assert page.locator(".row-head").last.evaluate("element => getComputedStyle(element).backgroundColor") != "rgba(0, 0, 0, 0)"
 
     page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
     page.evaluate("window.scrollTo(900, 600)")
