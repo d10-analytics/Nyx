@@ -1164,6 +1164,43 @@ def test_work_item_details_expand_in_top_bar_and_can_be_collapsed(open_page):
     assert details.locator("h2").inner_text() == "Dependent step"
 
 
+def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
+    value = json.loads(board_payload())
+    for index in range(8):
+        project = f"Project {index:02d}"
+        stage = f"Stage {index:02d}"
+        value["inventory"]["projects"].append({"name": project, "availability": "complete"})
+        value["inventory"]["stages"].append({
+            "project": project, "stage": stage, "availability": "complete",
+        })
+        value["entries"].append(_entry(
+            f"123e4567-e89b-42d3-a456-426614174{index + 100:03d}",
+            f"{project}/{stage}/item", "under_development", f"Item {index}", project,
+        ))
+    value["inventory"]["stages"].sort(key=lambda item: (item["project"], item["stage"]))
+    value["entries"].sort(key=lambda item: item["package_path"])
+    _reseal(value)
+    page = open_page(StaticClient(json.dumps(value).encode()))
+    page.set_viewport_size({"width": 640, "height": 400})
+    page.locator("#board .card").first.wait_for()
+    page.evaluate("window.scrollTo(900, 600)")
+    page.wait_for_function("window.scrollX > 400 && window.scrollY > 300")
+    toolbar = page.locator(".toolbar").bounding_box()
+    column = page.locator(".column-head").last.bounding_box()
+    row = page.locator(".row-head").last.bounding_box()
+    assert abs(toolbar["x"]) < 2 and abs(toolbar["y"]) < 2
+    assert abs(column["y"] - toolbar["height"]) < 2
+    assert abs(row["x"]) < 2
+
+    page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
+    page.evaluate("window.scrollTo(900, 600)")
+    page.wait_for_function("window.scrollX > 400 && window.scrollY > 300")
+    expanded_toolbar = page.locator(".toolbar").bounding_box()
+    assert expanded_toolbar["height"] > toolbar["height"]
+    assert abs(page.locator(".column-head").last.bounding_box()["y"] -
+               expanded_toolbar["height"]) < 2
+
+
 def test_item_issue_summary_escapes_diagnostic_codes(open_page):
     value = json.loads(board_payload())
     value["entries"][1]["diagnostics"] = [{
