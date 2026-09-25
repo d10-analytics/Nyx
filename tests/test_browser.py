@@ -1183,6 +1183,7 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
     page = open_page(StaticClient(json.dumps(value).encode()))
     page.set_viewport_size({"width": 640, "height": 400})
     page.locator("#board .card").first.wait_for()
+    assert page.locator(".column-head").last.bounding_box()["width"] < 350
     page.evaluate("window.scrollTo(900, 600)")
     page.wait_for_function("window.scrollX > 400 && window.scrollY > 300")
     toolbar = page.locator(".toolbar").bounding_box()
