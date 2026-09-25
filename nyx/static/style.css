@@ -122,9 +122,9 @@ button.pending {
 
 #board {
   --card-min-width: 18rem;
-  --label-min-width: 12rem;
+  --label-min-width: 13rem;
   --board-horizontal-padding: 4rem;
-  --label-width: minmax(9rem, 12rem);
+  --label-width: minmax(9rem, 13rem);
   position: relative;
   width: max(100vw, var(--board-min-width, 100vw));
   display: grid;
@@ -283,9 +283,9 @@ button.pending {
   #board { padding-left: 1rem; padding-right: 1rem; }
   #board {
     --card-min-width: 12rem;
-    --label-min-width: 8rem;
+    --label-min-width: 9rem;
     --board-horizontal-padding: 2rem;
-    --label-width: minmax(6rem, 8rem);
+    --label-width: minmax(6rem, 9rem);
   }
   .details dl { grid-template-columns: 1fr; }
   .stage-order-editor, .work-item-panel { min-width: 0; }
