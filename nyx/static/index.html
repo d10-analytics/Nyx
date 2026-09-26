@@ -35,18 +35,25 @@
         </div>
         <button id="refresh" type="button">Refresh view</button>
       </div>
-      <details id="stage-order-editor" class="stage-order-editor" hidden>
+      <details id="stage-order-editor" class="stage-order-editor">
         <summary id="stage-order-heading">Board settings</summary>
         <div class="stage-order-content">
-          <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Changes apply after Save.</p>
-          <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
-          <div class="stage-order-actions">
-            <button id="stage-order-save" type="button">Save</button>
-            <button id="stage-order-cancel" type="button">Cancel</button>
-            <button id="stage-order-reset" type="button">Reset</button>
-            <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+          <label class="selection-preference" for="deselect-on-empty-click">
+            <input id="deselect-on-empty-click" type="checkbox">
+            Click empty space to deselect
+          </label>
+          <p class="selection-preference-help">Applies immediately in this browser.</p>
+          <div id="stage-order-controls" hidden>
+            <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Save to apply these changes.</p>
+            <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
+            <div class="stage-order-actions">
+              <button id="stage-order-save" type="button">Save</button>
+              <button id="stage-order-cancel" type="button">Cancel</button>
+              <button id="stage-order-reset" type="button">Reset</button>
+              <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+            </div>
+            <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
           </div>
-          <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
         </div>
       </details>
     </header>

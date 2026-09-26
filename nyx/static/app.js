@@ -61,6 +61,7 @@
   // before the browser ever sees it.  A finished stage that is also configured
   // hidden therefore stays hidden even when this box is unchecked.
   const TERMINAL_STORAGE_KEY = "spec-tracker-hide-terminal-rows";
+  const DESELECT_STORAGE_KEY = "spec-tracker-deselect-on-empty-click";
 
   const board = document.querySelector("#board");
   const toolbar = document.querySelector(".toolbar");
@@ -68,8 +69,9 @@
   const filter = document.querySelector("#filter");
   const compactControl = document.querySelector("#compact-view");
   const terminalControl = document.querySelector("#hide-terminal-rows");
+  const deselectControl = document.querySelector("#deselect-on-empty-click");
   const refreshButton = document.querySelector("#refresh");
-  const stageOrderEditor = document.querySelector("#stage-order-editor");
+  const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
   const stageOrderCancel = document.querySelector("#stage-order-cancel");
@@ -87,6 +89,7 @@
   let railEdges = [];
   let compactView = true;
   let hideTerminalRows = true;
+  let deselectOnEmptyClick = false;
   let refreshFailure = null;
   let savedStageOrder = [];
   let savedCompletedStages = [];
@@ -305,12 +308,9 @@
   }
 
   function renderStageOrderEditor({focusStage = null} = {}) {
-    if (!settingsAvailable && !settingsReloadAvailable) {
-      stageOrderEditor.hidden = true;
-      return;
-    }
+    stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
+    if (stageOrderControls.hidden) return;
     if (settingsAvailable && !editorStageOrder.length) editorStageOrder = editorNames();
-    stageOrderEditor.hidden = false;
     const controlsDisabled = !settingsAvailable || settingsBusy;
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
@@ -1225,6 +1225,19 @@
     }
   }
 
+  function readDeselectPreference() {
+    deselectOnEmptyClick = false;
+    try {
+      deselectOnEmptyClick = window.localStorage.getItem(DESELECT_STORAGE_KEY) === "true";
+    } catch (_) { /* unchecked is the fallback when storage is unavailable */ }
+    deselectControl.checked = deselectOnEmptyClick;
+  }
+
+  function setDeselectPreference(value) {
+    deselectOnEmptyClick = value;
+    try { window.localStorage.setItem(DESELECT_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
+  }
+
   function safeCategory(error) {
     return SAFE_CATEGORIES.includes(error.message) ? error.message : "producer_unavailable";
   }
@@ -1315,6 +1328,7 @@
   board.addEventListener("click", (event) => {
     const card = event.target.closest("[data-package-path]");
     if (card) select(card.dataset.packagePath);
+    else if (deselectOnEmptyClick && selectedPath && !event.target.closest(".board-issues")) select(null);
   });
   refreshButton.addEventListener("click", () => {
     if (pending) apply(pending);
@@ -1360,6 +1374,7 @@
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   terminalControl.addEventListener("change", () => setTerminalPreference(terminalControl.checked));
+  deselectControl.addEventListener("change", () => setDeselectPreference(deselectControl.checked));
   if (typeof ResizeObserver === "function") {
     const updateToolbarHeight = () =>
       document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
@@ -1377,6 +1392,7 @@
 
   readCompactPreference();
   readTerminalPreference();
+  readDeselectPreference();
   loadSettings();
   request("manual");
   window.setInterval(() => request("poll"), POLL_INTERVAL);

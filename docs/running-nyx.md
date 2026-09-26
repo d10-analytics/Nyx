@@ -137,6 +137,14 @@ catalog only when its configuration revision matches the saved settings before
 showing changed dependency results; a conflict or failed refresh keeps the last
 valid board and tells you to reload or retry.
 
+**Click empty space to deselect** is a separate checkbox in Board settings.
+It starts unchecked, so clicking a selected card again clears the selection.
+When checked, clicking an empty cell, row label, or other empty board space
+also clears it; clicking another card selects that card. The choice applies
+immediately and is saved in this browser when storage is available. It remains
+available if saved board settings cannot load. **Save**, **Cancel**, and
+**Reset** affect the saved row settings, not this checkbox.
+
 Selecting a stage as finished also marks its rows as terminal on the board. The
 **Hide terminal rows** checkbox in the top bar starts checked, so finished rows
 are hidden until you reveal them, and the choice is stored in the browser like
