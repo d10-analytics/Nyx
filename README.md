@@ -19,8 +19,8 @@ not edit specifications or move them for you.
 
 ![Nyx showing a fictional community event, with the festival plan selected and its permit outcomes available.](docs/images/sample-board.png)
 
-*This fictional community-event view shows the board and selected work item in
-the light theme. The compact and expanded disclosure views are documented in
+*This fictional community-event view shows the board and a selected card in
+the light theme. The compact and expanded board views are documented in
 [running Nyx](docs/running-nyx.md). The bundled trail-planning software sample
 remains available in the [sample walkthrough](examples/sample-specifications/README.md).*
 
@@ -78,8 +78,8 @@ when no update is waiting. Use the stop command above when you are finished.
 
 Setup saves the workspace location and configured stage visibility for your
 account on this host. These setup choices are separate from the browser's personal
-**Hide empty rows and columns** preference, which is stored only in that
-browser. The **Board row order** editor saves its order in the same account-local
+**Hide empty rows and columns** and **Hide terminal rows** preferences, which are
+stored only in that browser. The **Board row order** editor saves its order in the same account-local
 configuration, shared by that account's browser and desktop views. The saved order
 survives browser reload and a supported Nyx restart, and is keyed by workspace root:
 switching from workspace A to workspace B does not apply A's order, while returning
@@ -99,6 +99,16 @@ account-local configuration for the current workspace root, so another root can
 use a different policy and returning to this root restores its own choice.
 Named outcomes still use `Prerequisite: UUID | claim-name` and keep their own
 claim and evidence semantics.
+
+The same finished-stage selection drives the board's **Hide terminal rows**
+control in the top bar. It starts checked, so rows for finished stages are hidden
+until you reveal them, and the preference lives in the browser like **Hide empty
+rows and columns**. This is presentation only: it never changes setup, the
+catalog, or which dependencies are satisfied. It is also deliberately separate
+from stage hiding. Hiding a stage removes its rows and cards from the catalog
+before the browser sees them, while marking a stage finished only groups its rows
+as terminal. A stage that is both hidden and finished therefore stays hidden even
+when you uncheck **Hide terminal rows**.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor

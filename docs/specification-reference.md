@@ -28,8 +28,8 @@ The field spellings above are the stable `spec.md` file contract. Keep writing
 `Package ID`, `Target repo`, `Claim`, and `Prerequisite` exactly as shown, even
 when the browser uses friendlier labels. Nyx presents each specification as a
 **work item**, its directory location as a stage, and a `Target repo` value as
-**Target project** when that context is useful. The stable `Package ID` is
-available under the technical disclosure rather than occupying the everyday card view.
+**Target Folder** on the card when that context is useful. Each card shows its
+directory path as **Filepath**; the stable `Package ID` stays in the file.
 
 For example, a community-event item can point to two outcomes from one permit
 item by repeating the `Prerequisite` field:
@@ -40,9 +40,8 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 ```
 
 The providing item records those outcomes with separate `Claim` rows. The file
-syntax remains unchanged while the selected work item shows each prerequisite
-in its Dependencies disclosure. A configured-hidden provider can still appear
-there as context.
+syntax remains unchanged while the board shows dependency status and links on
+cards. A configured-hidden provider does not appear as a card.
 
 Nyx also reads `Closure`, `Sanity Recommendation`, and `Human Sanity Decision`
 as reported text. These fields are optional; they do not trigger actions.
@@ -120,15 +119,11 @@ Completion Prerequisite: 55555555-5555-4555-8555-555555555555
 appear together on one dependent item. Completion never uses a magic claim name,
 does not rewrite claim state, and does not verify the claim's evidence.
 
-Progress and dependency information comes from your specification files. A card
-with declared direct prerequisites shows **Dependencies satisfied**, **Waiting on
-dependencies**, **Dependencies unknown**, or **Dependencies unavailable**. A
-work item with no declared direct prerequisites has no dependency marker. The
-indicator concerns direct prerequisites only; it reports recorded information and
-does not imply implementation approval or completion. Missing, ambiguous, or
-malformed information can leave a relationship unknown or unavailable; it is not
-treated as satisfied. Moving a work item to `Done` does not satisfy its claims
-automatically.
+Progress and dependency information comes from your specification files. Board
+cards show prerequisite and dependent links without a dependency status line.
+Missing, ambiguous, or malformed information can leave a relationship unknown
+or unavailable; it is not treated as satisfied. Moving a work item to `Done`
+does not satisfy its claims automatically.
 
 The completion policy is configured in the collapsed **Board settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
@@ -137,6 +132,13 @@ Without a configured policy, a completion dependency is **unknown** with an
 actionable configuration explanation. Row order, hidden status, stage spelling,
 `Cancelled`, and `Archive` do not infer completion. A completed stage is a
 recorded workflow assertion rather than evidence verification.
+
+The selected finished stages also group terminal rows on the board. The **Hide
+terminal rows** control starts checked, so finished rows are hidden until the
+reader reveals them, and the preference belongs to the browser. It changes
+presentation only. It is separate from stage hiding, which removes rows from the
+catalog entirely; a stage that is both hidden and finished cannot be revealed by
+that control.
 
 ## Programs
 

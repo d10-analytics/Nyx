@@ -332,7 +332,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     from nyx.server import create_server
 
                     baseline = {
-                        "schema_version": 5,
+                        "schema_version": 6,
                         "configuration_revision": None,
                         "inventory": {
                             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -340,6 +340,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                         },
                         "visibility": {
                             "hidden_stages": [],
+                            "terminal_stages": [],
                             "visible_entry_count": 0,
                             "hidden_entry_count": 0,
                         },
@@ -444,7 +445,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "configuration_revision": None,
                     "inventory": {
                         "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -458,6 +459,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                         ],
                     },
                     "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                                    "terminal_stages": [],
                                     "visible_entry_count": 1, "hidden_entry_count": 0},
                     "identity_coverage": {"state": "complete", "diagnostics": []},
                     "program_coverage": {"state": "complete", "diagnostics": []},

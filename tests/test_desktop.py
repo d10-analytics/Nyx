@@ -944,7 +944,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                 response = connection.getresponse()
                 assert response.status == 200
                 payload = json.loads(response.read())
-                assert payload["schema_version"] == 5
+                assert payload["schema_version"] == 6
                 assert payload["configuration_revision"] == state.load_configuration(paths).revision
                 connection.close()
                 legacy = dict(payload, schema_version=4)
@@ -3218,7 +3218,7 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                     catalog = json.loads(manager.fetch_catalog())
             finally:
                 assert manager.close(time.monotonic() + 30)
-        assert catalog["schema_version"] == 5
+        assert catalog["schema_version"] == 6
         assert catalog["configuration_revision"] == configuration.revision
         assert manager.active_count == 0
         legacy = dict(catalog, schema_version=4)

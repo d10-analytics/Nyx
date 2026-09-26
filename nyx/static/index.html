@@ -23,10 +23,16 @@
         </select>
         <label for="filter">Find work items</label>
         <input id="filter" type="search" placeholder="Find a work item, project, or program…" autocomplete="off">
-        <label class="compact-control" for="compact-view">
-          <input id="compact-view" type="checkbox" checked>
-          Hide empty rows and columns
-        </label>
+        <div class="compact-controls">
+          <label class="compact-control" for="compact-view">
+            <input id="compact-view" type="checkbox" checked>
+            Hide empty rows and columns
+          </label>
+          <label class="compact-control" for="hide-terminal-rows">
+            <input id="hide-terminal-rows" type="checkbox" checked>
+            Hide terminal rows
+          </label>
+        </div>
         <button id="refresh" type="button">Refresh view</button>
       </div>
       <details id="stage-order-editor" class="stage-order-editor" hidden>
@@ -42,13 +48,6 @@
           </div>
           <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
         </div>
-      </details>
-      <details id="work-item-panel" class="work-item-panel">
-        <summary>Work item</summary>
-        <aside id="details" class="details" aria-label="Selected work item details">
-          <h2>Select a work item</h2>
-          <p>Choose a card to inspect its details.</p>
-        </aside>
       </details>
     </header>
     <main id="board" aria-live="polite"></main>

@@ -37,7 +37,7 @@ def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
     return paths, home, spec
 
 
-def test_application_runtime_provider_admits_schema_five_and_rejects_schema_four():
+def test_application_runtime_provider_admits_schema_six_and_rejects_schema_four():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         package = root / "Fictional" / "Queue" / "entry"
@@ -58,7 +58,7 @@ def test_application_runtime_provider_admits_schema_five_and_rejects_schema_four
 
         application.workers = Workers(payload.encode("utf-8"))
         admitted = application._provider()
-        assert admitted.schema_version == 5
+        assert admitted.schema_version == 6
         assert admitted.configuration_revision is None
 
         legacy = json.loads(payload)

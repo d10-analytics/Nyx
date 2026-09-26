@@ -32,7 +32,7 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 5,
+        "schema_version": 6,
         "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -42,6 +42,7 @@ def raw_catalog():
             ],
         },
         "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                        "terminal_stages": [],
                         "visible_entry_count": 2, "hidden_entry_count": 0},
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
@@ -137,6 +138,7 @@ def test_default_provider_uses_unselected_scanner():
     [
         lambda value: value.update(schema_version=3),
         lambda value: value.update(schema_version=4),
+        lambda value: value.update(schema_version=5),
         lambda value: value.pop("configuration_revision"),
         lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
@@ -147,7 +149,7 @@ def test_default_provider_uses_unselected_scanner():
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-3", "schema-4", "missing-revision", "malformed-revision", "unknown-key", "nonboolean-visibility", "policy-mismatch", "cross-kind-edge", "transitive-reference"],
+    ids=["schema-3", "schema-4", "schema-5", "missing-revision", "malformed-revision", "unknown-key", "nonboolean-visibility", "policy-mismatch", "cross-kind-edge", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()

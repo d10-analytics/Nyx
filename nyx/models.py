@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 LIFECYCLES = frozenset(
     {
@@ -138,7 +138,9 @@ _COMPLETION_EDGE_KEYS = frozenset(
 )
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
-_VISIBILITY_KEYS = frozenset({"hidden_stages", "visible_entry_count", "hidden_entry_count"})
+_VISIBILITY_KEYS = frozenset(
+    {"hidden_stages", "terminal_stages", "visible_entry_count", "hidden_entry_count"}
+)
 _INVENTORY_KEYS = frozenset({"projects", "stages"})
 _INVENTORY_PROJECT_KEYS = frozenset({"name", "availability"})
 _INVENTORY_STAGE_KEYS = frozenset({"project", "stage", "availability"})
@@ -498,7 +500,7 @@ def _inventory(value: Any) -> tuple[dict[str, Any], set[str], set[tuple[str, str
     return {"projects": projects, "stages": stages}, project_names, stage_pairs
 
 
-def _visibility(value: Any) -> tuple[tuple[str, ...], int, int]:
+def _visibility(value: Any) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
     item = _object(value, "visibility")
     _keys(item, _VISIBILITY_KEYS, "visibility")
     hidden = item["hidden_stages"]
@@ -507,11 +509,25 @@ def _visibility(value: Any) -> tuple[tuple[str, ...], int, int]:
     hidden_stages = tuple(_component(stage, f"visibility.hidden_stages[{index}]") for index, stage in enumerate(hidden))
     if list(hidden_stages) != sorted(hidden_stages) or len(hidden_stages) != len(set(hidden_stages)):
         raise ProtocolError("visibility.hidden_stages must be unique and sorted")
+    # Terminal stages carry the account's completion policy to the browser as a
+    # display grouping.  They are intentionally allowed to overlap the hidden
+    # list: the browser applies the hidden policy first, so a stage that is both
+    # hidden and terminal stays hidden.  Producers that have no completion
+    # policy emit an empty list.
+    terminal = item["terminal_stages"]
+    if type(terminal) is not list:
+        raise ProtocolError("visibility.terminal_stages must be a list")
+    terminal_stages = tuple(
+        _component(stage, f"visibility.terminal_stages[{index}]")
+        for index, stage in enumerate(terminal)
+    )
+    if list(terminal_stages) != sorted(terminal_stages) or len(terminal_stages) != len(set(terminal_stages)):
+        raise ProtocolError("visibility.terminal_stages must be unique and sorted")
     visible = item["visible_entry_count"]
     concealed = item["hidden_entry_count"]
     if type(visible) is not int or visible < 0 or type(concealed) is not int or concealed < 0:
         raise ProtocolError("visibility counts must be nonnegative integers")
-    return hidden_stages, visible, concealed
+    return hidden_stages, terminal_stages, visible, concealed
 
 
 def _claims(value: Any, name: str) -> None:
@@ -779,7 +795,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         "configuration_revision",
         nullable=True,
     )
-    hidden_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
+    hidden_stages, terminal_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
     inventory, _project_names, inventory_pairs = _inventory(catalog["inventory"])
     for name in ("identity_coverage", "program_coverage"):
         _coverage(catalog[name], name)
@@ -814,6 +830,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         catalog_digest=digest,
         visibility={
             "hidden_stages": list(hidden_stages),
+            "terminal_stages": list(terminal_stages),
             "visible_entry_count": visible_count,
             "hidden_entry_count": hidden_count,
         },

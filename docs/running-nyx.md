@@ -85,6 +85,13 @@ the [workspace guide](workspaces.md), with the same capitalization. Any admitted
 literal stage directory can be hidden by its exact name, including a custom
 stage such as `Testing`.
 
+Hiding a stage is separate from marking it finished. A hidden stage is removed
+from the catalog before the browser sees it, and its entries appear only as
+dependency context when a visible work item references them. Marking a stage
+finished records a workflow assertion and groups its rows as terminal on the
+board; see **Choose board row order** below. The two policies can name the same
+stage, and hiding always wins: a hidden stage cannot be revealed from the board.
+
 To show every stage:
 
 ```bash
@@ -129,6 +136,15 @@ marked as unavailable when appropriate. If settings cannot be loaded, choose
 catalog only when its configuration revision matches the saved settings before
 showing changed dependency results; a conflict or failed refresh keeps the last
 valid board and tells you to reload or retry.
+
+Selecting a stage as finished also marks its rows as terminal on the board. The
+**Hide terminal rows** checkbox in the top bar starts checked, so finished rows
+are hidden until you reveal them, and the choice is stored in the browser like
+**Hide empty rows and columns**. This grouping is presentation only: it does not
+change setup, the catalog, or which dependencies count as satisfied. It is
+separate from stage hiding, which is a data-layer decision made at setup. A stage
+that is both hidden and marked finished stays hidden even when **Hide terminal
+rows** is unchecked, because hidden rows never reach the browser.
 
 ## Windows and macOS: the private desktop application
 
@@ -218,6 +234,13 @@ storage when available. If browser storage is blocked or full, Nyx keeps the
 preference in memory for the current page and safely falls back to checked on a
 new page. This preference never changes setup, the workspace, or the catalog.
 
+The **Hide terminal rows** checkbox uses the same contract. It starts checked and
+hides the rows for the stages the account marks as finished, and its value is
+stored in the browser the same way. Unchecking it reveals those rows without
+changing setup, the catalog, or the saved completion policy. A configured hidden
+stage is unaffected: hidden rows never reach the browser, so they cannot be
+revealed from the board.
+
 Search filters cards and their visible dependency rails without changing the
 project and stage axes. A hidden configured stage stays absent even when compact
 view is unchecked. Incomplete or unavailable dimensions remain visible with an
@@ -247,25 +270,21 @@ choose **Save**; keep that saved account-local order for all three images:
    minimal board view as `docs/images/sample-board.png`.
 2. Choose **Dark** and keep **Hide empty rows and columns** checked. Focus the
    selected festival card with the keyboard and press **Enter** twice: the first
-   press deselects it and the second reselects it. Then focus the
-   **Dependencies** summary and press **Enter**. Save this compact view as
-   `docs/images/sample-board-compact.png`. The hidden permit work item and its
-   two outcomes should remain visible in the disclosure.
-3. Uncheck **Hide empty rows and columns**. This redraws the details panel, so
-   focus the **Dependencies** summary and press **Enter** to reopen it. Then
-   focus the **Workspace issues** summary and press **Enter**. Save this
+   press deselects it and the second reselects it. Save this compact view as
+   `docs/images/sample-board-compact.png`.
+3. Uncheck **Hide empty rows and columns**. Then focus the **Workspace issues**
+   summary and press **Enter**. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 
-The first image is light with the saved row order, issue summary, selected festival
-card, and disclosures collapsed. The second is dark with compact view checked and
-the Dependencies disclosure opened by keyboard, showing the hidden permit title
-and both `venue-confirmed` and `permit-approved` outcomes. The third remains
-dark, unchecks compact view, and opens both Workspace issues and Dependencies by
-keyboard so the empty Planning row and Community_Resources column are visible.
+The first image is light with the saved row order, issue summary, and selected festival
+card. The second is dark with compact view checked and the selected card
+showing its filepath. The third remains dark, unchecks compact
+view, and opens Workspace issues by keyboard so the empty Planning row and
+Community_Resources column are visible.
 
 Review each file directly beside the running browser in both themes. Confirm
-that the selected card, hidden dependency context, multiple outcomes, empty
-dimensions, workspace issue, disclosure states, labels, and controls match the
+that the selected card, package path, empty dimensions, workspace issue,
+disclosure states, labels, and controls match the
 browser. Reject a capture if it contains a private path or value, was drawn by
 hand, or no longer shows the named state. This procedure is intentionally a
 repeatable browser session; it does not add a permanent screenshot framework.

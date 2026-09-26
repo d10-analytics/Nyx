@@ -199,6 +199,14 @@ hidden completed stage still appears as dependency context. This assertion recor
 workflow completion; it does not verify evidence, approve work, or satisfy a
 named outcome.
 
+The same selection groups finished rows on the board. The **Hide terminal rows**
+checkbox in the top bar starts checked, so rows for the selected stages are hidden
+until you reveal them, and the choice is stored in the browser. This is
+presentation only: it does not change the policy, the catalog, or dependency
+results. Hiding a stage is a separate, data-layer decision, and a stage that is
+both hidden and finished stays hidden even when **Hide terminal rows** is
+unchecked.
+
 The selected stage names are saved per canonical workspace root and shared by
 all projects in that root. Switching roots keeps each root's own policy, and a
 root with no saved names reports unknown for its simple completion dependencies.
