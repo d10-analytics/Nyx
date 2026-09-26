@@ -675,6 +675,67 @@ def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_
     assert settings.completed == ["Absent"]
 
 
+def test_empty_board_click_preference_changes_selection_immediately(open_page):
+    page = open_page(StaticClient(board_payload()), settings=BrowserSettings())
+    preference = page.get_by_role("checkbox", name="Click empty space to deselect")
+    assert not preference.is_checked()
+    assert page.locator("#stage-order-editor").get_attribute("open") is None
+
+    first = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    second = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    first.click()
+    page.locator(".row-head").first.click()
+    assert first.get_attribute("aria-pressed") == "true"
+
+    open_stage_editor(page)
+    preference.check()
+    assert page.get_by_role("button", name="Save").is_disabled()
+    page.locator(".row-head").first.click()
+    assert first.get_attribute("aria-pressed") == "false"
+    assert page.locator(".card.selected").count() == 0
+
+    first.click()
+    second.click()
+    assert first.get_attribute("aria-pressed") == "false"
+    assert second.get_attribute("aria-pressed") == "true"
+    second.click()
+    assert second.get_attribute("aria-pressed") == "false"
+
+    first.click()
+    page.locator("#board .cell.vacant").first.click()
+    assert first.get_attribute("aria-pressed") == "false"
+    preference.uncheck()
+    first.click()
+    page.locator(".row-head").first.click()
+    assert first.get_attribute("aria-pressed") == "true"
+
+
+def test_empty_click_preference_is_available_without_saved_settings_and_persists(open_page):
+    page = open_page(StaticClient(board_payload()))
+    open_stage_editor(page)
+    preference = page.get_by_role("checkbox", name="Click empty space to deselect")
+    assert not preference.is_checked()
+    assert page.locator("#stage-order-controls").is_hidden()
+    preference.check()
+    assert page.evaluate("localStorage.getItem('spec-tracker-deselect-on-empty-click')") == "true"
+    page.reload()
+    open_stage_editor(page)
+    assert preference.is_checked()
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    card.click()
+    page.locator(".row-head").first.click()
+    assert card.get_attribute("aria-pressed") == "false"
+
+    blocked = open_page(
+        StaticClient(board_payload()),
+        init_script="""Object.defineProperty(window, 'localStorage', {
+          get() { throw new DOMException('Blocked', 'SecurityError'); }
+        });""",
+    )
+    open_stage_editor(blocked)
+    assert not blocked.get_by_role("checkbox", name="Click empty space to deselect").is_checked()
+
+
 def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_snapshot(open_page):
     first = dependency_state_payload("unsatisfied")
     stale = dependency_state_payload("unsatisfied")
