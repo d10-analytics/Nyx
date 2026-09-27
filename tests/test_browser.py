@@ -21,6 +21,11 @@ GATE = "123e4567-e89b-42d3-a456-426614174002"
 LOOSE = "123e4567-e89b-42d3-a456-426614174003"
 REVERSE = "123e4567-e89b-42d3-a456-426614174004"
 XSS_TITLE = '<img src=x onerror="alert(1)"> loose package'
+# Computed card backgrounds: a card with no incoming arrow uses the brand
+# color in both themes; every other card uses the theme surface.
+NO_INCOMING_CARD = "rgb(1, 120, 124)"
+DARK_CARD = "rgb(27, 37, 51)"
+LIGHT_CARD = "rgb(255, 255, 255)"
 
 
 def _declared(title, project):
@@ -640,8 +645,8 @@ def open_stage_editor(page):
         editor.locator("summary").click()
 
 
-def dependency_state_payload(state):
-    value = json.loads(board_payload())
+def dependency_state_payload(state, *, titles=None):
+    value = json.loads(board_payload(titles=titles))
     gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
     edge = gate["relationship"]["prerequisites"][0]
     edge.update(observed_state=state, resolved_state=state, reason=f"claim_{state}")
@@ -677,7 +682,6 @@ def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_
 def test_empty_board_click_preference_changes_selection_immediately(open_page):
     page = open_page(StaticClient(board_payload()), settings=BrowserSettings())
     preference = page.get_by_role("checkbox", name="Click empty space to deselect")
-    assert not preference.is_checked()
     assert page.locator("#stage-order-editor").get_attribute("open") is None
 
     first = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
@@ -687,6 +691,7 @@ def test_empty_board_click_preference_changes_selection_immediately(open_page):
     assert first.get_attribute("aria-pressed") == "true"
 
     open_stage_editor(page)
+    assert not preference.is_checked()
     preference.check()
     assert page.get_by_role("button", name="Save").is_disabled()
     page.locator(".row-head").first.click()
@@ -769,7 +774,7 @@ def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_s
 @pytest.mark.parametrize("case", ["stale", "null", "malformed", "schema-4"])
 def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_page, case):
     valid = dependency_state_payload("unsatisfied")
-    bad = dependency_state_payload("satisfied")
+    bad = dependency_state_payload("satisfied", titles={"gate": "Rejected gate"})
     if case == "stale":
         bad["configuration_revision"] = "revision-before-save"
     elif case == "null":
@@ -779,7 +784,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
     else:
         bad["schema_version"] = 4
     bad["catalog_digest"] = canonical_digest(bad)
-    fresh = dependency_state_payload("unknown")
+    fresh = dependency_state_payload("unknown", titles={"gate": "Fresh gate"})
     fresh["configuration_revision"] = "revision-2"
     fresh["catalog_digest"] = canonical_digest(fresh)
     client = BlockingRawSequenceClient([valid, bad, fresh])
@@ -798,11 +803,23 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
         page.get_by_role("button", name="Save").click()
         assert client.started.wait(timeout=5)
-        assert page.locator(".dependency-indicator").count() == 0
-        client.release.set()
+        # The save message only lasts until the blocked post-save refresh resolves.
         page.get_by_text("Board row order saved.", exact=True).wait_for(timeout=15000)
+        gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
+        assert gate_title.inner_text() == "Gate step"
+        page.evaluate("""() => {
+          window.sawRejectedSnapshot = false;
+          new MutationObserver(() => {
+            if (document.querySelector('#board').textContent.includes('Rejected gate')) {
+              window.sawRejectedSnapshot = true;
+            }
+          }).observe(document.querySelector('#board'), {childList: true, subtree: true});
+        }""")
+        client.release.set()
+        playwright.expect(gate_title).to_have_text("Fresh gate", timeout=15000)
 
-    assert page.locator(".dependency-indicator").count() == 0
+    assert page.locator("#stage-order-status").inner_text() == "Current board row order loaded."
+    assert page.evaluate("window.sawRejectedSnapshot") is False
 
 
 def coherent_refresh_payload():
@@ -858,9 +875,16 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
+    # Queue now counts as finished, so the refreshed board hides its row and
+    # the arrow from the target while terminal rows are hidden.
+    playwright.expect(target).to_have_count(0, timeout=15000)
+    assert connection_pairs(page) == set()
     assert source.locator(".dependency-indicator").count() == 0
     assert source.get_attribute("aria-pressed") == "true"
     assert page.locator("#work-item-panel").count() == 0
+
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert target.count() == 1
     assert connection_pairs(page) == {(target_id, source_id)}
 
 
@@ -1741,7 +1765,7 @@ def test_card_color_follows_incoming_arrows_regardless_of_prerequisite_state(
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
     assert card.locator(".dependency-indicator").count() == 0
-    expected_color = "rgb(27, 37, 51)" if edge_states else "rgb(20, 61, 43)"
+    expected_color = DARK_CARD if edge_states else NO_INCOMING_CARD
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == expected_color
     card.click()
     assert "selected" in card.get_attribute("class").split()
@@ -1768,6 +1792,7 @@ def test_refresh_changes_satisfied_dependency_indicator_and_details_to_unknown(o
     page = open_page(SequenceClient([first, second]))
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
     assert card.locator(".dependency-indicator").count() == 0
+    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
     card.click()
     assert page.locator("#work-item-panel").count() == 0
     refresh = page.locator("#refresh")
@@ -1775,7 +1800,7 @@ def test_refresh_changes_satisfied_dependency_indicator_and_details_to_unknown(o
     refresh.click()
     assert card.locator(".dependency-indicator").count() == 0
     assert page.locator("#work-item-panel").count() == 0
-    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(20, 61, 43)"
+    assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
 
 def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_page):
@@ -1785,20 +1810,20 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
     assert source.locator("xpath=..").get_attribute("class") == dependent.locator(
         "xpath=.."
     ).get_attribute("class")
-    assert source.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(20, 61, 43)"
-    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
+    assert source.evaluate("el => getComputedStyle(el).backgroundColor") == NO_INCOMING_CARD
+    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
     page.fill("#filter", "Dependent step")
     assert connection_pairs(page) == set()
-    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(20, 61, 43)"
+    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == NO_INCOMING_CARD
 
     page.fill("#filter", "")
     assert (STEP_ONE, STEP_TWO) in connection_pairs(page)
-    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(27, 37, 51)"
+    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
     page.get_by_label("Theme", exact=True).select_option("light")
-    assert source.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(220, 252, 231)"
-    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(255, 255, 255)"
+    assert source.evaluate("el => getComputedStyle(el).backgroundColor") == NO_INCOMING_CARD
+    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == LIGHT_CARD
 
 
 def connection_pairs(page):
@@ -2076,9 +2101,10 @@ def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(ope
     page.locator(f'.card[data-package-id="{STEP_ONE}"]').click()
     cross = page.locator(f'.connection[data-source="{STEP_ONE}"][data-dependent="{LOOSE}"]')
     assert "emphasized" in cross.get_attribute("class").split()
+    # Selection changes the border only; the source keeps its no-incoming color.
     assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').evaluate(
         "c => getComputedStyle(c).backgroundColor"
-    ) == "rgb(27, 37, 51)"
+    ) == NO_INCOMING_CARD
     page.locator(f'.card[data-package-id="{STEP_ONE}"]').click()
     assert page.locator(".connection.emphasized, .connection.muted").count() == 0
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
@@ -2202,8 +2228,8 @@ def contrast_ratio(first, second):
 
 
 @pytest.mark.parametrize("theme,page_color,card_color", [
-    ("dark", "rgb(17, 24, 33)", "rgb(27, 37, 51)"),
-    ("light", "rgb(244, 246, 248)", "rgb(255, 255, 255)"),
+    ("dark", "rgb(17, 24, 33)", DARK_CARD),
+    ("light", "rgb(244, 246, 248)", LIGHT_CARD),
 ])
 def test_native_themes_preserve_readable_cards_arrows_and_selection(
     open_page, theme, page_color, card_color
@@ -2212,7 +2238,7 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
     page.get_by_label("Theme", exact=True).select_option(theme)
     source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     neutral = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    assert source.evaluate("c => getComputedStyle(c).backgroundColor") == card_color
+    assert source.evaluate("c => getComputedStyle(c).backgroundColor") == NO_INCOMING_CARD
     assert neutral.evaluate("c => getComputedStyle(c).backgroundColor") == card_color
     assert page.locator("html").evaluate("el => getComputedStyle(el).backgroundColor") == page_color
     assert page.locator("html").evaluate("el => getComputedStyle(el).colorScheme") == theme
@@ -2595,6 +2621,10 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
             timeout=15000
         )
 
+    # The refresh issue is addressable on its own while workspace issues share the summary.
+    assert page.locator("#board-issues summary").inner_text() == (
+        "Workspace issues: discovery_unavailable (1) · Latest refresh issue: producer_protocol_error"
+    )
     assert not page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
     assert page.locator(".column-head").all_text_contents() == [
         "Alpha", "EmptyProject", "ZeroProject"
