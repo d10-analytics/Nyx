@@ -1,3 +1,10 @@
+@font-face {
+  font-family: "Anta";
+  src: url("/static/Anta-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 :root {
   color-scheme: dark;
   --page: #111821;
@@ -9,14 +16,14 @@
   --border: #42546a;
   --control-border: #63768e;
   --divider: #71859e;
-  --toolbar: #14243a;
+  --toolbar: #01787c;
   --toolbar-text: #ffffff;
   --toolbar-muted: #c8d5ea;
   --rail: #5799d6;
   --emphasis: #76b7ff;
   --focus-border: #76b7ff;
   --focus-ring: #4889ce;
-  --no-incoming-arrow: #143d2b;
+  --no-incoming-arrow: #01787c;
   --link: #9ebcff;
   --warning: #ffd18c;
   --pending: #785b1b;
@@ -39,12 +46,12 @@
   --border: #c5ccd5;
   --control-border: #9da9b8;
   --divider: #718096;
-  --toolbar: #172b4d;
+  --toolbar: #01787c;
   --rail: #327bb8;
   --emphasis: #164f91;
   --focus-border: #2463a5;
   --focus-ring: #8db9e7;
-  --no-incoming-arrow: #dcfce7;
+  --no-incoming-arrow: #01787c;
   --link: #3e5790;
   --warning: #825000;
   --pending: #ffd97a;
@@ -63,22 +70,30 @@ body { margin: 0; min-width: 100%; width: max-content; }
   width: 100vw;
   display: flex;
   gap: 2rem;
-  align-items: end;
-  justify-content: space-between;
+  align-items: center;
+  justify-content: flex-end;
   flex-wrap: wrap;
-  padding: 1.1rem 2rem;
+  padding: .5rem 2rem;
   background: var(--toolbar);
   color: var(--toolbar-text);
+  font-weight: 700;
 }
+.toolbar button { font-weight: 700; }
+.brand { display: flex; align-items: center; gap: .5rem; margin-right: auto; flex-shrink: 0; }
+.brand-logo { display: block; width: 60px; height: 60px; object-fit: contain; }
+.brand-text { display: flex; flex-direction: column; }
+.brand-name { font: 400 2.5rem/1.1 "Anta", sans-serif; color: #f2c84b; }
+.brand-attribution { margin-top: .3rem; color: var(--toolbar-muted); font-size: .8rem; white-space: nowrap; }
+.toolbar-actions { display: flex; align-items: center; justify-content: flex-end; flex: 1; gap: 1rem; flex-wrap: wrap; min-width: 0; }
 h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: .25rem; font-size: 1.5rem; }
 .toolbar p { margin-bottom: 0; color: var(--toolbar-muted); }
-.controls { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.controls { display: flex; align-items: center; justify-content: flex-end; gap: .6rem; flex-wrap: wrap; }
 .compact-controls { display: flex; flex-direction: column; align-items: flex-start; gap: .3rem; }
 .compact-control { display: inline-flex; align-items: center; gap: .35rem; color: var(--toolbar-text); }
 .compact-control input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
 .stage-order-editor {
-  min-width: min(100%, 28rem);
+  min-width: 0;
   max-width: 42rem;
   padding: .7rem .9rem;
   border: 1px solid var(--control-border);
@@ -87,6 +102,7 @@ h1 { margin-bottom: .25rem; font-size: 1.5rem; }
   color: var(--heading);
 }
 .stage-order-editor summary { cursor: pointer; font-weight: 700; }
+.stage-order-editor[open] { min-width: min(100%, 28rem); }
 .stage-order-content { margin-top: .55rem; }
 .stage-order-editor p { margin: .2rem 0 .55rem; color: var(--muted); font-size: .85rem; }
 .selection-preference { display: inline-flex; align-items: center; gap: .35rem; }
@@ -239,7 +255,14 @@ button.pending {
   box-shadow: 0 1px 2px var(--shadow);
 }
 .card[hidden] { display: none; }
-.card.no-incoming-arrow { background: var(--no-incoming-arrow); }
+.card.no-incoming-arrow {
+  --heading: #ffffff;
+  --muted: #e6edf3;
+  --link: #e6edf3;
+  --warning: #ffd18c;
+  color: var(--heading);
+  background: var(--no-incoming-arrow);
+}
 .card-status {
   display: block;
   margin-top: .35rem;
@@ -259,7 +282,10 @@ button.pending {
 .cell.filtered-empty .empty { display: none; }
 
 @media (max-width: 700px) {
-  .toolbar { align-items: stretch; flex-direction: column; gap: 1rem; }
+  .toolbar { gap: .6rem; padding: .5rem 1rem; }
+  .toolbar-actions, .toolbar-actions .controls { display: contents; }
+  .brand-logo { width: 48px; height: 48px; }
+  .brand-name { font-size: 1.8rem; }
   #board { padding-left: 1rem; padding-right: 1rem; }
   #board {
     --card-min-width: 12rem;

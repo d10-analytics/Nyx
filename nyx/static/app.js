@@ -65,7 +65,6 @@
 
   const board = document.querySelector("#board");
   const toolbar = document.querySelector(".toolbar");
-  const status = document.querySelector("#status");
   const filter = document.querySelector("#filter");
   const compactControl = document.querySelector("#compact-view");
   const terminalControl = document.querySelector("#hide-terminal-rows");
@@ -1014,15 +1013,6 @@
     return authenticate(snapshot);
   }
 
-  function loadedStatus(snapshot) {
-    const count = snapshot.entries.length;
-    const discoveryDiagnostics = workspaceDiagnostics(snapshot).length;
-    const packageDiagnostics = snapshot.entries.some((entry) => (entry.diagnostics || []).length);
-    return `Loaded ${count} work item${count === 1 ? "" : "s"}` +
-      (discoveryDiagnostics ? " · workspace issues available" :
-        packageDiagnostics ? " · work item issues present" : "");
-  }
-
   function setPending(available) {
     refreshButton.dataset.pending = String(available);
     refreshButton.classList.toggle("pending", available);
@@ -1174,7 +1164,6 @@
       entry.board_visible && entry.package_path === selectedPath)) {
       selectedPath = null;
     }
-    status.textContent = loadedStatus(snapshot);
     renderBoard();
     renderStageOrderEditor();
   }
@@ -1249,7 +1238,6 @@
       return;
     }
     busy = true;
-    if (kind === "manual") status.textContent = "Refreshing work items…";
     fetch(CATALOG_ROUTE, { cache: "no-store" })
       .then(async (response) => {
         let payload;
@@ -1292,7 +1280,6 @@
           pending = null;
           setPending(false);
         }
-        status.textContent = loadedStatus(displayed);
         if (hadRefreshFailure) {
           renderBoard();
         }
@@ -1308,8 +1295,6 @@
           return;
         }
         refreshFailure = safeCategory(error);
-        status.textContent = `${kind === "poll" ? "Update check failed" : "Refresh failed"}: ` +
-          refreshFailure;
         renderBoard();
       })
       .finally(() => {

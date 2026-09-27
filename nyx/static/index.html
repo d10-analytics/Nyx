@@ -10,52 +10,57 @@
   </head>
   <body>
     <header class="toolbar">
-      <div>
-        <h1>Work item viewer</h1>
-        <p id="status" role="status">Loading work items…</p>
-      </div>
-      <div class="controls">
-        <label for="theme">Theme</label>
-        <select id="theme">
-          <option value="system">System</option>
-          <option value="light">Light</option>
-          <option value="dark" selected>Dark</option>
-        </select>
-        <label for="filter">Find work items</label>
-        <input id="filter" type="search" placeholder="Find a work item, project, or program…" autocomplete="off">
-        <div class="compact-controls">
-          <label class="compact-control" for="compact-view">
-            <input id="compact-view" type="checkbox" checked>
-            Hide empty rows and columns
-          </label>
-          <label class="compact-control" for="hide-terminal-rows">
-            <input id="hide-terminal-rows" type="checkbox" checked>
-            Hide terminal rows
-          </label>
+      <div class="brand" aria-label="Nyx by D10 Analytics">
+        <img class="brand-logo" src="/static/d10-diamond.svg" alt="" width="60" height="60">
+        <div class="brand-text">
+          <span class="brand-name">Nyx</span>
+          <span class="brand-attribution">by D10 Analytics</span>
         </div>
-        <button id="refresh" type="button">Refresh view</button>
       </div>
-      <details id="stage-order-editor" class="stage-order-editor">
-        <summary id="stage-order-heading">Board settings</summary>
-        <div class="stage-order-content">
-          <label class="selection-preference" for="deselect-on-empty-click">
-            <input id="deselect-on-empty-click" type="checkbox">
-            Click empty space to deselect
-          </label>
-          <p class="selection-preference-help">Applies immediately in this browser.</p>
-          <div id="stage-order-controls" hidden>
-            <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Save to apply these changes.</p>
-            <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
-            <div class="stage-order-actions">
-              <button id="stage-order-save" type="button">Save</button>
-              <button id="stage-order-cancel" type="button">Cancel</button>
-              <button id="stage-order-reset" type="button">Reset</button>
-              <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+      <div class="toolbar-actions">
+        <details id="stage-order-editor" class="stage-order-editor">
+          <summary id="stage-order-heading">Board settings</summary>
+          <div class="stage-order-content">
+            <label class="selection-preference" for="deselect-on-empty-click">
+              <input id="deselect-on-empty-click" type="checkbox">
+              Click empty space to deselect
+            </label>
+            <p class="selection-preference-help">Applies immediately in this browser.</p>
+            <div id="stage-order-controls" hidden>
+              <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Save to apply these changes.</p>
+              <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
+              <div class="stage-order-actions">
+                <button id="stage-order-save" type="button">Save</button>
+                <button id="stage-order-cancel" type="button">Cancel</button>
+                <button id="stage-order-reset" type="button">Reset</button>
+                <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+              </div>
+              <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
             </div>
-            <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
           </div>
+        </details>
+        <div class="controls">
+          <label for="theme">Theme</label>
+          <select id="theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark" selected>Dark</option>
+          </select>
+          <label for="filter">Search</label>
+          <input id="filter" type="search" placeholder="Find a work item, project, or program…" autocomplete="off">
+          <div class="compact-controls">
+            <label class="compact-control" for="compact-view">
+              <input id="compact-view" type="checkbox" checked>
+              Hide empty rows and columns
+            </label>
+            <label class="compact-control" for="hide-terminal-rows">
+              <input id="hide-terminal-rows" type="checkbox" checked>
+              Hide terminal rows
+            </label>
+          </div>
+          <button id="refresh" type="button">Refresh view</button>
         </div>
-      </details>
+      </div>
     </header>
     <main id="board" aria-live="polite"></main>
     <script src="/static/app.js" defer></script>

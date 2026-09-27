@@ -22,6 +22,8 @@ _STATIC = {
     "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/static/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
     "/static/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/static/d10-diamond.svg": ("d10-diamond.svg", "image/svg+xml"),
+    "/static/Anta-Regular.ttf": ("Anta-Regular.ttf", "font/ttf"),
 }
 _API_ROUTES = frozenset({"/api/catalog", "/api/settings"})
 _SAFE_ERRORS = frozenset(

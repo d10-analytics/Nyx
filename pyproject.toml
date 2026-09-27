@@ -34,7 +34,7 @@ nyx-desktop = "nyx.desktop:main"
 include = ["nyx*"]
 
 [tool.setuptools.package-data]
-nyx = ["static/*.html", "static/*.js", "static/*.css"]
+nyx = ["static/*.html", "static/*.js", "static/*.css", "static/*.svg", "static/*.ttf", "static/*.txt"]
 
 [tool.ruff]
 line-length = 100
