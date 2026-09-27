@@ -256,10 +256,11 @@ button.pending {
 }
 .card[hidden] { display: none; }
 .card.no-incoming-arrow {
+  /* Every text color here keeps at least 4.5:1 contrast on the brand teal. */
   --heading: #ffffff;
-  --muted: #e6edf3;
-  --link: #e6edf3;
-  --warning: #ffd18c;
+  --muted: #f0f4f8;
+  --link: #f0f4f8;
+  --warning: #fff1cc;
   color: var(--heading);
   background: var(--no-incoming-arrow);
 }
