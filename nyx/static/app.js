@@ -544,16 +544,20 @@
   function boardIssueHtml(snapshot) {
     const diagnostics = workspaceDiagnostics(snapshot);
     if (!diagnostics.length && !refreshFailure) return "";
+    // Each part is its own element so one issue stays addressable when both
+    // kinds are present; the separator keeps the summary text unchanged.
     const summary = [
       diagnostics.length
-        ? `Workspace issues: ${diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})` : "",
-      refreshFailure ? `Latest refresh issue: ${refreshFailure}` : "",
+        ? `<span class="workspace-issue-summary">${text(`Workspace issues: ${
+          diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})`)}</span>` : "",
+      refreshFailure
+        ? `<span class="refresh-issue-summary">${text(`Latest refresh issue: ${refreshFailure}`)}</span>` : "",
     ].filter(Boolean).join(" · ");
     const issueItems = diagnostics.map((item) =>
       `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
     const refreshItem = refreshFailure
       ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
-    return `<details class="board-issues" id="board-issues"><summary>${text(summary)}</summary>` +
+    return `<details class="board-issues" id="board-issues"><summary>${summary}</summary>` +
       `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
   }
 
