@@ -876,9 +876,13 @@ def test_static_assets_are_served_from_the_fixed_allowlist():
         ("/static/app.js", "text/javascript; charset=utf-8"),
         ("/static/theme.js", "text/javascript; charset=utf-8"),
         ("/static/style.css", "text/css; charset=utf-8"),
+        ("/static/d10-diamond.svg", "image/svg+xml"),
+        ("/static/Anta-Regular.ttf", "font/ttf"),
     ):
         with RunningServer(StubClient(catalog=valid_catalog())) as port:
             status, content_type, body = request(port, "GET", path)
         assert status == 200
         assert content_type == expected_type
         assert body
+        if path.startswith("/static/"):
+            assert body == (Path(__file__).parents[1] / "nyx" / path.lstrip("/")).read_bytes()

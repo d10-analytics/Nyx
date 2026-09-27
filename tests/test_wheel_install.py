@@ -35,6 +35,9 @@ EXPECTED_ASSETS = {
     "nyx/static/app.js",
     "nyx/static/style.css",
     "nyx/static/theme.js",
+    "nyx/static/d10-diamond.svg",
+    "nyx/static/Anta-Regular.ttf",
+    "nyx/static/Anta-OFL.txt",
 }
 
 

@@ -2459,9 +2459,9 @@ _BOARD_JSON_SNAPSHOT_SCRIPT = """
     href: null,
     readyState: null,
     origin: null,
-    hasStatus: false,
+    boardReady: false,
     error: null,
-    status: '',
+    refreshIssue: '',
     titles: [],
     rows: [],
     links: [],
@@ -2472,8 +2472,8 @@ _BOARD_JSON_SNAPSHOT_SCRIPT = """
     result.href = String(location.href);
     result.readyState = String(document.readyState);
     result.origin = String(location.origin);
-    result.hasStatus = !!document.querySelector('#status');
-    result.status = document.querySelector('#status') ? String(document.querySelector('#status').textContent) : '';
+    result.boardReady = !!document.querySelector('#board .card, #board .board-empty');
+    result.refreshIssue = document.querySelector('#board-issues summary')?.textContent || '';
     result.titles = [...document.querySelectorAll('.card-title')].map((node) => String(node.textContent));
     result.rows = [...document.querySelectorAll('.board-row')].map((node) => String(node.dataset.lifecycle));
     result.links = [...document.querySelectorAll('.card-links')].map((node) => String(node.textContent));
@@ -2656,7 +2656,7 @@ def _wait_for_json_board(application, page, timeout: float = 60.0, probe=None):
     numeric, and string values; an object-returning snapshot arrives as an
     empty string and cannot tell a rendered board apart from a blank document.
     A missing, empty, or malformed string result is a hard failure, and the
-    board is accepted only once its status reports a loaded catalog.
+    board is accepted once cards or an empty result have rendered without a refresh failure.
     """
 
     deadline = time.monotonic() + timeout
@@ -2670,26 +2670,26 @@ def _wait_for_json_board(application, page, timeout: float = 60.0, probe=None):
         except AssertionError as error:
             raise AssertionError(_board_diagnostic(snapshot, probe, raw)) from error
         snapshot = _parse_board_observation(raw, probe)
-        if str(snapshot.get("status", "")).startswith("Loaded"):
+        if snapshot.get("boardReady") and "Latest refresh issue:" not in snapshot.get("refreshIssue", ""):
             return snapshot
         _pump_native_events(application, 50)
     raise AssertionError(_board_diagnostic(snapshot, probe, raw))
 
 
-def _wait_for_status(application, page, prefix: str, timeout: float = 30.0):
+def _wait_for_refresh_issue(application, page, timeout: float = 30.0):
     deadline = time.monotonic() + timeout
     value = None
     while time.monotonic() < deadline:
         value = _eval_js(
             application,
             page,
-            "document.querySelector('#status').textContent",
+            "document.querySelector('#board-issues summary')?.textContent || ''",
             timeout=15.0,
         )
-        if isinstance(value, str) and value.startswith(prefix):
+        if isinstance(value, str) and "Latest refresh issue:" in value:
             return value
         _pump_native_events(application, 50)
-    raise AssertionError(f"board status never reached {prefix!r}: {value!r}")
+    raise AssertionError(f"board refresh issue never appeared: {value!r}")
 
 
 def _wait_for_engine_sanity(application, page, timeout: float = 30.0):
@@ -2890,7 +2890,8 @@ def test_board_json_observation_parses_strings_and_rejects_missing_results():
 
     payload = json.dumps(
         {
-            "status": "Loaded 3 packages",
+            "boardReady": True,
+            "refreshIssue": "",
             "titles": ["Alpha delivery", "Beta design"],
             "rows": ["in-progress", "planned"],
             "links": ["needs: Beta design"],
@@ -2961,7 +2962,7 @@ def test_required_native_board_json_snapshot_separates_rendering_from_observatio
                 assert window._open_board()
                 snapshot = _wait_for_json_board(application, page, probe=probe)
                 assert snapshot["origin"] == f"http://127.0.0.1:{port}"
-                assert snapshot["hasStatus"] is True
+                assert snapshot["boardReady"] is True
                 assert "Alpha delivery" in snapshot["titles"]
             finally:
                 released = _destroy_native_window(
@@ -3017,12 +3018,12 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
                 )
                 shared.catalog_admitted = False
                 _eval_js(application, page, "document.querySelector('#refresh').click()")
-                assert _wait_for_status(application, page, "Refresh failed").startswith(
-                    "Refresh failed"
-                )
+                assert "Latest refresh issue:" in _wait_for_refresh_issue(application, page)
                 shared.catalog_admitted = True
                 _eval_js(application, page, "document.querySelector('#refresh').click()")
-                assert _wait_for_status(application, page, "Loaded").startswith("Loaded")
+                recovered = _wait_for_json_board(application, page, probe=probe)
+                assert "Alpha delivery" in recovered["titles"]
+                assert "Latest refresh issue:" not in recovered["refreshIssue"]
             finally:
                 released = _destroy_native_window(
                     application,

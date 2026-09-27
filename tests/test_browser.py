@@ -594,8 +594,7 @@ def open_page():
                 page.add_init_script(init_script)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             page.wait_for_function(
-                "document.querySelector('#board .card, #board .board-empty') || "
-                "document.querySelector('#status').textContent.includes('failed')",
+                "document.querySelector('#board .card, #board .board-empty, #board-issues')",
                 timeout=15000,
             )
             page.wait_for_timeout(150)
@@ -1011,7 +1010,7 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
         assert page.locator("#board .card").count() == 4
         assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
         client.release.set()
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -1083,6 +1082,13 @@ def test_markup_shaped_stage_names_are_escaped_with_independent_controls(open_pa
 
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
+    assert page.locator(".toolbar h1, .toolbar #status").count() == 0
+    assert page.get_by_label("Search", exact=True).is_visible()
+    assert page.locator(".brand-name").inner_text() == "Nyx"
+    assert page.locator(".brand-attribution").inner_text() == "by D10 Analytics"
+    assert page.locator(".brand-logo").evaluate("image => image.complete && image.naturalWidth > 0")
+    assert page.evaluate("async () => (await document.fonts.load('40px Anta')).length > 0")
+    assert page.locator(".brand-name").evaluate("node => getComputedStyle(node).color") == "rgb(242, 200, 75)"
     assert page.locator(".column-head").all_inner_texts() == ["Alpha", "Beta"]
     rows = page.locator(".row-head").all_inner_texts()
     assert rows == ["Queue", "Under Development"]
@@ -1100,12 +1106,12 @@ def test_browser_accepts_explicit_blank_declared_metadata(open_page):
 def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     client = SequenceClient([CatalogError("producer_unavailable"), board_payload()])
     page = open_page(client)
-    page.get_by_text("Refresh failed: producer_unavailable", exact=True).wait_for(
+    page.get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
         timeout=15000
     )
     page.locator("#board .card").first.wait_for(timeout=15000)
     assert page.locator("#board .card").count() == 4
-    assert page.locator("#status").inner_text().startswith("Loaded 4 work items")
+    assert page.locator("#board-issues").count() == 0
     assert client.calls == 2
 
 
@@ -1604,7 +1610,7 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     page = open_page(client)
 
     page.wait_for_selector("#refresh.pending", timeout=15000)
-    page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+    page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
         timeout=15000
     )
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
@@ -1662,7 +1668,6 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
 
     board_issues = page.locator("#board-issues")
     assert "discovery_unavailable" in board_issues.locator("summary").inner_text()
-    assert "workspace issues available" in page.locator("#status").inner_text().lower()
     board_issues.locator("summary").click()
     assert board_issues.locator("li").inner_text() == (
         "discovery_unavailable first catalog discovery failure"
@@ -1676,13 +1681,12 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     )
     page.fill("#filter", "")
     page.click("#refresh")
-    page.get_by_text("Loaded 0 work items", exact=False).wait_for(timeout=15000)
+    page.wait_for_function("document.querySelectorAll('#board .card').length === 0", timeout=15000)
     page.locator("#board-issues summary").click()
     assert page.locator("#board-issues li").inner_text() == (
         "discovery_unavailable refreshed catalog discovery failure"
     )
     assert page.locator(".card.selected").count() == 0
-    assert "select a work item" not in page.locator("#status").inner_text().lower()
 
 
 def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open_page):
@@ -1704,8 +1708,6 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
         f"discovery_unavailable {discovery_message}"
     )
     assert page.locator("#board-issues img").count() == 0
-    assert "workspace issues available" in page.locator("#status").inner_text().lower()
-    assert "select a work item" not in page.locator("#status").inner_text().lower()
 
 
 @pytest.mark.parametrize("participation,state,edge_states", [
@@ -2416,11 +2418,9 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
         board_payload(titles={"step_one": "Recovered foundation"}),
     ])
     page = open_page(client)
-    page.get_by_text("Update check failed: producer_timeout", exact=True).wait_for(timeout=15000)
+    page.get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
     page.wait_for_selector("#refresh.pending", timeout=15000)
-    assert page.locator("#status").inner_text() == (
-        "Loaded 4 work items · select a work item to view issues"
-    )
+    assert page.locator("#board-issues").count() == 0
     assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
     assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 0
     page.click("#refresh")
@@ -2591,7 +2591,7 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
             RawSequenceClient([valid, invalid]),
             init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
         )
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2812,7 +2812,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2838,7 +2838,7 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(client)
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2867,7 +2867,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2889,7 +2889,7 @@ def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2966,7 +2966,7 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
         page.get_by_role("button", name="Refresh view").click()
-        page.get_by_text("Update check failed: producer_protocol_error", exact=True).wait_for(
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
