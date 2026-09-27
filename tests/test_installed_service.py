@@ -101,7 +101,7 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
     entries = value["entries"]
-    assert value["schema_version"] == 5
+    assert value["schema_version"] == 6
     assert value["configuration_revision"] is not None
     assert value["inventory"] == {
         "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -111,6 +111,8 @@ def _assert_catalog(value: dict[str, object], hidden_stages: list[str]) -> None:
         ],
     }
     assert value["visibility"]["hidden_stages"] == hidden_stages
+    # These services never save a completion policy, so no stage is terminal.
+    assert value["visibility"]["terminal_stages"] == []
     assert value["visibility"]["visible_entry_count"] == len(PACKAGED_STAGES) - len(hidden_stages)
     assert value["visibility"]["hidden_entry_count"] == len(hidden_stages)
     assert [entry["package_path"] for entry in entries] == sorted(
@@ -140,7 +142,7 @@ def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: st
     from nyx.models import canonical_digest
 
     value = {
-        "schema_version": 5,
+        "schema_version": 6,
         "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -148,6 +150,7 @@ def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: st
         },
         "visibility": {
             "hidden_stages": [],
+            "terminal_stages": [],
             "visible_entry_count": 0,
             "hidden_entry_count": 0,
         },
@@ -232,15 +235,9 @@ def _assert_hidden_browser(url: str) -> None:
             queue.click()
             assert queue.locator(".card-links").count() == 0
             assert page.locator('.connection[data-source="%s"]' % PACKAGE_IDS["Done"]).count() == 0
-            dependencies = page.locator("#details .dependencies")
-            assert dependencies.get_attribute("open") is None
-            dependencies.locator("summary").click()
-            assert dependencies.get_attribute("open") == ""
-            assert dependencies.locator(".prerequisite-target").inner_text() == "Done package"
-            assert dependencies.locator(".direct-prerequisite-state").inner_text() == (
-                "Reported direct prerequisite state: satisfied."
-            )
-            assert dependencies.locator(".reported-state").inner_text() == "Reported state: satisfied"
+            assert queue.get_attribute("aria-pressed") == "true"
+            assert page.locator("#work-item-panel").count() == 0
+            assert page.locator(".toolbar #refresh").count() == 1
         finally:
             browser.close()
 

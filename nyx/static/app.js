@@ -54,14 +54,23 @@
   const CATALOG_ROUTE = "/api/catalog";
   const SETTINGS_ROUTE = "/api/settings";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
+  // The terminal-row preference mirrors the compact-view preference: it is a
+  // browser-local display choice applied to the catalog already fetched.  It
+  // never changes setup, the workspace, or the catalog, and it is unrelated to
+  // the account's hidden-stage policy, which removes a row from the board
+  // before the browser ever sees it.  A finished stage that is also configured
+  // hidden therefore stays hidden even when this box is unchecked.
+  const TERMINAL_STORAGE_KEY = "spec-tracker-hide-terminal-rows";
+  const DESELECT_STORAGE_KEY = "spec-tracker-deselect-on-empty-click";
 
   const board = document.querySelector("#board");
-  const detailPanel = document.querySelector("#details");
-  const status = document.querySelector("#status");
+  const toolbar = document.querySelector(".toolbar");
   const filter = document.querySelector("#filter");
   const compactControl = document.querySelector("#compact-view");
+  const terminalControl = document.querySelector("#hide-terminal-rows");
+  const deselectControl = document.querySelector("#deselect-on-empty-click");
   const refreshButton = document.querySelector("#refresh");
-  const stageOrderEditor = document.querySelector("#stage-order-editor");
+  const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
   const stageOrderCancel = document.querySelector("#stage-order-cancel");
@@ -78,6 +87,8 @@
   let railColumns = [];
   let railEdges = [];
   let compactView = true;
+  let hideTerminalRows = true;
+  let deselectOnEmptyClick = false;
   let refreshFailure = null;
   let savedStageOrder = [];
   let savedCompletedStages = [];
@@ -296,12 +307,9 @@
   }
 
   function renderStageOrderEditor({focusStage = null} = {}) {
-    if (!settingsAvailable && !settingsReloadAvailable) {
-      stageOrderEditor.hidden = true;
-      return;
-    }
+    stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
+    if (stageOrderControls.hidden) return;
     if (settingsAvailable && !editorStageOrder.length) editorStageOrder = editorNames();
-    stageOrderEditor.hidden = false;
     const controlsDisabled = !settingsAvailable || settingsBusy;
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
@@ -309,7 +317,7 @@
         '<span class="stage-order-dormant">(not currently available)</span>';
       const completed = editorCompletedStages.includes(stage);
       return `<li class="stage-order-item" data-stage="${text(stage)}">` +
-        `<span class="stage-order-name">${text(label)} <code>${text(stage)}</code>${dormant}</span>` +
+        `<span class="stage-order-name">${text(label)}${dormant}</span>` +
         `<label class="stage-completed"><input type="checkbox" class="stage-completed-toggle" ` +
         `aria-label="Counts as finished: ${text(label)}" data-stage="${text(stage)}"` +
         `${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
@@ -408,41 +416,19 @@
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 
-  function dependencyIndicator(entry) {
-    const state = entry.relationship.direct_prerequisite_state;
-    const edges = entry.relationship.prerequisites || [];
-    if (state === "no_declared_prerequisites" && edges.length === 0) return null;
-    if (state === "relationship_unavailable") {
-      return { state: "unavailable", label: "Dependencies unavailable", title: "Dependency information is unavailable." };
-    }
-    if (state === "unknown" || edges.some((edge) => edge.resolved_state === "unknown")) {
-      return { state: "unknown", label: "Dependencies unknown", title: "Dependency information is unknown." };
-    }
-    if (state === "unsatisfied" || edges.some((edge) => edge.resolved_state === "unsatisfied")) {
-      return { state: "waiting", label: "Waiting on dependencies", title: "Some dependencies are not satisfied." };
-    }
-    if (state === "satisfied" && edges.length > 0 &&
-        edges.every((edge) => edge.resolved_state === "satisfied")) {
-      return { state: "satisfied", label: "Dependencies satisfied", title: "Direct dependencies are satisfied." };
-    }
-    return { state: "unavailable", label: "Dependencies unavailable", title: "Dependency information is unavailable." };
-  }
-
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
-    const dependency = dependencyIndicator(entry);
     return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
       `${idAttribute} data-search="${text(searchText(entry))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
-      (targetProject ? `<span class="card-project">Target project: ${text(targetProject)}</span>` : "") +
-      (dependency ? `<span class="dependency-indicator dependency-${dependency.state}" ` +
-        `title="${text(dependency.title)}">${text(dependency.label)}</span>` : "") +
+      (targetProject ? `<span class="card-project">Target Folder: ${text(targetProject)}</span>` : "") +
+      `<span class="card-filepath">Filepath: ${text(entry.package_path)}</span>` +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
 
@@ -453,9 +439,27 @@
       cell.map((entry) => cardHtml(entry, byId, dependentsOf)).join("") + "</div>";
   }
 
+  // Finished ("terminal") stages the reader has chosen to hide right now.  The
+  // set is recomputed on every render because the completion policy can change
+  // when Board settings are saved.  When the box is unchecked the set is empty,
+  // so finished rows are treated like any other row.  Hidden stages are not
+  // removed here; callers apply the hidden policy first, which keeps hidden
+  // stages un-revealable even when a hidden stage is also marked finished.
+  function gatedTerminalStages() {
+    if (!hideTerminalRows) return new Set();
+    return new Set(displayed?.visibility.terminal_stages || []);
+  }
+
   function inventoryAxes(entries) {
     const hiddenStages = new Set(displayed?.visibility.hidden_stages || []);
+    // Terminal gating is purely a browser display choice: it removes finished
+    // rows from this render and touches neither the catalog nor the saved
+    // policy.  It is deliberately separate from the hidden-stage policy, which
+    // removes a row entirely; see the note on ``terminal_stages`` in the
+    // catalog builder for why the two concepts are not merged.
+    const gatedStages = gatedTerminalStages();
     const inventory = displayed?.inventory || { projects: [], stages: [] };
+    const eligibleStages = [];
     const stages = [];
     const stageByKey = new Map();
     inventory.stages.forEach((record) => {
@@ -465,14 +469,22 @@
       if (!dimension) {
         dimension = { key, stage: record.stage, availability: record.availability };
         stageByKey.set(key, dimension);
-        stages.push(dimension);
+        eligibleStages.push(dimension);
       } else if (record.availability === "incomplete") {
         dimension.availability = "incomplete";
       }
     });
+    eligibleStages.forEach((dimension) => {
+      if (gatedStages.has(dimension.stage)) return;
+      stages.push(dimension);
+    });
 
     const entryProjects = new Set(entries.map((entry) => entry.project));
-    const hasEligibleStages = stages.length > 0;
+    const hasEligibleStages = eligibleStages.length > 0;
+    // Every admissible row is a finished row the reader chose to hide.  The
+    // board uses this to explain the empty result instead of reporting that no
+    // stage directories were found.
+    const terminalHidden = hasEligibleStages && stages.length === 0;
     const projects = [];
     inventory.projects.forEach((record) => {
       const projectStages = inventory.stages.filter((stage) => stage.project === record.name);
@@ -510,7 +522,7 @@
         project.availability === "incomplete" || project.incompleteStage ||
           populatedProjects.has(project.key))
       : projects;
-    return { stages: visibleStages, projects: visibleProjects, hasEligibleStages };
+    return { stages: visibleStages, projects: visibleProjects, hasEligibleStages, terminalHidden };
   }
 
   function dimensionNotice(dimension) {
@@ -532,16 +544,20 @@
   function boardIssueHtml(snapshot) {
     const diagnostics = workspaceDiagnostics(snapshot);
     if (!diagnostics.length && !refreshFailure) return "";
+    // Each part is its own element so one issue stays addressable when both
+    // kinds are present; the separator keeps the summary text unchanged.
     const summary = [
       diagnostics.length
-        ? `Workspace issues: ${diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})` : "",
-      refreshFailure ? `Latest refresh issue: ${refreshFailure}` : "",
+        ? `<span class="workspace-issue-summary">${text(`Workspace issues: ${
+          diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})`)}</span>` : "",
+      refreshFailure
+        ? `<span class="refresh-issue-summary">${text(`Latest refresh issue: ${refreshFailure}`)}</span>` : "",
     ].filter(Boolean).join(" · ");
     const issueItems = diagnostics.map((item) =>
       `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
     const refreshItem = refreshFailure
       ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
-    return `<details class="board-issues" id="board-issues"><summary>${text(summary)}</summary>` +
+    return `<details class="board-issues" id="board-issues"><summary>${summary}</summary>` +
       `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
   }
 
@@ -551,6 +567,12 @@
       return '<p class="empty board-empty">No work items in the catalog.</p>';
     }
     const hiddenStages = new Set(displayed.visibility.hidden_stages || []);
+    // The reader hid finished rows and those were the only admissible rows, so
+    // name that cause before the generic empty-board explanations below.
+    if (axes.terminalHidden) {
+      return '<p class="empty board-empty terminal-hidden">Finished rows are hidden. ' +
+        'Uncheck “Hide terminal rows” to show them.</p>';
+    }
     const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
       displayed.inventory.stages.some((stage) =>
         !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
@@ -573,7 +595,13 @@
   }
 
   function renderBoard() {
-    const entries = displayed ? displayed.entries.filter((entry) => entry.board_visible) : [];
+    // Finished rows the reader is hiding are removed from the working entry set
+    // (not just from the axes) so dependency edges, rail planning, and column
+    // depths treat them as absent, exactly like an entry outside the board.
+    const gatedStages = gatedTerminalStages();
+    const entries = displayed
+      ? displayed.entries.filter((entry) => entry.board_visible && !gatedStages.has(entry.stage))
+      : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
     const axes = inventoryAxes(entries);
@@ -582,14 +610,24 @@
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
-    if (!axes.stages.length && axes.projects.length) {
-      board.style.setProperty("--column-tracks", columns.map(() => "minmax(var(--card-min-width), 1fr)").join(" "));
+    const setBoardColumns = (gutters) => {
+      const widths = gutters.map((gutter) => `calc(var(--card-min-width) + ${gutter}px)`);
+      board.style.setProperty("--column-tracks", widths.map((width) =>
+        `minmax(${width}, 1fr)`).join(" "));
+      board.style.setProperty("--board-min-width", widths.length
+        ? `calc(var(--label-min-width) + ${widths.join(" + ")} + ` +
+          `${columns.length * .9}rem + var(--board-horizontal-padding))`
+        : "100vw");
+    };
+    if (!axes.stages.length && axes.projects.length && !axes.terminalHidden) {
+      setBoardColumns(columns.map(() => 0));
       board.innerHTML = issues + '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
         '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
       return;
     }
     if (!axes.stages.length || !axes.projects.length) {
+      setBoardColumns([]);
       board.innerHTML = issues + emptyBoardHtml(axes, entries);
       return;
     }
@@ -609,11 +647,10 @@
       railPlan.set(key, { edges });
       return [key, { depth, reserved: edges.length }];
     }));
-    board.style.setProperty("--column-tracks", columns.map(([key]) => {
+    setBoardColumns(columns.map(([key]) => {
       const reserved = plans.get(key).reserved;
-      const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
-      return `minmax(calc(var(--card-min-width) + ${gutter}px), 1fr)`;
-    }).join(" "));
+      return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
+    }));
     let html = issues + (!entries.length
       ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
         ? "The catalog has incomplete dimensions; no work items are currently available."
@@ -658,7 +695,7 @@
 
   function drawRails() {
     board.querySelector(".rail-layer")?.remove();
-    if (!displayed || !railEdges.length) return;
+    if (!displayed) return;
     const heads = [...board.querySelectorAll(".column-head")];
     const boardRect = board.getBoundingClientRect();
     const cards = new Map();
@@ -667,13 +704,18 @@
     });
     const visibleEdges = railEdges.filter((edge) =>
       cards.has(edge.source) && cards.has(edge.dependent));
+    const incoming = new Set(visibleEdges.map((edge) => edge.dependent));
+    board.querySelectorAll(".card").forEach((card) => {
+      card.classList.toggle("no-incoming-arrow", !card.hidden && !incoming.has(card.dataset.packageId));
+    });
+    if (!visibleEdges.length) return;
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
     const selectedId = selected?.dataset.packageId;
     const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
     const bands = new Map([...board.querySelectorAll(".board-row")].map((row) =>
       [row.dataset.lifecycle, row.querySelector(".connection-band")]));
     const laneX = (key, edge) => {
-      const columnLeft = heads[railColumns.indexOf(key)].getBoundingClientRect().left - boardRect.left;
+      const columnLeft = heads[railColumns.indexOf(key)].offsetLeft;
       return columnLeft + (railPlan.get(key).edges.indexOf(edge) + .5) * RAIL_PITCH;
     };
     const port = (id, edge) => {
@@ -729,69 +771,6 @@
     board.append(svg);
   }
 
-  function renderDetails() {
-    const entries = displayed ? displayed.entries : [];
-    const entry = entries.find((item) => item.board_visible && item.package_path === selectedPath);
-    if (!entry) {
-      const emptyCatalog = displayed && entries.length === 0;
-      detailPanel.innerHTML = (emptyCatalog
-        ? "<h2>No work items available</h2><p>The catalog contains no work item entries.</p>"
-        : "<h2>Select a work item</h2><p>Choose a card to inspect its details.</p>");
-      return;
-    }
-    const byId = indexByPackageId(entries);
-    const targetProject = entry.declared.target_project &&
-      entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
-    const programTitle = entry.relationship.program.title;
-    const context = (targetProject ? `<dt>Target project</dt><dd>${text(targetProject)}</dd>` : "") +
-      (programTitle ? `<dt>Program</dt><dd>${text(programTitle)}</dd>` : "");
-    // Keep every relationship visible even when several edges share a target.
-    const prerequisites = (entry.relationship.prerequisites || []).map((edge) => {
-      const target = prerequisiteTarget(edge, byId);
-      const targetHtml = `<span class="prerequisite-target">${text(target ? titleOf(target) : "unresolved target")}</span>`;
-      if (edge.kind === "claim") {
-        return '<li class="prerequisite-claim prerequisite-claim-kind">' +
-          `${targetHtml} · ` +
-          `<span class="claim-name">Claim: ${text(edge.claim_name || "unnamed")}</span> · ` +
-          `<span class="reported-state">Reported state: ${text(edge.resolved_state)}</span> · ` +
-          `<span class="claim-reason">Reason: ${text(edge.reason)}</span></li>`;
-      }
-      return '<li class="prerequisite-claim prerequisite-completion">' +
-        `${targetHtml} · ` +
-        `<span class="completion-kind">Whole-item completion</span> · ` +
-        `<span class="observed-stage">Observed stage: ${text(edge.observed_stage)}</span> · ` +
-        `<span class="completion-reason">Reason: ${text(edge.reason)}</span></li>`;
-    });
-    const dependency = dependencyIndicator(entry);
-    const dependencySummary = dependency ? dependency.label : "No direct prerequisites";
-    const dependencyBody = `<p class="direct-prerequisite-state" data-direct-prerequisite-state="${text(entry.relationship.direct_prerequisite_state)}">` +
-      `${text(directPrerequisiteSummary(entry.relationship.direct_prerequisite_state, prerequisites.length))}</p>` +
-      (prerequisites.length ? `<ul class="prerequisite-claims">${prerequisites.join("")}</ul>` : "");
-    const itemIssues = (entry.diagnostics || []).length
-      ? `<details class="item-issues"><summary>Issues: ${text(entry.diagnostics.map((item) => item.code).join(", "))} (${entry.diagnostics.length})</summary>` +
-        `<ul class="diagnostics">${entry.diagnostics.map((item) =>
-          `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("")}</ul></details>` : "";
-    detailPanel.innerHTML = `<h2>${text(titleOf(entry))}</h2><dl>` +
-      `<dt>Stage</dt><dd>${text(stageLabelOf(entry.stage))}</dd>${context}</dl>` +
-      `<details class="dependencies"><summary>Dependencies · ${text(dependencySummary)}</summary>${dependencyBody}</details>` +
-      `${itemIssues}` +
-      `<details class="technical-details"><summary>Technical details (Stable ID available)</summary><dl>` +
-      `<dt>Stable ID</dt><dd>${text(entry.package_id)}</dd>` +
-      `<dt>Package path</dt><dd>${text(entry.package_path)}</dd></dl></details>`;
-  }
-
-  function directPrerequisiteSummary(state, claimCount) {
-    switch (state) {
-      case "no_declared_prerequisites": return claimCount === 0
-        ? "No direct prerequisites."
-        : "Reported direct prerequisite state: no declared prerequisites.";
-      case "satisfied": return "Reported direct prerequisite state: satisfied.";
-      case "unsatisfied": return "Reported direct prerequisite state: unsatisfied.";
-      case "unknown": return "Direct prerequisite information is unknown.";
-      default: return "Direct prerequisite information unavailable.";
-    }
-  }
-
   function select(path) {
     selectedPath = selectedPath === path ? null : path;
     board.querySelectorAll(".card").forEach((card) => {
@@ -799,7 +778,6 @@
       card.classList.toggle("selected", selected);
       card.setAttribute("aria-pressed", String(selected));
     });
-    renderDetails();
     drawRails();
   }
 
@@ -948,7 +926,7 @@
   function validateSnapshot(snapshot) {
     const top = ["catalog_digest", "configuration_revision", "discovery_diagnostics", "entries", "identity_coverage",
       "inventory", "program_coverage", "programs", "schema_version", "visibility"];
-    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 5 &&
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 6 &&
       /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
       Array.isArray(snapshot.programs));
     protocol(snapshot.configuration_revision === null || safeText(snapshot.configuration_revision));
@@ -975,8 +953,10 @@
       scalarCompare(stage.project, snapshot.inventory.stages[index - 1].project) > 0 ||
       (stage.project === snapshot.inventory.stages[index - 1].project &&
         scalarCompare(stage.stage, snapshot.inventory.stages[index - 1].stage) > 0)));
-    if (!exactKeys(snapshot.visibility, ["hidden_stages", "visible_entry_count", "hidden_entry_count"]) ||
+    if (!exactKeys(snapshot.visibility, ["hidden_stages", "terminal_stages",
+      "visible_entry_count", "hidden_entry_count"]) ||
         !Array.isArray(snapshot.visibility.hidden_stages) ||
+        !Array.isArray(snapshot.visibility.terminal_stages) ||
         !Number.isInteger(snapshot.visibility.visible_entry_count) || snapshot.visibility.visible_entry_count < 0 ||
         !Number.isInteger(snapshot.visibility.hidden_entry_count) || snapshot.visibility.hidden_entry_count < 0) {
       throw new Error("producer_protocol_error");
@@ -984,6 +964,12 @@
     snapshot.visibility.hidden_stages.forEach((stage) => protocol(component(stage)));
     protocol(snapshot.visibility.hidden_stages.every((stage, index) =>
       index === 0 || scalarCompare(stage, snapshot.visibility.hidden_stages[index - 1]) > 0));
+    // Terminal stages are the account's completion policy, carried for the
+    // "Hide terminal rows" grouping.  Overlap with hidden_stages is legal: the
+    // hidden policy is applied first, so a stage that is both stays hidden.
+    snapshot.visibility.terminal_stages.forEach((stage) => protocol(component(stage)));
+    protocol(snapshot.visibility.terminal_stages.every((stage, index) =>
+      index === 0 || scalarCompare(stage, snapshot.visibility.terminal_stages[index - 1]) > 0));
     diagnostics(snapshot.discovery_diagnostics);
     [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
       protocol(exactKeys(coverage, ["diagnostics", "state"]) && ["complete", "incomplete"].includes(coverage.state));
@@ -1029,15 +1015,6 @@
       throw new Error("producer_protocol_error");
     }
     return authenticate(snapshot);
-  }
-
-  function loadedStatus(snapshot) {
-    const count = snapshot.entries.length;
-    const discoveryDiagnostics = workspaceDiagnostics(snapshot).length;
-    const packageDiagnostics = snapshot.entries.some((entry) => (entry.diagnostics || []).length);
-    return `Loaded ${count} work item${count === 1 ? "" : "s"}` +
-      (discoveryDiagnostics ? " · workspace issues available" :
-        packageDiagnostics ? " · select a work item to view issues" : "");
   }
 
   function setPending(available) {
@@ -1191,9 +1168,7 @@
       entry.board_visible && entry.package_path === selectedPath)) {
       selectedPath = null;
     }
-    status.textContent = loadedStatus(snapshot);
     renderBoard();
-    renderDetails();
     renderStageOrderEditor();
   }
 
@@ -1215,8 +1190,45 @@
     compactControl.checked = compactView;
     if (displayed) {
       renderBoard();
-      renderDetails();
     }
+  }
+
+  // Terminal-row preference: same contract as the compact preference.  It is
+  // stored per browser, never sent to the server, and defaults to checked so
+  // finished rows start hidden.  Storage failures fall back to the in-memory
+  // value for this page and back to checked on a fresh page.
+  function readTerminalPreference() {
+    hideTerminalRows = true;
+    try {
+      const value = window.localStorage.getItem(TERMINAL_STORAGE_KEY);
+      if (value === "true") hideTerminalRows = true;
+      if (value === "false") hideTerminalRows = false;
+    } catch (_) {
+      // A checked checkbox is the safe fallback when browser storage is unavailable.
+    }
+    terminalControl.checked = hideTerminalRows;
+  }
+
+  function setTerminalPreference(value) {
+    hideTerminalRows = value;
+    try { window.localStorage.setItem(TERMINAL_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
+    terminalControl.checked = hideTerminalRows;
+    if (displayed) {
+      renderBoard();
+    }
+  }
+
+  function readDeselectPreference() {
+    deselectOnEmptyClick = false;
+    try {
+      deselectOnEmptyClick = window.localStorage.getItem(DESELECT_STORAGE_KEY) === "true";
+    } catch (_) { /* unchecked is the fallback when storage is unavailable */ }
+    deselectControl.checked = deselectOnEmptyClick;
+  }
+
+  function setDeselectPreference(value) {
+    deselectOnEmptyClick = value;
+    try { window.localStorage.setItem(DESELECT_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
   }
 
   function safeCategory(error) {
@@ -1230,7 +1242,6 @@
       return;
     }
     busy = true;
-    if (kind === "manual") status.textContent = "Refreshing work items…";
     fetch(CATALOG_ROUTE, { cache: "no-store" })
       .then(async (response) => {
         let payload;
@@ -1273,10 +1284,8 @@
           pending = null;
           setPending(false);
         }
-        status.textContent = loadedStatus(displayed);
         if (hadRefreshFailure) {
           renderBoard();
-          renderDetails();
         }
       })
       .catch((error) => {
@@ -1290,10 +1299,7 @@
           return;
         }
         refreshFailure = safeCategory(error);
-        status.textContent = `${kind === "poll" ? "Update check failed" : "Refresh failed"}: ` +
-          refreshFailure;
         renderBoard();
-        renderDetails();
       })
       .finally(() => {
         busy = false;
@@ -1311,6 +1317,7 @@
   board.addEventListener("click", (event) => {
     const card = event.target.closest("[data-package-path]");
     if (card) select(card.dataset.packagePath);
+    else if (deselectOnEmptyClick && selectedPath && !event.target.closest(".board-issues")) select(null);
   });
   refreshButton.addEventListener("click", () => {
     if (pending) apply(pending);
@@ -1355,7 +1362,13 @@
   });
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
+  terminalControl.addEventListener("change", () => setTerminalPreference(terminalControl.checked));
+  deselectControl.addEventListener("change", () => setDeselectPreference(deselectControl.checked));
   if (typeof ResizeObserver === "function") {
+    const updateToolbarHeight = () =>
+      document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
+    updateToolbarHeight();
+    new ResizeObserver(updateToolbarHeight).observe(toolbar);
     let resizeFrame = null;
     new ResizeObserver(() => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
@@ -1367,6 +1380,8 @@
   }
 
   readCompactPreference();
+  readTerminalPreference();
+  readDeselectPreference();
   loadSettings();
   request("manual");
   window.setInterval(() => request("poll"), POLL_INTERVAL);

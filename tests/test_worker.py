@@ -204,7 +204,7 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
             )
             try:
                 catalog = json.loads(manager.fetch_catalog())
-                assert catalog["schema_version"] == 5
+                assert catalog["schema_version"] == 6
                 assert manager.close(time.monotonic() + 2)
                 assert manager.active_count == 0
                 assert claim.held
@@ -246,7 +246,7 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
             with patch.object(worker.sys, "stdout", stdout):
                 assert worker._worker_main() == 0
         payload = json.loads(stdout.buffer.writes[0])
-        assert payload["schema_version"] == 5
+        assert payload["schema_version"] == 6
         assert payload["configuration_revision"] == saved.revision
         source_entry = next(
             item for item in payload["entries"] if item["package_id"] == "11111111-1111-4111-8111-111111111111"

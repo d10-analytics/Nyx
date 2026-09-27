@@ -25,7 +25,7 @@ def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, obj
 def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages) -> None:
     value = json.loads(catalog.build_catalog(SAMPLE_ROOT, hidden_stages=hidden_stages))
 
-    assert value["schema_version"] == 5
+    assert value["schema_version"] == 6
     assert value["configuration_revision"] is None
     assert value["inventory"] == {
         "projects": [
@@ -48,6 +48,8 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     }
     assert value["visibility"] == {
         "hidden_stages": list(hidden_stages),
+        # The sample workspace saves no completion policy.
+        "terminal_stages": [],
             "visible_entry_count": 5 if hidden_stages else 6,
         "hidden_entry_count": 1 if hidden_stages else 0,
     }

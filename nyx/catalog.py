@@ -1108,6 +1108,24 @@ def _build_catalog(
         if completion_policy_valid and completion_policy_value is not None
         else None
     )
+    # Terminal stages are the literal stages the account marks as "counts as
+    # finished" (the completion policy).  Nyx exposes them to the browser as a
+    # display grouping only: the board keeps finished rows on the page and the
+    # "Hide terminal rows" control decides whether they are shown.
+    #
+    # This is deliberately *not* merged with the hidden-stage policy.  Hiding a
+    # stage is a display choice; marking one finished is a workflow assertion
+    # that satisfies whole-item completion dependencies.  Collapsing the two
+    # would let a purely visual action silently satisfy a dependency, and the
+    # hidden policy is account-wide while the completion policy is saved per
+    # workspace root.  When a stage is both hidden and terminal, hidden keeps
+    # precedence: its entries are not emitted as board rows, and the browser
+    # filters hidden stages before it considers the terminal grouping.
+    #
+    # The completion policy is already canonical (sorted and unique) because it
+    # comes from ``_validate_completed_stage_names``.  An invalid or absent
+    # policy yields no terminal stages rather than surfacing a partial set.
+    terminal_stages = tuple(completion_policy) if completion_policy else ()
     if configuration_revision is not None and not isinstance(configuration_revision, str):
         raise ValueError("configuration revision must be text or null")
     records: list[dict[str, object]] = []
@@ -1327,7 +1345,7 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "catalog_digest": None,
         "configuration_revision": configuration_revision,
         "inventory": {
@@ -1336,6 +1354,7 @@ def _build_catalog(
         },
         "visibility": {
             "hidden_stages": list(policy),
+            "terminal_stages": list(terminal_stages),
             "visible_entry_count": len(board),
             "hidden_entry_count": len(records) - len(board),
         },

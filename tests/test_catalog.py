@@ -26,10 +26,13 @@ COMPLETE_ORACLE_BYTES = '{"catalog_digest":"f1040b4367b54ea507ff91e667a8ca623780
 
 
 def _migrate_oracle(legacy: str) -> str:
-    """Keep the historical graph assertions exact while adding the v5 fields."""
+    """Keep the historical graph assertions exact while adding the v6 fields."""
     value = json.loads(legacy)
-    value["schema_version"] = 5
+    value["schema_version"] = 6
     value["configuration_revision"] = None
+    # The historical fixtures predate the completion policy, so they carry no
+    # terminal-stage grouping.  The digest is recomputed below.
+    value["visibility"]["terminal_stages"] = []
     for entry in value["entries"]:
         for edge in entry["relationship"]["prerequisites"]:
             edge["kind"] = "claim"
@@ -290,7 +293,7 @@ class CatalogTests(TestCase):
             value = json.loads(first)
             self.assertEqual(["Fictional/Queue/zeta", "Fictional/Under_Development/alpha"],
                              [entry["package_path"] for entry in value["entries"]])
-            self.assertEqual(5, value["schema_version"])
+            self.assertEqual(6, value["schema_version"])
             self.assertEqual(
                 {"projects": [{"name": "Fictional", "availability": "complete"}],
                  "stages": [
@@ -300,6 +303,7 @@ class CatalogTests(TestCase):
                 value["inventory"],
             )
             self.assertEqual({"hidden_stages": ["Archive", "Done", "In_Progress"],
+                              "terminal_stages": [],
                               "visible_entry_count": 2, "hidden_entry_count": 0},
                              value["visibility"])
             self.assertEqual("Ω", value["entries"][0]["declared"]["title"])
@@ -601,6 +605,7 @@ class CatalogTests(TestCase):
         mutations = (
             lambda value: value.update(schema_version=3),
             lambda value: value.update(schema_version=4),
+            lambda value: value.update(schema_version=5),
             lambda value: value["inventory"].update(extra=[]),
             lambda value: value["inventory"].update(projects={}),
             lambda value: value["inventory"]["projects"].append(value["inventory"]["projects"][0]),
@@ -873,7 +878,7 @@ class CatalogTests(TestCase):
                     self.assertEqual(16, scans.call_count)
                     renders.append(rendered)
                     value = json.loads(rendered)
-                    self.assertEqual(5, value["schema_version"])
+                    self.assertEqual(6, value["schema_version"])
                     self.assertEqual(4, value["visibility"]["visible_entry_count"])
                     self.assertEqual(3, value["visibility"]["hidden_entry_count"])
                     digest_input = dict(value)
@@ -998,6 +1003,7 @@ class CatalogTests(TestCase):
             )
             self.assertEqual(
                 {"hidden_stages": ["Archive", "Done", "In_Progress"],
+                 "terminal_stages": [],
                  "visible_entry_count": 1, "hidden_entry_count": 2},
                 value["visibility"],
             )
@@ -1054,7 +1060,7 @@ class CatalogTests(TestCase):
 
             value, source_entry_value = source_entry()
             edge = source_entry_value["relationship"]["prerequisites"][0]
-            self.assertEqual(5, value["schema_version"])
+            self.assertEqual(6, value["schema_version"])
             self.assertEqual("revision-1", value["configuration_revision"])
             self.assertEqual(
                 {
@@ -1120,6 +1126,54 @@ class CatalogTests(TestCase):
             with self.assertRaises(ValueError):
                 parse_catalog(malformed)
 
+def test_terminal_stages_track_the_completion_policy_not_the_hidden_policy():
+    """Terminal rows report the finished stages, independent of hidden stages.
+
+    The browser hides finished rows by default, so the catalog must still
+    deliver those entries together with a terminal-stage grouping.  Hiding a
+    stage stays a separate, data-layer concern: it removes entries entirely and
+    must not be conflated with the workflow assertion that a stage counts as
+    finished.
+    """
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        package(root, "Done", "target", "# Done item\n")
+        package(root, "Queue", "source", "# Queue item\n")
+
+        no_policy = json.loads(catalog.scan_catalog(root, hidden_stages=[]))
+        assert no_policy["visibility"] == {
+            "hidden_stages": [],
+            "terminal_stages": [],
+            "visible_entry_count": 2,
+            "hidden_entry_count": 0,
+        }
+
+        finished = json.loads(
+            catalog.scan_catalog(
+                root, hidden_stages=[], completed_stage_names=["Done", "Archive"]
+            )
+        )
+        # The completion policy is reported verbatim, including a stage that is
+        # absent from this workspace, and finishing a stage does not hide it.
+        assert finished["visibility"]["terminal_stages"] == ["Archive", "Done"]
+        assert finished["visibility"]["hidden_stages"] == []
+        done_entries = [entry for entry in finished["entries"] if entry["stage"] == "Done"]
+        assert done_entries and all(entry["board_visible"] for entry in done_entries)
+
+        # Hidden and finished are independent.  A stage can be both, and the
+        # hidden policy still removes its entries from the board, which is why
+        # the browser can never reveal a hidden stage by unchecking the box.
+        overlapping = json.loads(
+            catalog.scan_catalog(root, hidden_stages=["Done"], completed_stage_names=["Done"])
+        )
+        assert overlapping["visibility"]["hidden_stages"] == ["Done"]
+        assert overlapping["visibility"]["terminal_stages"] == ["Done"]
+        assert all(
+            entry["board_visible"] is (entry["stage"] != "Done")
+            for entry in overlapping["entries"]
+        )
+
+
 ORACLE_IDS = [
     "11111111-1111-4111-8111-111111111111",
     "22222222-2222-4222-8222-222222222222",
@@ -1168,7 +1222,7 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         root = make_baseline_graph(Path(temporary))
         rendered = catalog.build_catalog(root)
         value = json.loads(rendered)
-        assert value["schema_version"] == 5
+        assert value["schema_version"] == 6
         assert set(value) == {
             "schema_version", "catalog_digest", "configuration_revision", "visibility", "identity_coverage",
             "program_coverage", "discovery_diagnostics", "entries", "programs", "inventory",

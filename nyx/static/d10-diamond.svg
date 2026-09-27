@@ -1,0 +1,632 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="910"
+   height="920"
+   viewBox="145 135 910 920"
+   version="1.1"
+   id="svg187"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <svg
+     viewBox="-5 20 1075.9004 1110"
+     width="850"
+     height="876.93994"
+     version="1.1"
+     x="175"
+     y="161.53003"
+     id="approved-diamond">
+    <defs
+       id="defs55">
+      <clipPath
+         id="outer-band-only"
+         clipPathUnits="userSpaceOnUse">
+        <path
+           d="M 532.9502,44.550168 18.676736,554.78837 532.9502,1073.0971 1047.2237,554.78837 Z m 0,126.780852 L 145.95694,555.28773 532.9502,945.31754 919.94345,555.28773 Z"
+           clip-rule="evenodd"
+           id="path2" />
+      </clipPath>
+      <mask
+         id="open-routes"
+         maskUnits="userSpaceOnUse"
+         x="0"
+         y="0"
+         width="1065"
+         height="1130">
+        <rect
+           width="1065"
+           height="1130"
+           fill="#ffffff"
+           id="rect5"
+           x="0"
+           y="0" />
+        <g
+           clip-path="url(#outer-band-only)"
+           id="g49">
+          <g
+             id="g47"
+             filter="url(#to-black)">
+            <use
+               xlink:href="#editable-cut-0"
+               id="use6" />
+            <use
+               xlink:href="#editable-cut-5"
+               id="use8" />
+            <use
+               xlink:href="#editable-cut-5-3"
+               id="use10" />
+            <use
+               xlink:href="#editable-cut-6"
+               id="use12" />
+            <use
+               xlink:href="#editable-cut-7"
+               id="use14" />
+            <use
+               xlink:href="#editable-cut-8"
+               id="use16" />
+            <use
+               xlink:href="#editable-cut-9"
+               id="use18" />
+            <use
+               xlink:href="#editable-cut-10"
+               id="use20" />
+            <use
+               xlink:href="#editable-cut-11"
+               id="use22" />
+            <use
+               xlink:href="#editable-cut-12"
+               id="use24" />
+            <use
+               xlink:href="#editable-cut-12-5"
+               id="use26" />
+            <use
+               xlink:href="#editable-cut-13"
+               id="use28" />
+            <use
+               xlink:href="#editable-cut-14"
+               id="use30" />
+            <use
+               xlink:href="#editable-cut-15"
+               id="use32" />
+            <use
+               xlink:href="#editable-cut-16"
+               id="use34" />
+            <use
+               xlink:href="#editable-cut-17"
+               id="use36" />
+            <use
+               xlink:href="#editable-cut-19"
+               id="use38" />
+            <use
+               xlink:href="#editable-cut-19-6"
+               id="use40" />
+            <use
+               xlink:href="#editable-cut-19-6-5"
+               id="use42" />
+            <use
+               xlink:href="#path370-6"
+               id="use44" />
+            <use
+               xlink:href="#path370-7"
+               id="use46" />
+            <use
+               xlink:href="#editable-cut-19-6-3"
+               id="use48" />
+            <use
+               xlink:href="#editable-cut-19-6-56"
+               id="use50" />
+            <use
+               xlink:href="#editable-cut-19-6-2"
+               id="use52" />
+          </g>
+        </g>
+      </mask>
+      <filter
+         id="to-black"
+         x="-0.0044847694"
+         y="-0.0045851562"
+         width="1.0044848"
+         height="1.0045851"
+         color-interpolation-filters="sRGB">
+        <feColorMatrix
+           type="matrix"
+           values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0"
+           id="feColorMatrix52" />
+      </filter>
+      <linearGradient
+         id="mirrored-gold-bronze"
+         gradientUnits="userSpaceOnUse"
+         x1="18.676735"
+         x2="1047.2236"
+         y1="0"
+         y2="0">
+        <stop
+           offset="0%"
+           stop-color="#AD6A05"
+           id="stop59" />
+        <stop
+           offset="12%"
+           stop-color="#AD6A05"
+           id="stop61" />
+        <stop
+           offset="38%"
+           stop-color="#F2C84B"
+           id="stop63" />
+        <stop
+           offset="50%"
+           stop-color="#FBCB50"
+           id="stop65" />
+        <stop
+           offset="62%"
+           stop-color="#F2C84B"
+           id="stop67" />
+        <stop
+           offset="88%"
+           stop-color="#AD6A05"
+           id="stop69" />
+        <stop
+           offset="100%"
+           stop-color="#AD6A05"
+           id="stop71" />
+      </linearGradient>
+      <filter
+         id="downward-shadow"
+         filterUnits="userSpaceOnUse"
+         x="-30"
+         y="0"
+         width="1126"
+         height="1140"
+         color-interpolation-filters="sRGB">
+        <feGaussianBlur
+           in="SourceAlpha"
+           stdDeviation="3.5"
+           result="soft-alpha"
+           id="feGaussianBlur74" />
+        <feOffset
+           in="soft-alpha"
+           dx="0"
+           dy="16"
+           result="below"
+           id="feOffset76" />
+        <feFlood
+           flood-color="#00383B"
+           flood-opacity="0.46"
+           result="shadow-color"
+           id="feFlood78" />
+        <feComposite
+           in="shadow-color"
+           in2="below"
+           operator="in"
+           result="shadow"
+           id="feComposite80" />
+        <feGaussianBlur
+           in="SourceGraphic"
+           stdDeviation=".25"
+           result="soft-gold"
+           id="feGaussianBlur82" />
+        <feGaussianBlur
+           in="SourceAlpha"
+           stdDeviation="2.8"
+           result="bevel-shade-alpha"
+           id="feGaussianBlur84" />
+        <feOffset
+           in="bevel-shade-alpha"
+           dx="0"
+           dy="-4.5"
+           result="bevel-shade-offset"
+           id="feOffset86" />
+        <feComposite
+           in="SourceAlpha"
+           in2="bevel-shade-offset"
+           operator="out"
+           result="bevel-shade-edge"
+           id="feComposite88" />
+        <feFlood
+           flood-color="#69400C"
+           flood-opacity=".46"
+           result="bevel-shade-color"
+           id="feFlood90" />
+        <feComposite
+           in="bevel-shade-color"
+           in2="bevel-shade-edge"
+           operator="in"
+           result="bevel-shade"
+           id="feComposite92" />
+        <feGaussianBlur
+           in="SourceAlpha"
+           stdDeviation="3.0"
+           result="broad-highlight-alpha"
+           id="feGaussianBlur94" />
+        <feOffset
+           in="broad-highlight-alpha"
+           dx="0"
+           dy="4.5"
+           result="broad-highlight-offset"
+           id="feOffset96" />
+        <feComposite
+           in="SourceAlpha"
+           in2="broad-highlight-offset"
+           operator="out"
+           result="broad-highlight-edge"
+           id="feComposite98" />
+        <feFlood
+           flood-color="#FFEAB1"
+           flood-opacity=".48"
+           result="broad-highlight-color"
+           id="feFlood100" />
+        <feComposite
+           in="broad-highlight-color"
+           in2="broad-highlight-edge"
+           operator="in"
+           result="broad-highlight"
+           id="feComposite102" />
+        <feGaussianBlur
+           in="SourceAlpha"
+           stdDeviation=".7"
+           result="rim-highlight-alpha"
+           id="feGaussianBlur104" />
+        <feOffset
+           in="rim-highlight-alpha"
+           dx="0"
+           dy="1.3"
+           result="rim-highlight-offset"
+           id="feOffset106" />
+        <feComposite
+           in="SourceAlpha"
+           in2="rim-highlight-offset"
+           operator="out"
+           result="rim-highlight-edge"
+           id="feComposite108" />
+        <feFlood
+           flood-color="#FFFBEF"
+           flood-opacity=".80"
+           result="rim-highlight-color"
+           id="feFlood110" />
+        <feComposite
+           in="rim-highlight-color"
+           in2="rim-highlight-edge"
+           operator="in"
+           result="rim-highlight"
+           id="feComposite112" />
+        <feMerge
+           id="feMerge124">
+          <feMergeNode
+             in="shadow"
+             id="feMergeNode114" />
+          <feMergeNode
+             in="soft-gold"
+             id="feMergeNode116" />
+          <feMergeNode
+             in="bevel-shade"
+             id="feMergeNode118" />
+          <feMergeNode
+             in="broad-highlight"
+             id="feMergeNode120" />
+          <feMergeNode
+             in="rim-highlight"
+             id="feMergeNode122" />
+        </feMerge>
+      </filter>
+      <linearGradient
+         id="vertical-surface-light"
+         gradientUnits="userSpaceOnUse"
+         x1="0"
+         x2="0"
+         y1="44.550167"
+         y2="1073.097">
+        <stop
+           offset="0%"
+           stop-color="#FFF0BD"
+           stop-opacity=".25"
+           id="stop127" />
+        <stop
+           offset="48%"
+           stop-color="#FFF0BD"
+           stop-opacity="0"
+           id="stop129" />
+        <stop
+           offset="52%"
+           stop-color="#AD5200"
+           stop-opacity="0"
+           id="stop131" />
+        <stop
+           offset="100%"
+           stop-color="#AD5200"
+           stop-opacity=".15"
+           id="stop133" />
+      </linearGradient>
+      <pattern
+         id="lit-gold-surface"
+         patternUnits="userSpaceOnUse"
+         patternContentUnits="userSpaceOnUse"
+         x="-30"
+         y="0"
+         width="1126"
+         height="1140">
+        <rect
+           x="-30"
+           y="0"
+           width="1126"
+           height="1140"
+           fill="url(#mirrored-gold-bronze)"
+           id="rect136" />
+        <rect
+           x="-30"
+           y="0"
+           width="1126"
+           height="1140"
+           fill="url(#vertical-surface-light)"
+           id="rect138" />
+      </pattern>
+      <filter
+         id="circuit-recess-tone"
+         color-interpolation-filters="sRGB"
+         x="-0.0044847694"
+         y="-0.0045851562"
+         width="1.0044848"
+         height="1.0045851">
+        <feColorMatrix
+           type="matrix"
+           values="0 0 0 0 0  0 0 0 0 0.18  0 0 0 0 0.19  0 0 0 0.72 0"
+           id="feColorMatrix103" />
+      </filter>
+      <path
+         id="editable-cut-0"
+         d="m 696.58858,207.12426 v 126.78086 l 7.5,7.44115 V 214.56541 Z"
+         fill="#00baca" />
+      <path
+         id="editable-cut-5"
+         d="m 394.60598,153.60778 v 77.19423 L 290.62425,333.96784 v 25.76574 L 133.6305,515.49548"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-5-3"
+         d="m 727.56507,213.27672 v 106.89085 l 41.55945,41.23335 h 41.02859 l 74.7983,74.2114"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-6"
+         d="m 347.82324,277.21766 -8.25005,8.18532 V 391.30289 L 315.79148,414.898"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-7"
+         d="m 212.07142,437.67004 -45.40761,45.05132 v -39.54461 l 42.18437,-41.85337"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-8"
+         d="m 190.60054,586.04709 v 72.49578 l 106.1742,107.0073 v 20.00055 L 469.3343,959.46427"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-9"
+         d="m 240.15678,708.48795 12.91062,13.01193 H 160.57574 L 101.39343,661.8532"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-10"
+         d="m 363.77397,853.07566 8.55235,8.61945 h 42.40035 l 30.41662,30.65529"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-11"
+         d="M 931.1184,700.09612 H 846.40096 L 740.39299,806.93589 h -27.8471 l -68.04806,68.58199"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-12"
+         d="m 796.75505,750.13158 -8.45364,8.51997 h -98.37163 l -27.20791,27.42139"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-12-5"
+         d="m 925.5568,623.49097 h -38.73531 l -71.29591,71.85533 v 35.86746"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="editable-cut-13"
+         d="m 648.96065,871.02005 -8.46406,8.53047 v 49.66711 l -26.57646,26.78499"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <circle
+         id="editable-cut-14"
+         cx="133.63049"
+         cy="515.49548"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-15"
+         cx="208.84818"
+         cy="401.32339"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-16"
+         cx="469.33429"
+         cy="959.46429"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-17"
+         cx="445.14328"
+         cy="892.3504"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-19"
+         cx="613.9201"
+         cy="956.00262"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-19-6"
+         cx="925.55682"
+         cy="623.49097"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-19-6-5"
+         cx="884.95142"
+         cy="435.6123"
+         r="12"
+         fill="#00baca" />
+      <path
+         id="path370-6"
+         d="m 829.02333,380.12307 v 39.38119 m -101.45826,-135.07514 44.38801,44.03972"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <path
+         id="path370-7"
+         d="M 700.06542,289.72727 658.29179,248.28142 V 212.94951"
+         fill="none"
+         stroke="#00baca"
+         stroke-width="7.5"
+         stroke-linejoin="miter"
+         stroke-linecap="round" />
+      <circle
+         id="editable-cut-19-6-3"
+         cx="829.02332"
+         cy="419.50427"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-19-6-56"
+         cx="771.95306"
+         cy="328.46884"
+         r="12"
+         fill="#00baca" />
+      <circle
+         id="editable-cut-19-6-2"
+         cx="658.29181"
+         cy="212.94951"
+         r="12"
+         fill="#00baca" />
+    </defs>
+    <g
+       id="circuit-recess-shading"
+       clip-path="url(#outer-band-only)">
+      <g
+         filter="url(#circuit-recess-tone)"
+         id="g179">
+        <use
+           xlink:href="#editable-cut-0"
+           id="use131" />
+        <use
+           xlink:href="#editable-cut-5"
+           id="use133" />
+        <use
+           xlink:href="#editable-cut-5-3"
+           id="use135" />
+        <use
+           xlink:href="#editable-cut-6"
+           id="use137" />
+        <use
+           xlink:href="#editable-cut-7"
+           id="use139" />
+        <use
+           xlink:href="#editable-cut-8"
+           id="use141" />
+        <use
+           xlink:href="#editable-cut-9"
+           id="use143" />
+        <use
+           xlink:href="#editable-cut-10"
+           id="use145" />
+        <use
+           xlink:href="#editable-cut-11"
+           id="use147" />
+        <use
+           xlink:href="#editable-cut-12"
+           id="use149" />
+        <use
+           xlink:href="#editable-cut-12-5"
+           id="use151" />
+        <use
+           xlink:href="#editable-cut-13"
+           id="use153" />
+        <use
+           xlink:href="#editable-cut-14"
+           id="use155" />
+        <use
+           xlink:href="#editable-cut-15"
+           id="use157" />
+        <use
+           xlink:href="#editable-cut-16"
+           id="use159" />
+        <use
+           xlink:href="#editable-cut-17"
+           id="use161" />
+        <use
+           xlink:href="#editable-cut-19"
+           id="use163" />
+        <use
+           xlink:href="#editable-cut-19-6"
+           id="use165" />
+        <use
+           xlink:href="#editable-cut-19-6-5"
+           id="use167" />
+        <use
+           xlink:href="#path370-6"
+           id="use169" />
+        <use
+           xlink:href="#path370-7"
+           id="use171" />
+        <use
+           xlink:href="#editable-cut-19-6-3"
+           id="use173" />
+        <use
+           xlink:href="#editable-cut-19-6-56"
+           id="use175" />
+        <use
+           xlink:href="#editable-cut-19-6-2"
+           id="use177" />
+      </g>
+    </g>
+    <g
+       id="shadowed-diamond"
+       filter="url(#downward-shadow)">
+      <path
+         id="polished-diamond"
+         d="M 532.9502,44.550168 18.676736,554.78837 532.9502,1073.0971 1047.2237,554.78837 Z m 0,126.780852 L 375.62393,510.35423 532.9502,611.80517 690.27646,510.35423 Z M 884.05423,519.68011 645.32124,282.82035 745.82573,499.398 Z M 420.57915,282.82035 181.84616,519.68011 320.07466,499.398 Z M 560.4502,917.60176 898.0763,577.32646 726.8639,552.20465 560.4502,659.51558 Z M 339.03649,552.20465 167.82409,577.32646 505.4502,917.60176 V 659.51558 Z"
+         style="opacity:1;fill:url(#lit-gold-surface);fill-rule:evenodd;stroke:none"
+         mask="url(#open-routes)" />
+    </g>
+  </svg>
+</svg>
