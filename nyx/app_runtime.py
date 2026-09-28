@@ -125,6 +125,22 @@ class ApplicationRuntime:
         finally:
             self._settings_release()
 
+    def get_workspace(self) -> dict[str, str]:
+        """Return the active literal workspace path with its configuration revision."""
+
+        self._settings_admit()
+        try:
+            with self._settings_operation_lock:
+                configuration = self._configuration
+                if configuration is None:
+                    raise CatalogError("settings_unavailable")
+                return {
+                    "root": str(configuration.specification_root),
+                    "revision": configuration.revision,
+                }
+        finally:
+            self._settings_release()
+
     def save_settings(
         self, revision: str, order: object, completed: object = state._OMITTED
     ) -> dict[str, object]:

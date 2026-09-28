@@ -663,6 +663,10 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._profile = self._presentation_profile()
             self._board = QtWebEngineWidgets.QWebEngineView(self)
             self._page = QtWebEngineCore.QWebEnginePage(self._profile, self._board)
+            self._page.settings().setAttribute(
+                QtWebEngineCore.QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard,
+                True,
+            )
             self._board.setPage(self._page)
             self._board.loadFinished.connect(self._board_load_finished)
             layout.addWidget(self._board)

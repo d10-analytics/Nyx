@@ -223,6 +223,8 @@ directory.
 Use **Find** to search visible card metadata, including work item titles, projects,
 and program names. Select a card to inspect its recorded values, prerequisites,
 and diagnostics. A hidden prerequisite can still appear in those details.
+Right-click a card to copy the full directory path of its work item. Nyx shows
+a brief confirmation beside the card when the copy succeeds.
 
 Nyx checks for changed information every ten seconds. **Apply update** loads the
 waiting snapshot; **Refresh view** requests an immediate check when no update is

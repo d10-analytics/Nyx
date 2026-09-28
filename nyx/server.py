@@ -25,7 +25,7 @@ _STATIC = {
     "/static/d10-diamond.svg": ("d10-diamond.svg", "image/svg+xml"),
     "/static/Anta-Regular.ttf": ("Anta-Regular.ttf", "font/ttf"),
 }
-_API_ROUTES = frozenset({"/api/catalog", "/api/settings"})
+_API_ROUTES = frozenset({"/api/catalog", "/api/settings", "/api/workspace"})
 _SAFE_ERRORS = frozenset(
     {
         "producer_unavailable",
@@ -142,6 +142,18 @@ def _handler_for(
                 return
             self._send(HTTPStatus.OK, _json_bytes(body), "application/json")
 
+        def _workspace_get(self) -> None:
+            settings = self._settings_provider()
+            if settings is None or not hasattr(settings, "get_workspace"):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            try:
+                body = settings.get_workspace()
+            except CatalogError as error:
+                self._send(HTTPStatus.SERVICE_UNAVAILABLE, _json_bytes({"error": error.code}), "application/json")
+                return
+            self._send(HTTPStatus.OK, _json_bytes(body), "application/json")
+
         def _settings_put(self) -> None:
             settings = self._settings_provider()
             if settings is None or not hasattr(settings, "save_settings"):
@@ -209,6 +221,12 @@ def _handler_for(
                         b"Method not allowed\n",
                         "text/plain; charset=utf-8",
                     )
+                return
+            if self.path == "/api/workspace":
+                if self.command in {"GET", "HEAD"}:
+                    self._workspace_get()
+                else:
+                    self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"Method not allowed\n", "text/plain; charset=utf-8")
                 return
             if self.command not in {"GET", "HEAD"}:
                 self._send(

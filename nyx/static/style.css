@@ -89,6 +89,24 @@ h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: .25rem; font-size: 1.5rem; }
 .toolbar p { margin-bottom: 0; color: var(--toolbar-muted); }
 .controls { display: flex; align-items: center; justify-content: flex-end; gap: .6rem; flex-wrap: wrap; }
+#copy-status {
+  position: fixed;
+  z-index: 50;
+  max-width: calc(100vw - 1rem);
+  width: max-content;
+  margin: 0;
+  padding: .55rem .75rem;
+  border: 2px solid var(--emphasis);
+  border-radius: .45rem;
+  background: var(--surface);
+  color: var(--heading);
+  box-shadow: 0 .4rem 1rem var(--shadow);
+  font-weight: 700;
+  pointer-events: none;
+  visibility: hidden;
+}
+#copy-status.visible { visibility: visible; }
+#copy-status.error { border-color: var(--warning); }
 .compact-controls { display: flex; flex-direction: column; align-items: flex-start; gap: .3rem; }
 .compact-control { display: inline-flex; align-items: center; gap: .35rem; color: var(--toolbar-text); }
 .compact-control input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }

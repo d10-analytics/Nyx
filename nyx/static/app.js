@@ -53,6 +53,7 @@
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
   const SETTINGS_ROUTE = "/api/settings";
+  const WORKSPACE_ROUTE = "/api/workspace";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
   // The terminal-row preference mirrors the compact-view preference: it is a
   // browser-local display choice applied to the catalog already fetched.  It
@@ -70,6 +71,7 @@
   const terminalControl = document.querySelector("#hide-terminal-rows");
   const deselectControl = document.querySelector("#deselect-on-empty-click");
   const refreshButton = document.querySelector("#refresh");
+  const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
@@ -83,6 +85,10 @@
   let busy = false;
   let queued = null;
   let selectedPath = null;
+  let workspace = null;
+  let workspaceRequest = 0;
+  let copyAttempt = 0;
+  let copyStatusTimer = null;
   let railPlan = new Map();
   let railColumns = [];
   let railEdges = [];
@@ -1170,6 +1176,51 @@
     }
     renderBoard();
     renderStageOrderEditor();
+    if (!workspace || workspace.revision !== snapshot.configuration_revision) loadWorkspace();
+  }
+
+  function loadWorkspace() {
+    const serial = ++workspaceRequest;
+    workspace = null;
+    fetch(WORKSPACE_ROUTE, {cache: "no-store"})
+      .then((response) => response.ok ? response.json() : null)
+      .then((value) => {
+        if (serial !== workspaceRequest || !value ||
+          !exactKeys(value, ["root", "revision"]) ||
+          typeof value.root !== "string" || !value.root ||
+          typeof value.revision !== "string" || !value.revision) return;
+        workspace = value;
+      }).catch(() => { /* Copy feedback is shown when requested. */ });
+  }
+
+  function fullDirectoryPath(root, relative) {
+    const windows = /^[A-Za-z]:[\\/]/.test(root) || root.startsWith("\\\\");
+    const separator = windows ? "\\" : "/";
+    return root + (root.endsWith("/") || root.endsWith("\\") ? "" : separator) +
+      (windows ? relative.replaceAll("/", "\\") : relative);
+  }
+
+  function showCopyStatus(message, anchor, isError = false) {
+    if (copyStatusTimer !== null) window.clearTimeout(copyStatusTimer);
+    copyStatus.textContent = message;
+    copyStatus.classList.toggle("error", isError);
+    copyStatus.classList.add("visible");
+    const bubble = copyStatus.getBoundingClientRect();
+    const margin = 8;
+    const gap = 10;
+    const right = anchor.right + gap;
+    const left = anchor.left - bubble.width - gap;
+    const x = right + bubble.width <= window.innerWidth - margin ? right
+      : left >= margin ? left
+        : Math.max(margin, Math.min(anchor.left, window.innerWidth - bubble.width - margin));
+    const y = Math.max(margin, Math.min(anchor.top + margin,
+      window.innerHeight - bubble.height - margin));
+    copyStatus.style.left = `${x}px`;
+    copyStatus.style.top = `${y}px`;
+    copyStatusTimer = window.setTimeout(() => {
+      copyStatus.classList.remove("visible");
+      copyStatusTimer = null;
+    }, isError ? 4000 : 2000);
   }
 
   function readCompactPreference() {
@@ -1318,6 +1369,34 @@
     const card = event.target.closest("[data-package-path]");
     if (card) select(card.dataset.packagePath);
     else if (deselectOnEmptyClick && selectedPath && !event.target.closest(".board-issues")) select(null);
+  });
+  board.addEventListener("contextmenu", (event) => {
+    const card = event.target.closest(".card[data-package-path]");
+    if (!card) return;
+    event.preventDefault();
+    const attempt = ++copyAttempt;
+    const anchor = card.getBoundingClientRect();
+    if (copyStatusTimer !== null) window.clearTimeout(copyStatusTimer);
+    copyStatusTimer = null;
+    copyStatus.classList.remove("visible");
+    copyStatus.textContent = "";
+    if (!displayed || !workspace ||
+      workspace.revision !== displayed.configuration_revision) {
+      showCopyStatus("Full directory path is unavailable. Refresh the view and try again.", anchor, true);
+      return;
+    }
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      showCopyStatus("Clipboard access is unavailable in this browser.", anchor, true);
+      return;
+    }
+    const path = fullDirectoryPath(workspace.root, card.dataset.packagePath);
+    navigator.clipboard.writeText(path).then(() => {
+      if (attempt === copyAttempt) showCopyStatus("Full directory path copied.", anchor);
+    }).catch(() => {
+      if (attempt === copyAttempt) {
+        showCopyStatus("Clipboard access was denied; directory path was not copied.", anchor, true);
+      }
+    });
   });
   refreshButton.addEventListener("click", () => {
     if (pending) apply(pending);
