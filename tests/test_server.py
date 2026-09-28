@@ -688,7 +688,7 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                 assert status == 200
                 assert content_type == "application/json"
                 assert json.loads(body) == {
-                    "root": str(specification_root),
+                    "root": str(initial.specification_root),
                     "revision": initial.revision,
                 }
 
