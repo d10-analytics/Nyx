@@ -190,9 +190,16 @@ class _WebEngineProfile:
 class _WebEnginePage:
     def __init__(self, profile=None, parent=None):
         self._profile = profile
+        self._settings = SimpleNamespace(attributes=[])
+        self._settings.setAttribute = lambda attribute, enabled: self._settings.attributes.append(
+            (attribute, enabled)
+        )
 
     def profile(self):
         return self._profile
+
+    def settings(self):
+        return self._settings
 
     def runJavaScript(self, script, callback=None, *_):
         if callback is not None:
@@ -235,6 +242,7 @@ def _fake_qt():
         "QtWebEngineCore": SimpleNamespace(
             QWebEnginePage=_WebEnginePage,
             QWebEngineProfile=_WebEngineProfile,
+            QWebEngineSettings=SimpleNamespace(WebAttribute=SimpleNamespace(JavascriptCanAccessClipboard=3)),
         ),
         "QtWebEngineWidgets": SimpleNamespace(QWebEngineView=_WebEngineView),
     }
@@ -358,6 +366,7 @@ class WebProfile:
     def setCachePath(self, value): pass
 class WebPage:
     def __init__(self, *args): pass
+    def settings(self): return SimpleNamespace(setAttribute=lambda *args: None)
 class WebView(Widget):
     def __init__(self, *args): super().__init__(*args); self.loadFinished = Signal()
     def setPage(self, value): pass
@@ -375,7 +384,8 @@ widgets = SimpleNamespace(
     QPushButton=Button, QVBoxLayout=Layout, QWidget=Widget,
 )
 web_widgets = SimpleNamespace(QWebEngineView=WebView)
-web_core = SimpleNamespace(QWebEnginePage=WebPage, QWebEngineProfile=WebProfile)
+web_core = SimpleNamespace(QWebEnginePage=WebPage, QWebEngineProfile=WebProfile,
+                           QWebEngineSettings=SimpleNamespace(WebAttribute=SimpleNamespace(JavascriptCanAccessClipboard=3)))
 desktop._load_qt = lambda: {
     "QtCore": SimpleNamespace(QUrl=lambda value: value),
     "QtWidgets": widgets,
@@ -563,6 +573,7 @@ def test_first_launch_save_starts_admitted_runtime_and_opens_board():
         ):
             session = desktop.DesktopSession()
             window = desktop._build_window(_fake_qt(), session)
+            assert window._page.settings().attributes == [(3, True)]
 
             window._root.setText(str(workspace))
             window._save.click()

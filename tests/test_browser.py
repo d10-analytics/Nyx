@@ -527,10 +527,11 @@ class BlockingRawSequenceClient(RawSequenceClient):
 class BrowserSettings:
     """Small application-settings seam used by the browser behavior tests."""
 
-    def __init__(self, order=(), completed=(), revision="revision-1"):
+    def __init__(self, order=(), completed=(), revision="revision-1", root=None):
         self.order = list(order)
         self.completed = list(completed)
         self.revision = revision
+        self.root = root
         self.calls = []
         self.get_calls = 0
         self.fail_next = False
@@ -542,6 +543,11 @@ class BrowserSettings:
             self.fail_next_load = False
             raise CatalogError("producer_unavailable")
         return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision}
+
+    def get_workspace(self):
+        if self.root is None:
+            raise CatalogError("settings_unavailable")
+        return {"root": str(self.root), "revision": self.revision}
 
     def save_settings(self, revision, order, completed):
         self.calls.append((revision, list(order), list(completed)))
@@ -588,6 +594,7 @@ def open_page():
                     ),
                 )
                 application.get_settings = settings.get_settings
+                application.get_workspace = settings.get_workspace
                 application.save_settings = settings.save_settings
                 client.settings = settings
                 application.start(static_ready=lambda: True)
@@ -653,6 +660,59 @@ def dependency_state_payload(state, *, titles=None):
     gate["relationship"]["direct_prerequisite_state"] = state
     _reseal(value)
     return value
+
+
+def test_card_right_click_copies_full_directory_without_changing_selection(open_page, tmp_path):
+    root = tmp_path / "spec workspace"
+    settings = BrowserSettings(root=root)
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    page.wait_for_load_state("networkidle")
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    relative = card.get_attribute("data-package-path")
+    assert relative
+    card.click(button="right")
+    playwright.expect(page.locator("#copy-status")).to_have_text("Full directory path copied.")
+    playwright.expect(page.locator("#copy-status")).to_be_visible()
+    card_box = card.bounding_box()
+    popup_box = page.locator("#copy-status").bounding_box()
+    assert card_box and popup_box
+    assert 8 <= popup_box["x"] - (card_box["x"] + card_box["width"]) <= 12
+    assert popup_box["x"] + popup_box["width"] <= page.viewport_size["width"]
+    assert popup_box["y"] + popup_box["height"] <= page.viewport_size["height"]
+    assert page.evaluate("navigator.clipboard.readText()") == str(root / relative)
+    assert card.get_attribute("aria-pressed") == "false"
+    playwright.expect(page.locator("#copy-status")).to_be_hidden(timeout=3500)
+    page.set_viewport_size({"width": 480, "height": 320})
+    card.click(button="right")
+    playwright.expect(page.locator("#copy-status")).to_be_visible()
+    popup_box = page.locator("#copy-status").bounding_box()
+    assert popup_box
+    assert popup_box["x"] >= 0 and popup_box["y"] >= 0
+    assert popup_box["x"] + popup_box["width"] <= 480
+    assert popup_box["y"] + popup_box["height"] <= 320
+    card.click()
+    assert card.get_attribute("aria-pressed") == "true"
+
+
+def test_card_copy_failure_shows_error_beside_card(open_page, tmp_path):
+    page = open_page(
+        StaticClient(board_payload()),
+        settings=BrowserSettings(root=tmp_path),
+        init_script="""Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: {writeText: () => Promise.reject(new Error('denied'))}
+        });""",
+    )
+    page.wait_for_load_state("networkidle")
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    card.click(button="right")
+    popup = page.locator("#copy-status")
+    playwright.expect(popup).to_be_visible()
+    playwright.expect(popup).to_have_class(re.compile(r"\berror\b"))
+    playwright.expect(popup).to_have_text(
+        "Clipboard access was denied; directory path was not copied."
+    )
 
 
 def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_targets(open_page):

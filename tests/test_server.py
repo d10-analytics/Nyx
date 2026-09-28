@@ -684,6 +684,14 @@ def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_pre
                 }
                 assert str(specification_root) not in body.decode("utf-8")
 
+                status, content_type, body = request(port, "GET", "/api/workspace")
+                assert status == 200
+                assert content_type == "application/json"
+                assert json.loads(body) == {
+                    "root": str(specification_root),
+                    "revision": initial.revision,
+                }
+
                 status, _, body = request(
                     port,
                     "PUT",
