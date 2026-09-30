@@ -228,19 +228,38 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 The checked-in images use only the complete fictional community-event fixture
 listed in the [workspace guide](workspaces.md): four `spec.md` work items
 (Queue/festival, Done/permit, Needs_Fixes/cleanup, and
-Under_Development/event-site), two `.gitkeep` empty dimensions, and one
-malformed `Reference/Programs/.../program.md` that naturally produces the
-`invalid_package` workspace issue. Create that disposable workspace outside the
-repository, configure it with `nyx --setup <fixture-root>`, and start Nyx through
+Under_Development/event-site), and two `.gitkeep` empty dimensions. Create that
+disposable workspace outside the repository, configure it with
+`nyx --setup <fixture-root>`, and start Nyx through
 its normal local server and scanner. Do not use a private workspace for a public
 example.
+
+Use an isolated temporary account home outside the repository for every fixture
+setup, start, status, and stop command and the browser session. Stop the owner's
+Nyx instance first, record the SHA-256 of the owner's `.nyx/config/config.json`,
+and verify that `/api/workspace` reports the fixture root before saving Board
+settings. After visual acceptance, stop the isolated
+instance, remove its temporary home, and confirm the owner's configuration hash
+is unchanged.
 
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
 fresh browser context so the compact preference starts checked. Before saving the
 first image, open **Board settings**, use **Board row order** to move **Queue**
 above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
-**Hide terminal rows** checked for all three images:
+**Hide terminal rows** checked for all three images.
+
+Before each capture, inspect the live `/api/catalog` response: every diagnostic
+array must be empty, including discovery, coverage, item, transitive, and nested
+relationship, claim, and program diagnostics. Both identity and program coverage
+must be complete, and `programs` must be empty. Confirm exactly the four work
+items remain in the catalog, each with `state` complete, and every project and
+stage inventory availability is complete, including the empty `Planning` stage
+and `Community_Resources` project. Confirm the festival's completion prerequisite still targets the
+permit, observes `Done`, and resolves as satisfied with reason
+`completion_satisfied`. In the actual browser, verify there is no workspace or
+refresh issues panel (`#board-issues` must be absent, not merely collapsed or
+hidden). Keep **Board settings** closed in every image.
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -248,20 +267,23 @@ above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
    selected festival card with the keyboard and press **Enter** twice: the first
    press deselects it and the second reselects it. Save this compact view as
    `docs/images/sample-board-compact.png`.
-3. Uncheck **Hide empty rows and columns**. Then focus the **Workspace issues**
-   summary and press **Enter**. Save this
+3. Uncheck **Hide empty rows and columns** to reveal the empty `Planning` row
+   and `Community_Resources` column. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 
-The first image is light with the saved row order, issue summary, and selected festival
-card. The second is dark with compact view checked and the selected card
-showing its filepath. The third remains dark, unchecks compact
-view, and opens Workspace issues by keyboard so the empty Planning row and
-Community_Resources column are visible.
+The first image is light with the saved row order and selected festival card
+showing its filepath. The second is dark with compact view checked and the same
+selected card and filepath. Both omit the empty dimensions. The third remains
+dark with the same selected card and filepath,
+unchecks compact view, and shows the empty Planning row and Community_Resources
+column. All three omit the finished Done row and permit card and have no issues
+panel.
 
 Review each file directly beside the running browser in both themes. Confirm
-that the selected card, package path, empty dimensions, workspace issue,
-disclosure states, labels, and controls match the
-browser. Reject a capture if it contains a private path or value, was drawn by
+that the selected card, package path, empty dimensions, saved row order, labels,
+controls, and absence of workspace or refresh issues match the browser.
+Reject a capture if the catalog is incomplete, any diagnostic or issues panel
+is present, it contains a private path or value, was drawn by
 hand, or no longer shows the named state. This procedure is intentionally a
 repeatable browser session; it does not add a permanent screenshot framework.
 

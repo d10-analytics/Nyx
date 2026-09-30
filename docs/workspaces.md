@@ -29,7 +29,6 @@ community-planning/
 │   ├── Needs_Fixes/cleanup/spec.md
 │   ├── Planning/.gitkeep
 │   ├── Queue/festival/spec.md
-│   ├── Reference/Programs/123e4567-e89b-42d3-a456-426614174101/program.md
 │   └── Under_Development/event-site/spec.md
 └── Community_Resources/.gitkeep
 ```
@@ -79,21 +78,17 @@ Status: needs-fixes
 ```
 
 The empty `Planning` stage and `Community_Resources` project each contain only
-`.gitkeep`. To make the captured **Workspace issues** disclosure deterministic,
-the fixture also contains the valid-UUID directory
-`Community_Event/Reference/Programs/123e4567-e89b-42d3-a456-426614174101/`
-with this intentionally malformed `program.md`:
-
-```text
-# This extra line makes the fictional descriptor invalid
-```
-
-The normal scanner reports that descriptor as `invalid_package` while retaining
-the four work items and resolving the permit item. Configure the fixture
+`.gitkeep`. These four work items and two empty dimensions are the entire
+disposable fixture. The normal scanner must retain all four work items, resolve
+the permit item, and report zero diagnostics with complete identity and program
+coverage and complete project and stage inventory. Configure the fixture
 with `nyx --setup <fixture-root>` and start the normal local server and scanner.
 In **Board settings**, check **Counts as finished** beside `Done` and choose
 **Save**; keep **Hide terminal rows** checked for every capture, as described in
 the [capture procedure](running-nyx.md#capture-and-review-the-fictional-example).
+Before each capture, verify the live catalog is complete and diagnostic-free
+and the browser has no workspace or refresh issues panel. The expanded view
+reveals the empty `Planning` row and `Community_Resources` column.
 The interface calls each
 specification a **work item** and displays its directory stage as a board row;
 the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
@@ -283,5 +278,5 @@ and stages, then use the [specification reference](specification-reference.md)
 when those relationships help you track the work.
 
 The [running guide](running-nyx.md) describes the fictional event captures in
-light and dark themes, including compact view, finished-row filtering, and
-keyboard-opened disclosures.
+light and dark themes, including compact view, finished-row filtering, keyboard
+card selection, and expanded empty dimensions.
