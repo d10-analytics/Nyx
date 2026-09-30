@@ -57,10 +57,8 @@
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
   // The terminal-row preference mirrors the compact-view preference: it is a
   // browser-local display choice applied to the catalog already fetched.  It
-  // never changes setup, the workspace, or the catalog, and it is unrelated to
-  // the account's hidden-stage policy, which removes a row from the board
-  // before the browser ever sees it.  A finished stage that is also configured
-  // hidden therefore stays hidden even when this box is unchecked.
+  // never changes setup, the workspace, or the catalog.  Unchecking the box
+  // makes finished stages eligible for display again.
   const TERMINAL_STORAGE_KEY = "spec-tracker-hide-terminal-rows";
   const DESELECT_STORAGE_KEY = "spec-tracker-deselect-on-empty-click";
 
@@ -236,10 +234,6 @@
     return byId.get(edge.target_package_id) || null;
   }
 
-  function rowKeyOf(entry) {
-    return entry.board_visible ? rowDataKeyOf(entry.stage) : null;
-  }
-
   function stageKeyOf(stage) {
     return stage;
   }
@@ -250,19 +244,6 @@
 
   function stageLabelOf(stage) {
     return BOARD_LABELS.get(BOARD_STAGES.get(stage)) || stage;
-  }
-
-  function canonicalStageNames(snapshot = displayed) {
-    if (!snapshot) return [];
-    const hidden = new Set(snapshot.visibility.hidden_stages || []);
-    const names = [];
-    const seen = new Set();
-    (snapshot.inventory.stages || []).forEach((record) => {
-      if (hidden.has(record.stage) || seen.has(record.stage)) return;
-      seen.add(record.stage);
-      names.push(record.stage);
-    });
-    return names;
   }
 
   function inventoryStageNames(snapshot = displayed) {
@@ -278,7 +259,7 @@
   }
 
   function projectedStageNames(snapshot = displayed) {
-    const eligible = canonicalStageNames(snapshot);
+    const eligible = inventoryStageNames(snapshot);
     const available = new Set(eligible);
     const result = [];
     const seen = new Set();
@@ -361,7 +342,7 @@
         edges.push({
           source: source.package_id, dependent: entry.package_id,
           sourceColumn: columnKeyOf(source), dependentColumn: columnKeyOf(entry),
-          row: rowKeyOf(source),
+          row: rowDataKeyOf(source.stage),
         });
       });
     });
@@ -395,7 +376,7 @@
     const parts = prerequisiteTargets(entry).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
       if (!target) {
-        // A valid edge may point to a hidden context entry. It is intentionally
+        // A valid edge may point to a target in a gated finished row. It is
         // absent from the interactive index, but it is not an unresolved target.
         if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
         return '<span class="link unresolved">unresolved target</span>';
@@ -448,28 +429,22 @@
   // Finished ("terminal") stages the reader has chosen to hide right now.  The
   // set is recomputed on every render because the completion policy can change
   // when Board settings are saved.  When the box is unchecked the set is empty,
-  // so finished rows are treated like any other row.  Hidden stages are not
-  // removed here; callers apply the hidden policy first, which keeps hidden
-  // stages un-revealable even when a hidden stage is also marked finished.
+  // so finished rows are treated like any other row.
   function gatedTerminalStages() {
     if (!hideTerminalRows) return new Set();
-    return new Set(displayed?.visibility.terminal_stages || []);
+    return new Set(displayed?.terminal_stages || []);
   }
 
   function inventoryAxes(entries) {
-    const hiddenStages = new Set(displayed?.visibility.hidden_stages || []);
     // Terminal gating is purely a browser display choice: it removes finished
     // rows from this render and touches neither the catalog nor the saved
-    // policy.  It is deliberately separate from the hidden-stage policy, which
-    // removes a row entirely; see the note on ``terminal_stages`` in the
-    // catalog builder for why the two concepts are not merged.
+    // completion policy.  Unchecking the control restores those rows.
     const gatedStages = gatedTerminalStages();
     const inventory = displayed?.inventory || { projects: [], stages: [] };
     const eligibleStages = [];
     const stages = [];
     const stageByKey = new Map();
     inventory.stages.forEach((record) => {
-      if (hiddenStages.has(record.stage)) return;
       const key = stageKeyOf(record.stage);
       let dimension = stageByKey.get(key);
       if (!dimension) {
@@ -494,10 +469,8 @@
     const projects = [];
     inventory.projects.forEach((record) => {
       const projectStages = inventory.stages.filter((stage) => stage.project === record.name);
-      const hasStage = projectStages.some((stage) => !hiddenStages.has(stage.stage));
       const incompleteStage = projectStages.some((stage) =>
-        !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
-      if (projectStages.length && !hasStage) return;
+        stage.availability === "incomplete");
       const dimension = {
         key: record.name,
         project: record.name,
@@ -572,7 +545,6 @@
     if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
       return '<p class="empty board-empty">No work items in the catalog.</p>';
     }
-    const hiddenStages = new Set(displayed.visibility.hidden_stages || []);
     // The reader hid finished rows and those were the only admissible rows, so
     // name that cause before the generic empty-board explanations below.
     if (axes.terminalHidden) {
@@ -581,7 +553,7 @@
     }
     const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
       displayed.inventory.stages.some((stage) =>
-        !hiddenStages.has(stage.stage) && stage.availability === "incomplete");
+        stage.availability === "incomplete");
     if (incomplete && !axes.stages.length) {
       return '<p class="empty board-empty incomplete-empty">Discovery is incomplete; unavailable dimensions remain hidden until they can be confirmed.</p>';
     }
@@ -606,7 +578,7 @@
     // depths treat them as absent, exactly like an entry outside the board.
     const gatedStages = gatedTerminalStages();
     const entries = displayed
-      ? displayed.entries.filter((entry) => entry.board_visible && !gatedStages.has(entry.stage))
+      ? displayed.entries.filter((entry) => !gatedStages.has(entry.stage))
       : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
@@ -931,8 +903,8 @@
 
   function validateSnapshot(snapshot) {
     const top = ["catalog_digest", "configuration_revision", "discovery_diagnostics", "entries", "identity_coverage",
-      "inventory", "program_coverage", "programs", "schema_version", "visibility"];
-    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 6 &&
+      "inventory", "program_coverage", "programs", "schema_version", "terminal_stages"];
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 7 &&
       /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
       Array.isArray(snapshot.programs));
     protocol(snapshot.configuration_revision === null || safeText(snapshot.configuration_revision));
@@ -959,23 +931,12 @@
       scalarCompare(stage.project, snapshot.inventory.stages[index - 1].project) > 0 ||
       (stage.project === snapshot.inventory.stages[index - 1].project &&
         scalarCompare(stage.stage, snapshot.inventory.stages[index - 1].stage) > 0)));
-    if (!exactKeys(snapshot.visibility, ["hidden_stages", "terminal_stages",
-      "visible_entry_count", "hidden_entry_count"]) ||
-        !Array.isArray(snapshot.visibility.hidden_stages) ||
-        !Array.isArray(snapshot.visibility.terminal_stages) ||
-        !Number.isInteger(snapshot.visibility.visible_entry_count) || snapshot.visibility.visible_entry_count < 0 ||
-        !Number.isInteger(snapshot.visibility.hidden_entry_count) || snapshot.visibility.hidden_entry_count < 0) {
-      throw new Error("producer_protocol_error");
-    }
-    snapshot.visibility.hidden_stages.forEach((stage) => protocol(component(stage)));
-    protocol(snapshot.visibility.hidden_stages.every((stage, index) =>
-      index === 0 || scalarCompare(stage, snapshot.visibility.hidden_stages[index - 1]) > 0));
+    protocol(Array.isArray(snapshot.terminal_stages));
     // Terminal stages are the account's completion policy, carried for the
-    // "Hide terminal rows" grouping.  Overlap with hidden_stages is legal: the
-    // hidden policy is applied first, so a stage that is both stays hidden.
-    snapshot.visibility.terminal_stages.forEach((stage) => protocol(component(stage)));
-    protocol(snapshot.visibility.terminal_stages.every((stage, index) =>
-      index === 0 || scalarCompare(stage, snapshot.visibility.terminal_stages[index - 1]) > 0));
+    // reversible "Hide terminal rows" grouping.
+    snapshot.terminal_stages.forEach((stage) => protocol(component(stage)));
+    protocol(snapshot.terminal_stages.every((stage, index) =>
+      index === 0 || scalarCompare(stage, snapshot.terminal_stages[index - 1]) > 0));
     diagnostics(snapshot.discovery_diagnostics);
     [snapshot.identity_coverage, snapshot.program_coverage].forEach((coverage) => {
       protocol(exactKeys(coverage, ["diagnostics", "state"]) && ["complete", "incomplete"].includes(coverage.state));
@@ -989,11 +950,9 @@
       program.member_package_ids.forEach((member) => uuid(member));
       diagnostics(program.diagnostics);
     });
-    const hidden = new Set(snapshot.visibility.hidden_stages);
-    let visible = 0;
     const paths = [];
     snapshot.entries.forEach((entry) => {
-      protocol(exactKeys(entry, ["board_visible", "declared", "diagnostics", "package_id", "package_path",
+      protocol(exactKeys(entry, ["declared", "diagnostics", "package_id", "package_path",
         "project", "relationship", "stage", "state", "transitive_diagnostics"]));
       uuid(entry.package_id, true);
       protocol(component(entry.project) && component(entry.stage) &&
@@ -1002,7 +961,6 @@
           entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
         (entry.package_path === `${entry.project}/${entry.stage}` ||
           entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)) &&
-        typeof entry.board_visible === "boolean" && entry.board_visible === !hidden.has(entry.stage) &&
         ["complete", "partial"].includes(entry.state));
       protocol(exactKeys(entry.declared, ["closure", "human_sanity_decision", "sanity_recommendation",
         "status", "target_project", "title"]));
@@ -1011,15 +969,10 @@
       relationship(entry.relationship);
       protocol(Array.isArray(entry.transitive_diagnostics) && entry.transitive_diagnostics.length === 0);
       paths.push(entry.package_path);
-      if (entry.board_visible) visible += 1;
     });
     protocol(paths.every((path, index) => index === 0 ||
       scalarCompare(path, paths[index - 1]) >= 0) &&
       new Set(paths).size === paths.length);
-    if (visible !== snapshot.visibility.visible_entry_count ||
-        snapshot.visibility.hidden_entry_count < snapshot.entries.length - visible) {
-      throw new Error("producer_protocol_error");
-    }
     return authenticate(snapshot);
   }
 
@@ -1171,7 +1124,7 @@
     ])];
     if (!retainDraft) editorCompletedStages = [...savedCompletedStages];
     if (selectedPath && !snapshot.entries.some((entry) =>
-      entry.board_visible && entry.package_path === selectedPath)) {
+      entry.package_path === selectedPath)) {
       selectedPath = null;
     }
     renderBoard();
