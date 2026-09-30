@@ -40,8 +40,9 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 ```
 
 The providing item records those outcomes with separate `Claim` rows. The file
-syntax remains unchanged while the board shows dependency status and links on
-cards. A configured-hidden provider does not appear as a card.
+syntax remains unchanged while the board shows prerequisite and dependent links
+on cards. A provider in a finished row appears when **Hide terminal rows** is
+unchecked.
 
 Nyx also reads `Closure`, `Sanity Recommendation`, and `Human Sanity Decision`
 as reported text. These fields are optional; they do not trigger actions.
@@ -127,18 +128,18 @@ does not satisfy its claims automatically.
 
 The completion policy is configured in the collapsed **Board settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
-canonical workspace root and can include hidden or temporarily absent names.
+canonical workspace root and can include temporarily absent names.
 Without a configured policy, a completion dependency is **unknown** with an
-actionable configuration explanation. Row order, hidden status, stage spelling,
+actionable configuration explanation. Row order, stage spelling,
 `Cancelled`, and `Archive` do not infer completion. A completed stage is a
 recorded workflow assertion rather than evidence verification.
 
 The selected finished stages also group terminal rows on the board. The **Hide
 terminal rows** control starts checked, so finished rows are hidden until the
 reader reveals them, and the preference belongs to the browser. It changes
-presentation only. It is separate from stage hiding, which removes rows from the
-catalog entirely; a stage that is both hidden and finished cannot be revealed by
-that control.
+presentation only: every discovered stage remains in the catalog, and unchecking
+the control reveals finished rows without changing dependency results. This is
+the only control that hides populated stage rows.
 
 ## Programs
 
@@ -163,16 +164,16 @@ Program Membership: 99999999-9999-4999-8999-999999999999
 
 Use a fresh UUID for your own program and match it in the directory name,
 descriptor, and membership fields. Membership comes from the work items; a separate
-member list is not needed. The browser shows resolved program membership in card
-details and includes the program title in search. Board columns remain projects.
+member list is not needed. The browser includes the resolved program title in
+search. Board columns remain projects.
 
 ## Diagnostics
 
 Diagnostics identify problems reading or interpreting the workspace, such as
 unreadable files, duplicate IDs, invalid fields, or unresolved references.
 Inspect the affected specification and its prerequisites rather than inferring
-completion from an incomplete view. A prerequisite hidden from the board by
-stage policy can still be included as context in a visible dependent's details.
+completion from an incomplete view. Uncheck **Hide terminal rows** to show
+providers in finished rows and their connections to dependent cards.
 
 Discovery diagnostics also distinguish a safely identified but incomplete
 project or stage from a confirmed empty one. Inspect the affected directory and
