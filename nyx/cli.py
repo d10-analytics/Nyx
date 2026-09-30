@@ -27,9 +27,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands.add_argument("--stop", action="store_true")
     commands.add_argument("--status", action="store_true")
-    policy = parser.add_mutually_exclusive_group()
-    policy.add_argument("--hide-stage", action="append", metavar="NAME")
-    policy.add_argument("--show-all-stages", action="store_true")
     return parser
 
 
@@ -49,10 +46,6 @@ def _retired_arguments(args: argparse.Namespace) -> list[str]:
         retired.append("--stop")
     if args.status:
         retired.append("--status")
-    if args.hide_stage is not None:
-        retired.append("--hide-stage")
-    if args.show_all_stages:
-        retired.append("--show-all-stages")
     return retired
 
 
@@ -78,25 +71,21 @@ def _status_snapshot() -> int:
     configuration_status = configuration.status
     if configuration_status == "configured":
         root = configuration.specification_root
-        hidden_stages = configuration.hidden_stages
         configuration_lines = [
             "Configuration: configured",
             f"Workspace: {_json_literal(str(root))}",
-            "Hidden stages: " + _json_literal(list(hidden_stages or ())),
         ]
         configuration_diagnostic = None
     elif configuration_status == "not_configured":
         configuration_lines = [
             "Configuration: not configured",
             "Workspace: not configured",
-            "Hidden stages: not configured",
         ]
         configuration_diagnostic = None
     else:
         configuration_lines = [
             "Configuration: unavailable",
             "Workspace: unavailable",
-            "Hidden stages: unavailable",
         ]
         configuration_diagnostic = "configuration unavailable"
 
@@ -142,18 +131,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"nyx: {_DESKTOP_LIFECYCLE_REFUSAL}", file=sys.stderr)
             return 2
         return _launch_desktop()
-    if (args.hide_stage is not None or args.show_all_stages) and args.setup is None:
-        _parser().error("--hide-stage and --show-all-stages require --setup")
     try:
         if args.status:
             return _status_snapshot()
         if args.setup is not None:
-            if args.hide_stage is not None:
-                configuration = runtime.setup(args.setup, hidden_stages=args.hide_stage)
-            elif args.show_all_stages:
-                configuration = runtime.setup(args.setup, hidden_stages=())
-            else:
-                configuration = runtime.setup(args.setup)
+            configuration = runtime.setup(args.setup)
             print(f"configured {configuration.specification_root}")
         elif args.stop:
             print(runtime.stop())
