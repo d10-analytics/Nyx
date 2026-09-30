@@ -2939,6 +2939,8 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
 def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_page, mutate):
     valid = json.loads(lifecycle_payload())
     invalid = json.loads(lifecycle_payload())
+    for entry in invalid["entries"]:
+        entry["declared"]["title"] = "Rejected refresh content"
     mutate(invalid)
     invalid["catalog_digest"] = canonical_digest(invalid)
 
@@ -2955,6 +2957,12 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
         )
 
     assert page.locator("#board .card").count() == 7
+    assert page.locator(".row-head").all_text_contents() == [
+        label for _stage, _lifecycle, label, _title in sorted(STAGE_ROWS)
+    ]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
+    ) == [[stage, title] for stage, _lifecycle, _label, title in sorted(STAGE_ROWS)]
     assert page.locator("#refresh").inner_text() == "Refresh view"
 
 
