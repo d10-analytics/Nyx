@@ -287,7 +287,6 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
         assert running.stdout.splitlines() == [
             "Configuration: configured",
             f'Workspace: {json.dumps(str(specification_root.resolve()))}',
-            "Hidden stages: []",
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',
         ]
@@ -319,7 +318,6 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
         assert after_stop.stdout.splitlines() == [
             "Configuration: configured",
             f'Workspace: {json.dumps(str(specification_root.resolve()))}',
-            "Hidden stages: []",
             "Runtime: not running",
         ]
         rejection = subprocess.run(
@@ -335,18 +333,13 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     from nyx.server import create_server
 
                     baseline = {
-                        "schema_version": 6,
+                        "schema_version": 7,
                         "configuration_revision": None,
                         "inventory": {
                             "projects": [{"name": "Fictional", "availability": "complete"}],
                             "stages": [],
                         },
-                        "visibility": {
-                            "hidden_stages": [],
-                            "terminal_stages": [],
-                            "visible_entry_count": 0,
-                            "hidden_entry_count": 0,
-                        },
+                        "terminal_stages": [],
                         "identity_coverage": {"state": "complete", "diagnostics": []},
                         "program_coverage": {"state": "complete", "diagnostics": []},
                         "discovery_diagnostics": [],
@@ -417,7 +410,6 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "package_path": "Fictional/Queue/installed-demo",
                     "project": "Fictional",
                     "stage": "Queue",
-                    "board_visible": True,
                     "state": "complete",
                     "declared": {
                         "title": "Installed catalog entry",
@@ -448,7 +440,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "transitive_diagnostics": [],
                 }
                 catalog = {
-                    "schema_version": 6,
+                    "schema_version": 7,
                     "configuration_revision": None,
                     "inventory": {
                         "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -461,9 +453,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                             },
                         ],
                     },
-                    "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
-                                    "terminal_stages": [],
-                                    "visible_entry_count": 1, "hidden_entry_count": 0},
+                    "terminal_stages": [],
                     "identity_coverage": {"state": "complete", "diagnostics": []},
                     "program_coverage": {"state": "complete", "diagnostics": []},
                     "discovery_diagnostics": [],
@@ -619,7 +609,6 @@ def test_installed_wheel_desktop_console_refuses_lifecycle_and_routes_to_the_app
             ["--setup", str(specification_root)],
             ["--status"],
             ["--stop"],
-            ["--setup", str(specification_root), "--show-all-stages"],
         ):
             completed = _run_installed_console(console, arguments, root=root, home=home)
             assert completed.returncode == 2, (arguments, completed.stderr)

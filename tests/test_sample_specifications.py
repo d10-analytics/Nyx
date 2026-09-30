@@ -21,11 +21,11 @@ def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, obj
     return next(entry for entry in entries if entry["package_path"] == package_path)
 
 
-@pytest.mark.parametrize("hidden_stages", [(), ("Done",)], ids=["all-stages", "hide-done"])
-def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages) -> None:
-    value = json.loads(catalog.build_catalog(SAMPLE_ROOT, hidden_stages=hidden_stages))
+@pytest.mark.parametrize("completed_stages", [(), ("Done",)], ids=["all-stages", "completed-done"])
+def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stages) -> None:
+    value = json.loads(catalog.build_catalog(SAMPLE_ROOT, completed_stage_names=completed_stages))
 
-    assert value["schema_version"] == 6
+    assert value["schema_version"] == 7
     assert value["configuration_revision"] is None
     assert value["inventory"] == {
         "projects": [
@@ -46,13 +46,8 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             )
         ],
     }
-    assert value["visibility"] == {
-        "hidden_stages": list(hidden_stages),
-        # The sample workspace saves no completion policy.
-        "terminal_stages": [],
-            "visible_entry_count": 5 if hidden_stages else 6,
-        "hidden_entry_count": 1 if hidden_stages else 0,
-    }
+    assert value["terminal_stages"] == list(completed_stages)
+    assert "visibility" not in value
     assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
     assert value["program_coverage"] == {"state": "complete", "diagnostics": []}
     assert value["discovery_diagnostics"] == []
@@ -92,19 +87,19 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "Define the route API contract",
             PREREQUISITE_ID,
             "Done",
-            not hidden_stages,
+            True,
         ),
     }
     assert {
         entry["package_path"] for entry in value["entries"]
     } == set(expected_entries)
-    for package_path, (title, package_id, stage, board_visible) in expected_entries.items():
+    for package_path, (title, package_id, stage, _admitted) in expected_entries.items():
         entry = _entry_by_path(value, package_path)
         assert entry["declared"]["title"] == title
         assert entry["declared"]["target_project"] == package_path.split("/")[0]
         assert entry["package_id"] == package_id
         assert entry["stage"] == stage
-        assert entry["board_visible"] is board_visible
+        assert "board_visible" not in entry
         assert entry["diagnostics"] == []
         assert entry["transitive_diagnostics"] == []
 
@@ -119,7 +114,9 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
     }
     assert delivery["relationship"]["program"] == plan["relationship"]["program"]
     assert plan["relationship"]["direct_prerequisite_state"] == "satisfied"
-    assert delivery["relationship"]["direct_prerequisite_state"] == "unknown"
+    assert delivery["relationship"]["direct_prerequisite_state"] == (
+        "unsatisfied" if completed_stages else "unknown"
+    )
     assert plan["relationship"]["prerequisites"] == [
         {
             "kind": "claim",
@@ -145,8 +142,8 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(hidden_stages)
             "kind": "completion",
             "target_package_id": PREREQUISITE_ID,
             "observed_stage": "Done",
-            "resolved_state": "unknown",
-            "reason": "completion_policy_needed",
+            "resolved_state": "satisfied" if completed_stages else "unknown",
+            "reason": "completion_satisfied" if completed_stages else "completion_policy_needed",
         },
     ]
     verify = _entry_by_path(value, "Trail_Web/Testing/verify")

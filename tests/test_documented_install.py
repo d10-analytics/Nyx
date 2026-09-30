@@ -51,7 +51,7 @@ EXPECTED = {
     "bash": (
         "python3.12 -m venv .venv",
         ".venv/bin/python -m pip install .",
-        ".venv/bin/nyx --setup examples/sample-specifications --show-all-stages",
+        ".venv/bin/nyx --setup examples/sample-specifications",
         ".venv/bin/nyx",
         ".venv/bin/nyx --status",
         ".venv/bin/nyx --stop",
@@ -99,7 +99,7 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "performs no write",
         "Reset",
         "canonical inventory order",
-        "hidden or absent",
+        "absent",
         "survives browser reload",
         "supported Nyx",
         "failed Save",
@@ -111,7 +111,7 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "performs no write",
         "Reset",
         "Unlisted eligible stages",
-        "hidden or absent",
+        "absent",
         "If loading account settings fails, no saved order is available, "
         "so the board uses canonical inventory order",
         "reports the problem for retry",
@@ -135,7 +135,7 @@ COMPLETION_GUIDANCE_MARKERS = {
         "**Save** to persist the row order and completion policy together",
         "**Cancel** drops both kinds of unsaved change",
         "**Reset** clears the current root's row order and completed-stage set",
-        "hidden stages",
+        "Hide terminal rows",
         "Reload board settings",
         "configuration revision",
         "moving it out reopens it",
@@ -148,7 +148,7 @@ COMPLETION_GUIDANCE_MARKERS = {
         "saved per canonical workspace root",
         "root with no saved names reports unknown",
         "A cancelled or archived item",
-        "hidden completed stage",
+        "finished row",
         "mixed dependent item",
     ),
     "docs/specification-reference.md": (
@@ -214,6 +214,21 @@ def test_documents_publish_the_private_desktop_guidance():
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     for marker in DESKTOP_GUIDANCE_MARKERS:
         assert marker in guide, marker
+
+
+@pytest.mark.parametrize("name", [
+    "README.md", "docs/running-nyx.md", "docs/workspaces.md",
+    "docs/specification-reference.md", "examples/sample-specifications/README.md",
+])
+def test_documents_remove_stage_hiding_and_retain_finished_rows(name):
+    document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+    assert not re.search(
+        r"hide-stage|show-all-stages|visible stages|stage visibility|configured-hidden|"
+        r"hidden stages|hidden completed stage|hidden prerequisite|hidden or absent",
+        document, re.IGNORECASE,
+    )
+    assert "Hide terminal rows" in document
+    assert "Board settings" in document
 
 
 def test_documents_publish_the_saved_stage_order_contract():
@@ -323,7 +338,7 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
     assert setup.stdout.strip() == f"configured {sample}"
     configuration = json.loads((home / ".nyx/config/config.json").read_text(encoding="utf-8"))
     assert configuration["specification_root"] == str(sample)
-    assert configuration["hidden_stages"] == []
+    assert configuration == {"schema_version": 3, "specification_root": str(sample)}
     locator = home / ".nyx/runtime/instance.json"
     claim = home / ".nyx/runtime/lease.lock"
     try:
@@ -334,7 +349,6 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
         assert status.stdout.splitlines() == [
             "Configuration: configured",
             f"Workspace: {json.dumps(str(sample))}",
-            "Hidden stages: []",
             "Runtime: running",
             'URL: "http://127.0.0.1:8765/"',
         ]

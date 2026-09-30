@@ -487,7 +487,7 @@ def test_desktop_starts_shared_runtime_with_worker_only_inheritance():
                 session.close()
 
 
-def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stages():
+def test_first_launch_valid_selection_uses_canonical_schema_three_state():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
@@ -517,14 +517,12 @@ def test_first_launch_valid_selection_uses_canonical_state_owner_and_hidden_stag
             desktop, "ApplicationRuntime", FakeApplicationRuntime
         ):
             session = desktop.DesktopSession()
-            result = session.choose_workspace(supplied, ["Done", "Queue", "Done"])
+            result = session.choose_workspace(supplied)
             paths = state.state_paths()
             assert result.specification_root == workspace.resolve()
-            assert result.hidden_stages == ("Done", "Queue")
             assert state.load_configuration(paths) == result
             assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-                "hidden_stages": ["Done", "Queue"],
-                "schema_version": 2,
+                "schema_version": 3,
                 "specification_root": str(workspace.resolve()),
             }
             session.close()
@@ -578,7 +576,7 @@ def test_first_launch_save_starts_admitted_runtime_and_opens_board():
             window._root.setText(str(workspace))
             window._save.click()
 
-            assert state.load_configuration() == state.Configuration(workspace.resolve(), ())
+            assert state.load_configuration() == state.Configuration(workspace.resolve())
             assert len(created) == 1
             assert session.runtime is created[0]
             assert created[0].started
@@ -637,7 +635,7 @@ def test_first_launch_save_runtime_failure_preserves_selection_and_retries_board
             window._root.setText(str(workspace))
             window._save.click()
 
-            assert state.load_configuration() == state.Configuration(workspace.resolve(), ())
+            assert state.load_configuration() == state.Configuration(workspace.resolve())
             assert created[0].cleanup_calls == 1
             assert session.runtime is None
             assert window._board.url() is None
@@ -653,17 +651,34 @@ def test_first_launch_save_runtime_failure_preserves_selection_and_retries_board
             window._quit.click()
 
 
-def test_replacing_workspace_without_policy_input_preserves_hidden_stages():
+def test_replacing_workspace_preserves_saved_order_and_completion():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
+            paths = state.state_paths()
+            expected = {
+                "schema_version": 2,
+                "hidden_stages": [],
+                "specification_root": str(first.resolve()),
+                "stage_orders": {str(first.resolve()): ["Done", "Queue"],
+                                 str(second.resolve()): ["Archive", "Queue"]},
+                "completed_stages": {str(first.resolve()): ["Done"],
+                                     str(second.resolve()): ["Archive"]},
+            }
+            paths.config_file.write_text(json.dumps(expected) + "\n", encoding="utf-8")
             session = desktop.DesktopSession()
             session.choose_workspace(second)
-            assert state.load_configuration().hidden_stages == ("Queue",)
+            assert state.load_configuration().specification_root == second.resolve()
+            expected.pop("hidden_stages")
+            expected["schema_version"] = 3
+            expected["specification_root"] = str(second.resolve())
+            assert json.loads(paths.config_file.read_bytes()) == expected
+            assert state.load_configuration().stage_order == ("Archive", "Queue")
+            assert state.load_configuration().completed_stage_names == ("Archive",)
             session.close()
 
 
@@ -955,7 +970,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                 response = connection.getresponse()
                 assert response.status == 200
                 payload = json.loads(response.read())
-                assert payload["schema_version"] == 6
+                assert payload["schema_version"] == 7
                 assert payload["configuration_revision"] == state.load_configuration(paths).revision
                 connection.close()
                 legacy = dict(payload, schema_version=4)
@@ -1056,7 +1071,7 @@ def test_post_replacement_failure_keeps_committed_bytes_unverified_and_revalidat
             with patch.object(state, "_verify_record", side_effect=fail_once):
                 session = desktop.DesktopSession()
                 with pytest.raises(desktop.SelectionUnavailableError):
-                    session.choose_workspace(second, ["Queue"])
+                    session.choose_workspace(second)
                 assert session.unverified
                 assert json.loads(paths.config_file.read_text(encoding="utf-8"))["specification_root"] == str(
                     second.resolve()
@@ -1093,7 +1108,7 @@ def test_configured_shell_change_action_saves_replacement_and_preserves_policy()
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             session = desktop.DesktopSession()
             window = desktop._build_window(_fake_qt(), session)
             assert window._change.isEnabled()
@@ -1108,7 +1123,7 @@ def test_configured_shell_change_action_saves_replacement_and_preserves_policy()
             window._save.click()
 
             assert state.load_configuration() == state.Configuration(
-                second.resolve(), ("Queue",)
+                second.resolve()
             )
             assert window._change.isEnabled()
             assert not window._save.isEnabled()
@@ -1124,7 +1139,7 @@ def test_shell_pre_replacement_failure_preserves_prior_bytes_and_retry_state():
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
             before = paths.config_file.read_bytes()
             session = desktop.DesktopSession()
@@ -1151,7 +1166,7 @@ def test_shell_post_replacement_failure_blocks_change_until_revalidation():
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
             original_verify = state._verify_record
             replacement_failed = False
@@ -1180,7 +1195,7 @@ def test_shell_post_replacement_failure_blocks_change_until_revalidation():
                 window._save.click()
                 committed = paths.config_file.read_bytes()
                 assert json.loads(committed)["specification_root"] == str(second.resolve())
-                assert json.loads(committed)["hidden_stages"] == ["Queue"]
+                assert "hidden_stages" not in json.loads(committed)
                 assert window._status.text() == "Nyx configuration was saved but is unverified"
                 assert not window._change.isEnabled()
                 assert not window._save.isEnabled()
@@ -1241,7 +1256,7 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
         with _home_patches(home)[0], patch.object(
             desktop, "ApplicationRuntime", FakeApplicationRuntime
         ):
-            state.setup(first, ["Queue"])
+            state.setup(first)
             session = desktop.DesktopSession()
             session.start_runtime(static_ready=lambda: True)
             before = state.state_paths().config_file.read_bytes()
@@ -1254,7 +1269,7 @@ def test_active_workspace_switch_keeps_claims_and_retries_incomplete_stop():
             assert session.claims.held
             assert session.retry_workspace_switch()
             assert state.load_configuration() == state.Configuration(
-                second.resolve(), ("Queue",)
+                second.resolve()
             )
             assert session.runtime is instances[1]
             assert session.claims.held
@@ -1584,7 +1599,7 @@ def test_postcommit_switch_retry_revalidates_then_restarts_saved_workspace():
             window._retry.click()
 
             assert not session.unverified
-            assert session.configuration == state.Configuration(second.resolve(), ())
+            assert session.configuration == state.Configuration(second.resolve())
             assert session.runtime is instances[1]
             session.close()
 
@@ -1780,7 +1795,7 @@ def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
             session = desktop.DesktopSession()
 
@@ -1876,12 +1891,12 @@ def test_verified_switch_can_leave_saved_workspace_without_running_runtime():
             session.start_runtime(static_ready=lambda: True)
             with pytest.raises(desktop.DesktopUnavailableError):
                 session.choose_workspace(second)
-            assert state.load_configuration() == state.Configuration(second.resolve(), ())
+            assert state.load_configuration() == state.Configuration(second.resolve())
             assert session.runtime is None
             assert session.runtime_retryable
             assert session.claims.held
             session.close()
-            assert state.load_configuration() == state.Configuration(second.resolve(), ())
+            assert state.load_configuration() == state.Configuration(second.resolve())
 
 
 def test_unavailable_shell_disables_change_save_and_revalidation():
@@ -2039,7 +2054,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
         first = _workspace(root, "first")
         second = _workspace(root, "second")
         with _home_patches(home)[0]:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             session = desktop.DesktopSession()
             application = QtWidgets.QApplication.instance()
             owns_application = application is None
@@ -2054,7 +2069,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             window._save.click()
             application.processEvents()
             assert state.load_configuration() == state.Configuration(
-                second.resolve(), ("Queue",)
+                second.resolve()
             )
 
             handle = window.windowHandle()
@@ -2095,7 +2110,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             assert not session.claims.held
             assert not window.isVisible()
             assert state.load_configuration() == state.Configuration(
-                second.resolve(), ("Queue",)
+                second.resolve()
             )
             released = _destroy_native_window(
                 application,
@@ -2166,7 +2181,7 @@ def _inert_application_runtime() -> desktop.ApplicationRuntime:
 
 
 def _board_workspace(root: Path) -> Path:
-    """A sample workspace with visible content, a hidden stage, and an edge."""
+    """A sample workspace with content, a finished stage, and an edge."""
 
     workspace = _workspace(root, "board")
     packages = {
@@ -2183,7 +2198,7 @@ def _board_workspace(root: Path) -> Path:
             "Claim: design-ready | satisfied | sha256:" + "f" * 64 + "\n"
         ),
         ("Gamma", "Done", "finished"): (
-            "# Hidden completed work\n"
+            "# Completed work\n"
             "Target repo: Gamma\n"
             "Package ID: 33333333-3333-4333-8333-333333333333\n"
         ),
@@ -2434,7 +2449,8 @@ def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
             patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
-            state.setup(workspace, ["Done"])
+            state.setup(workspace)
+            state.save_configuration_owned(workspace, completed_stage_names=["Done"])
             session = desktop.DesktopSession()
             try:
                 application = session.start_runtime()
@@ -2448,10 +2464,9 @@ def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
                 ]
                 assert "Alpha delivery" in titles
                 assert "Beta design" in titles
-                assert "Hidden completed work" not in titles
-                assert payload["visibility"]["hidden_stages"] == ["Done"]
-                assert payload["visibility"]["hidden_entry_count"] == 1
-                assert all(entry["stage"] != "Done" for entry in payload["entries"])
+                assert "Completed work" in titles
+                assert payload["terminal_stages"] == ["Done"]
+                assert sum(entry["stage"] == "Done" for entry in payload["entries"]) == 1
                 alpha = next(
                     entry
                     for entry in payload["entries"]
@@ -2959,7 +2974,8 @@ def test_required_native_board_json_snapshot_separates_rendering_from_observatio
             patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
-            state.setup(workspace, ["Done"])
+            state.setup(workspace)
+            state.save_configuration_owned(workspace, completed_stage_names=["Done"])
             session = desktop.DesktopSession()
             session.start_runtime()
             shared = session.runtime
@@ -2988,7 +3004,7 @@ def test_required_native_board_json_snapshot_separates_rendering_from_observatio
 
 
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
-def test_required_native_embedded_board_renders_content_hidden_stage_and_dependency():
+def test_required_native_embedded_board_renders_content_gated_finished_stage_and_dependency():
     _assert_native_host_has_no_offscreen_platform()
     port = _free_loopback_port()
     with _native_temp_home() as root:
@@ -3000,7 +3016,8 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
             patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
-            state.setup(workspace, ["Done"])
+            state.setup(workspace)
+            state.save_configuration_owned(workspace, completed_stage_names=["Done"])
             session = desktop.DesktopSession()
             session.start_runtime()
             shared = session.runtime
@@ -3021,7 +3038,7 @@ def test_required_native_embedded_board_renders_content_hidden_stage_and_depende
                 snapshot = _wait_for_json_board(application, page, probe=probe)
                 assert "Alpha delivery" in snapshot["titles"]
                 assert "Beta design" in snapshot["titles"]
-                assert "Hidden completed work" not in snapshot["titles"]
+                assert "Completed work" not in snapshot["titles"]
                 assert "done" not in snapshot["rows"]
                 assert any(
                     "needs:" in link and "Beta design" in link
@@ -3230,7 +3247,7 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                     catalog = json.loads(manager.fetch_catalog())
             finally:
                 assert manager.close(time.monotonic() + 30)
-        assert catalog["schema_version"] == 6
+        assert catalog["schema_version"] == 7
         assert catalog["configuration_revision"] == configuration.revision
         assert manager.active_count == 0
         legacy = dict(catalog, schema_version=4)

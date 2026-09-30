@@ -69,12 +69,11 @@ def test_setup_uses_controlled_home_and_persists_canonical_empty_symlink_root():
             loaded = state.load_configuration(paths)
 
         assert result.specification_root == actual.resolve()
-        assert result.hidden_stages == ()
+
         assert loaded == result
         payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
         assert payload == {
-            "schema_version": 2,
-            "hidden_stages": [],
+            "schema_version": 3,
             "specification_root": str(actual.resolve()),
         }
         assert paths.config_file.is_relative_to(home)
@@ -185,36 +184,6 @@ def test_expired_admission_preserves_existing_configuration_and_claims():
         assert after == before
 
 
-def test_hidden_stages_are_deduplicated_and_scalar_sorted_without_normalization():
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        home = isolated_home(root)
-        spec_root = isolated_root(root, "spec-root")
-        home_patch, uid_patch = configure_home(home)
-        with home_patch, uid_patch:
-            result = state.setup(spec_root, ["z", "é", "z", " A ", "a"])
-            payload = json.loads(state.state_paths().config_file.read_text(encoding="utf-8"))
-
-        assert result.hidden_stages == (" A ", "a", "z", "é")
-        assert payload == {
-            "hidden_stages": [" A ", "a", "z", "é"],
-            "schema_version": 2,
-            "specification_root": str(spec_root.resolve()),
-        }
-
-
-@pytest.mark.parametrize("invalid", ["", ".", "..", "a/b", "a\\b", "a\x00b", "a\x7fb", "\ud800"])
-def test_invalid_hidden_stage_rejected_before_state_creation(invalid):
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        home = isolated_home(root)
-        spec_root = isolated_root(root, "spec-root")
-        home_patch, uid_patch = configure_home(home)
-        with home_patch, uid_patch, pytest.raises(state.HiddenStageError):
-            state.setup(spec_root, [invalid])
-        assert not (home / ".config").exists()
-
-
 def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -230,14 +199,13 @@ def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates()
                 encoding="utf-8",
             )
             before = paths.config_file.read_bytes()
-            assert state.load_configuration(paths).hidden_stages == ()
+            assert state.load_configuration(paths) == state.Configuration(first.resolve())
             assert paths.config_file.read_bytes() == before
-            migrated = state.setup(second, ["Queue"])
+            migrated = state.setup(second)
 
-        assert migrated.hidden_stages == ("Queue",)
+        assert migrated == state.Configuration(second.resolve())
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "hidden_stages": ["Queue"],
-            "schema_version": 2,
+            "schema_version": 3,
             "specification_root": str(second.resolve()),
         }
 
@@ -252,7 +220,7 @@ def test_root_keyed_stage_orders_migrate_and_preserve_each_literal_workspace():
         marker.write_bytes(b"source remains unchanged")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
             legacy = {
                 "schema_version": 1,
@@ -267,7 +235,6 @@ def test_root_keyed_stage_orders_migrate_and_preserve_each_literal_workspace():
             )
             second_saved = state.save_configuration_owned(
                 second,
-                ["Queue"],
                 stage_order=["Event", "Idea"],
                 paths=paths,
             )
@@ -284,7 +251,7 @@ def test_root_keyed_stage_orders_migrate_and_preserve_each_literal_workspace():
             str(first.resolve()): ["Testing", "testing", "Booking"],
             str(second.resolve()): ["Event", "Idea"],
         }
-        assert reloaded.hidden_stages == ("Queue",)
+
         assert marker.read_bytes() == b"source remains unchanged"
 
 
@@ -299,7 +266,7 @@ def test_invalid_stage_order_fails_before_replacement_and_preserves_policy(inval
         workspace = isolated_root(root, "workspace")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            state.setup(workspace, ["Queue"])
+            state.setup(workspace)
             paths = state.state_paths()
             before = paths.config_file.read_bytes()
             with pytest.raises(state.StageOrderError):
@@ -307,7 +274,6 @@ def test_invalid_stage_order_fails_before_replacement_and_preserves_policy(inval
             assert paths.config_file.read_bytes() == before
             loaded = state.revalidate_configuration(paths)
 
-        assert loaded.hidden_stages == ("Queue",)
         assert loaded.stage_orders == {}
 
 
@@ -318,7 +284,7 @@ def test_stage_order_revision_changes_only_for_validated_configuration_bytes():
         workspace = isolated_root(root, "workspace")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            initial = state.setup(workspace, ["Queue"])
+            initial = state.setup(workspace)
             paths = state.state_paths()
             first_revision = state.configuration_revision(initial)
             saved = state.save_configuration_owned(
@@ -481,25 +447,6 @@ def test_runtime_setup_preserves_saved_stage_orders_when_reapplying_existing_con
         assert reloaded.stage_orders == {str(workspace.resolve()): ("A", "B")}
 
 
-def test_omitted_setup_preserves_existing_policy_but_explicit_empty_clears_it():
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        home = isolated_home(root)
-        spec_root = isolated_root(root, "spec-root")
-        home_patch, uid_patch = configure_home(home)
-        with home_patch, uid_patch:
-            state.setup(spec_root, ["Queue"])
-            paths = state.state_paths()
-            before = paths.config_file.read_bytes()
-            preserved = state.setup(spec_root)
-            assert preserved.hidden_stages == ("Queue",)
-            assert paths.config_file.read_bytes() == before
-            cleared = state.setup(spec_root, [])
-
-        assert cleared.hidden_stages == ()
-        assert json.loads(paths.config_file.read_text(encoding="utf-8"))["hidden_stages"] == []
-
-
 def test_post_replace_verification_failure_keeps_new_record_without_claiming_rollback():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -520,11 +467,10 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
             with patch.object(state, "_verify_record", side_effect=fail_after_replacement), pytest.raises(
                 state.ConfigurationCommitVerificationError, match="replaced but could not be verified"
             ):
-                state.setup(second, ["Queue"])
+                state.setup(second)
 
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "hidden_stages": ["Queue"],
-            "schema_version": 2,
+            "schema_version": 3,
             "specification_root": str(second.resolve()),
         }
 
@@ -544,25 +490,6 @@ def test_owned_save_classifies_pre_replacement_failure_without_creating_first_re
             assert not paths.config_file.exists()
 
 
-def test_owned_save_omission_defaults_empty_then_preserves_existing_policy():
-    with TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        home = isolated_home(root)
-        first = isolated_root(root, "first")
-        second = isolated_root(root, "second")
-        third = isolated_root(root, "third")
-        home_patch, uid_patch = configure_home(home)
-        with home_patch, uid_patch:
-            paths = state.state_paths(create=True)
-            initial = state.save_configuration_owned(first, paths=paths)
-            assert initial.hidden_stages == ()
-            state.save_configuration_owned(second, ["Queue"], paths=paths)
-            preserved = state.save_configuration_owned(third, paths=paths)
-            assert preserved.hidden_stages == ("Queue",)
-            cleared = state.save_configuration_owned(first, [], paths=paths)
-        assert cleared.hidden_stages == ()
-
-
 def test_candidate_validation_is_canonical_and_does_not_write_configuration():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -573,11 +500,11 @@ def test_candidate_validation_is_canonical_and_does_not_write_configuration():
         supplied.symlink_to(second, target_is_directory=True)
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
             before = paths.config_file.read_bytes()
             candidate = state.validate_configuration_candidate(supplied, paths=paths)
-            assert candidate == state.Configuration(second.resolve(), ("Queue",))
+            assert candidate == state.Configuration(second.resolve())
             assert paths.config_file.read_bytes() == before
 
 
@@ -607,9 +534,9 @@ def test_owned_save_classifies_post_replacement_verification_and_revalidation():
             with patch.object(state, "_verify_record", side_effect=verify_once), pytest.raises(
                 state.ConfigurationCommitVerificationError
             ):
-                state.save_configuration_owned(second, ["Queue"], paths=paths)
+                state.save_configuration_owned(second, paths=paths)
             assert state.load_configuration(paths).specification_root == second.resolve()
-            assert state.revalidate_configuration(paths) == state.Configuration(second.resolve(), ("Queue",))
+            assert state.revalidate_configuration(paths) == state.Configuration(second.resolve())
 
 
 def test_atomic_replacement_failure_preserves_previous_configuration_bytes():
@@ -795,7 +722,7 @@ def test_state_admission_is_portable_across_platform_labels():
             Path, "home", return_value=home
         ):
             paths = state.state_paths(create=True)
-            state._save_configuration(paths, spec_root.resolve(), ())
+            state._save_configuration(paths, spec_root.resolve())
         assert paths.config_file.exists()
 
 
@@ -829,13 +756,14 @@ def test_configuration_observation_reports_confirmed_absence_without_defaults_or
             observed = state.observe_configuration()
         assert observed.status == "not_configured"
         assert observed.specification_root is None
-        assert observed.hidden_stages is None
+
         assert observed.diagnostic is None
         assert _managed_snapshot(home) == before
 
 
-@pytest.mark.parametrize("schema_version", [1, 2])
-def test_configuration_observation_returns_valid_schema_data_only_when_configured(schema_version):
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+@pytest.mark.parametrize("legacy_policy", [[], ["Queue"], ["bad/name"], [None, 3, {}, "Done", "Done"]])
+def test_configuration_observation_returns_valid_schema_data_only_when_configured(schema_version, legacy_policy):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = isolated_home(root)
@@ -849,17 +777,18 @@ def test_configuration_observation_returns_valid_schema_data_only_when_configure
                 "specification_root": str(spec_root.resolve()),
             }
             if schema_version == 2:
-                payload["hidden_stages"] = ["Queue"]
+                payload["hidden_stages"] = legacy_policy
             paths.config_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
             os.chmod(paths.config_file, 0o600)
             before = _managed_snapshot(home)
             observed = state.observe_configuration()
+            assert state.load_configuration(paths) == state.Configuration(spec_root.resolve())
 
         assert observed.status == "configured"
         assert observed.specification_root == spec_root.resolve()
-        assert observed.hidden_stages == (("Queue",) if schema_version == 2 else ())
+
         assert observed.configuration == state.Configuration(
-            spec_root.resolve(), ("Queue",) if schema_version == 2 else ()
+            spec_root.resolve()
         )
         assert _managed_snapshot(home) == before
 
@@ -869,7 +798,15 @@ def test_configuration_observation_returns_valid_schema_data_only_when_configure
     [
         {"schema_version": 2, "hidden_stages": ["Queue"], "specification_root": "/tmp/root", "extra": 1},
         {"schema_version": 99, "hidden_stages": [], "specification_root": "/tmp/root"},
-        {"schema_version": 2, "hidden_stages": ["bad/name"], "specification_root": "/tmp/root"},
+        {"schema_version": 2, "specification_root": "/tmp/root"},
+        {"schema_version": 2, "hidden_stages": None, "specification_root": "/tmp/root"},
+        {"schema_version": 2, "hidden_stages": "Done", "specification_root": "/tmp/root"},
+        {"schema_version": 2, "hidden_stages": {}, "specification_root": "/tmp/root"},
+        {"schema_version": 3, "hidden_stages": [], "specification_root": "/tmp/root"},
+        {"schema_version": 3, "hidden_stages": ["Done"], "specification_root": "/tmp/root"},
+        {"schema_version": 4, "specification_root": "/tmp/root"},
+        *[{"schema_version": version, "specification_root": "/tmp/root"}
+          for version in (0, -1, None, True, 2.0, "3")],
     ],
 )
 def test_configuration_observation_collapses_invalid_and_unsupported_records(payload):
@@ -881,11 +818,14 @@ def test_configuration_observation_collapses_invalid_and_unsupported_records(pay
             paths = state.state_paths(create=True)
             paths.config_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
             os.chmod(paths.config_file, 0o600)
+            before = paths.config_file.read_bytes()
+            with pytest.raises(state.ConfigurationError):
+                state.load_configuration(paths)
             observed = state.observe_configuration()
+            assert paths.config_file.read_bytes() == before
         assert observed.status == "unavailable"
         assert observed.diagnostic == state.CONFIGURATION_UNAVAILABLE
         assert observed.specification_root is None
-        assert observed.hidden_stages is None
 
 
 def test_configuration_observation_collapses_path_resolution_value_error():
@@ -929,7 +869,7 @@ def test_configuration_observation_reports_concurrent_valid_replacement_as_unava
             paths = state.state_paths()
             original_load = state.load_configuration
             replacement = paths.config_directory / "replacement.json"
-            replacement.write_bytes(state._configuration_bytes(second.resolve(), ("Queue",)))
+            replacement.write_bytes(state._configuration_bytes(second.resolve()))
 
             def replace_during_read(selected):
                 os.replace(replacement, paths.config_file)
@@ -942,7 +882,7 @@ def test_configuration_observation_reports_concurrent_valid_replacement_as_unava
             "unavailable", diagnostic=state.CONFIGURATION_UNAVAILABLE
         )
         assert state.load_configuration(paths) == state.Configuration(
-            second.resolve(), ("Queue",)
+            second.resolve()
         )
 
 
@@ -953,14 +893,13 @@ def test_configuration_observation_isolated_from_unsafe_runtime_ancestry():
         spec_root = isolated_root(root, "spec-root")
         home_patch, uid_patch = configure_home(home)
         with home_patch, uid_patch:
-            state.setup(spec_root, ["Queue"])
+            state.setup(spec_root)
             paths = state.state_paths()
             os.chmod(paths.runtime_directory, 0o755)
             with patch.object(state, "state_paths", side_effect=AssertionError("aggregate paths used")):
                 observed = state.observe_configuration()
         assert observed.status == "configured"
         assert observed.specification_root == spec_root.resolve()
-        assert observed.hidden_stages == ("Queue",)
 
 
 def test_runtime_observation_isolated_from_unsafe_configuration_and_has_no_create_path():
@@ -1213,9 +1152,9 @@ def test_persisted_configuration_inside_a_packaged_footprint_stays_unavailable(
     home_patch, uid_patch = configure_home(home)
     with home_patch, uid_patch:
         paths = state.state_paths(create=True)
-        state._save_configuration(paths, external.resolve(), ())
+        state._save_configuration(paths, external.resolve())
         assert state.load_configuration(paths).specification_root == external.resolve()
-        state._save_configuration(paths, inside.resolve(), ())
+        state._save_configuration(paths, inside.resolve())
         with pytest.raises(state.ConfigurationError):
             state.load_configuration(paths)
         with pytest.raises(state.ConfigurationError):
