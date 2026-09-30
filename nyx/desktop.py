@@ -442,7 +442,6 @@ class DesktopSession:
             try:
                 committed = state.save_configuration_owned(
                     configuration.specification_root,
-                    configuration.hidden_stages,
                     paths=self.paths,
                 )
             except state.ConfigurationCommitVerificationError as error:
@@ -490,7 +489,6 @@ class DesktopSession:
     def choose_workspace(
         self,
         specification_root: str | os.PathLike[str],
-        hidden_stages: tuple[str, ...] | list[str] | object = state._OMITTED,
     ) -> state.Configuration:
         """Validate and atomically save a chooser selection while claims are held."""
 
@@ -520,7 +518,6 @@ class DesktopSession:
             )
             configuration = state.validate_configuration_candidate(
                 specification_root,
-                hidden_stages,
                 paths=self.paths,
             )
         except state.StateError as error:

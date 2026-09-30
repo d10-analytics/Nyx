@@ -17,7 +17,7 @@ board after starting Nyx, before running the final stop command.
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install .
-.venv/bin/nyx --setup examples/sample-specifications --show-all-stages
+.venv/bin/nyx --setup examples/sample-specifications
 .venv/bin/nyx
 .venv/bin/nyx --status
 .venv/bin/nyx --stop
@@ -35,12 +35,12 @@ to the browser.
 ## Set up a workspace
 
 ```bash
-nyx --setup path/to/specifications --show-all-stages
+nyx --setup path/to/specifications
 nyx
 ```
 
 Replace `path/to/specifications` with your workspace directory. Setup saves its
-absolute location and stage visibility for the current account on this host. The browser runs
+absolute location for the current account on this host. The browser runs
 at **http://127.0.0.1:8765/**.
 
 Run `nyx` again to reuse an already running, ready instance. It prints the same
@@ -65,44 +65,10 @@ nyx --status
 nyx --stop
 ```
 
-Status reports the configured workspace, hidden stages, and runtime state. It
+Status reports the configured workspace and runtime state. It
 does not start or reconfigure Nyx. Stopping an already stopped instance is safe.
 Both commands are Linux service commands; the desktop application does not
 provide them.
-
-## Choose visible stages
-
-Stop Nyx before changing its workspace or stage policy:
-
-```bash
-nyx --stop
-nyx --setup path/to/specifications --hide-stage Done --hide-stage Archive
-nyx
-```
-
-Repeat `--hide-stage` for each stage to hide. Use the directory names listed in
-the [workspace guide](workspaces.md), with the same capitalization. Any admitted
-literal stage directory can be hidden by its exact name, including a custom
-stage such as `Testing`.
-
-Hiding a stage is separate from marking it finished. A hidden stage is removed
-from the catalog before the browser sees it, and its entries appear only as
-dependency context when a visible work item references them. Marking a stage
-finished records a workflow assertion and groups its rows as terminal on the
-board; see **Choose board row order** below. The two policies can name the same
-stage, and hiding always wins: a hidden stage cannot be revealed from the board.
-
-To show every stage:
-
-```bash
-nyx --stop
-nyx --setup path/to/specifications --show-all-stages
-nyx
-```
-
-The visibility flags are setup options; they cannot be used alone or combined
-with each other. An active instance rejects changes to its workspace or policy.
-Use an explicit visibility option when setting up so the intended board is clear.
 
 ## Choose board row order
 
@@ -116,7 +82,7 @@ restart, and is kept separately for each workspace root.
 
 **Cancel** discards the editor's unsaved moves and performs no write. **Reset**
 clears the saved order for the current workspace only; the board then follows the
-canonical inventory order. A hidden or absent saved stage name stays in the editor
+canonical inventory order. An absent saved stage name stays in the editor
 as a retained literal, marked as unavailable, but it produces no board row. A new
 eligible stage that is not yet saved follows the saved names and is appended in
 canonical inventory order. If the settings service cannot load, the board remains
@@ -129,8 +95,8 @@ The same collapsed **Board settings** panel also lists **Counts as finished**
 beside every literal stage name. Select the stages whose names define whole-item
 completion, then choose **Save** to persist the row order and completion policy
 together. **Cancel** drops both kinds of unsaved change; **Reset** clears the
-current root's row order and completed-stage set. Hidden stages and saved names
-that are temporarily absent remain available in the panel as literal settings,
+current root's row order and completed-stage set. Saved names that are
+temporarily absent remain available in the panel as literal settings,
 marked as unavailable when appropriate. If settings cannot be loaded, choose
 **Reload board settings** to retry. After a successful save, Nyx refreshes the
 catalog only when its configuration revision matches the saved settings before
@@ -149,10 +115,9 @@ Selecting a stage as finished also marks its rows as terminal on the board. The
 **Hide terminal rows** checkbox in the top bar starts checked, so finished rows
 are hidden until you reveal them, and the choice is stored in the browser like
 **Hide empty rows and columns**. This grouping is presentation only: it does not
-change setup, the catalog, or which dependencies count as satisfied. It is
-separate from stage hiding, which is a data-layer decision made at setup. A stage
-that is both hidden and marked finished stays hidden even when **Hide terminal
-rows** is unchecked, because hidden rows never reach the browser.
+change setup, the catalog, or which dependencies count as satisfied. Every
+discovered stage remains in the catalog; uncheck **Hide terminal rows** to reveal
+finished rows. This is the only control that hides populated stage rows.
 
 ## Windows and macOS: the private desktop application
 
@@ -220,9 +185,10 @@ directory.
 
 ## Read and refresh the board
 
-Use **Find** to search visible card metadata, including work item titles, projects,
-and program names. Select a card to inspect its recorded values, prerequisites,
-and diagnostics. A hidden prerequisite can still appear in those details.
+Use **Find** to search card metadata, including work item titles, projects,
+and program names. Cards show prerequisite and dependent links; selecting a card
+highlights its connections to other displayed cards. To see a provider in a
+finished row, uncheck **Hide terminal rows**.
 Right-click a card to copy the full directory path of its work item. Nyx shows
 a brief confirmation beside the card when the copy succeeds.
 
@@ -232,9 +198,8 @@ waiting. Changes are not applied automatically while you are reading a snapshot.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that
-relationship; moving it out reopens it. Hidden completed targets remain available
-as dependency context, and the details identify whole-item completion separately
-from a named outcome. No stage is completed automatically because it is called
+relationship; moving it out reopens it. Hiding finished rows does not change
+dependency results. No stage is completed automatically because it is called
 `Done`, `Cancelled`, or `Archive`, and a completed stage is a recorded workflow
 assertion rather than evidence verification.
 
@@ -247,13 +212,11 @@ new page. This preference never changes setup, the workspace, or the catalog.
 The **Hide terminal rows** checkbox uses the same contract. It starts checked and
 hides the rows for the stages the account marks as finished, and its value is
 stored in the browser the same way. Unchecking it reveals those rows without
-changing setup, the catalog, or the saved completion policy. A configured hidden
-stage is unaffected: hidden rows never reach the browser, so they cannot be
-revealed from the board.
+changing setup, the catalog, or the saved completion policy.
 
 Search filters cards and their visible dependency rails without changing the
-project and stage axes. A hidden configured stage stays absent even when compact
-view is unchecked. Incomplete or unavailable dimensions remain visible with an
+project and stage axes. Compact view does not override **Hide terminal rows**.
+Incomplete or unavailable dimensions remain visible with an
 `incomplete / unavailable` notice; Nyx does not compact them as if they were
 empty. If a refresh returns malformed data, Nyx reports the refresh failure and
 retains the last valid displayed board and browser-local preference.
@@ -265,16 +228,38 @@ Choose **Light**, **Dark**, or **System** from the theme menu to suit your displ
 The checked-in images use only the complete fictional community-event fixture
 listed in the [workspace guide](workspaces.md): four `spec.md` work items
 (Queue/festival, Done/permit, Needs_Fixes/cleanup, and
-Under_Development/event-site), two `.gitkeep` empty dimensions, and one
-malformed `Reference/Programs/.../program.md` that naturally produces the
-`invalid_package` workspace issue. Create that disposable workspace outside the
-repository, start Nyx through its normal local server and scanner, and configure
-the `Done` stage as hidden. Do not use a private workspace for a public example.
+Under_Development/event-site), and two `.gitkeep` empty dimensions. Create that
+disposable workspace outside the repository, configure it with
+`nyx --setup <fixture-root>`, and start Nyx through
+its normal local server and scanner. Do not use a private workspace for a public
+example.
+
+Use an isolated temporary account home outside the repository for every fixture
+setup, start, status, and stop command and the browser session. Stop the owner's
+Nyx instance first, record the SHA-256 of the owner's `.nyx/config/config.json`,
+and verify that `/api/workspace` reports the fixture root before saving Board
+settings. After visual acceptance, stop the isolated
+instance, remove its temporary home, and confirm the owner's configuration hash
+is unchanged.
 
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
 fresh browser context so the compact preference starts checked. Before saving the
-first image, use **Board row order** to move **Queue** above **Needs Fixes** and
-choose **Save**; keep that saved account-local order for all three images:
+first image, open **Board settings**, use **Board row order** to move **Queue**
+above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
+**Save**. Keep that saved account-local order and completion policy, and keep
+**Hide terminal rows** checked for all three images.
+
+Before each capture, inspect the live `/api/catalog` response: every diagnostic
+array must be empty, including discovery, coverage, item, transitive, and nested
+relationship, claim, and program diagnostics. Both identity and program coverage
+must be complete, and `programs` must be empty. Confirm exactly the four work
+items remain in the catalog, each with `state` complete, and every project and
+stage inventory availability is complete, including the empty `Planning` stage
+and `Community_Resources` project. Confirm the festival's completion prerequisite still targets the
+permit, observes `Done`, and resolves as satisfied with reason
+`completion_satisfied`. In the actual browser, verify there is no workspace or
+refresh issues panel (`#board-issues` must be absent, not merely collapsed or
+hidden). Keep **Board settings** closed in every image.
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -282,20 +267,23 @@ choose **Save**; keep that saved account-local order for all three images:
    selected festival card with the keyboard and press **Enter** twice: the first
    press deselects it and the second reselects it. Save this compact view as
    `docs/images/sample-board-compact.png`.
-3. Uncheck **Hide empty rows and columns**. Then focus the **Workspace issues**
-   summary and press **Enter**. Save this
+3. Uncheck **Hide empty rows and columns** to reveal the empty `Planning` row
+   and `Community_Resources` column. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 
-The first image is light with the saved row order, issue summary, and selected festival
-card. The second is dark with compact view checked and the selected card
-showing its filepath. The third remains dark, unchecks compact
-view, and opens Workspace issues by keyboard so the empty Planning row and
-Community_Resources column are visible.
+The first image is light with the saved row order and selected festival card
+showing its filepath. The second is dark with compact view checked and the same
+selected card and filepath. Both omit the empty dimensions. The third remains
+dark with the same selected card and filepath,
+unchecks compact view, and shows the empty Planning row and Community_Resources
+column. All three omit the finished Done row and permit card and have no issues
+panel.
 
 Review each file directly beside the running browser in both themes. Confirm
-that the selected card, package path, empty dimensions, workspace issue,
-disclosure states, labels, and controls match the
-browser. Reject a capture if it contains a private path or value, was drawn by
+that the selected card, package path, empty dimensions, saved row order, labels,
+controls, and absence of workspace or refresh issues match the browser.
+Reject a capture if the catalog is incomplete, any diagnostic or issues panel
+is present, it contains a private path or value, was drawn by
 hand, or no longer shows the named state. This procedure is intentionally a
 repeatable browser session; it does not add a permanent screenshot framework.
 
@@ -303,7 +291,8 @@ repeatable browser session; it does not add a permanent screenshot framework.
 
 - **The board is empty:** check the workspace reported by `nyx --status` on
   Linux, or the workspace chosen in the desktop application, the
-  [directory layout](workspaces.md), and whether the relevant stages are hidden.
+  [directory layout](workspaces.md), and the **Hide terminal rows** setting.
+  Uncheck it to reveal finished rows.
   If the catalog contains admitted folders but no work items, uncheck **Hide
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that

@@ -29,7 +29,6 @@ community-planning/
 │   ├── Needs_Fixes/cleanup/spec.md
 │   ├── Planning/.gitkeep
 │   ├── Queue/festival/spec.md
-│   ├── Reference/Programs/123e4567-e89b-42d3-a456-426614174101/program.md
 │   └── Under_Development/event-site/spec.md
 └── Community_Resources/.gitkeep
 ```
@@ -79,19 +78,18 @@ Status: needs-fixes
 ```
 
 The empty `Planning` stage and `Community_Resources` project each contain only
-`.gitkeep`. To make the captured **Workspace issues** disclosure deterministic,
-the fixture also contains the valid-UUID directory
-`Community_Event/Reference/Programs/123e4567-e89b-42d3-a456-426614174101/`
-with this intentionally malformed `program.md`:
-
-```text
-# This extra line makes the fictional descriptor invalid
-```
-
-The normal scanner reports that descriptor as `invalid_package` while retaining
-the four work items and resolving the hidden permit item. Configure the fixture
-with `nyx --setup <fixture-root> --hide-stage Done`; the capture procedure then
-uses the normal local server and scanner route. The interface calls each
+`.gitkeep`. These four work items and two empty dimensions are the entire
+disposable fixture. The normal scanner must retain all four work items, resolve
+the permit item, and report zero diagnostics with complete identity and program
+coverage and complete project and stage inventory. Configure the fixture
+with `nyx --setup <fixture-root>` and start the normal local server and scanner.
+In **Board settings**, check **Counts as finished** beside `Done` and choose
+**Save**; keep **Hide terminal rows** checked for every capture, as described in
+the [capture procedure](running-nyx.md#capture-and-review-the-fictional-example).
+Before each capture, verify the live catalog is complete and diagnostic-free
+and the browser has no workspace or refresh issues panel. The expanded view
+reveals the empty `Planning` row and `Community_Resources` column.
+The interface calls each
 specification a **work item** and displays its directory stage as a board row;
 the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
 file contract. Use fresh UUIDs in a real workspace.
@@ -142,7 +140,7 @@ From the directory containing `specifications`, configure Nyx:
 
 ```bash
 nyx --stop
-nyx --setup specifications --show-all-stages
+nyx --setup specifications
 nyx
 ```
 
@@ -180,7 +178,7 @@ After moving files, request a refresh and apply the update.
 Completion is an explicit, literal policy for this workspace. Open the collapsed
 **Board settings** panel, select **Counts as finished** beside each stage whose
 literal name should count, and choose **Save**. There is no implicit `Done` or
-`Archive` rule: row order, visual position, hidden status, cancellation, and
+`Archive` rule: row order, visual position, cancellation, and
 the spelling of a stage never infer completion. A cancelled or archived item
 therefore remains outside the completion policy unless you deliberately select
 that exact literal stage name.
@@ -194,8 +192,8 @@ Completion Prerequisite: 55555555-5555-4555-8555-555555555555
 
 When the target moves into a selected stage, this whole-item requirement becomes
 satisfied; moving it out reopens the requirement. A missing policy leaves the
-requirement **unknown** and asks you to configure completed stages. A target in a
-hidden completed stage still appears as dependency context. This assertion records
+requirement **unknown** and asks you to configure completed stages. Hiding a
+finished row does not change its dependency results. This assertion records
 workflow completion; it does not verify evidence, approve work, or satisfy a
 named outcome.
 
@@ -203,14 +201,14 @@ The same selection groups finished rows on the board. The **Hide terminal rows**
 checkbox in the top bar starts checked, so rows for the selected stages are hidden
 until you reveal them, and the choice is stored in the browser. This is
 presentation only: it does not change the policy, the catalog, or dependency
-results. Hiding a stage is a separate, data-layer decision, and a stage that is
-both hidden and finished stays hidden even when **Hide terminal rows** is
-unchecked.
+results. Every discovered stage remains in the catalog. Uncheck **Hide terminal
+rows** to reveal finished rows; this is the only control that hides populated
+stage rows.
 
 The selected stage names are saved per canonical workspace root and shared by
 all projects in that root. Switching roots keeps each root's own policy, and a
 root with no saved names reports unknown for its simple completion dependencies.
-Hidden stages and names that are temporarily absent remain retained in the Board
+Names that are temporarily absent remain retained in the Board
 settings panel so they can be used again when available. **Cancel** leaves the
 saved policy unchanged; **Reset** removes the current root's completion policy.
 
@@ -233,12 +231,11 @@ when no update is waiting. If the refreshed catalog differs, the button becomes
 you apply them together. A failed or malformed refresh leaves the displayed
 snapshot in place.
 
-Configured hidden stages and compact view are different controls. `--hide-stage`
-removes a literal stage from the displayed policy and from search and rails, but
-its prerequisite can remain visible in a selected card's details. The browser's
-**Hide empty rows and columns** checkbox only compacts admitted, policy-eligible
-dimensions from the displayed snapshot; unchecking it restores confirmed-empty
-rows and columns without changing the workspace or configuration.
+The browser's **Hide empty rows and columns** checkbox compacts confirmed-empty
+dimensions from the displayed snapshot; unchecking it restores those rows and
+columns without changing the workspace or configuration. It does not override
+**Hide terminal rows**: uncheck that control to show finished rows and their
+cards and dependency connections.
 
 The **Board row order** editor is another presentation control. It saves a
 root-keyed order map in the current account's configuration, so browser and
@@ -247,9 +244,9 @@ it. Switching between workspace roots does not carry one root's order into
 another. **Move up** and **Move down** change the draft; **Save** persists it,
 **Cancel** performs no write, and **Reset** clears only the current root's saved
 order. Unlisted eligible stages are appended in canonical inventory order until
-you save them. Saved names remain literal even when their stage is hidden or
-absent; they retain their place for a later return but do not produce a row while
-hidden or absent. If loading account settings fails, no saved order is available,
+you save them. Saved names remain literal even when their stage is absent;
+they retain their place for a later return but do not produce a row while
+absent. If loading account settings fails, no saved order is available,
 so the board uses canonical inventory order and reports the problem for retry.
 Choose **Reload board row order** to retry. A conflict or reload-needed Save
 requires that reload, which replaces the stale unsaved draft with the current
@@ -281,5 +278,5 @@ and stages, then use the [specification reference](specification-reference.md)
 when those relationships help you track the work.
 
 The [running guide](running-nyx.md) describes the fictional event captures in
-light and dark themes, including compact view, hidden prerequisite context, and
-keyboard-opened disclosures.
+light and dark themes, including compact view, finished-row filtering, keyboard
+card selection, and expanded empty dimensions.

@@ -15,6 +15,7 @@ import pytest
 
 from nyx import state, worker
 from nyx._native_claim import NativeClaim
+from nyx.models import parse_catalog
 
 
 class _Buffer:
@@ -39,14 +40,12 @@ def test_worker_main_loads_once_and_transports_configuration_by_identity(
     tmp_path: Path,
 ) -> None:
     root = (tmp_path / "specification-root").resolve()
-    hidden_stages = tuple(["Done", "In_Progress"])
     configuration = state.Configuration(
         root,
-        hidden_stages,
         completed_stages={str(root): ("Done",)},
     )
     load_count = 0
-    scanner_arguments: list[tuple[object, object, object, object]] = []
+    scanner_arguments: list[tuple[object, object, object]] = []
     stdout = _Stdout()
 
     def load_configuration() -> state.Configuration:
@@ -57,12 +56,11 @@ def test_worker_main_loads_once_and_transports_configuration_by_identity(
     def scan_catalog(
         received_root: object,
         *,
-        hidden_stages: object,
         completed_stage_names: object,
         configuration_revision: object,
     ) -> str:
         scanner_arguments.append(
-            (received_root, hidden_stages, completed_stage_names, configuration_revision)
+            (received_root, completed_stage_names, configuration_revision)
         )
         return "catalog ✓"
 
@@ -75,9 +73,8 @@ def test_worker_main_loads_once_and_transports_configuration_by_identity(
 
     assert load_count == 1
     assert len(scanner_arguments) == 1
-    received_root, received_hidden_stages, received_completed, received_revision = scanner_arguments[0]
+    received_root, received_completed, received_revision = scanner_arguments[0]
     assert received_root is root
-    assert received_hidden_stages is hidden_stages
     assert received_completed is configuration.completed_stage_names
     assert received_revision == configuration.revision
     assert stdout.buffer.writes == ["catalog ✓".encode("utf-8")]
@@ -132,7 +129,7 @@ def test_inherited_worker_validates_claim_and_parent_observation_before_one_load
         claim = NativeClaim(root / "recovery.lock")
         assert claim.acquire(blocking=False)
         read_fd, write_fd = os.pipe()
-        configuration = state.Configuration(root, ("Queue",))
+        configuration = state.Configuration(root)
         stdout = _Stdout()
         loaded = 0
 
@@ -204,7 +201,7 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
             )
             try:
                 catalog = json.loads(manager.fetch_catalog())
-                assert catalog["schema_version"] == 6
+                assert catalog["schema_version"] == 7
                 assert manager.close(time.monotonic() + 2)
                 assert manager.active_count == 0
                 assert claim.held
@@ -246,7 +243,15 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
             with patch.object(worker.sys, "stdout", stdout):
                 assert worker._worker_main() == 0
         payload = json.loads(stdout.buffer.writes[0])
-        assert payload["schema_version"] == 6
+        assert set(payload) == {
+            "catalog_digest", "configuration_revision", "discovery_diagnostics", "entries",
+            "identity_coverage", "inventory", "program_coverage", "programs",
+            "schema_version", "terminal_stages",
+        }
+        assert payload["schema_version"] == 7
+        assert payload["terminal_stages"] == ["Done"]
+        assert all("board_visible" not in entry for entry in payload["entries"])
+        assert parse_catalog(payload).as_dict() == payload
         assert payload["configuration_revision"] == saved.revision
         source_entry = next(
             item for item in payload["entries"] if item["package_id"] == "11111111-1111-4111-8111-111111111111"

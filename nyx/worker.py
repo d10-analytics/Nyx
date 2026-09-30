@@ -256,7 +256,6 @@ def _worker_main(
         configuration = state.load_configuration()
         rendered = scan_catalog(
             configuration.specification_root,
-            hidden_stages=configuration.hidden_stages,
             completed_stage_names=configuration.completed_stage_names,
             configuration_revision=configuration.revision,
         )

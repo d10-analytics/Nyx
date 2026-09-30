@@ -24,12 +24,13 @@ before changing its setup.
 
 ```bash
 nyx --stop
-nyx --setup examples/sample-specifications --show-all-stages
+nyx --setup examples/sample-specifications
 nyx
 ```
 
-Open **http://127.0.0.1:8765/**. With all stages shown, the catalog contains
-three projects and six work items. The work items are:
+Open **http://127.0.0.1:8765/**. The catalog contains three projects and six work
+items. Uncheck **Hide terminal rows** to show every populated stage, including
+any stages already marked finished for this workspace. The work items are:
 
 | Project | Stage | Work |
 | --- | --- | --- |
@@ -49,38 +50,38 @@ sample or Nyx setup.
 
 ## Follow a dependency
 
-Select **Plan the route preview**. Its `contract-ready` prerequisite is satisfied
-by the API contract specification, so the design work has the input it needs.
+Select **Plan the route preview** to highlight its connection to the API contract.
+In the specification files linked below, its `contract-ready` prerequisite is
+satisfied by the API contract specification, so the design work has the input it
+needs.
 
-Now select **Build the route preview**. It depends on a different claim from the
-same specification: `implementation-ready`, which is still unsatisfied. Finishing
-the contract did not finish the implementation. A specification's stage and its
+Now compare **Build the route preview** in the files. It depends on a different
+claim from the same specification: `implementation-ready`, which is still
+unsatisfied. Finishing the contract did not finish the implementation. A
+specification's stage and its
 individual claims describe different things.
 
-The three web specifications belong to the **Route preview** program, which
-appears in their details. Try searching for `Route preview` to focus on that
-work.
+The three web specifications belong to the **Route preview** program.
+Try searching for `Route preview` to focus on that work.
 
 ## Focus on unfinished work
 
-Hide completed work by changing the setup:
+Open **Board settings**, select **Counts as finished** beside `Done` only, and
+choose **Save**. Check **Hide terminal rows** to hide its finished row. This
+records `Done` as finished for whole-item completion requirements; it does not
+change the API contract's individual claims.
 
-```bash
-nyx --stop
-nyx --setup examples/sample-specifications --hide-stage Done
-nyx
-```
+There are now five displayed work items when search is clear. The API contract
+remains in the catalog and its claim still satisfies **Verify the route
+preview**, while its implementation claim remains unsatisfied for **Build the
+route preview**. Uncheck **Hide terminal rows** to restore the API contract card
+and its dependency connections. Select either dependent card to highlight those
+connections; inspect the linked specification files below for claim state and
+evidence.
 
-There are now five visible work items. Select **Verify the route preview**:
-the API contract is a configured-hidden prerequisite, but it remains available
-in the selected card's details. Select **Build the route preview** as well to
-compare its unsatisfied implementation prerequisite. The API contract remains
-available as prerequisite context even though its card is hidden. To restore the
-full board, stop Nyx and run setup again with `--show-all-stages`.
-
-The configured `Done` policy is separate from compact view. The checkbox can
-hide confirmed-empty rows and columns, but it cannot reveal a configured-hidden
-stage or its cards.
+**Hide empty rows and columns** is a separate compact-view preference. It can
+hide confirmed-empty dimensions, but unchecking it does not reveal finished
+rows while **Hide terminal rows** remains checked.
 
 ## Move a work item and apply the update
 
@@ -110,12 +111,13 @@ board rather than partially applying the result.
 
 ## Compare compact and expanded views
 
-With `Done` hidden and the sample work item restored to `Testing`, leave **Hide
-empty rows and columns** checked for the compact view. Then uncheck it to show
-the admitted empty `Ready_For_Review` row and `Trail_Mobile` column alongside
+With `Done` marked finished, **Hide terminal rows** checked, and the sample work
+item restored to `Testing`, leave **Hide empty rows and columns** checked for
+the compact view. Then uncheck it to show the admitted empty `Ready_For_Review`
+row and `Trail_Mobile` column alongside
 the populated dimensions. Search filters cards but leaves the axes unchanged.
-Select **Verify the route preview** in either state to inspect its satisfied API
-prerequisite; the hidden card is not added to the board or search results.
+Uncheck **Hide terminal rows** to reveal the API contract card, then select
+**Verify the route preview** to highlight its dependency connection.
 
 When you finish exploring, run `nyx --stop`.
 

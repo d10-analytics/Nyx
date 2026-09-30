@@ -21,8 +21,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 LEGACY_CONFIG_SCHEMA_VERSION = 1
+POLICY_CONFIG_SCHEMA_VERSION = 2
+_LEGACY_POLICY_KEY = "hidden_stages"
 CONFIG_FILENAME = "config.json"
 DEPLOYMENT_FILENAME = "deployment.json"
 RUNTIME_DIRECTORY = "runtime"
@@ -71,10 +73,6 @@ class ConfigurationCommitVerificationError(ConfigurationError):
     """The replacement committed, but its immediate verification failed."""
 
 
-class HiddenStageError(ConfigurationError):
-    """A hidden-stage name is outside the admitted Unicode component domain."""
-
-
 class StageOrderError(ConfigurationError):
     """A saved stage order is malformed or contains duplicate names."""
 
@@ -100,7 +98,6 @@ class Configuration:
     """The validated contents of the Nyx setup record."""
 
     specification_root: Path
-    hidden_stages: tuple[str, ...] = ()
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
     completed_stages: Mapping[str, tuple[str, ...]] | None = None
 
@@ -147,7 +144,6 @@ class Configuration:
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "schema_version": CONFIG_SCHEMA_VERSION,
-            "hidden_stages": list(self.hidden_stages),
             "specification_root": str(self.specification_root),
         }
         if self.stage_orders:
@@ -169,7 +165,6 @@ class ConfigurationObservation:
 
     status: str
     specification_root: Path | None = None
-    hidden_stages: tuple[str, ...] | None = None
     diagnostic: str | None = None
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
     completed_stages: Mapping[str, tuple[str, ...]] | None = None
@@ -187,10 +182,8 @@ class ConfigurationObservation:
         if self.status != "configured":
             return None
         assert self.specification_root is not None
-        assert self.hidden_stages is not None
         return Configuration(
             self.specification_root,
-            self.hidden_stages,
             self.stage_orders or {},
             self.completed_stages or {},
         )
@@ -476,28 +469,6 @@ def _verify_record(path: Path, _uid: int | None = None) -> os.stat_result:
     return details
 
 
-def _validate_hidden_stages(values: Iterable[str]) -> tuple[str, ...]:
-    if isinstance(values, (str, bytes)):
-        raise HiddenStageError("hidden stages must be a sequence of names")
-    try:
-        names = tuple(values)
-    except (TypeError, ValueError) as error:
-        raise HiddenStageError("hidden stages must be a sequence of names") from error
-    for name in names:
-        if not isinstance(name, str):
-            raise HiddenStageError("hidden stage names must be text")
-        if (
-            not name
-            or name in {".", ".."}
-            or "/" in name
-            or "\\" in name
-            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
-            or any(0xD800 <= ord(character) <= 0xDFFF for character in name)
-        ):
-            raise HiddenStageError(f"invalid hidden stage name: {name!r}")
-    return tuple(sorted(set(names)))
-
-
 def _validate_stage_order(values: Iterable[str]) -> tuple[str, ...]:
     """Validate one literal order without sorting or normalizing its names."""
 
@@ -601,30 +572,23 @@ def _configuration_from_payload(payload: Any) -> Configuration:
     if schema_version == LEGACY_CONFIG_SCHEMA_VERSION:
         if set(payload) != {"schema_version", "specification_root"}:
             raise ConfigurationError("Nyx configuration schema is invalid")
-        hidden_stages: tuple[str, ...] = ()
         stage_orders: dict[str, tuple[str, ...]] = {}
         completed_stages: dict[str, tuple[str, ...]] = {}
-    elif schema_version == CONFIG_SCHEMA_VERSION:
+    elif schema_version in {POLICY_CONFIG_SCHEMA_VERSION, CONFIG_SCHEMA_VERSION}:
+        required = {"schema_version", "specification_root"}
         allowed = {
             "schema_version",
-            "hidden_stages",
             "specification_root",
             "stage_orders",
             "completed_stages",
         }
-        if not set(payload).issubset(allowed) or set(payload) < {
-            "schema_version", "hidden_stages", "specification_root"
-        }:
+        if schema_version == POLICY_CONFIG_SCHEMA_VERSION:
+            required.add(_LEGACY_POLICY_KEY)
+            allowed.add(_LEGACY_POLICY_KEY)
+            if not isinstance(payload.get(_LEGACY_POLICY_KEY), list):
+                raise ConfigurationError("Nyx configuration legacy policy is invalid")
+        if not required.issubset(payload) or not set(payload).issubset(allowed):
             raise ConfigurationError("Nyx configuration schema is invalid")
-        raw_hidden_stages = payload.get("hidden_stages")
-        if not isinstance(raw_hidden_stages, list):
-            raise ConfigurationError("Nyx configuration hidden stages are invalid")
-        try:
-            hidden_stages = _validate_hidden_stages(raw_hidden_stages)
-        except HiddenStageError as error:
-            raise ConfigurationError("Nyx configuration hidden stages are invalid") from error
-        if raw_hidden_stages != list(hidden_stages):
-            raise ConfigurationError("Nyx configuration hidden stages are not canonical")
         raw_stage_orders = payload.get("stage_orders", {})
         if not isinstance(raw_stage_orders, dict):
             raise ConfigurationError("Nyx configuration stage orders are invalid")
@@ -666,7 +630,7 @@ def _configuration_from_payload(payload: Any) -> Configuration:
     # instead of being served after a restart.
     if any(_is_within(canonical, footprint) for footprint in _installation_footprints()):
         raise ConfigurationError("Nyx configuration root is inside the Nyx installation")
-    return Configuration(canonical, hidden_stages, stage_orders, completed_stages)
+    return Configuration(canonical, stage_orders, completed_stages)
 
 
 def load_configuration(paths: StatePaths | None = None) -> Configuration:
@@ -710,7 +674,6 @@ def observe_configuration() -> ConfigurationObservation:
     return ConfigurationObservation(
         "configured",
         specification_root=configuration.specification_root,
-        hidden_stages=configuration.hidden_stages,
         stage_orders=configuration.stage_orders,
         completed_stages=configuration.completed_stages,
     )
@@ -749,7 +712,6 @@ observe_runtime_paths = observe_runtime
 
 def _configuration_bytes(
     root: Path,
-    hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None = None,
     completed_stages: Mapping[str, Iterable[str]] | None = None,
 ) -> bytes:
@@ -757,7 +719,7 @@ def _configuration_bytes(
     completed = {} if completed_stages is None else _validate_completed_stages(completed_stages)
     return (
         json.dumps(
-            Configuration(root, hidden_stages, orders, completed).as_dict(),
+            Configuration(root, orders, completed).as_dict(),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -783,7 +745,6 @@ def _sync_directory(path: Path) -> None:
 def _atomic_write_configuration(
     paths: StatePaths,
     root: Path,
-    hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None = None,
     completed_stages: Mapping[str, Iterable[str]] | None = None,
     *,
@@ -802,7 +763,7 @@ def _atomic_write_configuration(
             prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
         )
         try:
-            data = _configuration_bytes(root, hidden_stages, stage_orders, completed_stages)
+            data = _configuration_bytes(root, stage_orders, completed_stages)
             written = 0
             while written < len(data):
                 _check_deadline(deadline, deadline_ns)
@@ -840,7 +801,6 @@ def _atomic_write_configuration(
 def _save_configuration(
     paths: StatePaths,
     root: Path,
-    hidden_stages: tuple[str, ...],
     stage_orders: Mapping[str, Iterable[str]] | None | object = _OMITTED,
     completed_stages: Mapping[str, Iterable[str]] | None | object = _OMITTED,
     *,
@@ -869,18 +829,16 @@ def _save_configuration(
     _atomic_write_configuration(
         paths,
         root,
-        hidden_stages,
         validated_orders,
         validated_completed,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
-    return Configuration(root, hidden_stages, validated_orders, validated_completed)
+    return Configuration(root, validated_orders, validated_completed)
 
 
 def validate_configuration_candidate(
     specification_root: str | os.PathLike[str],
-    hidden_stages: Iterable[str] | object = _OMITTED,
     *,
     paths: StatePaths | None = None,
     stage_orders: Mapping[str, Iterable[str]] | object = _OMITTED,
@@ -895,10 +853,6 @@ def validate_configuration_candidate(
     current: Configuration | None = None
     if _lstat(selected_paths.config_file) is not None:
         current = load_configuration(selected_paths)
-    if hidden_stages is _OMITTED:
-        validated_hidden_stages = () if current is None else current.hidden_stages
-    else:
-        validated_hidden_stages = _validate_hidden_stages(hidden_stages)
     if stage_orders is not _OMITTED and stage_order is not _OMITTED:
         raise StageOrderError("provide stage_orders or stage_order, not both")
     if completed_stages is not _OMITTED and completed_stage_names is not _OMITTED:
@@ -936,12 +890,11 @@ def validate_configuration_candidate(
             validated_completed[str(root)] = validated_names
         else:
             validated_completed.pop(str(root), None)
-    return Configuration(root, validated_hidden_stages, validated_orders, validated_completed)
+    return Configuration(root, validated_orders, validated_completed)
 
 
 def save_configuration_owned(
     specification_root: str | os.PathLike[str],
-    hidden_stages: Iterable[str] | object = _OMITTED,
     *,
     paths: StatePaths | None = None,
     deadline: float | None = None,
@@ -956,7 +909,7 @@ def save_configuration_owned(
     Desktop ownership already holds the account and recovery claims.  This
     seam deliberately bypasses the public setup aliases, which would try to
     acquire the account lease a second time, while retaining this module's
-    canonical root, hidden-stage, and atomic-write validation.
+    canonical root, saved-settings, and atomic-write validation.
     """
 
     selected_paths = (
@@ -966,7 +919,6 @@ def save_configuration_owned(
     )
     candidate = validate_configuration_candidate(
         specification_root,
-        hidden_stages,
         paths=selected_paths,
         stage_orders=stage_orders,
         stage_order=stage_order,
@@ -976,7 +928,6 @@ def save_configuration_owned(
     return _save_configuration(
         selected_paths,
         candidate.specification_root,
-        candidate.hidden_stages,
         candidate.stage_orders,
         candidate.completed_stages,
         deadline=deadline,
@@ -1005,7 +956,6 @@ def _configuration_revision(configuration: Configuration) -> str:
     return hashlib.sha256(
         _configuration_bytes(
             configuration.specification_root,
-            configuration.hidden_stages,
             configuration.stage_orders,
             configuration.completed_stages,
         )
@@ -1035,28 +985,22 @@ configuration_digest = configuration_revision
 
 def save_configuration(
     specification_root: str | os.PathLike[str],
-    hidden_stages: Iterable[str] | object = _OMITTED,
 ) -> Configuration:
     """Delegate configuration replacement through the runtime authorization gate."""
 
     from . import runtime
 
-    if hidden_stages is _OMITTED:
-        return runtime.setup(specification_root)
-    return runtime.setup(specification_root, hidden_stages=hidden_stages)
+    return runtime.setup(specification_root)
 
 
 def setup(
     specification_root: str | os.PathLike[str],
-    hidden_stages: Iterable[str] | object = _OMITTED,
 ) -> Configuration:
     """Delegate setup through the runtime authorization gate."""
 
     from . import runtime
 
-    if hidden_stages is _OMITTED:
-        return runtime.setup(specification_root)
-    return runtime.setup(specification_root, hidden_stages=hidden_stages)
+    return runtime.setup(specification_root)
 
 
 __all__ = [
@@ -1069,7 +1013,6 @@ __all__ = [
     "ConfigurationError",
     "ConfigurationObservation",
     "CompletedStageError",
-    "HiddenStageError",
     "StageOrderError",
     "LEGACY_CONFIG_SCHEMA_VERSION",
     "RUNTIME_STATES",

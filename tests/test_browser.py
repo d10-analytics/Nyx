@@ -69,7 +69,6 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
         "package_path": path,
         "project": project,
         "stage": stage,
-        "board_visible": lifecycle in {"under_development", "queue", "needs_fixes", "awaiting_retrospective"},
         "state": "complete",
         "declared": _declared(title, project),
         "diagnostics": [] if diagnostics is None else diagnostics,
@@ -93,18 +92,9 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
 
 
 def _reseal(value):
-    value["schema_version"] = 6
+    value["schema_version"] = 7
     value.setdefault("configuration_revision", "revision-1")
-    # Hand-built fixtures predate the terminal-row grouping, so a missing list
-    # means the fixture declares no completion policy.
-    value["visibility"].setdefault("terminal_stages", [])
-    entries = value["entries"]
-    value["visibility"]["visible_entry_count"] = sum(
-        entry["board_visible"] for entry in entries
-    )
-    value["visibility"]["hidden_entry_count"] = sum(
-        not entry["board_visible"] for entry in entries
-    )
+    value.setdefault("terminal_stages", [])
     value["catalog_digest"] = canonical_digest(value)
     return value
 
@@ -139,8 +129,7 @@ def board_payload(*, titles=None):
                 {"project": "Beta", "stage": "Under_Development", "availability": "complete"},
             ],
         },
-        "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
-                        "visible_entry_count": 4, "hidden_entry_count": 0},
+        "terminal_stages": [],
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -211,9 +200,8 @@ def mixed_producer_root(tmp_path, *, target_stage="Queue"):
 class ScanningClient:
     """Use the real catalog producer for each browser request."""
 
-    def __init__(self, root, *, hidden_stages=()):
+    def __init__(self, root):
         self.root = root
-        self.hidden_stages = hidden_stages
         self.settings = None
         self.calls = 0
 
@@ -223,7 +211,6 @@ class ScanningClient:
         revision = self.settings.revision if self.settings is not None else None
         return parse_catalog(scan_catalog(
             self.root,
-            hidden_stages=self.hidden_stages,
             completed_stage_names=completed,
             configuration_revision=revision,
         ))
@@ -246,7 +233,7 @@ UNICODE_LOW = "\ue000"
 UNICODE_HIGH = "\U00010000"
 
 
-def lifecycle_payload(*, hidden_stages=()):
+def lifecycle_payload(*, completed_stages=()):
     entries = []
     for stage, lifecycle, _label, title in STAGE_ROWS:
         prerequisites = None
@@ -268,7 +255,6 @@ def lifecycle_payload(*, hidden_stages=()):
             "Fictional",
             prerequisites=prerequisites,
         )
-        entry["board_visible"] = stage not in hidden_stages
         if stage == "Done":
             entry["relationship"]["claims"] = [{
                 "name": "release",
@@ -286,11 +272,7 @@ def lifecycle_payload(*, hidden_stages=()):
                 for stage, *_rest in sorted(STAGE_ROWS)
             ],
         },
-        "visibility": {
-            "hidden_stages": list(hidden_stages),
-            "visible_entry_count": 0,
-            "hidden_entry_count": 0,
-        },
+        "terminal_stages": list(completed_stages),
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -303,12 +285,12 @@ def lifecycle_payload(*, hidden_stages=()):
 
 COMPACT_CARD = "123e4567-e89b-42d3-a456-426614174020"
 COMPACT_DEPENDENT = "123e4567-e89b-42d3-a456-426614174021"
-COMPACT_HIDDEN = "123e4567-e89b-42d3-a456-426614174022"
+COMPACT_COMPLETED = "123e4567-e89b-42d3-a456-426614174022"
 
 
 def compact_payload(*, extra_stage=False):
-    hidden_edge = _edge(COMPACT_HIDDEN, "release")
-    hidden_edge.update(
+    completed_edge = _edge(COMPACT_COMPLETED, "release")
+    completed_edge.update(
         observed_state="satisfied",
         observed_evidence_ref="sha256:" + "c" * 64,
         resolved_state="satisfied",
@@ -331,14 +313,14 @@ def compact_payload(*, extra_stage=False):
             "queue",
             "Visible dependent",
             "Alpha",
-            prerequisites=[visible_edge, hidden_edge],
+            prerequisites=[visible_edge, completed_edge],
         ),
         _entry(
-            COMPACT_HIDDEN,
-            "HiddenOnly/Done/hidden",
+            COMPACT_COMPLETED,
+            "Alpha/Done/completed",
             "Done",
-            "Hidden prerequisite",
-            "HiddenOnly",
+            "Completed prerequisite",
+            "Alpha",
         ),
     ]
     if extra_stage:
@@ -351,12 +333,12 @@ def compact_payload(*, extra_stage=False):
         ))
     entries.sort(key=lambda entry: entry["package_path"])
     stages = [
+        {"project": "Alpha", "stage": "Done", "availability": "complete"},
         {"project": "Alpha", "stage": "Partial", "availability": "incomplete"},
         {"project": "Alpha", "stage": "Queue", "availability": "complete"},
         {"project": "Alpha", "stage": "Review", "availability": "complete"},
         {"project": "Alpha", "stage": "Testing", "availability": "complete"},
         {"project": "EmptyProject", "stage": "Empty", "availability": "complete"},
-        {"project": "HiddenOnly", "stage": "Done", "availability": "complete"},
     ]
     if not extra_stage:
         stages.remove({"project": "Alpha", "stage": "Review", "availability": "complete"})
@@ -366,16 +348,11 @@ def compact_payload(*, extra_stage=False):
             "projects": [
                 {"name": "Alpha", "availability": "complete"},
                 {"name": "EmptyProject", "availability": "complete"},
-                {"name": "HiddenOnly", "availability": "complete"},
                 {"name": "ZeroProject", "availability": "complete"},
             ],
             "stages": stages,
         },
-        "visibility": {
-            "hidden_stages": ["Done"],
-            "visible_entry_count": 0,
-            "hidden_entry_count": 0,
-        },
+        "terminal_stages": ["Done"],
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [
@@ -407,7 +384,7 @@ def unicode_producer_payload():
             program_path.joinpath("program.md").write_text(
                 f"# malformed program {marker}\n", encoding="utf-8"
             )
-        payload = scan_catalog(root, hidden_stages=(UNICODE_LOW, UNICODE_HIGH))
+        payload = scan_catalog(root, completed_stage_names=(UNICODE_LOW, UNICODE_HIGH))
     value = json.loads(payload)
     return payload.encode("utf-8"), value
 
@@ -415,7 +392,7 @@ def unicode_producer_payload():
 def reversed_unicode_payload(payload, kind):
     value = json.loads(payload)
     if kind == "policy":
-        value["visibility"]["hidden_stages"].reverse()
+        value["terminal_stages"].reverse()
     elif kind == "path":
         value["entries"].reverse()
     else:
@@ -717,7 +694,7 @@ def test_card_copy_failure_shows_error_beside_card(open_page, tmp_path):
 
 def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_targets(open_page):
     settings = BrowserSettings(order=["Missing", "Done"], completed=["Done", "Absent"])
-    page = open_page(StaticClient(lifecycle_payload(hidden_stages=("Done",))), settings=settings)
+    page = open_page(StaticClient(lifecycle_payload(completed_stages=("Done",))), settings=settings)
     editor = page.locator("#stage-order-editor")
     editor.wait_for()
     assert editor.get_attribute("open") is None
@@ -917,7 +894,7 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
 
 def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_page, tmp_path):
     root, target_id, source_id = mixed_producer_root(tmp_path)
-    settings = BrowserSettings()
+    settings = BrowserSettings(completed=["Other"])
     client = ScanningClient(root)
     page = open_page(client, settings=settings)
 
@@ -927,6 +904,10 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     assert "needs: Target Alpha" in source.inner_text()
     assert "blocks: Dependent Beta" in target.inner_text()
     assert connection_pairs(page) == {(target_id, source_id)}
+    before = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
+                  if entry["package_id"] == source_id)
+    edge = next(edge for edge in before["relationship"]["prerequisites"] if edge["kind"] == "completion")
+    assert (edge["resolved_state"], edge["reason"]) == ("unsatisfied", "completion_unsatisfied")
 
     source.click()
     assert page.locator("#work-item-panel").count() == 0
@@ -939,6 +920,11 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     # the arrow from the target while terminal rows are hidden.
     playwright.expect(target).to_have_count(0, timeout=15000)
     assert connection_pairs(page) == set()
+    after = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
+                 if entry["package_id"] == source_id)
+    edge = next(edge for edge in after["relationship"]["prerequisites"] if edge["kind"] == "completion")
+    assert (edge["resolved_state"], edge["reason"]) == ("satisfied", "completion_satisfied")
+    assert source.locator(".link.unresolved").count() == 0
     assert source.locator(".dependency-indicator").count() == 0
     assert source.get_attribute("aria-pressed") == "true"
     assert page.locator("#work-item-panel").count() == 0
@@ -948,10 +934,10 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     assert connection_pairs(page) == {(target_id, source_id)}
 
 
-def test_real_producer_hidden_completion_target_keeps_context_without_card_or_rail(open_page, tmp_path):
+def test_real_producer_terminal_gated_completion_target_reveals_card_and_rail(open_page, tmp_path):
     root, target_id, source_id = mixed_producer_root(tmp_path, target_stage="Done")
     settings = BrowserSettings(completed=["Done"])
-    client = ScanningClient(root, hidden_stages=("Done",))
+    client = ScanningClient(root)
     page = open_page(client, settings=settings)
 
     assert page.locator(f'.card[data-package-id="{target_id}"]').count() == 0
@@ -959,6 +945,16 @@ def test_real_producer_hidden_completion_target_keeps_context_without_card_or_ra
     assert connection_pairs(page) == set()
     page.locator(f'.card[data-package-id="{source_id}"]').click()
     assert page.locator("#work-item-panel").count() == 0
+    source = page.locator(f'.card[data-package-id="{source_id}"]')
+    assert source.locator(".link.unresolved").count() == 0
+    value = client.fetch_catalog().as_dict()
+    dependent = next(entry for entry in value["entries"] if entry["package_id"] == source_id)
+    completion = next(edge for edge in dependent["relationship"]["prerequisites"] if edge["kind"] == "completion")
+    assert completion["resolved_state"] == "satisfied"
+    assert completion["reason"] == "completion_satisfied"
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert page.locator(f'.card[data-package-id="{target_id}"]').count() == 1
+    assert connection_pairs(page) == {(target_id, source_id)}
 
 
 def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_page, tmp_path):
@@ -983,7 +979,7 @@ def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_pa
     missing_edge = missing_entry["relationship"]["prerequisites"][0]
     assert (invalid_edge["kind"], invalid_edge["reason"]) == ("completion", "invalid_prerequisite")
     assert (missing_edge["kind"], missing_edge["reason"]) == ("completion", "missing_target")
-    assert parse_catalog(value).schema_version == 6
+    assert parse_catalog(value).schema_version == 7
 
     page = open_page(StaticClient(value))
     for package_id, reason in ((source_id, "invalid_prerequisite"),
@@ -1358,10 +1354,7 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     added["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(added)
     hidden = json.loads(json.dumps(added))
-    hidden["visibility"]["hidden_stages"].append("Queue")
-    for entry in hidden["entries"]:
-        if entry["stage"] == "Queue":
-            entry["board_visible"] = False
+    hidden["terminal_stages"].append("Queue")
     _reseal(hidden)
     removed = json.loads(board_payload())
     recreated = json.loads(json.dumps(added))
@@ -2172,6 +2165,7 @@ def test_selection_emphasizes_incoming_and_outgoing_arrows_and_restores_them(ope
 
 def routing_payload():
     value = json.loads(board_payload())
+    value["terminal_stages"] = ["Done"]
     far = "123e4567-e89b-42d3-a456-426614174004"
     unknown = "123e4567-e89b-42d3-a456-426614174005"
     value["entries"].extend([
@@ -2514,10 +2508,20 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
     assert client.calls == 3
 
 
-def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_context(
-    open_page,
+def test_real_producer_renders_all_seven_rows_and_finished_done_keeps_direct_context(
+    open_page, tmp_path,
 ):
-    page = open_page(StaticClient(lifecycle_payload()))
+    root = tmp_path / "seven-stages"
+    for stage, _lifecycle, _label, title in STAGE_ROWS:
+        body = f"# {title}\nPackage ID: {STAGE_IDS[stage]}\n"
+        if stage == "Queue":
+            body += f"Prerequisite: {STAGE_IDS['Done']} | release\n"
+        if stage == "Done":
+            body += "Claim: release | satisfied | sha256:" + "b" * 64 + "\n"
+        _write_package(root, "Fictional", stage, "package", STAGE_IDS[stage], body)
+    client = ScanningClient(root)
+    page = open_page(client)
+    assert client.fetch_catalog().as_dict()["terminal_stages"] == []
     ordered_rows = sorted(STAGE_ROWS)
     assert page.locator(".row-head").all_text_contents() == [label for _, _, label, _ in ordered_rows]
     assert page.locator("#board .card").count() == 7
@@ -2525,7 +2529,7 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
     ) == [[stage, title] for stage, _, _, title in ordered_rows]
 
-    hidden = json.loads(lifecycle_payload(hidden_stages=("Done",)))
+    hidden = json.loads(lifecycle_payload(completed_stages=("Done",)))
     queue_path = "Fictional/Queue/package"
     done_path = "Fictional/Done/package"
     hidden_page = open_page(StaticClient(hidden))
@@ -2544,14 +2548,14 @@ def test_show_all_snapshot_renders_all_seven_rows_and_hidden_done_keeps_direct_c
     assert hidden_page.locator("#work-item-panel").count() == 0
 
 
-def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page):
+def test_compact_view_uses_inventory_axes_and_preserves_gated_context(open_page):
     page = open_page(StaticClient(compact_payload()))
     compact = page.get_by_label("Hide empty rows and columns", exact=True)
     assert compact.is_checked()
     assert page.locator(".column-head").all_text_contents() == ["Alpha"]
     assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert page.locator('.card[data-package-path="Alpha/Testing/custom"]').count() == 1
-    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+    assert page.locator('.card[data-package-path="Alpha/Done/completed"]').count() == 0
     assert "incomplete / unavailable" in page.locator(
         '.board-row[data-lifecycle="Partial"] .row-head'
     ).inner_text()
@@ -2559,7 +2563,7 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
     dependent.click()
     assert page.locator("#work-item-panel").count() == 0
-    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+    assert page.locator('.card[data-package-path="Alpha/Done/completed"]').count() == 0
 
     compact.uncheck()
     assert not compact.is_checked()
@@ -2572,15 +2576,14 @@ def test_compact_view_uses_inventory_axes_and_preserves_hidden_context(open_page
     assert page.locator('.board-row[data-lifecycle="Empty"] .empty').all_text_contents() == [
         "—", "—", "—"
     ]
-    assert page.locator('.card[data-package-path="HiddenOnly/Done/hidden"]').count() == 0
+    assert page.locator('.card[data-package-path="Alpha/Done/completed"]').count() == 0
 
 
 def test_no_eligible_stage_state_keeps_projects_when_compaction_is_disabled(open_page):
     value = json.loads(compact_payload())
-    hidden = sorted(stage["stage"] for stage in value["inventory"]["stages"])
-    value["visibility"]["hidden_stages"] = hidden
-    for entry in value["entries"]:
-        entry["board_visible"] = False
+    value["inventory"] = {"projects": [{"name": "ZeroProject", "availability": "complete"}], "stages": []}
+    value["entries"] = []
+    value["terminal_stages"] = []
     _reseal(value)
     page = open_page(StaticClient(value))
     assert page.get_by_text("Empty folders are hidden", exact=False).count() == 1
@@ -2596,7 +2599,7 @@ def test_compact_view_keeps_incomplete_project_when_no_stage_is_discoverable(ope
         "projects": [{"name": "UnreadableProject", "availability": "incomplete"}],
         "stages": [],
     }
-    value["visibility"]["hidden_stages"] = []
+    value["terminal_stages"] = []
     value["entries"] = []
     _reseal(value)
 
@@ -2723,7 +2726,7 @@ def test_compact_preference_uses_storage_and_checked_fallback(open_page, storage
 
 def test_terminal_rows_hide_and_show_with_the_checkbox(open_page):
     value = json.loads(lifecycle_payload())
-    value["visibility"]["terminal_stages"] = ["Archive", "Done"]
+    value["terminal_stages"] = ["Archive", "Done"]
     _reseal(value)
     page = open_page(StaticClient(value))
 
@@ -2744,7 +2747,7 @@ def test_terminal_rows_hide_and_show_with_the_checkbox(open_page):
 
 def test_terminal_preference_uses_storage_and_checked_fallback(open_page):
     value = json.loads(lifecycle_payload())
-    value["visibility"]["terminal_stages"] = ["Archive", "Done"]
+    value["terminal_stages"] = ["Archive", "Done"]
     _reseal(value)
 
     page = open_page(StaticClient(value))
@@ -2775,21 +2778,6 @@ def test_terminal_preference_uses_storage_and_checked_fallback(open_page):
     assert blocked.get_by_label("Hide terminal rows", exact=True).is_checked()
 
 
-def test_hidden_stage_stays_hidden_when_terminal_rows_are_revealed(open_page):
-    # Hiding a stage is a separate, data-layer policy.  A stage that is both
-    # hidden and finished must stay off the board even after the terminal gate
-    # is opened, which is why the two concepts are not merged.
-    value = json.loads(lifecycle_payload(hidden_stages=("Done",)))
-    value["visibility"]["terminal_stages"] = ["Done"]
-    _reseal(value)
-    page = open_page(StaticClient(value))
-
-    terminal = page.get_by_label("Hide terminal rows", exact=True)
-    assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
-    terminal.uncheck()
-    assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
-    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 0
-
 
 def test_terminal_only_board_explains_hidden_finished_rows(open_page):
     value = json.loads(lifecycle_payload())
@@ -2798,7 +2786,7 @@ def test_terminal_only_board_explains_hidden_finished_rows(open_page):
         stage for stage in value["inventory"]["stages"] if stage["stage"] in keep
     ]
     value["entries"] = [entry for entry in value["entries"] if entry["stage"] in keep]
-    value["visibility"]["terminal_stages"] = ["Archive", "Done"]
+    value["terminal_stages"] = ["Archive", "Done"]
     _reseal(value)
     page = open_page(StaticClient(value))
 
@@ -2835,9 +2823,11 @@ def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     assert page.locator('.board-row[data-lifecycle="Review"]').count() == 1
 
 
-def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_page):
+def test_pending_removed_entry_snapshot_clears_selection_only_after_apply(open_page):
     first = lifecycle_payload()
-    second = lifecycle_payload(hidden_stages=("Done",))
+    second = json.loads(lifecycle_payload())
+    second["entries"] = [entry for entry in second["entries"] if entry["stage"] != "Done"]
+    _reseal(second)
     page = open_page(SequenceClient([first, second]))
     done = page.locator('.card[data-package-path="Fictional/Done/package"]')
     done.click()
@@ -2859,7 +2849,7 @@ def test_pending_done_hidden_snapshot_clears_selection_only_after_apply(open_pag
 
 def test_real_producer_scalar_policy_paths_and_diagnostics_are_displayed(open_page):
     payload, value = unicode_producer_payload()
-    assert value["visibility"]["hidden_stages"] == [UNICODE_LOW, UNICODE_HIGH]
+    assert value["terminal_stages"] == [UNICODE_LOW, UNICODE_HIGH]
     diagnostics = value["program_coverage"]["diagnostics"]
     assert [item["code"] for item in diagnostics] == ["invalid_package", "invalid_package"]
     assert diagnostics[0]["message"] < diagnostics[1]["message"]
@@ -2914,8 +2904,8 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
 
 def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     valid = json.loads(lifecycle_payload())
-    duplicate = json.loads(lifecycle_payload(hidden_stages=("Done",)))
-    duplicate["visibility"]["hidden_stages"] = ["Done", "Done"]
+    duplicate = json.loads(lifecycle_payload(completed_stages=("Done",)))
+    duplicate["terminal_stages"] = ["Done", "Done"]
     _reseal(duplicate)
     assert duplicate["catalog_digest"] == canonical_digest(duplicate)
 
@@ -2939,13 +2929,18 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
 
 
 @pytest.mark.parametrize("mutate", [
-    lambda value: value["visibility"].update(terminal_stages=["Done", "Done"]),
-    lambda value: value["visibility"].update(terminal_stages=["Done", "Archive"]),
-    lambda value: value["visibility"].pop("terminal_stages"),
+    lambda value: value.update(terminal_stages=["Done", "Done"]),
+    lambda value: value.update(terminal_stages=["Done", "Archive"]),
+    lambda value: value.pop("terminal_stages"),
+    lambda value: value.update(schema_version=6),
+    lambda value: value.update(visibility={}),
+    lambda value: value["entries"][0].update(board_visible=True),
 ])
 def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_page, mutate):
     valid = json.loads(lifecycle_payload())
     invalid = json.loads(lifecycle_payload())
+    for entry in invalid["entries"]:
+        entry["declared"]["title"] = "Rejected refresh content"
     mutate(invalid)
     invalid["catalog_digest"] = canonical_digest(invalid)
 
@@ -2962,6 +2957,12 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
         )
 
     assert page.locator("#board .card").count() == 7
+    assert page.locator(".row-head").all_text_contents() == [
+        label for _stage, _lifecycle, label, _title in sorted(STAGE_ROWS)
+    ]
+    assert page.locator(".board-row").evaluate_all(
+        "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
+    ) == [[stage, title] for stage, _lifecycle, _label, title in sorted(STAGE_ROWS)]
     assert page.locator("#refresh").inner_text() == "Refresh view"
 
 

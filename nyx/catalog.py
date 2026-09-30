@@ -13,30 +13,11 @@ from pathlib import Path
 from .state import (
     CompletedStageError,
     _validate_completed_stage_names,
-    _validate_hidden_stages,
 )
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
-_OMITTED = object()
 _INVALID_POLICY = object()
 
-CATALOG_LIFECYCLE_DIRECTORIES = {
-    "Under_Development": "under_development",
-    "Queue": "queue",
-    "In_Progress": "in_progress",
-    "Needs_Fixes": "needs_fixes",
-    "Awaiting_Retrospective": "awaiting_retrospective",
-    "Done": "done",
-    "Archive": "archive",
-}
-CATALOG_BOARD_LIFECYCLES = {
-    "under_development", "queue", "needs_fixes", "awaiting_retrospective",
-}
-CATALOG_HIDDEN_STAGES = sorted(
-    directory
-    for directory, lifecycle in CATALOG_LIFECYCLE_DIRECTORIES.items()
-    if lifecycle not in CATALOG_BOARD_LIFECYCLES
-)
 _IGNORED_ROOT_SYMLINK_NAMES = {"CLAUDE.md", "CODEX.md"}
 _IGNORED_PROJECT_SYMLINK_NAME = "template_spec.md"
 _SAFE_COMPONENT_MAX = 1024
@@ -76,13 +57,6 @@ _PROVENANCE = re.compile(
 _HEADER_FIELD = re.compile(
     r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Completion Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
 )
-
-
-def _catalog_policy(hidden_stages: Iterable[str] | object) -> tuple[str, ...]:
-    """Return the canonical policy, retaining the omitted-call legacy default."""
-    if hidden_stages is _OMITTED:
-        return tuple(CATALOG_HIDDEN_STAGES)
-    return _validate_hidden_stages(hidden_stages)
 
 
 def _completion_policy(
@@ -988,7 +962,6 @@ def _render_entry(
     identity_complete: bool,
     program_index: dict[str, list[dict[str, object]]],
     program_coverage_complete: bool,
-    hidden_stages: tuple[str, ...],
     completion_policy: tuple[str, ...] | None,
     completion_policy_valid: bool,
 ) -> dict[str, object]:
@@ -1083,7 +1056,6 @@ def _render_entry(
         "package_path": package_path,
         "project": project,
         "stage": stage,
-        "board_visible": stage not in hidden_stages,
         "state": record["state"],
         "declared": record["declared"],
         "diagnostics": diagnostics,
@@ -1095,12 +1067,10 @@ def _render_entry(
 def _build_catalog(
     spec_root: Path,
     *,
-    hidden_stages: Iterable[str] | object = _OMITTED,
     completed_stage_names: Iterable[str] | None = None,
     configuration_revision: str | None = None,
 ) -> str:
     """Build the relationship catalog from one captured scan."""
-    policy = _catalog_policy(hidden_stages)
     completion_policy_value = _completion_policy(completed_stage_names)
     completion_policy_valid = completion_policy_value is not _INVALID_POLICY
     completion_policy = (
@@ -1113,14 +1083,9 @@ def _build_catalog(
     # display grouping only: the board keeps finished rows on the page and the
     # "Hide terminal rows" control decides whether they are shown.
     #
-    # This is deliberately *not* merged with the hidden-stage policy.  Hiding a
-    # stage is a display choice; marking one finished is a workflow assertion
-    # that satisfies whole-item completion dependencies.  Collapsing the two
-    # would let a purely visual action silently satisfy a dependency, and the
-    # hidden policy is account-wide while the completion policy is saved per
-    # workspace root.  When a stage is both hidden and terminal, hidden keeps
-    # precedence: its entries are not emitted as board rows, and the browser
-    # filters hidden stages before it considers the terminal grouping.
+    # Marking a stage finished is a workflow assertion that satisfies whole-item
+    # completion dependencies.  The policy is saved per workspace root; the
+    # browser-local row control changes only the displayed board.
     #
     # The completion policy is already canonical (sorted and unique) because it
     # comes from ``_validate_completed_stage_names``.  An invalid or absent
@@ -1280,28 +1245,7 @@ def _build_catalog(
             for descriptor in program_index.get(program_id, []):
                 descriptor.setdefault("member_package_ids", []).append(record.get("package_id"))
 
-    board = [record for record in records if record["stage"] not in policy]
-    visible_ids = {
-        row["target_package_id"]
-        for record in board
-        for row in (record["relationship"]["prerequisites"] if record["relationship"] else [])
-        if row["target_package_id"] is not None
-    }
-    projected = list(board)
-    for target_id in sorted(visible_ids):
-        candidates = index.get(target_id, [])
-        if len(candidates) != 1:
-            continue
-        target = candidates[0]
-        if (
-            target.get("package_id") != target_id
-            or target.get("relationship") is None
-            or target["stage"] not in policy
-        ):
-            continue
-        if target not in projected:
-            projected.append(target)
-    projected.sort(key=lambda record: str(record["package_path"]))
+    records.sort(key=lambda record: str(record["package_path"]))
     entries = [
         _render_entry(
             record,
@@ -1309,15 +1253,14 @@ def _build_catalog(
             identity_complete,
             program_index,
             program_coverage_complete,
-            policy,
             completion_policy,
             completion_policy_valid,
         )
-        for record in projected
+        for record in records
     ]
     emitted_program_ids = {
         record["relationship"]["program"]["program_id"]
-        for record in projected
+        for record in records
         if record.get("relationship")
         and record["relationship"]["program"].get("program_id") is not None
     }
@@ -1345,19 +1288,14 @@ def _build_catalog(
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 6,
+        "schema_version": 7,
         "catalog_digest": None,
         "configuration_revision": configuration_revision,
         "inventory": {
             "projects": inventory_projects,
             "stages": inventory_stages,
         },
-        "visibility": {
-            "hidden_stages": list(policy),
-            "terminal_stages": list(terminal_stages),
-            "visible_entry_count": len(board),
-            "hidden_entry_count": len(records) - len(board),
-        },
+        "terminal_stages": list(terminal_stages),
         "identity_coverage": {"state": "complete" if identity_complete else "incomplete", "diagnostics": identity_diagnostics},
         "program_coverage": {
             "state": "complete" if program_coverage_complete else "incomplete",
@@ -1381,15 +1319,12 @@ def _build_catalog(
 def build_catalog(
     spec_root: Path,
     *,
-    hidden_stages: Iterable[str] | object = _OMITTED,
     completed_stage_names: Iterable[str] | None = None,
     configuration_revision: str | None = None,
 ) -> str:
     """Build the deterministic catalog without shared validation hooks."""
-    policy = _catalog_policy(hidden_stages)
     return _build_catalog(
         spec_root,
-        hidden_stages=policy,
         completed_stage_names=completed_stage_names,
         configuration_revision=configuration_revision,
     )
@@ -1398,15 +1333,12 @@ def build_catalog(
 def scan_catalog(
     spec_root: Path,
     *,
-    hidden_stages: Iterable[str] | object = _OMITTED,
     completed_stage_names: Iterable[str] | None = None,
     configuration_revision: str | None = None,
 ) -> str:
     """Build the deterministic catalog."""
-    policy = _catalog_policy(hidden_stages)
     return _build_catalog(
         spec_root,
-        hidden_stages=policy,
         completed_stage_names=completed_stage_names,
         configuration_revision=configuration_revision,
     )

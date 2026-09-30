@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 LIFECYCLES = frozenset(
     {
@@ -73,7 +73,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "catalog_digest",
         "configuration_revision",
         "inventory",
-        "visibility",
+        "terminal_stages",
         "identity_coverage",
         "program_coverage",
         "discovery_diagnostics",
@@ -87,7 +87,6 @@ _ENTRY_KEYS = frozenset(
         "package_path",
         "project",
         "stage",
-        "board_visible",
         "state",
         "declared",
         "diagnostics",
@@ -138,9 +137,6 @@ _COMPLETION_EDGE_KEYS = frozenset(
 )
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
-_VISIBILITY_KEYS = frozenset(
-    {"hidden_stages", "terminal_stages", "visible_entry_count", "hidden_entry_count"}
-)
 _INVENTORY_KEYS = frozenset({"projects", "stages"})
 _INVENTORY_PROJECT_KEYS = frozenset({"name", "availability"})
 _INVENTORY_STAGE_KEYS = frozenset({"project", "stage", "availability"})
@@ -224,7 +220,6 @@ class CatalogEntry:
     package_path: str
     project: str
     stage: str
-    board_visible: bool
     declared: dict[str, str | None]
     diagnostics: tuple[Diagnostic, ...]
     state: str = "complete"
@@ -249,7 +244,6 @@ class CatalogEntry:
             "package_path": self.package_path,
             "project": self.project,
             "stage": self.stage,
-            "board_visible": self.board_visible,
             "state": self.state,
             "relationship": self.relationship_data or {
                 "participation": "available" if self.direct_prerequisite_state != "relationship_unavailable" else "legacy",
@@ -277,7 +271,7 @@ class Catalog:
     entries: tuple[CatalogEntry, ...]
     discovery_diagnostics: tuple[Diagnostic, ...]
     catalog_digest: str
-    visibility: dict[str, Any]
+    terminal_stages: tuple[str, ...]
     identity_coverage: dict[str, Any]
     program_coverage: dict[str, Any]
     programs: tuple[dict[str, Any], ...]
@@ -298,7 +292,7 @@ class Catalog:
             "program_coverage": self.program_coverage,
             "programs": [dict(item) for item in self.programs],
             "schema_version": self.schema_version,
-            "visibility": dict(self.visibility),
+            "terminal_stages": list(self.terminal_stages),
         }
         if not include_digest:
             result.pop("catalog_digest")
@@ -500,34 +494,16 @@ def _inventory(value: Any) -> tuple[dict[str, Any], set[str], set[tuple[str, str
     return {"projects": projects, "stages": stages}, project_names, stage_pairs
 
 
-def _visibility(value: Any) -> tuple[tuple[str, ...], tuple[str, ...], int, int]:
-    item = _object(value, "visibility")
-    _keys(item, _VISIBILITY_KEYS, "visibility")
-    hidden = item["hidden_stages"]
-    if type(hidden) is not list:
-        raise ProtocolError("visibility.hidden_stages must be a list")
-    hidden_stages = tuple(_component(stage, f"visibility.hidden_stages[{index}]") for index, stage in enumerate(hidden))
-    if list(hidden_stages) != sorted(hidden_stages) or len(hidden_stages) != len(set(hidden_stages)):
-        raise ProtocolError("visibility.hidden_stages must be unique and sorted")
-    # Terminal stages carry the account's completion policy to the browser as a
-    # display grouping.  They are intentionally allowed to overlap the hidden
-    # list: the browser applies the hidden policy first, so a stage that is both
-    # hidden and terminal stays hidden.  Producers that have no completion
-    # policy emit an empty list.
-    terminal = item["terminal_stages"]
-    if type(terminal) is not list:
-        raise ProtocolError("visibility.terminal_stages must be a list")
+def _terminal_stages(value: Any) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise ProtocolError("terminal_stages must be a list")
     terminal_stages = tuple(
-        _component(stage, f"visibility.terminal_stages[{index}]")
-        for index, stage in enumerate(terminal)
+        _component(stage, f"terminal_stages[{index}]")
+        for index, stage in enumerate(value)
     )
     if list(terminal_stages) != sorted(terminal_stages) or len(terminal_stages) != len(set(terminal_stages)):
-        raise ProtocolError("visibility.terminal_stages must be unique and sorted")
-    visible = item["visible_entry_count"]
-    concealed = item["hidden_entry_count"]
-    if type(visible) is not int or visible < 0 or type(concealed) is not int or concealed < 0:
-        raise ProtocolError("visibility counts must be nonnegative integers")
-    return hidden_stages, terminal_stages, visible, concealed
+        raise ProtocolError("terminal_stages must be unique and sorted")
+    return terminal_stages
 
 
 def _claims(value: Any, name: str) -> None:
@@ -707,9 +683,6 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     package_id = _uuid4(item["package_id"], f"entries[{index}].package_id", nullable=True)
     project = _component(item["project"], f"entries[{index}].project")
     stage = _component(item["stage"], f"entries[{index}].stage")
-    board_visible = item["board_visible"]
-    if type(board_visible) is not bool:
-        raise ProtocolError(f"entries[{index}].board_visible must be a boolean")
     state = _string(item["state"], f"entries[{index}].state")
     if state not in _STATES:
         raise ProtocolError(f"entries[{index}] has an invalid state")
@@ -734,7 +707,6 @@ def _entry(value: Any, index: int) -> CatalogEntry:
         package_path=package_path,
         project=project,
         stage=stage,
-        board_visible=board_visible,
         declared=declared_values,
         diagnostics=_diagnostics(item["diagnostics"], f"entries[{index}].diagnostics"),
         state=state,
@@ -795,7 +767,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         "configuration_revision",
         nullable=True,
     )
-    hidden_stages, terminal_stages, visible_count, hidden_count = _visibility(catalog["visibility"])
+    terminal_stages = _terminal_stages(catalog["terminal_stages"])
     inventory, _project_names, inventory_pairs = _inventory(catalog["inventory"])
     for name in ("identity_coverage", "program_coverage"):
         _coverage(catalog[name], name)
@@ -807,12 +779,6 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
     paths = [item.package_path for item in entries]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ProtocolError("entries must be unique and path-sorted")
-    if sum(item.board_visible for item in entries) != visible_count:
-        raise ProtocolError("visibility.visible_entry_count does not match entries")
-    if hidden_count < sum(not item.board_visible for item in entries):
-        raise ProtocolError("visibility.hidden_entry_count is below emitted hidden entries")
-    if any(item.board_visible == (item.stage in hidden_stages) for item in entries):
-        raise ProtocolError("entry board visibility conflicts with hidden stage policy")
     if type(catalog["programs"]) is not list:
         raise ProtocolError("programs must be a list")
     program_ids = [
@@ -828,12 +794,7 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         entries=entries,
         discovery_diagnostics=diagnostics,
         catalog_digest=digest,
-        visibility={
-            "hidden_stages": list(hidden_stages),
-            "terminal_stages": list(terminal_stages),
-            "visible_entry_count": visible_count,
-            "hidden_entry_count": hidden_count,
-        },
+        terminal_stages=terminal_stages,
         identity_coverage=dict(catalog["identity_coverage"]),
         program_coverage=dict(catalog["program_coverage"]),
         programs=tuple(dict(program) for program in catalog["programs"]),

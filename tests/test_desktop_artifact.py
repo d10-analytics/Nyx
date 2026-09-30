@@ -23,7 +23,7 @@ import pytest
 
 from nyx import state
 from nyx._native_claim import NativeClaim
-from nyx.catalog import CATALOG_HIDDEN_STAGES, scan_catalog
+from nyx.catalog import scan_catalog
 from nyx.worker import CatalogWorkerManager
 
 _ARTIFACT_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
@@ -43,9 +43,6 @@ PORT = 8765
 _HOST = f"127.0.0.1:{PORT}"
 _START_TIMEOUT = 90.0
 _SOURCE_ROOT = Path(__file__).parents[1]
-# The delivered application must apply the persisted policy exactly, so the
-# written configuration and every expected catalog use the same hidden stages.
-_DELIVERED_HIDDEN_STAGES: tuple[str, ...] = tuple(CATALOG_HIDDEN_STAGES)
 
 
 class ArtifactLayout:
@@ -123,10 +120,8 @@ def _sanitized_environment(home: Path, decoy: Path) -> dict[str, str]:
 def _write_configuration(
     home: Path,
     workspace: Path,
-    *,
-    hidden_stages: tuple[str, ...] = _DELIVERED_HIDDEN_STAGES,
 ) -> tuple[Path, state.Configuration]:
-    configuration = state.Configuration(workspace.resolve(), hidden_stages)
+    configuration = state.Configuration(workspace.resolve())
     config_directory = home / ".nyx" / "config"
     config_directory.mkdir(parents=True, exist_ok=True)
     config_file = config_directory / "config.json"
@@ -146,7 +141,6 @@ def _write_configuration(
 def _expected_catalog(configuration: state.Configuration) -> str:
     return scan_catalog(
         configuration.specification_root,
-        hidden_stages=configuration.hidden_stages,
         completed_stage_names=configuration.completed_stage_names,
         configuration_revision=configuration.revision,
     )
@@ -437,7 +431,6 @@ def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
                 json.dumps(
                     {
                         "schema_version": 99,
-                        "hidden_stages": [],
                         "specification_root": str(root),
                     }
                 ).encode("utf-8"),
@@ -448,7 +441,6 @@ def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
                 json.dumps(
                     {
                         "schema_version": state.CONFIG_SCHEMA_VERSION,
-                        "hidden_stages": list(_DELIVERED_HIDDEN_STAGES),
                         "specification_root": str(root),
                     }
                 ).encode("utf-8")

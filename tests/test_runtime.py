@@ -58,7 +58,7 @@ def test_application_runtime_provider_admits_schema_six_and_rejects_schema_four(
 
         application.workers = Workers(payload.encode("utf-8"))
         admitted = application._provider()
-        assert admitted.schema_version == 6
+        assert admitted.schema_version == 7
         assert admitted.configuration_revision is None
 
         legacy = json.loads(payload)
@@ -977,9 +977,45 @@ def test_failed_start_cleanup_retains_resistant_worker_until_later_completion():
         assert application.workers.active_count == 0
 
 
+def _owner_schema_two(paths, specification_root):
+    root = str(specification_root.resolve())
+    payload = {
+        "schema_version": 2,
+        "specification_root": root,
+        "hidden_stages": [],
+        "stage_orders": {root: ["Under_Development", "Queue", "In_Progress",
+                                "Needs_Fixes", "Awaiting_Retrospective", "Done", "Archive"]},
+        "completed_stages": {root: ["Archive", "Done"]},
+    }
+    paths.config_file.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return payload
+
+
+def test_schema_two_owner_settings_rewrite_only_on_setup_with_equal_revision():
+    with TemporaryDirectory() as temporary:
+        paths, home, specification_root = _fixture(Path(temporary))
+        expected = _owner_schema_two(paths, specification_root)
+        before = paths.config_file.read_bytes()
+        loaded = state.load_configuration(paths)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            observed = state.observe_configuration()
+        assert observed.configuration == loaded
+        assert observed.status == "configured"
+        assert paths.config_file.read_bytes() == before
+        with patch.object(runtime, "_paths", return_value=paths):
+            rewritten = runtime.setup(specification_root)
+        expected.pop("hidden_stages")
+        expected["schema_version"] = 3
+        assert json.loads(paths.config_file.read_bytes()) == expected
+        assert rewritten.stage_orders == loaded.stage_orders
+        assert rewritten.completed_stages == loaded.completed_stages
+        assert rewritten.revision == loaded.revision == state.configuration_revision(paths)
+
+
 def test_application_settings_save_conflict_and_restart_persistence():
     with TemporaryDirectory() as temporary:
         paths, _, specification_root = _fixture(Path(temporary))
+        expected = _owner_schema_two(paths, specification_root)
         initial = state.load_configuration(paths)
         application = runtime.ApplicationRuntime(
             port=runtime.PORT, deadline=time.monotonic() + 5
@@ -992,6 +1028,11 @@ def test_application_settings_save_conflict_and_restart_persistence():
         assert saved["outcome"] == "success"
         assert saved["order"] == ["Done", "Queue"]
         assert saved["completed"] == ["Done"]
+        expected.pop("hidden_stages")
+        expected["schema_version"] = 3
+        expected["stage_orders"][str(specification_root.resolve())] = ["Done", "Queue"]
+        expected["completed_stages"][str(specification_root.resolve())] = ["Done"]
+        assert json.loads(paths.config_file.read_bytes()) == expected
         assert application.save_settings(initial.revision, ["Archive"])["outcome"] == "conflict"
         assert state.load_configuration(paths).stage_order == ("Done", "Queue")
         assert state.load_configuration(paths).completed_stage_names == ("Done",)
@@ -1982,6 +2023,7 @@ def test_held_lease_allows_same_root_setup_without_mutation():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 configuration = runtime.setup(first)
+            assert configuration == state.Configuration(first.resolve())
         finally:
             lease.close()
         assert configuration.specification_root == first.resolve()
@@ -2078,65 +2120,26 @@ def test_held_lease_setup_rejects_expiry_after_real_configuration_admission():
         _assert_claim_available(lease_path)
 
 
-def test_held_lease_excludes_changed_hidden_stage_policy_without_mutation():
-    with TemporaryDirectory() as temporary:
-        paths, _, first = _fixture(Path(temporary))
-        with patch.object(runtime, "_paths", return_value=paths):
-            runtime.setup(first, ["Queue"])
-        before = paths.config_file.read_bytes()
-        lease = runtime._lease_lock(paths, timeout=0.0)
-        assert lease.acquire(blocking=False)
-        try:
-            with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
-                runtime.ActiveInstanceError
-            ):
-                runtime.setup(first, ["Other"])
-        finally:
-            lease.close()
-        assert paths.config_file.read_bytes() == before
-        assert state.load_configuration(paths).hidden_stages == ("Queue",)
-
-
-def test_held_lease_allows_identical_hidden_stage_policy_without_mutation():
-    with TemporaryDirectory() as temporary:
-        paths, _, first = _fixture(Path(temporary))
-        with patch.object(runtime, "_paths", return_value=paths):
-            runtime.setup(first, ["Queue"])
-        before = paths.config_file.read_bytes()
-        lease = runtime._lease_lock(paths, timeout=0.0)
-        assert lease.acquire(blocking=False)
-        try:
-            with patch.object(runtime, "_paths", return_value=paths):
-                configuration = runtime.setup(first, ["Queue", "Queue"])
-        finally:
-            lease.close()
-        assert configuration.hidden_stages == ("Queue",)
-        assert paths.config_file.read_bytes() == before
-
-
 @pytest.mark.parametrize("alias", [state.setup, state.save_configuration])
-@pytest.mark.parametrize("requested", ["root", "policy"])
-def test_held_lease_rejects_changed_root_or_policy_through_state_aliases(alias, requested):
+def test_held_lease_rejects_changed_root_through_state_aliases(alias):
     with TemporaryDirectory() as temporary:
         paths, _, first = _fixture(Path(temporary))
         second = Path(temporary) / "second"
         second.mkdir()
         with patch.object(runtime, "_paths", return_value=paths):
-            runtime.setup(first, ["Queue"])
+            runtime.setup(first)
         before = paths.config_file.read_bytes()
         lease = runtime._lease_lock(paths, timeout=0.0)
         assert lease.acquire(blocking=False)
         try:
-            arguments = (second, ["Queue"]) if requested == "root" else (first, ["Other"])
             with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
                 runtime.ActiveInstanceError
             ):
-                alias(*arguments)
+                alias(second)
         finally:
             lease.close()
         assert paths.config_file.read_bytes() == before
         assert state.load_configuration(paths).specification_root == first.resolve()
-        assert state.load_configuration(paths).hidden_stages == ("Queue",)
 
 
 def test_active_schema_one_identity_preserves_legacy_bytes():
@@ -2152,9 +2155,9 @@ def test_active_schema_one_identity_preserves_legacy_bytes():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 configuration = runtime.setup(first)
+            assert configuration == state.Configuration(first.resolve())
         finally:
             lease.close()
-        assert configuration.hidden_stages == ()
         assert paths.config_file.read_bytes() == before
 
 
@@ -2173,9 +2176,9 @@ def test_active_schema_one_identity_preserves_noncanonical_legacy_bytes():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 configuration = runtime.setup(first)
+            assert configuration == state.Configuration(first.resolve())
         finally:
             lease.close()
-        assert configuration.hidden_stages == ()
         assert paths.config_file.read_bytes() == before
 
 

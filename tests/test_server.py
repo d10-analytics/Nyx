@@ -32,7 +32,7 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 6,
+        "schema_version": 7,
         "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -41,9 +41,7 @@ def raw_catalog():
                 {"project": "Fictional", "stage": "Under_Development", "availability": "complete"},
             ],
         },
-        "visibility": {"hidden_stages": ["Archive", "Done", "In_Progress"],
-                        "terminal_stages": [],
-                        "visible_entry_count": 2, "hidden_entry_count": 0},
+        "terminal_stages": [],
         "identity_coverage": {"state": "complete", "diagnostics": []},
         "program_coverage": {"state": "complete", "diagnostics": []},
         "discovery_diagnostics": [],
@@ -57,7 +55,6 @@ def raw_catalog():
             "package_path": path,
             "project": path.split("/")[0],
             "stage": path.split("/")[1],
-            "board_visible": True,
             "state": "complete",
             "declared": {"title": title, "target_project": "Fictional",
                          "status": "ready", "closure": "approved",
@@ -125,12 +122,20 @@ def valid_catalog():
     return parse_catalog(raw_catalog())
 
 
-def test_default_provider_uses_unselected_scanner():
-    payload = json.dumps(raw_catalog(), separators=(",", ":"))
-    with patch.object(server, "scan_catalog", return_value=payload) as scanner:
-        result = server._default_provider()
-    assert result == valid_catalog()
-    scanner.assert_called_once_with(server.Path.cwd())
+def test_default_provider_uses_real_scanner_and_emits_every_stage(tmp_path, monkeypatch):
+    stages = ("Archive", "Awaiting_Retrospective", "Done", "In_Progress",
+              "Needs_Fixes", "Queue", "Under_Development")
+    for stage in stages:
+        package = tmp_path / "Fictional" / stage / "item"
+        package.mkdir(parents=True)
+        (package / "spec.md").write_text(f"# {stage}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    result = server._default_provider().as_dict()
+    assert result["terminal_stages"] == []
+    assert [entry["package_path"] for entry in result["entries"]] == [
+        f"Fictional/{stage}/item" for stage in stages
+    ]
+    assert all("board_visible" not in entry for entry in result["entries"])
 
 
 @pytest.mark.parametrize(
@@ -139,17 +144,22 @@ def test_default_provider_uses_unselected_scanner():
         lambda value: value.update(schema_version=3),
         lambda value: value.update(schema_version=4),
         lambda value: value.update(schema_version=5),
+        lambda value: value.update(schema_version=6),
         lambda value: value.pop("configuration_revision"),
         lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
-        lambda value: value["entries"][0].update(board_visible="true"),
+        lambda value: value["entries"][0].update(board_visible=True),
+        lambda value: value.update(visibility={}),
+        lambda value: value.pop("terminal_stages"),
+        lambda value: value.update(terminal_stages=["Done", "Archive"]),
+        lambda value: value.update(terminal_stages=["Done", "Done"]),
         lambda value: value["entries"][0].update(stage="Done"),
         lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(kind="completion"),
         lambda value: value["entries"][0].update(
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-3", "schema-4", "schema-5", "missing-revision", "malformed-revision", "unknown-key", "nonboolean-visibility", "policy-mismatch", "cross-kind-edge", "transitive-reference"],
+    ids=["schema-3", "schema-4", "schema-5", "schema-6", "missing-revision", "malformed-revision", "unknown-key", "old-entry-field", "old-object", "missing-terminal", "unsorted-terminal", "duplicate-terminal", "inventory-mismatch", "cross-kind-edge", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
@@ -170,7 +180,7 @@ def test_schema_four_parser_rejects_bad_digest_even_when_shape_is_valid():
     lambda catalog: replace(catalog, schema_version=3),
     lambda catalog: replace(
         catalog,
-        entries=(replace(catalog.entries[0], board_visible="yes"), *catalog.entries[1:]),
+        terminal_stages=("Done", "Done"),
     ),
 ])
 def test_catalog_object_providers_are_revalidated_as_schema_four(alter):

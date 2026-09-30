@@ -29,11 +29,12 @@ remains available in the [sample walkthrough](examples/sample-specifications/REA
 The board brings work from multiple projects into one view, with project columns
 and rows for planning, queued work, implementation, fixes, review, completion,
 and archived work. Dependency connections help you follow relationships within
-and across projects, while card details explain the recorded prerequisites.
+and across projects through prerequisite and dependent links on cards.
 
 Search helps you find work by its title, project, or program—a named group of
-related specifications. You can hide stages to focus on active work and still
-inspect a hidden prerequisite through a visible card's details.
+related specifications. Mark finished stages in **Board settings** and use
+**Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
+rows and their dependency connections.
 
 Your plans stay in files you can edit, keep in version control, and use with
 other tools. On Linux, Nyx runs locally as a background service and opens in
@@ -53,18 +54,18 @@ Linux (POSIX shell):
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install .
-.venv/bin/nyx --setup examples/sample-specifications --show-all-stages
+.venv/bin/nyx --setup examples/sample-specifications
 .venv/bin/nyx
 .venv/bin/nyx --status
 .venv/bin/nyx --stop
 ```
 
-Open **http://127.0.0.1:8765/**. Select **Build the route preview** to see why
-its prerequisite is not yet satisfied, then compare it with **Plan the route
-preview**. The [sample walkthrough](examples/sample-specifications/README.md)
+Open **http://127.0.0.1:8765/**. Uncheck **Hide terminal rows** and select
+**Build the route preview** or **Plan the route preview** to highlight their
+connections to the API contract. The [sample walkthrough](examples/sample-specifications/README.md)
 explains the fictional software project, its custom stage, and the compact-view
 workflow. For a non-programming example, the [workspace guide](docs/workspaces.md)
-also shows a fictional community event with a hidden permit work item and two
+also shows a fictional community event with a finished permit work item and two
 recorded outcomes.
 
 Throughout the linked guides, bare `nyx` is shorthand for the console installed
@@ -76,8 +77,8 @@ When files change, Nyx checks for an update every ten seconds. Click **Apply
 update** when it appears to load the new view. **Refresh view** checks immediately
 when no update is waiting. Use the stop command above when you are finished.
 
-Setup saves the workspace location and configured stage visibility for your
-account on this host. These setup choices are separate from the browser's personal
+Setup saves the workspace location for your account on this host. This setup
+choice is separate from the browser's personal
 **Hide empty rows and columns** and **Hide terminal rows** preferences, which are
 stored only in that browser. The **Board row order** editor saves its order in the same account-local
 configuration, shared by that account's browser and desktop views. The saved order
@@ -93,7 +94,7 @@ Simple completion dependencies use an explicit `Completion Prerequisite: UUID`
 header and a literal set of stage names that you choose in **Board settings**.
 For example, selecting `Done` makes a work item in the literal `Done` stage
 count as finished for this workspace. Nyx does not infer completion from a row
-name, row order, hidden status, cancellation, or Archive, and it never treats a
+name, row order, cancellation, or Archive, and it never treats a
 completed stage as evidence verification. The setting is saved in the
 account-local configuration for the current workspace root, so another root can
 use a different policy and returning to this root restores its own choice.
@@ -104,11 +105,9 @@ The same finished-stage selection drives the board's **Hide terminal rows**
 control in the top bar. It starts checked, so rows for finished stages are hidden
 until you reveal them, and the preference lives in the browser like **Hide empty
 rows and columns**. This is presentation only: it never changes setup, the
-catalog, or which dependencies are satisfied. It is also deliberately separate
-from stage hiding. Hiding a stage removes its rows and cards from the catalog
-before the browser sees them, while marking a stage finished only groups its rows
-as terminal. A stage that is both hidden and finished therefore stays hidden even
-when you uncheck **Hide terminal rows**.
+catalog, or which dependencies are satisfied. Every discovered stage has rows in
+the catalog; **Hide terminal rows** is the only control that hides populated
+stage rows. Unchecking it reveals finished rows and their cards.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor
@@ -179,7 +178,7 @@ Nyx itself does not launch agents or execute the work described by a specificati
 
 - [Sample walkthrough](examples/sample-specifications/README.md): explore a small project.
 - [Your specification workspace](docs/workspaces.md): create and organize your own work.
-- [Running Nyx](docs/running-nyx.md): start, stop, check status, and choose visible stages.
+- [Running Nyx](docs/running-nyx.md): start, stop, check status, and configure board settings.
 - [Specification reference](docs/specification-reference.md): metadata, programs, and dependencies.
 
 Nyx serves one local account on the fixed loopback address. The browser

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -83,6 +84,10 @@ def test_real_setup_cli_uses_portable_state_layout(capsys):
             runtime_directory=home / ".nyx" / "runtime",
         )
         assert paths.config_file.is_file()
+        assert json.loads(paths.config_file.read_bytes()) == {
+            "schema_version": 3,
+            "specification_root": str(specification.resolve()),
+        }
         assert paths.runtime_directory.is_dir()
         assert not (home / ".config" / "nyx").exists()
         assert not (home / ".local" / "state" / "nyx").exists()
@@ -101,31 +106,23 @@ def test_expired_start_cli_reports_bounded_error_without_creating_state(capsys):
         assert capsys.readouterr().err == "nyx: Nyx startup timed out\n"
 
 
-def test_setup_replaces_hidden_stage_policy_from_repeated_options(capsys):
-    class Configuration:
-        specification_root = "/private/spec-root"
-
-    with patch.object(runtime, "setup", return_value=Configuration()) as setup:
-        assert cli.main(["--setup", "/input/link", "--hide-stage", "Queue", "--hide-stage", "Done"]) == 0
-
-    setup.assert_called_once_with("/input/link", hidden_stages=["Queue", "Done"])
-    assert "configured /private/spec-root" in capsys.readouterr().out
-
-
-def test_setup_can_explicitly_clear_hidden_stage_policy(capsys):
-    class Configuration:
-        specification_root = "/private/spec-root"
-
-    with patch.object(runtime, "setup", return_value=Configuration()) as setup:
-        assert cli.main(["--setup", "/input/link", "--show-all-stages"]) == 0
-
-    setup.assert_called_once_with("/input/link", hidden_stages=())
-    assert "configured /private/spec-root" in capsys.readouterr().out
-
-
-def test_hidden_stage_options_are_setup_only():
-    with pytest.raises(SystemExit):
-        cli.main(["--hide-stage", "Queue"])
+@pytest.mark.parametrize("flag", [["--hide-stage", "Done"], ["--show-all-stages"]])
+@pytest.mark.parametrize("with_setup", [False, True])
+def test_removed_stage_options_are_unrecognized_without_mutating_state(tmp_path, capsys, flag, with_setup):
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home):
+        state.setup(workspace)
+        paths = state.state_paths()
+        before = paths.config_file.read_bytes()
+        arguments = (["--setup", str(workspace)] if with_setup else []) + flag
+        with pytest.raises(SystemExit) as error:
+            cli.main(arguments)
+        assert error.value.code == 2
+        assert "unrecognized arguments:" in capsys.readouterr().err
+        assert paths.config_file.read_bytes() == before
 
 
 def test_help_names_the_configured_location_workspace_and_preserves_spec_root(
@@ -136,13 +133,14 @@ def test_help_names_the_configured_location_workspace_and_preserves_spec_root(
 
     assert error.value.code == 0
     captured = capsys.readouterr()
+    assert "--hide-stage" not in captured.out
+    assert "--show-all-stages" not in captured.out
     assert "--setup SPEC_ROOT" in captured.out
     assert "configure the Workspace at SPEC_ROOT" in captured.out
     assert captured.err == ""
 
 
-@pytest.mark.parametrize("requested", ["root", "policy"])
-def test_active_setup_rejects_changed_root_or_policy_without_cli_mutation(capsys, requested):
+def test_active_setup_rejects_changed_root_without_cli_mutation(capsys):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -154,15 +152,13 @@ def test_active_setup_rejects_changed_root_or_policy_without_cli_mutation(capsys
         with patch.object(state, "resolve_account_home", return_value=home), patch.object(
             state, "_current_uid", return_value=state._current_uid()
         ):
-            state.setup(first, ["Queue"])
+            state.setup(first)
             paths = state.state_paths()
         lease = runtime._lease_lock(paths, timeout=0.0)
         assert lease.acquire(blocking=False)
         before = paths.config_file.read_bytes()
         try:
-            arguments = ["--setup", str(second)] if requested == "root" else [
-                "--setup", str(first), "--hide-stage", "Other"
-            ]
+            arguments = ["--setup", str(second)]
             with patch.object(runtime, "_paths", return_value=paths):
                 assert cli.main(arguments) == 1
         finally:
@@ -177,7 +173,6 @@ def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifec
     configuration = state.ConfigurationObservation(
         "configured",
         specification_root=Path("/private/spec\n-root\x1b[31m\u0085"),
-        hidden_stages=("Done", "Queue\n\u0085"),
     )
     runtime_observation = runtime.RuntimeObservation("not_running")
     with patch.object(state, "observe_configuration", return_value=configuration) as observe_config, patch.object(
@@ -196,7 +191,6 @@ def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifec
     assert captured.out.splitlines() == [
         "Configuration: configured",
         f"Workspace: {cli._json_literal(str(configuration.specification_root))}",
-        'Hidden stages: ["Done", "Queue\\n\\u0085"]',
         "Runtime: not running",
     ]
     assert captured.err == ""
@@ -218,7 +212,6 @@ def test_status_running_prints_verified_url_after_runtime(capsys):
     assert captured.out.splitlines() == [
         "Configuration: not configured",
         "Workspace: not configured",
-        "Hidden stages: not configured",
         "Runtime: running",
         'URL: "http://127.0.0.1:8765/\\n"',
     ]
@@ -241,7 +234,6 @@ def test_status_keeps_runtime_result_when_configuration_is_unavailable(capsys):
     assert captured.out.splitlines() == [
         "Configuration: unavailable",
         "Workspace: unavailable",
-        "Hidden stages: unavailable",
         "Runtime: running",
         f'URL: "{runtime.URL}"',
         "Diagnostic: configuration unavailable",
@@ -272,7 +264,6 @@ def test_status_collapses_malformed_persisted_root_and_preserves_runtime_sibling
         assert captured.out.splitlines() == [
             "Configuration: unavailable",
             "Workspace: unavailable",
-            "Hidden stages: unavailable",
             "Runtime: not running",
             "Diagnostic: configuration unavailable",
         ]
@@ -284,7 +275,7 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     capsys,
 ):
     configuration = state.ConfigurationObservation(
-        "configured", specification_root=Path("/private/spec"), hidden_stages=()
+        "configured", specification_root=Path("/private/spec")
     )
     runtime_observation = runtime.RuntimeObservation(
         "unknown", diagnostic="raw runtime exception"
@@ -298,7 +289,6 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     assert captured.out.splitlines() == [
         "Configuration: configured",
         f"Workspace: {cli._json_literal(str(configuration.specification_root))}",
-        "Hidden stages: []",
         "Runtime: unknown",
         "Diagnostic: runtime state unavailable",
     ]
@@ -311,8 +301,8 @@ def test_status_keeps_configuration_result_when_runtime_is_unknown_and_bounds_di
     [
         (["--status", "--setup", "/tmp/spec"], "argument --setup: not allowed with argument --status"),
         (["--status", "--stop"], "argument --stop: not allowed with argument --status"),
-        (["--status", "--hide-stage", "Queue"], "--hide-stage and --show-all-stages require --setup"),
-        (["--status", "--show-all-stages"], "--hide-stage and --show-all-stages require --setup"),
+        (["--status", "--hide-stage", "Queue"], "unrecognized arguments:"),
+        (["--status", "--show-all-stages"], "unrecognized arguments:"),
     ],
 )
 def test_status_rejects_other_commands_before_observing(arguments, error_fragment, capsys):
@@ -354,7 +344,6 @@ def test_status_orders_configuration_and_runtime_diagnostics_after_both_observat
     assert captured.out.splitlines() == [
         "Configuration: unavailable",
         "Workspace: unavailable",
-        "Hidden stages: unavailable",
         "Runtime: unknown",
         "Diagnostic: configuration unavailable",
         "Diagnostic: runtime control timed out",
@@ -382,10 +371,6 @@ def test_desktop_console_launches_the_owned_application(monkeypatch):
         ["--setup", "/tmp/spec"],
         ["--status"],
         ["--stop"],
-        ["--setup", "/tmp/spec", "--hide-stage", "Queue"],
-        ["--setup", "/tmp/spec", "--show-all-stages"],
-        ["--hide-stage", "Queue"],
-        ["--show-all-stages"],
     ],
 )
 def test_desktop_console_refuses_retired_commands_before_any_lifecycle(
@@ -423,7 +408,7 @@ def test_desktop_console_refusal_leaves_configuration_and_state_untouched(
             state.setup(specification)
             paths = state.state_paths()
         before = paths.config_file.read_bytes()
-        assert cli.main(["--setup", str(specification), "--show-all-stages"]) == 2
+        assert cli.main(["--setup", str(specification)]) == 2
         assert cli.main(["--status"]) == 2
         assert cli.main(["--stop"]) == 2
         assert paths.config_file.read_bytes() == before
