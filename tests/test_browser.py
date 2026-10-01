@@ -777,11 +777,11 @@ def test_empty_click_preference_is_available_without_saved_settings_and_persists
     assert not blocked.get_by_role("checkbox", name="Click empty space to deselect").is_checked()
 
 
-def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_snapshot(open_page):
+def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board(open_page):
     first = dependency_state_payload("unsatisfied")
-    stale = dependency_state_payload("unsatisfied")
-    fresh = dependency_state_payload("satisfied")
-    client = BlockingSequenceClient([first, first, stale, fresh, fresh], blocked_call=3)
+    stale = dependency_state_payload("unsatisfied", titles={"gate": "Stale gate"})
+    fresh = dependency_state_payload("satisfied", titles={"gate": "Fresh gate"})
+    client = BlockingSequenceClient([first, first, stale, stale, fresh], blocked_call=3)
     settings = BrowserSettings()
     page_a = open_page(client, settings=settings)
     page_b = open_page(client, settings=settings)
@@ -799,12 +799,22 @@ def test_post_save_refresh_rejects_late_other_revision_and_keeps_last_accepted_s
     page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
     page_b.get_by_role("button", name="Save").click()
-    assert page_a.locator(".dependency-indicator").count() == 0
+    gate_title = page_a.locator(f'.card[data-package-id="{GATE}"] .card-title')
+    playwright.expect(gate_title).to_have_text("Gate step")
+    page_a.evaluate("""() => {
+      window.sawRejectedSnapshot = false;
+      new MutationObserver(() => {
+        if (document.querySelector('#board').textContent.includes('Stale gate')) {
+          window.sawRejectedSnapshot = true;
+        }
+      }).observe(document.querySelector('#board'), {childList: true, subtree: true});
+    }""")
     client.release.set()
 
     page_b.get_by_text("Board row order saved.", exact=True).wait_for()
     page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
-    assert page_a.locator(".dependency-indicator").count() == 0
+    playwright.expect(gate_title).to_have_text("Fresh gate")
+    assert page_a.evaluate("window.sawRejectedSnapshot") is False
     assert settings.completed == []
 
 
@@ -869,7 +879,7 @@ def coherent_refresh_payload():
     return value
 
 
-def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_together(open_page):
+def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(open_page):
     client = SequenceClient([dependency_state_payload("unsatisfied"), coherent_refresh_payload()])
     settings = BrowserSettings()
     page = open_page(client, settings=settings)
@@ -881,7 +891,6 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
     page.get_by_text("Board row order saved.", exact=True).wait_for()
 
     gate = page.locator(f'.card[data-package-id="{GATE}"]')
-    assert gate.locator(".dependency-indicator").count() == 0
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert "blocks:" in step_two.locator(".card-links").inner_text()
     assert "loose package" in step_two.locator(".card-links").inner_text()
@@ -892,7 +901,7 @@ def test_successful_save_updates_detail_needs_blocks_and_target_pair_rail_togeth
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
 
 
-def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_page, tmp_path):
+def test_real_producer_completion_policy_save_hides_finished_target_and_rail(open_page, tmp_path):
     root, target_id, source_id = mixed_producer_root(tmp_path)
     settings = BrowserSettings(completed=["Other"])
     client = ScanningClient(root)
@@ -900,7 +909,6 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
 
     source = page.locator(f'.card[data-package-id="{source_id}"]')
     target = page.locator(f'.card[data-package-id="{target_id}"]')
-    assert source.locator(".dependency-indicator").count() == 0
     assert "needs: Target Alpha" in source.inner_text()
     assert "blocks: Dependent Beta" in target.inner_text()
     assert connection_pairs(page) == {(target_id, source_id)}
@@ -910,7 +918,6 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     assert (edge["resolved_state"], edge["reason"]) == ("unsatisfied", "completion_unsatisfied")
 
     source.click()
-    assert page.locator("#work-item-panel").count() == 0
 
     open_stage_editor(page)
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
@@ -925,9 +932,7 @@ def test_real_producer_mixed_edges_save_policy_and_render_distinct_details(open_
     edge = next(edge for edge in after["relationship"]["prerequisites"] if edge["kind"] == "completion")
     assert (edge["resolved_state"], edge["reason"]) == ("satisfied", "completion_satisfied")
     assert source.locator(".link.unresolved").count() == 0
-    assert source.locator(".dependency-indicator").count() == 0
     assert source.get_attribute("aria-pressed") == "true"
-    assert page.locator("#work-item-panel").count() == 0
 
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
     assert target.count() == 1
@@ -944,7 +949,6 @@ def test_real_producer_terminal_gated_completion_target_reveals_card_and_rail(op
     assert page.locator(f'.card[data-package-id="{source_id}"]').count() == 1
     assert connection_pairs(page) == set()
     page.locator(f'.card[data-package-id="{source_id}"]').click()
-    assert page.locator("#work-item-panel").count() == 0
     source = page.locator(f'.card[data-package-id="{source_id}"]')
     assert source.locator(".link.unresolved").count() == 0
     value = client.fetch_catalog().as_dict()
@@ -982,10 +986,10 @@ def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_pa
     assert parse_catalog(value).schema_version == 7
 
     page = open_page(StaticClient(value))
-    for package_id, reason in ((source_id, "invalid_prerequisite"),
-                               ("123e4567-e89b-42d3-a456-426614174014", "missing_target")):
-        page.locator(f'.card[data-package-id="{package_id}"]').click()
-        assert page.locator("#work-item-panel").count() == 0
+    for package_id in (source_id, "123e4567-e89b-42d3-a456-426614174014"):
+        card = page.locator(f'.card[data-package-id="{package_id}"]')
+        playwright.expect(card).to_have_count(1)
+        playwright.expect(card.locator(".link.unresolved")).to_have_text("unresolved target")
 
 
 CLAIM_EDGE_REASONS = [
@@ -1040,7 +1044,6 @@ def test_browser_admits_every_python_valid_typed_edge_reason(open_page, kind, re
     assert parse_catalog(value).entries
     page = open_page(StaticClient(value))
     assert page.locator(f'.card[data-package-id="{GATE}"]').count() == 1
-    assert page.locator("#work-item-panel").count() == 0
 
 
 def malformed_typed_edge_payload(case):
@@ -1112,7 +1115,6 @@ def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_p
     page.get_by_role("button", name="Save").click()
     assert client.started.wait(timeout=5)
     settings.switch_root()
-    assert page.locator(".dependency-indicator").count() == 0
     assert page.locator("#stage-order-list .stage-order-item[data-stage='Under_Development']").locator(
         ".stage-completed-toggle"
     ).is_checked()
@@ -1162,7 +1164,6 @@ def test_markup_shaped_stage_names_are_escaped_with_independent_controls(open_pa
 
 def test_board_renders_lifecycle_rows_and_project_columns(open_page):
     page = open_page(StaticClient(board_payload()))
-    assert page.locator(".toolbar h1, .toolbar #status").count() == 0
     assert page.get_by_label("Search", exact=True).is_visible()
     assert page.locator(".brand-name").inner_text() == "Nyx"
     assert page.locator(".brand-attribution").inner_text() == "by D10 Analytics"
@@ -1255,22 +1256,24 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
                expanded_toolbar["height"]) < 2
 
 
-def test_old_format_review_fields_stay_searchable_without_panel(open_page):
+def test_old_format_review_fields_stay_searchable_and_card_keyboard_selectable(open_page):
     value = json.loads(board_payload())
     value["entries"][1]["declared"].update(
-        closure="approved", sanity_recommendation="PROCEED_TO_DESIGN",
-        human_sanity_decision="AFFIRMED", status="ready",
+        closure="zq-closure", sanity_recommendation="zq-recommendation",
+        human_sanity_decision="zq-decision", status="zq-status",
     )
     _reseal(value)
     page = open_page(StaticClient(value))
-    page.fill("#filter", "proceed_to_design")
-    assert page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').count() == 1
-    page.fill("#filter", "")
     card = page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]')
+    gate = page.locator(f'.card[data-package-id="{GATE}"]')
+    for term in ("zq-status", "zq-closure", "zq-recommendation", "zq-decision"):
+        page.fill("#filter", term)
+        playwright.expect(card).to_be_visible()
+        playwright.expect(gate).to_be_hidden()
+    page.fill("#filter", "")
     card.focus()
     page.keyboard.press("Enter")
     assert card.get_attribute("aria-pressed") == "true"
-    assert page.locator("#work-item-panel").count() == 0
 
 
 def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(open_page):
@@ -1289,7 +1292,6 @@ def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(op
     assert loose.locator(".card-filepath").inner_text() == (
         "Filepath: Beta/Under_Development/loose"
     )
-    assert page.locator("#work-item-panel").count() == 0
 
 
 def test_card_titles_are_escaped_and_never_render_markup(open_page):
@@ -1702,33 +1704,6 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     assert page.locator("#board-issues").count() == 0
 
 
-@pytest.mark.parametrize(
-    ("participation", "state", "unblocked"),
-    [
-        ("available", "no_declared_prerequisites", False),
-        ("available", "unknown", True),
-        ("legacy", "relationship_unavailable", True),
-    ],
-)
-def test_cards_distinguish_confirmed_empty_from_unknown_or_unavailable_prerequisites(
-    open_page, participation, state, unblocked
-):
-    value = json.loads(board_payload())
-    relationship = value["entries"][0]["relationship"]
-    relationship.update(
-        participation=participation,
-        direct_prerequisite_state=state,
-        prerequisites=[],
-    )
-    _reseal(value)
-    page = open_page(StaticClient(value))
-    card = page.locator(f'.card[data-package-id="{GATE}"]')
-    card.click()
-
-    assert page.locator("#work-item-panel").count() == 0
-    assert card.locator(".dependency-indicator").count() == 0
-
-
 def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_refresh(open_page):
     first = json.loads(board_payload())
     first["discovery_diagnostics"] = [
@@ -1778,7 +1753,6 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
 
     assert page.locator("#board .card").count() == 0
     assert "Empty folders are hidden" in page.locator("#board .board-empty").inner_text()
-    assert page.locator("#work-item-panel").count() == 0
     page.locator("#board-issues summary").click()
     assert discovery_message in page.locator("#board-issues").inner_text()
     assert page.locator("#board-issues li").inner_text() == (
@@ -1817,16 +1791,14 @@ def test_card_color_follows_incoming_arrows_regardless_of_prerequisite_state(
     _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
-    assert card.locator(".dependency-indicator").count() == 0
     expected_color = DARK_CARD if edge_states else NO_INCOMING_CARD
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == expected_color
     card.click()
     assert "selected" in card.get_attribute("class").split()
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == expected_color
-    assert page.locator("#work-item-panel").count() == 0
 
 
-def test_refresh_changes_satisfied_dependency_indicator_and_details_to_unknown(open_page):
+def test_refresh_changing_only_incoming_edge_state_keeps_card_color(open_page):
     first = json.loads(board_payload())
     relationship = first["entries"][1]["relationship"]
     satisfied = _edge(STEP_TWO, "build")
@@ -1844,15 +1816,12 @@ def test_refresh_changes_satisfied_dependency_indicator_and_details_to_unknown(o
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
-    assert card.locator(".dependency-indicator").count() == 0
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
     card.click()
-    assert page.locator("#work-item-panel").count() == 0
     refresh = page.locator("#refresh")
     playwright.expect(refresh).to_have_text("Apply update", timeout=15000)
     refresh.click()
-    assert card.locator(".dependency-indicator").count() == 0
-    assert page.locator("#work-item-panel").count() == 0
+    playwright.expect(refresh).to_have_text("Refresh view")
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
 
@@ -2407,7 +2376,6 @@ def test_unavailable_or_invalid_saved_theme_keeps_page_and_selector_usable(
     page.get_by_label("Theme", exact=True).select_option("light")
     assert page.locator("html").get_attribute("data-theme") == "light"
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
-    assert page.locator("#work-item-panel").count() == 0
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
 
 
@@ -2508,7 +2476,7 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
     assert client.calls == 3
 
 
-def test_real_producer_renders_all_seven_rows_and_finished_done_keeps_direct_context(
+def test_real_producer_renders_all_seven_rows_and_finished_done_hides_provider_links_and_rail(
     open_page, tmp_path,
 ):
     root = tmp_path / "seven-stages"
@@ -2545,10 +2513,9 @@ def test_real_producer_renders_all_seven_rows_and_finished_done_keeps_direct_con
     assert hidden_page.locator(
         f'.connection[data-source="{STAGE_IDS["Done"]}"]'
     ).count() == 0
-    assert hidden_page.locator("#work-item-panel").count() == 0
 
 
-def test_compact_view_uses_inventory_axes_and_preserves_gated_context(open_page):
+def test_compact_view_uses_inventory_axes_and_keeps_gated_card_hidden_on_selection(open_page):
     page = open_page(StaticClient(compact_payload()))
     compact = page.get_by_label("Hide empty rows and columns", exact=True)
     assert compact.is_checked()
@@ -2562,7 +2529,6 @@ def test_compact_view_uses_inventory_axes_and_preserves_gated_context(open_page)
 
     dependent = page.locator('.card[data-package-path="Alpha/Queue/dependent"]')
     dependent.click()
-    assert page.locator("#work-item-panel").count() == 0
     assert page.locator('.card[data-package-path="Alpha/Done/completed"]').count() == 0
 
     compact.uncheck()
@@ -2867,7 +2833,18 @@ def test_real_producer_scalar_policy_paths_and_diagnostics_are_displayed(open_pa
         card = page.locator(f'.card[data-package-path="{path}"]')
         card.click()
         assert card.locator(".card-title").inner_text() == f"Diagnostic {marker}"
-        assert page.locator("#work-item-panel").count() == 0
+
+    rendered_diagnostics = page.locator("#board-issues li").all_text_contents()
+    expected_diagnostics = [
+        f"{item['code']} {item['message']}"
+        for item in (
+            value["discovery_diagnostics"]
+            + value["identity_coverage"]["diagnostics"]
+            + value["program_coverage"]["diagnostics"]
+        )
+    ]
+    assert rendered_diagnostics == expected_diagnostics
+    assert len(rendered_diagnostics) == 2
 
 
 @pytest.mark.parametrize("kind", ["policy", "path", "diagnostics"])
