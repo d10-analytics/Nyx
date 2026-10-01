@@ -799,6 +799,15 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
     page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
     page_b.get_by_role("button", name="Save").click()
+    # The competing save must commit, and its own catalog refresh must consume
+    # the next snapshot, before the delayed refresh is released; otherwise the
+    # delayed snapshot could be stamped with a revision that is still current.
+    page_b.get_by_text("Board row order saved.", exact=True).wait_for()
+    playwright.expect(
+        page_b.locator(f'.card[data-package-id="{GATE}"] .card-title')
+    ).to_have_text("Stale gate")
+    assert client.calls == 4
+    assert settings.revision == "revision-4"
     gate_title = page_a.locator(f'.card[data-package-id="{GATE}"] .card-title')
     playwright.expect(gate_title).to_have_text("Gate step")
     page_a.evaluate("""() => {
@@ -811,7 +820,6 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
     }""")
     client.release.set()
 
-    page_b.get_by_text("Board row order saved.", exact=True).wait_for()
     page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
     playwright.expect(gate_title).to_have_text("Fresh gate")
     assert page_a.evaluate("window.sawRejectedSnapshot") is False
