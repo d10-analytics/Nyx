@@ -86,8 +86,6 @@ body { margin: 0; min-width: 100%; width: max-content; }
 .brand-attribution { margin-top: .3rem; color: var(--toolbar-muted); font-size: .8rem; white-space: nowrap; }
 .toolbar-actions { display: flex; align-items: center; justify-content: flex-end; flex: 1; gap: 1rem; flex-wrap: wrap; min-width: 0; }
 h1, h2, h3, p { margin-top: 0; }
-h1 { margin-bottom: .25rem; font-size: 1.5rem; }
-.toolbar p { margin-bottom: 0; color: var(--toolbar-muted); }
 .controls { display: flex; align-items: center; justify-content: flex-end; gap: .6rem; flex-wrap: wrap; }
 #copy-status {
   position: fixed;
@@ -281,13 +279,6 @@ button.pending {
   --warning: #fff1cc;
   color: var(--heading);
   background: var(--no-incoming-arrow);
-}
-.card-status {
-  display: block;
-  margin-top: .35rem;
-  color: var(--muted);
-  font-size: .82rem;
-  font-weight: 700;
 }
 .card:hover, .card:focus { border-color: var(--focus-border); outline: 2px solid var(--focus-ring); }
 .card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--focus-ring), 0 2px 5px var(--selected-shadow); }
