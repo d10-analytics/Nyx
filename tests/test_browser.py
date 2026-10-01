@@ -890,7 +890,6 @@ def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board row order saved.", exact=True).wait_for()
 
-    gate = page.locator(f'.card[data-package-id="{GATE}"]')
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert "blocks:" in step_two.locator(".card-links").inner_text()
     assert "loose package" in step_two.locator(".card-links").inner_text()
