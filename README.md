@@ -17,7 +17,7 @@ files remain the shared record of the work, and Nyx provides a consistent place
 to follow it. Nyx reads your specifications and displays the result; it does
 not edit specifications or move them for you.
 
-![Nyx showing a fictional community event, with the festival plan selected and its permit outcomes available.](docs/images/sample-board.png)
+![Nyx showing a fictional community-event board in the light theme, with the neighborhood festival card selected.](docs/images/sample-board.png)
 
 *This fictional community-event view shows the board and a selected card in
 the light theme. The compact and expanded board views are documented in
