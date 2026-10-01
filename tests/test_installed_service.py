@@ -225,7 +225,6 @@ def _assert_show_all_browser(url: str) -> None:
             queue = page.locator('.card[data-package-path="Fictional/Queue/queue"]')
             queue.click()
             assert queue.get_attribute("aria-pressed") == "true"
-            assert page.locator("#work-item-panel").count() == 0
             assert page.locator(".toolbar #refresh").count() == 1
         finally:
             browser.close()

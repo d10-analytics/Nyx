@@ -36,12 +36,11 @@
     "target_changed_during_read", "target_invalid_identity", "self_edge",
     "invalid_prerequisite",
   ]);
-  // These fields remain part of the wire contract and searchable index. They
-  // are intentionally not all ordinary visible details.
+  // These fields are indexed for search. Only the title and target project
+  // are displayed.
   const DECLARED_FIELDS = [
-    ["title", "Title"], ["target_project", "Target project"], ["status", "Status"],
-    ["closure", "Closure"], ["sanity_recommendation", "Sanity recommendation"],
-    ["human_sanity_decision", "Human sanity decision"],
+    "title", "target_project", "status", "closure",
+    "sanity_recommendation", "human_sanity_decision",
   ];
   const SAFE_CATEGORIES = [
     "producer_unavailable", "producer_timeout", "producer_failed",
@@ -350,18 +349,6 @@
     return edges;
   }
 
-  function columnsFor(entries) {
-    const columns = new Map();
-    entries.forEach((entry) => {
-      const key = columnKeyOf(entry);
-      if (!columns.has(key)) columns.set(key, projectOf(entry));
-    });
-    return [...columns.entries()].sort((a, b) => {
-      if (a[0] === "" || b[0] === "") return a[0] === b[0] ? 0 : a[0] === "" ? 1 : -1;
-      return a[1].localeCompare(b[1]);
-    });
-  }
-
   function orderCell(cell, depth) {
     return [...cell].sort((a, b) => {
       const depthA = a.package_id ? depth.get(a.package_id) ?? 0 : 0;
@@ -399,7 +386,7 @@
   function searchText(entry) {
     return [
       entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title, entry.state,
-      ...DECLARED_FIELDS.map(([field]) => entry.declared[field]),
+      ...DECLARED_FIELDS.map((field) => entry.declared[field]),
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 

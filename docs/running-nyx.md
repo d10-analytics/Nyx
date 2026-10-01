@@ -185,7 +185,7 @@ directory.
 
 ## Read and refresh the board
 
-Use **Find** to search card metadata, including work item titles, projects,
+Use **Search** to search card metadata, including work item titles, projects,
 and program names. Cards show prerequisite and dependent links; selecting a card
 highlights its connections to other displayed cards. To see a provider in a
 finished row, uncheck **Hide terminal rows**.
@@ -297,8 +297,12 @@ repeatable browser session; it does not add a permanent screenshot framework.
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that
   a directory is empty.
-- **A card or dependency has a diagnostic:** inspect its `spec.md` header for a
-  missing or duplicated ID, a malformed field, or an unavailable prerequisite.
+- A dependency shows **unresolved target**, or a work item looks wrong: inspect
+  the involved `spec.md` headers for a missing or duplicated `Package ID`, a
+  malformed field, or a prerequisite naming a nonexistent item. The board does
+  not list problems inside individual specifications. **Workspace issues**
+  reports only directories, specification files, and program descriptors that
+  could not be read or identified.
   The [reference](specification-reference.md) explains the expected format.
 - **An edit has not appeared:** request a refresh and apply any pending update.
   If the catalog cannot be refreshed, the browser reports the problem; do not

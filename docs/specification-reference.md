@@ -14,7 +14,7 @@ Put metadata in that header, one field per line.
 | --- | --- |
 | `# Title` | The first top-level heading supplies the card title. |
 | `Package ID: UUID` | A stable, unique identity for the specification. |
-| `Status: text` | Optional reported text retained for search; it does not change the stage or appear in ordinary item details. |
+| `Status: text` | Optional reported text retained for search; it does not change the stage and is not shown on cards. |
 | `Target repo: path` | The final path component supplies the displayed target project. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
@@ -169,11 +169,13 @@ search. Board columns remain projects.
 
 ## Diagnostics
 
-Diagnostics identify problems reading or interpreting the workspace, such as
-unreadable files, duplicate IDs, invalid fields, or unresolved references.
-Inspect the affected specification and its prerequisites rather than inferring
-completion from an incomplete view. Uncheck **Hide terminal rows** to show
-providers in finished rows and their connections to dependent cards.
+**Workspace issues** lists unreadable directories, unreadable or invalid
+`spec.md` files, and invalid or duplicate program descriptors. A prerequisite
+that cannot be resolved to exactly one work item shows on the dependent card as
+**unresolved target**. Duplicate or malformed Package IDs and invalid claims or
+fields are otherwise not listed; inspect the affected specification headers
+rather than inferring completion from an incomplete view. Uncheck **Hide terminal
+rows** to show providers in finished rows and their connections to dependent cards.
 
 Discovery diagnostics also distinguish a safely identified but incomplete
 project or stage from a confirmed empty one. Inspect the affected directory and
