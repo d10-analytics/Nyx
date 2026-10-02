@@ -7,10 +7,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+from test_server import raw_catalog, reported_contract_cases
 
 from nyx.app_runtime import ApplicationRuntime
 from nyx.catalog import scan_catalog
-from nyx.models import canonical_digest, parse_catalog
+from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 from nyx.server import CatalogError, _create_application_server, create_server
 
 playwright = pytest.importorskip("playwright.sync_api")
@@ -30,9 +31,6 @@ LIGHT_CARD = "rgb(255, 255, 255)"
 
 def _declared(title, project):
     return {
-        "closure": "approved",
-        "human_sanity_decision": "AFFIRMED",
-        "sanity_recommendation": "PROCEED_TO_DESIGN",
         "status": "ready",
         "target_project": project,
         "title": title,
@@ -62,16 +60,14 @@ def _completion_edge(target_id, *, observed_stage=None, resolved_state="unknown"
     }
 
 
-def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diagnostics=None):
+def _entry(package_id, path, lifecycle, title, project, prerequisites=None):
     stage = path.split("/")[1]
     return {
         "package_id": package_id,
         "package_path": path,
         "project": project,
         "stage": stage,
-        "state": "complete",
         "declared": _declared(title, project),
-        "diagnostics": [] if diagnostics is None else diagnostics,
         "relationship": {
             "participation": "available",
             "claims": [],
@@ -83,16 +79,15 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None, diag
                 "program_id": None,
                 "title": None,
                 "resolution": "not_declared",
-                "diagnostics": [],
             },
-            "superseded_by": {"package_id": None, "resolution": "not_declared", "diagnostics": []},
+            "superseded_by": {"package_id": None, "resolution": "not_declared"},
         },
-        "transitive_diagnostics": [],
+        "reported_fields": [],
     }
 
 
 def _reseal(value):
-    value["schema_version"] = 7
+    value["schema_version"] = SCHEMA_VERSION
     value.setdefault("configuration_revision", "revision-1")
     value.setdefault("terminal_stages", [])
     value["catalog_digest"] = canonical_digest(value)
@@ -117,7 +112,7 @@ def _admit_inventory_stage(value, project, stage):
 def board_payload(*, titles=None):
     titles = titles or {}
     value = {
-        "schema_version": 4,
+        "schema_version": SCHEMA_VERSION,
         "inventory": {
             "projects": [
                 {"name": "Alpha", "availability": "complete"},
@@ -156,7 +151,6 @@ def board_payload(*, titles=None):
                 titles.get("step_two", "Dependent step"),
                 "Alpha",
                 prerequisites=[_edge(STEP_ONE, "build")],
-                diagnostics=[{"code": "invalid_package", "message": "example diagnostic"}],
             ),
             _entry(
                 LOOSE,
@@ -260,11 +254,10 @@ def lifecycle_payload(*, completed_stages=()):
                 "name": "release",
                 "state": "satisfied",
                 "evidence_ref": "sha256:" + "b" * 64,
-                "diagnostics": [],
             }]
         entries.append(entry)
     value = {
-        "schema_version": 4,
+        "schema_version": SCHEMA_VERSION,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
             "stages": [
@@ -343,7 +336,7 @@ def compact_payload(*, extra_stage=False):
     if not extra_stage:
         stages.remove({"project": "Alpha", "stage": "Review", "availability": "complete"})
     value = {
-        "schema_version": 4,
+        "schema_version": SCHEMA_VERSION,
         "inventory": {
             "projects": [
                 {"name": "Alpha", "availability": "complete"},
@@ -990,7 +983,7 @@ def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_pa
     missing_edge = missing_entry["relationship"]["prerequisites"][0]
     assert (invalid_edge["kind"], invalid_edge["reason"]) == ("completion", "invalid_prerequisite")
     assert (missing_edge["kind"], missing_edge["reason"]) == ("completion", "missing_target")
-    assert parse_catalog(value).schema_version == 7
+    assert parse_catalog(value).schema_version == SCHEMA_VERSION
 
     page = open_page(StaticClient(value))
     for package_id in (source_id, "123e4567-e89b-42d3-a456-426614174014"):
@@ -1263,20 +1256,25 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
                expanded_toolbar["height"]) < 2
 
 
-def test_old_format_review_fields_stay_searchable_and_card_keyboard_selectable(open_page):
-    value = json.loads(board_payload())
-    value["entries"][1]["declared"].update(
-        closure="zq-closure", sanity_recommendation="zq-recommendation",
-        human_sanity_decision="zq-decision", status="zq-status",
-    )
-    _reseal(value)
-    page = open_page(StaticClient(value))
-    card = page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]')
-    gate = page.locator(f'.card[data-package-id="{GATE}"]')
-    for term in ("zq-status", "zq-closure", "zq-recommendation", "zq-decision"):
+def test_reported_values_and_declared_slots_stay_searchable(open_page, tmp_path):
+    _write_package(tmp_path, "Alpha", "Queue", "searchable", STEP_ONE,
+                   f"# Searchable\nPackage ID: {STEP_ONE}\nOwner Note: awaiting budget\nClosure: approved\nStatus: zqstatus\nTarget repo: /work/zqtarget\n")
+    _write_package(tmp_path, "Alpha", "Queue", "other", STEP_TWO,
+                   f"# Other\nPackage ID: {STEP_TWO}\n")
+    value = json.loads(scan_catalog(tmp_path))
+    entry = next(entry for entry in value["entries"] if entry["package_id"] == STEP_ONE)
+    assert entry["reported_fields"] == [{"name": "Closure", "value": "approved"}, {"name": "Owner Note", "value": "awaiting budget"}]
+    assert entry["declared"]["status"] == "zqstatus"
+    assert entry["declared"]["target_project"] == "zqtarget"
+    page = open_page(ScanningClient(tmp_path))
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    other = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    for term in ("budget", "approved", "zqstatus", "zqtarget"):
         page.fill("#filter", term)
         playwright.expect(card).to_be_visible()
-        playwright.expect(gate).to_be_hidden()
+        playwright.expect(other).to_be_hidden()
+    assert "awaiting budget" not in card.inner_text()
+    assert "approved" not in card.inner_text()
     page.fill("#filter", "")
     card.focus()
     page.keyboard.press("Enter")
@@ -2916,7 +2914,7 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     lambda value: value.update(terminal_stages=["Done", "Done"]),
     lambda value: value.update(terminal_stages=["Done", "Archive"]),
     lambda value: value.pop("terminal_stages"),
-    lambda value: value.update(schema_version=6),
+    lambda value: value.update(schema_version=7),
     lambda value: value.update(visibility={}),
     lambda value: value["entries"][0].update(board_visible=True),
 ])
@@ -3048,3 +3046,111 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
     assert page.locator("#board .card").count() == 7
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
     assert page.locator("#refresh").inner_text() == "Refresh view"
+
+
+@pytest.mark.parametrize("value,accepted", reported_contract_cases())
+def test_reported_contract_at_browser_acceptance(open_page, monkeypatch, value, accepted):
+    from nyx import server as server_module
+
+    monkeypatch.setattr(server_module, "parse_catalog", lambda candidate: candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate))
+    assert value["catalog_digest"] == canonical_digest(value)
+    if accepted:
+        page = open_page(RawSequenceClient([value]))
+        assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
+        assert page.locator("#board-issues").count() == 0
+    else:
+        page = open_page(RawSequenceClient([raw_catalog(), value]))
+        assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
+        page.click("#refresh")
+        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
+        assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
+
+
+def test_real_screened_reported_and_declared_text_is_browser_safe(open_page, tmp_path):
+    long_value = "startword " + "a" * 1013 + "😀" + "b" * 66 + " tailword"
+    _write_package(tmp_path, "Alpha", "Queue", "long", STEP_ONE,
+                   f"# {'t' * 1100}\nPackage ID: {STEP_ONE}\nOwner Note: {long_value}\n")
+    _write_package(tmp_path, "Alpha", "Queue", "tabs", STEP_TWO,
+                   f"# Tab\ttitle\nPackage ID: {STEP_TWO}\nOwner Note: tab\tvalue\nStatus: tab\tstatus\n")
+    value = json.loads(scan_catalog(tmp_path))
+    first, second = value["entries"]
+    assert first["reported_fields"] == [{"name": "Owner Note", "value": long_value[:1023]}]
+    assert first["declared"]["title"] == "t" * 1024
+    assert second["declared"]["title"] == "Tab title"
+    assert second["declared"]["status"] == "tab status"
+    assert second["reported_fields"] == [{"name": "Owner Note", "value": "tab value"}]
+    assert parse_catalog(value).as_dict() == value
+    page = open_page(ScanningClient(tmp_path))
+    assert page.locator(".card").count() == 2
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    page.fill("#filter", "startword")
+    playwright.expect(card).to_be_visible()
+    page.fill("#filter", "tailword")
+    playwright.expect(card).to_be_hidden()
+
+
+@pytest.mark.parametrize("duplicate", [False, True], ids=["missing", "duplicate"])
+def test_real_unresolved_targets_do_not_draw_connections(open_page, tmp_path, duplicate):
+    _write_package(tmp_path, "Alpha", "Queue", "source", STEP_ONE,
+                   f"# Source\nPackage ID: {STEP_ONE}\nPrerequisite: {STEP_TWO} | release\nClaim: local | maybe\n")
+    if duplicate:
+        for name in ("target-a", "target-b"):
+            _write_package(tmp_path, "Alpha", "Queue", name, STEP_TWO,
+                           f"# Target\nPackage ID: {STEP_TWO}\nClaim: release | satisfied | sha256:{'a' * 64}\n")
+    value = json.loads(scan_catalog(tmp_path))
+    edge = value["entries"][0]["relationship"]["prerequisites"][0]
+    assert edge["reason"] == ("duplicate_target" if duplicate else "missing_target")
+    page = open_page(ScanningClient(tmp_path))
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    assert "unresolved target" in card.inner_text()
+    assert connection_pairs(page) == set()
+    page.fill("#filter", "partial")
+    playwright.expect(card).to_be_hidden()
+
+
+def test_real_workspace_issues_and_default_relationship_cards_render(open_page, tmp_path):
+    stage = tmp_path / "Alpha" / "Queue"
+    stage.mkdir(parents=True)
+    for name, data in (("empty", b""), ("invalid", b"\xff")):
+        folder = stage / name
+        folder.mkdir()
+        (folder / "spec.md").write_bytes(data)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (stage / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+    value = json.loads(scan_catalog(tmp_path))
+    assert value["identity_coverage"]["state"] == "incomplete"
+    assert parse_catalog(value).as_dict() == value
+    page = open_page(ScanningClient(tmp_path))
+    assert "discovery_unavailable" in page.locator("#board-issues").inner_text()
+    assert sorted(page.locator(".card").evaluate_all("cards => cards.map(card => card.dataset.packagePath)")) == ["Alpha/Queue/empty", "Alpha/Queue/invalid"]
+
+
+def test_worker_reported_snapshot_round_trips_into_browser(open_page, tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    from nyx import state, worker
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "workspace"
+    _write_package(root, "Alpha", "Queue", "worker", STEP_ONE,
+                   f"# Worker item\nPackage ID: {STEP_ONE}\nOwner Note: workersearch\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    state.setup(root)
+    output = io.BytesIO()
+    with monkeypatch.context() as capture:
+        capture.setattr(worker.sys, "stdout", SimpleNamespace(buffer=output))
+        assert worker._worker_main() == 0
+    value = json.loads(output.getvalue())
+    assert value["entries"][0]["reported_fields"] == [{"name": "Owner Note", "value": "workersearch"}]
+    assert parse_catalog(value).as_dict() == value
+    assert value["catalog_digest"] == canonical_digest(value)
+    page = open_page(StaticClient(value))
+    page.fill("#filter", "workersearch")
+    playwright.expect(page.locator(f'.card[data-package-id="{STEP_ONE}"]')).to_be_visible()

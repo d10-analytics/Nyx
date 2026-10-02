@@ -329,11 +329,11 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     import http.client
                     import json
                     import threading
-                    from nyx.models import canonical_digest
+                    from nyx.models import SCHEMA_VERSION, canonical_digest
                     from nyx.server import create_server
 
                     baseline = {
-                        "schema_version": 7,
+                        "schema_version": SCHEMA_VERSION,
                         "configuration_revision": None,
                         "inventory": {
                             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -402,7 +402,7 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 import json
                 import threading
                 import sys
-                from nyx.models import canonical_digest
+                from nyx.models import SCHEMA_VERSION, canonical_digest
                 from nyx.server import create_server
 
                 entry = {
@@ -410,16 +410,11 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     "package_path": "Fictional/Queue/installed-demo",
                     "project": "Fictional",
                     "stage": "Queue",
-                    "state": "complete",
                     "declared": {
                         "title": "Installed catalog entry",
                         "target_project": "Fictional",
                         "status": "ready",
-                        "closure": "approved",
-                        "sanity_recommendation": "PROCEED_TO_DESIGN",
-                        "human_sanity_decision": "AFFIRMED",
                     },
-                    "diagnostics": [],
                     "relationship": {
                         "participation": "available",
                         "claims": [],
@@ -429,18 +424,16 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                             "program_id": None,
                             "title": None,
                             "resolution": "not_declared",
-                            "diagnostics": [],
                         },
                         "superseded_by": {
                             "package_id": None,
                             "resolution": "not_declared",
-                            "diagnostics": [],
                         },
                     },
-                    "transitive_diagnostics": [],
+                    "reported_fields": [],
                 }
                 catalog = {
-                    "schema_version": 7,
+                    "schema_version": SCHEMA_VERSION,
                     "configuration_revision": None,
                     "inventory": {
                         "projects": [{"name": "Fictional", "availability": "complete"}],

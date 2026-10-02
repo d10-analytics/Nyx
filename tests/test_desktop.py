@@ -20,7 +20,7 @@ import pytest
 
 from nyx import _native_claim, app_runtime, desktop, runtime, state
 from nyx._native_claim import NativeClaim
-from nyx.models import canonical_digest, parse_catalog
+from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 try:
@@ -970,7 +970,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                 response = connection.getresponse()
                 assert response.status == 200
                 payload = json.loads(response.read())
-                assert payload["schema_version"] == 7
+                assert payload["schema_version"] == SCHEMA_VERSION
                 assert payload["configuration_revision"] == state.load_configuration(paths).revision
                 connection.close()
                 legacy = dict(payload, schema_version=4)
@@ -3247,7 +3247,7 @@ def test_delivered_worker_entry_reuses_manager_protocol_and_reaps(delivered_work
                     catalog = json.loads(manager.fetch_catalog())
             finally:
                 assert manager.close(time.monotonic() + 30)
-        assert catalog["schema_version"] == 7
+        assert catalog["schema_version"] == SCHEMA_VERSION
         assert catalog["configuration_revision"] == configuration.revision
         assert manager.active_count == 0
         legacy = dict(catalog, schema_version=4)

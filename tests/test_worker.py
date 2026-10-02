@@ -15,7 +15,7 @@ import pytest
 
 from nyx import state, worker
 from nyx._native_claim import NativeClaim
-from nyx.models import parse_catalog
+from nyx.models import SCHEMA_VERSION, parse_catalog
 
 
 class _Buffer:
@@ -201,7 +201,7 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
             )
             try:
                 catalog = json.loads(manager.fetch_catalog())
-                assert catalog["schema_version"] == 7
+                assert catalog["schema_version"] == SCHEMA_VERSION
                 assert manager.close(time.monotonic() + 2)
                 assert manager.active_count == 0
                 assert claim.held
@@ -223,7 +223,7 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
         target.mkdir(parents=True)
         source.mkdir(parents=True)
         source.joinpath("spec.md").write_text(
-            "# Source\nPackage ID: 11111111-1111-4111-8111-111111111111\n"
+            "# Source\nPackage ID: 11111111-1111-4111-8111-111111111111\nOwner Note: worker text\n"
             "Completion Prerequisite: 22222222-2222-4222-8222-222222222222\n",
             encoding="utf-8",
         )
@@ -248,7 +248,7 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
             "identity_coverage", "inventory", "program_coverage", "programs",
             "schema_version", "terminal_stages",
         }
-        assert payload["schema_version"] == 7
+        assert payload["schema_version"] == SCHEMA_VERSION
         assert payload["terminal_stages"] == ["Done"]
         assert all("board_visible" not in entry for entry in payload["entries"])
         assert parse_catalog(payload).as_dict() == payload
@@ -256,6 +256,7 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
         source_entry = next(
             item for item in payload["entries"] if item["package_id"] == "11111111-1111-4111-8111-111111111111"
         )
+        assert source_entry["reported_fields"] == [{"name": "Owner Note", "value": "worker text"}]
         assert source_entry["relationship"]["prerequisites"][0]["reason"] == "completion_satisfied"
 
 

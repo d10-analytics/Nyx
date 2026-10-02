@@ -10,7 +10,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from nyx import catalog
-from nyx.models import canonical_digest, parse_catalog
+from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 
 V1 = """# Example
 Status: approved
@@ -28,12 +28,23 @@ COMPLETE_ORACLE_BYTES = "{\"catalog_digest\":\"29be6f910089807a68848044c136d2980
 def _migrate_oracle(legacy: str) -> str:
     """Canonicalize the inspected schema-seven producer oracles."""
     value = json.loads(legacy)
-    value["schema_version"] = 7
+    value["schema_version"] = SCHEMA_VERSION
     value["configuration_revision"] = None
     # The historical fixtures predate the completion policy, so they carry no
     # terminal-stage grouping.  The digest is recomputed below.
     value["terminal_stages"] = []
+    for program in value["programs"]:
+        del program["diagnostics"]
     for entry in value["entries"]:
+        for key in ("state", "diagnostics", "transitive_diagnostics"):
+            del entry[key]
+        for key in ("closure", "sanity_recommendation", "human_sanity_decision"):
+            del entry["declared"][key]
+        entry["reported_fields"] = []
+        for claim in entry["relationship"]["claims"]:
+            del claim["diagnostics"]
+        for key in ("program", "superseded_by"):
+            del entry["relationship"][key]["diagnostics"]
         for edge in entry["relationship"]["prerequisites"]:
             edge["kind"] = "claim"
     projects = sorted({entry["project"] for entry in value["entries"]})
@@ -140,7 +151,7 @@ class CatalogTests(TestCase):
                         entry for entry in value["entries"]
                         if entry["package_path"] == "Fictional/Queue/anchor-link"
                     )
-                    self.assertEqual("nonregular_anchor", anchor_entry["diagnostics"][0]["code"])
+                    self.assertIn({"code": "nonregular_anchor", "message": "nonregular anchor: " + anchor_entry["package_path"]}, value["identity_coverage"]["diagnostics"])
                     self.assertTrue(value["discovery_diagnostics"])
 
     def test_anchor_links_nonregular_unreadable_and_changed_reads_are_bounded(self) -> None:
@@ -196,10 +207,9 @@ class CatalogTests(TestCase):
                     for producer in (catalog.build_catalog, catalog.scan_catalog)
                 ]
             for value in values:
-                entries = {entry["package_path"]: entry for entry in value["entries"]}
-                self.assertEqual("nonregular_anchor", entries["Fictional/Queue/fifo"]["diagnostics"][0]["code"])
-                self.assertEqual("unreadable_anchor", entries["Fictional/Queue/unreadable"]["diagnostics"][0]["code"])
-                self.assertEqual("changed_during_read", entries["Fictional/Queue/changed"]["diagnostics"][0]["code"])
+                self.assertIn({"code": "nonregular_anchor", "message": "nonregular anchor: Fictional/Queue/fifo"}, value["identity_coverage"]["diagnostics"])
+                self.assertIn({"code": "unreadable_anchor", "message": "unreadable anchor: Fictional/Queue/unreadable"}, value["identity_coverage"]["diagnostics"])
+                self.assertIn({"code": "changed_during_read", "message": "changed during read: Fictional/Queue/changed"}, value["identity_coverage"]["diagnostics"])
                 self.assertNotIn("outside-marker", json.dumps(value))
             unreadable.joinpath("spec.md").chmod(0o600)
 
@@ -293,7 +303,7 @@ class CatalogTests(TestCase):
             value = json.loads(first)
             self.assertEqual(["Fictional/Queue/zeta", "Fictional/Under_Development/alpha"],
                              [entry["package_path"] for entry in value["entries"]])
-            self.assertEqual(7, value["schema_version"])
+            self.assertEqual(SCHEMA_VERSION, value["schema_version"])
             self.assertEqual(
                 {"projects": [{"name": "Fictional", "availability": "complete"}],
                  "stages": [
@@ -434,7 +444,6 @@ class CatalogTests(TestCase):
             self.assertEqual("Target", target["declared"]["title"])
             self.assertEqual(
                 [{
-                    "diagnostics": [],
                     "evidence_ref": f"sha256:{'a' * 64}",
                     "name": "handoff",
                     "state": "satisfied",
@@ -588,7 +597,7 @@ class CatalogTests(TestCase):
             self.assertEqual(
                 [{"code": "nonregular_anchor", "message":
                   "nonregular anchor: Fictional/Queue/linked-package"}],
-                entries["Fictional/Queue/linked-package"]["diagnostics"],
+                [item for item in value["identity_coverage"]["diagnostics"] if item["message"].endswith(": Fictional/Queue/linked-package")],
             )
             self.assertNotIn("Escaped", json.dumps(value))
 
@@ -703,10 +712,9 @@ class CatalogTests(TestCase):
             if sys.platform != "win32":
                 unreadable_anchor.chmod(0o600)
             entries = {entry["package_path"]: entry for entry in value["entries"]}
-            self.assertEqual("invalid_package_id",
-                             entries["Fictional/Queue/malformed"]["diagnostics"][0]["code"])
-            self.assertEqual("unreadable_anchor",
-                             entries["Fictional/Queue/unreadable"]["diagnostics"][0]["code"])
+            self.assertEqual("invalid",
+                             entries["Fictional/Queue/malformed"]["relationship"]["participation"])
+            self.assertIn({"code": "unreadable_anchor", "message": "unreadable anchor: Fictional/Queue/unreadable"}, value["identity_coverage"]["diagnostics"])
             self.assertNotIn(str(malformed), json.dumps(value))
 
     def test_output_bound_is_enforced(self) -> None:
@@ -875,7 +883,7 @@ class CatalogTests(TestCase):
                     self.assertEqual(16, scans.call_count)
                     renders.append(rendered)
                     value = json.loads(rendered)
-                    self.assertEqual(7, value["schema_version"])
+                    self.assertEqual(SCHEMA_VERSION, value["schema_version"])
                     digest_input = dict(value)
                     digest_input.pop("catalog_digest")
                     self.assertEqual(
@@ -963,7 +971,7 @@ class CatalogTests(TestCase):
 
             value, source_entry_value = source_entry()
             edge = source_entry_value["relationship"]["prerequisites"][0]
-            self.assertEqual(7, value["schema_version"])
+            self.assertEqual(SCHEMA_VERSION, value["schema_version"])
             self.assertEqual("revision-1", value["configuration_revision"])
             self.assertEqual(
                 {
@@ -1092,7 +1100,7 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         root = make_baseline_graph(Path(temporary))
         rendered = catalog.build_catalog(root)
         value = json.loads(rendered)
-        assert value["schema_version"] == 7
+        assert value["schema_version"] == SCHEMA_VERSION
         assert set(value) == {
             "schema_version", "catalog_digest", "configuration_revision", "terminal_stages", "identity_coverage",
             "program_coverage", "discovery_diagnostics", "entries", "programs", "inventory",
@@ -1119,9 +1127,106 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         ]
         assert "Fictional/Archive/pkg" in {entry["package_path"] for entry in value["entries"]}
         queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
-        assert {item["code"] for item in queue["diagnostics"]} == {"invalid_claim", "invalid_prerequisite"}
+        assert queue["relationship"]["claims"] == [{"name": "release", "state": "unsatisfied", "evidence_ref": None}]
         assert {item["reason"] for item in queue["relationship"]["prerequisites"]} == {"claim_satisfied", "invalid_prerequisite"}
         assert queue["relationship"]["program"]["resolution"] == "resolved"
         assert queue["relationship"]["superseded_by"]["resolution"] == "resolved"
-        assert queue["relationship"]["superseded_by"]["diagnostics"][0]["code"] == "successor_cycle"
+        assert set(queue["relationship"]["superseded_by"]) == {"package_id", "resolution"}
         assert value["programs"][0]["member_package_ids"] == [ORACLE_IDS[0], ORACLE_IDS[1]]
+
+
+def test_reported_header_grammar_order_deduplication_and_screening(tmp_path):
+    cases = [
+        ("Closure: a\nCLOSURE: b\nclosure: c", [{"name": "Closure", "value": "a"}]),
+        ("Package id: x\nStatus: s\n**Target repo:** /work/repo\nProgram membership: y", []),
+        ("**Closure:** v\n> Note: v\n<!-- X: v -->\n- Item: v\n| Col: v |\n`Code: v`\nhttps://x\n# Heading: v", [{"name": "Closure", "value": "v"}]),
+        ("Empty:\nBlank: \t\t\nOwner Note:\nOwner Note: later", [{"name": "Owner Note", "value": "later"}]),
+        ("**First**: one\n Second: two\nThird:** three\n## Body\nIgnored: body", [{"name": "First", "value": "one"}, {"name": "Second", "value": "two"}, {"name": "Third", "value": "three"}]),
+        ("A" * 64 + ": yes\n" + "B" * 65 + ": no\nBad\tName: no\nXÄ: upper\nXä: lower", [{"name": "A" * 64, "value": "yes"}, {"name": "XÄ", "value": "upper"}, {"name": "Xä", "value": "lower"}]),
+    ]
+    for index, (header, expected) in enumerate(cases):
+        root = tmp_path / str(index)
+        package(root, "Queue", "item", "# Example\n" + header)
+        value = json.loads(catalog.scan_catalog(root))
+        assert value["entries"][0]["reported_fields"] == expected
+        assert parse_catalog(value).as_dict() == value
+        if index == 1:
+            assert value["entries"][0]["declared"]["status"] == "s"
+    root = tmp_path / "cap"
+    names = [f"Z{i:02}" for i in reversed(range(64))] + ["Aaa Last"]
+    package(root, "Queue", "item", "# Cap\n" + "\n".join(f"{name}: {name}" for name in names))
+    value = json.loads(catalog.scan_catalog(root))
+    assert value["entries"][0]["reported_fields"] == [
+        {"name": name, "value": name} for name in sorted(names[:64])
+    ]
+
+
+def test_real_text_screening_truncates_on_code_point_boundary(tmp_path):
+    long_value = "startword " + "a" * 1013 + "😀" + "b" * 66 + " tailword"
+    assert len(long_value.encode("utf-16-le")) // 2 == 1100
+    package(tmp_path, "Queue", "item", "# " + "t" * 1100 + "\nOwner Note: " + long_value + "\nStatus: a\tb\nTarget repo: /work/x\ty\nOther: a\x00b\x7fc\n")
+    value = json.loads(catalog.scan_catalog(tmp_path))
+    entry = value["entries"][0]
+    assert entry["declared"] == {"title": "t" * 1024, "status": "a b", "target_project": "x y"}
+    assert entry["reported_fields"] == [{"name": "Other", "value": "a b c"}, {"name": "Owner Note", "value": long_value[:1023]}]
+    assert parse_catalog(value).as_dict() == value
+
+
+def test_invalid_claim_forms_keep_resolution_marker_private(tmp_path):
+    target_id, source_id = ORACLE_IDS[:2]
+    for index, rows in enumerate([
+        "Claim: release | satisfied | sha256:bad\n",
+        "Claim: release | maybe\n",
+        "Claim: release | satisfied | sha256:" + "a" * 64 + "\nClaim: release | unknown\n",
+    ]):
+        root = tmp_path / str(index)
+        package(root, "Queue", "target", f"# Target\nPackage ID: {target_id}\n" + rows)
+        package(root, "Queue", "source", f"# Source\nPackage ID: {source_id}\nPrerequisite: {target_id} | release\n")
+        value = json.loads(catalog.scan_catalog(root))
+        source, target = value["entries"]
+        assert target["relationship"]["claims"] == [{"name": "release", "state": "unknown", "evidence_ref": None}]
+        edge = source["relationship"]["prerequisites"][0]
+        assert (edge["reason"], edge["resolved_state"]) == ("invalid_claim", "unknown")
+        assert parse_catalog(value).as_dict() == value
+
+
+def test_core_headers_and_exact_wire_shapes_include_default_relationships(tmp_path):
+    from nyx.models import DIAGNOSTIC_CODES
+
+    target_id, source_id, program_id = ORACLE_IDS[:3]
+    descriptor = tmp_path / "Fictional" / "Reference" / "Programs" / program_id
+    descriptor.mkdir(parents=True)
+    (descriptor / "program.md").write_text(f"Program ID: {program_id}\nProgram Title: Core\n", encoding="utf-8")
+    package(tmp_path, "Done", "target", f"# Target\nPackage ID: {target_id}\nClaim: release | satisfied | sha256:" + "a" * 64 + "\n")
+    package(tmp_path, "Queue", "source", f"# Source\nPackage ID: {source_id}\nTarget repo: /work/core\nStatus: ready\nPrerequisite: {target_id} | release\nCompletion Prerequisite: {target_id}\nProgram Membership: {program_id}\nSuperseded By: {target_id}\n")
+    value = json.loads(catalog.scan_catalog(tmp_path, completed_stage_names=["Done"]))
+    source = value["entries"][1]
+    assert source["declared"] == {"title": "Source", "target_project": "core", "status": "ready"}
+    assert source["package_id"] == source_id
+    assert {edge["reason"] for edge in source["relationship"]["prerequisites"]} == {"claim_satisfied", "completion_satisfied"}
+    assert source["relationship"]["program"] == {"program_id": program_id, "title": "Core", "resolution": "resolved"}
+    assert source["relationship"]["superseded_by"] == {"package_id": target_id, "resolution": "resolved"}
+    assert value["entries"][0]["relationship"]["claims"] == [{"name": "release", "state": "satisfied", "evidence_ref": "sha256:" + "a" * 64}]
+    package(tmp_path, "Queue", "empty", "")
+    invalid = package(tmp_path, "Queue", "bytes", "") / "spec.md"
+    invalid.write_bytes(b"\xff")
+    unreadable = package(tmp_path, "Queue", "unreadable", "# Hidden") / "spec.md"
+    original = catalog._catalog_read_anchor
+    with patch.object(catalog, "_catalog_read_anchor", side_effect=lambda path: (None, "unreadable_anchor") if path == unreadable else original(path)):
+        value = json.loads(catalog.scan_catalog(tmp_path, completed_stage_names=["Done"]))
+    assert len(value["entries"]) == 5
+    for entry in value["entries"]:
+        assert set(entry) == {"package_id", "package_path", "project", "stage", "declared", "reported_fields", "relationship"}
+        assert set(entry["declared"]) == {"title", "target_project", "status"}
+        assert entry["reported_fields"] == []
+        relationship = entry["relationship"]
+        assert set(relationship) == {"participation", "claims", "prerequisites", "direct_prerequisite_state", "program", "superseded_by"}
+        for claim in relationship["claims"]:
+            assert set(claim) == {"name", "state", "evidence_ref"}
+        assert set(relationship["program"]) == {"program_id", "title", "resolution"}
+        assert set(relationship["superseded_by"]) == {"package_id", "resolution"}
+    assert all(set(program) == {"program_id", "title", "member_package_ids"} for program in value["programs"])
+    assert DIAGNOSTIC_CODES == set(catalog.CATALOG_DIAGNOSTIC_MESSAGES) == {
+        "discovery_unavailable", "invalid_package", "unreadable_anchor", "nonregular_anchor", "changed_during_read", "duplicate_program_id"
+    }
+    assert parse_catalog(value).as_dict() == value
