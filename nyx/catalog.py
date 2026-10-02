@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
 
+from .models import DECLARED_FIELDS, MAX_REPORTED_FIELDS, SCHEMA_VERSION, _safe_text
 from .state import (
     CompletedStageError,
     _validate_completed_stage_names,
@@ -27,23 +28,7 @@ CATALOG_DIAGNOSTIC_MESSAGES = {
     "nonregular_anchor": "nonregular anchor",
     "changed_during_read": "changed during read",
     "discovery_unavailable": "discovery unavailable",
-    "invalid_package_id": "invalid package identity",
-    "duplicate_package_id": "duplicate package identity",
-    "invalid_claim": "invalid claim",
-    "invalid_provenance": "invalid provenance",
-    "duplicate_claim": "duplicate claim",
-    "invalid_prerequisite": "invalid prerequisite",
-    "invalid_program_membership": "invalid program membership",
-    "invalid_superseded_by": "invalid successor declaration",
-    "target_unreadable": "target unreadable",
-    "target_changed_during_read": "target changed during read",
-    "target_invalid_identity": "target has invalid identity",
-    "missing_program_descriptor": "missing program descriptor",
     "duplicate_program_id": "duplicate program identity",
-    "missing_successor": "missing successor target",
-    "successor_cycle": "successor cycle detected",
-    "relationship_cycle": "relationship cycle detected",
-    "transitive_diagnostics_truncated": "transitive diagnostics truncated",
 }
 
 _CANONICAL_UUID = re.compile(
@@ -54,9 +39,51 @@ _CLAIM_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _PROVENANCE = re.compile(
     r"^(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$"
 )
-_HEADER_FIELD = re.compile(
-    r"^\s*\*{0,2}(Package ID|Program Membership|Superseded By|Prerequisite|Completion Prerequisite|Claim)\*{0,2}\s*:\s?(.*?)\s*$"
+_HEADER_LABELS = (
+    "Package ID", "Program Membership", "Superseded By", "Prerequisite",
+    "Completion Prerequisite", "Claim",
 )
+_HEADER_FIELD = re.compile(
+    r"^\s*\*{0,2}(" + "|".join(_HEADER_LABELS) + r")\*{0,2}\s*:\s?(.*?)\s*$"
+)
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+_REPORTED_EXCLUSIONS = {label.translate(_ASCII_LOWER) for label in (*_HEADER_LABELS, "Status", "Target repo")}
+_REPORTED_FIELD = re.compile(r"^\s*(?:\*\*)?([A-Z][^:*`<>|\[\]\x00-\x1f\x7f]{0,63}?)(?:\*\*:|:\*\*|:)(.*)$")
+
+
+def _screen_text(value: str) -> str:
+    value = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in value).strip()
+    units = 0
+    end = 0
+    for character in value:
+        units += 2 if ord(character) > 0xFFFF else 1
+        if units > 1024:
+            break
+        end += 1
+    value = value[:end]
+    return value if _safe_text(value) else ""
+
+
+def _reported_fields(lines: list[str]) -> list[dict[str, str]]:
+    fields = []
+    seen = set()
+    for line in lines:
+        match = _REPORTED_FIELD.fullmatch(line)
+        if match is None:
+            continue
+        name, value = (part.strip() for part in match.groups())
+        folded = name.translate(_ASCII_LOWER)
+        if folded in _REPORTED_EXCLUSIONS:
+            continue
+        value = _screen_text(value)
+        if not value or folded in seen:
+            continue
+        seen.add(folded)
+        fields.append({"name": name, "value": value})
+        if len(fields) == MAX_REPORTED_FIELDS:
+            break
+    return sorted(fields, key=lambda field: field["name"])
+
 
 
 def _completion_policy(
@@ -122,14 +149,8 @@ def _catalog_declared(lines: list[str]) -> dict[str, str | None]:
             title = match.group(1)
             break
 
-    values: dict[str, str | None] = {
-        "closure": _metadata_value(lines, "Closure"),
-        "human_sanity_decision": _metadata_value(lines, "Human Sanity Decision"),
-        "sanity_recommendation": _metadata_value(lines, "Sanity Recommendation"),
-        "status": _metadata_value(lines, "Status"),
-        "target_project": None,
-        "title": title,
-    }
+    values = dict.fromkeys(DECLARED_FIELDS)
+    values.update(title=title, status=_metadata_value(lines, "Status"))
     target_repo = _metadata_value(lines, "Target repo")
     if target_repo:
         try:
@@ -138,7 +159,7 @@ def _catalog_declared(lines: list[str]) -> dict[str, str | None]:
                 values["target_project"] = target_path.name
         except (OSError, ValueError):
             pass
-    return values
+    return {key: _screen_text(value) if value is not None else None for key, value in values.items()}
 
 
 def _catalog_mode_readable(mode: int, *, directory: bool = False) -> bool:
@@ -251,13 +272,6 @@ def _diagnostic(code: str, package_path: str | None = None) -> dict[str, str]:
     return {"code": code, "message": message}
 
 
-def _sort_diagnostics(
-    diagnostics: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    """Return diagnostics in the wire contract's canonical order."""
-    return sorted(diagnostics, key=lambda item: (item["code"], item["message"]))
-
-
 def _header(data: bytes) -> tuple[list[str], str | None]:
     try:
         text = data.decode("utf-8")
@@ -272,8 +286,8 @@ def _header(data: bytes) -> tuple[list[str], str | None]:
 
 
 def _parse_header(
-    lines: list[str], package_path: str
-) -> tuple[dict[str, object], set[str], list[dict[str, str]]]:
+    lines: list[str]
+) -> tuple[dict[str, object], set[str]]:
     """Parse only package-owned header rows and redact submitted invalid values."""
     scalar_values: dict[str, list[str]] = {
         "Package ID": [],
@@ -283,7 +297,6 @@ def _parse_header(
     prereq_rows: list[str] = []
     completion_rows: list[str] = []
     claim_rows: list[str] = []
-    diagnostics: list[dict[str, str]] = []
     for line in lines:
         match = _HEADER_FIELD.match(line)
         if not match:
@@ -309,19 +322,10 @@ def _parse_header(
     elif package_identity_valid:
         package_id = _uuid(package_values[0].strip())
         package_identity_valid = package_id is not None
-    if package_values and not package_identity_valid:
-        diagnostics.append(_diagnostic("invalid_package_id", package_path))
-    if len(package_values) > 1:
-        diagnostics.append(_diagnostic("duplicate_package_id", package_path))
-
     membership: str | None = None
     membership_values = scalar_values["Program Membership"]
     if len(membership_values) == 1:
         membership = _uuid(membership_values[0].strip())
-        if membership is None:
-            diagnostics.append(_diagnostic("invalid_program_membership", package_path))
-    elif membership_values:
-        diagnostics.append(_diagnostic("invalid_program_membership", package_path))
 
     successor: str | None = None
     successor_values = scalar_values["Superseded By"]
@@ -329,9 +333,6 @@ def _parse_header(
         successor = _uuid(successor_values[0].strip())
         if successor is None or successor == package_id:
             successor = None
-            diagnostics.append(_diagnostic("invalid_superseded_by", package_path))
-    elif successor_values:
-        diagnostics.append(_diagnostic("invalid_superseded_by", package_path))
 
     claims: dict[str, dict[str, object]] = {}
     parsed_prerequisites: list[dict[str, object]] = []
@@ -339,7 +340,7 @@ def _parse_header(
     for value in claim_rows:
         parts = [part.strip() for part in value.split("|")]
         name = parts[0] if parts and _CLAIM_NAME.fullmatch(parts[0]) else None
-        claim_diagnostic: list[dict[str, str]] = []
+        invalid = False
         state: str = "unknown"
         evidence_ref: str | None = None
         if len(parts) == 2 and parts[1] in {"unsatisfied", "unknown"}:
@@ -351,26 +352,20 @@ def _parse_header(
         ):
             state = "satisfied"
             evidence_ref = parts[2]
-        elif len(parts) == 3 and len(parts) >= 2 and parts[1] == "satisfied":
-            claim_diagnostic.append(_diagnostic("invalid_provenance", package_path))
         else:
-            claim_diagnostic.append(_diagnostic("invalid_claim", package_path))
+            invalid = True
         if name is None:
-            diagnostics.append(_diagnostic("invalid_claim", package_path))
             continue
         if name in claims:
-            diagnostics.append(_diagnostic("duplicate_claim", package_path))
             claims[name]["state"] = "unknown"
             claims[name]["evidence_ref"] = None
-            claims[name]["diagnostics"] = [_diagnostic("duplicate_claim", package_path)]
+            claims[name]["invalid"] = True
             continue
-        if claim_diagnostic:
-            diagnostics.extend(claim_diagnostic)
         claims[name] = {
             "name": name,
-            "state": state if not claim_diagnostic else "unknown",
-            "evidence_ref": evidence_ref if not claim_diagnostic else None,
-            "diagnostics": claim_diagnostic,
+            "state": state if not invalid else "unknown",
+            "evidence_ref": evidence_ref if not invalid else None,
+            "invalid": invalid,
         }
 
     for value in prereq_rows:
@@ -379,35 +374,27 @@ def _parse_header(
         claim_name = (
             parts[1] if len(parts) == 2 and _CLAIM_NAME.fullmatch(parts[1]) else None
         )
-        row_diagnostics: list[dict[str, str]] = []
         if len(parts) != 2 or target_id is None or claim_name is None:
             malformed_prerequisite = True
-            row_diagnostics.append(_diagnostic("invalid_prerequisite", package_path))
-            diagnostics.extend(row_diagnostics)
         parsed_prerequisites.append(
             {
                 "kind": "claim",
                 "target_package_id": target_id,
                 "claim_name": claim_name,
                 "valid": len(parts) == 2 and target_id is not None and claim_name is not None,
-                "diagnostics": row_diagnostics,
             }
         )
 
     for value in completion_rows:
         target_id = _uuid(value.strip()) if "|" not in value else None
         valid = len(value.strip()) > 0 and target_id is not None and "|" not in value
-        row_diagnostics: list[dict[str, str]] = []
         if not valid:
             malformed_prerequisite = True
-            row_diagnostics.append(_diagnostic("invalid_prerequisite", package_path))
-            diagnostics.extend(row_diagnostics)
         parsed_prerequisites.append(
             {
                 "kind": "completion",
                 "target_package_id": target_id,
                 "valid": valid,
-                "diagnostics": row_diagnostics,
             }
         )
 
@@ -426,38 +413,21 @@ def _parse_header(
             "program_id": membership,
             "title": None,
             "resolution": "unknown" if membership or membership_values else "not_declared",
-            "diagnostics": (
-                [_diagnostic("invalid_program_membership", package_path)]
-                if membership_values and membership is None
-                else []
-            ),
         },
         "superseded_by": {
             "package_id": successor,
             "resolution": "unknown" if successor or successor_values else "not_declared",
-            "diagnostics": (
-                [_diagnostic("invalid_superseded_by", package_path)]
-                if successor_values and successor is None
-                else []
-            ),
         },
     }
     if relationship["direct_prerequisite_state"] is None:
         relationship["direct_prerequisite_state"] = (
             "no_declared_prerequisites" if package_identity_valid and not parsed_prerequisites else None
         )
-    return relationship, package_candidates, diagnostics
+    return relationship, package_candidates
 
 
 def _empty_declared() -> dict[str, str | None]:
-    return {
-        "title": None,
-        "target_project": None,
-        "status": None,
-        "closure": None,
-        "sanity_recommendation": None,
-        "human_sanity_decision": None,
-    }
+    return dict.fromkeys(DECLARED_FIELDS)
 
 
 _PROGRAM_FIELD = re.compile(
@@ -514,7 +484,6 @@ def _parse_program_descriptor(
             "program_path": program_path,
             "candidate_ids": candidates,
             "diagnostics": diagnostics,
-            "state": "partial" if diagnostics else "complete",
         },
         candidates,
         diagnostics,
@@ -580,7 +549,6 @@ def _scan_programs(
         parsed["read_diagnostic"] = read_diagnostic
         if read_diagnostic:
             parsed["diagnostics"].append(_catalog_diagnostic(read_diagnostic, program_path))
-            parsed["state"] = "partial"
             diagnostics.append(_catalog_diagnostic(read_diagnostic, program_path))
         programs.append(parsed)
         diagnostics.extend(parsed_diagnostics)
@@ -599,7 +567,6 @@ def _program_index(
 
 def _resolve_program(
     relationship: dict[str, object],
-    package_path: str,
     program_index: dict[str, list[dict[str, object]]],
     program_coverage_complete: bool,
 ) -> None:
@@ -609,20 +576,16 @@ def _resolve_program(
         return
     if not program_coverage_complete:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_catalog_diagnostic("discovery_unavailable", package_path)]
         return
     candidates = program_index.get(program_id, [])
     if not candidates:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("missing_program_descriptor", package_path)]
     elif len(candidates) > 1:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("duplicate_program_id", package_path)]
     else:
         descriptor = candidates[0]
         if descriptor["diagnostics"]:
             context["resolution"] = "unknown"
-            context["diagnostics"] = [_diagnostic("invalid_package", package_path)]
         else:
             context["resolution"] = "resolved"
             context["title"] = descriptor["title"]
@@ -630,8 +593,6 @@ def _resolve_program(
 
 def _resolve_successor(
     relationship: dict[str, object],
-    package_id: str | None,
-    package_path: str,
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
 ) -> None:
@@ -641,121 +602,22 @@ def _resolve_successor(
         return
     if not identity_complete:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [
-            _catalog_diagnostic("discovery_unavailable", package_path)
-        ]
         return
     candidates = index.get(successor_id, [])
     if not candidates:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("missing_successor", package_path)]
         return
     if len(candidates) > 1:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("duplicate_package_id", package_path)]
         return
     target = candidates[0]
     if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor", "changed_during_read"}:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("invalid_superseded_by", package_path)]
         return
     if target.get("package_id") != successor_id or target.get("relationship") is None:
         context["resolution"] = "unknown"
-        context["diagnostics"] = [_diagnostic("invalid_superseded_by", package_path)]
         return
     context["resolution"] = "resolved"
-
-    seen: set[str] = set()
-    current = successor_id
-    while current is not None and current not in seen:
-        seen.add(current)
-        next_candidates = index.get(current, [])
-        if len(next_candidates) != 1:
-            break
-        next_relationship = next_candidates[0].get("relationship")
-        next_context = next_relationship.get("superseded_by") if next_relationship else None
-        current = next_context.get("package_id") if next_context else None
-    if current is not None and current in seen:
-        context["diagnostics"] = [_diagnostic("successor_cycle", package_path)]
-
-
-def _transitive_diagnostics(
-    record: dict[str, object],
-    index: dict[str, list[dict[str, object]]],
-    identity_complete: bool,
-) -> list[dict[str, object]]:
-    found: dict[tuple[str, str, tuple[str, ...]], dict[str, object]] = {}
-
-    def diagnostic_code(edge_reason: str) -> str:
-        return {
-            "duplicate_target": "duplicate_package_id",
-            "identity_coverage_incomplete": "discovery_unavailable",
-            "target_unreadable": "unreadable_anchor",
-            "target_changed_during_read": "changed_during_read",
-            "target_invalid_identity": "invalid_package_id",
-            "missing_claim": "invalid_claim",
-            "claim_unknown": "invalid_claim",
-            "invalid_claim": "invalid_claim",
-            "self_edge": "relationship_cycle",
-            "invalid_prerequisite": "invalid_prerequisite",
-            "missing_target": "invalid_prerequisite",
-        }.get(edge_reason, "invalid_prerequisite")
-
-    def add(origin: str | None, code: str, path: tuple[str, ...]) -> None:
-        if origin is None:
-            return
-        key = (origin, code, path)
-        if key in found:
-            return
-        if len(found) >= 65:
-            largest = max(found)
-            if key >= largest:
-                return
-            del found[largest]
-        found[key] = {
-            "origin_package_id": origin,
-            "code": code,
-            "path_package_ids": list(path),
-        }
-
-    root_id = record.get("package_id")
-    if root_id is None:
-        return []
-    stack: list[tuple[dict[str, object], tuple[str, ...]]] = [
-        (record, (str(root_id),))
-    ]
-    while stack:
-        current, path = stack.pop()
-        relationship = current.get("relationship")
-        current_id = current.get("package_id")
-        if not relationship or current_id is None:
-            continue
-        for row in reversed(relationship["prerequisites"]):
-            target_id = row["target_package_id"]
-            edge = _edge(current, row, index, identity_complete, None, True)
-            edge_reason = str(edge["reason"])
-            edge_path = path + ((str(target_id),) if target_id is not None else ())
-            if edge_reason not in {"claim_satisfied", "claim_unsatisfied"}:
-                add(str(current_id), diagnostic_code(edge_reason), edge_path)
-            if target_id is None:
-                continue
-            candidates = index.get(target_id, [])
-            if len(candidates) != 1:
-                continue
-            target = candidates[0]
-            if target_id in path:
-                add(str(target_id), "relationship_cycle", edge_path)
-                continue
-            stack.append((target, edge_path))
-    ordered = [found[key] for key in sorted(found)]
-    if len(ordered) > 64:
-        ordered = ordered[:64]
-        ordered.append(
-            {
-                "code": "transitive_diagnostics_truncated",
-            }
-        )
-    return ordered
 
 
 def _scan_stage(
@@ -784,17 +646,14 @@ def _scan_stage(
             declared = _empty_declared()
             relationship = None
             candidates: set[str] = set()
-            diagnostics: list[dict[str, str]] = []
+            reported_fields = []
             decode_diagnostic: str | None = None
             if data is not None:
                 lines, decode_diagnostic = _header(data)
                 if lines:
                     declared = _catalog_declared(lines)
-                    relationship, candidates, diagnostics = _parse_header(lines, package_path)
-                else:
-                    diagnostics.append(_catalog_diagnostic(decode_diagnostic or "invalid_package", package_path))
-            if read_diagnostic:
-                diagnostics.append(_catalog_diagnostic(read_diagnostic, package_path))
+                    relationship, candidates = _parse_header(lines)
+                    reported_fields = _reported_fields(lines)
             package_id = (
                 next(iter(candidates))
                 if relationship
@@ -817,8 +676,7 @@ def _scan_stage(
                     "relationship": relationship,
                     "candidate_ids": candidates,
                     "package_id": package_id,
-                    "diagnostics": diagnostics,
-                    "state": "partial" if diagnostics else "complete",
+                    "reported_fields": reported_fields,
                 }
             )
             continue
@@ -943,7 +801,7 @@ def _edge(
             else:
                 edge["observed_state"] = claim["state"]
                 edge["observed_evidence_ref"] = claim["evidence_ref"]
-                if claim["diagnostics"]:
+                if claim["invalid"]:
                     edge["reason"] = "invalid_claim"
                 elif claim["state"] == "satisfied":
                     edge["resolved_state"] = "satisfied"
@@ -976,24 +834,19 @@ def _render_entry(
                 "program_id": None,
                 "title": None,
                 "resolution": "not_declared",
-                "diagnostics": [],
             },
             "superseded_by": {
                 "package_id": None,
                 "resolution": "not_declared",
-                "diagnostics": [],
             },
         }
     _resolve_program(
         relationship,
-        str(record["package_path"]),
         program_index,
         program_coverage_complete,
     )
     _resolve_successor(
         relationship,
-        record.get("package_id"),
-        str(record["package_path"]),
         index,
         identity_complete,
     )
@@ -1023,22 +876,13 @@ def _render_entry(
         direct_state = "unsatisfied"
     else:
         direct_state = "satisfied"
-    rendered_claims = []
-    for claim in relationship["claims"]:
-        rendered_claim = dict(claim)
-        rendered_claim["diagnostics"] = _sort_diagnostics(
-            list(claim["diagnostics"])
-        )
-        rendered_claims.append(rendered_claim)
+    rendered_claims = [
+        {key: claim[key] for key in ("name", "state", "evidence_ref")}
+        for claim in relationship["claims"]
+    ]
     rendered_claims.sort(key=lambda claim: str(claim["name"]))
     rendered_program = dict(relationship["program"])
-    rendered_program["diagnostics"] = _sort_diagnostics(
-        list(relationship["program"]["diagnostics"])
-    )
     rendered_successor = dict(relationship["superseded_by"])
-    rendered_successor["diagnostics"] = _sort_diagnostics(
-        list(relationship["superseded_by"]["diagnostics"])
-    )
     relationship_out = {
         "participation": relationship["participation"],
         "claims": rendered_claims,
@@ -1047,7 +891,6 @@ def _render_entry(
         "program": rendered_program,
         "superseded_by": rendered_successor,
     }
-    diagnostics = _sort_diagnostics(list(record["diagnostics"]))
     package_path = str(record["package_path"])
     path_parts = package_path.split("/")
     project, stage = path_parts[0], path_parts[1]
@@ -1056,11 +899,9 @@ def _render_entry(
         "package_path": package_path,
         "project": project,
         "stage": stage,
-        "state": record["state"],
         "declared": record["declared"],
-        "diagnostics": diagnostics,
+        "reported_fields": record["reported_fields"],
         "relationship": relationship_out,
-        "transitive_diagnostics": [],
     }
 
 
@@ -1200,13 +1041,6 @@ def _build_catalog(
     for record in records:
         for candidate in record["candidate_ids"]:
             index.setdefault(candidate, []).append(record)
-    for candidate, candidates in index.items():
-        if len(candidates) > 1:
-            for record in candidates:
-                record["diagnostics"].append(
-                    _diagnostic("duplicate_package_id", record["package_path"])
-                )
-                record["state"] = "partial"
     discovery_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
     identity_diagnostics = list(discovery_diagnostics)
     for record in records:
@@ -1229,7 +1063,6 @@ def _build_catalog(
                 descriptor["diagnostics"].append(
                     _diagnostic("duplicate_program_id", descriptor["program_path"])
                 )
-                descriptor["state"] = "partial"
             program_diagnostics.extend(
                 _diagnostic("duplicate_program_id", descriptor["program_path"])
                 for descriptor in candidates
@@ -1284,11 +1117,10 @@ def _build_catalog(
                     for member in descriptor.get("member_package_ids", [])
                     if member is not None
                 ),
-                "diagnostics": [],
             }
         )
     catalog: dict[str, object] = {
-        "schema_version": 7,
+        "schema_version": SCHEMA_VERSION,
         "catalog_digest": None,
         "configuration_revision": configuration_revision,
         "inventory": {
