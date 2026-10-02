@@ -17,7 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 LIFECYCLES = frozenset(
     {
@@ -31,14 +31,9 @@ LIFECYCLES = frozenset(
     }
 )
 
-DECLARED_FIELDS = (
-    "title",
-    "target_project",
-    "status",
-    "closure",
-    "sanity_recommendation",
-    "human_sanity_decision",
-)
+DECLARED_FIELDS = ("title", "target_project", "status")
+REPORTED_FIELD_KEYS = frozenset({"name", "value"})
+MAX_REPORTED_FIELDS = 64
 
 DIAGNOSTIC_CODES = frozenset(
     {
@@ -47,23 +42,7 @@ DIAGNOSTIC_CODES = frozenset(
         "nonregular_anchor",
         "changed_during_read",
         "discovery_unavailable",
-        "invalid_package_id",
-        "duplicate_package_id",
-        "invalid_claim",
-        "invalid_provenance",
-        "duplicate_claim",
-        "invalid_prerequisite",
-        "invalid_program_membership",
-        "invalid_superseded_by",
-        "target_unreadable",
-        "target_changed_during_read",
-        "target_invalid_identity",
-        "missing_program_descriptor",
         "duplicate_program_id",
-        "missing_successor",
-        "successor_cycle",
-        "relationship_cycle",
-        "transitive_diagnostics_truncated",
     }
 )
 
@@ -82,17 +61,7 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _ENTRY_KEYS = frozenset(
-    {
-        "package_id",
-        "package_path",
-        "project",
-        "stage",
-        "state",
-        "declared",
-        "diagnostics",
-        "relationship",
-        "transitive_diagnostics",
-    }
+    {"package_id", "package_path", "project", "stage", "declared", "reported_fields", "relationship"}
 )
 _RELATIONSHIP_KEYS = frozenset(
     {
@@ -135,17 +104,15 @@ _COMPLETION_EDGE_KEYS = frozenset(
         "reason",
     }
 )
-_PROGRAM_KEYS = frozenset({"program_id", "title", "resolution", "diagnostics"})
+_PROGRAM_KEYS = frozenset({"program_id", "title", "resolution"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
 _INVENTORY_KEYS = frozenset({"projects", "stages"})
 _INVENTORY_PROJECT_KEYS = frozenset({"name", "availability"})
 _INVENTORY_STAGE_KEYS = frozenset({"project", "stage", "availability"})
-_CLAIM_KEYS = frozenset({"name", "state", "evidence_ref", "diagnostics"})
-_SUCCESSOR_KEYS = frozenset({"package_id", "resolution", "diagnostics"})
-_CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids", "diagnostics"})
-_TRANSITIVE_DIAGNOSTIC_KEYS = frozenset({"origin_package_id", "code", "path_package_ids"})
+_CLAIM_KEYS = frozenset({"name", "state", "evidence_ref"})
+_SUCCESSOR_KEYS = frozenset({"package_id", "resolution"})
+_CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids"})
 _DIAGNOSTIC_KEYS = frozenset({"code", "message"})
-_STATES = frozenset({"complete", "partial"})
 _COVERAGE_STATES = frozenset({"complete", "incomplete"})
 _OBSERVED_STATES = frozenset({"satisfied", "unsatisfied", "unknown"})
 _DIRECT_PREREQUISITE_STATES = _OBSERVED_STATES | {
@@ -221,15 +188,13 @@ class CatalogEntry:
     project: str
     stage: str
     declared: dict[str, str | None]
-    diagnostics: tuple[Diagnostic, ...]
-    state: str = "complete"
+    reported_fields: tuple[dict[str, str], ...]
+    relationship_data: dict[str, Any]
     package_id: str | None = None
     program_id: str | None = None
     program_title: str | None = None
     prerequisites: tuple[dict[str, Any], ...] = ()
     direct_prerequisite_state: str = "relationship_unavailable"
-    relationship_data: dict[str, Any] | None = None
-    transitive_diagnostics: tuple[dict[str, Any], ...] = ()
 
     @property
     def lifecycle(self) -> str:
@@ -239,30 +204,12 @@ class CatalogEntry:
     def as_dict(self) -> dict[str, Any]:
         return {
             "declared": dict(self.declared),
-            "diagnostics": [item.as_dict() for item in self.diagnostics],
+            "reported_fields": [dict(item) for item in self.reported_fields],
             "package_id": self.package_id,
             "package_path": self.package_path,
             "project": self.project,
             "stage": self.stage,
-            "state": self.state,
-            "relationship": self.relationship_data or {
-                "participation": "available" if self.direct_prerequisite_state != "relationship_unavailable" else "legacy",
-                "claims": [],
-                "prerequisites": [dict(edge) for edge in self.prerequisites],
-                "direct_prerequisite_state": self.direct_prerequisite_state,
-                "program": {
-                    "program_id": self.program_id,
-                    "title": self.program_title,
-                    "resolution": "resolved" if self.program_id is not None else "not_declared",
-                    "diagnostics": [],
-                },
-                "superseded_by": {
-                    "package_id": None,
-                    "resolution": "not_declared",
-                    "diagnostics": [],
-                },
-            },
-            "transitive_diagnostics": [dict(item) for item in self.transitive_diagnostics],
+            "relationship": self.relationship_data,
         }
 
 
@@ -519,7 +466,6 @@ def _claims(value: Any, name: str) -> None:
         if state not in _OBSERVED_STATES:
             raise ProtocolError(f"{item_name}.state is invalid")
         _provenance(item["evidence_ref"], f"{item_name}.evidence_ref", nullable=True)
-        _diagnostics(item["diagnostics"], f"{item_name}.diagnostics")
         names.append(claim_name)
     if names != sorted(names) or len(names) != len(set(names)):
         raise ProtocolError(f"{name} must be unique and name-sorted")
@@ -532,7 +478,6 @@ def _successor(value: Any, name: str) -> None:
     resolution = _string(item["resolution"], f"{name}.resolution")
     if resolution not in {"not_declared", "resolved", "unknown"}:
         raise ProtocolError(f"{name}.resolution is invalid")
-    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
 
 
 def _catalog_program(value: Any, name: str) -> str:
@@ -553,13 +498,7 @@ def _catalog_program(value: Any, name: str) -> str:
     ]
     if members != sorted(members):
         raise ProtocolError(f"{name}.member_package_ids must be sorted")
-    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
     return program_id
-
-
-def _transitive_diagnostics(value: Any, name: str) -> None:
-    if value != []:
-        raise ProtocolError(f"{name} must be the empty reference list")
 
 
 def _edge(value: Any, name: str) -> dict[str, Any]:
@@ -633,7 +572,6 @@ def _program(value: Any, name: str) -> tuple[str | None, str | None]:
         or any(ord(character) < 32 or ord(character) == 127 for character in title)
     ):
         raise ProtocolError(f"{name}.title is invalid")
-    _diagnostics(item["diagnostics"], f"{name}.diagnostics")
     if resolution == "resolved" and program_id is not None:
         return program_id, title
     return None, None
@@ -677,15 +615,43 @@ def _relationship(
     return program_id, program_title, prerequisites, direct_state
 
 
+def _safe_text(value: Any, max_units: int = 1024) -> bool:
+    """Match browser text safety, measuring length in UTF-16 code units."""
+    return (
+        type(value) is str
+        and bool(value)
+        and not any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value)
+        and sum(2 if ord(c) > 0xFFFF else 1 for c in value) <= max_units
+    )
+
+
+def _reported_fields(value: Any, name: str) -> tuple[dict[str, str], ...]:
+    if type(value) is not list or len(value) > MAX_REPORTED_FIELDS:
+        raise ProtocolError(f"{name} must be a bounded list")
+    result = []
+    seen = set()
+    previous = None
+    for raw in value:
+        item = _object(raw, name)
+        _keys(item, REPORTED_FIELD_KEYS, name)
+        if not all(_safe_text(item[key]) for key in REPORTED_FIELD_KEYS):
+            raise ProtocolError(f"{name} must contain safe text")
+        field_name = item["name"]
+        folded = field_name.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+        if folded in seen or (previous is not None and previous >= field_name):
+            raise ProtocolError(f"{name} must be unique and name-sorted")
+        seen.add(folded)
+        previous = field_name
+        result.append(dict(item))
+    return tuple(result)
+
+
 def _entry(value: Any, index: int) -> CatalogEntry:
     item = _object(value, f"entries[{index}]")
     _keys(item, _ENTRY_KEYS, f"entries[{index}]")
     package_id = _uuid4(item["package_id"], f"entries[{index}].package_id", nullable=True)
     project = _component(item["project"], f"entries[{index}].project")
     stage = _component(item["stage"], f"entries[{index}].stage")
-    state = _string(item["state"], f"entries[{index}].state")
-    if state not in _STATES:
-        raise ProtocolError(f"entries[{index}] has an invalid state")
     declared = _object(item["declared"], f"entries[{index}].declared")
     _keys(declared, frozenset(DECLARED_FIELDS), f"entries[{index}].declared")
     declared_values = {
@@ -697,8 +663,10 @@ def _entry(value: Any, index: int) -> CatalogEntry:
     program_id, program_title, prerequisites, direct_state = _relationship(
         item["relationship"], index
     )
-    transitive_value = item["transitive_diagnostics"]
-    _transitive_diagnostics(transitive_value, f"entries[{index}].transitive_diagnostics")
+    for field, value in declared_values.items():
+        if value not in (None, "") and not _safe_text(value):
+            raise ProtocolError(f"entries[{index}].declared.{field} must be safe text")
+    reported_fields = _reported_fields(item["reported_fields"], f"entries[{index}].reported_fields")
     package_path = _package_path(item["package_path"])
     parts = package_path.split("/")
     if len(parts) < 2 or project != parts[0] or stage != parts[1]:
@@ -708,8 +676,7 @@ def _entry(value: Any, index: int) -> CatalogEntry:
         project=project,
         stage=stage,
         declared=declared_values,
-        diagnostics=_diagnostics(item["diagnostics"], f"entries[{index}].diagnostics"),
-        state=state,
+        reported_fields=reported_fields,
         package_id=package_id,
         program_id=program_id,
         program_title=program_title,
@@ -723,7 +690,6 @@ def _entry(value: Any, index: int) -> CatalogEntry:
             "program": item["relationship"]["program"],
             "superseded_by": item["relationship"]["superseded_by"],
         },
-        transitive_diagnostics=tuple(dict(item) for item in transitive_value),
     )
 
 

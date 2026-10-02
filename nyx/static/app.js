@@ -38,10 +38,10 @@
   ]);
   // These fields are indexed for search. Only the title and target project
   // are displayed.
-  const DECLARED_FIELDS = [
-    "title", "target_project", "status", "closure",
-    "sanity_recommendation", "human_sanity_decision",
-  ];
+  const DECLARED_FIELDS = ["title", "target_project", "status"];
+  const REPORTED_FIELD_KEYS = ["name", "value"];
+  const MAX_REPORTED_FIELDS = 64;
+  const SCHEMA_VERSION = 8;
   const SAFE_CATEGORIES = [
     "producer_unavailable", "producer_timeout", "producer_failed",
     "producer_output_too_large", "producer_protocol_error",
@@ -385,8 +385,9 @@
 
   function searchText(entry) {
     return [
-      entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title, entry.state,
+      entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title,
       ...DECLARED_FIELDS.map((field) => entry.declared[field]),
+      ...entry.reported_fields.map((field) => field.value),
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 
@@ -826,11 +827,10 @@
       "relationship_unavailable"].includes(value.direct_prerequisite_state));
     protocol(Array.isArray(value.claims));
     value.claims.forEach((claim) => {
-      protocol(exactKeys(claim, ["diagnostics", "evidence_ref", "name", "state"]));
+      protocol(exactKeys(claim, ["evidence_ref", "name", "state"]));
       protocol(/^[a-z][a-z0-9-]{0,63}$/.test(claim.name));
       protocol(["satisfied", "unsatisfied", "unknown"].includes(claim.state));
       provenance(claim.evidence_ref, true);
-      diagnostics(claim.diagnostics);
     });
     protocol(value.claims.every((claim, index) => index === 0 || claim.name >= value.claims[index - 1].name));
     protocol(Array.isArray(value.prerequisites));
@@ -854,15 +854,13 @@
       }
       protocol(["satisfied", "unsatisfied", "unknown"].includes(edge.resolved_state));
     });
-    protocol(exactKeys(value.program, ["diagnostics", "program_id", "resolution", "title"]));
+    protocol(exactKeys(value.program, ["program_id", "resolution", "title"]));
     uuid(value.program.program_id, true);
     protocol(["not_declared", "resolved", "unknown"].includes(value.program.resolution));
     protocol(value.program.title === null || safeText(value.program.title));
-    diagnostics(value.program.diagnostics);
-    protocol(exactKeys(value.superseded_by, ["diagnostics", "package_id", "resolution"]));
+    protocol(exactKeys(value.superseded_by, ["package_id", "resolution"]));
     uuid(value.superseded_by.package_id, true);
     protocol(["not_declared", "resolved", "unknown"].includes(value.superseded_by.resolution));
-    diagnostics(value.superseded_by.diagnostics);
   }
 
   function asciiString(value) {
@@ -891,7 +889,7 @@
   function validateSnapshot(snapshot) {
     const top = ["catalog_digest", "configuration_revision", "discovery_diagnostics", "entries", "identity_coverage",
       "inventory", "program_coverage", "programs", "schema_version", "terminal_stages"];
-    protocol(exactKeys(snapshot, top) && snapshot.schema_version === 7 &&
+    protocol(exactKeys(snapshot, top) && snapshot.schema_version === SCHEMA_VERSION &&
       /^[0-9a-f]{64}$/.test(snapshot.catalog_digest) && Array.isArray(snapshot.entries) &&
       Array.isArray(snapshot.programs));
     protocol(snapshot.configuration_revision === null || safeText(snapshot.configuration_revision));
@@ -930,31 +928,36 @@
       diagnostics(coverage.diagnostics);
     });
     snapshot.programs.forEach((program) => {
-      protocol(exactKeys(program, ["diagnostics", "member_package_ids", "program_id", "title"]));
+      protocol(exactKeys(program, ["member_package_ids", "program_id", "title"]));
       uuid(program.program_id);
       protocol(safeText(program.title));
       protocol(Array.isArray(program.member_package_ids));
       program.member_package_ids.forEach((member) => uuid(member));
-      diagnostics(program.diagnostics);
     });
     const paths = [];
     snapshot.entries.forEach((entry) => {
-      protocol(exactKeys(entry, ["declared", "diagnostics", "package_id", "package_path",
-        "project", "relationship", "stage", "state", "transitive_diagnostics"]));
+      protocol(exactKeys(entry, ["declared", "reported_fields", "package_id", "package_path",
+        "project", "relationship", "stage"]));
       uuid(entry.package_id, true);
       protocol(component(entry.project) && component(entry.stage) &&
         inventoryStages.has(`${entry.project}\u0000${entry.stage}`) && safeText(entry.package_path) &&
         !(entry.package_path.startsWith("/") || entry.package_path.includes("\\") ||
           entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
         (entry.package_path === `${entry.project}/${entry.stage}` ||
-          entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)) &&
-        ["complete", "partial"].includes(entry.state));
-      protocol(exactKeys(entry.declared, ["closure", "human_sanity_decision", "sanity_recommendation",
-        "status", "target_project", "title"]));
+          entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)));
+      protocol(exactKeys(entry.declared, DECLARED_FIELDS));
       Object.values(entry.declared).forEach((value) => protocol(declaredText(value)));
-      diagnostics(entry.diagnostics);
+      protocol(Array.isArray(entry.reported_fields) && entry.reported_fields.length <= MAX_REPORTED_FIELDS);
+      const reportedNames = new Set();
+      entry.reported_fields.forEach((field, index) => {
+        protocol(exactKeys(field, REPORTED_FIELD_KEYS) && safeText(field.name) && safeText(field.value));
+        const folded = field.name.replace(/[A-Z]/g, (character) => character.toLowerCase());
+        protocol(!reportedNames.has(folded) && (index === 0 ||
+          scalarCompare(field.name, entry.reported_fields[index - 1].name) > 0));
+        reportedNames.add(folded);
+      });
       relationship(entry.relationship);
-      protocol(Array.isArray(entry.transitive_diagnostics) && entry.transitive_diagnostics.length === 0);
+
       paths.push(entry.package_path);
     });
     protocol(paths.every((path, index) => index === 0 ||

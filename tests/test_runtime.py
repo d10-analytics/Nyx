@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from nyx import _native_claim, catalog, runtime, state, worker
-from nyx.models import canonical_digest
+from nyx.models import SCHEMA_VERSION, canonical_digest
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
@@ -58,7 +58,7 @@ def test_application_runtime_provider_admits_schema_six_and_rejects_schema_four(
 
         application.workers = Workers(payload.encode("utf-8"))
         admitted = application._provider()
-        assert admitted.schema_version == 7
+        assert admitted.schema_version == SCHEMA_VERSION
         assert admitted.configuration_revision is None
 
         legacy = json.loads(payload)

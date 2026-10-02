@@ -95,7 +95,7 @@ def test_setup_accepts_empty_root_and_defers_malformed_children_to_catalog():
             assert result.specification_root == spec_root.resolve()
             catalog = json.loads(scan_catalog(result.specification_root))
             assert catalog["entries"][0]["relationship"]["participation"] == "legacy"
-            assert catalog["entries"][0]["diagnostics"] == []
+            assert catalog["identity_coverage"] == {"state": "complete", "diagnostics": []}
 
 
 def test_valid_inactive_configuration_survives_loading_in_a_new_process():

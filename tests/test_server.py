@@ -13,7 +13,7 @@ import pytest
 
 from nyx import server, state
 from nyx.app_runtime import ApplicationRuntime
-from nyx.models import canonical_digest, parse_catalog
+from nyx.models import SCHEMA_VERSION, ProtocolError, canonical_digest, parse_catalog
 from nyx.server import CatalogError, _create_application_server, create_server
 
 
@@ -32,7 +32,7 @@ class StubClient:
 
 def raw_catalog():
     value = {
-        "schema_version": 7,
+        "schema_version": SCHEMA_VERSION,
         "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -55,20 +55,16 @@ def raw_catalog():
             "package_path": path,
             "project": path.split("/")[0],
             "stage": path.split("/")[1],
-            "state": "complete",
             "declared": {"title": title, "target_project": "Fictional",
-                         "status": "ready", "closure": "approved",
-                         "sanity_recommendation": "IMPLEMENT",
-                         "human_sanity_decision": "AFFIRMED"},
-            "diagnostics": [],
+                         "status": "ready"},
             "relationship": {"participation": "available", "claims": [],
                               "prerequisites": [],
                               "direct_prerequisite_state": "no_declared_prerequisites",
                               "program": {"program_id": None, "title": None,
-                                          "resolution": "not_declared", "diagnostics": []},
+                                          "resolution": "not_declared"},
                               "superseded_by": {"package_id": None,
-                                                "resolution": "not_declared", "diagnostics": []}},
-            "transitive_diagnostics": [],
+                                                "resolution": "not_declared"}},
+            "reported_fields": [],
         })
     first, second = value["entries"]
     program_id = str(UUID(int=3, version=4))
@@ -79,7 +75,6 @@ def raw_catalog():
                 "name": "release",
                 "state": "satisfied",
                 "evidence_ref": "sha256:" + "a" * 64,
-                "diagnostics": [],
             }
         ],
         "prerequisites": [
@@ -98,12 +93,10 @@ def raw_catalog():
             "program_id": program_id,
             "title": "Test program",
             "resolution": "resolved",
-            "diagnostics": [],
         },
         "superseded_by": {
             "package_id": second["package_id"],
             "resolution": "resolved",
-            "diagnostics": [],
         },
     }
     value["programs"] = [
@@ -111,7 +104,6 @@ def raw_catalog():
             "program_id": program_id,
             "title": "Test program",
             "member_package_ids": [first["package_id"]],
-            "diagnostics": [],
         }
     ]
     value["catalog_digest"] = canonical_digest(value)
@@ -145,6 +137,7 @@ def test_default_provider_uses_real_scanner_and_emits_every_stage(tmp_path, monk
         lambda value: value.update(schema_version=4),
         lambda value: value.update(schema_version=5),
         lambda value: value.update(schema_version=6),
+        lambda value: value.update(schema_version=7),
         lambda value: value.pop("configuration_revision"),
         lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
@@ -159,14 +152,15 @@ def test_default_provider_uses_real_scanner_and_emits_every_stage(tmp_path, monk
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-3", "schema-4", "schema-5", "schema-6", "missing-revision", "malformed-revision", "unknown-key", "old-entry-field", "old-object", "missing-terminal", "unsorted-terminal", "duplicate-terminal", "inventory-mismatch", "cross-kind-edge", "transitive-reference"],
+    ids=["schema-3", "schema-4", "schema-5", "schema-6", "schema-7", "missing-revision", "malformed-revision", "unknown-key", "old-entry-field", "old-object", "missing-terminal", "unsorted-terminal", "duplicate-terminal", "inventory-mismatch", "cross-kind-edge", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
     mutate(value)
     value["catalog_digest"] = canonical_digest(value)
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError) as error:
         parse_catalog(value)
+    assert str(error.value) != "catalog digest mismatch"
 
 
 def test_schema_four_parser_rejects_bad_digest_even_when_shape_is_valid():
@@ -184,8 +178,10 @@ def test_schema_four_parser_rejects_bad_digest_even_when_shape_is_valid():
     ),
 ])
 def test_catalog_object_providers_are_revalidated_as_schema_four(alter):
+    value = alter(valid_catalog())
+    value = replace(value, catalog_digest=canonical_digest(value.as_dict()))
     with pytest.raises(CatalogError, match="producer_protocol_error"):
-        server._catalog_from_provider(lambda: alter(valid_catalog()))
+        server._catalog_from_provider(lambda: value)
 
 
 class RunningServer:
@@ -479,7 +475,6 @@ def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
                         "program_id": str(UUID(int=3, version=4)),
                         "title": "Program",
                         "member_package_ids": ["not-a-uuid"],
-                        "diagnostics": [],
                     }
                 ]
             }
@@ -904,3 +899,66 @@ def test_static_assets_are_served_from_the_fixed_allowlist():
         assert body
         if path.startswith("/static/"):
             assert body == (Path(__file__).parents[1] / "nyx" / path.lstrip("/")).read_bytes()
+
+
+def reported_contract_cases():
+    """Shared protocol examples exercised at Python and browser acceptance points."""
+    cases = []
+
+    def add(name, mutate, accepted=False):
+        value = raw_catalog()
+        mutate(value, value["entries"][0])
+        value["catalog_digest"] = canonical_digest(value)
+        cases.append(pytest.param(value, accepted, id=name))
+
+    add("extra-declared", lambda v, e: e["declared"].update(closure="approved"))
+    add("missing-declared", lambda v, e: e["declared"].pop("status"))
+    records = [
+        ("not-list", {}),
+        ("extra-record-key", [{"name": "Note", "value": "ok", "extra": 1}]),
+        ("missing-value", [{"name": "Note"}]),
+        ("sixty-five", [{"name": f"N{i:02}", "value": "ok"} for i in range(65)]),
+        ("unsorted", [{"name": "Z", "value": "ok"}, {"name": "A", "value": "ok"}]),
+        ("duplicate", [{"name": "Note", "value": "ok"}] * 2),
+        ("ascii-case-duplicate", [{"name": "CLOSURE", "value": "a"}, {"name": "Closure", "value": "b"}]),
+        ("ascii-overlong", [{"name": "Note", "value": "a" * 1025}]),
+        ("astral-overlong", [{"name": "Note", "value": "😀" * 513}]),
+        ("empty-value", [{"name": "Note", "value": ""}]),
+        ("tab-value", [{"name": "Note", "value": "a\tb"}]),
+        ("control-value", [{"name": "Note", "value": "a\x7fb"}]),
+        ("surrogate-value", [{"name": "Note", "value": "\ud800"}]),
+        ("empty-name", [{"name": "", "value": "ok"}]),
+        ("control-name", [{"name": "N\t", "value": "ok"}]),
+        ("surrogate-name", [{"name": "N\ud800", "value": "ok"}]),
+        ("utf16-order", [{"name": "X😀", "value": "a"}, {"name": "X�", "value": "b"}]),
+    ]
+    for name, fields in records:
+        add(name, lambda v, e, fields=fields: e.update(reported_fields=fields))
+    add("tab-title", lambda v, e: e["declared"].update(title="a\tb"))
+    add("overlong-title", lambda v, e: e["declared"].update(title="a" * 1025))
+    add("entry-state", lambda v, e: e.update(state="complete"))
+    add("entry-diagnostics", lambda v, e: e.update(diagnostics=[]))
+    add("transitive", lambda v, e: e.update(transitive_diagnostics=[]))
+    add("claim-diagnostics", lambda v, e: e["relationship"]["claims"][0].update(diagnostics=[]))
+    add("program-diagnostics", lambda v, e: e["relationship"]["program"].update(diagnostics=[]))
+    add("successor-diagnostics", lambda v, e: e["relationship"]["superseded_by"].update(diagnostics=[]))
+    add("catalog-program-diagnostics", lambda v, e: v["programs"][0].update(diagnostics=[]))
+    for name, fields in [
+        ("sixty-four", [{"name": f"N{i:02}", "value": "ok"} for i in range(64)]),
+        ("astral-limit", [{"name": "Note", "value": "😀" * 512}]),
+        ("unicode-distinct", [{"name": "XÄ", "value": "a"}, {"name": "Xä", "value": "b"}]),
+        ("scalar-order", [{"name": "X�", "value": "a"}, {"name": "X😀", "value": "b"}]),
+    ]:
+        add(name, lambda v, e, fields=fields: e.update(reported_fields=fields), True)
+    return cases
+
+
+@pytest.mark.parametrize("value,accepted", reported_contract_cases())
+def test_reported_contract_at_python_acceptance(value, accepted):
+    assert value["catalog_digest"] == canonical_digest(value)
+    if accepted:
+        assert parse_catalog(value).as_dict() == value
+    else:
+        with pytest.raises(ProtocolError) as error:
+            parse_catalog(value)
+        assert str(error.value) != "catalog digest mismatch"

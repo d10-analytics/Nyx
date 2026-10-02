@@ -100,8 +100,10 @@ def _fetch_catalog(url: str) -> dict[str, object]:
 
 
 def _assert_catalog(value: dict[str, object]) -> None:
+    from nyx.models import SCHEMA_VERSION
+
     entries = value["entries"]
-    assert value["schema_version"] == 7
+    assert value["schema_version"] == SCHEMA_VERSION
     assert value["configuration_revision"] is not None
     assert value["inventory"] == {
         "projects": [{"name": "Fictional", "availability": "complete"}],
@@ -135,10 +137,10 @@ def _assert_catalog(value: dict[str, object]) -> None:
 
 @pytest.mark.parametrize("case", ["schema-3", "schema-4", "malformed-revision", "duplicate-project"])
 def test_installed_service_rejects_malformed_inventory_at_http_boundary(case: str) -> None:
-    from nyx.models import canonical_digest
+    from nyx.models import SCHEMA_VERSION, canonical_digest
 
     value = {
-        "schema_version": 7,
+        "schema_version": SCHEMA_VERSION,
         "configuration_revision": None,
         "inventory": {
             "projects": [{"name": "Fictional", "availability": "complete"}],

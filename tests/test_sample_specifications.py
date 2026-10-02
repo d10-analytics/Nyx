@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from nyx import catalog
-from nyx.models import canonical_digest, parse_catalog
+from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 
 SAMPLE_ROOT = Path(__file__).parents[1] / "examples" / "sample-specifications"
 PROGRAM_ID = "99999999-9999-4999-8999-999999999999"
@@ -25,7 +25,7 @@ def _entry_by_path(value: dict[str, object], package_path: str) -> dict[str, obj
 def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stages) -> None:
     value = json.loads(catalog.build_catalog(SAMPLE_ROOT, completed_stage_names=completed_stages))
 
-    assert value["schema_version"] == 7
+    assert value["schema_version"] == SCHEMA_VERSION
     assert value["configuration_revision"] is None
     assert value["inventory"] == {
         "projects": [
@@ -100,8 +100,8 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stag
         assert entry["package_id"] == package_id
         assert entry["stage"] == stage
         assert "board_visible" not in entry
-        assert entry["diagnostics"] == []
-        assert entry["transitive_diagnostics"] == []
+        assert set(entry) == {"package_id", "package_path", "project", "stage", "declared", "reported_fields", "relationship"}
+        assert entry["reported_fields"] == []
 
     plan = _entry_by_path(value, "Trail_Web/Under_Development/plan")
     delivery = _entry_by_path(value, "Trail_Web/Queue/delivery")
@@ -110,7 +110,6 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stag
         "program_id": PROGRAM_ID,
         "title": "Route preview",
         "resolution": "resolved",
-        "diagnostics": [],
     }
     assert delivery["relationship"]["program"] == plan["relationship"]["program"]
     assert plan["relationship"]["direct_prerequisite_state"] == "satisfied"
@@ -165,13 +164,11 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stag
             "name": "contract-ready",
             "state": "satisfied",
             "evidence_ref": "sha256:" + "f" * 64,
-            "diagnostics": [],
         },
         {
             "name": "implementation-ready",
             "state": "unsatisfied",
             "evidence_ref": None,
-            "diagnostics": [],
         },
     ]
     assert value["programs"] == [
@@ -183,7 +180,6 @@ def test_sample_catalog_resolves_stages_program_and_prerequisites(completed_stag
                 "22222222-2222-4222-8222-222222222222",
                 "66666666-6666-4666-8666-666666666666",
             ],
-            "diagnostics": [],
         }
     ]
 
