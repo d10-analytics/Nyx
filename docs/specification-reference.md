@@ -44,8 +44,12 @@ syntax remains unchanged while the board shows prerequisite and dependent links
 on cards. A provider in a finished row appears when **Hide terminal rows** is
 unchecked.
 
-Nyx also reads `Closure`, `Sanity Recommendation`, and `Human Sanity Decision`
-as reported text. These fields are optional; they do not trigger actions.
+Other header lines of the form `Name: value`, such as `Owner Note: waiting for
+venue confirmation`, are retained as reported text. Names must start with a
+capital letter (`A`–`Z`). Their values are searchable but are not shown on cards
+and do not trigger actions. Names are compared case-insensitively for `A`–`Z`;
+the first occurrence with a nonempty value wins. Nyx keeps at most the first
+64 distinct fields in header order and shortens long values.
 Project and stage come from the work item's directory location.
 
 The project is the first directory below the configured workspace root, and the

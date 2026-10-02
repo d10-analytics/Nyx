@@ -80,13 +80,13 @@ Status: needs-fixes
 The empty `Planning` stage and `Community_Resources` project each contain only
 `.gitkeep`. These four work items and two empty dimensions are the entire
 disposable fixture. The normal scanner must retain all four work items, resolve
-the permit item, and report zero diagnostics with complete identity and program
+the permit item, and report zero workspace diagnostics with complete identity and program
 coverage and complete project and stage inventory. Configure the fixture
 with `nyx --setup <fixture-root>` and start the normal local server and scanner.
 In **Board settings**, check **Counts as finished** beside `Done` and choose
 **Save**; keep **Hide terminal rows** checked for every capture, as described in
 the [capture procedure](running-nyx.md#capture-and-review-the-fictional-example).
-Before each capture, verify the live catalog is complete and diagnostic-free
+Before each capture, verify the live catalog is complete and has no workspace diagnostics
 and the browser has no workspace or refresh issues panel. The expanded view
 reveals the empty `Planning` row and `Community_Resources` column.
 The interface calls each

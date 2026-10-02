@@ -249,12 +249,11 @@ above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
 **Hide terminal rows** checked for all three images.
 
-Before each capture, inspect the live `/api/catalog` response: every diagnostic
-array must be empty, including discovery, coverage, item, transitive, and nested
-relationship, claim, and program diagnostics. Both identity and program coverage
-must be complete, and `programs` must be empty. Confirm exactly the four work
-items remain in the catalog, each with `state` complete, and every project and
-stage inventory availability is complete, including the empty `Planning` stage
+Before each capture, inspect the live `/api/catalog` response: the workspace
+diagnostics in `discovery_diagnostics` must be empty. Both identity and program
+coverage must be complete, and `programs` must be empty. Confirm exactly the four
+work items remain in the catalog and every project and stage inventory
+availability is complete, including the empty `Planning` stage
 and `Community_Resources` project. Confirm the festival's completion prerequisite still targets the
 permit, observes `Done`, and resolves as satisfied with reason
 `completion_satisfied`. In the actual browser, verify there is no workspace or
@@ -282,7 +281,7 @@ panel.
 Review each file directly beside the running browser in both themes. Confirm
 that the selected card, package path, empty dimensions, saved row order, labels,
 controls, and absence of workspace or refresh issues match the browser.
-Reject a capture if the catalog is incomplete, any diagnostic or issues panel
+Reject a capture if the catalog is incomplete, any workspace diagnostic or issues panel
 is present, it contains a private path or value, was drawn by
 hand, or no longer shows the named state. This procedure is intentionally a
 repeatable browser session; it does not add a permanent screenshot framework.
