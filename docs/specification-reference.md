@@ -45,11 +45,18 @@ on cards. A provider in a finished row appears when **Hide terminal rows** is
 unchecked.
 
 Other header lines of the form `Name: value`, such as `Owner Note: waiting for
-venue confirmation`, are retained as reported text. Names must start with a
-capital letter (`A`–`Z`). Their values are searchable but are not shown on cards
-and do not trigger actions. Names are compared case-insensitively for `A`–`Z`;
-the first occurrence with a nonempty value wins. Nyx keeps at most the first
-64 distinct fields in header order and shortens long values.
+venue confirmation`, are retained as reported text. The name may be bold, as in
+`**Owner Note:** text` or `**Owner Note**: text`. Their values are searchable
+but are not shown on cards and do not trigger actions. Names must start with a
+capital letter (`A`–`Z`), be at most 64 characters long, and contain no `:`,
+`*`, `` ` ``, `<`, `>`, `|`, `[`, `]`, or control characters. The field names in
+the table above (`Package ID`, `Status`, `Target repo`, `Program Membership`,
+`Claim`, `Prerequisite`, `Completion Prerequisite`, and `Superseded By`) never
+become additional reported text, in any capitalization. Nyx ignores a line whose
+name breaks these rules; it does not shorten a long name. Names are compared
+case-insensitively for `A`–`Z`; the first occurrence with a nonempty value wins.
+Nyx keeps at most the first 64 distinct fields in header order and shortens long
+values.
 Project and stage come from the work item's directory location.
 
 The project is the first directory below the configured workspace root, and the
