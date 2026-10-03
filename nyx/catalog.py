@@ -19,8 +19,6 @@ from .state import (
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _INVALID_POLICY = object()
 
-_IGNORED_ROOT_SYMLINK_NAMES = {"CLAUDE.md", "CODEX.md"}
-_IGNORED_PROJECT_SYMLINK_NAME = "template_spec.md"
 _SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
@@ -178,6 +176,11 @@ def _catalog_is_reparse(info: os.stat_result) -> bool:
         return True
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(info, "st_file_attributes", 0) & reparse)
+
+
+def _catalog_is_document_link_name(name: str) -> bool:
+    """Return whether a linked entry has a literal Markdown document name."""
+    return name.endswith(".md")
 
 
 def _catalog_admit_directory(path: Path, *, root: bool = False) -> Path:
@@ -691,6 +694,8 @@ def _scan_stage(
                 complete = False
                 continue
             if _catalog_is_reparse(child_info):
+                if _catalog_is_document_link_name(child.name):
+                    continue
                 discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(child_path, spec_root)))
                 complete = False
                 continue
@@ -963,7 +968,7 @@ def _build_catalog(
             inventory_projects.append({"name": repository.name, "availability": "incomplete"})
             continue
         if _catalog_is_reparse(repository_info):
-            if repository.name in _IGNORED_ROOT_SYMLINK_NAMES:
+            if _catalog_is_document_link_name(repository.name):
                 continue
             discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(spec_root, spec_root)))
             continue
@@ -1011,7 +1016,7 @@ def _build_catalog(
                     project_inventory["availability"] = "incomplete"
                     continue
                 if _catalog_is_reparse(stage_info):
-                    if directory == _IGNORED_PROJECT_SYMLINK_NAME:
+                    if _catalog_is_document_link_name(directory):
                         continue
                     discovery_diagnostics.append(_catalog_diagnostic("discovery_unavailable", _catalog_relative(repository_path, spec_root)))
                     continue

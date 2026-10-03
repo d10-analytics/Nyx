@@ -74,7 +74,13 @@ path to its literal root before saving it, while a catalog scan invoked directly
 with a linked or reparse root rejects that root. Every discovered structural
 directory must be literal: Nyx rejects symlinks and Windows reparse points before
 descent, including project, stage, grouping, work item, `Reference`, `Programs`,
-and UUID program directories. Symlinked or reparse anchors are not read. This is
+and UUID program directories. At the workspace, project, stage, and grouping
+levels, a link whose name ends in `.md` (case-sensitive) is instead treated as
+a document: it is not followed and does not make discovery incomplete, so a
+linked folder with such a name contributes no work items. Names that Nyx
+already rejects as unsafe keep their diagnostic. A link named `spec.md` or
+`program.md` where Nyx expects an anchor is treated as a nonregular anchor
+rather than as a document. Symlinked or reparse anchors are not read. This is
 a trusted-local input contract and does not claim hostile concurrent
 path-substitution containment. Case is preserved literally; case-distinct
 siblings exist only where the host filesystem supports them, and Nyx does not

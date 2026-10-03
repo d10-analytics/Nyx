@@ -13,7 +13,17 @@ before saving it. A catalog scan invoked directly with a symlink or Windows
 reparse point as its root rejects that root. The same literal-directory rule
 applies to discovered projects, stages, grouping directories, work item
 directories, and program directories; linked or reparse entries are skipped with bounded
-discovery information. This is a trusted-local workspace contract, not
+discovery information. At the workspace, project, stage, and grouping levels, a
+linked or reparse entry whose name ends in `.md` (matched exactly, so
+`notes.MD` does not count) is instead treated as a document, like a regular
+file: it is not followed and does not make discovery incomplete. Names that Nyx
+already rejects as unsafe keep their diagnostic. Because Nyx never follows
+links, a linked folder named like `notes.md` is not scanned: its work items do
+not appear, and discovery still reports complete. A link named `spec.md` inside
+a stage, grouping, or work item directory, or `program.md` inside a program
+directory, is treated as that directory's anchor rather than as a document: Nyx
+reports a nonregular anchor and does not read through the link. This is a
+trusted-local workspace contract, not
 containment against a hostile process changing a pathname while a scan is in
 progress.
 
