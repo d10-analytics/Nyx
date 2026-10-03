@@ -538,6 +538,58 @@ class CatalogTests(TestCase):
                             )
                             self.assertNotIn("Escaped", json.dumps(value))
 
+    def test_unsafe_document_link_names_keep_their_discovery_diagnostic(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("control characters cannot appear in Windows file names")
+        name = "bad\x01.md"
+        for level in ("root", "project"):
+            for target_kind in ("directory", "file"):
+                with self.subTest(name=name, level=level, target=target_kind):
+                    with TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        root = base / "specs"
+                        package(root, "Queue", "item", "# Item\n")
+                        parent = {"root": root, "project": root / "Fictional"}[level]
+                        link = parent / name
+                        outside = base / "outside"
+                        if target_kind == "directory":
+                            (outside / "escaped").mkdir(parents=True)
+                            (outside / "escaped" / "spec.md").write_text(
+                                "# Escaped directory\n", encoding="utf-8"
+                            )
+                            link_directory(link, outside)
+                        else:
+                            outside.write_text("# Escaped file\n", encoding="utf-8")
+                            link.symlink_to(outside)
+                        self.assertTrue(link.is_symlink())
+
+                        value = json.loads(catalog.scan_catalog(root))
+                        diagnostic_path = {"root": ".", "project": "Fictional"}[level]
+                        diagnostics = [{
+                            "code": "discovery_unavailable",
+                            "message": f"discovery unavailable: {diagnostic_path}",
+                        }]
+                        self.assertEqual(diagnostics, value["discovery_diagnostics"])
+                        self.assertEqual(
+                            {"state": "incomplete", "diagnostics": diagnostics},
+                            value["identity_coverage"],
+                        )
+                        self.assertEqual(
+                            {
+                                "projects": [{"name": "Fictional", "availability": "complete"}],
+                                "stages": [{
+                                    "project": "Fictional", "stage": "Queue",
+                                    "availability": "complete",
+                                }],
+                            },
+                            value["inventory"],
+                        )
+                        self.assertEqual(
+                            {"Fictional/Queue/item"},
+                            {entry["package_path"] for entry in value["entries"]},
+                        )
+                        self.assertNotIn("Escaped", json.dumps(value))
+
     def test_spec_links_at_root_and_project_are_documents_not_anchors(self) -> None:
         for level in ("root", "project"):
             for target_kind in ("directory", "file"):
