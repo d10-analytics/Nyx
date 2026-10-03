@@ -388,7 +388,7 @@ class CatalogTests(TestCase):
             }
             assert "outside" not in json.dumps(value)
 
-    def test_nonpackage_workspace_symlinks_are_ignored_for_complete_relationships(self) -> None:
+    def test_markdown_links_at_every_level_preserve_complete_relationships(self) -> None:
         with TemporaryDirectory() as temporary:
             base = Path(temporary)
             root = base / "specs"
@@ -409,22 +409,21 @@ class CatalogTests(TestCase):
                 f"Claim: handoff | satisfied | sha256:{'a' * 64}\n",
             )
 
-            outside_root = base / "outside-root"
-            (outside_root / "Queue" / "escaped").mkdir(parents=True)
-            (outside_root / "Queue" / "escaped" / "spec.md").write_text(
-                "# Escaped root link\n", encoding="utf-8"
+            group = root / "Fictional" / "Done" / "group"
+            group.mkdir()
+            links = (
+                root / "AGENTS.md",
+                root / "Fictional" / "notes.md",
+                root / "Fictional" / "Queue" / "guide.md",
+                group / "notes.md",
             )
-            root.joinpath("CLAUDE.md").symlink_to(outside_root, target_is_directory=True)
-            root.joinpath("CODEX.md").symlink_to(outside_root, target_is_directory=True)
-
-            outside_template = base / "outside-template"
-            (outside_template / "escaped").mkdir(parents=True)
-            (outside_template / "escaped" / "spec.md").write_text(
-                "# Escaped template link\n", encoding="utf-8"
-            )
-            (root / "Fictional" / "template_spec.md").symlink_to(
-                outside_template, target_is_directory=True
-            )
+            for index, link in enumerate(links):
+                outside = base / f"outside-{index}"
+                (outside / "escaped").mkdir(parents=True)
+                (outside / "escaped" / "spec.md").write_text(
+                    f"# Escaped link {index}\n", encoding="utf-8"
+                )
+                link_directory(link, outside)
 
             value = json.loads(catalog.scan_catalog(root))
             entries = {entry["package_path"]: entry for entry in value["entries"]}
@@ -432,8 +431,19 @@ class CatalogTests(TestCase):
             target = entries["Fictional/Done/target"]
             edge = source["relationship"]["prerequisites"][0]
 
-            self.assertEqual("complete", value["identity_coverage"]["state"])
-            self.assertEqual([], value["identity_coverage"]["diagnostics"])
+            self.assertEqual(
+                {"state": "complete", "diagnostics": []}, value["identity_coverage"]
+            )
+            self.assertEqual(
+                {
+                    "projects": [{"name": "Fictional", "availability": "complete"}],
+                    "stages": [
+                        {"project": "Fictional", "stage": "Done", "availability": "complete"},
+                        {"project": "Fictional", "stage": "Queue", "availability": "complete"},
+                    ],
+                },
+                value["inventory"],
+            )
             self.assertEqual("complete", value["program_coverage"]["state"])
             self.assertEqual([], value["discovery_diagnostics"])
             self.assertEqual(
@@ -458,6 +468,120 @@ class CatalogTests(TestCase):
             self.assertEqual("claim_satisfied", edge["reason"])
             self.assertNotIn("Escaped", json.dumps(value))
 
+    def test_document_link_names_are_literal_at_every_discovery_level(self) -> None:
+        for name in ("notes.md", "CLAUDE.md", ".md", "notes.MD", "notes.md.txt", "notes"):
+            for level in ("root", "project", "stage", "grouping"):
+                for target_kind in ("directory", "file"):
+                    with self.subTest(name=name, level=level, target=target_kind):
+                        with TemporaryDirectory() as temporary:
+                            base = Path(temporary)
+                            root = base / "specs"
+                            package(root, "Queue", "item", "# Item\n")
+                            group = root / "Fictional" / "Queue" / "group"
+                            group.mkdir()
+                            parents = {
+                                "root": root,
+                                "project": root / "Fictional",
+                                "stage": root / "Fictional" / "Queue",
+                                "grouping": group,
+                            }
+                            link = parents[level] / name
+                            outside = base / "outside"
+                            if target_kind == "directory":
+                                (outside / "escaped").mkdir(parents=True)
+                                (outside / "escaped" / "spec.md").write_text(
+                                    "# Escaped directory\n", encoding="utf-8"
+                                )
+                                link_directory(link, outside)
+                            else:
+                                outside.write_text("# Escaped file\n", encoding="utf-8")
+                                link.symlink_to(outside)
+
+                            value = json.loads(catalog.scan_catalog(root))
+                            quiet = name in {"notes.md", "CLAUDE.md", ".md"}
+                            diagnostic_path = {
+                                "root": ".",
+                                "project": "Fictional",
+                                "stage": f"Fictional/Queue/{name}",
+                                "grouping": f"Fictional/Queue/group/{name}",
+                            }[level]
+                            diagnostics = [] if quiet else [{
+                                "code": "discovery_unavailable",
+                                "message": f"discovery unavailable: {diagnostic_path}",
+                            }]
+                            availability = (
+                                "incomplete"
+                                if not quiet and level in {"stage", "grouping"}
+                                else "complete"
+                            )
+                            self.assertEqual(diagnostics, value["discovery_diagnostics"])
+                            self.assertEqual(
+                                {
+                                    "state": "complete" if quiet else "incomplete",
+                                    "diagnostics": diagnostics,
+                                },
+                                value["identity_coverage"],
+                            )
+                            self.assertEqual(
+                                {
+                                    "projects": [{"name": "Fictional", "availability": availability}],
+                                    "stages": [{
+                                        "project": "Fictional", "stage": "Queue",
+                                        "availability": availability,
+                                    }],
+                                },
+                                value["inventory"],
+                            )
+                            self.assertEqual(
+                                {"Fictional/Queue/item"},
+                                {entry["package_path"] for entry in value["entries"]},
+                            )
+                            self.assertNotIn("Escaped", json.dumps(value))
+
+    def test_spec_links_at_root_and_project_are_documents_not_anchors(self) -> None:
+        for level in ("root", "project"):
+            for target_kind in ("directory", "file"):
+                with self.subTest(name="spec.md", level=level, target=target_kind):
+                    with TemporaryDirectory() as temporary:
+                        base = Path(temporary)
+                        root = base / "specs"
+                        package(root, "Queue", "item", "# Item\n")
+                        (root / "Fictional" / "Queue" / "group").mkdir()
+                        parent = root if level == "root" else root / "Fictional"
+                        link = parent / "spec.md"
+                        outside = base / "outside"
+                        if target_kind == "directory":
+                            (outside / "escaped").mkdir(parents=True)
+                            (outside / "escaped" / "spec.md").write_text(
+                                "# Escaped directory\n", encoding="utf-8"
+                            )
+                            link_directory(link, outside)
+                        else:
+                            outside.write_text("# Escaped file\n", encoding="utf-8")
+                            link.symlink_to(outside)
+
+                        value = json.loads(catalog.scan_catalog(root))
+                        self.assertEqual([], value["discovery_diagnostics"])
+                        self.assertEqual(
+                            {"state": "complete", "diagnostics": []},
+                            value["identity_coverage"],
+                        )
+                        self.assertEqual(
+                            {
+                                "projects": [{"name": "Fictional", "availability": "complete"}],
+                                "stages": [{
+                                    "project": "Fictional", "stage": "Queue",
+                                    "availability": "complete",
+                                }],
+                            },
+                            value["inventory"],
+                        )
+                        self.assertEqual(
+                            {"Fictional/Queue/item"},
+                            {entry["package_path"] for entry in value["entries"]},
+                        )
+                        self.assertNotIn("Escaped", json.dumps(value))
+
     def test_regular_workspace_link_names_remain_ordinary_candidates(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "specs"
@@ -465,6 +589,7 @@ class CatalogTests(TestCase):
                 ("CLAUDE.md", "Queue", "claude"),
                 ("CODEX.md", "Queue", "codex"),
                 ("Fictional", "template_spec.md", "template"),
+                ("Fictional", "Queue", "guide.md/pkg"),
             )
             for project, stage, name in fixtures:
                 package_path = root / project / stage / name
@@ -488,6 +613,7 @@ class CatalogTests(TestCase):
                     "CLAUDE.md/Queue/claude",
                     "CODEX.md/Queue/codex",
                     "Fictional/template_spec.md/template",
+                    "Fictional/Queue/guide.md/pkg",
                 },
                 {entry["package_path"] for entry in value["entries"]},
             )
