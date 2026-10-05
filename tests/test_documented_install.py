@@ -160,6 +160,18 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
+PORT_CONFLICT_GUIDANCE_MARKERS = (
+    "**Nyx says port 8765 is already in use:**",
+    "Linux", "`ss -ltnp 'sport = :8765'`",
+    "macOS", "`lsof -nP -iTCP:8765 -sTCP:LISTEN`",
+    "Windows PowerShell", "`Get-NetTCPConnection -LocalPort 8765 -State Listen`",
+    "`OwningProcess` is the process ID",
+    "Close that program", "run `nyx` again", "**Revalidate**",
+    "Nyx never switches ports",
+    "Nyx runtime could not start; retry",
+    "excluded or reserved port range", "no owning program",
+    "`netsh interface ipv4 show excludedportrange protocol=tcp`",
+)
 EVENT_COMPLETION_EXAMPLE = (
     "# Organize the neighborhood festival\n"
     "Package ID: 123e4567-e89b-42d3-a456-426614174100\n"
@@ -259,6 +271,20 @@ def test_event_walkthrough_shows_whole_item_and_named_outcomes():
     assert "event plan's whole-item requirement" in document
     assert "literal `Done` stage" in document
     assert "separate named outcomes" in document
+
+
+def test_port_conflict_guidance_matches_the_public_message():
+    from nyx import runtime
+
+    document = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    assert document.splitlines()[0] == "# Running Nyx"
+    section = document.split("## If something looks wrong\n", 1)[1].split("\n## ", 1)[0]
+    normalized = re.sub(r"\s+", " ", section)
+    for marker in PORT_CONFLICT_GUIDANCE_MARKERS:
+        assert marker in normalized, marker
+    assert "```" not in section
+    assert "If something looks wrong" in runtime.PORT_UNAVAILABLE_MESSAGE
+    assert "Running Nyx" in runtime.PORT_UNAVAILABLE_MESSAGE
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
