@@ -497,7 +497,7 @@ class BlockingRawSequenceClient(RawSequenceClient):
 class BrowserSettings:
     """Small application-settings seam used by the browser behavior tests."""
 
-    def __init__(self, order=(), completed=(), revision="revision-1", root=None):
+    def __init__(self, order=(), completed=(), revision="revision-1", root=None, gate=None):
         self.order = list(order)
         self.completed = list(completed)
         self.revision = revision
@@ -506,9 +506,14 @@ class BrowserSettings:
         self.get_calls = 0
         self.fail_next = False
         self.fail_next_load = False
+        self.gate = gate
+        self.entered = threading.Event()
 
     def get_settings(self):
         self.get_calls += 1
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(timeout=10)
         if self.fail_next_load:
             self.fail_next_load = False
             raise CatalogError("producer_unavailable")
@@ -521,6 +526,9 @@ class BrowserSettings:
 
     def save_settings(self, revision, order, completed):
         self.calls.append((revision, list(order), list(completed)))
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(timeout=10)
         if self.fail_next:
             self.fail_next = False
             return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "failure"}
@@ -1506,6 +1514,169 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
         "JSON.stringify(['Queue', 'Under Development'])"
     )
     assert row_labels(page2) == ["Queue", "Under Development"]
+
+
+def arm_focus_sampler(page):
+    page.evaluate("""() => {
+      window.focusViolations = [];
+      const check = () => {
+        if (!document.activeElement || document.activeElement === document.body) {
+          window.focusViolations.push(performance.now());
+        }
+      };
+      const frame = () => { check(); requestAnimationFrame(frame); };
+      requestAnimationFrame(frame);
+      for (const event of ['focusin', 'focusout']) {
+        document.addEventListener(event, () => setTimeout(check, 0));
+      }
+    }""")
+
+
+def assert_focus_sampler_clean(page):
+    page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)))")
+    assert page.evaluate("window.focusViolations") == []
+
+
+def test_stage_editor_focus_stays_on_used_control_or_successor(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    checkbox = page.get_by_role("checkbox", name="Counts as finished: Queue", exact=True)
+    checkbox.focus()
+    arm_focus_sampler(page)
+    kept = checkbox.element_handle()
+    checkbox.press("Space")
+    playwright.expect(checkbox).to_be_checked()
+    playwright.expect(checkbox).to_be_focused()
+    assert not kept.evaluate("node => node.isConnected")
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    page.get_by_role("button", name="Move Queue down", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Queue up", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Under Development down", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    page.get_by_role("button", name="Save", exact=True).press("Enter")
+    playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+    assert settings.get_calls == 2
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Reset", exact=True).press("Enter")
+    playwright.expect(page.locator(".row-head")).to_have_text(["Queue", "Under Development"])
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.calls == [
+        ("revision-1", ["Under_Development", "Queue"], []), ("revision-2", [], []),
+    ]
+    assert settings.get_calls == 3
+    assert_focus_sampler_clean(page)
+
+    winner = open_page(StaticClient(board_payload()), settings=settings)
+    winner.locator("#stage-order-heading").press("Enter")
+    with winner.expect_response(lambda response: response.url.endswith("/api/settings") and response.request.method == "GET"):
+        winner.get_by_role("button", name="Reset", exact=True).press("Enter")
+    playwright.expect(winner.get_by_role("button", name="Reset", exact=True)).to_be_enabled()
+    assert settings.calls[-1] == ("revision-3", [], [])
+    assert settings.get_calls == 5
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    page.get_by_role("button", name="Save", exact=True).press("Enter")
+    reload = page.get_by_role("button", name="Reload board settings", exact=True)
+    playwright.expect(reload).to_be_focused()
+    assert settings.calls[-1] == ("revision-3", ["Under_Development", "Queue"], [])
+    assert len(settings.calls) == 4
+    assert settings.get_calls == 5
+    assert_focus_sampler_clean(page)
+    reload.press("Enter")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.get_calls == 6
+    assert len(settings.calls) == 4
+    assert_focus_sampler_clean(page)
+
+
+def test_stage_editor_focus_survives_held_settings_requests(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    save = page.get_by_role("button", name="Save", exact=True)
+    save.focus()
+    arm_focus_sampler(page)
+    settings.gate = threading.Event()
+    try:
+        save.press("Enter")
+        assert settings.entered.wait(timeout=2)
+        playwright.expect(save).to_be_focused()
+        assert save.get_attribute("aria-disabled") == "true"
+        assert save.get_attribute("disabled") is None
+        assert float(save.evaluate("node => getComputedStyle(node).opacity")) < 1
+        checkbox = page.get_by_role("checkbox", name="Counts as finished: Under Development", exact=True)
+        checkbox.focus()
+        kept = checkbox.element_handle()
+        checkbox.press("Space")
+        assert not checkbox.is_checked()
+        assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+        assert_focus_sampler_clean(page)
+    finally:
+        settings.gate.set()
+    playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    playwright.expect(checkbox).to_be_focused()
+    assert not kept.evaluate("node => node.isConnected")
+    assert settings.get_calls == 2
+    assert len(settings.calls) == 1
+    assert_focus_sampler_clean(page)
+
+    failed = BrowserSettings()
+    failed.fail_next_load = True
+    retry_page = open_page(StaticClient(board_payload()), settings=failed)
+    retry_page.locator("#stage-order-heading").press("Enter")
+    reload = retry_page.get_by_role("button", name="Reload board settings", exact=True)
+    reload.focus()
+    arm_focus_sampler(retry_page)
+    failed.gate = threading.Event()
+    try:
+        reload.press("Enter")
+        assert failed.entered.wait(timeout=2)
+        playwright.expect(reload).to_be_focused()
+        assert reload.get_attribute("aria-disabled") == "true"
+        assert reload.get_attribute("disabled") is None
+        assert failed.get_calls == 2
+        assert failed.calls == []
+        assert_focus_sampler_clean(retry_page)
+    finally:
+        failed.gate.set()
+    playwright.expect(retry_page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(retry_page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert failed.get_calls == 2
+    assert failed.calls == []
+    assert_focus_sampler_clean(retry_page)
+
+
+def test_manual_refresh_keeps_focus_outside_stage_editor(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    refresh = page.get_by_role("button", name="Refresh view", exact=True)
+    refresh.focus()
+    arm_focus_sampler(page)
+    card = page.locator(".card").first.element_handle()
+    with page.expect_response("**/api/catalog"):
+        refresh.press("Enter")
+    page.wait_for_function("node => !node.isConnected", arg=card)
+    playwright.expect(refresh).to_be_focused()
+    assert_focus_sampler_clean(page)
 
 
 def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
