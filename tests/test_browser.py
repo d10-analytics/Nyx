@@ -2306,6 +2306,41 @@ def test_same_project_relationship_text_is_available_to_screen_readers(open_page
     assert escaped.locator("#board img").count() == 0
 
 
+@pytest.mark.parametrize("source_project", ["Alpha", "Beta"])
+def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_page, tmp_path, source_project):
+    _write_package(
+        tmp_path, source_project, "Queue", "source", STEP_ONE,
+        f"# Foundation step\nPackage ID: {STEP_ONE}\n"
+        "Claim: release | unsatisfied\nClaim: second | unsatisfied\n",
+    )
+    _write_package(
+        tmp_path, "Alpha", "Queue", "dependent", STEP_TWO,
+        f"# Dependent step\nPackage ID: {STEP_TWO}\n"
+        f"Prerequisite: {STEP_ONE} | INVALID\nPrerequisite: {STEP_ONE} | release\n"
+        f"Prerequisite: {STEP_ONE} | second\n",
+    )
+    value = json.loads(scan_catalog(tmp_path))
+    dependent_entry = next(entry for entry in value["entries"] if entry["package_id"] == STEP_TWO)
+    assert [edge["reason"] for edge in dependent_entry["relationship"]["prerequisites"]] == [
+        "invalid_prerequisite", "claim_unsatisfied", "claim_unsatisfied",
+    ]
+    page = open_page(ScanningClient(tmp_path))
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO)}
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    if source_project == "Alpha":
+        assert dependent.locator(".card-rail-text").all_text_contents() == ["needs: Foundation step"]
+        assert source.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent step"]
+        assert dependent.locator(".card-links").count() == 0
+        assert source.locator(".card-links").count() == 0
+    else:
+        assert dependent.locator(".card-links").all_text_contents() == ["needs: Foundation step Beta"]
+        assert source.locator(".card-links").all_text_contents() == ["blocks: Dependent step Alpha"]
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+    assert dependent.text_content().count("Foundation step") == 1
+    assert source.text_content().count("Dependent step") == 1
+
+
 def test_no_incoming_text_follows_search_like_the_color(open_page):
     page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
 
