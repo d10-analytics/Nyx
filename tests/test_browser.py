@@ -1217,6 +1217,30 @@ def test_cross_project_arrows_retain_inline_names(open_page):
 
 
 def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
+    def aligned_geometry():
+        # ResizeObserver updates the sticky offset after layout. Sample the
+        # complete geometry together so a resize cannot split the observation.
+        snapshot = page.wait_for_function("""() => {
+            const toolbar = document.querySelector('.toolbar').getBoundingClientRect();
+            const column = [...document.querySelectorAll('.column-head')].at(-1).getBoundingClientRect();
+            const row = [...document.querySelectorAll('.row-head')].at(-1).getBoundingClientRect();
+            const cell = [...document.querySelectorAll('.board-row .cell')].at(-1).getBoundingClientRect();
+            const offset = parseFloat(getComputedStyle(document.documentElement)
+                .getPropertyValue('--toolbar-height'));
+            if (!Number.isFinite(offset) || window.scrollX <= 400 || window.scrollY <= 300 ||
+                Math.abs(offset - toolbar.height) >= 2 ||
+                Math.abs(toolbar.x) >= 2 || Math.abs(toolbar.y) >= 2 ||
+                Math.abs(column.y - toolbar.height) >= 2 || Math.abs(row.x) >= 2) {
+                return false;
+            }
+            return {toolbar: toolbar.toJSON(), column: column.toJSON(),
+                    row: row.toJSON(), cell: cell.toJSON()};
+        }""", timeout=5000)
+        try:
+            return snapshot.json_value()
+        finally:
+            snapshot.dispose()
+
     value = json.loads(board_payload())
     for index in range(8):
         project = f"Project {index:02d}"
@@ -1234,25 +1258,24 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
     _reseal(value)
     page = open_page(StaticClient(json.dumps(value).encode()))
     page.set_viewport_size({"width": 640, "height": 400})
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
     page.locator("#board .card").first.wait_for()
     assert page.locator(".column-head").last.bounding_box()["width"] < 350
     page.evaluate("window.scrollTo(900, 600)")
-    page.wait_for_function("window.scrollX > 400 && window.scrollY > 300")
-    toolbar = page.locator(".toolbar").bounding_box()
-    column = page.locator(".column-head").last.bounding_box()
-    row = page.locator(".row-head").last.bounding_box()
+    geometry = aligned_geometry()
+    toolbar, column, row = (geometry[key] for key in ("toolbar", "column", "row"))
     assert abs(toolbar["x"]) < 2 and abs(toolbar["y"]) < 2
     assert abs(column["y"] - toolbar["height"]) < 2
     assert abs(row["x"]) < 2
-    assert row["height"] >= page.locator(".board-row").last.locator(".cell").last.bounding_box()["height"]
+    assert row["height"] >= geometry["cell"]["height"]
     assert page.locator(".row-head").last.evaluate("element => getComputedStyle(element).backgroundColor") != "rgba(0, 0, 0, 0)"
 
     page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]').click()
     page.evaluate("window.scrollTo(900, 600)")
-    page.wait_for_function("window.scrollX > 400 && window.scrollY > 300")
-    expanded_toolbar = page.locator(".toolbar").bounding_box()
+    expanded_geometry = aligned_geometry()
+    expanded_toolbar = expanded_geometry["toolbar"]
     assert abs(expanded_toolbar["height"] - toolbar["height"]) < 2
-    assert abs(page.locator(".column-head").last.bounding_box()["y"] -
+    assert abs(expanded_geometry["column"]["y"] -
                expanded_toolbar["height"]) < 2
 
 
