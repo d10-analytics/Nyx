@@ -2259,6 +2259,76 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
     assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == LIGHT_CARD
 
 
+def test_same_project_relationship_text_is_available_to_screen_readers(open_page):
+    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+    expected = {
+        STEP_TWO: ["needs: Foundation step", "blocks: Gate step"],
+        STEP_ONE: ["blocks: Dependent step"],
+        GATE: ["needs: Dependent step"],
+        LOOSE: [],
+    }
+    visible = {STEP_ONE: 1, LOOSE: 1, STEP_TWO: 0, GATE: 0}
+    for package_id, texts in expected.items():
+        card = page.locator(f'.card[data-package-id="{package_id}"]')
+        spans = card.locator(".card-rail-text")
+        assert spans.all_text_contents() == texts
+        assert card.locator(".card-links").count() == visible[package_id]
+        for span in spans.all():
+            assert span.evaluate("node => node.childNodes.length === 1 && node.firstChild.nodeType === Node.TEXT_NODE")
+            box = span.bounding_box()
+            assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-links').inner_text() == (
+        f"blocks: {XSS_TITLE} Beta"
+    )
+    assert page.locator(f'.card[data-package-id="{LOOSE}"] .card-links').inner_text() == (
+        "needs: Foundation step Alpha"
+    )
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+    playwright.expect(page.locator(f'.card[data-package-id="{LOOSE}"]')).not_to_have_accessible_name(
+        re.compile("blocks:")
+    )
+    assert page.locator("#board").get_by_text("Foundation step", exact=True).count() == 1
+
+    page.fill("#filter", "Dependent step")
+    kept = dependent.element_handle()
+    page.get_by_role("button", name="Refresh view", exact=True).click()
+    page.wait_for_function("node => !node.isConnected", arg=kept)
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').is_hidden()
+    assert page.locator(".rail").count() == 0
+    assert dependent.locator(".card-rail-text").all_text_contents() == expected[STEP_TWO]
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+
+    escaped = open_page(StaticClient(dependency_state_payload("unsatisfied", titles={"step_one": XSS_TITLE})))
+    assert escaped.locator(f'.card[data-package-id="{STEP_TWO}"] .card-rail-text').all_text_contents() == [
+        f"needs: {XSS_TITLE}", "blocks: Gate step",
+    ]
+    assert escaped.locator("#board img").count() == 0
+
+
+def test_no_incoming_text_follows_search_like_the_color(open_page):
+    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+
+    def assert_text_matches_color():
+        for card in page.locator(".card").all():
+            start = card.locator(".card-start-text")
+            assert start.count() == 1
+            expected = "No prerequisite shown." if "no-incoming-arrow" in card.get_attribute("class").split() else ""
+            assert start.text_content() == expected
+
+    source = page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-start-text')
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"] .card-start-text')
+    assert_text_matches_color()
+    assert source.text_content() == "No prerequisite shown."
+    assert dependent.text_content() == ""
+    page.fill("#filter", "Dependent step")
+    assert_text_matches_color()
+    assert dependent.text_content() == "No prerequisite shown."
+    page.fill("#filter", "")
+    assert_text_matches_color()
+    assert dependent.text_content() == ""
+
+
 def connection_pairs(page):
     return {
         tuple(pair) for pair in page.locator(".connection").evaluate_all(
