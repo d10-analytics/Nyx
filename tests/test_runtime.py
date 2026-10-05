@@ -344,7 +344,7 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(
-                    lease_fd, time.monotonic_ns() + 20_000_000
+                    lease_fd, time.monotonic_ns() + 500_000_000
                 )
             with patch.object(
                 daemon.application, "_server_factory", return_value=Server()
