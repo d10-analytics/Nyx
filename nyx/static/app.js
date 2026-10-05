@@ -507,9 +507,12 @@
     return diagnostics;
   }
 
-  function boardIssueHtml(snapshot) {
-    const diagnostics = workspaceDiagnostics(snapshot);
-    if (!diagnostics.length && !refreshFailure) return "";
+  function syncBoardIssues(panel = board.querySelector("#board-issues")) {
+    const diagnostics = workspaceDiagnostics(displayed);
+    if (!diagnostics.length && !refreshFailure) {
+      panel?.remove();
+      return;
+    }
     // Each part is its own element so one issue stays addressable when both
     // kinds are present; the separator keeps the summary text unchanged.
     const summary = [
@@ -523,8 +526,15 @@
       `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
     const refreshItem = refreshFailure
       ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
-    return `<details class="board-issues" id="board-issues"><summary>${summary}</summary>` +
-      `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
+    if (!panel) {
+      panel = document.createElement("details");
+      panel.id = "board-issues";
+      panel.className = "board-issues";
+      panel.innerHTML = '<summary></summary><ul class="diagnostics"></ul>';
+    }
+    panel.querySelector("summary").innerHTML = summary;
+    panel.querySelector("ul").innerHTML = issueItems + refreshItem;
+    if (board.firstElementChild !== panel) board.prepend(panel);
   }
 
   function terminalHiddenHtml() {
@@ -573,7 +583,8 @@
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
     const axes = inventoryAxes(entries);
-    const issues = boardIssueHtml(displayed);
+    const issues = board.querySelector("#board-issues");
+    issues?.remove();
     const columns = axes.projects.map((project) => [project.key, project.project]);
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
@@ -589,14 +600,16 @@
     };
     if (!axes.stages.length && axes.projects.length && !axes.terminalHidden) {
       setBoardColumns(columns.map(() => 0));
-      board.innerHTML = issues + '<h2 class="board-corner" aria-hidden="true"></h2>' +
+      board.innerHTML = '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
         '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
+      syncBoardIssues(issues);
       return;
     }
     if (!axes.stages.length || !axes.projects.length) {
       setBoardColumns([]);
-      board.innerHTML = issues + emptyBoardHtml(axes, entries);
+      board.innerHTML = emptyBoardHtml(axes, entries);
+      syncBoardIssues(issues);
       return;
     }
     railEdges = planEdges(entries, byId);
@@ -619,7 +632,7 @@
       const reserved = plans.get(key).reserved;
       return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
     }));
-    let html = issues + (!entries.length
+    let html = (!entries.length
       ? (axes.terminalHidden ? terminalHiddenHtml()
         : `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
         ? "The catalog has incomplete dimensions; no work items are currently available."
@@ -647,6 +660,7 @@
         `<h2 class="row-head">${text(stageLabelOf(stage.stage))}${dimensionNotice(stage)}</h2>${cells}</section>`;
     });
     board.innerHTML = html;
+    syncBoardIssues(issues);
     applyFilter();
   }
 
@@ -1110,6 +1124,7 @@
     displayed = snapshot;
     pending = null;
     refreshFailure = null;
+    document.querySelector("#refresh-status").textContent = "";
     setPending(false);
     editorStageOrder = [...new Set([
       ...(retainDraft ? priorEditor : editorNames(snapshot)),
@@ -1273,16 +1288,23 @@
       .then((snapshot) => {
         const hadRefreshFailure = Boolean(refreshFailure);
         refreshFailure = null;
-        if (kind === "manual" || kind === "settings" || !displayed) { apply(snapshot); return; }
-        if (digestOf(snapshot) !== digestOf(displayed)) {
-          pending = snapshot;
-          setPending(true);
+        if (kind === "manual" || kind === "settings" || !displayed) {
+          apply(snapshot);
         } else {
-          pending = null;
-          setPending(false);
+          if (digestOf(snapshot) !== digestOf(displayed)) {
+            pending = snapshot;
+            setPending(true);
+          } else {
+            pending = null;
+            setPending(false);
+          }
+          if (hadRefreshFailure) {
+            syncBoardIssues();
+            drawRails();
+          }
         }
         if (hadRefreshFailure) {
-          renderBoard();
+          document.querySelector("#refresh-status").textContent = "Refresh issue resolved.";
         }
       })
       .catch((error) => {
@@ -1295,8 +1317,14 @@
           loadSettings({refreshCatalog: true});
           return;
         }
-        refreshFailure = safeCategory(error);
-        renderBoard();
+        const failure = safeCategory(error);
+        const changed = failure !== refreshFailure;
+        refreshFailure = failure;
+        syncBoardIssues();
+        drawRails();
+        if (changed) {
+          document.querySelector("#refresh-status").textContent = `Latest refresh issue: ${failure}`;
+        }
       })
       .finally(() => {
         busy = false;
