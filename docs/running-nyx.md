@@ -216,6 +216,7 @@ changing setup, the catalog, or the saved completion policy.
 
 Search filters cards and their visible dependency rails without changing the
 project and stage axes. Compact view does not override **Hide terminal rows**.
+Each project column reserves at most eight arrow lanes; a relationship without a drawn arrow is written on its cards as `needs:` or `blocks:` text.
 Incomplete or unavailable dimensions remain visible with an
 `incomplete / unavailable` notice; Nyx does not compact them as if they were
 empty. If a refresh returns malformed data, Nyx reports the refresh failure and

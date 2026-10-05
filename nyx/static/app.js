@@ -49,6 +49,7 @@
   const SVG_NS = "http://www.w3.org/2000/svg";
   const RAIL_PITCH = 14;
   const RAIL_INSET = 20;
+  const RAIL_LANE_CAP = 8;
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
   const SETTINGS_ROUTE = "/api/settings";
@@ -394,7 +395,7 @@
   // screen readers when a same-project arrow supplies the visual connection.
   function needsHtml(entry, byId) {
     const railNames = [];
-    const lanes = railPlan.get(columnKeyOf(entry))?.edges || [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
     const parts = prerequisiteTargets(entry, byId).map(({edge, target}) => {
       if (!target) {
         // A valid edge may point to a target in a gated finished row. It is
@@ -404,7 +405,7 @@
       }
       if (target.package_id === entry.package_id || byId.get(entry.package_id) !== entry) return "";
       if (columnKeyOf(target) === columnKeyOf(entry)) {
-        if (lanes.some((lane) => lane.source === target.package_id && lane.dependent === entry.package_id)) {
+        if (lanes?.has(`${target.package_id}>${entry.package_id}`)) {
           railNames.push(titleOf(target));
           return "";
         }
@@ -419,12 +420,12 @@
 
   function blocksHtml(entry, dependentsOf) {
     const railNames = [];
-    const lanes = railPlan.get(columnKeyOf(entry))?.edges || [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
     const parts = (dependentsOf.get(entry.package_id) || [])
       .map((dependent) => {
         if (dependent.package_id === entry.package_id) return "";
         if (columnKeyOf(dependent) === columnKeyOf(entry)) {
-          if (lanes.some((lane) => lane.source === entry.package_id && lane.dependent === dependent.package_id)) {
+          if (lanes?.has(`${entry.package_id}>${dependent.package_id}`)) {
             railNames.push(titleOf(dependent));
             return "";
           }
@@ -668,21 +669,53 @@
       return;
     }
     railEdges = planEdges(entries, byId);
-    const bands = new Map();
-    railEdges.forEach((edge) => {
-      if (edge.sourceColumn === edge.dependentColumn) return;
-      edge.bandLane = bands.get(edge.row) || 0;
-      bands.set(edge.row, edge.bandLane + 1);
-    });
     const plans = new Map(columns.map(([key]) => {
       const columnEntries = entries.filter((entry) => columnKeyOf(entry) === key);
       const depth = depthForColumn(columnEntries, railEdges);
-      const edges = railEdges.filter((edge) =>
-        edge.sourceColumn === key || edge.dependentColumn === key);
-      // Reserve distinct lanes for local arrows and both ends of cross-project arrows.
-      railPlan.set(key, { edges });
-      return [key, { depth, reserved: edges.length }];
+      const cells = new Map();
+      const positions = new Map();
+      const bandSlots = new Map();
+      let position = 0;
+      axes.stages.forEach((stage) => {
+        bandSlots.set(rowDataKeyOf(stage.stage), position++);
+        const ordered = orderCell(columnEntries.filter((entry) =>
+          stageKeyOf(entry.stage) === stage.key), depth);
+        cells.set(stage.key, ordered);
+        ordered.forEach((entry) => positions.set(entry.package_id, position++));
+      });
+      const intervals = railEdges.filter((edge) =>
+        edge.sourceColumn === key || edge.dependentColumn === key).map((edge) => {
+        const local = edge.sourceColumn === edge.dependentColumn;
+        const first = local ? positions.get(edge.source) : bandSlots.get(edge.row);
+        const last = positions.get(edge.dependentColumn === key ? edge.dependent : edge.source);
+        return {edge, start: Math.min(first, last), end: Math.max(first, last)};
+      });
+      intervals.sort((a, b) => a.start - b.start || a.end - b.end ||
+        a.edge.source.localeCompare(b.edge.source) || a.edge.dependent.localeCompare(b.edge.dependent));
+      const ends = [];
+      const lanes = new Map();
+      intervals.forEach(({edge, start, end}) => {
+        // Closed intervals sharing a card or band position cannot share a lane.
+        let lane = ends.findIndex((lastEnd) => lastEnd < start);
+        if (lane < 0) {
+          if (ends.length === RAIL_LANE_CAP) return;
+          lane = ends.length;
+        }
+        ends[lane] = end;
+        lanes.set(`${edge.source}>${edge.dependent}`, lane);
+      });
+      railPlan.set(key, {lanes});
+      return [key, {cells, reserved: ends.length}];
     }));
+    const bands = new Map();
+    railEdges.forEach((edge) => {
+      const pair = `${edge.source}>${edge.dependent}`;
+      edge.drawn = railPlan.get(edge.sourceColumn).lanes.has(pair) &&
+        railPlan.get(edge.dependentColumn).lanes.has(pair);
+      if (!edge.drawn || edge.sourceColumn === edge.dependentColumn) return;
+      edge.bandLane = bands.get(edge.row) || 0;
+      bands.set(edge.row, edge.bandLane + 1);
+    });
     setBoardColumns(columns.map(([key]) => {
       const reserved = plans.get(key).reserved;
       return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
@@ -697,12 +730,11 @@
     axes.stages.forEach((stage) => {
       const key = stage.key;
       const rowKey = rowDataKeyOf(stage.stage);
-      const rowEntries = entries.filter((entry) => stageKeyOf(entry.stage) === key);
       const cells = columns.map(([columnKey]) => {
-        const { depth, reserved } = plans.get(columnKey);
+        const { cells: orderedCells, reserved } = plans.get(columnKey);
         const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
         return cellHtml(
-          orderCell(rowEntries.filter((entry) => columnKeyOf(entry) === columnKey), depth),
+          orderedCells.get(key),
           byId,
           dependentsOf,
           gutter,
@@ -748,7 +780,8 @@
       card.classList.toggle("no-incoming-arrow", noIncoming);
       card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
     });
-    if (!visibleEdges.length) return;
+    const drawnEdges = visibleEdges.filter((edge) => edge.drawn);
+    if (!drawnEdges.length) return;
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
     const selectedId = selected?.dataset.packageId;
     const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
@@ -756,11 +789,11 @@
       [row.dataset.lifecycle, row.querySelector(".connection-band")]));
     const laneX = (key, edge) => {
       const columnLeft = heads[railColumns.indexOf(key)].offsetLeft;
-      return columnLeft + (railPlan.get(key).edges.indexOf(edge) + .5) * RAIL_PITCH;
+      return columnLeft + (railPlan.get(key).lanes.get(`${edge.source}>${edge.dependent}`) + .5) * RAIL_PITCH;
     };
     const port = (id, edge) => {
       const rect = cards.get(id).getBoundingClientRect();
-      const incident = visibleEdges.filter((item) => item.source === id || item.dependent === id);
+      const incident = drawnEdges.filter((item) => item.source === id || item.dependent === id);
       return {
         x: rect.left - boardRect.left,
         y: rect.top - boardRect.top + 12 +
@@ -780,7 +813,7 @@
       'markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">' +
       `<path class="arrow-${kind}" d="M0 0L10 5L0 10Z"></path></marker>`).join("") + '</defs>';
     // Draw emphasized connections last so their crossings remain easy to follow.
-    [...visibleEdges].sort((a, b) => Number(related(a)) - Number(related(b))).forEach((edge) => {
+    [...drawnEdges].sort((a, b) => Number(related(a)) - Number(related(b))).forEach((edge) => {
       const start = port(edge.source, edge);
       const end = port(edge.dependent, edge);
       const sourceX = laneX(edge.sourceColumn, edge);
