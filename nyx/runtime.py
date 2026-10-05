@@ -527,11 +527,14 @@ def _read_live_instance(paths: state.StatePaths) -> tuple[Instance, _Metadata]:
     """Read a live locator and retain its publication identity for the call."""
 
     record_path = _record_path(paths)
-    snapshot = _record_snapshot(record_path)
-    instance = _read_instance(paths)
-    if not _record_unchanged(record_path, snapshot):
-        raise UnhealthyInstanceError("Nyx instance record changed")
-    return instance, snapshot
+    try:
+        snapshot = _record_snapshot(record_path)
+        instance = _read_instance(paths)
+        if not _record_unchanged(record_path, snapshot):
+            raise UnhealthyInstanceError("Nyx instance record changed")
+        return instance, snapshot
+    except OSError as error:
+        raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
 
 
 def _write_instance(

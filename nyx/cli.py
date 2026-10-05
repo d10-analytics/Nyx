@@ -18,15 +18,27 @@ _DESKTOP_LIFECYCLE_REFUSAL = (
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nyx")
+    parser = argparse.ArgumentParser(
+        prog="nyx",
+        description=f"Start the Nyx board at {runtime.URL}, or reuse the one already running.",
+        epilog=(
+            "--setup, --stop and --status are available on Linux only; on Windows "
+            "and macOS, open the Nyx application and use its workspace controls. "
+            "Run 'nyx --setup <workspace>' once before the first start."
+        ),
+    )
     commands = parser.add_mutually_exclusive_group()
     commands.add_argument(
         "--setup",
         metavar="SPEC_ROOT",
         help="configure the Workspace at SPEC_ROOT",
     )
-    commands.add_argument("--stop", action="store_true")
-    commands.add_argument("--status", action="store_true")
+    commands.add_argument("--stop", action="store_true", help="stop the running Nyx board")
+    commands.add_argument(
+        "--status",
+        action="store_true",
+        help="report configuration and runtime state without changing either",
+    )
     return parser
 
 
@@ -142,6 +154,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(runtime.start())
         return 0
+    except state.ConfigurationMissingError:
+        print(
+            "nyx: Nyx configuration is missing; run 'nyx --setup <workspace>' first",
+            file=sys.stderr,
+        )
+        return 1
     except (state.StateError, runtime.RuntimeErrorBase) as error:
         print(f"nyx: {error}", file=sys.stderr)
         return 1
