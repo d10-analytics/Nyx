@@ -2057,6 +2057,31 @@ def test_application_runtime_classifies_only_port_unavailable_errors(error_name)
         assert caught.value.__cause__ is injected
 
 
+@pytest.mark.parametrize("error_name", ["EADDRINUSE", "EACCES"])
+@pytest.mark.parametrize("failure_phase", ["thread_start", "readiness"])
+def test_application_runtime_does_not_classify_errors_after_bind(error_name, failure_phase):
+    import errno
+
+    injected = OSError(getattr(errno, error_name), "private-post-bind-detail")
+
+    def fail():
+        raise injected
+
+    server = SimpleNamespace(serve_forever=lambda: None)
+    thread = SimpleNamespace(start=fail if failure_phase == "thread_start" else lambda: None)
+    application = app_runtime.ApplicationRuntime(
+        port=runtime.PORT,
+        deadline=time.monotonic() + 5,
+        server_factory=lambda **_kwargs: server,
+        thread_factory=lambda **_kwargs: thread,
+    )
+    with pytest.raises(OSError) as caught:
+        application.start(static_ready=fail)
+    assert caught.value is injected
+    assert application.server is server
+    assert application.http_thread is thread
+
+
 def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
