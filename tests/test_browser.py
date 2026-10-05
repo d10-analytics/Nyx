@@ -2795,6 +2795,65 @@ def test_terminal_only_board_explains_hidden_finished_rows(open_page):
     assert page.locator(".board-row").count() == 2
 
 
+@pytest.mark.parametrize("compact", [True, False], ids=["compact", "expanded"])
+def test_finished_rows_hidden_message_names_hide_terminal_rows(open_page, compact):
+    value = json.loads(compact_payload())
+    value["inventory"]["projects"] = [{"name": "Alpha", "availability": "complete"}]
+    value["inventory"]["stages"] = [
+        stage for stage in value["inventory"]["stages"]
+        if stage["stage"] in {"Done", "Queue"}
+    ]
+    value["entries"] = [entry for entry in value["entries"] if entry["stage"] == "Done"]
+    value["discovery_diagnostics"] = []
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    compact_control = page.get_by_label("Hide empty rows and columns", exact=True)
+    assert compact_control.is_checked()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+    if not compact:
+        compact_control.uncheck()
+        assert page.locator(".column-head").all_text_contents() == ["Alpha"]
+        assert row_labels(page) == ["Queue"]
+
+    empty = page.locator("#board .board-empty")
+    assert empty.count() == 1
+    assert set(empty.get_attribute("class").split()) == {"empty", "board-empty", "terminal-hidden"}
+    assert empty.inner_text() == (
+        "Finished rows are hidden. Uncheck “Hide terminal rows” to show them."
+    )
+    assert page.locator("#board .compact-hidden, #board .admitted-empty").count() == 0
+    assert page.locator("#board .card").count() == 0
+
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert page.locator('#board .card[data-package-path="Alpha/Done/completed"]').count() == 1
+    assert page.locator("#board .board-empty").count() == 0
+
+
+def test_finished_rows_hidden_precedes_incomplete_discovery(open_page):
+    value = json.loads(compact_payload())
+    value["inventory"]["projects"] = [{"name": "Alpha", "availability": "complete"}]
+    value["inventory"]["stages"] = [
+        stage for stage in value["inventory"]["stages"]
+        if stage["stage"] in {"Done", "Partial", "Queue"}
+    ]
+    value["entries"] = [entry for entry in value["entries"] if entry["stage"] == "Done"]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+
+    empty = page.locator("#board .board-empty")
+    assert empty.count() == 1
+    assert set(empty.get_attribute("class").split()) == {"empty", "board-empty", "terminal-hidden"}
+    assert empty.inner_text() == (
+        "Finished rows are hidden. Uncheck “Hide terminal rows” to show them."
+    )
+    assert page.locator("#board .compact-hidden, #board .admitted-empty").count() == 0
+    assert "incomplete / unavailable" in page.locator(
+        '.board-row[data-lifecycle="Partial"] .row-head'
+    ).inner_text()
+
+
 def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     first = compact_payload()
     second = compact_payload(extra_stage=True)
