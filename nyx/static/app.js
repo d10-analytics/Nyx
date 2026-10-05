@@ -145,16 +145,16 @@
     return index;
   }
 
-  function prerequisiteTargets(entry) {
-    const seen = new Set();
-    const targets = [];
+  function prerequisiteTargets(entry, byId) {
+    const targets = new Map();
     (entry.relationship.prerequisites || []).forEach((edge) => {
       const key = edge.target_package_id || "";
-      if (seen.has(key)) return;
-      seen.add(key);
-      targets.push(edge);
+      const target = prerequisiteTarget(edge, byId);
+      const previous = targets.get(key);
+      // An invalid declaration must not hide a valid relationship to the same item.
+      if (!previous || (!previous.target && target)) targets.set(key, {edge, target});
     });
-    return targets;
+    return [...targets.values()];
   }
 
   function depthForColumn(columnEntries, edges) {
@@ -395,8 +395,7 @@
   function needsHtml(entry, byId) {
     const railNames = [];
     const lanes = railPlan.get(columnKeyOf(entry))?.edges || [];
-    const parts = prerequisiteTargets(entry).map((edge) => {
-      const target = prerequisiteTarget(edge, byId);
+    const parts = prerequisiteTargets(entry, byId).map(({edge, target}) => {
       if (!target) {
         // A valid edge may point to a target in a gated finished row. It is
         // absent from the interactive index, but it is not an unresolved target.
