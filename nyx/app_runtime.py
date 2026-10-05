@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import threading
 import time
@@ -20,6 +21,10 @@ from .worker import CatalogWorkerManager, WorkerError
 Deadline = float | Callable[[], float]
 ServerFactory = Callable[..., TrackerServer]
 ThreadFactory = Callable[..., threading.Thread]
+
+
+class ApplicationPortUnavailableError(RuntimeError):
+    """The application listener could not bind its configured port."""
 
 
 class ApplicationReadinessError(RuntimeError):
@@ -271,11 +276,16 @@ class ApplicationRuntime:
         """Start the listener, leaving catalog admission closed."""
 
         self._require_deadline()
-        self.server = self._server_factory(
-            provider=self._provider,
-            port=self.port,
-            settings_provider=self,
-        )
+        try:
+            self.server = self._server_factory(
+                provider=self._provider,
+                port=self.port,
+                settings_provider=self,
+            )
+        except OSError as error:
+            if error.errno in (errno.EADDRINUSE, errno.EACCES):
+                raise ApplicationPortUnavailableError("application port is unavailable") from error
+            raise
         self.http_thread = self._thread_factory(
             target=self.server.serve_forever,
             daemon=True,
@@ -367,4 +377,6 @@ class ApplicationRuntime:
         return self.workers.close(deadline) and time.monotonic() < deadline
 
 
-__all__ = ["ApplicationReadinessError", "ApplicationRuntime"]
+__all__ = [
+    "ApplicationPortUnavailableError", "ApplicationReadinessError", "ApplicationRuntime"
+]

@@ -288,6 +288,17 @@ repeatable browser session; it does not add a permanent screenshot framework.
 
 ## If something looks wrong
 
+- **Nyx says port 8765 is already in use:** find the program using it with
+  `ss -ltnp 'sport = :8765'` on Linux,
+  `lsof -nP -iTCP:8765 -sTCP:LISTEN` on macOS, or
+  `Get-NetTCPConnection -LocalPort 8765 -State Listen` in Windows PowerShell
+  (`OwningProcess` is the process ID). Close that program, then run `nyx` again
+  or choose **Revalidate**. Nyx never switches ports. On Windows, a conflict
+  can sometimes appear only as `Nyx runtime could not start; retry`; an
+  excluded or reserved port range can raise the same error with no owning
+  program. List those ranges with
+  `netsh interface ipv4 show excludedportrange protocol=tcp`.
+
 - **The board is empty:** check the workspace reported by `nyx --status` on
   Linux, or the workspace chosen in the desktop application, the
   [directory layout](workspaces.md), and the **Hide terminal rows** setting.

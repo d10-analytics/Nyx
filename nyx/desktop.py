@@ -19,7 +19,7 @@ from typing import Any
 
 from . import runtime, state
 from ._native_claim import NativeClaim
-from .app_runtime import ApplicationRuntime
+from .app_runtime import ApplicationPortUnavailableError, ApplicationRuntime
 from .worker import CatalogWorkerManager
 
 APPLICATION_CLAIM_FILENAME = "lease.lock"
@@ -363,7 +363,11 @@ class DesktopSession:
             if cleaned:
                 self._application_runtime = None
                 self._runtime_start_failed = False
-            self._pending_error = "Nyx runtime could not start; retry"
+            self._pending_error = (
+                runtime.PORT_UNAVAILABLE_MESSAGE
+                if isinstance(error, ApplicationPortUnavailableError)
+                else "Nyx runtime could not start; retry"
+            )
             configuration = self.snapshot.configuration or self._observe().configuration
             self.snapshot = DesktopSnapshot(
                 "runtime_blocked",
