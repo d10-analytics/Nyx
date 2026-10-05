@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import errno
 import json
 import os
 import secrets
@@ -20,13 +19,22 @@ from typing import Any, Self
 
 from . import state
 from ._native_claim import NativeClaim, NativeDirectory, open_existing_read
-from .app_runtime import ApplicationReadinessError, ApplicationRuntime
+from .app_runtime import (
+    ApplicationPortUnavailableError,
+    ApplicationReadinessError,
+    ApplicationRuntime,
+)
 from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
 from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
 
 PORT = 8765
 URL = f"http://127.0.0.1:{PORT}/"
+PORT_UNAVAILABLE_MESSAGE = (
+    f"Nyx could not start: port {PORT} is already in use by another program. "
+    'Close that program and try again; "If something looks wrong" in the '
+    "Running Nyx guide shows how to find it."
+)
 SCHEMA_VERSION = 1
 LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
@@ -59,8 +67,8 @@ _DAEMON_FAILURES = {
 
 
 def _startup_failure(message: str, process: subprocess.Popen[bytes], phase: str) -> StartupError:
-    error = StartupError(message)
     code = process.poll()
+    error = PortConflictError(PORT_UNAVAILABLE_MESSAGE) if code == 30 else StartupError(message)
     outcome = "child-running" if code is None else _DAEMON_FAILURES.get(code, "child-exited")
     error.add_note(f"internal startup phase={phase}; outcome={outcome}; exit={code}")
     return error
@@ -519,11 +527,14 @@ def _read_live_instance(paths: state.StatePaths) -> tuple[Instance, _Metadata]:
     """Read a live locator and retain its publication identity for the call."""
 
     record_path = _record_path(paths)
-    snapshot = _record_snapshot(record_path)
-    instance = _read_instance(paths)
-    if not _record_unchanged(record_path, snapshot):
-        raise UnhealthyInstanceError("Nyx instance record changed")
-    return instance, snapshot
+    try:
+        snapshot = _record_snapshot(record_path)
+        instance = _read_instance(paths)
+        if not _record_unchanged(record_path, snapshot):
+            raise UnhealthyInstanceError("Nyx instance record changed")
+        return instance, snapshot
+    except OSError as error:
+        raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
 
 
 def _write_instance(
@@ -1194,9 +1205,9 @@ class _Daemon:
             self.application.admit_catalog()
             self.startup_failure_code = 29
             self.application.wait()
+        except ApplicationPortUnavailableError:
+            raise PortConflictError(PORT_UNAVAILABLE_MESSAGE) from None
         except OSError as error:
-            if self.startup_failure_code == 24 and error.errno in (errno.EADDRINUSE, errno.EACCES):
-                raise PortConflictError("Nyx fixed port 8765 is unavailable") from None
             raise StartupError("Nyx server could not start") from error
         finally:
             if not self.stop_requested.is_set():
@@ -1758,6 +1769,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "PORT",
+    "PORT_UNAVAILABLE_MESSAGE",
     "RUNTIME_CONTROL_IDENTITY_MISMATCH",
     "RUNTIME_CONTROL_TIMED_OUT",
     "RUNTIME_CONTROL_UNAVAILABLE",

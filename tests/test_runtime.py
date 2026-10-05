@@ -344,7 +344,7 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(
-                    lease_fd, time.monotonic_ns() + 20_000_000
+                    lease_fd, time.monotonic_ns() + 500_000_000
                 )
             with patch.object(
                 daemon.application, "_server_factory", return_value=Server()
@@ -479,7 +479,10 @@ def test_startup_diagnostic_notes_preserve_public_message_and_hide_child_details
     runtime.desktop_host(),
     reason="the detached Linux service is not dispatched on desktop hosts",
 )
-def test_public_start_reports_sanitized_detached_child_failure():
+@pytest.mark.parametrize("error_name", ["EADDRINUSE", "ENOMEM"])
+@pytest.mark.parametrize("through_cli", [False, True])
+def test_public_start_reports_sanitized_detached_child_failure(error_name, through_cli, capsys):
+    from nyx import cli
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         paths, home, _ = _fixture(root)
@@ -487,7 +490,7 @@ def test_public_start_reports_sanitized_detached_child_failure():
         script = (
             "import errno, runpy; from nyx import app_runtime\n"
             "def fail(**kwargs):\n"
-            "    raise OSError(errno.EADDRINUSE, 'private-child-detail')\n"
+            f"    raise OSError(errno.{error_name}, 'private-child-detail')\n"
             "class FailingApplicationRuntime(app_runtime.ApplicationRuntime):\n"
             "    def __init__(self, **kwargs):\n"
             "        super().__init__(**kwargs)\n"
@@ -502,13 +505,49 @@ def test_public_start_reports_sanitized_detached_child_failure():
             side_effect=lambda deadline: [
                 sys.executable, "-c", script, "--deadline-ns", str(deadline)
             ],
-        ), pytest.raises(runtime.StartupError) as caught:
-            runtime.start()
-        assert "outcome=fixed-port-unavailable; exit=30" in caught.value.__notes__[0]
-        assert "private-child-detail" not in repr(caught.value.__notes__)
-        assert "private-child-detail" not in str(caught.value)
+        ):
+            if through_cli:
+                assert cli.main([]) == 1
+                captured = capsys.readouterr()
+                expected = (
+                    runtime.PORT_UNAVAILABLE_MESSAGE if error_name == "EADDRINUSE"
+                    else "Nyx daemon exited before readiness"
+                )
+                assert captured.out == ""
+                assert captured.err == f"nyx: {expected}\n"
+            else:
+                with pytest.raises(runtime.StartupError) as caught:
+                    runtime.start()
+                if error_name == "EADDRINUSE":
+                    assert isinstance(caught.value, runtime.PortConflictError)
+                    assert str(caught.value) == runtime.PORT_UNAVAILABLE_MESSAGE
+                    outcome = "fixed-port-unavailable; exit=30"
+                else:
+                    assert not isinstance(caught.value, runtime.PortConflictError)
+                    assert str(caught.value) == "Nyx daemon exited before readiness"
+                    outcome = "http-start-failed; exit=24"
+                assert f"outcome={outcome}" in caught.value.__notes__[0]
+                assert "private-child-detail" not in repr(caught.value.__notes__)
+                assert "private-child-detail" not in str(caught.value)
         assert not runtime._record_path(paths).exists()
         _assert_claim_available(paths.runtime_directory / "lease.lock")
+
+
+
+def test_startup_port_conflict_uses_actionable_public_message():
+    error = runtime._startup_failure(
+        "Nyx daemon exited before readiness", SimpleNamespace(poll=lambda: 30), "readiness"
+    )
+    assert isinstance(error, runtime.PortConflictError)
+    assert str(error) == runtime.PORT_UNAVAILABLE_MESSAGE
+    assert runtime.PORT_UNAVAILABLE_MESSAGE == (
+        "Nyx could not start: port 8765 is already in use by another program. "
+        'Close that program and try again; "If something looks wrong" in the '
+        "Running Nyx guide shows how to find it."
+    )
+    assert error.__notes__ == [
+        "internal startup phase=readiness; outcome=fixed-port-unavailable; exit=30"
+    ]
 
 
 def test_daemon_entry_rejects_unvalidated_inherited_object_before_initialization():
@@ -2949,6 +2988,78 @@ def test_public_stop_rejects_replacement_of_original_terminal_lease_object():
         assert not record.exists()
         assert lease_path.read_bytes() == b"replacement"
         _assert_claim_available(lease_path)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="requires POSIX permissions enforced for a non-root user",
+)
+@pytest.mark.parametrize("command", ["start", "stop", "cli-start", "cli-stop"])
+def test_unreadable_live_record_reports_unavailable_without_mutation(command, capsys):
+    from nyx import cli
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd, lease = _held_lease(paths)
+        _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        before = record.read_bytes()
+        try:
+            record.chmod(0o000)
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "desktop_host", return_value=False
+            ), patch.object(runtime, "_send_control") as send_control:
+                if command.startswith("cli-"):
+                    arguments = [] if command == "cli-start" else ["--stop"]
+                    assert cli.main(arguments) == 1
+                    captured = capsys.readouterr()
+                    assert captured.out == ""
+                    assert captured.err == "nyx: Nyx instance record is unavailable\n"
+                else:
+                    with pytest.raises(runtime.UnhealthyInstanceError) as error:
+                        getattr(runtime, command)()
+                    assert str(error.value) == "Nyx instance record is unavailable"
+                    assert isinstance(error.value.__cause__, PermissionError)
+                send_control.assert_not_called()
+            record.chmod(0o600)
+            assert record.read_bytes() == before
+            fresh_lease = runtime._lease_lock(paths, timeout=0.0)
+            try:
+                assert fresh_lease.acquire(blocking=False) is False
+            finally:
+                fresh_lease.close()
+        finally:
+            record.chmod(0o600)
+            lease.close()
+            os.close(lease_fd)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="requires POSIX symlinks and a non-root user",
+)
+@pytest.mark.parametrize("command", ["start", "stop"])
+def test_unsafe_live_record_preserves_runtime_error_and_symlink(command):
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd, lease = _held_lease(paths)
+        _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        target = paths.runtime_directory / "valid-record.json"
+        record.rename(target)
+        record.symlink_to(target)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control"
+            ) as send_control, pytest.raises(runtime.RuntimeErrorBase) as error:
+                getattr(runtime, command)()
+            assert type(error.value) is runtime.RuntimeErrorBase
+            assert str(error.value) == "unsafe Nyx runtime state"
+            assert record.is_symlink()
+            send_control.assert_not_called()
+        finally:
+            lease.close()
+            os.close(lease_fd)
 
 
 @pytest.mark.parametrize(

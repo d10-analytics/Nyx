@@ -69,6 +69,10 @@ class ConfigurationError(StateError):
     """A persisted configuration is missing, unsafe, or malformed."""
 
 
+class ConfigurationMissingError(ConfigurationError):
+    """The required configuration record or its directory is absent."""
+
+
 class ConfigurationCommitVerificationError(ConfigurationError):
     """The replacement committed, but its immediate verification failed."""
 
@@ -461,7 +465,7 @@ def _verify_record(path: Path, _uid: int | None = None) -> os.stat_result:
     try:
         details = path.lstat()
     except FileNotFoundError as error:
-        raise ConfigurationError("Nyx configuration is missing") from error
+        raise ConfigurationMissingError("Nyx configuration is missing") from error
     except OSError as error:
         raise ConfigurationError("Nyx configuration is unavailable") from error
     if _is_reparse_or_link(path, details) or not stat.S_ISREG(details.st_mode):
@@ -638,9 +642,9 @@ def load_configuration(paths: StatePaths | None = None) -> Configuration:
 
     selected = state_paths() if paths is None else paths
     if not _admit_directory(selected.state_directory, create=False):
-        raise ConfigurationError("Nyx configuration is missing")
+        raise ConfigurationMissingError("Nyx configuration is missing")
     if not _admit_directory(selected.config_directory, create=False):
-        raise ConfigurationError("Nyx configuration is missing")
+        raise ConfigurationMissingError("Nyx configuration is missing")
     _verify_record(selected.config_file)
     try:
         payload = json.loads(selected.config_file.read_text(encoding="utf-8"))
@@ -1011,6 +1015,7 @@ __all__ = [
     "Configuration",
     "ConfigurationCommitVerificationError",
     "ConfigurationError",
+    "ConfigurationMissingError",
     "ConfigurationObservation",
     "CompletedStageError",
     "StageOrderError",

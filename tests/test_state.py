@@ -1182,3 +1182,29 @@ def test_packaged_worker_helper_rejects_a_workspace_elsewhere_in_the_application
 
     with pytest.raises(state.SpecificationRootError):
         state.resolve_specification_root(inside_application)
+
+
+@pytest.mark.parametrize("missing", ["state-directory", "config-directory", "config-file"])
+def test_missing_configuration_sites_raise_configuration_missing_error(tmp_path, missing):
+    home = isolated_home(tmp_path)
+    with patch.object(state, "resolve_account_home", return_value=home):
+        paths = state.state_paths()
+        if missing != "state-directory":
+            paths.state_directory.mkdir(mode=0o700)
+        if missing == "config-file":
+            paths.config_directory.mkdir(mode=0o700)
+        with pytest.raises(state.ConfigurationMissingError) as error:
+            state.load_configuration(paths)
+    assert isinstance(error.value, state.ConfigurationError)
+    assert str(error.value) == "Nyx configuration is missing"
+
+
+def test_malformed_configuration_keeps_exact_configuration_error_type(tmp_path):
+    home = isolated_home(tmp_path)
+    with patch.object(state, "resolve_account_home", return_value=home):
+        paths = state.state_paths(create=True)
+        paths.config_file.write_bytes(b"{")
+        with pytest.raises(state.ConfigurationError) as error:
+            state.load_configuration(paths)
+    assert type(error.value) is state.ConfigurationError
+    assert str(error.value) == "Nyx configuration cannot be read"

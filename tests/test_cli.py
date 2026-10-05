@@ -106,6 +106,34 @@ def test_expired_start_cli_reports_bounded_error_without_creating_state(capsys):
         assert capsys.readouterr().err == "nyx: Nyx startup timed out\n"
 
 
+def test_missing_configuration_cli_explains_first_setup(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home):
+        assert cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "nyx: Nyx configuration is missing; run 'nyx --setup <workspace>' first\n"
+    )
+
+
+def test_malformed_configuration_cli_has_no_missing_setup_hint(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home):
+        assert cli.main(["--setup", str(workspace)]) == 0
+        capsys.readouterr()
+        paths = state.state_paths()
+        paths.config_file.write_bytes(b"{")
+        assert cli.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "nyx: Nyx configuration cannot be read\n"
+
+
 @pytest.mark.parametrize("flag", [["--hide-stage", "Done"], ["--show-all-stages"]])
 @pytest.mark.parametrize("with_setup", [False, True])
 def test_removed_stage_options_are_unrecognized_without_mutating_state(tmp_path, capsys, flag, with_setup):
@@ -137,6 +165,17 @@ def test_help_names_the_configured_location_workspace_and_preserves_spec_root(
     assert "--show-all-stages" not in captured.out
     assert "--setup SPEC_ROOT" in captured.out
     assert "configure the Workspace at SPEC_ROOT" in captured.out
+    normalized = " ".join(captured.out.split())
+    assert "stop the running Nyx board" in normalized
+    assert "report configuration and runtime state without changing either" in normalized
+    assert (
+        f"Start the Nyx board at {runtime.URL}, or reuse the one already running."
+    ) in normalized
+    assert (
+        "--setup, --stop and --status are available on Linux only; on Windows "
+        "and macOS, open the Nyx application and use its workspace controls. "
+        "Run 'nyx --setup <workspace>' once before the first start."
+    ) in normalized
     assert captured.err == ""
 
 

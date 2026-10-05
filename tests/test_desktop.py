@@ -1988,6 +1988,100 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
     assert calls[2:-1] == ["open_board"]
 
 
+@pytest.mark.parametrize("error_name", ["EADDRINUSE", "EACCES", "ENOMEM"])
+def test_failed_runtime_bind_shows_sanitized_retry_message(error_name):
+    import errno
+
+    injected = OSError(getattr(errno, error_name), "private-bind-detail")
+
+    def fail(**_kwargs):
+        raise injected
+
+    class FailingApplicationRuntime(app_runtime.ApplicationRuntime):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._server_factory = fail
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", FailingApplicationRuntime
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            try:
+                with pytest.raises(desktop.DesktopUnavailableError) as caught:
+                    session.start_runtime(static_ready=lambda: True)
+                if error_name == "ENOMEM":
+                    assert caught.value.__cause__ is injected
+                    expected = "Nyx runtime could not start; retry"
+                else:
+                    assert isinstance(
+                        caught.value.__cause__, app_runtime.ApplicationPortUnavailableError
+                    )
+                    assert caught.value.__cause__.__cause__ is injected
+                    expected = runtime.PORT_UNAVAILABLE_MESSAGE
+                assert session.pending_error == expected
+                assert session.snapshot.status == "runtime_blocked"
+                assert session.runtime_retryable
+                window = desktop._build_window(_fake_qt(), session)
+                assert window._status.text() == expected
+                assert "private-bind-detail" not in window._status.text()
+                assert window._retry.isEnabled()
+            finally:
+                session.close()
+            assert not session.claims.held
+
+
+@pytest.mark.parametrize("error_name", ["EADDRINUSE", "EACCES", "ENOMEM"])
+def test_application_runtime_classifies_only_port_unavailable_errors(error_name):
+    import errno
+
+    injected = OSError(getattr(errno, error_name), "private-bind-detail")
+
+    def fail(**_kwargs):
+        raise injected
+
+    application = app_runtime.ApplicationRuntime(
+        port=runtime.PORT, deadline=time.monotonic() + 5, server_factory=fail
+    )
+    if error_name == "ENOMEM":
+        with pytest.raises(OSError) as caught:
+            application.start()
+        assert caught.value is injected
+    else:
+        with pytest.raises(app_runtime.ApplicationPortUnavailableError) as caught:
+            application.start()
+        assert caught.value.__cause__ is injected
+
+
+@pytest.mark.parametrize("error_name", ["EADDRINUSE", "EACCES"])
+@pytest.mark.parametrize("failure_phase", ["thread_start", "readiness"])
+def test_application_runtime_does_not_classify_errors_after_bind(error_name, failure_phase):
+    import errno
+
+    injected = OSError(getattr(errno, error_name), "private-post-bind-detail")
+
+    def fail():
+        raise injected
+
+    server = SimpleNamespace(serve_forever=lambda: None)
+    thread = SimpleNamespace(start=fail if failure_phase == "thread_start" else lambda: None)
+    application = app_runtime.ApplicationRuntime(
+        port=runtime.PORT,
+        deadline=time.monotonic() + 5,
+        server_factory=lambda **_kwargs: server,
+        thread_factory=lambda **_kwargs: thread,
+    )
+    with pytest.raises(OSError) as caught:
+        application.start(static_ready=fail)
+    assert caught.value is injected
+    assert application.server is server
+    assert application.http_thread is thread
+
+
 def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
