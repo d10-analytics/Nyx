@@ -1315,6 +1315,51 @@ def test_reported_values_and_declared_slots_stay_searchable(open_page, tmp_path)
     assert card.get_attribute("aria-pressed") == "true"
 
 
+def test_long_unbroken_names_wrap_within_their_column(open_page):
+    token = "x" * 300
+    value = json.loads(board_payload())
+    projects = ["Alpha", "Beta", token]
+    value["inventory"] = {
+        "projects": [{"name": project, "availability": "complete"} for project in projects],
+        "stages": [
+            {"project": project, "stage": "Queue", "availability": "complete"}
+            for project in projects
+        ],
+    }
+    value["entries"] = [
+        _entry(STEP_ONE, f"Alpha/Queue/{token}", "queue", token, "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_TWO, "Beta/Queue/source", "queue", token, "Beta"),
+        _entry(GATE, f"{token}/Queue/item", "queue", "Third project item", token),
+    ]
+    value["entries"][0]["declared"]["target_project"] = token
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    alpha = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    beta = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    assert alpha.locator(".card-title").inner_text() == token
+    assert alpha.locator(".card-project").inner_text() == f"Target Folder: {token}"
+    assert alpha.locator(".card-filepath").inner_text() == f"Filepath: Alpha/Queue/{token}"
+    assert alpha.locator(".card-links").inner_text() == f"needs: {token} Beta"
+    assert beta.locator(".card-links").inner_text() == f"blocks: {token} Alpha"
+    assert page.locator(".column-head").all_text_contents() == projects
+
+    measurements = page.locator(
+        ".card-title, .card-project, .card-filepath, .card-links, .column-head"
+    ).evaluate_all("""nodes => nodes.map(node => ({
+      kind: node.className, text: node.textContent,
+      scrollWidth: node.scrollWidth, clientWidth: node.clientWidth,
+    }))""")
+    for measurement in measurements:
+        assert measurement["scrollWidth"] <= measurement["clientWidth"] + 1, measurement
+    bounds = page.locator(".card").evaluate_all("""cards => cards.map(card => ({
+      right: card.getBoundingClientRect().right,
+      cellRight: card.closest('.cell').getBoundingClientRect().right,
+    }))""")
+    assert len(bounds) == 3
+    for bound in bounds:
+        assert bound["right"] <= bound["cellRight"] + 1, bound
+
+
 def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(open_page):
     value = json.loads(board_payload())
     value["entries"][1]["declared"]["target_project"] = None
