@@ -233,6 +233,7 @@ button.pending {
   margin: .75rem 0;
 }
 .column-head {
+  overflow-wrap: anywhere;
   padding-bottom: .35rem;
   border-bottom: 2px solid var(--border);
   font-size: 1.05rem;
@@ -280,6 +281,7 @@ button.pending {
 .empty { color: var(--empty); font-style: italic; }
 
 .card {
+  overflow-wrap: anywhere;
   position: relative;
   z-index: 1;
   display: block;
@@ -305,7 +307,7 @@ button.pending {
 .card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--selected-ring), 0 2px 5px var(--selected-shadow); }
 .card-title { display: block; font-weight: 700; margin-bottom: .25rem; }
 .card-project { display: block; color: var(--muted); font-size: .88rem; }
-.card-filepath { display: block; color: var(--muted); font-size: .88rem; overflow-wrap: anywhere; }
+.card-filepath { display: block; color: var(--muted); font-size: .88rem; }
 .card-links { display: block; margin-top: .4rem; color: var(--link); font-size: .82rem; }
 .card-links .link { display: inline; }
 .card-links .link.cross em { font-style: normal; color: var(--warning); }
