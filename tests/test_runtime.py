@@ -314,6 +314,13 @@ def test_daemon_rechecks_shared_deadline_after_configuration_admission():
 
 
 def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
+    # Only readiness polling advances time; configuration cannot consume the
+    # deadline because of host load before the phase under test is reached.
+    clock = [1.0]
+
+    def advance_clock(seconds):
+        clock[0] += seconds
+
     class Server:
         def serve_forever(self):
             return None
@@ -342,16 +349,23 @@ def test_static_readiness_expiry_retains_its_distinct_daemon_failure_phase():
         paths, _, _ = _fixture(Path(temporary))
         lease_fd = os.open(paths.runtime_directory / "lease.lock", os.O_RDWR)
         try:
-            with patch.object(runtime, "_paths", return_value=paths):
-                daemon = runtime._Daemon(
-                    lease_fd, time.monotonic_ns() + 500_000_000
-                )
             with patch.object(
-                daemon.application, "_server_factory", return_value=Server()
-            ) as create_server, patch.object(runtime.threading, "Thread", Thread), patch.object(
-                daemon, "_static_ready", return_value=False
+                runtime.time, "monotonic", side_effect=lambda: clock[0]
+            ), patch.object(
+                runtime.time, "monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)
+            ), patch.object(
+                runtime.time, "sleep", side_effect=advance_clock
             ):
-                assert daemon.run() == 25
+                with patch.object(runtime, "_paths", return_value=paths):
+                    daemon = runtime._Daemon(lease_fd, 1_500_000_000)
+                with patch.object(
+                    daemon.application, "_server_factory", return_value=Server()
+                ) as create_server, patch.object(
+                    runtime.threading, "Thread", Thread
+                ), patch.object(daemon, "_static_ready", return_value=False) as ready:
+                    assert daemon.run() == 25
+                assert ready.call_count > 1
+                assert clock[0] >= daemon._deadline()
             create_server.assert_called_once()
         finally:
             try:
