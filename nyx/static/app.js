@@ -292,11 +292,43 @@
         JSON.stringify([...savedCompletedStages].sort(scalarCompare));
   }
 
-  function renderStageOrderEditor({focusStage = null} = {}) {
+  function renderStageOrderEditor() {
+    const editor = document.querySelector("#stage-order-editor");
+    const controls = () => [...editor.querySelectorAll("summary, input, button, select")];
+    const focused = document.activeElement;
+    const priorControls = controls();
+    const priorIndex = priorControls.indexOf(focused);
+    const keyOf = (control) => {
+      const item = control.closest(".stage-order-item");
+      return item ? [item.dataset.stage, control.dataset.stageMove || "completed"] : [control.id];
+    };
+    const priorKey = priorIndex >= 0 ? keyOf(focused) : null;
+    const restoreFocus = () => {
+      if (!priorKey) return;
+      const current = controls();
+      const operable = (control) => control?.isConnected && !control.disabled &&
+        !control.closest("[hidden]");
+      const same = current.find((control) =>
+        JSON.stringify(keyOf(control)) === JSON.stringify(priorKey) && operable(control));
+      const siblings = priorKey.length === 2 ? current.filter((control) => {
+        const key = keyOf(control);
+        return key.length === 2 && key[0] === priorKey[0] && operable(control);
+      }) : [];
+      const successor = same || siblings.find((control) => control.dataset.stageMove) ||
+        siblings[0] || current.slice(priorIndex + 1).find(operable) ||
+        current.slice(0, priorIndex).reverse().find(operable) ||
+        document.querySelector("#stage-order-heading");
+      successor.focus();
+    };
     stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
-    if (stageOrderControls.hidden) return;
+    if (stageOrderControls.hidden) {
+      restoreFocus();
+      return;
+    }
     if (settingsAvailable && !editorStageOrder.length) editorStageOrder = editorNames();
-    const controlsDisabled = !settingsAvailable || settingsBusy;
+    const controlsDisabled = !settingsAvailable;
+    const unavailable = (disabled) => disabled ? " disabled" :
+      settingsBusy ? ' aria-disabled="true"' : "";
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
       const dormant = inventoryStageNames().includes(stage) ? "" :
@@ -306,24 +338,24 @@
         `<span class="stage-order-name">${text(label)}${dormant}</span>` +
         `<label class="stage-completed"><input type="checkbox" class="stage-completed-toggle" ` +
         `aria-label="Counts as finished: ${text(label)}" data-stage="${text(stage)}"` +
-        `${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
+        `${completed ? " checked" : ""}${unavailable(controlsDisabled)}>` +
         `Counts as finished</label>` +
         `<button type="button" class="stage-order-move" data-stage-move="up" ` +
-        `aria-label="Move ${text(label)} up"${controlsDisabled || index === 0 ? " disabled" : ""}>Move up</button>` +
+        `aria-label="Move ${text(label)} up"${unavailable(controlsDisabled || index === 0)}>Move up</button>` +
         `<button type="button" class="stage-order-move" data-stage-move="down" ` +
-        `aria-label="Move ${text(label)} down"${controlsDisabled || index === editorStageOrder.length - 1 ? " disabled" : ""}>Move down</button>` +
+        `aria-label="Move ${text(label)} down"${unavailable(controlsDisabled || index === editorStageOrder.length - 1)}>Move down</button>` +
         `</li>`;
     }).join("");
     stageOrderSave.disabled = controlsDisabled || !hasUnsavedStageOrder();
     stageOrderCancel.disabled = controlsDisabled || !hasUnsavedStageOrder();
     stageOrderReset.disabled = controlsDisabled;
     stageOrderReload.hidden = !settingsReloadAvailable;
-    stageOrderReload.disabled = settingsBusy;
-    if (focusStage && settingsAvailable) {
-      const item = [...stageOrderList.children].find((candidate) =>
-        candidate.dataset.stage === focusStage);
-      item?.querySelector("[data-stage-move]:not(:disabled)")?.focus();
-    }
+    stageOrderReload.disabled = false;
+    [stageOrderSave, stageOrderCancel, stageOrderReset, stageOrderReload].forEach((control) => {
+      if (settingsBusy && !control.disabled) control.setAttribute("aria-disabled", "true");
+      else control.removeAttribute("aria-disabled");
+    });
+    restoreFocus();
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -1377,6 +1409,10 @@
     else request("manual");
   });
   stageOrderList.addEventListener("click", (event) => {
+    if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
+      event.preventDefault();
+      return;
+    }
     const move = event.target.closest("[data-stage-move]");
     const item = event.target.closest("[data-stage]");
     if (!settingsAvailable || settingsBusy || !move || !item) return;
@@ -1386,7 +1422,7 @@
     if (index < 0 || target < 0 || target >= editorStageOrder.length) return;
     [editorStageOrder[index], editorStageOrder[target]] =
       [editorStageOrder[target], editorStageOrder[index]];
-    renderStageOrderEditor({focusStage: stage});
+    renderStageOrderEditor();
     settingsStatus("Unsaved board row order changes.");
   });
   stageOrderList.addEventListener("change", (event) => {

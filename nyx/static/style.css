@@ -131,6 +131,7 @@ h1, h2, h3, p { margin-top: 0; }
 .stage-completed { display: inline-flex; align-items: center; gap: .25rem; white-space: nowrap; font-size: .82rem; }
 .stage-completed input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
 .stage-order-move { padding: .25rem .45rem; font-size: .82rem; }
+.stage-order-editor [aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
 .stage-order-actions { display: flex; gap: .4rem; margin-top: .65rem; }
 .stage-order-status { min-height: 1.25em; }
 .stage-order-status.error { color: var(--warning); }
