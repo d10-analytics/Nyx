@@ -1093,7 +1093,7 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
         assert page.locator("#board .card").count() == 4
         assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
         client.release.set()
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -1187,7 +1187,7 @@ def test_browser_accepts_explicit_blank_declared_metadata(open_page):
 def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     client = SequenceClient([CatalogError("producer_unavailable"), board_payload()])
     page = open_page(client)
-    page.get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
+    page.locator("#board").get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
         timeout=15000
     )
     page.locator("#board .card").first.wait_for(timeout=15000)
@@ -1720,7 +1720,7 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     page = open_page(client)
 
     page.wait_for_selector("#refresh.pending", timeout=15000)
-    page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+    page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
         timeout=15000
     )
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
@@ -1733,6 +1733,170 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     page.locator("#board").get_by_text("B", exact=True).wait_for(timeout=15000)
     assert client.calls == 3
     assert page.locator("#board-issues").count() == 0
+
+
+def observe_removed_cards(page):
+    page.evaluate("""() => {
+      window.removedCards = 0;
+      new MutationObserver(records => {
+        for (const record of records) {
+          for (const node of record.removedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE &&
+                (node.matches('.card') || node.querySelector('.card'))) window.removedCards++;
+          }
+        }
+      }).observe(document.querySelector('#board'), {childList: true, subtree: true});
+    }""")
+
+
+def observe_refresh_status(page):
+    assert page.locator("#refresh-status").count() == 1
+    page.evaluate("""() => {
+      window.refreshStatusRecords = 0;
+      window.refreshStatusTexts = [];
+      const status = document.querySelector('#refresh-status');
+      new MutationObserver(records => {
+        window.refreshStatusRecords += records.length;
+        window.refreshStatusTexts.push(status.textContent);
+      }).observe(status, {childList: true, characterData: true, subtree: true});
+    }""")
+
+
+def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
+    page = open_page(SequenceClient([board_payload(), CatalogError("producer_unavailable")]))
+    board = page.locator("#board")
+    assert board.get_attribute("aria-live") is None
+    assert board.get_attribute("role") is None
+    status = page.locator("#refresh-status")
+    assert status.count() == 1
+    assert board.locator("#refresh-status").count() == 0
+    assert status.get_attribute("role") == "status"
+    assert status.get_attribute("aria-atomic") == "true"
+    assert "visually-hidden" in status.get_attribute("class").split()
+    box = status.bounding_box()
+    assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
+
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.focus()
+    card.press("Enter")
+    kept = card.element_handle()
+    observe_removed_cards(page)
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_unavailable", timeout=15000)
+    assert kept.evaluate("node => node.isConnected && node === document.activeElement")
+    assert kept.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("window.removedCards") == 0
+    panel = page.locator("#board-issues")
+    assert panel.evaluate("node => node === node.parentElement.firstElementChild")
+    assert panel.get_attribute("open") is None
+    assert panel.locator("summary").inner_text() == "Latest refresh issue: producer_unavailable"
+    assert_readable_arrows(page)
+
+
+def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
+    value = json.loads(board_payload())
+    value["discovery_diagnostics"] = [
+        {"code": "discovery_unavailable", "message": "One folder could not be read"}
+    ]
+    _reseal(value)
+    client = SequenceClient([value, CatalogError("producer_protocol_error"), value])
+    page = open_page(client)
+    panel = page.locator("#board-issues").element_handle()
+    summary = page.locator("#board-issues summary")
+    summary.focus()
+    summary.press("Enter")
+    kept_summary = summary.element_handle()
+    observe_removed_cards(page)
+    with page.expect_response("**/api/catalog"):
+        page.locator("#refresh").click()
+    playwright.expect(summary).to_have_text(
+        "Workspace issues: discovery_unavailable (1) · Latest refresh issue: producer_protocol_error"
+    )
+    assert panel.evaluate("node => node.isConnected")
+    assert kept_summary.evaluate("node => node.isConnected")
+    assert panel.get_attribute("open") is not None
+    assert page.evaluate("window.removedCards") == 0
+
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]').element_handle()
+    with page.expect_response("**/api/catalog"):
+        page.locator("#refresh").click()
+    playwright.expect(summary).to_have_text("Workspace issues: discovery_unavailable (1)")
+    assert not card.evaluate("node => node.isConnected")
+    assert panel.evaluate("node => node.isConnected")
+    assert kept_summary.evaluate("node => node.isConnected")
+    assert panel.get_attribute("open") is not None
+    assert page.locator("#refresh-status").inner_text() == "Refresh issue resolved."
+    assert client.calls == 3
+
+
+def test_poll_recovery_removes_issues_in_place_and_announces_resolution(open_page):
+    page = open_page(SequenceClient([
+        board_payload(), CatalogError("producer_timeout"), board_payload(),
+    ]))
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.focus()
+    card.press("Enter")
+    kept = card.element_handle()
+    observe_removed_cards(page)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(
+        timeout=15000
+    )
+    playwright.expect(page.locator("#refresh-status")).to_have_text(
+        "Refresh issue resolved.", timeout=15000
+    )
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert kept.evaluate("node => node.isConnected && node === document.activeElement")
+    assert kept.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("window.removedCards") == 0
+
+
+def test_refresh_failure_changes_are_announced_once(open_page):
+    client = SequenceClient([
+        board_payload(), CatalogError("producer_unavailable"),
+        CatalogError("producer_unavailable"), CatalogError("producer_timeout"),
+    ])
+    page = open_page(client)
+    observe_refresh_status(page)
+    counts = []
+    for failure in ("producer_unavailable", "producer_unavailable", "producer_timeout"):
+        with page.expect_response("**/api/catalog") as response:
+            page.locator("#refresh").click()
+        response.value.finished()
+        playwright.expect(page.locator("#refresh-status")).to_have_text(
+            f"Latest refresh issue: {failure}"
+        )
+        # Flush mutation delivery after the fetch continuation updates the DOM.
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        counts.append(page.evaluate("window.refreshStatusRecords"))
+    assert counts[0] > 0
+    assert counts[1] == counts[0]
+    assert counts[2] > counts[1]
+    assert client.calls == 4
+
+
+def test_applying_pending_update_empties_refresh_status_silently(open_page):
+    client = SequenceClient([
+        board_payload(titles={"step_one": "A"}),
+        board_payload(titles={"step_one": "B"}),
+        CatalogError("producer_protocol_error"),
+    ])
+    page = open_page(client)
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        timeout=15000
+    )
+    status = page.locator("#refresh-status")
+    assert status.inner_text() == "Latest refresh issue: producer_protocol_error"
+    observe_refresh_status(page)
+    page.get_by_role("button", name="Apply update", exact=True).click()
+    assert page.locator("#board").get_by_text("B", exact=True).count() == 1
+    assert page.locator("#board-issues").count() == 0
+    assert status.inner_text() == ""
+    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
+    cleared_records = page.evaluate("window.refreshStatusRecords")
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_protocol_error", timeout=15000)
+    assert page.evaluate("window.refreshStatusRecords") > cleared_records
+    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
 
 
 def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_refresh(open_page):
@@ -2497,7 +2661,7 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
         board_payload(titles={"step_one": "Recovered foundation"}),
     ])
     page = open_page(client)
-    page.get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
     page.wait_for_selector("#refresh.pending", timeout=15000)
     assert page.locator("#board-issues").count() == 0
     assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
@@ -2677,7 +2841,7 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
             RawSequenceClient([valid, invalid]),
             init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
         )
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2959,7 +3123,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2985,7 +3149,7 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(client)
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3019,7 +3183,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3047,7 +3211,7 @@ def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3124,7 +3288,7 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
         page.get_by_role("button", name="Refresh view").click()
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3147,7 +3311,7 @@ def test_reported_contract_at_browser_acceptance(open_page, monkeypatch, value, 
         page = open_page(RawSequenceClient([raw_catalog(), value]))
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
         page.click("#refresh")
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
 
 
