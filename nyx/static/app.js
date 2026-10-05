@@ -390,8 +390,11 @@
     });
   }
 
-  // Keep cross-project names readable without requiring users to trace a long arrow.
+  // Keep names visible for long arrows or missing lanes, and available to
+  // screen readers when a same-project arrow supplies the visual connection.
   function needsHtml(entry, byId) {
+    const railNames = [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.edges || [];
     const parts = prerequisiteTargets(entry).map((edge) => {
       const target = prerequisiteTarget(edge, byId);
       if (!target) {
@@ -400,19 +403,39 @@
         if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
         return '<span class="link unresolved">unresolved target</span>';
       }
-      if (columnKeyOf(target) === columnKeyOf(entry)) return "";
+      if (target.package_id === entry.package_id || byId.get(entry.package_id) !== entry) return "";
+      if (columnKeyOf(target) === columnKeyOf(entry)) {
+        if (lanes.some((lane) => lane.source === target.package_id && lane.dependent === entry.package_id)) {
+          railNames.push(titleOf(target));
+          return "";
+        }
+        return `<span class="link">${text(titleOf(target))}</span>`;
+      }
       return `<span class="link cross">${text(titleOf(target))} ` +
         `<em>${text(projectOf(target))}</em></span>`;
     }).filter(Boolean);
-    return parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "";
+    return (parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "") +
+      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`needs: ${railNames.join(" · ")}`)}</span>` : "");
   }
 
   function blocksHtml(entry, dependentsOf) {
+    const railNames = [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.edges || [];
     const parts = (dependentsOf.get(entry.package_id) || [])
-      .filter((dependent) => columnKeyOf(dependent) !== columnKeyOf(entry))
-      .map((dependent) => `<span class="link cross">${text(titleOf(dependent))} ` +
-        `<em>${text(projectOf(dependent))}</em></span>`);
-    return parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "";
+      .map((dependent) => {
+        if (dependent.package_id === entry.package_id) return "";
+        if (columnKeyOf(dependent) === columnKeyOf(entry)) {
+          if (lanes.some((lane) => lane.source === entry.package_id && lane.dependent === dependent.package_id)) {
+            railNames.push(titleOf(dependent));
+            return "";
+          }
+          return `<span class="link">${text(titleOf(dependent))}</span>`;
+        }
+        return `<span class="link cross">${text(titleOf(dependent))} ` +
+          `<em>${text(projectOf(dependent))}</em></span>`;
+      }).filter(Boolean);
+    return (parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "") +
+      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`blocks: ${railNames.join(" · ")}`)}</span>` : "");
   }
 
   function searchText(entry) {
@@ -436,6 +459,7 @@
       `<span class="card-title">${text(titleOf(entry))}</span>` +
       (targetProject ? `<span class="card-project">Target Folder: ${text(targetProject)}</span>` : "") +
       `<span class="card-filepath">Filepath: ${text(entry.package_path)}</span>` +
+      '<span class="visually-hidden card-start-text"></span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
 
@@ -721,7 +745,9 @@
       cards.has(edge.source) && cards.has(edge.dependent));
     const incoming = new Set(visibleEdges.map((edge) => edge.dependent));
     board.querySelectorAll(".card").forEach((card) => {
-      card.classList.toggle("no-incoming-arrow", !card.hidden && !incoming.has(card.dataset.packageId));
+      const noIncoming = !card.hidden && !incoming.has(card.dataset.packageId);
+      card.classList.toggle("no-incoming-arrow", noIncoming);
+      card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
     });
     if (!visibleEdges.length) return;
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
