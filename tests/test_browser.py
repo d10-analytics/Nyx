@@ -1886,6 +1886,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
       return source.getBoundingClientRect().top > dependent.getBoundingClientRect().top;
     }""")
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(open_page):
@@ -2669,6 +2670,155 @@ def routing_payload():
     return value, far, unknown
 
 
+def assert_rail_lanes_do_not_overlap(page):
+    segments = page.locator(".rail").evaluate_all(r"""paths => paths.flatMap(path => {
+      const tokens = path.getAttribute('d').match(/[MHV]|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi);
+      const result = [];
+      let x = 0, y = 0;
+      for (let i = 0; i < tokens.length;) {
+        const command = tokens[i++];
+        if (command === 'M') { x = Number(tokens[i++]); y = Number(tokens[i++]); }
+        else if (command === 'H') x = Number(tokens[i++]);
+        else if (command === 'V') {
+          const next = Number(tokens[i++]);
+          result.push({source: path.parentNode.dataset.source,
+            dependent: path.parentNode.dataset.dependent, x,
+            start: Math.min(y, next), end: Math.max(y, next)});
+          y = next;
+        } else throw new Error(`Unexpected rail path command: ${command}`);
+      }
+      return result;
+    })""")
+    assert len(segments) >= page.locator(".rail").count()
+    for index, first in enumerate(segments):
+        for second in segments[index + 1:]:
+            if (first["source"], first["dependent"]) == (second["source"], second["dependent"]):
+                continue
+            if abs(first["x"] - second["x"]) <= 0.5:
+                assert max(first["start"], second["start"]) > min(first["end"], second["end"]), (first, second)
+    return segments
+
+
+def test_chained_rails_reuse_two_lanes(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 125)]
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(package_id, f"Alpha/Queue/item-{index:02d}", "queue",
+               f"{'Keep' if index < 13 else 'Other'} item {index:02d}", "Alpha",
+               [_edge(ids[index - 1], "input")] if index else [])
+        for index, package_id in enumerate(ids)
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px"]
+    assert connection_pairs(page) == set(zip(ids, ids[1:]))
+    assert_readable_arrows(page)
+    before = assert_rail_lanes_do_not_overlap(page)
+    lanes = {(segment["source"], segment["dependent"]): segment["x"] for segment in before}
+    page.fill("#filter", "Keep")
+    assert connection_pairs(page) == set(zip(ids[:12], ids[1:13]))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px"]
+    for segment in assert_rail_lanes_do_not_overlap(page):
+        assert segment["x"] == pytest.approx(lanes[(segment["source"], segment["dependent"])])
+    assert_readable_arrows(page)
+
+
+def test_rail_lanes_are_capped_and_overflow_is_written_on_cards(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 113)]
+    value = json.loads(board_payload())
+    value["entries"] = [_entry(ids[0], "Alpha/Queue/00-hub", "queue", "Hub", "Alpha")] + [
+        _entry(ids[index], f"Alpha/Queue/{index:02d}-dependent", "queue", f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+        for index in range(1, 13)
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["132px"]
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:9]}
+    for index, package_id in enumerate(ids[1:], start=1):
+        card = page.locator(f'.card[data-package-id="{package_id}"]')
+        if index <= 8:
+            assert card.locator(".card-rail-text").all_text_contents() == ["needs: Hub"]
+        else:
+            assert card.locator(".card-links").all_text_contents() == ["needs: Hub"]
+            assert card.locator(".card-links em").count() == 0
+            assert "no-incoming-arrow" not in card.get_attribute("class").split()
+            assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
+            assert card.locator(".card-start-text").text_content() == ""
+    hub = page.locator(f'.card[data-package-id="{ids[0]}"]')
+    assert hub.locator(".card-links").all_text_contents() == [
+        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(9, 13))
+    ]
+    assert hub.locator(".card-rail-text").all_text_contents() == [
+        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(1, 9))
+    ]
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_upward_edge_rails_use_separate_lanes(open_page):
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/q1", "queue", "Q1", "Alpha", [_edge(GATE, "input")]),
+        _entry(STEP_TWO, "Alpha/Queue/q2", "queue", "Q2", "Alpha", [_edge(STEP_ONE, "input")]),
+        _entry(GATE, "Alpha/Under_Development/u", "under_development", "U", "Alpha"),
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px", "48px"]
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (GATE, STEP_ONE)}
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_cross_row_rail_uses_the_source_row_band_slot(open_page):
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/a1", "queue", "A1", "Alpha"),
+        _entry(STEP_TWO, "Alpha/Queue/a2", "queue", "A2", "Alpha", [_edge(STEP_ONE, "input")]),
+        _entry(GATE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(LOOSE, "input")]),
+        _entry(LOOSE, "Beta/Queue/s", "queue", "S", "Beta"),
+    ]
+    _admit_inventory_stage(value, "Beta", "Queue")
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator('.board-row .cell:nth-of-type(1)').evaluate_all(
+        "cells => cells.map(cell => getComputedStyle(cell).paddingLeft)"
+    ) == ["48px", "48px"]
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (LOOSE, GATE)}
+    assert page.locator('.board-row[data-lifecycle="Queue"] .connection-band').count() == 1
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 109)]
+    value = json.loads(board_payload())
+    value["entries"] = [_entry(ids[0], "Alpha/Queue/hub", "queue", "Hub", "Alpha")] + [
+        _entry(ids[index], f"Alpha/Under_Development/{index:02d}-dependent", "under_development",
+               f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+        for index in range(1, 9)
+    ] + [
+        _entry(STEP_ONE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_TWO, "Beta/Under_Development/s", "under_development", "S", "Beta"),
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator('.board-row .cell:nth-of-type(1)').evaluate_all(
+        "cells => cells.map(cell => getComputedStyle(cell).paddingLeft)"
+    ) == ["132px", "132px"]
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    assert card.locator(".card-links").all_text_contents() == ["needs: S Beta"]
+    assert card.locator(".card-links em").inner_text() == "Beta"
+    assert "no-incoming-arrow" not in card.get_attribute("class").split()
+    assert card.locator(".card-start-text").text_content() == ""
+    assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
 def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_filter(open_page):
     value, far, unknown = routing_payload()
     page = open_page(StaticClient(value))
@@ -2697,6 +2847,7 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     assert connection_pairs(page) == expected
     assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 @pytest.mark.parametrize("reason,duplicate_record", [
@@ -2994,6 +3145,7 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
         (STEP_TWO, GATE), (GATE, LOOSE),
     }
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 @pytest.mark.parametrize("reason", [
