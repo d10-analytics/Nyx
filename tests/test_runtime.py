@@ -2990,6 +2990,78 @@ def test_public_stop_rejects_replacement_of_original_terminal_lease_object():
         _assert_claim_available(lease_path)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="requires POSIX permissions enforced for a non-root user",
+)
+@pytest.mark.parametrize("command", ["start", "stop", "cli-start", "cli-stop"])
+def test_unreadable_live_record_reports_unavailable_without_mutation(command, capsys):
+    from nyx import cli
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd, lease = _held_lease(paths)
+        _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        before = record.read_bytes()
+        try:
+            record.chmod(0o000)
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "desktop_host", return_value=False
+            ), patch.object(runtime, "_send_control") as send_control:
+                if command.startswith("cli-"):
+                    arguments = [] if command == "cli-start" else ["--stop"]
+                    assert cli.main(arguments) == 1
+                    captured = capsys.readouterr()
+                    assert captured.out == ""
+                    assert captured.err == "nyx: Nyx instance record is unavailable\n"
+                else:
+                    with pytest.raises(runtime.UnhealthyInstanceError) as error:
+                        getattr(runtime, command)()
+                    assert str(error.value) == "Nyx instance record is unavailable"
+                    assert isinstance(error.value.__cause__, PermissionError)
+                send_control.assert_not_called()
+            record.chmod(0o600)
+            assert record.read_bytes() == before
+            fresh_lease = runtime._lease_lock(paths, timeout=0.0)
+            try:
+                assert fresh_lease.acquire(blocking=False) is False
+            finally:
+                fresh_lease.close()
+        finally:
+            record.chmod(0o600)
+            lease.close()
+            os.close(lease_fd)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="requires POSIX symlinks and a non-root user",
+)
+@pytest.mark.parametrize("command", ["start", "stop"])
+def test_unsafe_live_record_preserves_runtime_error_and_symlink(command):
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd, lease = _held_lease(paths)
+        _write_runtime_record(paths)
+        record = paths.runtime_directory / "instance.json"
+        target = paths.runtime_directory / "valid-record.json"
+        record.rename(target)
+        record.symlink_to(target)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths), patch.object(
+                runtime, "_send_control"
+            ) as send_control, pytest.raises(runtime.RuntimeErrorBase) as error:
+                getattr(runtime, command)()
+            assert type(error.value) is runtime.RuntimeErrorBase
+            assert str(error.value) == "unsafe Nyx runtime state"
+            assert record.is_symlink()
+            send_control.assert_not_called()
+        finally:
+            lease.close()
+            os.close(lease_fd)
+
+
 @pytest.mark.parametrize(
     ("control", "label"),
     [
