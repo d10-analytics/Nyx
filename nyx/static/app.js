@@ -450,10 +450,9 @@
 
     const entryProjects = new Set(entries.map((entry) => entry.project));
     const hasEligibleStages = eligibleStages.length > 0;
-    // Every admissible row is a finished row the reader chose to hide.  The
-    // board uses this to explain the empty result instead of reporting that no
-    // stage directories were found.
-    const terminalHidden = hasEligibleStages && stages.length === 0;
+    // Explain hidden finished work even when empty unfinished rows remain.
+    const terminalHidden = (hasEligibleStages && stages.length === 0) ||
+      (hideTerminalRows && displayed?.entries.length > 0 && entries.length === 0);
     const projects = [];
     inventory.projects.forEach((record) => {
       const projectStages = inventory.stages.filter((stage) => stage.project === record.name);
@@ -528,16 +527,19 @@
       `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
   }
 
+  function terminalHiddenHtml() {
+    return '<p class="empty board-empty terminal-hidden">Finished rows are hidden. ' +
+      'Uncheck “Hide terminal rows” to show them.</p>';
+  }
+
   function emptyBoardHtml(axes, entries) {
     if (!displayed) return '<p class="empty board-empty">No work items in the catalog.</p>';
     if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
       return '<p class="empty board-empty">No work items in the catalog.</p>';
     }
-    // The reader hid finished rows and those were the only admissible rows, so
-    // name that cause before the generic empty-board explanations below.
+    // Name hidden finished rows before the generic empty-board explanations.
     if (axes.terminalHidden) {
-      return '<p class="empty board-empty terminal-hidden">Finished rows are hidden. ' +
-        'Uncheck “Hide terminal rows” to show them.</p>';
+      return terminalHiddenHtml();
     }
     const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
       displayed.inventory.stages.some((stage) =>
@@ -618,9 +620,10 @@
       return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
     }));
     let html = issues + (!entries.length
-      ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
+      ? (axes.terminalHidden ? terminalHiddenHtml()
+        : `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
         ? "The catalog has incomplete dimensions; no work items are currently available."
-        : "The catalog contains admitted folders but no work items."}</p>` : "") +
+        : "The catalog contains admitted folders but no work items."}</p>`) : "") +
       '<h2 class="board-corner" aria-hidden="true"></h2>' +
       axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("");
     axes.stages.forEach((stage) => {
