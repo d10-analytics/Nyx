@@ -1929,7 +1929,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     page.fill("#filter", "")
     page.click("#refresh")
     page.wait_for_function("document.querySelectorAll('#board .card').length === 0", timeout=15000)
-    page.locator("#board-issues summary").click()
+    assert page.locator("#board-issues").get_attribute("open") is not None
     assert page.locator("#board-issues li").inner_text() == (
         "discovery_unavailable refreshed catalog discovery failure"
     )
