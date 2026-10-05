@@ -23,6 +23,8 @@
   --emphasis: #76b7ff;
   --focus-border: #76b7ff;
   --focus-ring: #4889ce;
+  --toolbar-focus-ring: #ffffff;
+  --selected-ring: #4889ce;
   --no-incoming-arrow: #01787c;
   --link: #9ebcff;
   --warning: #ffd18c;
@@ -50,7 +52,9 @@
   --rail: #327bb8;
   --emphasis: #164f91;
   --focus-border: #2463a5;
-  --focus-ring: #8db9e7;
+  --focus-ring: #2463a5;
+  --toolbar-focus-ring: #ffffff;
+  --selected-ring: #8db9e7;
   --no-incoming-arrow: #01787c;
   --link: #3e5790;
   --warning: #825000;
@@ -141,6 +145,9 @@ input::placeholder { color: var(--muted); opacity: 1; }
 input:focus-visible, button:focus-visible, select:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+.toolbar .controls :is(input, button, select):focus-visible {
+  outline-color: var(--toolbar-focus-ring);
 }
 button { cursor: pointer; background: var(--surface); color: var(--heading); font-weight: 600; }
 button.pending {
@@ -295,7 +302,7 @@ button.pending {
   background: var(--no-incoming-arrow);
 }
 .card:hover, .card:focus { border-color: var(--focus-border); outline: 2px solid var(--focus-ring); }
-.card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--focus-ring), 0 2px 5px var(--selected-shadow); }
+.card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--selected-ring), 0 2px 5px var(--selected-shadow); }
 .card-title { display: block; font-weight: 700; margin-bottom: .25rem; }
 .card-project { display: block; color: var(--muted); font-size: .88rem; }
 .card-filepath { display: block; color: var(--muted); font-size: .88rem; overflow-wrap: anywhere; }
