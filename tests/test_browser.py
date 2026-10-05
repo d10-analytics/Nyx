@@ -2670,6 +2670,65 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
     assert contrast_ratio(divider, page_color) >= 3
 
 
+@pytest.mark.parametrize("theme,card_outline,selected_ring", [
+    ("dark", "rgb(72, 137, 206)", "rgb(72, 137, 206)"),
+    ("light", "rgb(36, 99, 165)", "rgb(141, 185, 231)"),
+])
+def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_outline, selected_ring):
+    value = json.loads(board_payload())
+    value["discovery_diagnostics"] = [
+        {"code": "discovery_unavailable", "message": "One folder could not be read"}
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value), settings=BrowserSettings())
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    page.keyboard.press("Tab")
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.press("Enter")
+    assert selected_ring in card.evaluate("node => getComputedStyle(node).boxShadow")
+
+    def check_indicator(control, *, expected=None, card=False):
+        control.focus()
+        measurement = control.evaluate("""node => {
+          const style = getComputedStyle(node);
+          let background = getComputedStyle(document.documentElement).backgroundColor;
+          for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+            const color = getComputedStyle(ancestor).backgroundColor;
+            const channels = color.match(/[\\d.]+/g).map(Number);
+            if (channels.length === 3 || channels[3] === 1) {
+              background = color;
+              break;
+            }
+          }
+          return {color: style.outlineColor, style: style.outlineStyle, background,
+            focus: node.matches(':focus'), visible: node.matches(':focus-visible')};
+        }""")
+        assert measurement["focus"] if card else measurement["visible"]
+        assert measurement["style"] != "none"
+        assert contrast_ratio(measurement["color"], measurement["background"]) >= 3, measurement
+        if expected is not None:
+            assert measurement["color"] == expected
+
+    check_indicator(card, expected=card_outline, card=True)
+    for selector in ("#filter", "#refresh", "#theme", "#compact-view", "#hide-terminal-rows"):
+        check_indicator(page.locator(selector), expected="rgb(255, 255, 255)")
+    page.locator("#stage-order-heading").press("Enter")
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    for selector in (
+        "#stage-order-heading", "#deselect-on-empty-click", ".stage-completed-toggle",
+        ".stage-order-move:not(:disabled)", "#stage-order-save", "#stage-order-cancel",
+        "#stage-order-reset", "#board-issues summary",
+    ):
+        check_indicator(page.locator(selector).first)
+
+    failed = BrowserSettings()
+    failed.fail_next_load = True
+    retry_page = open_page(StaticClient(board_payload()), settings=failed)
+    retry_page.get_by_label("Theme", exact=True).select_option(theme)
+    retry_page.locator("#stage-order-heading").press("Enter")
+    check_indicator(retry_page.locator("#stage-order-reload"))
+
+
 def test_dark_is_default_and_explicit_theme_survives_reload_and_system_changes(open_page):
     page = open_page(StaticClient(board_payload()), color_scheme="light")
     selector = page.get_by_label("Theme", exact=True)
