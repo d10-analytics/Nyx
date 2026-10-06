@@ -90,6 +90,7 @@
   let railPlan = new Map();
   let railColumns = [];
   let railEdges = [];
+  let cardPrerequisites = new Map();
   let compactView = true;
   let hideTerminalRows = true;
   let deselectOnEmptyClick = false;
@@ -135,7 +136,6 @@
   function indexDependents(entries, byId) {
     const index = new Map();
     entries.forEach((entry) => {
-      if (byId.get(entry.package_id) !== entry) return;
       (entry.relationship.prerequisites || []).forEach((edge) => {
         if (!prerequisiteTarget(edge, byId)) return;
         if (!index.has(edge.target_package_id)) index.set(edge.target_package_id, []);
@@ -403,7 +403,7 @@
         if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
         return '<span class="link unresolved">unresolved target</span>';
       }
-      if (target.package_id === entry.package_id || byId.get(entry.package_id) !== entry) return "";
+      if (target.package_id === entry.package_id) return "";
       if (columnKeyOf(target) === columnKeyOf(entry)) {
         if (lanes?.has(`${target.package_id}>${entry.package_id}`)) {
           railNames.push(titleOf(target));
@@ -638,6 +638,13 @@
       : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
+    // Keyed by path so cards sharing a package identity keep their own relationships.
+    cardPrerequisites = new Map(entries.map((entry) => [
+      entry.package_path,
+      prerequisiteTargets(entry, byId)
+        .filter(({target}) => target && target.package_id !== entry.package_id)
+        .map(({target}) => target.package_id),
+    ]));
     const axes = inventoryAxes(entries);
     const issues = board.querySelector("#board-issues");
     issues?.remove();
@@ -774,9 +781,11 @@
     });
     const visibleEdges = railEdges.filter((edge) =>
       cards.has(edge.source) && cards.has(edge.dependent));
-    const incoming = new Set(visibleEdges.map((edge) => edge.dependent));
+    // A prerequisite counts while its card is visible, whether it is shown by
+    // an arrow or only as relationship text.
     board.querySelectorAll(".card").forEach((card) => {
-      const noIncoming = !card.hidden && !incoming.has(card.dataset.packageId);
+      const prerequisites = cardPrerequisites.get(card.dataset.packagePath) || [];
+      const noIncoming = !card.hidden && !prerequisites.some((id) => cards.has(id));
       card.classList.toggle("no-incoming-arrow", noIncoming);
       card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
     });
