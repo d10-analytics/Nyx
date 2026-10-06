@@ -3048,7 +3048,9 @@ def assert_focus_indicator(control, *, expected=None, card=False):
         focus: node.matches(':focus'), visible: node.matches(':focus-visible')};
     }""")
     assert measurement["focus"] if card else measurement["visible"]
-    assert measurement["style"] != "none"
+    # An authored solid ring keeps the measured color; the browser default
+    # "auto" ring varies by browser build.
+    assert measurement["style"] == "solid", measurement
     assert contrast_ratio(measurement["painted"], measurement["background"]) >= 3, measurement
     if expected is not None:
         assert measurement["color"] == expected
@@ -3083,7 +3085,8 @@ def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_out
         ".stage-order-move:not(:disabled)", "#stage-order-save", "#stage-order-cancel",
         "#stage-order-reset", "#board-issues summary",
     ):
-        assert_focus_indicator(page.locator(selector).first)
+        expected = card_outline if selector.endswith(("heading", "summary")) else None
+        assert_focus_indicator(page.locator(selector).first, expected=expected)
 
     failed = BrowserSettings()
     failed.fail_next_load = True
