@@ -2971,6 +2971,40 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
     assert contrast_ratio(divider, page_color) >= 3
 
 
+def assert_focus_indicator(control, *, expected=None, card=False):
+    control.focus()
+    measurement = control.evaluate("""node => {
+      const style = getComputedStyle(node);
+      let background = getComputedStyle(document.documentElement).backgroundColor;
+      for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const color = getComputedStyle(ancestor).backgroundColor;
+        const channels = color.match(/[\\d.]+/g).map(Number);
+        if (channels.length === 3 || channels[3] === 1) {
+          background = color;
+          break;
+        }
+      }
+      let opacity = 1;
+      for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+        opacity *= Number(getComputedStyle(ancestor).opacity);
+      }
+      const foreground = style.outlineColor.match(/[\\d.]+/g).map(Number);
+      const surface = background.match(/[\\d.]+/g).map(Number);
+      const alpha = opacity * (foreground[3] ?? 1);
+      const painted = foreground.slice(0, 3).map((channel, index) =>
+        Math.round(channel * alpha + surface[index] * (1 - alpha)));
+      return {painted: `rgb(${painted.join(', ')})`, opacity, color: style.outlineColor, style: style.outlineStyle, background,
+        focus: node.matches(':focus'), visible: node.matches(':focus-visible')};
+    }""")
+    assert measurement["focus"] if card else measurement["visible"]
+    assert measurement["style"] != "none"
+    assert contrast_ratio(measurement["painted"], measurement["background"]) >= 3, measurement
+    if expected is not None:
+        assert measurement["color"] == expected
+
+    return measurement
+
+
 @pytest.mark.parametrize("theme,card_outline,selected_ring", [
     ("dark", "rgb(72, 137, 206)", "rgb(72, 137, 206)"),
     ("light", "rgb(36, 99, 165)", "rgb(141, 185, 231)"),
@@ -2988,31 +3022,9 @@ def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_out
     card.press("Enter")
     assert selected_ring in card.evaluate("node => getComputedStyle(node).boxShadow")
 
-    def check_indicator(control, *, expected=None, card=False):
-        control.focus()
-        measurement = control.evaluate("""node => {
-          const style = getComputedStyle(node);
-          let background = getComputedStyle(document.documentElement).backgroundColor;
-          for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
-            const color = getComputedStyle(ancestor).backgroundColor;
-            const channels = color.match(/[\\d.]+/g).map(Number);
-            if (channels.length === 3 || channels[3] === 1) {
-              background = color;
-              break;
-            }
-          }
-          return {color: style.outlineColor, style: style.outlineStyle, background,
-            focus: node.matches(':focus'), visible: node.matches(':focus-visible')};
-        }""")
-        assert measurement["focus"] if card else measurement["visible"]
-        assert measurement["style"] != "none"
-        assert contrast_ratio(measurement["color"], measurement["background"]) >= 3, measurement
-        if expected is not None:
-            assert measurement["color"] == expected
-
-    check_indicator(card, expected=card_outline, card=True)
+    assert_focus_indicator(card, expected=card_outline, card=True)
     for selector in ("#filter", "#refresh", "#theme", "#compact-view", "#hide-terminal-rows"):
-        check_indicator(page.locator(selector), expected="rgb(255, 255, 255)")
+        assert_focus_indicator(page.locator(selector), expected="rgb(255, 255, 255)")
     page.locator("#stage-order-heading").press("Enter")
     page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
     for selector in (
@@ -3020,14 +3032,66 @@ def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_out
         ".stage-order-move:not(:disabled)", "#stage-order-save", "#stage-order-cancel",
         "#stage-order-reset", "#board-issues summary",
     ):
-        check_indicator(page.locator(selector).first)
+        assert_focus_indicator(page.locator(selector).first)
 
     failed = BrowserSettings()
     failed.fail_next_load = True
     retry_page = open_page(StaticClient(board_payload()), settings=failed)
     retry_page.get_by_label("Theme", exact=True).select_option(theme)
     retry_page.locator("#stage-order-heading").press("Enter")
-    check_indicator(retry_page.locator("#stage-order-reload"))
+    assert_focus_indicator(retry_page.locator("#stage-order-reload"))
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+@pytest.mark.parametrize("request_kind", ["save", "reload"])
+def test_stage_editor_busy_focus_indicators_keep_composited_contrast(open_page, theme, request_kind):
+    settings = BrowserSettings()
+    settings.fail_next_load = request_kind == "reload"
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    page.locator("#stage-order-heading").press("Enter")
+    if request_kind == "save":
+        page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+        selectors = [
+            "#stage-order-save", "#stage-order-cancel", "#stage-order-reset",
+            '.stage-completed-toggle[data-stage="Under_Development"]',
+            '.stage-completed-toggle[data-stage="Queue"]',
+            '.stage-order-item[data-stage="Under_Development"] [data-stage-move="down"]',
+            '.stage-order-item[data-stage="Queue"] [data-stage-move="up"]',
+        ]
+    else:
+        selectors = ["#stage-order-reload"]
+    used = page.locator(selectors[0])
+    used.focus()
+    arm_focus_sampler(page)
+    settings.gate = threading.Event()
+    try:
+        used.press("Enter")
+        assert settings.entered.wait(timeout=2)
+        playwright.expect(used).to_be_focused()
+        busy = page.locator('#stage-order-editor [aria-disabled="true"]:visible')
+        assert busy.count() == len(selectors)
+        for selector in selectors:
+            control = page.locator(selector)
+            assert control.get_attribute("aria-disabled") == "true"
+            assert control.get_attribute("disabled") is None
+            measurement = assert_focus_indicator(control)
+            assert 0 < measurement["opacity"] < 1, measurement
+        assert settings.calls == (
+            [("revision-1", ["Under_Development", "Queue"], [])]
+            if request_kind == "save" else []
+        )
+        assert settings.get_calls == (1 if request_kind == "save" else 2)
+        used.focus()
+        assert_focus_sampler_clean(page)
+    finally:
+        settings.gate.set()
+    playwright.expect(page.locator("#stage-order-reset")).to_be_focused()
+    if request_kind == "save":
+        playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    else:
+        playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    assert_focus_sampler_clean(page)
 
 
 def test_dark_is_default_and_explicit_theme_survives_reload_and_system_changes(open_page):
