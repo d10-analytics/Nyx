@@ -2342,6 +2342,57 @@ def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_
     assert source.text_content().count("Dependent step") == 1
 
 
+@pytest.mark.parametrize("provider_project", ["Alpha", "Beta"])
+def test_shared_identity_cards_keep_valid_relationship_text(open_page, tmp_path, provider_project):
+    _write_package(
+        tmp_path, provider_project, "Queue", "provider", STEP_ONE,
+        f"# Provider\nPackage ID: {STEP_ONE}\nClaim: release | unsatisfied\n",
+    )
+    for name, title in (("first", "First twin"), ("second", "Second twin")):
+        _write_package(
+            tmp_path, "Alpha", "Queue", name, STEP_TWO,
+            f"# {title}\nPackage ID: {STEP_TWO}\nPrerequisite: {STEP_ONE} | release\n",
+        )
+    value = json.loads(scan_catalog(tmp_path))
+    twins = [entry for entry in value["entries"] if entry["package_id"] == STEP_TWO]
+    assert len(twins) == 2
+    for entry in twins:
+        assert [(edge["target_package_id"], edge["reason"]) for edge in entry["relationship"]["prerequisites"]] == [
+            (STEP_ONE, "claim_unsatisfied"),
+        ]
+    page = open_page(ScanningClient(tmp_path))
+    assert connection_pairs(page) == set()
+    cross = provider_project != "Alpha"
+    needs = "needs: Provider Beta" if cross else "needs: Provider"
+    provider = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.count() == 1
+        assert card.locator(".card-links").all_text_contents() == [needs]
+        assert card.locator(".card-links em").count() == int(cross)
+        assert "no-incoming-arrow" not in card.get_attribute("class").split()
+        assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
+        assert card.locator(".card-start-text").text_content() == ""
+        playwright.expect(card).not_to_have_accessible_name(re.compile("No prerequisite shown"))
+    suffix = " Alpha" if cross else ""
+    assert provider.locator(".card-links").all_text_contents() == [
+        f"blocks: First twin{suffix} · Second twin{suffix}"
+    ]
+    assert provider.locator(".card-start-text").text_content() == "No prerequisite shown."
+
+    # A relationship counts only while its prerequisite card is visible.
+    page.fill("#filter", "twin")
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.locator(".card-links").all_text_contents() == [needs]
+        assert "no-incoming-arrow" in card.get_attribute("class").split()
+        assert card.locator(".card-start-text").text_content() == "No prerequisite shown."
+    page.fill("#filter", "")
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.locator(".card-start-text").text_content() == ""
+
+
 def test_no_incoming_text_follows_search_like_the_color(open_page):
     page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
 
