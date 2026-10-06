@@ -142,7 +142,7 @@ h1, h2, h3, p { margin-top: 0; }
 input, button, select { border: 1px solid var(--control-border); border-radius: .3rem; padding: .5rem .7rem; font: inherit; }
 input, select { background: var(--surface); color: var(--heading); }
 input::placeholder { color: var(--muted); opacity: 1; }
-input:focus-visible, button:focus-visible, select:focus-visible {
+input:focus-visible, button:focus-visible, select:focus-visible, summary:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
