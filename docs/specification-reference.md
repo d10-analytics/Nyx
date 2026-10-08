@@ -36,8 +36,9 @@ Nyx reads a `spec.md` header as UTF-8. A single leading UTF-8 byte order mark
 limit is 65,536 bytes, counted from the first byte of the file and including
 both the BOM and the line break before the cut. A header that needs more than
 that limit is reported as an invalid package. Bytes after the cut are body
-content and are never decoded as part of the header, so an undecodable byte
-below the cut remains a header problem while the same byte in the body does not.
+content and are never decoded as part of the header, so an undecodable byte in
+the header before the cut still makes the item an invalid package while the
+same byte after the cut does not.
 
 For example, a community-event item can point to two outcomes from one permit
 item by repeating the `Prerequisite` field:
