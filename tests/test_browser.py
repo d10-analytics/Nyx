@@ -497,7 +497,7 @@ class BlockingRawSequenceClient(RawSequenceClient):
 class BrowserSettings:
     """Small application-settings seam used by the browser behavior tests."""
 
-    def __init__(self, order=(), completed=(), revision="revision-1", root=None):
+    def __init__(self, order=(), completed=(), revision="revision-1", root=None, gate=None):
         self.order = list(order)
         self.completed = list(completed)
         self.revision = revision
@@ -506,9 +506,14 @@ class BrowserSettings:
         self.get_calls = 0
         self.fail_next = False
         self.fail_next_load = False
+        self.gate = gate
+        self.entered = threading.Event()
 
     def get_settings(self):
         self.get_calls += 1
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(timeout=10)
         if self.fail_next_load:
             self.fail_next_load = False
             raise CatalogError("producer_unavailable")
@@ -521,6 +526,9 @@ class BrowserSettings:
 
     def save_settings(self, revision, order, completed):
         self.calls.append((revision, list(order), list(completed)))
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(timeout=10)
         if self.fail_next:
             self.fail_next = False
             return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "failure"}
@@ -1093,7 +1101,7 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
         assert page.locator("#board .card").count() == 4
         assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
         client.release.set()
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -1187,7 +1195,7 @@ def test_browser_accepts_explicit_blank_declared_metadata(open_page):
 def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     client = SequenceClient([CatalogError("producer_unavailable"), board_payload()])
     page = open_page(client)
-    page.get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
+    page.locator("#board").get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
         timeout=15000
     )
     page.locator("#board .card").first.wait_for(timeout=15000)
@@ -1305,6 +1313,51 @@ def test_reported_values_and_declared_slots_stay_searchable(open_page, tmp_path)
     card.focus()
     page.keyboard.press("Enter")
     assert card.get_attribute("aria-pressed") == "true"
+
+
+def test_long_unbroken_names_wrap_within_their_column(open_page):
+    token = "x" * 300
+    value = json.loads(board_payload())
+    projects = ["Alpha", "Beta", token]
+    value["inventory"] = {
+        "projects": [{"name": project, "availability": "complete"} for project in projects],
+        "stages": [
+            {"project": project, "stage": "Queue", "availability": "complete"}
+            for project in projects
+        ],
+    }
+    value["entries"] = [
+        _entry(STEP_ONE, f"Alpha/Queue/{token}", "queue", token, "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_TWO, "Beta/Queue/source", "queue", token, "Beta"),
+        _entry(GATE, f"{token}/Queue/item", "queue", "Third project item", token),
+    ]
+    value["entries"][0]["declared"]["target_project"] = token
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    alpha = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    beta = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    assert alpha.locator(".card-title").inner_text() == token
+    assert alpha.locator(".card-project").inner_text() == f"Target Folder: {token}"
+    assert alpha.locator(".card-filepath").inner_text() == f"Filepath: Alpha/Queue/{token}"
+    assert alpha.locator(".card-links").inner_text() == f"needs: {token} Beta"
+    assert beta.locator(".card-links").inner_text() == f"blocks: {token} Alpha"
+    assert page.locator(".column-head").all_text_contents() == projects
+
+    measurements = page.locator(
+        ".card-title, .card-project, .card-filepath, .card-links, .column-head"
+    ).evaluate_all("""nodes => nodes.map(node => ({
+      kind: node.className, text: node.textContent,
+      scrollWidth: node.scrollWidth, clientWidth: node.clientWidth,
+    }))""")
+    for measurement in measurements:
+        assert measurement["scrollWidth"] <= measurement["clientWidth"] + 1, measurement
+    bounds = page.locator(".card").evaluate_all("""cards => cards.map(card => ({
+      right: card.getBoundingClientRect().right,
+      cellRight: card.closest('.cell').getBoundingClientRect().right,
+    }))""")
+    assert len(bounds) == 3
+    for bound in bounds:
+        assert bound["right"] <= bound["cellRight"] + 1, bound
 
 
 def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(open_page):
@@ -1508,6 +1561,169 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     assert row_labels(page2) == ["Queue", "Under Development"]
 
 
+def arm_focus_sampler(page):
+    page.evaluate("""() => {
+      window.focusViolations = [];
+      const check = () => {
+        if (!document.activeElement || document.activeElement === document.body) {
+          window.focusViolations.push(performance.now());
+        }
+      };
+      const frame = () => { check(); requestAnimationFrame(frame); };
+      requestAnimationFrame(frame);
+      for (const event of ['focusin', 'focusout']) {
+        document.addEventListener(event, () => setTimeout(check, 0));
+      }
+    }""")
+
+
+def assert_focus_sampler_clean(page):
+    page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)))")
+    assert page.evaluate("window.focusViolations") == []
+
+
+def test_stage_editor_focus_stays_on_used_control_or_successor(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    checkbox = page.get_by_role("checkbox", name="Counts as finished: Queue", exact=True)
+    checkbox.focus()
+    arm_focus_sampler(page)
+    kept = checkbox.element_handle()
+    checkbox.press("Space")
+    playwright.expect(checkbox).to_be_checked()
+    playwright.expect(checkbox).to_be_focused()
+    assert not kept.evaluate("node => node.isConnected")
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    page.get_by_role("button", name="Move Queue down", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Queue up", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    assert stage_editor_order(page) == ["Queue", "Under_Development"]
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Move Under Development down", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+    page.get_by_role("button", name="Cancel", exact=True).press("Enter")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    page.get_by_role("button", name="Save", exact=True).press("Enter")
+    playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+    assert settings.get_calls == 2
+    assert_focus_sampler_clean(page)
+
+    page.get_by_role("button", name="Reset", exact=True).press("Enter")
+    playwright.expect(page.locator(".row-head")).to_have_text(["Queue", "Under Development"])
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.calls == [
+        ("revision-1", ["Under_Development", "Queue"], []), ("revision-2", [], []),
+    ]
+    assert settings.get_calls == 3
+    assert_focus_sampler_clean(page)
+
+    winner = open_page(StaticClient(board_payload()), settings=settings)
+    winner.locator("#stage-order-heading").press("Enter")
+    with winner.expect_response(lambda response: response.url.endswith("/api/settings") and response.request.method == "GET"):
+        winner.get_by_role("button", name="Reset", exact=True).press("Enter")
+    playwright.expect(winner.get_by_role("button", name="Reset", exact=True)).to_be_enabled()
+    assert settings.calls[-1] == ("revision-3", [], [])
+    assert settings.get_calls == 5
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    page.get_by_role("button", name="Save", exact=True).press("Enter")
+    reload = page.get_by_role("button", name="Reload board settings", exact=True)
+    playwright.expect(reload).to_be_focused()
+    assert settings.calls[-1] == ("revision-3", ["Under_Development", "Queue"], [])
+    assert len(settings.calls) == 4
+    assert settings.get_calls == 5
+    assert_focus_sampler_clean(page)
+    reload.press("Enter")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert settings.get_calls == 6
+    assert len(settings.calls) == 4
+    assert_focus_sampler_clean(page)
+
+
+def test_stage_editor_focus_survives_held_settings_requests(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    save = page.get_by_role("button", name="Save", exact=True)
+    save.focus()
+    arm_focus_sampler(page)
+    settings.gate = threading.Event()
+    try:
+        save.press("Enter")
+        assert settings.entered.wait(timeout=2)
+        playwright.expect(save).to_be_focused()
+        assert save.get_attribute("aria-disabled") == "true"
+        assert save.get_attribute("disabled") is None
+        assert float(save.evaluate("node => getComputedStyle(node).opacity")) < 1
+        checkbox = page.get_by_role("checkbox", name="Counts as finished: Under Development", exact=True)
+        checkbox.focus()
+        kept = checkbox.element_handle()
+        checkbox.press("Space")
+        assert not checkbox.is_checked()
+        assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
+        assert_focus_sampler_clean(page)
+    finally:
+        settings.gate.set()
+    playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    playwright.expect(checkbox).to_be_focused()
+    assert not kept.evaluate("node => node.isConnected")
+    assert settings.get_calls == 2
+    assert len(settings.calls) == 1
+    assert_focus_sampler_clean(page)
+
+    failed = BrowserSettings()
+    failed.fail_next_load = True
+    retry_page = open_page(StaticClient(board_payload()), settings=failed)
+    retry_page.locator("#stage-order-heading").press("Enter")
+    reload = retry_page.get_by_role("button", name="Reload board settings", exact=True)
+    reload.focus()
+    arm_focus_sampler(retry_page)
+    failed.gate = threading.Event()
+    try:
+        reload.press("Enter")
+        assert failed.entered.wait(timeout=2)
+        playwright.expect(reload).to_be_focused()
+        assert reload.get_attribute("aria-disabled") == "true"
+        assert reload.get_attribute("disabled") is None
+        assert failed.get_calls == 2
+        assert failed.calls == []
+        assert_focus_sampler_clean(retry_page)
+    finally:
+        failed.gate.set()
+    playwright.expect(retry_page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(retry_page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert failed.get_calls == 2
+    assert failed.calls == []
+    assert_focus_sampler_clean(retry_page)
+
+
+def test_manual_refresh_keeps_focus_outside_stage_editor(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-heading").press("Enter")
+    refresh = page.get_by_role("button", name="Refresh view", exact=True)
+    refresh.focus()
+    arm_focus_sampler(page)
+    card = page.locator(".card").first.element_handle()
+    with page.expect_response("**/api/catalog"):
+        refresh.press("Enter")
+    page.wait_for_function("node => !node.isConnected", arg=card)
+    playwright.expect(refresh).to_be_focused()
+    assert_focus_sampler_clean(page)
+
+
 def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     settings = BrowserSettings()
     settings.fail_next_load = True
@@ -1670,6 +1886,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
       return source.getBoundingClientRect().top > dependent.getBoundingClientRect().top;
     }""")
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(open_page):
@@ -1720,7 +1937,7 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     page = open_page(client)
 
     page.wait_for_selector("#refresh.pending", timeout=15000)
-    page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+    page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
         timeout=15000
     )
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
@@ -1733,6 +1950,170 @@ def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
     page.locator("#board").get_by_text("B", exact=True).wait_for(timeout=15000)
     assert client.calls == 3
     assert page.locator("#board-issues").count() == 0
+
+
+def observe_removed_cards(page):
+    page.evaluate("""() => {
+      window.removedCards = 0;
+      new MutationObserver(records => {
+        for (const record of records) {
+          for (const node of record.removedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE &&
+                (node.matches('.card') || node.querySelector('.card'))) window.removedCards++;
+          }
+        }
+      }).observe(document.querySelector('#board'), {childList: true, subtree: true});
+    }""")
+
+
+def observe_refresh_status(page):
+    assert page.locator("#refresh-status").count() == 1
+    page.evaluate("""() => {
+      window.refreshStatusRecords = 0;
+      window.refreshStatusTexts = [];
+      const status = document.querySelector('#refresh-status');
+      new MutationObserver(records => {
+        window.refreshStatusRecords += records.length;
+        window.refreshStatusTexts.push(status.textContent);
+      }).observe(status, {childList: true, characterData: true, subtree: true});
+    }""")
+
+
+def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
+    page = open_page(SequenceClient([board_payload(), CatalogError("producer_unavailable")]))
+    board = page.locator("#board")
+    assert board.get_attribute("aria-live") is None
+    assert board.get_attribute("role") is None
+    status = page.locator("#refresh-status")
+    assert status.count() == 1
+    assert board.locator("#refresh-status").count() == 0
+    assert status.get_attribute("role") == "status"
+    assert status.get_attribute("aria-atomic") == "true"
+    assert "visually-hidden" in status.get_attribute("class").split()
+    box = status.bounding_box()
+    assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
+
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.focus()
+    card.press("Enter")
+    kept = card.element_handle()
+    observe_removed_cards(page)
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_unavailable", timeout=15000)
+    assert kept.evaluate("node => node.isConnected && node === document.activeElement")
+    assert kept.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("window.removedCards") == 0
+    panel = page.locator("#board-issues")
+    assert panel.evaluate("node => node === node.parentElement.firstElementChild")
+    assert panel.get_attribute("open") is None
+    assert panel.locator("summary").inner_text() == "Latest refresh issue: producer_unavailable"
+    assert_readable_arrows(page)
+
+
+def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
+    value = json.loads(board_payload())
+    value["discovery_diagnostics"] = [
+        {"code": "discovery_unavailable", "message": "One folder could not be read"}
+    ]
+    _reseal(value)
+    client = SequenceClient([value, CatalogError("producer_protocol_error"), value])
+    page = open_page(client)
+    panel = page.locator("#board-issues").element_handle()
+    summary = page.locator("#board-issues summary")
+    summary.focus()
+    summary.press("Enter")
+    kept_summary = summary.element_handle()
+    observe_removed_cards(page)
+    with page.expect_response("**/api/catalog"):
+        page.locator("#refresh").click()
+    playwright.expect(summary).to_have_text(
+        "Workspace issues: discovery_unavailable (1) · Latest refresh issue: producer_protocol_error"
+    )
+    assert panel.evaluate("node => node.isConnected")
+    assert kept_summary.evaluate("node => node.isConnected")
+    assert panel.get_attribute("open") is not None
+    assert page.evaluate("window.removedCards") == 0
+
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]').element_handle()
+    with page.expect_response("**/api/catalog"):
+        page.locator("#refresh").click()
+    playwright.expect(summary).to_have_text("Workspace issues: discovery_unavailable (1)")
+    assert not card.evaluate("node => node.isConnected")
+    assert panel.evaluate("node => node.isConnected")
+    assert kept_summary.evaluate("node => node.isConnected")
+    assert panel.get_attribute("open") is not None
+    assert page.locator("#refresh-status").inner_text() == "Refresh issue resolved."
+    assert client.calls == 3
+
+
+def test_poll_recovery_removes_issues_in_place_and_announces_resolution(open_page):
+    page = open_page(SequenceClient([
+        board_payload(), CatalogError("producer_timeout"), board_payload(),
+    ]))
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.focus()
+    card.press("Enter")
+    kept = card.element_handle()
+    observe_removed_cards(page)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(
+        timeout=15000
+    )
+    playwright.expect(page.locator("#refresh-status")).to_have_text(
+        "Refresh issue resolved.", timeout=15000
+    )
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert kept.evaluate("node => node.isConnected && node === document.activeElement")
+    assert kept.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("window.removedCards") == 0
+
+
+def test_refresh_failure_changes_are_announced_once(open_page):
+    client = SequenceClient([
+        board_payload(), CatalogError("producer_unavailable"),
+        CatalogError("producer_unavailable"), CatalogError("producer_timeout"),
+    ])
+    page = open_page(client)
+    observe_refresh_status(page)
+    counts = []
+    for failure in ("producer_unavailable", "producer_unavailable", "producer_timeout"):
+        with page.expect_response("**/api/catalog") as response:
+            page.locator("#refresh").click()
+        response.value.finished()
+        playwright.expect(page.locator("#refresh-status")).to_have_text(
+            f"Latest refresh issue: {failure}"
+        )
+        # Flush mutation delivery after the fetch continuation updates the DOM.
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        counts.append(page.evaluate("window.refreshStatusRecords"))
+    assert counts[0] > 0
+    assert counts[1] == counts[0]
+    assert counts[2] > counts[1]
+    assert client.calls == 4
+
+
+def test_applying_pending_update_empties_refresh_status_silently(open_page):
+    client = SequenceClient([
+        board_payload(titles={"step_one": "A"}),
+        board_payload(titles={"step_one": "B"}),
+        CatalogError("producer_protocol_error"),
+    ])
+    page = open_page(client)
+    page.wait_for_selector("#refresh.pending", timeout=15000)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        timeout=15000
+    )
+    status = page.locator("#refresh-status")
+    assert status.inner_text() == "Latest refresh issue: producer_protocol_error"
+    observe_refresh_status(page)
+    page.get_by_role("button", name="Apply update", exact=True).click()
+    assert page.locator("#board").get_by_text("B", exact=True).count() == 1
+    assert page.locator("#board-issues").count() == 0
+    assert status.inner_text() == ""
+    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
+    cleared_records = page.evaluate("window.refreshStatusRecords")
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_protocol_error", timeout=15000)
+    assert page.evaluate("window.refreshStatusRecords") > cleared_records
+    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
 
 
 def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_refresh(open_page):
@@ -1765,7 +2146,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     page.fill("#filter", "")
     page.click("#refresh")
     page.wait_for_function("document.querySelectorAll('#board .card').length === 0", timeout=15000)
-    page.locator("#board-issues summary").click()
+    assert page.locator("#board-issues").get_attribute("open") is not None
     assert page.locator("#board-issues li").inner_text() == (
         "discovery_unavailable refreshed catalog discovery failure"
     )
@@ -1877,6 +2258,162 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
     page.get_by_label("Theme", exact=True).select_option("light")
     assert source.evaluate("el => getComputedStyle(el).backgroundColor") == NO_INCOMING_CARD
     assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == LIGHT_CARD
+
+
+def test_same_project_relationship_text_is_available_to_screen_readers(open_page):
+    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+    expected = {
+        STEP_TWO: ["needs: Foundation step", "blocks: Gate step"],
+        STEP_ONE: ["blocks: Dependent step"],
+        GATE: ["needs: Dependent step"],
+        LOOSE: [],
+    }
+    visible = {STEP_ONE: 1, LOOSE: 1, STEP_TWO: 0, GATE: 0}
+    for package_id, texts in expected.items():
+        card = page.locator(f'.card[data-package-id="{package_id}"]')
+        spans = card.locator(".card-rail-text")
+        assert spans.all_text_contents() == texts
+        assert card.locator(".card-links").count() == visible[package_id]
+        for span in spans.all():
+            assert span.evaluate("node => node.childNodes.length === 1 && node.firstChild.nodeType === Node.TEXT_NODE")
+            box = span.bounding_box()
+            assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-links').inner_text() == (
+        f"blocks: {XSS_TITLE} Beta"
+    )
+    assert page.locator(f'.card[data-package-id="{LOOSE}"] .card-links').inner_text() == (
+        "needs: Foundation step Alpha"
+    )
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+    playwright.expect(page.locator(f'.card[data-package-id="{LOOSE}"]')).not_to_have_accessible_name(
+        re.compile("blocks:")
+    )
+    assert page.locator("#board").get_by_text("Foundation step", exact=True).count() == 1
+
+    page.fill("#filter", "Dependent step")
+    kept = dependent.element_handle()
+    page.get_by_role("button", name="Refresh view", exact=True).click()
+    page.wait_for_function("node => !node.isConnected", arg=kept)
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').is_hidden()
+    assert page.locator(".rail").count() == 0
+    assert dependent.locator(".card-rail-text").all_text_contents() == expected[STEP_TWO]
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+
+    escaped = open_page(StaticClient(dependency_state_payload("unsatisfied", titles={"step_one": XSS_TITLE})))
+    assert escaped.locator(f'.card[data-package-id="{STEP_TWO}"] .card-rail-text').all_text_contents() == [
+        f"needs: {XSS_TITLE}", "blocks: Gate step",
+    ]
+    assert escaped.locator("#board img").count() == 0
+
+
+@pytest.mark.parametrize("source_project", ["Alpha", "Beta"])
+def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_page, tmp_path, source_project):
+    _write_package(
+        tmp_path, source_project, "Queue", "source", STEP_ONE,
+        f"# Foundation step\nPackage ID: {STEP_ONE}\n"
+        "Claim: release | unsatisfied\nClaim: second | unsatisfied\n",
+    )
+    _write_package(
+        tmp_path, "Alpha", "Queue", "dependent", STEP_TWO,
+        f"# Dependent step\nPackage ID: {STEP_TWO}\n"
+        f"Prerequisite: {STEP_ONE} | INVALID\nPrerequisite: {STEP_ONE} | release\n"
+        f"Prerequisite: {STEP_ONE} | second\n",
+    )
+    value = json.loads(scan_catalog(tmp_path))
+    dependent_entry = next(entry for entry in value["entries"] if entry["package_id"] == STEP_TWO)
+    assert [edge["reason"] for edge in dependent_entry["relationship"]["prerequisites"]] == [
+        "invalid_prerequisite", "claim_unsatisfied", "claim_unsatisfied",
+    ]
+    page = open_page(ScanningClient(tmp_path))
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO)}
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    if source_project == "Alpha":
+        assert dependent.locator(".card-rail-text").all_text_contents() == ["needs: Foundation step"]
+        assert source.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent step"]
+        assert dependent.locator(".card-links").count() == 0
+        assert source.locator(".card-links").count() == 0
+    else:
+        assert dependent.locator(".card-links").all_text_contents() == ["needs: Foundation step Beta"]
+        assert source.locator(".card-links").all_text_contents() == ["blocks: Dependent step Alpha"]
+    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+    assert dependent.text_content().count("Foundation step") == 1
+    assert source.text_content().count("Dependent step") == 1
+
+
+@pytest.mark.parametrize("provider_project", ["Alpha", "Beta"])
+def test_shared_identity_cards_keep_valid_relationship_text(open_page, tmp_path, provider_project):
+    _write_package(
+        tmp_path, provider_project, "Queue", "provider", STEP_ONE,
+        f"# Provider\nPackage ID: {STEP_ONE}\nClaim: release | unsatisfied\n",
+    )
+    for name, title in (("first", "First twin"), ("second", "Second twin")):
+        _write_package(
+            tmp_path, "Alpha", "Queue", name, STEP_TWO,
+            f"# {title}\nPackage ID: {STEP_TWO}\nPrerequisite: {STEP_ONE} | release\n",
+        )
+    value = json.loads(scan_catalog(tmp_path))
+    twins = [entry for entry in value["entries"] if entry["package_id"] == STEP_TWO]
+    assert len(twins) == 2
+    for entry in twins:
+        assert [(edge["target_package_id"], edge["reason"]) for edge in entry["relationship"]["prerequisites"]] == [
+            (STEP_ONE, "claim_unsatisfied"),
+        ]
+    page = open_page(ScanningClient(tmp_path))
+    assert connection_pairs(page) == set()
+    cross = provider_project != "Alpha"
+    needs = "needs: Provider Beta" if cross else "needs: Provider"
+    provider = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.count() == 1
+        assert card.locator(".card-links").all_text_contents() == [needs]
+        assert card.locator(".card-links em").count() == int(cross)
+        assert "no-incoming-arrow" not in card.get_attribute("class").split()
+        assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
+        assert card.locator(".card-start-text").text_content() == ""
+        playwright.expect(card).not_to_have_accessible_name(re.compile("No prerequisite shown"))
+    suffix = " Alpha" if cross else ""
+    assert provider.locator(".card-links").all_text_contents() == [
+        f"blocks: First twin{suffix} · Second twin{suffix}"
+    ]
+    assert provider.locator(".card-start-text").text_content() == "No prerequisite shown."
+
+    # A relationship counts only while its prerequisite card is visible.
+    page.fill("#filter", "twin")
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.locator(".card-links").all_text_contents() == [needs]
+        assert "no-incoming-arrow" in card.get_attribute("class").split()
+        assert card.locator(".card-start-text").text_content() == "No prerequisite shown."
+    page.fill("#filter", "")
+    for title in ("First twin", "Second twin"):
+        card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
+        assert card.locator(".card-start-text").text_content() == ""
+
+
+def test_no_incoming_text_follows_search_like_the_color(open_page):
+    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+
+    def assert_text_matches_color():
+        for card in page.locator(".card").all():
+            start = card.locator(".card-start-text")
+            assert start.count() == 1
+            expected = "No prerequisite shown." if "no-incoming-arrow" in card.get_attribute("class").split() else ""
+            assert start.text_content() == expected
+
+    source = page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-start-text')
+    dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"] .card-start-text')
+    assert_text_matches_color()
+    assert source.text_content() == "No prerequisite shown."
+    assert dependent.text_content() == ""
+    page.fill("#filter", "Dependent step")
+    assert_text_matches_color()
+    assert dependent.text_content() == "No prerequisite shown."
+    page.fill("#filter", "")
+    assert_text_matches_color()
+    assert dependent.text_content() == ""
 
 
 def connection_pairs(page):
@@ -2184,6 +2721,155 @@ def routing_payload():
     return value, far, unknown
 
 
+def assert_rail_lanes_do_not_overlap(page):
+    segments = page.locator(".rail").evaluate_all(r"""paths => paths.flatMap(path => {
+      const tokens = path.getAttribute('d').match(/[MHV]|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi);
+      const result = [];
+      let x = 0, y = 0;
+      for (let i = 0; i < tokens.length;) {
+        const command = tokens[i++];
+        if (command === 'M') { x = Number(tokens[i++]); y = Number(tokens[i++]); }
+        else if (command === 'H') x = Number(tokens[i++]);
+        else if (command === 'V') {
+          const next = Number(tokens[i++]);
+          result.push({source: path.parentNode.dataset.source,
+            dependent: path.parentNode.dataset.dependent, x,
+            start: Math.min(y, next), end: Math.max(y, next)});
+          y = next;
+        } else throw new Error(`Unexpected rail path command: ${command}`);
+      }
+      return result;
+    })""")
+    assert len(segments) >= page.locator(".rail").count()
+    for index, first in enumerate(segments):
+        for second in segments[index + 1:]:
+            if (first["source"], first["dependent"]) == (second["source"], second["dependent"]):
+                continue
+            if abs(first["x"] - second["x"]) <= 0.5:
+                assert max(first["start"], second["start"]) > min(first["end"], second["end"]), (first, second)
+    return segments
+
+
+def test_chained_rails_reuse_two_lanes(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 125)]
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(package_id, f"Alpha/Queue/item-{index:02d}", "queue",
+               f"{'Keep' if index < 13 else 'Other'} item {index:02d}", "Alpha",
+               [_edge(ids[index - 1], "input")] if index else [])
+        for index, package_id in enumerate(ids)
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px"]
+    assert connection_pairs(page) == set(zip(ids, ids[1:]))
+    assert_readable_arrows(page)
+    before = assert_rail_lanes_do_not_overlap(page)
+    lanes = {(segment["source"], segment["dependent"]): segment["x"] for segment in before}
+    page.fill("#filter", "Keep")
+    assert connection_pairs(page) == set(zip(ids[:12], ids[1:13]))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px"]
+    for segment in assert_rail_lanes_do_not_overlap(page):
+        assert segment["x"] == pytest.approx(lanes[(segment["source"], segment["dependent"])])
+    assert_readable_arrows(page)
+
+
+def test_rail_lanes_are_capped_and_overflow_is_written_on_cards(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 113)]
+    value = json.loads(board_payload())
+    value["entries"] = [_entry(ids[0], "Alpha/Queue/00-hub", "queue", "Hub", "Alpha")] + [
+        _entry(ids[index], f"Alpha/Queue/{index:02d}-dependent", "queue", f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+        for index in range(1, 13)
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["132px"]
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:9]}
+    for index, package_id in enumerate(ids[1:], start=1):
+        card = page.locator(f'.card[data-package-id="{package_id}"]')
+        if index <= 8:
+            assert card.locator(".card-rail-text").all_text_contents() == ["needs: Hub"]
+        else:
+            assert card.locator(".card-links").all_text_contents() == ["needs: Hub"]
+            assert card.locator(".card-links em").count() == 0
+            assert "no-incoming-arrow" not in card.get_attribute("class").split()
+            assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
+            assert card.locator(".card-start-text").text_content() == ""
+    hub = page.locator(f'.card[data-package-id="{ids[0]}"]')
+    assert hub.locator(".card-links").all_text_contents() == [
+        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(9, 13))
+    ]
+    assert hub.locator(".card-rail-text").all_text_contents() == [
+        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(1, 9))
+    ]
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_upward_edge_rails_use_separate_lanes(open_page):
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/q1", "queue", "Q1", "Alpha", [_edge(GATE, "input")]),
+        _entry(STEP_TWO, "Alpha/Queue/q2", "queue", "Q2", "Alpha", [_edge(STEP_ONE, "input")]),
+        _entry(GATE, "Alpha/Under_Development/u", "under_development", "U", "Alpha"),
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["48px", "48px"]
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (GATE, STEP_ONE)}
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_cross_row_rail_uses_the_source_row_band_slot(open_page):
+    value = json.loads(board_payload())
+    value["entries"] = [
+        _entry(STEP_ONE, "Alpha/Queue/a1", "queue", "A1", "Alpha"),
+        _entry(STEP_TWO, "Alpha/Queue/a2", "queue", "A2", "Alpha", [_edge(STEP_ONE, "input")]),
+        _entry(GATE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(LOOSE, "input")]),
+        _entry(LOOSE, "Beta/Queue/s", "queue", "S", "Beta"),
+    ]
+    _admit_inventory_stage(value, "Beta", "Queue")
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert row_labels(page) == ["Queue", "Under Development"]
+    assert page.locator('.board-row .cell:nth-of-type(1)').evaluate_all(
+        "cells => cells.map(cell => getComputedStyle(cell).paddingLeft)"
+    ) == ["48px", "48px"]
+    assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (LOOSE, GATE)}
+    assert page.locator('.board-row[data-lifecycle="Queue"] .connection-band').count() == 1
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
+def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
+    ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 109)]
+    value = json.loads(board_payload())
+    value["entries"] = [_entry(ids[0], "Alpha/Queue/hub", "queue", "Hub", "Alpha")] + [
+        _entry(ids[index], f"Alpha/Under_Development/{index:02d}-dependent", "under_development",
+               f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+        for index in range(1, 9)
+    ] + [
+        _entry(STEP_ONE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_TWO, "Beta/Under_Development/s", "under_development", "S", "Beta"),
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.locator('.board-row .cell:nth-of-type(1)').evaluate_all(
+        "cells => cells.map(cell => getComputedStyle(cell).paddingLeft)"
+    ) == ["132px", "132px"]
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    assert card.locator(".card-links").all_text_contents() == ["needs: S Beta"]
+    assert card.locator(".card-links em").inner_text() == "Beta"
+    assert "no-incoming-arrow" not in card.get_attribute("class").split()
+    assert card.locator(".card-start-text").text_content() == ""
+    assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
+    assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
+
+
 def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_filter(open_page):
     value, far, unknown = routing_payload()
     page = open_page(StaticClient(value))
@@ -2212,6 +2898,7 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     assert connection_pairs(page) == expected
     assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 @pytest.mark.parametrize("reason,duplicate_record", [
@@ -2335,6 +3022,132 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
     assert contrast_ratio(divider, page_color) >= 3
 
 
+def assert_focus_indicator(control, *, expected=None, card=False):
+    control.focus()
+    measurement = control.evaluate("""node => {
+      const style = getComputedStyle(node);
+      let background = getComputedStyle(document.documentElement).backgroundColor;
+      for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const color = getComputedStyle(ancestor).backgroundColor;
+        const channels = color.match(/[\\d.]+/g).map(Number);
+        if (channels.length === 3 || channels[3] === 1) {
+          background = color;
+          break;
+        }
+      }
+      let opacity = 1;
+      for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+        opacity *= Number(getComputedStyle(ancestor).opacity);
+      }
+      const foreground = style.outlineColor.match(/[\\d.]+/g).map(Number);
+      const surface = background.match(/[\\d.]+/g).map(Number);
+      const alpha = opacity * (foreground[3] ?? 1);
+      const painted = foreground.slice(0, 3).map((channel, index) =>
+        Math.round(channel * alpha + surface[index] * (1 - alpha)));
+      return {painted: `rgb(${painted.join(', ')})`, opacity, color: style.outlineColor, style: style.outlineStyle, background,
+        focus: node.matches(':focus'), visible: node.matches(':focus-visible')};
+    }""")
+    assert measurement["focus"] if card else measurement["visible"]
+    # An authored solid ring keeps the measured color; the browser default
+    # "auto" ring varies by browser build.
+    assert measurement["style"] == "solid", measurement
+    assert contrast_ratio(measurement["painted"], measurement["background"]) >= 3, measurement
+    if expected is not None:
+        assert measurement["color"] == expected
+
+    return measurement
+
+
+@pytest.mark.parametrize("theme,card_outline,selected_ring", [
+    ("dark", "rgb(72, 137, 206)", "rgb(72, 137, 206)"),
+    ("light", "rgb(36, 99, 165)", "rgb(141, 185, 231)"),
+])
+def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_outline, selected_ring):
+    value = json.loads(board_payload())
+    value["discovery_diagnostics"] = [
+        {"code": "discovery_unavailable", "message": "One folder could not be read"}
+    ]
+    _reseal(value)
+    page = open_page(StaticClient(value), settings=BrowserSettings())
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    page.keyboard.press("Tab")
+    card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    card.press("Enter")
+    assert selected_ring in card.evaluate("node => getComputedStyle(node).boxShadow")
+
+    assert_focus_indicator(card, expected=card_outline, card=True)
+    for selector in ("#filter", "#refresh", "#theme", "#compact-view", "#hide-terminal-rows"):
+        assert_focus_indicator(page.locator(selector), expected="rgb(255, 255, 255)")
+    page.locator("#stage-order-heading").press("Enter")
+    page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+    for selector in (
+        "#stage-order-heading", "#deselect-on-empty-click", ".stage-completed-toggle",
+        ".stage-order-move:not(:disabled)", "#stage-order-save", "#stage-order-cancel",
+        "#stage-order-reset", "#board-issues summary",
+    ):
+        expected = card_outline if selector.endswith(("heading", "summary")) else None
+        assert_focus_indicator(page.locator(selector).first, expected=expected)
+
+    failed = BrowserSettings()
+    failed.fail_next_load = True
+    retry_page = open_page(StaticClient(board_payload()), settings=failed)
+    retry_page.get_by_label("Theme", exact=True).select_option(theme)
+    retry_page.locator("#stage-order-heading").press("Enter")
+    assert_focus_indicator(retry_page.locator("#stage-order-reload"))
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+@pytest.mark.parametrize("request_kind", ["save", "reload"])
+def test_stage_editor_busy_focus_indicators_keep_composited_contrast(open_page, theme, request_kind):
+    settings = BrowserSettings()
+    settings.fail_next_load = request_kind == "reload"
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    page.locator("#stage-order-heading").press("Enter")
+    if request_kind == "save":
+        page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
+        selectors = [
+            "#stage-order-save", "#stage-order-cancel", "#stage-order-reset",
+            '.stage-completed-toggle[data-stage="Under_Development"]',
+            '.stage-completed-toggle[data-stage="Queue"]',
+            '.stage-order-item[data-stage="Under_Development"] [data-stage-move="down"]',
+            '.stage-order-item[data-stage="Queue"] [data-stage-move="up"]',
+        ]
+    else:
+        selectors = ["#stage-order-reload"]
+    used = page.locator(selectors[0])
+    used.focus()
+    arm_focus_sampler(page)
+    settings.gate = threading.Event()
+    try:
+        used.press("Enter")
+        assert settings.entered.wait(timeout=2)
+        playwright.expect(used).to_be_focused()
+        busy = page.locator('#stage-order-editor [aria-disabled="true"]:visible')
+        assert busy.count() == len(selectors)
+        for selector in selectors:
+            control = page.locator(selector)
+            assert control.get_attribute("aria-disabled") == "true"
+            assert control.get_attribute("disabled") is None
+            measurement = assert_focus_indicator(control)
+            assert 0 < measurement["opacity"] < 1, measurement
+        assert settings.calls == (
+            [("revision-1", ["Under_Development", "Queue"], [])]
+            if request_kind == "save" else []
+        )
+        assert settings.get_calls == (1 if request_kind == "save" else 2)
+        used.focus()
+        assert_focus_sampler_clean(page)
+    finally:
+        settings.gate.set()
+    playwright.expect(page.locator("#stage-order-reset")).to_be_focused()
+    if request_kind == "save":
+        playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
+    else:
+        playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    assert_focus_sampler_clean(page)
+
+
 def test_dark_is_default_and_explicit_theme_survives_reload_and_system_changes(open_page):
     page = open_page(StaticClient(board_payload()), color_scheme="light")
     selector = page.get_by_label("Theme", exact=True)
@@ -2450,6 +3263,7 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
         (STEP_TWO, GATE), (GATE, LOOSE),
     }
     assert_readable_arrows(page)
+    assert_rail_lanes_do_not_overlap(page)
 
 
 @pytest.mark.parametrize("reason", [
@@ -2497,7 +3311,7 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
         board_payload(titles={"step_one": "Recovered foundation"}),
     ])
     page = open_page(client)
-    page.get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
     page.wait_for_selector("#refresh.pending", timeout=15000)
     assert page.locator("#board-issues").count() == 0
     assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
@@ -2677,7 +3491,7 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
             RawSequenceClient([valid, invalid]),
             init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
         )
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2795,6 +3609,65 @@ def test_terminal_only_board_explains_hidden_finished_rows(open_page):
     assert page.locator(".board-row").count() == 2
 
 
+@pytest.mark.parametrize("compact", [True, False], ids=["compact", "expanded"])
+def test_finished_rows_hidden_message_names_hide_terminal_rows(open_page, compact):
+    value = json.loads(compact_payload())
+    value["inventory"]["projects"] = [{"name": "Alpha", "availability": "complete"}]
+    value["inventory"]["stages"] = [
+        stage for stage in value["inventory"]["stages"]
+        if stage["stage"] in {"Done", "Queue"}
+    ]
+    value["entries"] = [entry for entry in value["entries"] if entry["stage"] == "Done"]
+    value["discovery_diagnostics"] = []
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    compact_control = page.get_by_label("Hide empty rows and columns", exact=True)
+    assert compact_control.is_checked()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+    if not compact:
+        compact_control.uncheck()
+        assert page.locator(".column-head").all_text_contents() == ["Alpha"]
+        assert row_labels(page) == ["Queue"]
+
+    empty = page.locator("#board .board-empty")
+    assert empty.count() == 1
+    assert set(empty.get_attribute("class").split()) == {"empty", "board-empty", "terminal-hidden"}
+    assert empty.inner_text() == (
+        "Finished rows are hidden. Uncheck “Hide terminal rows” to show them."
+    )
+    assert page.locator("#board .compact-hidden, #board .admitted-empty").count() == 0
+    assert page.locator("#board .card").count() == 0
+
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert page.locator('#board .card[data-package-path="Alpha/Done/completed"]').count() == 1
+    assert page.locator("#board .board-empty").count() == 0
+
+
+def test_finished_rows_hidden_precedes_incomplete_discovery(open_page):
+    value = json.loads(compact_payload())
+    value["inventory"]["projects"] = [{"name": "Alpha", "availability": "complete"}]
+    value["inventory"]["stages"] = [
+        stage for stage in value["inventory"]["stages"]
+        if stage["stage"] in {"Done", "Partial", "Queue"}
+    ]
+    value["entries"] = [entry for entry in value["entries"] if entry["stage"] == "Done"]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_checked()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+
+    empty = page.locator("#board .board-empty")
+    assert empty.count() == 1
+    assert set(empty.get_attribute("class").split()) == {"empty", "board-empty", "terminal-hidden"}
+    assert empty.inner_text() == (
+        "Finished rows are hidden. Uncheck “Hide terminal rows” to show them."
+    )
+    assert page.locator("#board .compact-hidden, #board .admitted-empty").count() == 0
+    assert "incomplete / unavailable" in page.locator(
+        '.board-row[data-lifecycle="Partial"] .row-head'
+    ).inner_text()
+
+
 def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     first = compact_payload()
     second = compact_payload(extra_stage=True)
@@ -2900,7 +3773,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2926,7 +3799,7 @@ def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(client)
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2960,7 +3833,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -2988,7 +3861,7 @@ def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3065,7 +3938,7 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
         page.get_by_role("button", name="Refresh view").click()
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
@@ -3088,7 +3961,7 @@ def test_reported_contract_at_browser_acceptance(open_page, monkeypatch, value, 
         page = open_page(RawSequenceClient([raw_catalog(), value]))
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
         page.click("#refresh")
-        page.get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
+        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
 
 

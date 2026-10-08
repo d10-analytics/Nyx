@@ -49,6 +49,7 @@
   const SVG_NS = "http://www.w3.org/2000/svg";
   const RAIL_PITCH = 14;
   const RAIL_INSET = 20;
+  const RAIL_LANE_CAP = 8;
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
   const SETTINGS_ROUTE = "/api/settings";
@@ -89,6 +90,7 @@
   let railPlan = new Map();
   let railColumns = [];
   let railEdges = [];
+  let cardPrerequisites = new Map();
   let compactView = true;
   let hideTerminalRows = true;
   let deselectOnEmptyClick = false;
@@ -134,7 +136,6 @@
   function indexDependents(entries, byId) {
     const index = new Map();
     entries.forEach((entry) => {
-      if (byId.get(entry.package_id) !== entry) return;
       (entry.relationship.prerequisites || []).forEach((edge) => {
         if (!prerequisiteTarget(edge, byId)) return;
         if (!index.has(edge.target_package_id)) index.set(edge.target_package_id, []);
@@ -145,16 +146,16 @@
     return index;
   }
 
-  function prerequisiteTargets(entry) {
-    const seen = new Set();
-    const targets = [];
+  function prerequisiteTargets(entry, byId) {
+    const targets = new Map();
     (entry.relationship.prerequisites || []).forEach((edge) => {
       const key = edge.target_package_id || "";
-      if (seen.has(key)) return;
-      seen.add(key);
-      targets.push(edge);
+      const target = prerequisiteTarget(edge, byId);
+      const previous = targets.get(key);
+      // An invalid declaration must not hide a valid relationship to the same item.
+      if (!previous || (!previous.target && target)) targets.set(key, {edge, target});
     });
-    return targets;
+    return [...targets.values()];
   }
 
   function depthForColumn(columnEntries, edges) {
@@ -292,11 +293,43 @@
         JSON.stringify([...savedCompletedStages].sort(scalarCompare));
   }
 
-  function renderStageOrderEditor({focusStage = null} = {}) {
+  function renderStageOrderEditor() {
+    const editor = document.querySelector("#stage-order-editor");
+    const controls = () => [...editor.querySelectorAll("summary, input, button, select")];
+    const focused = document.activeElement;
+    const priorControls = controls();
+    const priorIndex = priorControls.indexOf(focused);
+    const keyOf = (control) => {
+      const item = control.closest(".stage-order-item");
+      return item ? [item.dataset.stage, control.dataset.stageMove || "completed"] : [control.id];
+    };
+    const priorKey = priorIndex >= 0 ? keyOf(focused) : null;
+    const restoreFocus = () => {
+      if (!priorKey) return;
+      const current = controls();
+      const operable = (control) => control?.isConnected && !control.disabled &&
+        !control.closest("[hidden]");
+      const same = current.find((control) =>
+        JSON.stringify(keyOf(control)) === JSON.stringify(priorKey) && operable(control));
+      const siblings = priorKey.length === 2 ? current.filter((control) => {
+        const key = keyOf(control);
+        return key.length === 2 && key[0] === priorKey[0] && operable(control);
+      }) : [];
+      const successor = same || siblings.find((control) => control.dataset.stageMove) ||
+        siblings[0] || current.slice(priorIndex + 1).find(operable) ||
+        current.slice(0, priorIndex).reverse().find(operable) ||
+        document.querySelector("#stage-order-heading");
+      successor.focus();
+    };
     stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
-    if (stageOrderControls.hidden) return;
+    if (stageOrderControls.hidden) {
+      restoreFocus();
+      return;
+    }
     if (settingsAvailable && !editorStageOrder.length) editorStageOrder = editorNames();
-    const controlsDisabled = !settingsAvailable || settingsBusy;
+    const controlsDisabled = !settingsAvailable;
+    const unavailable = (disabled) => disabled ? " disabled" :
+      settingsBusy ? ' aria-disabled="true"' : "";
     stageOrderList.innerHTML = editorStageOrder.map((stage, index) => {
       const label = stageLabelOf(stage);
       const dormant = inventoryStageNames().includes(stage) ? "" :
@@ -306,24 +339,24 @@
         `<span class="stage-order-name">${text(label)}${dormant}</span>` +
         `<label class="stage-completed"><input type="checkbox" class="stage-completed-toggle" ` +
         `aria-label="Counts as finished: ${text(label)}" data-stage="${text(stage)}"` +
-        `${completed ? " checked" : ""}${controlsDisabled ? " disabled" : ""}>` +
+        `${completed ? " checked" : ""}${unavailable(controlsDisabled)}>` +
         `Counts as finished</label>` +
         `<button type="button" class="stage-order-move" data-stage-move="up" ` +
-        `aria-label="Move ${text(label)} up"${controlsDisabled || index === 0 ? " disabled" : ""}>Move up</button>` +
+        `aria-label="Move ${text(label)} up"${unavailable(controlsDisabled || index === 0)}>Move up</button>` +
         `<button type="button" class="stage-order-move" data-stage-move="down" ` +
-        `aria-label="Move ${text(label)} down"${controlsDisabled || index === editorStageOrder.length - 1 ? " disabled" : ""}>Move down</button>` +
+        `aria-label="Move ${text(label)} down"${unavailable(controlsDisabled || index === editorStageOrder.length - 1)}>Move down</button>` +
         `</li>`;
     }).join("");
     stageOrderSave.disabled = controlsDisabled || !hasUnsavedStageOrder();
     stageOrderCancel.disabled = controlsDisabled || !hasUnsavedStageOrder();
     stageOrderReset.disabled = controlsDisabled;
     stageOrderReload.hidden = !settingsReloadAvailable;
-    stageOrderReload.disabled = settingsBusy;
-    if (focusStage && settingsAvailable) {
-      const item = [...stageOrderList.children].find((candidate) =>
-        candidate.dataset.stage === focusStage);
-      item?.querySelector("[data-stage-move]:not(:disabled)")?.focus();
-    }
+    stageOrderReload.disabled = false;
+    [stageOrderSave, stageOrderCancel, stageOrderReset, stageOrderReload].forEach((control) => {
+      if (settingsBusy && !control.disabled) control.setAttribute("aria-disabled", "true");
+      else control.removeAttribute("aria-disabled");
+    });
+    restoreFocus();
   }
 
   // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
@@ -358,29 +391,51 @@
     });
   }
 
-  // Keep cross-project names readable without requiring users to trace a long arrow.
+  // Keep names visible for long arrows or missing lanes, and available to
+  // screen readers when a same-project arrow supplies the visual connection.
   function needsHtml(entry, byId) {
-    const parts = prerequisiteTargets(entry).map((edge) => {
-      const target = prerequisiteTarget(edge, byId);
+    const railNames = [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
+    const parts = prerequisiteTargets(entry, byId).map(({edge, target}) => {
       if (!target) {
         // A valid edge may point to a target in a gated finished row. It is
         // absent from the interactive index, but it is not an unresolved target.
         if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
         return '<span class="link unresolved">unresolved target</span>';
       }
-      if (columnKeyOf(target) === columnKeyOf(entry)) return "";
+      if (target.package_id === entry.package_id) return "";
+      if (columnKeyOf(target) === columnKeyOf(entry)) {
+        if (lanes?.has(`${target.package_id}>${entry.package_id}`)) {
+          railNames.push(titleOf(target));
+          return "";
+        }
+        return `<span class="link">${text(titleOf(target))}</span>`;
+      }
       return `<span class="link cross">${text(titleOf(target))} ` +
         `<em>${text(projectOf(target))}</em></span>`;
     }).filter(Boolean);
-    return parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "";
+    return (parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "") +
+      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`needs: ${railNames.join(" · ")}`)}</span>` : "");
   }
 
   function blocksHtml(entry, dependentsOf) {
+    const railNames = [];
+    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
     const parts = (dependentsOf.get(entry.package_id) || [])
-      .filter((dependent) => columnKeyOf(dependent) !== columnKeyOf(entry))
-      .map((dependent) => `<span class="link cross">${text(titleOf(dependent))} ` +
-        `<em>${text(projectOf(dependent))}</em></span>`);
-    return parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "";
+      .map((dependent) => {
+        if (dependent.package_id === entry.package_id) return "";
+        if (columnKeyOf(dependent) === columnKeyOf(entry)) {
+          if (lanes?.has(`${entry.package_id}>${dependent.package_id}`)) {
+            railNames.push(titleOf(dependent));
+            return "";
+          }
+          return `<span class="link">${text(titleOf(dependent))}</span>`;
+        }
+        return `<span class="link cross">${text(titleOf(dependent))} ` +
+          `<em>${text(projectOf(dependent))}</em></span>`;
+      }).filter(Boolean);
+    return (parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "") +
+      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`blocks: ${railNames.join(" · ")}`)}</span>` : "");
   }
 
   function searchText(entry) {
@@ -404,6 +459,7 @@
       `<span class="card-title">${text(titleOf(entry))}</span>` +
       (targetProject ? `<span class="card-project">Target Folder: ${text(targetProject)}</span>` : "") +
       `<span class="card-filepath">Filepath: ${text(entry.package_path)}</span>` +
+      '<span class="visually-hidden card-start-text"></span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
 
@@ -450,10 +506,9 @@
 
     const entryProjects = new Set(entries.map((entry) => entry.project));
     const hasEligibleStages = eligibleStages.length > 0;
-    // Every admissible row is a finished row the reader chose to hide.  The
-    // board uses this to explain the empty result instead of reporting that no
-    // stage directories were found.
-    const terminalHidden = hasEligibleStages && stages.length === 0;
+    // Explain hidden finished work even when empty unfinished rows remain.
+    const terminalHidden = (hasEligibleStages && stages.length === 0) ||
+      (hideTerminalRows && displayed?.entries.length > 0 && entries.length === 0);
     const projects = [];
     inventory.projects.forEach((record) => {
       const projectStages = inventory.stages.filter((stage) => stage.project === record.name);
@@ -508,9 +563,12 @@
     return diagnostics;
   }
 
-  function boardIssueHtml(snapshot) {
-    const diagnostics = workspaceDiagnostics(snapshot);
-    if (!diagnostics.length && !refreshFailure) return "";
+  function syncBoardIssues(panel = board.querySelector("#board-issues")) {
+    const diagnostics = workspaceDiagnostics(displayed);
+    if (!diagnostics.length && !refreshFailure) {
+      panel?.remove();
+      return;
+    }
     // Each part is its own element so one issue stays addressable when both
     // kinds are present; the separator keeps the summary text unchanged.
     const summary = [
@@ -524,8 +582,20 @@
       `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
     const refreshItem = refreshFailure
       ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
-    return `<details class="board-issues" id="board-issues"><summary>${summary}</summary>` +
-      `<ul class="diagnostics">${issueItems}${refreshItem}</ul></details>`;
+    if (!panel) {
+      panel = document.createElement("details");
+      panel.id = "board-issues";
+      panel.className = "board-issues";
+      panel.innerHTML = '<summary></summary><ul class="diagnostics"></ul>';
+    }
+    panel.querySelector("summary").innerHTML = summary;
+    panel.querySelector("ul").innerHTML = issueItems + refreshItem;
+    if (board.firstElementChild !== panel) board.prepend(panel);
+  }
+
+  function terminalHiddenHtml() {
+    return '<p class="empty board-empty terminal-hidden">Finished rows are hidden. ' +
+      'Uncheck “Hide terminal rows” to show them.</p>';
   }
 
   function emptyBoardHtml(axes, entries) {
@@ -533,11 +603,9 @@
     if (!displayed.entries.length && !displayed.inventory.projects.length && !displayed.inventory.stages.length) {
       return '<p class="empty board-empty">No work items in the catalog.</p>';
     }
-    // The reader hid finished rows and those were the only admissible rows, so
-    // name that cause before the generic empty-board explanations below.
+    // Name hidden finished rows before the generic empty-board explanations.
     if (axes.terminalHidden) {
-      return '<p class="empty board-empty terminal-hidden">Finished rows are hidden. ' +
-        'Uncheck “Hide terminal rows” to show them.</p>';
+      return terminalHiddenHtml();
     }
     const incomplete = displayed.inventory.projects.some((project) => project.availability === "incomplete") ||
       displayed.inventory.stages.some((stage) =>
@@ -570,8 +638,16 @@
       : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
+    // Keyed by path so cards sharing a package identity keep their own relationships.
+    cardPrerequisites = new Map(entries.map((entry) => [
+      entry.package_path,
+      prerequisiteTargets(entry, byId)
+        .filter(({target}) => target && target.package_id !== entry.package_id)
+        .map(({target}) => target.package_id),
+    ]));
     const axes = inventoryAxes(entries);
-    const issues = boardIssueHtml(displayed);
+    const issues = board.querySelector("#board-issues");
+    issues?.remove();
     const columns = axes.projects.map((project) => [project.key, project.project]);
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
@@ -587,51 +663,85 @@
     };
     if (!axes.stages.length && axes.projects.length && !axes.terminalHidden) {
       setBoardColumns(columns.map(() => 0));
-      board.innerHTML = issues + '<h2 class="board-corner" aria-hidden="true"></h2>' +
+      board.innerHTML = '<h2 class="board-corner" aria-hidden="true"></h2>' +
         axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("") +
         '<p class="empty board-empty no-eligible-stages">No eligible stage directories were found.</p>';
+      syncBoardIssues(issues);
       return;
     }
     if (!axes.stages.length || !axes.projects.length) {
       setBoardColumns([]);
-      board.innerHTML = issues + emptyBoardHtml(axes, entries);
+      board.innerHTML = emptyBoardHtml(axes, entries);
+      syncBoardIssues(issues);
       return;
     }
     railEdges = planEdges(entries, byId);
-    const bands = new Map();
-    railEdges.forEach((edge) => {
-      if (edge.sourceColumn === edge.dependentColumn) return;
-      edge.bandLane = bands.get(edge.row) || 0;
-      bands.set(edge.row, edge.bandLane + 1);
-    });
     const plans = new Map(columns.map(([key]) => {
       const columnEntries = entries.filter((entry) => columnKeyOf(entry) === key);
       const depth = depthForColumn(columnEntries, railEdges);
-      const edges = railEdges.filter((edge) =>
-        edge.sourceColumn === key || edge.dependentColumn === key);
-      // Reserve distinct lanes for local arrows and both ends of cross-project arrows.
-      railPlan.set(key, { edges });
-      return [key, { depth, reserved: edges.length }];
+      const cells = new Map();
+      const positions = new Map();
+      const bandSlots = new Map();
+      let position = 0;
+      axes.stages.forEach((stage) => {
+        bandSlots.set(rowDataKeyOf(stage.stage), position++);
+        const ordered = orderCell(columnEntries.filter((entry) =>
+          stageKeyOf(entry.stage) === stage.key), depth);
+        cells.set(stage.key, ordered);
+        ordered.forEach((entry) => positions.set(entry.package_id, position++));
+      });
+      const intervals = railEdges.filter((edge) =>
+        edge.sourceColumn === key || edge.dependentColumn === key).map((edge) => {
+        const local = edge.sourceColumn === edge.dependentColumn;
+        const first = local ? positions.get(edge.source) : bandSlots.get(edge.row);
+        const last = positions.get(edge.dependentColumn === key ? edge.dependent : edge.source);
+        return {edge, start: Math.min(first, last), end: Math.max(first, last)};
+      });
+      intervals.sort((a, b) => a.start - b.start || a.end - b.end ||
+        a.edge.source.localeCompare(b.edge.source) || a.edge.dependent.localeCompare(b.edge.dependent));
+      const ends = [];
+      const lanes = new Map();
+      intervals.forEach(({edge, start, end}) => {
+        // Closed intervals sharing a card or band position cannot share a lane.
+        let lane = ends.findIndex((lastEnd) => lastEnd < start);
+        if (lane < 0) {
+          if (ends.length === RAIL_LANE_CAP) return;
+          lane = ends.length;
+        }
+        ends[lane] = end;
+        lanes.set(`${edge.source}>${edge.dependent}`, lane);
+      });
+      railPlan.set(key, {lanes});
+      return [key, {cells, reserved: ends.length}];
     }));
+    const bands = new Map();
+    railEdges.forEach((edge) => {
+      const pair = `${edge.source}>${edge.dependent}`;
+      edge.drawn = railPlan.get(edge.sourceColumn).lanes.has(pair) &&
+        railPlan.get(edge.dependentColumn).lanes.has(pair);
+      if (!edge.drawn || edge.sourceColumn === edge.dependentColumn) return;
+      edge.bandLane = bands.get(edge.row) || 0;
+      bands.set(edge.row, edge.bandLane + 1);
+    });
     setBoardColumns(columns.map(([key]) => {
       const reserved = plans.get(key).reserved;
       return reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
     }));
-    let html = issues + (!entries.length
-      ? `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
+    let html = (!entries.length
+      ? (axes.terminalHidden ? terminalHiddenHtml()
+        : `<p class="empty board-empty admitted-empty">${axes.stages.some((stage) => stage.availability === "incomplete")
         ? "The catalog has incomplete dimensions; no work items are currently available."
-        : "The catalog contains admitted folders but no work items."}</p>` : "") +
+        : "The catalog contains admitted folders but no work items."}</p>`) : "") +
       '<h2 class="board-corner" aria-hidden="true"></h2>' +
       axes.projects.map((project) => `<h2 class="column-head">${text(project.project)}${dimensionNotice(project)}</h2>`).join("");
     axes.stages.forEach((stage) => {
       const key = stage.key;
       const rowKey = rowDataKeyOf(stage.stage);
-      const rowEntries = entries.filter((entry) => stageKeyOf(entry.stage) === key);
       const cells = columns.map(([columnKey]) => {
-        const { depth, reserved } = plans.get(columnKey);
+        const { cells: orderedCells, reserved } = plans.get(columnKey);
         const gutter = reserved ? reserved * RAIL_PITCH + RAIL_INSET : 0;
         return cellHtml(
-          orderCell(rowEntries.filter((entry) => columnKeyOf(entry) === columnKey), depth),
+          orderedCells.get(key),
           byId,
           dependentsOf,
           gutter,
@@ -644,6 +754,7 @@
         `<h2 class="row-head">${text(stageLabelOf(stage.stage))}${dimensionNotice(stage)}</h2>${cells}</section>`;
     });
     board.innerHTML = html;
+    syncBoardIssues(issues);
     applyFilter();
   }
 
@@ -670,11 +781,16 @@
     });
     const visibleEdges = railEdges.filter((edge) =>
       cards.has(edge.source) && cards.has(edge.dependent));
-    const incoming = new Set(visibleEdges.map((edge) => edge.dependent));
+    // A prerequisite counts while its card is visible, whether it is shown by
+    // an arrow or only as relationship text.
     board.querySelectorAll(".card").forEach((card) => {
-      card.classList.toggle("no-incoming-arrow", !card.hidden && !incoming.has(card.dataset.packageId));
+      const prerequisites = cardPrerequisites.get(card.dataset.packagePath) || [];
+      const noIncoming = !card.hidden && !prerequisites.some((id) => cards.has(id));
+      card.classList.toggle("no-incoming-arrow", noIncoming);
+      card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
     });
-    if (!visibleEdges.length) return;
+    const drawnEdges = visibleEdges.filter((edge) => edge.drawn);
+    if (!drawnEdges.length) return;
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
     const selectedId = selected?.dataset.packageId;
     const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
@@ -682,11 +798,11 @@
       [row.dataset.lifecycle, row.querySelector(".connection-band")]));
     const laneX = (key, edge) => {
       const columnLeft = heads[railColumns.indexOf(key)].offsetLeft;
-      return columnLeft + (railPlan.get(key).edges.indexOf(edge) + .5) * RAIL_PITCH;
+      return columnLeft + (railPlan.get(key).lanes.get(`${edge.source}>${edge.dependent}`) + .5) * RAIL_PITCH;
     };
     const port = (id, edge) => {
       const rect = cards.get(id).getBoundingClientRect();
-      const incident = visibleEdges.filter((item) => item.source === id || item.dependent === id);
+      const incident = drawnEdges.filter((item) => item.source === id || item.dependent === id);
       return {
         x: rect.left - boardRect.left,
         y: rect.top - boardRect.top + 12 +
@@ -706,7 +822,7 @@
       'markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto">' +
       `<path class="arrow-${kind}" d="M0 0L10 5L0 10Z"></path></marker>`).join("") + '</defs>';
     // Draw emphasized connections last so their crossings remain easy to follow.
-    [...visibleEdges].sort((a, b) => Number(related(a)) - Number(related(b))).forEach((edge) => {
+    [...drawnEdges].sort((a, b) => Number(related(a)) - Number(related(b))).forEach((edge) => {
       const start = port(edge.source, edge);
       const end = port(edge.dependent, edge);
       const sourceX = laneX(edge.sourceColumn, edge);
@@ -1107,6 +1223,7 @@
     displayed = snapshot;
     pending = null;
     refreshFailure = null;
+    document.querySelector("#refresh-status").textContent = "";
     setPending(false);
     editorStageOrder = [...new Set([
       ...(retainDraft ? priorEditor : editorNames(snapshot)),
@@ -1270,16 +1387,23 @@
       .then((snapshot) => {
         const hadRefreshFailure = Boolean(refreshFailure);
         refreshFailure = null;
-        if (kind === "manual" || kind === "settings" || !displayed) { apply(snapshot); return; }
-        if (digestOf(snapshot) !== digestOf(displayed)) {
-          pending = snapshot;
-          setPending(true);
+        if (kind === "manual" || kind === "settings" || !displayed) {
+          apply(snapshot);
         } else {
-          pending = null;
-          setPending(false);
+          if (digestOf(snapshot) !== digestOf(displayed)) {
+            pending = snapshot;
+            setPending(true);
+          } else {
+            pending = null;
+            setPending(false);
+          }
+          if (hadRefreshFailure) {
+            syncBoardIssues();
+            drawRails();
+          }
         }
         if (hadRefreshFailure) {
-          renderBoard();
+          document.querySelector("#refresh-status").textContent = "Refresh issue resolved.";
         }
       })
       .catch((error) => {
@@ -1292,8 +1416,14 @@
           loadSettings({refreshCatalog: true});
           return;
         }
-        refreshFailure = safeCategory(error);
-        renderBoard();
+        const failure = safeCategory(error);
+        const changed = failure !== refreshFailure;
+        refreshFailure = failure;
+        syncBoardIssues();
+        drawRails();
+        if (changed) {
+          document.querySelector("#refresh-status").textContent = `Latest refresh issue: ${failure}`;
+        }
       })
       .finally(() => {
         busy = false;
@@ -1346,6 +1476,10 @@
     else request("manual");
   });
   stageOrderList.addEventListener("click", (event) => {
+    if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
+      event.preventDefault();
+      return;
+    }
     const move = event.target.closest("[data-stage-move]");
     const item = event.target.closest("[data-stage]");
     if (!settingsAvailable || settingsBusy || !move || !item) return;
@@ -1355,7 +1489,7 @@
     if (index < 0 || target < 0 || target >= editorStageOrder.length) return;
     [editorStageOrder[index], editorStageOrder[target]] =
       [editorStageOrder[target], editorStageOrder[index]];
-    renderStageOrderEditor({focusStage: stage});
+    renderStageOrderEditor();
     settingsStatus("Unsaved board row order changes.");
   });
   stageOrderList.addEventListener("change", (event) => {
