@@ -50,7 +50,7 @@ _HEADER_LABELS = (
     "Completion Prerequisite", "Claim",
 )
 _HEADER_FIELD = re.compile(
-    r"^\s*\*{0,2}(" + "|".join(_HEADER_LABELS) + r")\*{0,2}\s*:\s?(.*?)\s*$"
+    r"^\s*\*{0,2}(" + "|".join(_HEADER_LABELS) + r")\*{0,2}\s*:\s?(.*)"
 )
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _REPORTED_EXCLUSIONS = {label.translate(_ASCII_LOWER) for label in (*_HEADER_LABELS, "Status", "Target repo")}
@@ -106,7 +106,7 @@ def _completion_policy(
 
 def _metadata_value(lines: list[str], label: str) -> str | None:
     pattern = re.compile(
-        rf"^\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:\s*(.*?)\s*$",
+        rf"^\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:\s*(.*)",
         re.IGNORECASE,
     )
     for line in lines:
@@ -114,7 +114,7 @@ def _metadata_value(lines: list[str], label: str) -> str | None:
             break
         match = pattern.match(line)
         if match:
-            return match.group(1)
+            return match.group(1).rstrip()
     return None
 
 
@@ -150,9 +150,9 @@ def _catalog_diagnostic(code: str, package_path: str) -> dict[str, str]:
 def _catalog_declared(lines: list[str]) -> dict[str, str | None]:
     title: str | None = None
     for line in lines:
-        match = re.match(r"^#\s+(.+?)\s*$", line)
+        match = re.match(r"^#\s+(.+)", line)
         if match:
-            title = match.group(1)
+            title = match.group(1).rstrip()
             break
 
     values = dict.fromkeys(DECLARED_FIELDS)
@@ -355,6 +355,7 @@ def _parse_header(
         if not match:
             continue
         label, value = match.groups()
+        value = value.rstrip()
         if label in scalar_values:
             scalar_values[label].append(value)
         elif label == "Prerequisite":
@@ -484,7 +485,7 @@ def _empty_declared() -> dict[str, str | None]:
 
 
 _PROGRAM_FIELD = re.compile(
-    r"^\s*\*{0,2}(Program ID|Program Title)\*{0,2}\s*:\s?(.*?)\s*$"
+    r"^\s*\*{0,2}(Program ID|Program Title)\*{0,2}\s*:\s?(.*)"
 )
 
 
@@ -499,7 +500,7 @@ def _parse_program_descriptor(
     for line in lines:
         match = _PROGRAM_FIELD.match(line)
         if match:
-            values[match.group(1)].append(match.group(2))
+            values[match.group(1)].append(match.group(2).rstrip())
 
     candidates: set[str] = set()
     for value in values["Program ID"]:
