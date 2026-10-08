@@ -43,6 +43,7 @@ from test_wheel_install import (
     _venv_executable,
 )
 
+from nyx import catalog
 from nyx._native_claim import NativeClaim
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
@@ -263,6 +264,15 @@ def test_documents_publish_the_explicit_completion_contract():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
         for marker in markers:
             assert marker in document, (name, marker)
+
+
+def test_documented_header_limits_match_the_catalog():
+    document = (REPOSITORY_ROOT / "docs" / "specification-reference.md").read_text(encoding="utf-8")
+    normalized = re.sub(r"\s+", " ", document)
+    limit = f"{catalog._HEADER_BYTE_LIMIT:,}"
+    assert "A single leading UTF-8 byte order mark (BOM) is ignored" in normalized
+    assert f"The header limit is {limit} bytes" in normalized
+    assert f"A whole `program.md` descriptor obeys the same {limit}-byte limit" in normalized
 
 
 def test_event_walkthrough_shows_whole_item_and_named_outcomes():

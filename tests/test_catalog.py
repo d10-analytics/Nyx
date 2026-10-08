@@ -87,6 +87,84 @@ def link_directory(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+HEADER_SEPARATORS = (
+    b"\r", b"\n", b"\r\n", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e",
+    b"\xc2\x85", b"\xe2\x80\xa8", b"\xe2\x80\xa9",
+)
+
+
+def package_bytes(root: Path, stage: str, name: str, content: bytes) -> Path:
+    path = root / "Fictional" / stage / name
+    path.mkdir(parents=True)
+    path.joinpath("spec.md").write_bytes(content)
+    return path
+
+
+def program_descriptor(root: Path, program_id: str, content: bytes) -> Path:
+    path = root / "Fictional" / "Reference" / "Programs" / program_id
+    path.mkdir(parents=True)
+    path.joinpath("program.md").write_bytes(content)
+    return path
+
+
+def header_with_cut(offset: int, package_id: str, prefix: bytes = b"") -> bytes:
+    """Return item bytes whose byte-level ``## `` cut starts at ``offset``."""
+    core = b"# T\nPackage ID: " + package_id.encode() + b"\nStatus: s\n"
+    body_length = offset - len(prefix)
+    return prefix + core + b"x" * (body_length - len(core) - 1) + b"\n## B\n\xe9"
+
+
+def header_without_cut(length: int, package_id: str, prefix: bytes = b"") -> bytes:
+    core = b"# T\nPackage ID: " + package_id.encode() + b"\nStatus: s\n"
+    return prefix + core + b"x" * (length - len(prefix) - len(core))
+
+
+def entry_by_path(value: dict, package_path: str) -> dict:
+    return next(entry for entry in value["entries"] if entry["package_path"] == package_path)
+
+
+class RecordingReader:
+    """Wrap a real opened stream and record each read's size and end position."""
+
+    def __init__(self, stream, reads: list) -> None:
+        self._stream = stream
+        self._reads = reads
+
+    def read(self, *args):
+        data = self._stream.read(*args)
+        self._reads.append((args[0] if args else None, self._stream.tell()))
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stream.close()
+        return False
+
+
+class AppendingReader:
+    """Wrap a real opened stream and append to the file during each read."""
+
+    def __init__(self, stream, path: Path, payload: bytes) -> None:
+        self._stream = stream
+        self._path = path
+        self._payload = payload
+
+    def read(self, *args):
+        data = self._stream.read(*args)
+        with open(self._path, "ab") as sink:
+            sink.write(self._payload)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stream.close()
+        return False
+
+
 class CatalogTests(TestCase):
     def test_public_producers_use_one_portable_scanner_and_reject_root_links(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1408,3 +1486,215 @@ def test_core_headers_and_exact_wire_shapes_include_default_relationships(tmp_pa
         "discovery_unavailable", "invalid_package", "unreadable_anchor", "nonregular_anchor", "changed_during_read", "duplicate_program_id"
     }
     assert parse_catalog(value).as_dict() == value
+
+
+def test_header_body_byte_and_separator_table_through_both_producers(tmp_path):
+    package_id = "11111111-1111-4111-8111-111111111111"
+    root = tmp_path / "valid"
+    valid = {
+        "body-byte": b"# T\nPackage ID: " + package_id.encode() + b"\n## B\n\xe9",
+        "cr-only": b"# T\rPackage ID: " + package_id.encode() + b"\r## B\r\xe9",
+        "non-separator": (
+            b"# T\nStatus: x\xc5\x85## y\nPackage ID: "
+            + package_id.encode()
+            + b"\n## B\n\xe9"
+        ),
+    }
+    for index, separator in enumerate(HEADER_SEPARATORS):
+        valid[f"sep-{index}"] = b"# T\nStatus: s" + separator + b"## B\n\xe9"
+    for name, content in valid.items():
+        package_bytes(root, "Queue", name, content)
+
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(root))
+        assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
+        body = entry_by_path(value, "Fictional/Queue/body-byte")
+        assert body["declared"]["title"] == "T"
+        assert body["package_id"] == package_id
+        cr_only = entry_by_path(value, "Fictional/Queue/cr-only")
+        assert cr_only["declared"]["title"] == "T"
+        assert cr_only["package_id"] == package_id
+        non_separator = entry_by_path(value, "Fictional/Queue/non-separator")
+        assert non_separator["declared"]["title"] == "T"
+        assert non_separator["declared"]["status"] == "x\u0145## y"
+        assert non_separator["package_id"] == package_id
+        for index in range(len(HEADER_SEPARATORS)):
+            entry = entry_by_path(value, f"Fictional/Queue/sep-{index}")
+            assert entry["declared"]["title"] == "T"
+            assert entry["declared"]["status"] == "s"
+
+    header_root = tmp_path / "header-byte"
+    package_bytes(
+        header_root,
+        "Queue",
+        "header-byte",
+        b"# T\nPackage ID: " + package_id.encode() + b"\nStatus: \xe9\n## B\n",
+    )
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(header_root))
+        assert value["identity_coverage"]["state"] == "incomplete"
+        assert {
+            "code": "invalid_package",
+            "message": "invalid package: Fictional/Queue/header-byte",
+        } in value["identity_coverage"]["diagnostics"]
+
+
+def test_bom_header_and_program_descriptor_through_both_producers(tmp_path):
+    package_id = "22222222-2222-4222-8222-222222222222"
+    program_id = "99999999-9999-4999-8999-999999999999"
+    bom = b"\xef\xbb\xbf"
+    root = tmp_path / "specs"
+    package_bytes(root, "Queue", "bom-item",
+                  bom + b"# T\nPackage ID: " + package_id.encode() + b"\n## B\n")
+    package_bytes(root, "Queue", "double-bom",
+                  bom + bom + b"# T\nPackage ID: " + package_id.encode() + b"\n## B\n")
+    package_bytes(root, "Queue", "bom-cut-first",
+                  bom + b"## B\n# T\nPackage ID: " + package_id.encode() + b"\n")
+    package_bytes(root, "Queue", "bom-member",
+                  b"# Member\nProgram Membership: " + program_id.encode() + b"\n")
+    program_descriptor(
+        root,
+        program_id,
+        bom + b"Program ID: " + program_id.encode() + b"\nProgram Title: Core\n",
+    )
+
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(root))
+        bom_item = entry_by_path(value, "Fictional/Queue/bom-item")
+        assert bom_item["declared"]["title"] == "T"
+        assert bom_item["package_id"] == package_id
+        assert entry_by_path(value, "Fictional/Queue/double-bom")["declared"]["title"] is None
+        cut_first = entry_by_path(value, "Fictional/Queue/bom-cut-first")
+        assert cut_first["declared"]["title"] is None
+        assert cut_first["package_id"] is None
+        member = entry_by_path(value, "Fictional/Queue/bom-member")
+        assert member["relationship"]["program"]["title"] == "Core"
+        assert member["relationship"]["program"]["resolution"] == "resolved"
+        assert value["program_coverage"] == {"state": "complete", "diagnostics": []}
+
+
+def test_anchor_header_byte_bound_through_both_producers(tmp_path):
+    package_id = "33333333-3333-4333-8333-333333333333"
+    bom = b"\xef\xbb\xbf"
+    limit = catalog._HEADER_BYTE_LIMIT
+    root = tmp_path / "at-limit"
+    package_bytes(root, "Queue", "cut-at-limit", header_with_cut(limit, package_id))
+    package_bytes(root, "Queue", "no-cut-at-limit", header_without_cut(limit, package_id))
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(root))
+        assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
+        for name in ("cut-at-limit", "no-cut-at-limit"):
+            entry = entry_by_path(value, f"Fictional/Queue/{name}")
+            assert entry["declared"]["title"] == "T"
+            assert entry["package_id"] == package_id
+
+    over_root = tmp_path / "over-limit"
+    package_bytes(over_root, "Queue", "cut-over-limit",
+                  header_with_cut(limit + 1, package_id))
+    package_bytes(over_root, "Queue", "no-cut-over-limit",
+                  header_without_cut(limit + 1, package_id))
+    package_bytes(over_root, "Queue", "bom-cut-over-limit",
+                  header_with_cut(limit + 1, package_id, bom))
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(over_root))
+        assert value["identity_coverage"]["state"] == "incomplete"
+        for name in ("cut-over-limit", "no-cut-over-limit", "bom-cut-over-limit"):
+            assert {
+                "code": "invalid_package",
+                "message": f"invalid package: Fictional/Queue/{name}",
+            } in value["identity_coverage"]["diagnostics"]
+
+
+def test_anchor_program_descriptor_bound_through_both_producers(tmp_path):
+    program_id = "99999999-9999-4999-8999-999999999999"
+    limit = catalog._HEADER_BYTE_LIMIT
+    core = b"Program ID: " + program_id.encode() + b"\nProgram Title: Core\n"
+
+    at_limit = tmp_path / "at-limit"
+    package_bytes(at_limit, "Queue", "member",
+                  b"# Member\nProgram Membership: " + program_id.encode() + b"\n")
+    program_descriptor(at_limit, program_id, core + b"\n" * (limit - len(core)))
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(at_limit))
+        assert value["program_coverage"] == {"state": "complete", "diagnostics": []}
+        member = entry_by_path(value, "Fictional/Queue/member")
+        assert member["relationship"]["program"]["title"] == "Core"
+        assert member["relationship"]["program"]["resolution"] == "resolved"
+
+    over_limit = tmp_path / "over-limit"
+    package_bytes(over_limit, "Queue", "member",
+                  b"# Member\nProgram Membership: " + program_id.encode() + b"\n")
+    program_descriptor(over_limit, program_id, core + b"\n" * (limit + 1 - len(core)))
+    for producer in (catalog.build_catalog, catalog.scan_catalog):
+        value = json.loads(producer(over_limit))
+        assert value["program_coverage"]["state"] == "incomplete"
+        assert {
+            "code": "invalid_package",
+            "message": f"invalid package: Fictional/Reference/Programs/{program_id}",
+        } in value["program_coverage"]["diagnostics"]
+        member = entry_by_path(value, "Fictional/Queue/member")
+        assert member["relationship"]["program"]["title"] is None
+        assert member["relationship"]["program"]["resolution"] == "unknown"
+
+
+def test_anchor_changed_during_read_through_stream_wrapper(tmp_path):
+    package_id = "44444444-4444-4444-8444-444444444444"
+    root = tmp_path / "specs"
+    package = package_bytes(
+        root,
+        "Queue",
+        "changing",
+        b"# T\nPackage ID: " + package_id.encode() + b"\n## B\n" + b"x" * (32 * 1024 * 1024),
+    )
+    spec = package / "spec.md"
+    original_open = catalog.Path.open
+
+    def appending_open(target, *args, **kwargs):
+        stream = original_open(target, *args, **kwargs)
+        if Path(target) == spec:
+            return AppendingReader(stream, spec, b"\nappended")
+        return stream
+
+    with patch.object(catalog.Path, "open", autospec=True, side_effect=appending_open):
+        value = json.loads(catalog.build_catalog(root))
+    assert {
+        "code": "changed_during_read",
+        "message": "changed during read: Fictional/Queue/changing",
+    } in value["identity_coverage"]["diagnostics"]
+    assert value["identity_coverage"]["state"] == "incomplete"
+
+
+def test_anchor_bounded_read_bytes_through_stream_wrapper(tmp_path):
+    package_id = "55555555-5555-4555-8555-555555555555"
+    limit = catalog._HEADER_BYTE_LIMIT
+    root = tmp_path / "specs"
+    package = package_bytes(
+        root,
+        "Queue",
+        "large",
+        b"# T\nPackage ID: " + package_id.encode() + b"\n## B\n" + b"x" * (32 * 1024 * 1024),
+    )
+    spec = package / "spec.md"
+    reads: list = []
+    original_open = catalog.Path.open
+
+    def recording_open(target, *args, **kwargs):
+        stream = original_open(target, *args, **kwargs)
+        if Path(target) == spec:
+            return RecordingReader(stream, reads)
+        return stream
+
+    with patch.object(catalog.Path, "open", autospec=True, side_effect=recording_open):
+        data, diagnostic = catalog._catalog_read_anchor(spec)
+        value = json.loads(catalog.build_catalog(root))
+
+    assert data is not None
+    assert diagnostic is None
+    assert reads
+    for size, position in reads:
+        assert size is not None
+        assert size <= limit + 3
+        assert position <= limit + 3
+    entry = entry_by_path(value, "Fictional/Queue/large")
+    assert entry["declared"]["title"] == "T"
+    assert entry["package_id"] == package_id
