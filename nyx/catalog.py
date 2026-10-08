@@ -18,6 +18,14 @@ from .state import (
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 _INVALID_POLICY = object()
+_HEADER_BYTE_LIMIT = 65536
+_UTF8_BOM = b"\xef\xbb\xbf"
+# Byte forms of every separator recognized by str.splitlines(); a header cut
+# must follow one of them (or start the file after an optional BOM).
+_HEADER_CUT_SEPARATORS = (
+    b"\r", b"\n", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e",
+    b"\xc2\x85", b"\xe2\x80\xa8", b"\xe2\x80\xa9",
+)
 
 _SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
@@ -233,7 +241,7 @@ def _catalog_read_anchor(path: Path) -> tuple[bytes | None, str | None]:
             return None, "unreadable_anchor"
         try:
             with path.open("rb") as stream:
-                last_data = stream.read()
+                last_data = stream.read(_HEADER_BYTE_LIMIT + 3)
         except OSError:
             return last_data, "unreadable_anchor"
         try:
@@ -275,10 +283,52 @@ def _diagnostic(code: str, package_path: str | None = None) -> dict[str, str]:
     return {"code": code, "message": message}
 
 
-def _header(data: bytes) -> tuple[list[str], str | None]:
+def _catalog_header_cut(data: bytes) -> int | None:
+    """Return the byte offset of the header cut, or None when there is none."""
+    start = len(_UTF8_BOM) if data.startswith(_UTF8_BOM) else 0
+    if data[start:start + 3] == b"## ":
+        return start
+    index = data.find(b"## ", start)
+    while index != -1:
+        for separator in _HEADER_CUT_SEPARATORS:
+            if index >= len(separator) and data[index - len(separator):index] == separator:
+                return index
+        index = data.find(b"## ", index + 1)
+    return None
+
+
+def _catalog_anchor_text(data: bytes, *, cut: bool) -> str | None:
+    """Return the bounded anchor's UTF-8 text, or None when it is invalid.
+
+    A single leading BOM is stripped, the header bound is enforced over the
+    original byte offsets, and item headers are cut at the byte-level boundary
+    before the strict decode so body bytes never affect the header.
+    """
+    if cut:
+        offset = _catalog_header_cut(data)
+        if offset is None:
+            if len(data) > _HEADER_BYTE_LIMIT:
+                return None
+            header = data
+        elif offset > _HEADER_BYTE_LIMIT:
+            return None
+        else:
+            header = data[:offset]
+    else:
+        if len(data) > _HEADER_BYTE_LIMIT:
+            return None
+        header = data
+    if header.startswith(_UTF8_BOM):
+        header = header[len(_UTF8_BOM):]
     try:
-        text = data.decode("utf-8")
+        return header.decode("utf-8")
     except UnicodeDecodeError:
+        return None
+
+
+def _header(data: bytes) -> tuple[list[str], str | None]:
+    text = _catalog_anchor_text(data, cut=True)
+    if text is None:
         return [], "invalid_package"
     lines: list[str] = []
     for line in text.splitlines():
@@ -540,11 +590,11 @@ def _scan_programs(
         if data is None:
             diagnostics.append(_catalog_diagnostic(read_diagnostic or "unreadable_anchor", program_path))
             continue
-        try:
-            lines = data.decode("utf-8").splitlines()
-        except UnicodeDecodeError:
+        text = _catalog_anchor_text(data, cut=False)
+        if text is None:
             diagnostics.append(_catalog_diagnostic("invalid_package", program_path))
             continue
+        lines = text.splitlines()
         parsed, candidates, parsed_diagnostics = _parse_program_descriptor(
             lines, directory_id, program_path
         )
