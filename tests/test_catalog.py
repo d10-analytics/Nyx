@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1698,3 +1699,73 @@ def test_anchor_bounded_read_bytes_through_stream_wrapper(tmp_path):
     entry = entry_by_path(value, "Fictional/Queue/large")
     assert entry["declared"]["title"] == "T"
     assert entry["package_id"] == package_id
+
+
+def test_pattern_scan_is_linear_over_long_header_fields(tmp_path):
+    spaces = 60000
+    program_id = "99999999-9999-4999-8999-999999999999"
+    long_value = b"a" + b" " * spaces + b"b"
+    root = tmp_path / "specs"
+    rows = {
+        "claim": b"Claim: " + long_value + b"\n",
+        "status": b"Status: " + long_value + b"\n",
+        "target": b"Target repo: " + long_value + b"\n",
+        "title": b"# " + long_value + b"\n",
+    }
+    for name, content in rows.items():
+        package_bytes(root, "Queue", name, content)
+    program_descriptor(
+        root,
+        program_id,
+        b"Program ID: " + program_id.encode() + b"\nProgram Title: " + long_value + b"\n",
+    )
+
+    fixtures = [root / "Fictional" / "Queue" / name / "spec.md" for name in rows]
+    fixtures.append(
+        root / "Fictional" / "Reference" / "Programs" / program_id / "program.md"
+    )
+    for fixture in fixtures:
+        assert fixture.stat().st_size <= catalog._HEADER_BYTE_LIMIT, fixture
+
+    started = time.perf_counter()
+    value = json.loads(catalog.build_catalog(root))
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+
+    assert value["identity_coverage"]["state"] == "complete"
+    for name in rows:
+        assert {
+            "code": "invalid_package",
+            "message": f"invalid package: Fictional/Queue/{name}",
+        } not in value["identity_coverage"]["diagnostics"]
+
+
+def test_pattern_trailing_whitespace_stripping_table(tmp_path):
+    program_id = "99999999-9999-4999-8999-999999999999"
+    for index, whitespace in enumerate(("\xa0", "\u3000", "\t", "\x1f")):
+        encoded = whitespace.encode("utf-8")
+        root = tmp_path / f"ws-{index}"
+        package_bytes(
+            root,
+            "Queue",
+            "member",
+            b"# Member\nProgram Membership: " + program_id.encode()
+            + b"\nTarget repo: /work/x/ " + encoded + b"\n",
+        )
+        program_descriptor(
+            root,
+            program_id,
+            b"Program ID: " + program_id.encode()
+            + b"\nProgram Title: Core" + encoded + b"\n",
+        )
+        for producer in (catalog.build_catalog, catalog.scan_catalog):
+            value = json.loads(producer(root))
+            context = (whitespace, producer.__name__)
+            assert value["program_coverage"] == {"state": "complete", "diagnostics": []}, context
+            member = entry_by_path(value, "Fictional/Queue/member")
+            assert member["declared"]["target_project"] == "x", context
+            assert member["relationship"]["program"]["resolution"] == "resolved", context
+            assert member["relationship"]["program"]["title"] == "Core", context
+            assert value["programs"] == [
+                {"program_id": program_id, "title": "Core", "member_package_ids": []}
+            ], context
