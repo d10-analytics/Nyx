@@ -31,6 +31,15 @@ when the browser uses friendlier labels. Nyx presents each specification as a
 **Target Folder** on the card when that context is useful. Each card shows its
 directory path as **Filepath**; the stable `Package ID` stays in the file.
 
+Nyx reads a `spec.md` header as UTF-8. A single leading UTF-8 byte order mark
+(BOM) is ignored; a second BOM, or a BOM anywhere else, is content. The header
+limit is 65,536 bytes, counted from the first byte of the file and including
+both the BOM and the line break before the cut. A header that needs more than
+that limit is reported as an invalid package. Bytes after the cut are body
+content and are never decoded as part of the header, so an undecodable byte in
+the header before the cut still makes the item an invalid package while the
+same byte after the cut does not.
+
 For example, a community-event item can point to two outcomes from one permit
 item by repeating the `Prerequisite` field:
 
@@ -181,8 +190,10 @@ Program Membership: 99999999-9999-4999-8999-999999999999
 
 Use a fresh UUID for your own program and match it in the directory name,
 descriptor, and membership fields. Membership comes from the work items; a separate
-member list is not needed. The browser includes the resolved program title in
-search. Board columns remain projects.
+member list is not needed. A whole `program.md` descriptor obeys the same
+65,536-byte limit as a `spec.md` header, counted from the first byte of the
+file, and a larger descriptor is reported as an invalid package. The browser
+includes the resolved program title in search. Board columns remain projects.
 
 ## Diagnostics
 
