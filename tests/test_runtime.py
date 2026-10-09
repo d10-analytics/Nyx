@@ -1962,6 +1962,10 @@ def test_public_start_spawns_the_daemon_in_its_admitted_state_directory():
 def _require_loopback_listener() -> None:
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Mirror the daemon's listener, an HTTPServer with allow_reuse_address:
+        # TIME_WAIT sockets left by earlier requests to this port must not block
+        # the probe, while a live listener on the port still makes it fail.
+        capability_probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         capability_probe.bind(("127.0.0.1", runtime.PORT))
     except PermissionError:
         pytest.skip("sandbox does not permit loopback sockets")
