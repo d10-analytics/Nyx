@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
 from nyx import _native_claim, app_runtime, desktop, runtime, state
 from nyx._native_claim import NativeClaim
@@ -483,6 +484,7 @@ def test_desktop_starts_shared_runtime_with_worker_only_inheritance():
                 workers = observed["workers"]
                 assert workers._recovery_claim is session.claims.recovery
                 assert workers._parent_liveness_fd == session.claims.parent_liveness_read
+                assert workers._working_directory == session.paths.state_directory
                 assert observed["admitted"]
                 session.close()
 
@@ -1715,6 +1717,65 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
                 ]
             finally:
                 session.close()
+
+
+def test_desktop_catalog_worker_runs_in_state_directory_not_launch_directory(
+    tmp_path, monkeypatch
+):
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    try:
+        capability_probe.bind(("127.0.0.1", 0))
+        port = capability_probe.getsockname()[1]
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    finally:
+        capability_probe.close()
+
+    home = _home(tmp_path)
+    workspace = _workspace(tmp_path, "workspace")
+    package = workspace / "Fictional" / "Queue" / "sample"
+    package.mkdir(parents=True)
+    package.joinpath("spec.md").write_text("# SAMPLE\n", encoding="utf-8")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    marker = tmp_path / "shadow-imports.log"
+    plant_shadow(launch, marker)
+    install_proof_environment(monkeypatch, home, pythonpath=".")
+    # The desktop process itself runs in the shadow directory, so a worker
+    # that inherited this directory would resolve ``PYTHONPATH=.`` to it.
+    monkeypatch.chdir(launch)
+    assert Path.cwd() == launch.resolve()
+    assert os.environ["PYTHONPATH"] == "."
+
+    with _home_patches(home)[0], patch.object(runtime, "PORT", port):
+        state.setup(workspace)
+        session = desktop.DesktopSession()
+        try:
+            session.start_runtime()
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            try:
+                connection.request(
+                    "GET",
+                    "/api/catalog",
+                    headers={"Host": f"127.0.0.1:{port}"},
+                )
+                response = connection.getresponse()
+                status, catalog = response.status, json.loads(response.read())
+            finally:
+                connection.close()
+        finally:
+            # Release the session's handles before the temporary tree is
+            # removed; Windows refuses to delete open files.
+            session.close()
+
+    assert status == 200
+    assert catalog["schema_version"] == SCHEMA_VERSION
+    assert parse_catalog(catalog).as_dict() == catalog
+    assert [entry["declared"]["title"] for entry in catalog["entries"]] == ["SAMPLE"]
+    assert shadow_imports(marker) == []
 
 
 def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order():

@@ -340,6 +340,7 @@ class DesktopSession:
             recovery_claim=self.claims.recovery,
             recovery_path=self.claims.recovery.path,
             parent_liveness_fd=self.claims.parent_liveness_read,
+            working_directory=self.paths.state_directory,
         )
         application = ApplicationRuntime(
             port=runtime.PORT,

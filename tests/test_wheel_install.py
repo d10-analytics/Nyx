@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+from launch_shadow import plant_shadow, shadow_imports
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 EXPECTED_MODULES = {
@@ -535,6 +536,86 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                 process.stdin.write("\n")
                 process.stdin.close()
             process.wait(timeout=10)
+
+
+@pytest.mark.skipif(
+    _desktop_host(),
+    reason="the desktop hosts replace the detached console lifecycle with artifact proof",
+)
+def test_installed_wheel_serves_catalog_when_launched_from_a_shadow_directory():
+    """The installed console's daemon ignores modules in the launch directory.
+
+    The console runs from a directory holding a ``nyx`` package and a
+    ``json`` module that record their import in a marker, with no
+    ``PYTHONPATH``.  A daemon that inherited that directory as its import
+    path would import the shadow and never serve the catalog.
+    """
+
+    wheel = _wheel_path()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        venv = root / "venv"
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+        interpreter = _venv_executable(venv, "python")
+        subprocess.run(
+            [str(interpreter), "-m", "pip", "install", "--no-deps", str(wheel)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        console = _venv_executable(venv, "nyx")
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        package = specification_root / "Fictional" / "Queue" / "installed-demo"
+        package.mkdir(parents=True)
+        package.joinpath("spec.md").write_text(
+            "# Installed catalog entry\nStatus: approved\nClosure: approved\n",
+            encoding="utf-8",
+        )
+        launch = root / "launch"
+        marker = root / "shadow-imports.log"
+        plant_shadow(launch, marker)
+
+        # The shadow is live in this environment: an interpreter whose import
+        # path starts at the launch directory records the shadowed ``json``.
+        control = subprocess.run(
+            [str(interpreter), "-c", "import json"],
+            cwd=launch,
+            env=_installed_environment(home),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert control.returncode == 0, control.stderr
+        assert shadow_imports(marker) == ["json"]
+        marker.unlink()
+
+        setup = _run_installed_console(
+            console, ["--setup", str(specification_root)], root=launch, home=home
+        )
+        assert setup.returncode == 0, setup.stderr
+        assert setup.stdout.strip() == f"configured {specification_root.resolve()}"
+
+        try:
+            started = _run_installed_console(console, [], root=launch, home=home)
+            assert started.returncode == 0, started.stderr
+            assert started.stdout == "http://127.0.0.1:8765/\n"
+            connection = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
+            connection.request("GET", "/api/catalog", headers={"Host": "127.0.0.1:8765"})
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            assert response.status == 200
+            assert [entry["package_path"] for entry in json.loads(body)["entries"]] == [
+                "Fictional/Queue/installed-demo"
+            ]
+        finally:
+            stopped = _run_installed_console(console, ["--stop"], root=launch, home=home)
+        assert stopped.returncode == 0, stopped.stderr
+        assert stopped.stdout.strip() == "stopped"
+        assert not (home / ".nyx" / "runtime" / "instance.json").exists()
+        assert shadow_imports(marker) == []
 
 
 @pytest.mark.skipif(

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from launch_shadow import plant_shadow, proof_environment, shadow_imports
 
 from nyx import _native_claim, catalog, runtime, state, worker
 from nyx.models import SCHEMA_VERSION, canonical_digest
@@ -245,10 +246,20 @@ def test_windows_spawn_transfers_native_handles_and_child_maps_them():
         runtime.subprocess, "STARTUPINFO", return_value=startup, create=True
     ), patch.object(runtime.subprocess, "DETACHED_PROCESS", 8, create=True), patch.object(
         runtime.subprocess, "CREATE_NEW_PROCESS_GROUP", 16, create=True
-    ), patch.object(runtime.subprocess, "Popen", return_value=process) as popen:
-        assert runtime._spawn_daemon(11, 1234, ack_fd=22, claim_path=Path("claim")) is process
+    ), patch.object(
+        runtime.subprocess, "Popen", return_value=process
+    ) as popen, TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        assert (
+            runtime._spawn_daemon(
+                11, 1234, ack_fd=22, claim_path=Path("claim"), working_directory=directory
+            )
+            is process
+        )
 
     command, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+    assert command[:4] == [sys.executable, "-P", "-m", "nyx.runtime"]
+    assert kwargs["cwd"] == directory
     assert command[command.index("--daemon-handle") + 1] == "101"
     assert command[command.index("--ack-handle") + 1] == "202"
     assert "--daemon-fd" not in command and "--ack-fd" not in command
@@ -1907,9 +1918,17 @@ def test_posix_spawn_preserves_detached_descriptor_contract():
     process = object()
     with patch.object(runtime.os, "name", "posix"), patch.object(
         runtime.subprocess, "Popen", return_value=process
-    ) as popen:
-        assert runtime._spawn_daemon(11, 1234, ack_fd=22, claim_path=Path("claim")) is process
+    ) as popen, TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        assert (
+            runtime._spawn_daemon(
+                11, 1234, ack_fd=22, claim_path=Path("claim"), working_directory=directory
+            )
+            is process
+        )
     command, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+    assert command[:4] == [sys.executable, "-P", "-m", "nyx.runtime"]
+    assert kwargs["cwd"] == directory
     assert command[command.index("--daemon-fd") + 1] == "11"
     assert command[command.index("--ack-fd") + 1] == "22"
     assert kwargs["pass_fds"] == (11, 22)
@@ -1918,6 +1937,152 @@ def test_posix_spawn_preserves_detached_descriptor_contract():
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
+
+
+def test_public_start_spawns_the_daemon_in_its_admitted_state_directory():
+    class SpawnRecorded(Exception):
+        pass
+
+    spawn = Mock(side_effect=SpawnRecorded)
+    with TemporaryDirectory() as temporary:
+        paths, home, _ = _fixture(Path(temporary))
+        assert paths.state_directory == home / ".nyx"
+        assert paths.state_directory.is_dir()
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_spawn_daemon", spawn
+        ), pytest.raises(SpawnRecorded):
+            runtime.start()
+        assert spawn.call_count == 1
+        assert spawn.call_args.kwargs["working_directory"] == paths.state_directory
+        contender = runtime._lease_lock(paths, timeout=0.0)
+        assert contender.acquire(blocking=False)
+        contender.close()
+
+
+def _require_loopback_listener() -> None:
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Mirror the daemon's listener, an HTTPServer with allow_reuse_address:
+        # TIME_WAIT sockets left by earlier requests to this port must not block
+        # the probe, while a live listener on the port still makes it fail.
+        capability_probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        capability_probe.bind(("127.0.0.1", runtime.PORT))
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+
+def _sample_workspace(root: Path) -> Path:
+    workspace = root / "specifications"
+    package = workspace / "Fictional" / "Queue" / "sample"
+    package.mkdir(parents=True)
+    package.joinpath("spec.md").write_text("# Sample catalog entry\n", encoding="utf-8")
+    return workspace
+
+
+def _prove_isolated_cli_service(
+    *,
+    cli: list[str],
+    launch: Path,
+    environment: dict[str, str],
+    workspace: Path,
+    shadow_directory: Path,
+    marker: Path,
+) -> None:
+    """Start the real service, request a worker-built catalog, then stop it."""
+
+    def run_cli(*arguments: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cli, *arguments],
+            cwd=launch,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    try:
+        configured = run_cli("--setup", str(workspace))
+        assert configured.returncode == 0, configured.stderr
+        plant_shadow(shadow_directory, marker)
+        started = run_cli()
+        assert started.returncode == 0, (started.stderr, shadow_imports(marker))
+        assert started.stdout == f"{runtime.URL}\n"
+        connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=15)
+        try:
+            connection.request(
+                "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"}
+            )
+            response = connection.getresponse()
+            body = response.read()
+        finally:
+            connection.close()
+        assert response.status == 200, (body, shadow_imports(marker))
+        payload = json.loads(body)
+        assert payload["schema_version"] == SCHEMA_VERSION
+        assert [entry["package_path"] for entry in payload["entries"]] == [
+            "Fictional/Queue/sample"
+        ]
+        assert shadow_imports(marker) == []
+    finally:
+        for _ in range(2):
+            try:
+                stopped = run_cli("--stop", timeout=10)
+            except subprocess.TimeoutExpired:
+                continue
+            if stopped.returncode == 0:
+                break
+
+
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
+def test_cli_service_ignores_shadow_modules_planted_in_its_state_directory():
+    _require_loopback_listener()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        launch = root / "launch"
+        launch.mkdir()
+        environment = proof_environment(home)
+        assert "PYTHONPATH" not in environment
+        _prove_isolated_cli_service(
+            cli=[sys.executable, "-m", "nyx.cli"],
+            launch=launch,
+            environment=environment,
+            workspace=_sample_workspace(root),
+            shadow_directory=home / ".nyx",
+            marker=root / "shadow-imports.log",
+        )
+
+
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
+def test_cli_service_children_leave_the_launch_directory_for_the_state_directory():
+    _require_loopback_listener()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        launch = root / "launch"
+        launch.mkdir()
+        # The launcher ignores PYTHONPATH and its own directory, so only the
+        # spawned daemon and worker can resolve the relative entry, which
+        # names their working directory.
+        _prove_isolated_cli_service(
+            cli=[sys.executable, "-E", "-P", "-m", "nyx.cli"],
+            launch=launch,
+            environment=proof_environment(home, pythonpath="."),
+            workspace=_sample_workspace(root),
+            shadow_directory=launch,
+            marker=root / "shadow-imports.log",
+        )
 
 
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
@@ -4356,7 +4521,8 @@ def test_actual_daemon_spawn_retains_lease_after_launcher_death():
         script = (
             "import os,time; from nyx import runtime; paths=runtime._paths(create=True); "
             "lease=runtime._lease_lock(paths,timeout=0); assert lease.acquire(blocking=False); "
-            "runtime._spawn_daemon(lease.fd,int((time.monotonic()+5)*10**9)); os._exit(0)"
+            "runtime._spawn_daemon(lease.fd,int((time.monotonic()+5)*10**9),"
+            "working_directory=paths.state_directory); os._exit(0)"
         )
         launcher = subprocess.run(
             [sys.executable, "-c", script],
@@ -4487,7 +4653,8 @@ def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_ex
         "assert lease.acquire(blocking=False); read_fd,write_fd=os.pipe(); "
         f"runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r}]; "
         "process=runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
-        "ack_fd=write_fd,claim_path=paths.runtime_directory/'lease.lock'); "
+        "ack_fd=write_fd,claim_path=paths.runtime_directory/'lease.lock',"
+        "working_directory=paths.state_directory); "
         "Path(sys.argv[1]).write_text(str(process.pid),encoding='utf-8'); time.sleep(30)"
     )
     with TemporaryDirectory() as temporary:
@@ -4598,7 +4765,8 @@ def test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit():
             "import os,sys,time; from pathlib import Path; from nyx import runtime; "
             "lease=runtime._FileLock(Path(sys.argv[1]),timeout=0); assert lease.acquire(blocking=False); "
             f"runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r}]; "
-            "runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9); lease.close(); os._exit(0)"
+            "runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
+            "working_directory=Path(sys.argv[1]).parent); lease.close(); os._exit(0)"
         )
         launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
         assert launcher.wait(timeout=2) == 0
@@ -4668,7 +4836,8 @@ def test_continuous_external_contender_covers_launcher_loss_phase(phase):
         "else:\n"
         " read_fd,write_fd=os.pipe()\n"
         f" runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r},phase,marker,release]\n"
-        " runtime._spawn_daemon(lease.fd,time.monotonic_ns()+10**10,ack_fd=write_fd,claim_path=Path(lock_path))\n"
+        " runtime._spawn_daemon(lease.fd,time.monotonic_ns()+10**10,ack_fd=write_fd,"
+        "claim_path=Path(lock_path),working_directory=Path(lock_path).parent)\n"
         " os.close(write_fd)\n"
         " if phase == 'after_ack':\n"
         "  os.read(read_fd,1)\n"
