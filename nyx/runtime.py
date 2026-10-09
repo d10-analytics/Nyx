@@ -1323,8 +1323,11 @@ class _Daemon:
 
 
 def _daemon_command(deadline_ns: int) -> list[str]:
+    # ``-P`` keeps the daemon's working directory off its import path so that
+    # modules there cannot replace the installed package.
     return [
         sys.executable,
+        "-P",
         "-m",
         "nyx.runtime",
         "--deadline-ns",
@@ -1338,7 +1341,15 @@ def _spawn_daemon(
     *,
     ack_fd: int | None = None,
     claim_path: Path | None = None,
+    working_directory: Path,
 ) -> subprocess.Popen[bytes]:
+    """Spawn the detached daemon in ``working_directory``.
+
+    The daemon never inherits the launcher's directory: a relative import
+    path entry would otherwise resolve against wherever the user ran ``nyx``.
+    A missing directory fails the spawn rather than falling back.
+    """
+
     command = _daemon_command(deadline_ns)
     pass_fds = [lease_fd]
     if claim_path is not None:
@@ -1348,6 +1359,7 @@ def _spawn_daemon(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
+        cwd=working_directory,
     )
     if os.name == "nt":  # pragma: no cover - native Windows lane
         claim_handle = NativeClaim.transfer_handle(lease_fd)
@@ -1529,6 +1541,7 @@ def start() -> str:
                     deadline_ns,
                     ack_fd=ack_write,
                     claim_path=paths.runtime_directory / "lease.lock",
+                    working_directory=paths.state_directory,
                 )
                 os.close(ack_write)
                 ack_write = -1

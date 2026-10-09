@@ -106,7 +106,8 @@ def default_worker_command() -> list[str]:
     """Select the catalog worker entry for the current runtime.
 
     A standalone application must spawn its bundled console helper.  A source
-    or virtual-environment run keeps the module entry unchanged.
+    or virtual-environment run uses the module entry with ``-P`` so the
+    worker's working directory never joins its import path.
     """
 
     if _is_packaged_application():
@@ -114,7 +115,7 @@ def default_worker_command() -> list[str]:
         if bundled is None:
             raise WorkerError("producer_unavailable")
         return bundled
-    return [sys.executable, "-m", "nyx.worker"]
+    return [sys.executable, "-P", "-m", "nyx.worker"]
 
 
 def _windows_parent_pipe_closed(fd: int) -> bool:
@@ -314,9 +315,19 @@ class CatalogWorkerManager:
         recovery_claim: NativeClaim | None = None,
         recovery_path: Path | None = None,
         parent_liveness_fd: int | None = None,
+        working_directory: Path | None = None,
     ) -> None:
+        """Configure worker admission.
+
+        ``working_directory`` is the directory every worker spawns in.  When
+        it is ``None`` a worker inherits this process's directory.  A given
+        directory that is missing fails the fetch; there is no fallback to the
+        inherited directory.
+        """
+
         self._command_factory = command_factory or default_worker_command
         self._timeout = timeout
+        self._working_directory = working_directory
         self._recovery_claim = recovery_claim
         self._recovery_path = recovery_path or (
             None if recovery_claim is None else recovery_claim.path
@@ -347,6 +358,8 @@ class CatalogWorkerManager:
                 "stderr": subprocess.PIPE,
                 "close_fds": True,
             }
+            if self._working_directory is not None:
+                spawn_kwargs["cwd"] = self._working_directory
             inherited_handles: list[int] = []
             if self._recovery_claim is not None:
                 if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
