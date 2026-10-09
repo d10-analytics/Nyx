@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import pytest
+from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
 from nyx import state, worker
 from nyx._native_claim import NativeClaim
@@ -419,7 +420,12 @@ def test_packaged_application_without_helper_fails_closed_instead_of_reentering_
 def test_source_application_keeps_the_module_worker_entry(tmp_path, monkeypatch):
     monkeypatch.delattr(worker.sys, "frozen", raising=False)
     assert worker.bundled_worker_command() is None
-    assert worker.default_worker_command() == [worker.sys.executable, "-m", "nyx.worker"]
+    assert worker.default_worker_command() == [
+        worker.sys.executable,
+        "-P",
+        "-m",
+        "nyx.worker",
+    ]
 
 
 def test_console_helper_entry_emits_the_same_exact_bytes_as_the_module_entry():
@@ -449,3 +455,88 @@ def test_console_helper_entry_emits_the_same_exact_bytes_as_the_module_entry():
     assert helper_entry.returncode == 0, helper_entry.stderr
     assert helper_entry.stdout == module_entry.stdout
     assert helper_entry.stdout.decode("utf-8")
+
+
+def _configured_state(tmp_path: Path, monkeypatch, *, pythonpath: str | None = None):
+    """Configure Nyx under a fresh home with one catalog entry."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    package = workspace / "Fictional" / "Queue" / "sample"
+    package.mkdir(parents=True)
+    package.joinpath("spec.md").write_text("# Sample catalog entry\n", encoding="utf-8")
+    install_proof_environment(monkeypatch, home, pythonpath=pythonpath)
+    state.setup(workspace)
+    return state.state_paths()
+
+
+def _fetch_and_close(manager: worker.CatalogWorkerManager) -> dict[str, object]:
+    try:
+        payload = json.loads(manager.fetch_catalog())
+    finally:
+        assert manager.close(time.monotonic() + 5)
+    return payload
+
+
+def test_worker_in_its_state_directory_ignores_shadow_modules_planted_there(
+    tmp_path, monkeypatch
+):
+    paths = _configured_state(tmp_path, monkeypatch)
+    marker = tmp_path / "shadow-imports.log"
+    plant_shadow(paths.state_directory, marker)
+    assert "PYTHONPATH" not in os.environ
+
+    payload = _fetch_and_close(
+        worker.CatalogWorkerManager(working_directory=paths.state_directory, timeout=15)
+    )
+
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert parse_catalog(payload).as_dict() == payload
+    assert [entry["package_path"] for entry in payload["entries"]] == [
+        "Fictional/Queue/sample"
+    ]
+    assert shadow_imports(marker) == []
+
+
+def test_worker_runs_in_its_state_directory_instead_of_the_launch_directory(
+    tmp_path, monkeypatch
+):
+    paths = _configured_state(tmp_path, monkeypatch, pythonpath=".")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    marker = tmp_path / "shadow-imports.log"
+    plant_shadow(launch, marker)
+    monkeypatch.chdir(launch)
+    assert Path.cwd() == launch.resolve()
+    assert os.environ["PYTHONPATH"] == "."
+
+    payload = _fetch_and_close(
+        worker.CatalogWorkerManager(working_directory=paths.state_directory, timeout=15)
+    )
+
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert parse_catalog(payload).as_dict() == payload
+    assert shadow_imports(marker) == []
+
+
+def test_missing_worker_directory_fails_without_falling_back_to_the_launch_directory(
+    tmp_path, monkeypatch
+):
+    _configured_state(tmp_path, monkeypatch, pythonpath=".")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    marker = tmp_path / "shadow-imports.log"
+    plant_shadow(launch, marker)
+    monkeypatch.chdir(launch)
+    missing = tmp_path / "missing-state-directory"
+    manager = worker.CatalogWorkerManager(working_directory=missing, timeout=15)
+
+    try:
+        with pytest.raises(OSError):
+            manager.fetch_catalog()
+        assert manager.active_count == 0
+    finally:
+        assert manager.close(time.monotonic() + 5)
+    assert not missing.exists()
+    assert shadow_imports(marker) == []
