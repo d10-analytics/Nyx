@@ -1237,6 +1237,19 @@
     renderBoard();
     renderStageOrderEditor();
     if (!workspace || workspace.revision !== snapshot.configuration_revision) loadWorkspace();
+    // Settings saved from another page change the catalog revision; an unsaved
+    // draft is kept and must be replaced explicitly rather than discarded.
+    if (snapshot.configuration_revision === null || settingsRevision === null || settingsBusy ||
+      snapshot.configuration_revision === settingsRevision) return;
+    if (!retainDraft) {
+      loadSettings();
+      return;
+    }
+    settingsAvailable = false;
+    settingsReloadAvailable = true;
+    settingsRevision = null;
+    settingsStatus("Board settings changed elsewhere. Reload board settings to replace this unsaved draft.", true);
+    renderStageOrderEditor();
   }
 
   function loadWorkspace() {

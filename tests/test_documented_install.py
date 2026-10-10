@@ -82,6 +82,9 @@ DESKTOP_GUIDANCE_MARKERS = (
     "Quit",
     "already open",
     "Retry",
+    "**Cancel** is available only while changing the workspace",
+    "returns to the current workspace without quitting",
+    "**Close** finishes a blocked close or a board-display failure",
 )
 STAGE_ORDER_GUIDANCE_MARKERS = {
     "README.md": (
@@ -141,6 +144,11 @@ COMPLETION_GUIDANCE_MARKERS = {
         "configuration revision",
         "moving it out reopens it",
         "recorded workflow assertion",
+        "A theme change follows other open tabs",
+        "The compact view (**Hide empty rows and columns**), **Hide terminal rows**, and "
+        "**Click empty space to deselect** apply per tab until reload",
+        '"Board settings changed elsewhere. Reload board settings to replace this unsaved draft."',
+        "Choose **Reload board settings** to replace the draft",
     ),
     "docs/workspaces.md": (
         "no implicit `Done` or `Archive` rule",
@@ -167,7 +175,7 @@ PORT_CONFLICT_GUIDANCE_MARKERS = (
     "macOS", "`lsof -nP -iTCP:8765 -sTCP:LISTEN`",
     "Windows PowerShell", "`Get-NetTCPConnection -LocalPort 8765 -State Listen`",
     "`OwningProcess` is the process ID",
-    "Close that program", "run `nyx` again", "**Revalidate**",
+    "Close that program", "run `nyx` again", "or choose **Retry**",
     "Nyx never switches ports",
     "Nyx runtime could not start; retry",
     "excluded or reserved port range", "no owning program",
@@ -227,6 +235,8 @@ def test_documents_publish_the_private_desktop_guidance():
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     for marker in DESKTOP_GUIDANCE_MARKERS:
         assert marker in guide, marker
+    for name in DOCUMENTS:
+        assert "**Revalidate**" not in (REPOSITORY_ROOT / name).read_text(encoding="utf-8"), name
 
 
 @pytest.mark.parametrize("name", [
