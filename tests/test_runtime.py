@@ -2764,6 +2764,153 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         return runtime.observe_runtime()
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="SIGKILL not available on this platform",
+)
+def test_temporary_record_cleaned_up_after_stop(tmp_path):
+    """P3: SIGKILL crash leaves .instance.json.*; stop() sweeps it."""
+    paths, _, spec = _fixture(tmp_path)
+    instance = runtime.Instance(
+        "iid", runtime.URL, "cap", "127.0.0.1:43210"
+    )
+    record_bytes = (json.dumps(instance.as_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    script = textwrap.dedent(f"""\
+        import json, os, signal, sys, tempfile
+        sys.path.insert(0, {str(Path(__file__).parents[1])!r})
+        from nyx import runtime, state
+        from unittest.mock import patch
+
+        paths = state.state_paths()
+        instance = runtime.Instance(
+            "iid", runtime.URL, "cap", "127.0.0.1:43210"
+        )
+
+        def kill_replace(src, dst):
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        with patch.object(os, "replace", kill_replace):
+            try:
+                runtime._write_instance(paths, instance, deadline=float("inf"))
+            except BaseException:
+                pass
+    """)
+    environment = os.environ.copy()
+    environment["HOME"] = str(paths.account_home)
+    environment.pop("PYTHONHOME", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == -signal.SIGKILL
+    leftovers = list(paths.runtime_directory.glob(".instance.json.*"))
+    assert len(leftovers) == 1
+    assert leftovers[0].read_bytes() == record_bytes
+    assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+    assert _observe(paths).status == "unknown"
+    assert leftovers[0].exists()
+
+    with (
+        patch.object(state, "resolve_account_home", return_value=paths.account_home),
+        patch.object(state, "_current_uid", return_value=state._current_uid()),
+    ):
+        assert runtime.stop() == "stopped"
+
+    assert not list(paths.runtime_directory.glob(".instance.json.*"))
+    assert _observe(paths).status == "not_running"
+
+
+def test_temporary_record_swept_before_spawn(tmp_path):
+    """P4: sweep precedes daemon spawn."""
+    paths, _, _ = _fixture(tmp_path)
+    temp = paths.runtime_directory / ".instance.json.abc123"
+    temp.write_bytes(b"leftover")
+    captured: list[list[str]] = []
+
+    def fail_spawn(*_args, **_kwargs):
+        captured.append(list(
+            e.name for e in paths.runtime_directory.iterdir()
+            if e.name.startswith(".instance.json.")
+        ))
+        raise RuntimeError("sentinel")
+
+    with (
+        patch.object(runtime, "_paths", return_value=paths),
+        patch.object(runtime, "_spawn_daemon", fail_spawn),
+        pytest.raises(RuntimeError, match="sentinel"),
+    ):
+        runtime.start()
+    assert captured == [[]]
+    assert not temp.exists()
+
+
+def test_temporary_record_not_swept_while_lease_held(tmp_path):
+    """P5: held lease means a live writer; sweep must not run."""
+    paths, _, _ = _fixture(tmp_path)
+    lease_fd, lease = _held_lease(paths)
+    temp = paths.runtime_directory / ".instance.json.abc123"
+    temp.write_bytes(b"leftover")
+    try:
+        with (
+            patch.object(runtime, "_paths", return_value=paths),
+            pytest.raises(Exception),
+        ):
+            runtime.stop()
+        assert temp.exists()
+    finally:
+        lease.close()
+        os.close(lease_fd)
+
+
+@pytest.mark.parametrize("kind", ["malformed", "unsafe"])
+def test_temporary_record_not_swept_after_refused_record(tmp_path, kind):
+    """P6: invalid/unsafe record blocks sweep; leftover remains."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    if kind == "malformed":
+        record.write_text("not json", encoding="utf-8")
+    else:
+        record.mkdir()
+    try:
+        with (
+            patch.object(runtime, "_paths", return_value=paths),
+            pytest.raises(Exception),
+        ):
+            runtime.start()
+        assert leftover.exists()
+        if kind == "malformed":
+            assert record.exists()
+        else:
+            assert record.is_dir()
+    finally:
+        if kind != "malformed" and record.is_dir():
+            record.rmdir()
+        leftover.unlink(missing_ok=True)
+
+
+def test_temporary_record_directory_with_prefix_raises(tmp_path):
+    """P7: directory named .instance.json.x raises RuntimeErrorBase."""
+    paths, _, _ = _fixture(tmp_path)
+    bad = paths.runtime_directory / ".instance.json.x"
+    bad.mkdir()
+    try:
+        with (
+            patch.object(runtime, "_paths", return_value=paths),
+            pytest.raises(runtime.RuntimeErrorBase, match="cannot be removed"),
+        ):
+            runtime.start()
+        assert bad.is_dir()
+    finally:
+        bad.rmdir()
+
+
 @pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])
 def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damage):
     try:

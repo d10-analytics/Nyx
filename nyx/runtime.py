@@ -580,6 +580,10 @@ def _write_instance(
 
 
 def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
+    # Record step: validate and remove the stale locator when present, or
+    # accept its absence.  A later package may add a quarantine branch here;
+    # any successful record step (absent, validated-removed, quarantined)
+    # permits the temp-file sweep that follows.
     try:
         record = _record_path(paths)
         details = record.lstat()
@@ -588,9 +592,6 @@ def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
             or not stat.S_ISREG(details.st_mode)
         ):
             raise UnhealthyInstanceError("Nyx instance record is unsafe")
-        # A stale record is still persisted control input.  Validate it at the
-        # same boundary as active lifecycle operations before removing it, so a
-        # malformed endpoint cannot be silently discarded.
         _read_instance(paths)
         _require_deadline(deadline)
         record.unlink()
@@ -598,6 +599,18 @@ def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
         pass
     except OSError as error:
         raise RuntimeErrorBase("Nyx stale instance record cannot be removed") from error
+
+    # Sweep: remove leftover atomic-write temporaries that a hard kill
+    # between mkstemp and os.replace can leave behind.
+    for entry in paths.runtime_directory.iterdir():
+        if not entry.name.startswith(".instance.json."):
+            continue
+        try:
+            entry.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RuntimeErrorBase("Nyx stale instance record cannot be removed") from error
 
 
 def _peer_uid(connection: socket.socket) -> int | None:
