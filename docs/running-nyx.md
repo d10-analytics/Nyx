@@ -103,6 +103,13 @@ catalog only when its configuration revision matches the saved settings before
 showing changed dependency results; a conflict or failed refresh keeps the last
 valid board and tells you to reload or retry.
 
+When board settings are saved elsewhere, such as from another tab, a page picks
+up the change the next time it applies a board update. Without unsaved changes
+it loads the saved settings. With an unsaved draft it keeps the draft, disables
+**Save**, and shows "Board settings changed elsewhere. Reload board settings to
+replace this unsaved draft." Choose **Reload board settings** to replace the
+draft with the saved settings; Nyx never discards the draft on its own.
+
 **Click empty space to deselect** is a separate checkbox in Board settings.
 It starts unchecked, so clicking a selected card again clears the selection.
 When checked, clicking an empty cell, row label, or other empty board space
@@ -165,6 +172,15 @@ report that the desktop application has no lifecycle commands.
 - **Change workspace** stops the current work, saves the new workspace, and
   restarts. An incomplete stop keeps the previously saved workspace and shows a
   visible **Retry** rather than mixing the two workspaces.
+- **Cancel** is available only while changing the workspace, not at the
+  first-launch chooser. It discards the replacement choice and
+  returns to the current workspace without quitting; the current board keeps
+  running and nothing is saved.
+- The recovery button reads **Retry** or **Close**, and is unavailable when
+  there is nothing to recover. **Retry** repeats a stopped workspace change or a
+  runtime start.
+- **Close** finishes a blocked close or a board-display failure: it retries the
+  cleanup and exits once the work has stopped.
 - **Quit**, and closing the only window, request the same visible shutdown. The
   window exits only after its owned cleanup has finished.
 - One application owns the account on this host. A separately launched second
@@ -228,6 +244,9 @@ empty. If a refresh returns malformed data, Nyx reports the refresh failure and
 retains the last valid displayed board and browser-local preference.
 
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
+A theme change follows other open tabs. The compact view (**Hide empty rows and
+columns**), **Hide terminal rows**, and **Click empty space to deselect** apply
+per tab until reload: another open tab keeps its current choice until it reloads.
 
 ## Capture and review the fictional example
 
@@ -299,7 +318,7 @@ repeatable browser session; it does not add a permanent screenshot framework.
   `lsof -nP -iTCP:8765 -sTCP:LISTEN` on macOS, or
   `Get-NetTCPConnection -LocalPort 8765 -State Listen` in Windows PowerShell
   (`OwningProcess` is the process ID). Close that program, then run `nyx` again
-  or choose **Revalidate**. Nyx never switches ports. On Windows, a conflict
+  or choose **Retry**. Nyx never switches ports. On Windows, a conflict
   can sometimes appear only as `Nyx runtime could not start; retry`; an
   excluded or reserved port range can raise the same error with no owning
   program. List those ranges with
