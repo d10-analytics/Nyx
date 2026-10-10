@@ -1828,6 +1828,186 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     assert winning_page.get_by_role("button", name="Save").is_enabled()
 
 
+CHANGED_ELSEWHERE = (
+    "Board settings changed elsewhere. Reload board settings to replace this unsaved draft."
+)
+# Counts settings loads when the page starts them, so a check made right after
+# a visible apply result also covers a load the server has not yet received.
+SETTINGS_LOAD_COUNTER = """(() => {
+  window.settingsLoads = 0;
+  const original = window.fetch.bind(window);
+  window.fetch = (resource, options = {}) => {
+    if (String(resource).endsWith('/api/settings') && (options.method || 'GET') === 'GET') {
+      window.settingsLoads += 1;
+    }
+    return original(resource, options);
+  };
+})();"""
+
+
+def three_stage_payload(*, titles=None):
+    value = json.loads(board_payload(titles=titles))
+    _admit_inventory_stage(value, "Alpha", "Review")
+    value["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    value["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(value)
+    return value
+
+
+def open_same_board(page):
+    other = page.context.new_page()
+    other.add_init_script(SETTINGS_LOAD_COUNTER)
+    other.goto(page.url)
+    other.wait_for_function(
+        "document.querySelector('#board .card, #board .board-empty, #board-issues')",
+        timeout=15000,
+    )
+    return other
+
+
+def settings_loads(page):
+    return page.evaluate("window.settingsLoads")
+
+
+def save_review_first_elsewhere(page, settings):
+    """Save a new order from ``page`` and wait for its post-save refresh to apply."""
+    open_stage_editor(page)
+    page.get_by_role("button", name="Move Review up", exact=True).click()
+    page.get_by_role("button", name="Save", exact=True).click()
+    playwright.expect(page.locator(".row-head")).to_have_text(["Queue", "Review", "Under Development"])
+    assert settings.order == ["Queue", "Review", "Under_Development"]
+
+
+def test_apply_reloads_settings_saved_on_another_page_without_a_draft(open_page):
+    settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
+    page = open_page(
+        StaticClient(three_stage_payload()), settings=settings, init_script=SETTINGS_LOAD_COUNTER,
+    )
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    other = open_same_board(page)
+    try:
+        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+        playwright.expect(other.locator(".row-head")).to_have_text(["Queue", "Under Development", "Review"])
+
+        before_save = settings.get_calls
+        page_loads = settings_loads(page)
+        save_review_first_elsewhere(page, settings)
+        # The saving page refreshes through its post-save fetch alone.
+        assert settings_loads(page) == page_loads + 1
+        assert settings.get_calls == before_save + 1
+        assert page.locator("#stage-order-status").inner_text() == "Board row order saved."
+
+        before_apply = settings.get_calls
+        other_loads = settings_loads(other)
+        other.locator("#refresh").click()
+        playwright.expect(other.locator(".row-head")).to_have_text(["Queue", "Review", "Under Development"])
+        assert stage_editor_order(other) == ["Queue", "Review", "Under_Development"]
+        assert settings_loads(other) == other_loads + 1
+        assert settings.get_calls == before_apply + 1
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize("draft", ["row-move", "completed-stage"])
+def test_apply_keeps_unsaved_draft_when_settings_change_on_another_page(open_page, draft):
+    settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
+    page = open_page(StaticClient(three_stage_payload()), settings=settings)
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    other = open_same_board(page)
+    try:
+        status = other.locator("#stage-order-status")
+        playwright.expect(status).to_have_text("Current board row order loaded.")
+        open_stage_editor(other)
+        queue_finished = other.get_by_role("checkbox", name="Counts as finished: Queue", exact=True)
+        if draft == "row-move":
+            other.get_by_role("button", name="Move Under Development up", exact=True).click()
+            expected_draft = ["Under_Development", "Queue", "Review"]
+        else:
+            queue_finished.check()
+            expected_draft = ["Queue", "Under_Development", "Review"]
+        assert stage_editor_order(other) == expected_draft
+        assert other.get_by_role("button", name="Save", exact=True).is_enabled()
+
+        save_review_first_elsewhere(page, settings)
+        before = settings.get_calls
+        other_loads = settings_loads(other)
+        other.locator("#refresh").click()
+        playwright.expect(status).to_have_text(CHANGED_ELSEWHERE)
+        assert stage_editor_order(other) == expected_draft
+        assert queue_finished.is_checked() == (draft == "completed-stage")
+        assert other.get_by_role("button", name="Save", exact=True).is_disabled()
+        reload = other.get_by_role("button", name="Reload board settings", exact=True)
+        assert reload.is_visible()
+        assert settings_loads(other) == other_loads
+        assert settings.get_calls == before
+
+        reload.click()
+        playwright.expect(status).to_have_text("Current board row order loaded.")
+        assert stage_editor_order(other) == ["Queue", "Review", "Under_Development"]
+        assert not queue_finished.is_checked()
+        assert other.get_by_role("button", name="Save", exact=True).is_disabled()
+        assert settings_loads(other) == other_loads + 1
+        assert settings.get_calls == before + 1
+    finally:
+        other.close()
+
+
+def test_apply_adds_no_settings_load_while_settings_await_reload(open_page):
+    settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
+    client = StaticClient(three_stage_payload())
+    page = open_page(client, settings=settings)
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    settings.fail_next_load = True
+    other = open_same_board(page)
+    try:
+        status = other.locator("#stage-order-status")
+        failure = "Could not load board row order: producer_unavailable"
+        playwright.expect(status).to_have_text(failure)
+
+        save_review_first_elsewhere(page, settings)
+        client.payload = three_stage_payload(titles={"step_one": "Renamed foundation"})
+        before = settings.get_calls
+        other_loads = settings_loads(other)
+        other.locator("#refresh").click()
+        playwright.expect(
+            other.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
+        ).to_have_text("Renamed foundation")
+        assert settings_loads(other) == other_loads
+        assert settings.get_calls == before
+        assert status.text_content() == failure
+        open_stage_editor(other)
+        assert other.get_by_role("button", name="Reload board settings", exact=True).is_visible()
+    finally:
+        other.close()
+
+
+def test_settings_load_held_across_the_first_apply_is_the_only_load(open_page):
+    settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
+    page = open_page(StaticClient(three_stage_payload()), settings=settings)
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    before = settings.get_calls
+    settings.gate = threading.Event()
+    other = page.context.new_page()
+    try:
+        other.add_init_script(SETTINGS_LOAD_COUNTER)
+        other.goto(page.url)
+        assert settings.entered.wait(timeout=5)
+        playwright.expect(
+            other.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
+        ).to_have_text("Foundation step", timeout=15000)
+        assert settings_loads(other) == 1
+        settings.gate.set()
+        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+        assert settings_loads(other) == 1
+        assert settings.get_calls == before + 1
+    finally:
+        settings.gate.set()
+        other.close()
+
+
 def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     first = json.loads(board_payload())
     first["entries"].append(_entry(
