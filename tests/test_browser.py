@@ -2008,6 +2008,55 @@ def test_settings_load_held_across_the_first_apply_is_the_only_load(open_page):
         other.close()
 
 
+class CommitThenHoldSettings(BrowserSettings):
+    """Commit a save, then hold its response so the catalog runs ahead of the page."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hold = None
+        self.committed = threading.Event()
+
+    def save_settings(self, revision, order, completed):
+        result = super().save_settings(revision, order, completed)
+        if self.hold is not None:
+            self.committed.set()
+            self.hold.wait(timeout=10)
+        return result
+
+
+def test_apply_during_an_in_flight_save_keeps_the_editor_usable(open_page):
+    settings = CommitThenHoldSettings(order=["Queue", "Under_Development", "Review"])
+    client = StaticClient(three_stage_payload())
+    page = open_page(client, settings=settings, init_script=SETTINGS_LOAD_COUNTER)
+    status = page.locator("#stage-order-status")
+    playwright.expect(status).to_have_text("Current board row order loaded.")
+    open_stage_editor(page)
+    page.get_by_role("button", name="Move Review up", exact=True).click()
+    loads = settings_loads(page)
+    settings.hold = threading.Event()
+    try:
+        page.get_by_role("button", name="Save", exact=True).click()
+        assert settings.committed.wait(timeout=5)
+        # The catalog already carries the saved revision while the page still
+        # holds the previous one and its draft.
+        client.payload = three_stage_payload(titles={"step_one": "Renamed foundation"})
+        page.locator("#refresh").click()
+        playwright.expect(
+            page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
+        ).to_have_text("Renamed foundation")
+        assert status.text_content() == "Saving board row order…"
+        assert settings_loads(page) == loads
+    finally:
+        settings.hold.set()
+    playwright.expect(page.locator(".row-head")).to_have_text(["Queue", "Review", "Under Development"])
+    playwright.expect(status).to_have_text("Board row order saved.")
+    assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
+    assert not page.get_by_role("button", name="Reload board settings", exact=True).is_visible()
+    assert page.get_by_role("button", name="Move Queue down", exact=True).is_enabled()
+    assert page.get_by_role("button", name="Reset", exact=True).is_enabled()
+    assert settings_loads(page) == loads + 1
+
+
 def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     first = json.loads(board_payload())
     first["entries"].append(_entry(
