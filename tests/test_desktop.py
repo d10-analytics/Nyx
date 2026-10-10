@@ -107,9 +107,14 @@ class _MainWindow(_Widget):
         self._visible = True
 
     def close(self):
-        event = SimpleNamespace(accept=lambda: None)
+        # Like QWidget.close, an ignored close event keeps the window visible.
+        event = SimpleNamespace(accepted=True)
+        event.accept = lambda: setattr(event, "accepted", True)
+        event.ignore = lambda: setattr(event, "accepted", False)
         self.closeEvent(event)
-        self._visible = False
+        if event.accepted:
+            self._visible = False
+        return event.accepted
 
 
 class _LineEdit(_Widget):
@@ -130,9 +135,16 @@ class _Label(_LineEdit):
 
 
 class _Button(_Widget):
-    def __init__(self, *_):
+    def __init__(self, text="", *_):
         super().__init__()
+        self._text = text
         self.clicked = _Signal()
+
+    def setText(self, value):
+        self._text = value
+
+    def text(self):
+        return self._text
 
     def click(self):
         if self.isEnabled():
@@ -208,11 +220,20 @@ class _WebEnginePage:
 
 
 class _WebEngineView(_Widget):
+    # Optional callable whose result is recorded with every navigation call,
+    # so a test can see which runtime the session held at that moment.
+    observe = None
+
     def __init__(self, *_):
         super().__init__()
         self.loadFinished = _WebSignal()
         self._url = None
         self._page = None
+        self.navigations = []
+
+    def _record(self, kind, url):
+        observed = None if self.observe is None else self.observe()
+        self.navigations.append((kind, url, observed))
 
     def setPage(self, page):
         self._page = page
@@ -222,12 +243,19 @@ class _WebEngineView(_Widget):
 
     def setUrl(self, url):
         self._url = url
+        self._record("setUrl", url)
+
+    def reload(self):
+        self._record("reload", self._url)
 
     def url(self):
         return self._url
 
 
-def _fake_qt():
+def _fake_qt(observe=None):
+    view = _WebEngineView
+    if observe is not None:
+        view = type("_ObservedWebEngineView", (_WebEngineView,), {"observe": staticmethod(observe)})
     return {
         "QtCore": SimpleNamespace(QUrl=lambda value: value),
         "QtWidgets": SimpleNamespace(
@@ -245,7 +273,7 @@ def _fake_qt():
             QWebEngineProfile=_WebEngineProfile,
             QWebEngineSettings=SimpleNamespace(WebAttribute=SimpleNamespace(JavascriptCanAccessClipboard=3)),
         ),
-        "QtWebEngineWidgets": SimpleNamespace(QWebEngineView=_WebEngineView),
+        "QtWebEngineWidgets": SimpleNamespace(QWebEngineView=view),
     }
 
 
@@ -355,7 +383,9 @@ class LineEdit(Widget):
 class Label(LineEdit):
     def setWordWrap(self, value): pass
 class Button(Widget):
-    def __init__(self, *args): super().__init__(*args); self.clicked = Signal()
+    def __init__(self, text="", *args): super().__init__(); self.value = text; self.clicked = Signal()
+    def setText(self, value): self.value = value
+    def text(self): return self.value
 class Layout:
     def __init__(self, *args): pass
     def addRow(self, *args): pass
@@ -409,7 +439,7 @@ def test_module_import_does_not_require_qt(monkeypatch):
     assert desktop.APPLICATION_CLAIM_FILENAME == "lease.lock"
 
 
-def test_first_launch_cancel_releases_both_claims_without_creating_configuration():
+def test_first_launch_close_releases_both_claims_without_creating_configuration():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
@@ -419,7 +449,7 @@ def test_first_launch_cancel_releases_both_claims_without_creating_configuration
             assert session.snapshot.status == "not_configured"
             assert session.claims.held
             assert paths.config_file is not None and not paths.config_file.exists()
-            session.cancel()
+            session.close()
             assert not paths.config_file.exists()
             assert NativeClaim.probe(paths.runtime_directory / "lease.lock") == "free"
             assert NativeClaim.probe(paths.runtime_directory / "recovery.lock") == "free"
@@ -583,7 +613,7 @@ def test_first_launch_save_starts_admitted_runtime_and_opens_board():
             assert session.runtime is created[0]
             assert created[0].started
             assert created[0].catalog_admitted
-            assert window._board_opened
+            assert [kind for kind, _url, _runtime in window._board.navigations] == ["setUrl"]
             assert window._board.url() == "http://127.0.0.1:45123/"
 
             window._quit.click()
@@ -648,7 +678,7 @@ def test_first_launch_save_runtime_failure_preserves_selection_and_retries_board
             assert len(created) == 2
             assert session.runtime is created[1]
             assert created[1].catalog_admitted
-            assert window._board_opened
+            assert [kind for kind, _url, _runtime in window._board.navigations] == ["setUrl"]
             assert window._board.url() == "http://127.0.0.1:45123/"
             window._quit.click()
 
@@ -1604,6 +1634,462 @@ def test_postcommit_switch_retry_revalidates_then_restarts_saved_workspace():
             assert session.configuration == state.Configuration(second.resolve())
             assert session.runtime is instances[1]
             session.close()
+
+
+_SAME_BOARD_URL = "http://127.0.0.1:45125/"
+
+
+def _replaceable_runtime_type(instances, *, start_failures=None, control=None):
+    """A runtime double whose every instance reports the same board URL.
+
+    ``start_failures`` maps a resolved workspace root to the errors its next
+    starts raise, in order; ``control["shutdown"]`` decides whether shutdown
+    completes.  A single URL for every instance means only runtime identity,
+    never a URL difference, can tell the window that the board is stale.
+    """
+
+    failures = {} if start_failures is None else start_failures
+    settings = {"shutdown": True} if control is None else control
+
+    class ReplaceableRuntime:
+        def __init__(self, **_kwargs):
+            self.configuration = None
+            self.catalog_admitted = False
+            instances.append(self)
+
+        def capture_configuration(self, configuration, _paths):
+            self.configuration = configuration
+
+        def start(self, *, static_ready=None):
+            assert static_ready is None or static_ready()
+            pending = failures.get(self.configuration.specification_root)
+            if pending:
+                raise pending.pop(0)
+
+        def admit_catalog(self):
+            self.catalog_admitted = True
+
+        def board_url(self):
+            if not self.catalog_admitted:
+                raise RuntimeError("catalog has not been admitted")
+            return _SAME_BOARD_URL
+
+        def shutdown(self, _deadline):
+            return settings["shutdown"]
+
+        def cleanup_start_failure(self, _deadline):
+            return True
+
+    return ReplaceableRuntime
+
+
+def _observed_window(session):
+    """Build the window over a view that records ``session.runtime`` per navigation."""
+
+    return desktop._build_window(_fake_qt(lambda: session.runtime), session)
+
+
+def _fail_verification_once(paths, replacement):
+    original_verify = state._verify_record
+    failed = False
+
+    def fail_once(path):
+        nonlocal failed
+        details = original_verify(path)
+        if (
+            path == paths.config_file
+            and json.loads(path.read_text(encoding="utf-8"))["specification_root"]
+            == str(replacement.resolve())
+            and not failed
+        ):
+            failed = True
+            raise OSError("injected post-replacement verification failure")
+        return details
+
+    return patch.object(state, "_verify_record", side_effect=fail_once)
+
+
+def test_change_workspace_save_navigates_once_to_the_new_runtime():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = _observed_window(session)
+            window.show()
+            assert window._board.navigations == []
+            assert window._open_board()
+            first_runtime = session.runtime
+            assert window._board.navigations == [("setUrl", _SAME_BOARD_URL, first_runtime)]
+
+            window._change.click()
+            window._root.setText(str(root / "missing"))
+            window._save.click()
+            assert session.pending_error == "Nyx workspace could not be validated"
+            window._cancel.click()
+            assert session.runtime is first_runtime
+            assert len(window._board.navigations) == 1
+
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            assert len(instances) == 2
+            assert session.runtime is instances[1]
+            assert session.runtime is not first_runtime
+            assert len(window._board.navigations) == 2
+            kind, url, observed = window._board.navigations[1]
+            assert kind in {"setUrl", "reload"}
+            assert url == _SAME_BOARD_URL
+            assert observed is instances[1]
+            assert window._visible
+            assert session.claims.held
+            assert window._status.text() == f"Workspace: {second.resolve()}"
+
+            window._quit.click()
+            assert not session.claims.held
+
+
+def test_change_workspace_retry_after_failed_start_navigates_once_to_the_restarted_runtime():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        failures = {
+            second.resolve(): [
+                RuntimeError("injected startup failure"),
+                RuntimeError("injected repeated startup failure"),
+            ]
+        }
+        with _home_patches(home)[0], patch.object(
+            desktop,
+            "ApplicationRuntime",
+            _replaceable_runtime_type(instances, start_failures=failures),
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = _observed_window(session)
+            window.show()
+            assert window._open_board()
+            first_runtime = session.runtime
+
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            assert session.snapshot.status == "runtime_blocked"
+            assert session.runtime is None
+            assert len(window._board.navigations) == 1
+            assert window._retry.text() == "Retry"
+            assert window._retry.isEnabled()
+
+            with patch.object(
+                session, "retry_runtime", wraps=session.retry_runtime
+            ) as retry_runtime, patch.object(
+                session, "retry_workspace_switch", wraps=session.retry_workspace_switch
+            ) as retry_workspace_switch:
+                window._retry.click()
+                assert retry_runtime.call_count == 1
+                assert session.snapshot.status == "runtime_blocked"
+                assert session.runtime is None
+                assert len(window._board.navigations) == 1
+
+                window._retry.click()
+                assert retry_runtime.call_count == 2
+                assert retry_workspace_switch.call_count == 0
+
+            assert len(instances) == 4
+            assert session.runtime is instances[3]
+            assert session.runtime is not first_runtime
+            assert len(window._board.navigations) == 2
+            kind, url, observed = window._board.navigations[1]
+            assert kind in {"setUrl", "reload"}
+            assert url == _SAME_BOARD_URL
+            assert observed is instances[3]
+            assert window._visible
+            assert session.claims.held
+            window._quit.click()
+            assert not session.claims.held
+
+
+def test_change_workspace_unverified_commit_retry_navigates_once_to_the_restarted_runtime():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = _observed_window(session)
+            window.show()
+            assert window._open_board()
+            first_runtime = session.runtime
+
+            window._change.click()
+            window._root.setText(str(second))
+            with _fail_verification_once(paths, second):
+                window._save.click()
+            assert session.unverified
+            assert session.runtime is None
+            assert len(window._board.navigations) == 1
+            assert window._retry.text() == "Retry"
+
+            with patch.object(
+                session, "retry_workspace_switch", wraps=session.retry_workspace_switch
+            ) as retry_workspace_switch, patch.object(
+                session, "retry_runtime", wraps=session.retry_runtime
+            ) as retry_runtime:
+                window._retry.click()
+                assert retry_workspace_switch.call_count == 1
+                assert retry_runtime.call_count == 0
+
+            assert not session.unverified
+            assert session.configuration == state.Configuration(second.resolve())
+            assert session.runtime is instances[1]
+            assert session.runtime is not first_runtime
+            assert len(window._board.navigations) == 2
+            kind, url, observed = window._board.navigations[1]
+            assert kind in {"setUrl", "reload"}
+            assert url == _SAME_BOARD_URL
+            assert observed is instances[1]
+            window._quit.click()
+            assert not session.claims.held
+
+
+@pytest.mark.parametrize("failed_save", [True, False], ids=["after_failed_save", "without_save"])
+def test_cancel_after_change_keeps_the_current_workspace_and_clears_the_chooser_error(
+    failed_save,
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            before = paths.config_file.read_bytes()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = _observed_window(session)
+            window.show()
+            assert window._open_board()
+            current_runtime = session.runtime
+            assert not window._cancel.isEnabled()
+
+            window._change.click()
+            assert window._cancel.isEnabled()
+            if failed_save:
+                window._root.setText(str(root / "missing"))
+                window._save.click()
+                assert session.snapshot.status == "configured"
+                assert session.pending_error == "Nyx workspace could not be validated"
+                assert window._status.text() == "Nyx workspace could not be validated"
+                assert window._cancel.isEnabled()
+            else:
+                window._root.setText(str(root / "not-saved"))
+
+            with patch.object(session, "cancel", wraps=session.cancel) as cancel:
+                window._cancel.click()
+                assert cancel.call_count == 1
+
+            assert window._visible
+            assert session.claims.held
+            assert session.runtime is current_runtime
+            assert len(instances) == 1
+            assert paths.config_file.read_bytes() == before
+            assert window._root.text() == str(first.resolve())
+            assert window._status.text() == f"Workspace: {first.resolve()}"
+            assert session.pending_error is None
+            assert window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+            assert not window._root.isEnabled()
+            assert len(window._board.navigations) == 1
+
+            window._quit.click()
+            assert not session.claims.held
+
+
+def test_first_run_cancel_is_disabled_and_quit_releases_claims_without_configuration():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        with _home_patches(home)[0]:
+            session = desktop.DesktopSession()
+            paths = state.state_paths()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert session.snapshot.status == "not_configured"
+            assert window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+
+            session.cancel()
+            assert session.claims.held
+            assert session.snapshot.status == "not_configured"
+            assert not paths.config_file.exists()
+
+            window._quit.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert not paths.config_file.exists()
+            assert NativeClaim.probe(paths.runtime_directory / "lease.lock") == "free"
+            assert NativeClaim.probe(paths.runtime_directory / "recovery.lock") == "free"
+
+
+_RECOVERY_STATES = {
+    # state: (label, enabled, session method a click runs, or None)
+    "board_failed_shutdown_blocked": ("Close", True, "close"),
+    "switch_blocked": ("Retry", True, "retry_workspace_switch"),
+    "unverified_commit": ("Retry", True, "retry_workspace_switch"),
+    "runtime_blocked": ("Retry", True, "retry_runtime"),
+    "runtime_port_unavailable": ("Retry", True, "retry_runtime"),
+    "recovery_blocked": ("Retry", True, "retry_runtime"),
+    "shutdown_blocked": ("Close", True, "close"),
+    "configured": ("Retry", False, None),
+    "not_configured": ("Retry", False, None),
+    "unavailable": ("Retry", False, None),
+}
+_SPIED_SESSION_METHODS = ("retry_workspace_switch", "retry_runtime", "revalidate", "close")
+
+
+@pytest.mark.parametrize("state_name", list(_RECOVERY_STATES))
+def test_recovery_button_label_enablement_and_action_agree_with_cancel_disabled(state_name):
+    assert desktop.BOARD_FAILURE_MESSAGE == "Nyx board could not be displayed; choose Close"
+    label, enabled, method = _RECOVERY_STATES[state_name]
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        failures = {}
+        control = {"shutdown": True}
+        former_worker = None
+        runtime_type = _replaceable_runtime_type(
+            instances, start_failures=failures, control=control
+        )
+        with _home_patches(home)[0], patch.object(desktop, "ApplicationRuntime", runtime_type):
+            paths = state.state_paths(create=True)
+            if state_name == "unavailable":
+                paths.config_file.write_text("not json\n", encoding="utf-8")
+                os.chmod(paths.config_file, 0o600)
+            elif state_name != "not_configured":
+                state.setup(first)
+            if state_name == "recovery_blocked":
+                former_worker = NativeClaim(paths.runtime_directory / "recovery.lock")
+                assert former_worker.acquire(blocking=False)
+            if state_name == "runtime_blocked":
+                failures[first.resolve()] = [RuntimeError("injected startup failure")]
+            if state_name == "runtime_port_unavailable":
+                failures[first.resolve()] = [
+                    app_runtime.ApplicationPortUnavailableError("injected bind failure")
+                ]
+            session = desktop.DesktopSession()
+            if session.snapshot.status == "configured":
+                with contextlib.suppress(desktop.DesktopUnavailableError):
+                    session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            window._open_board()
+
+            if state_name == "board_failed_shutdown_blocked":
+                control["shutdown"] = False
+                window._board.loadFinished.emit(False)
+                assert window._board_failed
+                assert session.shutdown_blocked
+            elif state_name == "switch_blocked":
+                control["shutdown"] = False
+                window._change.click()
+                window._root.setText(str(second))
+                window._save.click()
+                assert session.snapshot.status == "switch_blocked"
+            elif state_name == "unverified_commit":
+                window._change.click()
+                window._root.setText(str(second))
+                with _fail_verification_once(paths, second):
+                    window._save.click()
+                assert session.unverified
+                assert session.snapshot.status == "unavailable"
+            elif state_name == "runtime_blocked":
+                assert session.snapshot.status == "runtime_blocked"
+                assert window._status.text() == "Nyx runtime could not start; retry"
+            elif state_name == "runtime_port_unavailable":
+                assert session.snapshot.status == "runtime_blocked"
+                assert window._status.text() == runtime.PORT_UNAVAILABLE_MESSAGE
+            elif state_name == "recovery_blocked":
+                assert session.snapshot.status == "recovery_blocked"
+            elif state_name == "shutdown_blocked":
+                control["shutdown"] = False
+                window._quit.click()
+                assert session.snapshot.status == "shutdown_blocked"
+                assert window._visible
+            elif state_name == "configured":
+                assert session.snapshot.status == "configured"
+                assert session.runtime is not None
+            elif state_name == "not_configured":
+                assert session.snapshot.status == "not_configured"
+            else:
+                assert session.snapshot.status == "unavailable"
+                assert not session.switch_retryable
+
+            assert window._retry.text() == label
+            assert window._retry.isEnabled() is enabled
+            assert not window._cancel.isEnabled()
+            assert window._visible
+            assert session.claims.held or state_name == "recovery_blocked"
+
+            with contextlib.ExitStack() as stack:
+                spies = {
+                    name: stack.enter_context(
+                        patch.object(session, name, wraps=getattr(session, name))
+                    )
+                    for name in _SPIED_SESSION_METHODS
+                }
+                window._retry.click()
+                for name, spy in spies.items():
+                    if name == method:
+                        expected_calls = 1
+                    elif name == "revalidate" and method == "retry_workspace_switch":
+                        # Retrying a switch re-reads the configuration itself.
+                        expected_calls = 1
+                    else:
+                        expected_calls = 0
+                    assert spy.call_count == expected_calls, (name, spy.call_count)
+
+            if method == "close":
+                # Shutdown is still blocked, so the window stays and offers Close again.
+                assert window._visible
+                assert session.claims.held
+                assert window._retry.text() == "Close"
+                assert window._retry.isEnabled()
+            assert window._retry.text() != "Revalidate"
+
+            control["shutdown"] = True
+            if former_worker is not None:
+                former_worker.close()
+            session.close()
+            assert not session.claims.held
 
 
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
@@ -3334,6 +3820,105 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                     / desktop.PRESENTATION_DIRECTORY,
                 )
                 session.close()
+            assert released
+
+
+def _titled_workspace(root: Path, name: str, titles) -> Path:
+    """A workspace whose Queue packages carry exactly the given card titles."""
+
+    workspace = _workspace(root, name)
+    for index, title in enumerate(titles):
+        directory = workspace / "Project" / "Queue" / f"package-{index}"
+        directory.mkdir(parents=True)
+        (directory / "spec.md").write_text(
+            f"# {title}\nTarget repo: Project\n", encoding="utf-8"
+        )
+    return workspace
+
+
+def _wait_for_board_titles(application, page, titles, timeout: float = 60.0, probe=None):
+    """Poll the rendered board until every given title is shown.
+
+    The view keeps the previous document while a replacement navigation is
+    in flight, so an observation can briefly be missing or come from either
+    document; only the deadline turns that into a failure.
+    """
+
+    deadline = time.monotonic() + timeout
+    raw = None
+    snapshot = None
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            raw = _eval_js(application, page, _BOARD_JSON_SNAPSHOT_SCRIPT, timeout=15.0)
+            snapshot = _parse_board_observation(raw, probe)
+        except AssertionError as error:
+            last_error = error
+        else:
+            if snapshot.get("boardReady") and set(titles) <= set(snapshot.get("titles", [])):
+                return snapshot
+        _pump_native_events(application, 50)
+    raise AssertionError(
+        f"titles {sorted(titles)!r} never rendered (last observation error: "
+        f"{last_error}): " + _board_diagnostic(snapshot, probe, raw)
+    )
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_change_workspace_save_replaces_the_rendered_board():
+    _assert_native_host_has_no_offscreen_platform()
+    port = _free_loopback_port()
+    first_titles = ("Amber harbor", "Amber lantern")
+    second_titles = ("Cobalt meadow",)
+    with _native_temp_home() as root:
+        home = _home(root)
+        first = _titled_workspace(root, "first", first_titles)
+        second = _titled_workspace(root, "second", second_titles)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(runtime, "PORT", port),
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            first_runtime = session.runtime
+            assert first_runtime is not None and first_runtime.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            released = None
+            try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=first_runtime.board_url())
+                # Opened exactly as the desktop entry does, with one call.
+                assert window._open_board()
+                initial = _wait_for_json_board(application, page, probe=probe)
+                assert set(first_titles) <= set(initial["titles"])
+                assert not set(second_titles) & set(initial["titles"])
+
+                window._change.click()
+                window._root.setText(str(second))
+                window._save.click()
+
+                assert state.load_configuration() == state.Configuration(second.resolve())
+                replaced = _wait_for_board_titles(
+                    application, page, second_titles, probe=probe
+                )
+                assert not set(first_titles) & set(replaced["titles"]), replaced["titles"]
+                assert window.isVisible()
+                assert session.claims.held
+                assert session.runtime is not None
+                assert session.runtime is not first_runtime
+            finally:
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
             assert released
 
 
