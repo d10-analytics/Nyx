@@ -26,7 +26,7 @@ APPLICATION_CLAIM_FILENAME = "lease.lock"
 RECOVERY_CLAIM_FILENAME = "recovery.lock"
 ALREADY_OPEN_MESSAGE = "Nyx is already open"
 UNAVAILABLE_MESSAGE = "Nyx is unavailable"
-BOARD_FAILURE_MESSAGE = "Nyx board could not be displayed; retry"
+BOARD_FAILURE_MESSAGE = "Nyx board could not be displayed; choose Close"
 PRESENTATION_PROFILE_NAME = "nyx-presentation"
 PRESENTATION_DIRECTORY = "presentation"
 
@@ -561,9 +561,17 @@ class DesktopSession:
         return configuration
 
     def cancel(self) -> None:
-        """Cancel the chooser without changing persisted state."""
+        """Abandon a replacement choice while the current workspace stays open.
 
-        self.close()
+        Only a chooser failure can leave an error while a configured workspace
+        is current, so cancelling clears it.  Claims, the runtime, and the
+        persisted configuration are untouched, and the session never closes.
+        """
+
+        if self._closed:
+            return
+        if self.snapshot.status == "configured" and not self._switch_in_progress:
+            self._pending_error = None
 
     def close(self) -> None:
         if self._closed:
@@ -634,20 +642,22 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self.resize(720, 460)
             self._session = session
             self._board_failed = False
-            self._board_opened = False
+            # The runtime object the view last navigated to; a different
+            # admitted runtime after a user action means the board is stale.
+            self._board_runtime: Any = None
             self._root = QtWidgets.QLineEdit(self)
             self._status = QtWidgets.QLabel(self)
             self._status.setWordWrap(True)
             self._change = QtWidgets.QPushButton("Change workspace", self)
             self._save = QtWidgets.QPushButton("Save workspace", self)
             self._cancel = QtWidgets.QPushButton("Cancel", self)
-            self._retry = QtWidgets.QPushButton("Revalidate", self)
+            self._retry = QtWidgets.QPushButton("Retry", self)
             self._quit = QtWidgets.QPushButton("Quit", self)
             self._changing = self._session.snapshot.status == "not_configured"
             self._change.clicked.connect(self._begin_change)
             self._save.clicked.connect(self._save_selection)
-            self._cancel.clicked.connect(self.close)
-            self._retry.clicked.connect(self._revalidate)
+            self._cancel.clicked.connect(self._end_change)
+            self._retry.clicked.connect(self._recover)
             self._quit.clicked.connect(self.close)
             form = QtWidgets.QFormLayout()
             form.addRow("Workspace root", self._root)
@@ -710,9 +720,16 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             except RuntimeError:
                 return False
             self._board_failed = False
-            self._board_opened = True
             board.setUrl(QtCore.QUrl(url))
+            self._board_runtime = application
             return True
+
+        def _open_replaced_board(self) -> None:
+            """Navigate once when a user action left a different runtime."""
+
+            application = self._session.runtime
+            if application is not None and application is not self._board_runtime:
+                self._open_board()
 
         def _board_load_finished(self, ok: bool) -> None:
             if ok or self._board_failed:
@@ -740,7 +757,8 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
-                self._retry.setEnabled(True)
+                self._cancel.setEnabled(False)
+                self._render_recovery()
                 return
             if snapshot.status == "configured" and snapshot.configuration is not None:
                 if not self._changing:
@@ -756,7 +774,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._root.setEnabled(self._changing)
                 self._change.setEnabled(not self._changing)
                 self._save.setEnabled(self._changing)
-                self._retry.setEnabled(False)
+                self._cancel.setEnabled(self._changing)
             elif snapshot.status == "not_configured":
                 self._changing = True
                 self._status.setText(
@@ -765,7 +783,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._root.setEnabled(True)
                 self._change.setEnabled(False)
                 self._save.setEnabled(True)
-                self._retry.setEnabled(False)
+                self._cancel.setEnabled(False)
             elif snapshot.status == "switch_blocked":
                 self._status.setText(
                     self._session.pending_error
@@ -774,7 +792,7 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
-                self._retry.setEnabled(True)
+                self._cancel.setEnabled(False)
             else:
                 self._status.setText(
                     self._session.pending_error
@@ -784,15 +802,43 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
-                self._retry.setEnabled(
-                    self._session.unverified
-                    or self._session.recovery_blocked
-                    or self._session.runtime_retryable
-                    or self._session.shutdown_blocked
-                )
+                self._cancel.setEnabled(False)
+            self._render_recovery()
+
+        def _recovery_action(self) -> tuple[str, Any] | None:
+            """Return the recovery button's label and handler, if it applies.
+
+            This is the only derivation of the recovery button: rendering takes
+            its label and enablement from it, and a click runs its handler.
+            """
+
+            if self._board_failed:
+                return "Close", self._settle_board_failure
+            if self._session.switch_retryable:
+                return "Retry", self._retry_workspace_switch
+            if self._session.shutdown_blocked:
+                return "Close", self.close
+            if self._session.recovery_blocked or self._session.runtime_retryable:
+                return "Retry", self._retry_runtime
+            return None
+
+        def _render_recovery(self) -> None:
+            action = self._recovery_action()
+            self._retry.setText("Retry" if action is None else action[0])
+            self._retry.setEnabled(action is not None)
+
+        def _recover(self) -> None:
+            action = self._recovery_action()
+            if action is not None:
+                action[1]()
 
         def _begin_change(self) -> None:
             self._changing = True
+            self._render()
+
+        def _end_change(self) -> None:
+            self._session.cancel()
+            self._changing = False
             self._render()
 
         def _save_selection(self) -> None:
@@ -802,33 +848,23 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._status.setText(str(error))
             else:
                 self._changing = False
-                if not self._board_opened:
-                    self._open_board()
+            self._open_replaced_board()
             self._render()
 
-        def _revalidate(self) -> None:
-            if self._board_failed:
-                self._settle_board_failure()
-                return
+        def _retry_workspace_switch(self) -> None:
+            self._run_retry(self._session.retry_workspace_switch)
+
+        def _retry_runtime(self) -> None:
+            self._run_retry(self._session.retry_runtime)
+
+        def _run_retry(self, operation: Any) -> None:
             try:
-                if self._session.switch_retryable:
-                    self._session.retry_workspace_switch()
-                elif self._session.shutdown_blocked:
-                    self.close()
-                    return
-                elif (
-                    self._session.recovery_blocked
-                    or self._session.runtime_retryable
-                ):
-                    self._session.retry_runtime()
-                else:
-                    self._session.revalidate()
+                operation()
             except DesktopError as error:
                 self._status.setText(str(error))
             else:
                 self._changing = False
-                if not self._board_opened:
-                    self._open_board()
+            self._open_replaced_board()
             self._render()
 
         def closeEvent(self, event: Any) -> None:
