@@ -2092,6 +2092,140 @@ def test_recovery_button_label_enablement_and_action_agree_with_cancel_disabled(
             assert not session.claims.held
 
 
+def test_board_failure_during_change_disables_cancel_and_offers_close():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._change.click()
+            assert window._cancel.isEnabled()
+
+            control["shutdown"] = False
+            window._board.loadFinished.emit(False)
+
+            assert window._board_failed
+            assert session.shutdown_blocked
+            assert window._visible
+            assert not window._cancel.isEnabled()
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert window._retry.text() == "Close"
+            assert window._retry.isEnabled()
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+
+
+@pytest.mark.parametrize("blocked", ["switch_blocked", "runtime_blocked"])
+def test_session_cancel_keeps_a_blocked_state_error_and_never_closes(blocked):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        control = {"shutdown": True}
+        failures = {}
+        with _home_patches(home)[0], patch.object(
+            desktop,
+            "ApplicationRuntime",
+            _replaceable_runtime_type(instances, start_failures=failures, control=control),
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            if blocked == "switch_blocked":
+                control["shutdown"] = False
+            else:
+                failures[second.resolve()] = [RuntimeError("injected startup failure")]
+            with contextlib.suppress(desktop.DesktopError):
+                session.choose_workspace(second)
+            assert session.snapshot.status == blocked
+            error = session.pending_error
+            assert error is not None
+            current_runtime = session.runtime
+            configuration_bytes = paths.config_file.read_bytes()
+
+            session.cancel()
+
+            assert session.pending_error == error
+            assert session.snapshot.status == blocked
+            assert session.claims.held
+            assert session.runtime is current_runtime
+            assert paths.config_file.read_bytes() == configuration_bytes
+
+            control["shutdown"] = True
+            session.close()
+            assert not session.claims.held
+
+
+def test_retryable_change_with_unreadable_configuration_offers_switch_retry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        control = {"shutdown": False}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+            assert session.snapshot.status == "switch_blocked"
+
+            # The configuration becomes unreadable before the switch is retried.
+            paths.config_file.write_text("not json\n", encoding="utf-8")
+            window._retry.click()
+
+            assert session.snapshot.status == "unavailable"
+            assert session.switch_retryable
+            assert not session.unverified
+            assert window._retry.text() == "Retry"
+            assert window._retry.isEnabled()
+            assert not window._cancel.isEnabled()
+
+            with contextlib.ExitStack() as stack:
+                spies = {
+                    name: stack.enter_context(
+                        patch.object(session, name, wraps=getattr(session, name))
+                    )
+                    for name in _SPIED_SESSION_METHODS
+                }
+                window._retry.click()
+                assert spies["retry_workspace_switch"].call_count == 1
+                assert spies["retry_runtime"].call_count == 0
+                assert spies["close"].call_count == 0
+                # Only the switch retry's own configuration re-read.
+                assert spies["revalidate"].call_count == 1
+
+            control["shutdown"] = True
+            session.close()
+            assert not session.claims.held
+
+
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
     try:
         capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
