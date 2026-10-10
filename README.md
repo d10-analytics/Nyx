@@ -146,8 +146,8 @@ that work and exits only after cleanup completes. Use **Change workspace** to
 stop, save, and restart; **Cancel** abandons the change and returns to the
 current workspace without quitting. Use **Retry** when an incomplete stop or an
 unexpected crash recovery is still blocked, and **Close** to finish a blocked
-close. See [running Nyx](docs/running-nyx.md) for the
-desktop actions and their limits.
+close or a board-display failure. See [running Nyx](docs/running-nyx.md) for
+the desktop actions and their limits.
 
 ## Track your own work
 
