@@ -197,7 +197,8 @@ The application serves one local account through the fixed loopback address and
 does not edit specifications. It has no automatic startup, auto-update, remote
 or shared hosting, cross-host configuration synchronization, or agent
 execution. Configuration and runtime state still live under `.nyx` in your home
-directory.
+directory. On Linux the desktop application refuses to start and directs you to
+use the `nyx` console entry instead.
 
 ## Read and refresh the board
 

@@ -335,6 +335,8 @@ from types import SimpleNamespace
 
 from nyx import desktop, worker
 
+desktop.runtime.desktop_host = lambda: True
+
 phase = os.environ["NYX_TEST_CRASH_PHASE"]
 marker_root = Path(os.environ["NYX_TEST_MARKER_ROOT"])
 desktop.runtime.PORT = int(os.environ["NYX_TEST_PORT"])
@@ -426,12 +428,56 @@ desktop._load_qt = lambda: {
 raise SystemExit(desktop.main([]))
 """
 
+_DESKTOP_ENTRY_CODE = (
+    "from nyx import desktop, runtime; "
+    "runtime.desktop_host = lambda: True; "
+    "raise SystemExit(desktop.main([]))"
+)
+
 
 def _wait_for_path(path: Path, timeout: float = 8.0) -> None:
     deadline = time.monotonic() + timeout
     while not path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert path.exists(), f"timed out waiting for {path.name}"
+
+
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="platform check only refuses on unsupported platforms",
+)
+def test_unsupported_platform_subprocess_exits_without_creating_home_tree():
+    """P1: Linux natural trigger — real subprocess, real filesystem."""
+    with TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["USERPROFILE"] = str(home)
+        environment.pop("PYTHONHOME", None)
+        result = subprocess.run(
+            [sys.executable, "-m", "nyx.desktop"],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert result.stderr == f"{desktop.UNSUPPORTED_PLATFORM_MESSAGE}\n"
+        assert list(home.iterdir()) == []
+
+
+def test_unsupported_platform_refuses_before_session_construction(capsys):
+    """P2: every OS — raising double proves check precedes session."""
+    sentinel = RuntimeError("DesktopSession must not be called")
+    with (
+        patch.object(desktop.runtime, "desktop_host", return_value=False),
+        patch.object(desktop, "DesktopSession", side_effect=sentinel),
+    ):
+        assert desktop.main([]) == 2
+    assert capsys.readouterr().err == f"{desktop.UNSUPPORTED_PLATFORM_MESSAGE}\n"
 
 
 def test_module_import_does_not_require_qt(monkeypatch):
@@ -767,7 +813,7 @@ def test_separate_process_reports_busy_without_writing_or_starting_runtime():
                 environment["USERPROFILE"] = str(home)
                 environment.pop("PYTHONHOME", None)
                 result = subprocess.run(
-                    [sys.executable, "-m", "nyx.desktop"],
+                    [sys.executable, "-c", _DESKTOP_ENTRY_CODE],
                     cwd=Path(__file__).parents[1],
                     env=environment,
                     check=False,
@@ -970,7 +1016,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
                         replacement.start_runtime()
 
                 third = subprocess.run(
-                    [sys.executable, "-m", "nyx.desktop"],
+                    [sys.executable, "-c", _DESKTOP_ENTRY_CODE],
                     cwd=Path(__file__).parents[1],
                     env=environment,
                     check=False,
@@ -2658,6 +2704,7 @@ def test_configured_desktop_entry_admits_shared_runtime_before_running_shell():
         _open_board=lambda: calls.append("open_board"),
     )
     with (
+        patch.object(desktop.runtime, "desktop_host", return_value=True),
         patch.object(desktop, "DesktopSession", Session),
         patch.object(desktop, "_load_qt", return_value={"QtWidgets": Widgets}),
         patch.object(desktop, "_build_window", return_value=window),

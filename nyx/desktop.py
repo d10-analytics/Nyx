@@ -27,6 +27,7 @@ RECOVERY_CLAIM_FILENAME = "recovery.lock"
 ALREADY_OPEN_MESSAGE = "Nyx is already open"
 UNAVAILABLE_MESSAGE = "Nyx is unavailable"
 BOARD_FAILURE_MESSAGE = "Nyx board could not be displayed; choose Close"
+UNSUPPORTED_PLATFORM_MESSAGE = "nyx-desktop: the desktop application runs only on Windows and macOS; on Linux use 'nyx'"
 PRESENTATION_PROFILE_NAME = "nyx-presentation"
 PRESENTATION_DIRECTORY = "presentation"
 
@@ -1014,6 +1015,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recovery-path", type=str, help=argparse.SUPPRESS)
     parser.add_argument("--parent-liveness-fd", type=int, help=argparse.SUPPRESS)
     options = parser.parse_args(argv)
+    if not runtime.desktop_host():
+        _report_desktop_error(UNSUPPORTED_PLATFORM_MESSAGE)
+        return 2
     if (
         options.recovery_fd is not None
         or options.recovery_path is not None
