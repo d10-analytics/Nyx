@@ -2769,7 +2769,7 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
     reason="SIGKILL not available on this platform",
 )
 def test_temporary_record_cleaned_up_after_stop(tmp_path):
-    """P3: SIGKILL crash leaves .instance.json.*; stop() sweeps it."""
+    """SIGKILL crash leaves .instance.json.*; stop() sweeps it."""
     paths, _, spec = _fixture(tmp_path)
     instance = runtime.Instance(
         "iid", runtime.URL, "cap", "127.0.0.1:43210"
@@ -2826,7 +2826,7 @@ def test_temporary_record_cleaned_up_after_stop(tmp_path):
 
 
 def test_temporary_record_swept_before_spawn(tmp_path):
-    """P4: sweep precedes daemon spawn."""
+    """Sweep precedes daemon spawn."""
     paths, _, _ = _fixture(tmp_path)
     temp = paths.runtime_directory / ".instance.json.abc123"
     temp.write_bytes(b"leftover")
@@ -2850,7 +2850,7 @@ def test_temporary_record_swept_before_spawn(tmp_path):
 
 
 def test_temporary_record_not_swept_while_lease_held(tmp_path):
-    """P5: held lease means a live writer; sweep must not run."""
+    """Held lease means a live writer; sweep must not run."""
     paths, _, _ = _fixture(tmp_path)
     lease_fd, lease = _held_lease(paths)
     temp = paths.runtime_directory / ".instance.json.abc123"
@@ -2869,7 +2869,7 @@ def test_temporary_record_not_swept_while_lease_held(tmp_path):
 
 @pytest.mark.parametrize("kind", ["malformed", "unsafe"])
 def test_temporary_record_not_swept_after_refused_record(tmp_path, kind):
-    """P6: invalid/unsafe record blocks sweep; leftover remains."""
+    """Invalid/unsafe record blocks sweep; leftover remains."""
     paths, _, _ = _fixture(tmp_path)
     record = paths.runtime_directory / "instance.json"
     leftover = paths.runtime_directory / ".instance.json.leftover"
@@ -2896,7 +2896,7 @@ def test_temporary_record_not_swept_after_refused_record(tmp_path, kind):
 
 
 def test_temporary_record_directory_with_prefix_raises(tmp_path):
-    """P7: directory named .instance.json.x raises RuntimeErrorBase."""
+    """Directory named .instance.json.x raises RuntimeErrorBase."""
     paths, _, _ = _fixture(tmp_path)
     bad = paths.runtime_directory / ".instance.json.x"
     bad.mkdir()
@@ -2909,6 +2909,48 @@ def test_temporary_record_directory_with_prefix_raises(tmp_path):
         assert bad.is_dir()
     finally:
         bad.rmdir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+@pytest.mark.parametrize("argv", [[], ["--stop"]], ids=["start", "stop"])
+def test_unlistable_runtime_directory_reports_bounded_cli_error(
+    tmp_path, monkeypatch, capsys, argv
+):
+    """An unreadable runtime directory refuses the sweep with a CLI error."""
+    from nyx import cli
+
+    paths, _, _ = _fixture(tmp_path)
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+    spawned: list[object] = []
+
+    def refuse_spawn(*args, **kwargs):
+        spawned.append(args)
+        raise AssertionError("daemon spawn must not be reached")
+
+    directory = paths.runtime_directory
+    original_mode = stat.S_IMODE(directory.stat().st_mode)
+    directory.chmod(0o300)
+    try:
+        try:
+            os.listdir(directory)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("directory read permission is not enforced (root?)")
+        with (
+            patch.object(state, "resolve_account_home", return_value=paths.account_home),
+            patch.object(state, "_current_uid", return_value=state._current_uid()),
+            patch.object(runtime, "_spawn_daemon", refuse_spawn),
+        ):
+            result = cli.main(argv)
+    finally:
+        directory.chmod(original_mode)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == "nyx: Nyx stale instance record cannot be removed\n"
+    assert captured.out == ""
+    assert spawned == []
 
 
 @pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])

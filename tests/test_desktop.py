@@ -447,7 +447,7 @@ def _wait_for_path(path: Path, timeout: float = 8.0) -> None:
     reason="platform check only refuses on unsupported platforms",
 )
 def test_unsupported_platform_subprocess_exits_without_creating_home_tree():
-    """P1: Linux natural trigger — real subprocess, real filesystem."""
+    """Linux natural trigger — real subprocess, real filesystem."""
     with TemporaryDirectory() as temporary:
         home = Path(temporary) / "home"
         home.mkdir()
@@ -470,7 +470,7 @@ def test_unsupported_platform_subprocess_exits_without_creating_home_tree():
 
 
 def test_unsupported_platform_refuses_before_session_construction(capsys):
-    """P2: every OS — raising double proves check precedes session."""
+    """Every OS — raising double proves check precedes session."""
     sentinel = RuntimeError("DesktopSession must not be called")
     with (
         patch.object(desktop.runtime, "desktop_host", return_value=False),
