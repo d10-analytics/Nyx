@@ -2770,14 +2770,16 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
 )
 def test_temporary_record_cleaned_up_after_stop(tmp_path):
     """SIGKILL crash leaves .instance.json.*; stop() sweeps it."""
-    paths, _, spec = _fixture(tmp_path)
+    paths, _, _ = _fixture(tmp_path)
     instance = runtime.Instance(
         "iid", runtime.URL, "cap", "127.0.0.1:43210"
     )
-    record_bytes = (json.dumps(instance.as_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    record_bytes = (
+        json.dumps(instance.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
 
     script = textwrap.dedent(f"""\
-        import json, os, signal, sys, tempfile
+        import os, signal, sys
         sys.path.insert(0, {str(Path(__file__).parents[1])!r})
         from nyx import runtime, state
         from unittest.mock import patch
@@ -2849,66 +2851,101 @@ def test_temporary_record_swept_before_spawn(tmp_path):
     assert not temp.exists()
 
 
-def test_temporary_record_not_swept_while_lease_held(tmp_path):
+_LIFECYCLE_OPERATIONS = pytest.mark.parametrize(
+    "operation", ["start", "stop"], ids=["start", "stop"]
+)
+
+
+def _refusing_spawn(*_args, **_kwargs):
+    raise AssertionError("daemon spawn must not be reached")
+
+
+def _run_lifecycle(paths: state.StatePaths, operation: str) -> str:
+    with (
+        patch.object(state, "resolve_account_home", return_value=paths.account_home),
+        patch.object(state, "_current_uid", return_value=state._current_uid()),
+        patch.object(runtime, "_spawn_daemon", _refusing_spawn),
+    ):
+        return getattr(runtime, operation)()
+
+
+@_LIFECYCLE_OPERATIONS
+def test_temporary_record_not_swept_while_lease_held(tmp_path, operation):
     """Held lease means a live writer; sweep must not run."""
     paths, _, _ = _fixture(tmp_path)
     lease_fd, lease = _held_lease(paths)
     temp = paths.runtime_directory / ".instance.json.abc123"
     temp.write_bytes(b"leftover")
     try:
-        with (
-            patch.object(runtime, "_paths", return_value=paths),
-            pytest.raises(Exception),
+        with pytest.raises(
+            runtime.UnhealthyInstanceError, match=r"^Nyx instance is not ready$"
         ):
-            runtime.stop()
-        assert temp.exists()
+            _run_lifecycle(paths, operation)
+        assert temp.read_bytes() == b"leftover"
+        assert not paths.runtime_directory.joinpath("instance.json").exists()
     finally:
         lease.close()
         os.close(lease_fd)
 
 
-@pytest.mark.parametrize("kind", ["malformed", "unsafe"])
-def test_temporary_record_not_swept_after_refused_record(tmp_path, kind):
-    """Invalid/unsafe record blocks sweep; leftover remains."""
+@_LIFECYCLE_OPERATIONS
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        pytest.param("malformed", r"^Nyx instance record is unavailable$", id="malformed"),
+        pytest.param("directory", r"^Nyx instance record is unsafe$", id="directory"),
+        pytest.param("symlink", r"^Nyx instance record is unsafe$", id="symlink"),
+    ],
+)
+def test_temporary_record_not_swept_after_refused_record(
+    tmp_path, operation, kind, message
+):
+    """A refused stale record blocks the sweep; record and leftover remain."""
     paths, _, _ = _fixture(tmp_path)
     record = paths.runtime_directory / "instance.json"
     leftover = paths.runtime_directory / ".instance.json.leftover"
     leftover.write_bytes(b"leftover")
+    target = tmp_path / "foreign-record.json"
     if kind == "malformed":
-        record.write_text("not json", encoding="utf-8")
-    else:
+        record.write_bytes(b"not json")
+    elif kind == "directory":
         record.mkdir()
-    try:
-        with (
-            patch.object(runtime, "_paths", return_value=paths),
-            pytest.raises(Exception),
-        ):
-            runtime.start()
-        assert leftover.exists()
-        if kind == "malformed":
-            assert record.exists()
-        else:
-            assert record.is_dir()
-    finally:
-        if kind != "malformed" and record.is_dir():
-            record.rmdir()
-        leftover.unlink(missing_ok=True)
+    else:
+        _write_runtime_record(paths)
+        target.write_bytes(record.read_bytes())
+        record.unlink()
+        record.symlink_to(target)
+    target_bytes = target.read_bytes() if kind == "symlink" else None
+
+    with pytest.raises(runtime.UnhealthyInstanceError, match=message):
+        _run_lifecycle(paths, operation)
+
+    assert leftover.read_bytes() == b"leftover"
+    if kind == "malformed":
+        assert record.read_bytes() == b"not json"
+    elif kind == "directory":
+        assert record.is_dir()
+        assert list(record.iterdir()) == []
+    else:
+        assert record.is_symlink()
+        assert os.readlink(record) == str(target)
+        assert target.read_bytes() == target_bytes
 
 
-def test_temporary_record_directory_with_prefix_raises(tmp_path):
-    """Directory named .instance.json.x raises RuntimeErrorBase."""
+@_LIFECYCLE_OPERATIONS
+def test_temporary_record_directory_with_prefix_raises(tmp_path, operation):
+    """A directory named like an atomic-write temporary is a bounded error."""
     paths, _, _ = _fixture(tmp_path)
     bad = paths.runtime_directory / ".instance.json.x"
     bad.mkdir()
-    try:
-        with (
-            patch.object(runtime, "_paths", return_value=paths),
-            pytest.raises(runtime.RuntimeErrorBase, match="cannot be removed"),
-        ):
-            runtime.start()
-        assert bad.is_dir()
-    finally:
-        bad.rmdir()
+    with pytest.raises(
+        runtime.RuntimeErrorBase,
+        match=r"^Nyx stale instance record cannot be removed$",
+    ) as raised:
+        _run_lifecycle(paths, operation)
+    assert type(raised.value) is runtime.RuntimeErrorBase
+    assert bad.is_dir()
+    assert list(bad.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
