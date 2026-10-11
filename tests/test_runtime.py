@@ -2764,6 +2764,232 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         return runtime.observe_runtime()
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="SIGKILL not available on this platform",
+)
+def test_temporary_record_cleaned_up_after_stop(tmp_path):
+    """SIGKILL crash leaves .instance.json.*; stop() sweeps it."""
+    paths, _, _ = _fixture(tmp_path)
+    instance = runtime.Instance(
+        "iid", runtime.URL, "cap", "127.0.0.1:43210"
+    )
+    record_bytes = (
+        json.dumps(instance.as_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+
+    script = textwrap.dedent(f"""\
+        import os, signal, sys
+        sys.path.insert(0, {str(Path(__file__).parents[1])!r})
+        from nyx import runtime, state
+        from unittest.mock import patch
+
+        paths = state.state_paths()
+        instance = runtime.Instance(
+            "iid", runtime.URL, "cap", "127.0.0.1:43210"
+        )
+
+        def kill_replace(src, dst):
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        with patch.object(os, "replace", kill_replace):
+            try:
+                runtime._write_instance(paths, instance, deadline=float("inf"))
+            except BaseException:
+                pass
+    """)
+    environment = os.environ.copy()
+    environment["HOME"] = str(paths.account_home)
+    environment.pop("PYTHONHOME", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == -signal.SIGKILL
+    leftovers = list(paths.runtime_directory.glob(".instance.json.*"))
+    assert len(leftovers) == 1
+    assert leftovers[0].read_bytes() == record_bytes
+    assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+    assert _observe(paths).status == "unknown"
+    assert leftovers[0].exists()
+
+    with (
+        patch.object(state, "resolve_account_home", return_value=paths.account_home),
+        patch.object(state, "_current_uid", return_value=state._current_uid()),
+    ):
+        assert runtime.stop() == "stopped"
+
+    assert not list(paths.runtime_directory.glob(".instance.json.*"))
+    assert _observe(paths).status == "not_running"
+
+
+def test_temporary_record_swept_before_spawn(tmp_path):
+    """Sweep precedes daemon spawn."""
+    paths, _, _ = _fixture(tmp_path)
+    temp = paths.runtime_directory / ".instance.json.abc123"
+    temp.write_bytes(b"leftover")
+    captured: list[list[str]] = []
+
+    def fail_spawn(*_args, **_kwargs):
+        captured.append(list(
+            e.name for e in paths.runtime_directory.iterdir()
+            if e.name.startswith(".instance.json.")
+        ))
+        raise RuntimeError("sentinel")
+
+    with (
+        patch.object(runtime, "_paths", return_value=paths),
+        patch.object(runtime, "_spawn_daemon", fail_spawn),
+        pytest.raises(RuntimeError, match="sentinel"),
+    ):
+        runtime.start()
+    assert captured == [[]]
+    assert not temp.exists()
+
+
+_LIFECYCLE_OPERATIONS = pytest.mark.parametrize(
+    "operation", ["start", "stop"], ids=["start", "stop"]
+)
+
+
+def _refusing_spawn(*_args, **_kwargs):
+    raise AssertionError("daemon spawn must not be reached")
+
+
+def _run_lifecycle(paths: state.StatePaths, operation: str) -> str:
+    with (
+        patch.object(state, "resolve_account_home", return_value=paths.account_home),
+        patch.object(state, "_current_uid", return_value=state._current_uid()),
+        patch.object(runtime, "_spawn_daemon", _refusing_spawn),
+    ):
+        return getattr(runtime, operation)()
+
+
+@_LIFECYCLE_OPERATIONS
+def test_temporary_record_not_swept_while_lease_held(tmp_path, operation):
+    """Held lease means a live writer; sweep must not run."""
+    paths, _, _ = _fixture(tmp_path)
+    lease_fd, lease = _held_lease(paths)
+    temp = paths.runtime_directory / ".instance.json.abc123"
+    temp.write_bytes(b"leftover")
+    try:
+        with pytest.raises(
+            runtime.UnhealthyInstanceError, match=r"^Nyx instance is not ready$"
+        ):
+            _run_lifecycle(paths, operation)
+        assert temp.read_bytes() == b"leftover"
+        assert not paths.runtime_directory.joinpath("instance.json").exists()
+    finally:
+        lease.close()
+        os.close(lease_fd)
+
+
+@_LIFECYCLE_OPERATIONS
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        pytest.param("malformed", r"^Nyx instance record is unavailable$", id="malformed"),
+        pytest.param("directory", r"^Nyx instance record is unsafe$", id="directory"),
+        pytest.param("symlink", r"^Nyx instance record is unsafe$", id="symlink"),
+    ],
+)
+def test_temporary_record_not_swept_after_refused_record(
+    tmp_path, operation, kind, message
+):
+    """A refused stale record blocks the sweep; record and leftover remain."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    target = tmp_path / "foreign-record.json"
+    if kind == "malformed":
+        record.write_bytes(b"not json")
+    elif kind == "directory":
+        record.mkdir()
+    else:
+        _write_runtime_record(paths)
+        target.write_bytes(record.read_bytes())
+        record.unlink()
+        record.symlink_to(target)
+    target_bytes = target.read_bytes() if kind == "symlink" else None
+
+    with pytest.raises(runtime.UnhealthyInstanceError, match=message):
+        _run_lifecycle(paths, operation)
+
+    assert leftover.read_bytes() == b"leftover"
+    if kind == "malformed":
+        assert record.read_bytes() == b"not json"
+    elif kind == "directory":
+        assert record.is_dir()
+        assert list(record.iterdir()) == []
+    else:
+        assert record.is_symlink()
+        assert os.path.samefile(record, target)
+        assert target.read_bytes() == target_bytes
+
+
+@_LIFECYCLE_OPERATIONS
+def test_temporary_record_directory_with_prefix_raises(tmp_path, operation):
+    """A directory named like an atomic-write temporary is a bounded error."""
+    paths, _, _ = _fixture(tmp_path)
+    bad = paths.runtime_directory / ".instance.json.x"
+    bad.mkdir()
+    with pytest.raises(
+        runtime.RuntimeErrorBase,
+        match=r"^Nyx stale instance record cannot be removed$",
+    ) as raised:
+        _run_lifecycle(paths, operation)
+    assert type(raised.value) is runtime.RuntimeErrorBase
+    assert bad.is_dir()
+    assert list(bad.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+@pytest.mark.parametrize("argv", [[], ["--stop"]], ids=["start", "stop"])
+def test_unlistable_runtime_directory_reports_bounded_cli_error(
+    tmp_path, monkeypatch, capsys, argv
+):
+    """An unreadable runtime directory refuses the sweep with a CLI error."""
+    from nyx import cli
+
+    paths, _, _ = _fixture(tmp_path)
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+    spawned: list[object] = []
+
+    def refuse_spawn(*args, **kwargs):
+        spawned.append(args)
+        raise AssertionError("daemon spawn must not be reached")
+
+    directory = paths.runtime_directory
+    original_mode = stat.S_IMODE(directory.stat().st_mode)
+    directory.chmod(0o300)
+    try:
+        try:
+            os.listdir(directory)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("directory read permission is not enforced (root?)")
+        with (
+            patch.object(state, "resolve_account_home", return_value=paths.account_home),
+            patch.object(state, "_current_uid", return_value=state._current_uid()),
+            patch.object(runtime, "_spawn_daemon", refuse_spawn),
+        ):
+            result = cli.main(argv)
+    finally:
+        directory.chmod(original_mode)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.err == "nyx: Nyx stale instance record cannot be removed\n"
+    assert captured.out == ""
+    assert spawned == []
+
+
 @pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])
 def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damage):
     try:

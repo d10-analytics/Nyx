@@ -580,22 +580,37 @@ def _write_instance(
 
 
 def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
+    # The temp-file sweep runs only after the record step succeeds: the stale
+    # locator is absent, or it was validated and removed.  Any filesystem
+    # failure in either step, including listing the runtime directory, is
+    # reported as one bounded lifecycle error.
     try:
-        record = _record_path(paths)
-        details = record.lstat()
-        if (
-            stat.S_ISLNK(details.st_mode)
-            or not stat.S_ISREG(details.st_mode)
-        ):
-            raise UnhealthyInstanceError("Nyx instance record is unsafe")
-        # A stale record is still persisted control input.  Validate it at the
-        # same boundary as active lifecycle operations before removing it, so a
-        # malformed endpoint cannot be silently discarded.
-        _read_instance(paths)
-        _require_deadline(deadline)
-        record.unlink()
-    except FileNotFoundError:
-        pass
+        try:
+            record = _record_path(paths)
+            details = record.lstat()
+            if (
+                stat.S_ISLNK(details.st_mode)
+                or not stat.S_ISREG(details.st_mode)
+            ):
+                raise UnhealthyInstanceError("Nyx instance record is unsafe")
+            # A stale record is still persisted control input.  Validate it at
+            # the same boundary as active lifecycle operations before removing
+            # it, so a malformed endpoint cannot be silently discarded.
+            _read_instance(paths)
+            _require_deadline(deadline)
+            record.unlink()
+        except FileNotFoundError:
+            pass
+
+        # Remove leftover atomic-write temporaries that a hard kill between
+        # mkstemp and os.replace can leave behind.
+        for entry in paths.runtime_directory.iterdir():
+            if not entry.name.startswith(".instance.json."):
+                continue
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
     except OSError as error:
         raise RuntimeErrorBase("Nyx stale instance record cannot be removed") from error
 
