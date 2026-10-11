@@ -2928,7 +2928,7 @@ def test_temporary_record_not_swept_after_refused_record(
         assert list(record.iterdir()) == []
     else:
         assert record.is_symlink()
-        assert os.readlink(record) == str(target)
+        assert os.path.samefile(record, target)
         assert target.read_bytes() == target_bytes
 
 
