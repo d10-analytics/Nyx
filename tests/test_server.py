@@ -962,3 +962,346 @@ def test_reported_contract_at_python_acceptance(value, accepted):
         with pytest.raises(ProtocolError) as error:
             parse_catalog(value)
         assert str(error.value) != "catalog digest mismatch"
+
+
+# --- Request framing, close rule and settings-PUT guards (AC-01, AC-05) ---
+
+UNCHANGED_SETTINGS = {"order": ["Queue", "Done"], "completed": ["Done"], "revision": "opaque"}
+
+
+def settings_body(revision="opaque"):
+    return json.dumps(
+        {"revision": revision, "order": [], "completed": []},
+        separators=(",", ":"),
+    ).encode()
+
+
+def embedded_put(port, revision):
+    """A complete savable PUT request; the declared body of every AC-01 vector."""
+    body = settings_body(revision)
+    head = (
+        "PUT /api/settings HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "\r\n"
+    ).encode("ascii")
+    return head + body
+
+
+def raw_request(port, first_line, *, host=None, body=b"", content_length=None, header_lines=()):
+    """Assemble one raw HTTP request; header_lines are emitted verbatim."""
+    lines = [
+        first_line,
+        "Host: " + (host if host is not None else f"127.0.0.1:{port}"),
+        "Content-Type: application/json",
+    ]
+    if content_length is not None:
+        lines.append(f"Content-Length: {content_length}")
+    lines.extend(header_lines)
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1") + body
+
+
+def send_and_drain(port, payload):
+    """Send raw bytes and collect every response byte until close or reset."""
+    chunks = []
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.settimeout(5)
+        try:
+            connection.sendall(payload)
+        except OSError:
+            # The server may close early on an over-bound body before the
+            # client finishes sending; the caller asserts what arrived.
+            return b"".join(chunks)
+        try:
+            while True:
+                piece = connection.recv(65536)
+                if not piece:
+                    break
+                chunks.append(piece)
+        except ConnectionResetError:
+            pass  # a reset after the complete response is accepted
+    return b"".join(chunks)
+
+
+def one_response_with_close(data):
+    """Assert exactly one response with Connection: close; return head and body."""
+    assert data.count(b"HTTP/1.1") == 1
+    head, separator, body = data.partition(b"\r\n\r\n")
+    assert separator
+    assert b"connection: close" in head.lower()
+    return head, body
+
+
+def response_status(head):
+    return int(head.split(b" ", 2)[1])
+
+
+def assert_unchanged_settings(port):
+    status, _, body = request(port, "GET", "/api/settings")
+    assert status == 200
+    assert json.loads(body) == UNCHANGED_SETTINGS
+
+
+DECLARED_BODY_CASES = (
+    "post-root",
+    "post-catalog",
+    "delete-settings",
+    "options-settings",
+    "patch-workspace",
+    "unknown-method",
+    "unknown-method-chunked",
+    "missing-route",
+    "head-index",
+    "get-index",
+    "settings-host-mismatch",
+    "settings-over-bound",
+)
+
+
+def declared_body_vector(name, port, revision):
+    """Build each AC-01 vector; the baseline double-responds and saves the PUT."""
+    put = embedded_put(port, revision)
+    simple = {
+        "post-root": ("POST / HTTP/1.1", 405, b"Method not allowed\n"),
+        "post-catalog": ("POST /api/catalog HTTP/1.1", 405, b"Method not allowed\n"),
+        "delete-settings": ("DELETE /api/settings HTTP/1.1", 405, b"Method not allowed\n"),
+        "options-settings": ("OPTIONS /api/settings HTTP/1.1", 405, b"Method not allowed\n"),
+        "patch-workspace": ("PATCH /api/workspace HTTP/1.1", 405, b"Method not allowed\n"),
+        "unknown-method": ("FOO / HTTP/1.1", 405, b"Method not allowed\n"),
+        "missing-route": ("GET /nope HTTP/1.1", 404, b"Not found\n"),
+        "head-index": ("HEAD / HTTP/1.1", 200, b""),
+        "settings-host-mismatch": ("POST /api/settings HTTP/1.1", 404, b"Not found\n"),
+    }
+    if name == "unknown-method-chunked":
+        return (
+            raw_request(
+                port, "FOO / HTTP/1.1", body=put,
+                header_lines=["Transfer-Encoding: chunked"],
+            ),
+            405,
+            b"Method not allowed\n",
+        )
+    if name == "settings-over-bound":
+        return (
+            raw_request(
+                port, "PUT /api/settings HTTP/1.1", body=put,
+                content_length=1024 * 1024 + 1,
+            ),
+            400,
+            b'{"error":"invalid_payload"}',
+        )
+    if name == "get-index":
+        return (
+            raw_request(port, "GET / HTTP/1.1", body=put, content_length=len(put)),
+            200,
+            server._STATIC_ROOT.joinpath("index.html").read_bytes(),
+        )
+    first_line, status, body = simple[name]
+    host = f"outside.invalid:{port}" if name == "settings-host-mismatch" else None
+    return (
+        raw_request(port, first_line, host=host, body=put, content_length=len(put)),
+        status,
+        body,
+    )
+
+
+@pytest.mark.parametrize("case", DECLARED_BODY_CASES)
+def test_declared_body_requests_are_answered_once_then_closed_without_saving(case):
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        payload, expected_status, expected_body = declared_body_vector(case, port, "opaque")
+        head, body = one_response_with_close(send_and_drain(port, payload))
+        assert response_status(head) == expected_status
+        assert body == expected_body
+        assert settings.calls == []
+        assert_unchanged_settings(port)
+
+
+def test_standalone_settings_put_with_declared_body_is_404_then_close():
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        put = embedded_put(port, "opaque")
+        payload = raw_request(port, "PUT /api/settings HTTP/1.1", body=put, content_length=len(put))
+        head, body = one_response_with_close(send_and_drain(port, payload))
+    assert response_status(head) == 404
+    assert body == b"Not found\n"
+
+
+INVALID_FRAMING_CASES = (
+    "chunked-without-length",
+    "chunked-and-length",
+    "duplicate-length",
+    "plus-prefixed-length",
+    "underscored-length",
+    "non-ascii-length",
+    "zero-padded-length",
+)
+
+
+def invalid_framing_vector(name, port, revision):
+    """Build each AC-01 invalid-framing vector; a lenient parse would save."""
+    body = settings_body(revision)
+    if name == "chunked-without-length":
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body,
+            header_lines=["Transfer-Encoding: chunked"],
+        )
+    if name == "chunked-and-length":
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body,
+            content_length=len(body),
+            header_lines=["Transfer-Encoding: chunked"],
+        )
+    if name == "duplicate-length":
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body,
+            header_lines=[f"Content-Length: {len(body)}", "Content-Length: 0"],
+        )
+    if name == "plus-prefixed-length":
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body,
+            header_lines=[f"Content-Length: +{len(body)}"],
+        )
+    if name == "underscored-length":
+        padded = body.ljust(50)  # int("5_0") == 50
+        assert len(padded) == 50
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=padded,
+            header_lines=["Content-Length: 5_0"],
+        )
+    if name == "non-ascii-length":
+        # The UTF-8 bytes of an Arabic-Indic digit arrive decoded as
+        # ISO-8859-1, so no lenient parser can read them as a number (F-05);
+        # this vector is close-rule coverage only.
+        return raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body,
+            header_lines=["Content-Length: \xd9\xa5"],
+        )
+    assert name == "zero-padded-length"
+    return raw_request(
+        port, "PUT /api/settings HTTP/1.1", body=body,
+        header_lines=[f"Content-Length: {len(body):011d}"],
+    )
+
+
+@pytest.mark.parametrize("case", INVALID_FRAMING_CASES)
+def test_invalid_framing_is_answered_400_then_closed_without_saving(case):
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        payload = invalid_framing_vector(case, port, "opaque")
+        head, body = one_response_with_close(send_and_drain(port, payload))
+        assert response_status(head) == 400
+        assert json.loads(body) == {"error": "invalid_payload"}
+        assert settings.calls == []
+        assert_unchanged_settings(port)
+
+
+def test_invalid_framing_with_mismatched_host_stays_404_and_closes():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        payload = raw_request(
+            port, "PUT /api/settings HTTP/1.1", host=f"outside.invalid:{port}",
+            body=settings_body("opaque"),
+            header_lines=["Transfer-Encoding: chunked"],
+        )
+        head, body = one_response_with_close(send_and_drain(port, payload))
+        assert response_status(head) == 404
+        assert body == b"Not found\n"
+        assert b"text/plain; charset=utf-8" in head
+        assert settings.calls == []
+
+
+def test_valid_settings_put_still_saves_and_closes():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        body = settings_body("opaque")
+        payload = raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body, content_length=len(body)
+        )
+        head, body = one_response_with_close(send_and_drain(port, payload))
+        assert response_status(head) == 200
+        assert json.loads(body)["outcome"] == "success"
+        assert settings.calls == [("opaque", [], [])]
+
+
+def test_pipelined_bodyless_gets_both_answer_on_one_connection():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        pipelined = raw_request(port, "GET /api/settings HTTP/1.1") * 2
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+            connection.settimeout(5)
+            connection.sendall(pipelined)
+            data = b""
+            while data.count(b"HTTP/1.1") < 2:
+                piece = connection.recv(65536)
+                if not piece:
+                    break
+                data += piece
+            try:
+                connection.settimeout(0.5)
+                data += connection.recv(65536)
+            except TimeoutError:
+                pass  # the connection stays open after both responses
+        assert data.count(b"HTTP/1.1") == 2
+        parts = data.split(b"HTTP/1.1")
+        assert len(parts) == 3
+        first_head, _, first_body = parts[1].partition(b"\r\n\r\n")
+        second_head, _, second_body = parts[2].partition(b"\r\n\r\n")
+        assert first_head.startswith(b" 200") and second_head.startswith(b" 200")
+        assert b"connection: close" not in (first_head + second_head).lower()
+        assert json.loads(first_body) == UNCHANGED_SETTINGS
+        assert json.loads(second_body) == UNCHANGED_SETTINGS
+        assert settings.calls == []
+
+
+def test_settings_put_rejects_extra_key_without_saving():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        body = json.dumps(
+            {"revision": "opaque", "order": [], "completed": [], "extra": True}
+        ).encode()
+        status, _, response = request(port, "PUT", "/api/settings", body=body)
+        assert status == 400
+        assert json.loads(response) == {"error": "invalid_payload"}
+        assert settings.calls == []
+        assert_unchanged_settings(port)
+
+
+def test_settings_put_rejects_missing_completed_key_without_saving():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        body = json.dumps({"revision": "opaque", "order": []}).encode()
+        status, _, response = request(port, "PUT", "/api/settings", body=body)
+        assert status == 400
+        assert json.loads(response) == {"error": "invalid_payload"}
+        assert settings.calls == []
+        assert_unchanged_settings(port)
+
+
+def test_settings_put_accepts_a_valid_body_of_exactly_one_mebibyte():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        body = settings_body("opaque").ljust(1024 * 1024)
+        assert len(body) == 1024 * 1024
+        status, _, response = request(port, "PUT", "/api/settings", body=body)
+        assert status == 200
+        assert json.loads(response)["outcome"] == "success"
+        assert settings.calls == [("opaque", [], [])]
+
+
+def test_settings_put_rejects_one_byte_over_the_bound_and_keeps_state():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        body = settings_body("opaque").ljust(1024 * 1024 + 1)
+        assert len(body) == 1024 * 1024 + 1
+        payload = raw_request(
+            port, "PUT /api/settings HTTP/1.1", body=body, content_length=len(body)
+        )
+        data = send_and_drain(port, payload)
+        if data:
+            head, separator, rest = data.partition(b"\r\n\r\n")
+            assert data.startswith(b"HTTP/1.1 400")
+            if separator:
+                assert json.loads(rest) == {"error": "invalid_payload"}
+        assert settings.calls == []
+        assert_unchanged_settings(port)
