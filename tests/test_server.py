@@ -1640,18 +1640,55 @@ EXPECTED_SECURITY_HEADERS = (
 
 
 def assert_security_headers_exactly_once(head: bytes) -> None:
-    """Each D-12 header appears exactly once with its exact value in the block."""
+    """Each D-12 header name appears on exactly one line, carrying its exact value."""
     lines = head.split(b"\r\n")[1:]
     for name, value in EXPECTED_SECURITY_HEADERS:
-        prefix = f"{name.lower()}:".encode()
-        wanted_value = value.lower().encode()
+        wanted_name = name.lower().encode()
         matches = [
-            line
-            for line in lines
-            if line.lower().startswith(prefix)
-            and line[len(prefix) :].strip().lower() == wanted_value
+            line for line in lines
+            if line.partition(b":")[0].strip().lower() == wanted_name
         ]
         assert matches == [f"{name}: {value}".encode()], (name, matches)
+
+
+def _security_head(*extra_lines: bytes, omit: str | None = None) -> bytes:
+    lines = [b"HTTP/1.0 400 Bad Request", b"Content-Type: application/json"]
+    lines += [
+        f"{name}: {value}".encode()
+        for name, value in EXPECTED_SECURITY_HEADERS
+        if name != omit
+    ]
+    return b"\r\n".join(lines + list(extra_lines))
+
+
+def test_security_header_helper_accepts_one_exact_line_per_header():
+    assert_security_headers_exactly_once(_security_head())
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        _security_head(b"X-Frame-Options: SAMEORIGIN"),
+        _security_head(b"x-frame-options: sameorigin"),
+        _security_head(b"X-Content-Type-Options: sniff"),
+        _security_head(b"Content-Security-Policy: default-src *"),
+        _security_head(b"X-Frame-Options: DENY"),
+        _security_head(omit="X-Frame-Options"),
+        _security_head(b"X-Frame-Options: SAMEORIGIN", omit="X-Frame-Options"),
+    ],
+    ids=[
+        "second-different-value",
+        "second-different-value-lowercase-name",
+        "second-nosniff-value",
+        "second-csp-value",
+        "exact-duplicate",
+        "missing",
+        "wrong-value-only",
+    ],
+)
+def test_security_header_helper_rejects_any_other_same_name_line(head):
+    with pytest.raises(AssertionError):
+        assert_security_headers_exactly_once(head)
 
 
 def http_response_with_security_headers(port, method, path):
