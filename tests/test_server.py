@@ -1515,3 +1515,95 @@ def test_default_timeout_and_cap_constants_are_pinned():
         assert created.RequestHandlerClass.timeout == server._CONNECTION_TIMEOUT_SECONDS
     finally:
         created.server_close()
+
+
+EXPECTED_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; "
+    "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+EXPECTED_SECURITY_HEADERS = (
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Content-Security-Policy", EXPECTED_CSP),
+)
+
+
+def assert_security_headers_exactly_once(head: bytes) -> None:
+    """Each D-12 header appears exactly once with its exact value in the block."""
+    lines = head.split(b"\r\n")[1:]
+    for name, value in EXPECTED_SECURITY_HEADERS:
+        prefix = f"{name.lower()}:".encode()
+        wanted_value = value.lower().encode()
+        matches = [
+            line
+            for line in lines
+            if line.lower().startswith(prefix)
+            and line[len(prefix) :].strip().lower() == wanted_value
+        ]
+        assert matches == [f"{name}: {value}".encode()], (name, matches)
+
+
+def http_response_with_security_headers(port, method, path):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection.request(method, path)
+    response = connection.getresponse()
+    body = response.read()
+    seen = {
+        name: response.msg.get_all(name) for name, _ in EXPECTED_SECURITY_HEADERS
+    }
+    connection.close()
+    return response.status, body, seen
+
+
+@pytest.mark.parametrize(
+    "method, path, expected_status",
+    [
+        ("GET", "/", 200),
+        ("GET", "/api/settings", 200),
+        ("GET", "/nope", 404),
+        ("POST", "/", 405),
+        ("HEAD", "/api/catalog", 200),
+    ],
+)
+def test_framing_headers_appear_exactly_once_on_dispatched_responses(
+    method, path, expected_status
+):
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        status, body, seen = http_response_with_security_headers(port, method, path)
+    assert status == expected_status
+    for name, value in EXPECTED_SECURITY_HEADERS:
+        assert seen[name] == [value]
+    if method == "HEAD":
+        assert body == b""
+    if path == "/api/settings":
+        assert json.loads(body) == UNCHANGED_SETTINGS
+    if path == "/" and method == "GET":
+        assert body.startswith(b"<!doctype html")
+    if path == "/" and method == "POST":
+        assert body == b"Method not allowed\n"
+
+
+def test_framing_headers_appear_exactly_once_on_invalid_framing_400():
+    settings = SettingsStub()
+    with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+        payload = invalid_framing_vector("chunked-without-length", port, "opaque")
+        head, body = one_response_with_close(send_and_drain(port, payload))
+    assert response_status(head) == 400
+    assert json.loads(body) == {"error": "invalid_payload"}
+    assert_security_headers_exactly_once(head)
+
+
+def test_framing_headers_on_the_standard_library_414():
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        # Exactly 65,537 request-line bytes with no line terminator: the
+        # stdlib readline limit produces its own 414 response.
+        request_line = b"GET /" + b"a" * 65523 + b" HTTP/1.1"
+        assert len(request_line) == 65537
+        data = send_and_drain(port, request_line)
+    assert data.count(b"HTTP/1.1") == 1
+    head, _, _ = data.partition(b"\r\n\r\n")
+    assert response_status(head) == 414
+    assert_security_headers_exactly_once(head)

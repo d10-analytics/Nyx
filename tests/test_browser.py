@@ -583,12 +583,28 @@ def open_page():
                 server = application.server
                 thread = application.http_thread
             context = browser.new_context(color_scheme=color_scheme)
+            # D-13: record CSP violations for every page and navigation in
+            # this context and assert none at teardown.
+            violations = []
+            context.expose_binding(
+                "__nyxCspViolation", lambda source, entry: violations.append(entry)
+            )
+            context.add_init_script(
+                "window.__cspViolations = [];"
+                "document.addEventListener('securitypolicyviolation', (event) => {"
+                "  const entry = {directive: event.violatedDirective,"
+                "                  blockedURI: event.blockedURI};"
+                "  window.__cspViolations.push(entry);"
+                "  window.__nyxCspViolation(entry);"
+                "});"
+            )
             page = context.new_page()
+            page._nyx_csp_violations = violations
             if init_script:
                 page.add_init_script(init_script)
             page.goto(f"http://127.0.0.1:{server.server_port}/")
             page.wait_for_function(
-                "document.querySelector('#board .card, #board .board-empty, #board-issues')",
+                "() => document.querySelector('#board .card, #board .board-empty, #board-issues')",
                 timeout=15000,
             )
             page.wait_for_timeout(150)
@@ -600,6 +616,9 @@ def open_page():
         finally:
             for application, server, thread, page in created:
                 page.context.close()
+                assert page._nyx_csp_violations == [], (
+                    f"recorded CSP violations: {page._nyx_csp_violations}"
+                )
                 if application is None:
                     server.shutdown()
                     thread.join()
@@ -1866,7 +1885,7 @@ def open_same_board(page):
     other.add_init_script(SETTINGS_LOAD_COUNTER)
     other.goto(page.url)
     other.wait_for_function(
-        "document.querySelector('#board .card, #board .board-empty, #board-issues')",
+        "() => document.querySelector('#board .card, #board .board-empty, #board-issues')",
         timeout=15000,
     )
     return other
@@ -2378,7 +2397,9 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
     )
     page.fill("#filter", "")
     page.click("#refresh")
-    page.wait_for_function("document.querySelectorAll('#board .card').length === 0", timeout=15000)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#board .card').length === 0", timeout=15000
+    )
     assert page.locator("#board-issues").get_attribute("open") is not None
     assert page.locator("#board-issues li").inner_text() == (
         "discovery_unavailable refreshed catalog discovery failure"
@@ -4344,3 +4365,54 @@ def test_cross_origin_no_cors_post_smuggling_never_saves_settings(open_page):
         assert attacker.locator("body").get_attribute("data-smuggle") == "settled"
         attacker.wait_for_timeout(1000)
     assert settings.calls == []
+
+
+def test_frame_from_second_origin_is_blocked_by_frame_ancestors(open_page):
+    """A board framed from a second loopback origin loads a chrome error page (D-13)."""
+    page = open_page(StaticClient(board_payload()))
+    board_port = urlparse(page.url).port
+    markup = (
+        "<!doctype html><html><body>"
+        f'<iframe src="http://127.0.0.1:{board_port}/"></iframe>'
+        "</body></html>"
+    ).encode("ascii")
+    with second_origin_page_server(markup) as attacker_url:
+        attacker_context = page.context.browser.new_context()
+        attacker = attacker_context.new_page()
+        try:
+            attacker.goto(attacker_url)
+            attacker.locator("iframe").wait_for(state="attached", timeout=15000)
+            deadline = time.monotonic() + 15
+            while True:
+                assert len(attacker.frames) > 1, "the board frame never appeared"
+                frame_url = attacker.frames[1].url
+                if frame_url.startswith("chrome-error://"):
+                    break
+                assert time.monotonic() < deadline, (
+                    f"the frame URL never became a chrome error page: {frame_url}"
+                )
+                attacker.wait_for_timeout(200)
+            frame = attacker.frames[1]
+            assert frame.locator("#board").count() == 0
+        finally:
+            attacker_context.close()
+
+
+def test_csp_violation_recorder_records_and_clears(open_page):
+    """The open_page recorder is live: an img-src violation is observed, then cleared."""
+    page = open_page(StaticClient(board_payload()))
+    violations = page._nyx_csp_violations
+    assert violations == []
+    # A data: URI image is outside img-src 'self' and needs no network.
+    page.evaluate(
+        "() => { const img = document.createElement('img');"
+        " img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';"
+        " document.body.append(img); }"
+    )
+    page.wait_for_function(
+        "() => window.__cspViolations.some((v) => v.directive === 'img-src')",
+        timeout=5000,
+    )
+    assert violations, "the context-level recorder never received the violation"
+    assert violations[-1]["directive"] == "img-src"
+    violations.clear()
