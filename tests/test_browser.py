@@ -3,11 +3,15 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlparse
 
 import pytest
-from test_server import raw_catalog, reported_contract_cases
+from test_server import embedded_put, raw_catalog, reported_contract_cases
 
 from nyx.app_runtime import ApplicationRuntime
 from nyx.catalog import scan_catalog
@@ -4282,3 +4286,61 @@ def test_worker_reported_snapshot_round_trips_into_browser(open_page, tmp_path, 
     page = open_page(StaticClient(value))
     page.fill("#filter", "workersearch")
     playwright.expect(page.locator(f'.card[data-package-id="{STEP_ONE}"]')).to_be_visible()
+
+
+@contextmanager
+def second_origin_page_server(markup):
+    """Serve attacker-controlled markup from a real second loopback origin (D-13)."""
+
+    class AttackerPageHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(markup)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(markup)
+
+        def log_message(self, format, *args):
+            return
+
+    page_server = ThreadingHTTPServer(("127.0.0.1", 0), AttackerPageHandler)
+    thread = threading.Thread(target=page_server.serve_forever)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{page_server.server_port}"
+    finally:
+        page_server.shutdown()
+        thread.join()
+        page_server.server_close()
+
+
+def smuggling_page(target_url, payload):
+    """Markup that POSTs raw smuggled bytes at the board origin (F-01)."""
+    return (
+        "<!doctype html><html><body><script>\n"
+        f"const payload = {json.dumps(payload.decode('ascii'))};\n"
+        f"const target = {json.dumps(target_url)};\n"
+        "fetch(target, {method: 'POST', mode: 'no-cors', body: payload})"
+        ".then(() => { document.body.dataset.smuggle = 'settled'; },"
+        " (error) => { document.body.dataset.smuggle = 'failed: ' + error; });\n"
+        "</script></body></html>"
+    ).encode("ascii")
+
+
+def test_cross_origin_no_cors_post_smuggling_never_saves_settings(open_page):
+    settings = BrowserSettings()
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    board_port = urlparse(page.url).port
+    smuggled = embedded_put(board_port, settings.revision)
+    with second_origin_page_server(
+        smuggling_page(f"http://127.0.0.1:{board_port}/", smuggled)
+    ) as attacker_url:
+        attacker = page.context.new_page()
+        attacker.goto(attacker_url)
+        attacker.wait_for_selector("body[data-smuggle]", timeout=15000, state="attached")
+        assert attacker.locator("body").get_attribute("data-smuggle") == "settled"
+        attacker.wait_for_timeout(1000)
+    assert settings.calls == []
