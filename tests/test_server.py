@@ -1504,13 +1504,21 @@ def test_owned_shutdown_completes_while_the_cap_is_full():
 
 def test_injected_handler_thread_start_failure_releases_the_slot():
     cap = CONNECTION_CAP
+    # AC-03 floors the patched timeout at 2 s; this proof uses 10 s so every
+    # holder's handler thread stays alive through the whole spawn window:
+    # with t = 2 s a holder thread dies about t after its accept (the
+    # handler's blocked readline times out and the stdlib closes the
+    # connection), so on a slow hosted runner the last holder can be
+    # accepted after earlier holders already expired and no wait deadline
+    # can ever observe cap simultaneously live threads.
+    hold_timeout = 10
     client = StubClient(catalog=valid_catalog())
 
     class FailingThread(threading.Thread):
         def start(self):
             raise RuntimeError("injected thread-start failure")
 
-    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", hold_timeout), patch.object(
         server, "_MAX_ACTIVE_CONNECTIONS", cap
     ):
         with RunningServer(client) as port:
@@ -1521,16 +1529,41 @@ def test_injected_handler_thread_start_failure_releases_the_slot():
             with patch.object(threading, "Thread", FailingThread):
                 connection = open_connection(port)
                 connection.sendall(raw_request(port, "GET / HTTP/1.1"))
-                data = read_until_refused(connection, CONNECTION_TIMEOUT + 1)
+                data = read_until_refused(connection, hold_timeout + 1)
                 connection.close()
             assert b"HTTP/1.1" not in data  # closed without a response
+
+            peak = [0]
+
+            def wait_live(expected):
+                def check():
+                    live = handler_thread_count() - baseline
+                    peak[0] = max(peak[0], live)
+                    return live >= expected
+
+                return check
+
             # The released slot leaves room for c concurrent partial
-            # connections, all accepted afterwards. The long deadline
-            # tolerates slow hosted runners without weakening the count.
-            holders = [hold_connection(port) for _ in range(cap)]
-            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 15)
-            for connection in holders:
-                connection.close()
+            # connections, all accepted afterwards. Each holder's thread is
+            # confirmed live before the next holder opens, so expiry timing
+            # cannot keep the live count from reaching the cap; the peak
+            # tracked across the waits keeps the acceptance
+            # expiry-agnostic. If the slot were not released, the third
+            # holder would be refused and its handler thread would never
+            # start, so the peak could never reach c.
+            holders = []
+            try:
+                for expected in range(1, cap + 1):
+                    holders.append(hold_connection(port))
+                    assert wait_for(wait_live(expected), hold_timeout), (
+                        f"only {peak[0]} of {expected} handler threads went live"
+                    )
+                assert peak[0] >= cap, (
+                    f"live handler threads peaked at {peak[0]}, never reaching cap {cap}"
+                )
+            finally:
+                for connection in holders:
+                    connection.close()
 
 
 def test_default_timeout_and_cap_constants_are_pinned():
