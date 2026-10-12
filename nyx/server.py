@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 from collections.abc import Callable
@@ -26,6 +27,10 @@ _STATIC = {
     "/static/Anta-Regular.ttf": ("Anta-Regular.ttf", "font/ttf"),
 }
 _API_ROUTES = frozenset({"/api/catalog", "/api/settings", "/api/workspace"})
+# A declared Content-Length must be 1-10 ASCII digits after SP/HTAB
+# stripping (D-10); a lenient int() parse would accept "+5", "5_0" and
+# arbitrarily long zero padding.
+_DECLARED_LENGTH = re.compile(r"[0-9]{1,10}")
 _SAFE_ERRORS = frozenset(
     {
         "producer_unavailable",
@@ -112,12 +117,37 @@ def _handler_for(
                 f"localhost:{expected_port}",
             }
 
+        def _body_length(self) -> int | None:
+            """Own the request's declared body framing (D-10).
+
+            No body declaration or a single Content-Length of 1-10 ASCII
+            digits (SP/HTAB stripped) is a length; any Transfer-Encoding, a
+            duplicate Content-Length, or any other value is invalid framing.
+            """
+            if self.headers.get_all("Transfer-Encoding"):
+                return None
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) > 1:
+                return None
+            if not lengths:
+                return 0
+            value = lengths[0].strip(" \t")
+            if _DECLARED_LENGTH.fullmatch(value) is None:
+                return None
+            return int(value)
+
         def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+            length = self._body_length()
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                if length is None or length > 0:
+                    # D-01: a declared or invalid body always closes, so every
+                    # dispatch branch and every settings-PUT exit inherits the
+                    # rule without per-path tracking.
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(body)
@@ -159,11 +189,8 @@ def _handler_for(
             if settings is None or not hasattr(settings, "save_settings"):
                 self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
                 return
-            try:
-                length = int(self.headers.get("Content-Length", "-1"))
-            except ValueError:
-                length = -1
-            if length < 0 or length > 1024 * 1024:
+            length = self._body_length()
+            if length is None or length > 1024 * 1024:
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
                 return
             try:
@@ -209,6 +236,15 @@ def _handler_for(
         def _dispatch(self) -> None:
             if not self._host_allowed():
                 self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            if self._body_length() is None:
+                # D-10: invalid framing is answered 400 after the Host check
+                # (AR-02: Host-mismatch output stays 404); _send closes.
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes({"error": "invalid_payload"}),
+                    "application/json",
+                )
                 return
             if self.path == "/api/settings":
                 if self.command in {"GET", "HEAD"}:
