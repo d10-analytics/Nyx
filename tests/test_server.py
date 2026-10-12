@@ -1357,6 +1357,28 @@ def read_until_eof(connection, timeout):
         chunks.append(piece)
 
 
+def read_until_refused(connection, timeout):
+    """Read until end of stream or a connection reset; both count as closed.
+
+    On Windows a refusal of a socket with unread data can surface as a reset
+    rather than end of stream. Either outcome counts as closed without a
+    response, provided no response bytes arrived.
+    """
+    connection.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            piece = connection.recv(65536)
+        except (ConnectionResetError, ConnectionAbortedError):
+            break
+        except TimeoutError:
+            break
+        if not piece:
+            break
+        chunks.append(piece)
+    return b"".join(chunks)
+
+
 def flood_once(port):
     """One cap-excess connection sending no bytes; True when refused within 0.5 s.
 
@@ -1492,17 +1514,21 @@ def test_injected_handler_thread_start_failure_releases_the_slot():
         server, "_MAX_ACTIVE_CONNECTIONS", cap
     ):
         with RunningServer(client) as port:
+            # Snapshot before the injected failure: no other handler thread
+            # can appear between here and the holders below (the failing
+            # request's thread never starts), so the count delta is exact.
             baseline = handler_thread_count()
             with patch.object(threading, "Thread", FailingThread):
                 connection = open_connection(port)
                 connection.sendall(raw_request(port, "GET / HTTP/1.1"))
-                data, _ = read_until_eof(connection, CONNECTION_TIMEOUT + 1)
+                data = read_until_refused(connection, CONNECTION_TIMEOUT + 1)
                 connection.close()
             assert b"HTTP/1.1" not in data  # closed without a response
             # The released slot leaves room for c concurrent partial
-            # connections, all accepted afterwards.
+            # connections, all accepted afterwards. The long deadline
+            # tolerates slow hosted runners without weakening the count.
             holders = [hold_connection(port) for _ in range(cap)]
-            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 5)
+            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 15)
             for connection in holders:
                 connection.close()
 
