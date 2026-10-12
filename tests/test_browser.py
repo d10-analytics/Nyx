@@ -554,18 +554,35 @@ class RootSwitchSettings(BrowserSettings):
 
 
 @contextmanager
-def page_launcher():
+def page_launcher(launch_timeout_ms=15000):
     """Yield a page launcher; teardown stops every server before asserting."""
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
         created = []
 
+        def stop_server(application, server, thread):
+            """Stop one launched server; return False if the application did not stop."""
+            if application is None:
+                try:
+                    server.shutdown()
+                    thread.join()
+                finally:
+                    server.server_close()
+                return True
+            return application.shutdown(time.monotonic() + 2) is True
+
         def launch(client, *, color_scheme="light", init_script=None, settings=None):
             application = None
+            server = None
+            thread = None
             if settings is None:
                 server = create_server(client)
                 thread = threading.Thread(target=server.serve_forever)
-                thread.start()
+                try:
+                    thread.start()
+                except BaseException:
+                    server.server_close()
+                    raise
             else:
                 application = ApplicationRuntime(
                     port=0,
@@ -580,35 +597,55 @@ def page_launcher():
                 application.get_workspace = settings.get_workspace
                 application.save_settings = settings.save_settings
                 client.settings = settings
-                application.start(static_ready=lambda: True)
-                server = application.server
-                thread = application.http_thread
-            context = browser.new_context(color_scheme=color_scheme)
-            # D-13: record CSP violations for every page and navigation in
-            # this context and assert none at teardown.
-            violations = []
-            context.expose_binding(
-                "__nyxCspViolation", lambda source, entry: violations.append(entry)
-            )
-            context.add_init_script(
-                "window.__cspViolations = [];"
-                "document.addEventListener('securitypolicyviolation', (event) => {"
-                "  const entry = {directive: event.violatedDirective,"
-                "                  blockedURI: event.blockedURI};"
-                "  window.__cspViolations.push(entry);"
-                "  window.__nyxCspViolation(entry);"
-                "});"
-            )
-            page = context.new_page()
-            page._nyx_csp_violations = violations
-            if init_script:
-                page.add_init_script(init_script)
-            page.goto(f"http://127.0.0.1:{server.server_port}/")
-            page.wait_for_function(
-                "() => document.querySelector('#board .card, #board .board-empty, #board-issues')",
-                timeout=15000,
-            )
-            page.wait_for_timeout(150)
+            context = None
+            try:
+                if application is not None:
+                    application.start(static_ready=lambda: True)
+                    server = application.server
+                    thread = application.http_thread
+                context = browser.new_context(color_scheme=color_scheme)
+                # D-13: record CSP violations for every page and navigation in
+                # this context and assert none at teardown.
+                violations = []
+                context.expose_binding(
+                    "__nyxCspViolation", lambda source, entry: violations.append(entry)
+                )
+                context.add_init_script(
+                    "window.__cspViolations = [];"
+                    "document.addEventListener('securitypolicyviolation', (event) => {"
+                    "  const entry = {directive: event.violatedDirective,"
+                    "                  blockedURI: event.blockedURI};"
+                    "  window.__cspViolations.push(entry);"
+                    "  window.__nyxCspViolation(entry);"
+                    "});"
+                )
+                page = context.new_page()
+                page._nyx_csp_violations = violations
+                if init_script:
+                    page.add_init_script(init_script)
+                page.goto(f"http://127.0.0.1:{server.server_port}/")
+                page.wait_for_function(
+                    "() => document.querySelector("
+                    "'#board .card, #board .board-empty, #board-issues')",
+                    timeout=launch_timeout_ms,
+                )
+                page.wait_for_timeout(150)
+            except BaseException as failure:
+                # A launch that fails after its server started stops that
+                # server (and closes its context) before the error propagates;
+                # a running non-daemon serve_forever thread would otherwise
+                # keep the interpreter alive at exit.
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception as cleanup_error:
+                        failure.add_note(f"context close also failed: {cleanup_error!r}")
+                try:
+                    if not stop_server(application, server, thread):
+                        failure.add_note(f"application did not stop: {application}")
+                except Exception as cleanup_error:
+                    failure.add_note(f"server cleanup also failed: {cleanup_error!r}")
+                raise
             created.append((application, server, thread, page))
             return page
 
@@ -629,19 +666,10 @@ def page_launcher():
                     errors.append(error)
                     return None
 
-            def stop_standalone(server, thread):
-                try:
-                    server.shutdown()
-                    thread.join()
-                finally:
-                    server.server_close()
-
             for application, server, thread, page in created:
                 attempt(page.context.close)
                 violations.extend(page._nyx_csp_violations)
-                if application is None:
-                    attempt(lambda: stop_standalone(server, thread))
-                elif attempt(lambda: application.shutdown(time.monotonic() + 2)) is not True:
+                if attempt(lambda: stop_server(application, server, thread)) is False:
                     unstopped.append(application)
             attempt(browser.close)
             if errors:
@@ -4485,3 +4513,67 @@ def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(mon
     assert leaked == []
     assert "img-src" in str(failure.value)
     assert page.is_closed()
+
+
+@pytest.mark.parametrize("with_application", [False, True], ids=["standalone", "application"])
+def test_launch_failure_after_server_start_stops_the_server_before_raising(
+    monkeypatch, with_application
+):
+    """A launch that fails while waiting for the board leaves no server running."""
+    servers = []
+    applications = []
+    original_create_server = create_server
+
+    def recording_create_server(client):
+        created = original_create_server(client)
+        servers.append(created)
+        return created
+
+    class RecordingApplicationRuntime(ApplicationRuntime):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            applications.append(self)
+
+    monkeypatch.setitem(globals(), "create_server", recording_create_server)
+    monkeypatch.setitem(globals(), "ApplicationRuntime", RecordingApplicationRuntime)
+    settings = BrowserSettings() if with_application else None
+    # Rename the board before any page script can render into it, so the
+    # launch wait for a rendered board can never succeed.
+    hide_board = (
+        "document.addEventListener('readystatechange', () => {"
+        "  const board = document.getElementById('board');"
+        "  if (board) { board.id = 'renamed-board'; }"
+        "}, {capture: true});"
+    )
+    before = set(threading.enumerate())
+    started = time.monotonic()
+    with pytest.raises(playwright.TimeoutError):
+        with page_launcher(launch_timeout_ms=1000) as launch:
+            launch(StaticClient(board_payload()), init_script=hide_board, settings=settings)
+    elapsed = time.monotonic() - started
+    leaked = [
+        thread for thread in set(threading.enumerate()) - before
+        if thread.is_alive() and not thread.daemon
+    ] + [
+        application.http_thread for application in applications
+        if application.http_thread is not None and application.http_thread.is_alive()
+    ]
+    listening = [
+        server for server in servers + [application.server for application in applications]
+        if server is not None and server.socket.fileno() != -1
+    ]
+    if leaked or listening:
+        # Keep a regression from hanging the interpreter at exit.
+        for leaked_server in servers:
+            leaked_server.shutdown()
+            leaked_server.server_close()
+        for application in applications:
+            application.shutdown(time.monotonic() + 2)
+    if with_application:
+        assert servers == [] and len(applications) == 1
+        assert applications[0].http_thread is not None
+    else:
+        assert len(servers) == 1 and applications == []
+    assert leaked == []
+    assert listening == []
+    assert elapsed < 30
