@@ -1211,6 +1211,64 @@ def test_invalid_framing_with_mismatched_host_stays_404_and_closes():
         assert settings.calls == []
 
 
+ROUTE_FRAMING_CASES = (
+    "get-index-chunked",
+    "post-catalog-chunked",
+    "get-catalog-plus-length",
+    "head-index-duplicate-length",
+)
+
+
+def route_framing_vector(name, port, revision):
+    """Invalid framing on routes whose own handlers never inspect the body.
+
+    Without the dispatch-level framing check these routes answer 200 or 405,
+    so only that shared check can produce the 400.
+    """
+    put = embedded_put(port, revision)
+    if name == "get-index-chunked":
+        return raw_request(
+            port, "GET / HTTP/1.1", body=put,
+            header_lines=["Transfer-Encoding: chunked"],
+        )
+    if name == "post-catalog-chunked":
+        return raw_request(
+            port, "POST /api/catalog HTTP/1.1", body=put,
+            header_lines=["Transfer-Encoding: chunked"],
+        )
+    if name == "get-catalog-plus-length":
+        return raw_request(
+            port, "GET /api/catalog HTTP/1.1", body=put,
+            header_lines=[f"Content-Length: +{len(put)}"],
+        )
+    assert name == "head-index-duplicate-length"
+    return raw_request(
+        port, "HEAD / HTTP/1.1", body=put,
+        header_lines=[f"Content-Length: {len(put)}", "Content-Length: 0"],
+    )
+
+
+@pytest.mark.parametrize("standalone", [False, True], ids=["application", "standalone"])
+@pytest.mark.parametrize("case", ROUTE_FRAMING_CASES)
+def test_invalid_framing_on_non_settings_routes_is_answered_400_then_closed(case, standalone):
+    settings = None if standalone else SettingsStub()
+    client = StubClient(catalog=valid_catalog())
+    with RunningServer(client, settings) as port:
+        payload = route_framing_vector(case, port, "opaque")
+        # send_and_drain returns only at end of stream (a hang raises timeout).
+        head, body = one_response_with_close(send_and_drain(port, payload))
+        assert response_status(head) == 400
+        assert b"content-type: application/json" in head.lower()
+        if case.startswith("head-"):
+            assert body == b""
+        else:
+            assert json.loads(body) == {"error": "invalid_payload"}
+        assert client.calls == 0
+        if settings is not None:
+            assert settings.calls == []
+            assert_unchanged_settings(port)
+
+
 def test_valid_settings_put_still_saves_and_closes():
     settings = SettingsStub()
     with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:

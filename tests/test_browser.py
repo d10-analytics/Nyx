@@ -553,8 +553,9 @@ class RootSwitchSettings(BrowserSettings):
         self.revision = "root-b-revision"
 
 
-@pytest.fixture
-def open_page():
+@contextmanager
+def page_launcher():
+    """Yield a page launcher; teardown stops every server before asserting."""
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
         created = []
@@ -614,18 +615,45 @@ def open_page():
         try:
             yield launch
         finally:
-            for application, server, thread, page in created:
-                page.context.close()
-                assert page._nyx_csp_violations == [], (
-                    f"recorded CSP violations: {page._nyx_csp_violations}"
-                )
-                if application is None:
+            # Every context, server, application and the browser is closed
+            # before any teardown failure is raised, so a failing assertion
+            # can never leave a non-daemon serve_forever thread running.
+            errors = []
+            violations = []
+            unstopped = []
+
+            def attempt(action):
+                try:
+                    return action()
+                except Exception as error:
+                    errors.append(error)
+                    return None
+
+            def stop_standalone(server, thread):
+                try:
                     server.shutdown()
                     thread.join()
+                finally:
                     server.server_close()
-                else:
-                    assert application.shutdown(time.monotonic() + 2)
-            browser.close()
+
+            for application, server, thread, page in created:
+                attempt(page.context.close)
+                violations.extend(page._nyx_csp_violations)
+                if application is None:
+                    attempt(lambda: stop_standalone(server, thread))
+                elif attempt(lambda: application.shutdown(time.monotonic() + 2)) is not True:
+                    unstopped.append(application)
+            attempt(browser.close)
+            if errors:
+                raise errors[0]
+            assert unstopped == [], f"applications that did not stop: {unstopped}"
+            assert violations == [], f"recorded CSP violations: {violations}"
+
+
+@pytest.fixture
+def open_page():
+    with page_launcher() as launch:
+        yield launch
 
 
 def card_titles(page, column=1, row="Under Development"):
@@ -4416,3 +4444,44 @@ def test_csp_violation_recorder_records_and_clears(open_page):
     assert violations, "the context-level recorder never received the violation"
     assert violations[-1]["directive"] == "img-src"
     violations.clear()
+
+
+def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(monkeypatch):
+    """A recorded violation fails teardown without leaving serve_forever running."""
+    servers = []
+    original_create_server = create_server
+
+    def recording_create_server(client):
+        created = original_create_server(client)
+        servers.append(created)
+        return created
+
+    monkeypatch.setitem(globals(), "create_server", recording_create_server)
+    before = set(threading.enumerate())
+    with pytest.raises(AssertionError, match="recorded CSP violations") as failure:
+        with page_launcher() as launch:
+            page = launch(StaticClient(board_payload()))
+            page.evaluate(
+                "() => { const img = document.createElement('img');"
+                " img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';"
+                " document.body.append(img); }"
+            )
+            page.wait_for_function(
+                "() => window.__cspViolations.some((v) => v.directive === 'img-src')",
+                timeout=5000,
+            )
+            server_threads = [
+                thread for thread in set(threading.enumerate()) - before
+                if not thread.daemon
+            ]
+            assert server_threads, "the standalone server thread never started"
+    leaked = [thread for thread in server_threads if thread.is_alive()]
+    if leaked:
+        # Keep a regression from hanging the interpreter at exit.
+        for leaked_server in servers:
+            leaked_server.shutdown()
+            leaked_server.server_close()
+    assert len(servers) == 1
+    assert leaked == []
+    assert "img-src" in str(failure.value)
+    assert page.is_closed()
