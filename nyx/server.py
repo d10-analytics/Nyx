@@ -31,6 +31,11 @@ _API_ROUTES = frozenset({"/api/catalog", "/api/settings", "/api/workspace"})
 # stripping (D-10); a lenient int() parse would accept "+5", "5_0" and
 # arbitrarily long zero padding.
 _DECLARED_LENGTH = re.compile(r"[0-9]{1,10}")
+# D-11: per-connection read timeout and handler-thread cap. Both are read
+# when the handler class and server are built, so tests patch the module
+# attributes before constructing a server.
+_CONNECTION_TIMEOUT_SECONDS = 15.0
+_MAX_ACTIVE_CONNECTIONS = 32
 _SAFE_ERRORS = frozenset(
     {
         "producer_unavailable",
@@ -93,6 +98,11 @@ def _handler_for(
 ) -> type[BaseHTTPRequestHandler]:
     class TrackerHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # D-11: a stalled reader (idle connection or an unread body) is
+        # answered/abandoned within the timeout instead of holding the
+        # connection indefinitely; combined with D-01's close rule the
+        # timed-out connection is closed, never returned to the next readline.
+        timeout = _CONNECTION_TIMEOUT_SECONDS
 
         def log_message(self, format: str, *args: object) -> None:
             # Catalog values and filesystem paths never enter request logs.
@@ -343,6 +353,25 @@ class TrackerServer(ThreadingHTTPServer):
             self._active_connections.add(connection)
         return connection, address
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            # D-03: beyond the cap, refuse immediately; shutdown_request
+            # removes the socket from _active_connections via close_request.
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # The handler thread never started, so its finally will not run.
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
+
     def close_request(self, request: Any) -> None:
         with self._connection_lock:
             self._active_connections.discard(request)
@@ -377,6 +406,10 @@ class TrackerServer(ThreadingHTTPServer):
     ) -> None:
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
+        # D-03: bound the handler threads; acquired without blocking in
+        # process_request so serve_forever (and thus owned shutdown) never
+        # stalls waiting for a slot.
+        self._connection_slots = threading.BoundedSemaphore(_MAX_ACTIVE_CONNECTIONS)
         selected_provider = provider if provider is not None else _default_provider
         super().__init__(
             ("127.0.0.1", port),
