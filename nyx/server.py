@@ -104,6 +104,22 @@ def _handler_for(
         # timed-out connection is closed, never returned to the next readline.
         timeout = _CONNECTION_TIMEOUT_SECONDS
 
+        def send_response(self, code: int, message: str | None = None) -> None:
+            # D-12: every real response (including stdlib send_error paths and
+            # HEAD) carries the framing protection headers exactly once. The
+            # interim 100 Continue is sent via send_response_only and is not
+            # stamped.
+            super().send_response(code, message)
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "style-src-attr 'unsafe-inline'; img-src 'self'; font-src 'self'; "
+                "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+                "frame-ancestors 'none'",
+            )
+
         def log_message(self, format: str, *args: object) -> None:
             # Catalog values and filesystem paths never enter request logs.
             return
