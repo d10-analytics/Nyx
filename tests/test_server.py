@@ -1504,13 +1504,7 @@ def test_owned_shutdown_completes_while_the_cap_is_full():
 
 def test_injected_handler_thread_start_failure_releases_the_slot():
     cap = CONNECTION_CAP
-    # AC-03 floors the patched timeout at 2 s; this proof uses 10 s so every
-    # holder's handler thread stays alive through the whole spawn window:
-    # with t = 2 s a holder thread dies about t after its accept (the
-    # handler's blocked readline times out and the stdlib closes the
-    # connection), so on a slow hosted runner the last holder can be
-    # accepted after earlier holders already expired and no wait deadline
-    # can ever observe cap simultaneously live threads.
+    # The patched timeout only has to outlast the proof; AC-03 floors it at 2 s.
     hold_timeout = 10
     client = StubClient(catalog=valid_catalog())
 
@@ -1522,10 +1516,6 @@ def test_injected_handler_thread_start_failure_releases_the_slot():
         server, "_MAX_ACTIVE_CONNECTIONS", cap
     ):
         with RunningServer(client) as port:
-            # Snapshot before the injected failure: no other handler thread
-            # can appear between here and the holders below (the failing
-            # request's thread never starts), so the count delta is exact.
-            baseline = handler_thread_count()
             with patch.object(threading, "Thread", FailingThread):
                 connection = open_connection(port)
                 connection.sendall(raw_request(port, "GET / HTTP/1.1"))
@@ -1533,37 +1523,39 @@ def test_injected_handler_thread_start_failure_releases_the_slot():
                 connection.close()
             assert b"HTTP/1.1" not in data  # closed without a response
 
-            peak = [0]
-
-            def wait_live(expected):
-                def check():
-                    live = handler_thread_count() - baseline
-                    peak[0] = max(peak[0], live)
-                    return live >= expected
-
-                return check
-
             # The released slot leaves room for c concurrent partial
-            # connections, all accepted afterwards. Each holder's thread is
-            # confirmed live before the next holder opens, so expiry timing
-            # cannot keep the live count from reaching the cap; the peak
-            # tracked across the waits keeps the acceptance
-            # expiry-agnostic. If the slot were not released, the third
-            # holder would be refused and its handler thread would never
-            # start, so the peak could never reach c.
+            # connections, all accepted afterwards. Acceptance is proved by
+            # behavior, not by counting threads: every holder is open at once
+            # and then completes its request. A connection refused for lack
+            # of a slot is closed without a response, so a slot that was not
+            # released on the failure path leaves the c-th holder unanswered.
             holders = []
             try:
-                for expected in range(1, cap + 1):
+                for _ in range(cap):
                     holders.append(hold_connection(port))
-                    assert wait_for(wait_live(expected), hold_timeout), (
-                        f"only {peak[0]} of {expected} handler threads went live"
-                    )
-                assert peak[0] >= cap, (
-                    f"live handler threads peaked at {peak[0]}, never reaching cap {cap}"
-                )
+                finish = f"Host: 127.0.0.1:{port}\r\n\r\n".encode("ascii")
+                for holder in holders:
+                    try:
+                        holder.sendall(finish)
+                    except OSError:
+                        pass  # a refused holder; the response check reports it
+                statuses = []
+                for holder in holders:
+                    reply = b""
+                    holder.settimeout(5)
+                    try:
+                        while b"\r\n" not in reply:
+                            piece = holder.recv(65536)
+                            if not piece:
+                                break
+                            reply += piece
+                    except (ConnectionResetError, ConnectionAbortedError, TimeoutError):
+                        pass
+                    statuses.append(reply.split(b"\r\n", 1)[0])
+                assert statuses == [b"HTTP/1.1 200 OK"] * cap, statuses
             finally:
-                for connection in holders:
-                    connection.close()
+                for holder in holders:
+                    holder.close()
 
 
 def test_default_timeout_and_cap_constants_are_pinned():
