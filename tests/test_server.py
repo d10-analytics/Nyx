@@ -1305,3 +1305,213 @@ def test_settings_put_rejects_one_byte_over_the_bound_and_keeps_state():
                 assert json.loads(rest) == {"error": "invalid_payload"}
         assert settings.calls == []
         assert_unchanged_settings(port)
+
+
+# --- Connection timeout and handler cap (AC-03, D-03, D-11) ---
+
+CONNECTION_TIMEOUT = 2  # patched per-connection read timeout (t)
+CONNECTION_CAP = 3  # patched handler-thread cap (c)
+HANDLER_THREAD_SUFFIX = "(process_request_thread)"
+
+
+def handler_thread_count():
+    return sum(
+        1 for thread in threading.enumerate() if thread.name.endswith(HANDLER_THREAD_SUFFIX)
+    )
+
+
+def wait_for(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def open_connection(port):
+    connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+    connection.settimeout(5)
+    return connection
+
+
+def hold_connection(port):
+    """Open a connection whose handler thread blocks on a partial request."""
+    connection = open_connection(port)
+    connection.sendall(b"GET / HTTP/1.1\r\n")
+    return connection
+
+
+def read_until_eof(connection, timeout):
+    """Read until end of stream; return (data, elapsed) with elapsed None on stall."""
+    connection.settimeout(timeout)
+    chunks = []
+    started = time.monotonic()
+    while True:
+        try:
+            piece = connection.recv(65536)
+        except TimeoutError:
+            return b"".join(chunks), None
+        if not piece:
+            return b"".join(chunks), time.monotonic() - started
+        chunks.append(piece)
+
+
+def flood_once(port):
+    """One cap-excess connection sending no bytes; True when refused within 0.5 s.
+
+    No bytes are sent: on Windows a refusal of a socket with unread data can
+    surface as a reset. End of stream or a reset both count as refused
+    provided no response bytes arrived.
+    """
+    connection = open_connection(port)
+    try:
+        connection.settimeout(0.5)
+        try:
+            data = connection.recv(65536)
+        except (ConnectionResetError, ConnectionAbortedError):
+            return True
+        except TimeoutError:
+            return False
+        return data == b""
+    finally:
+        connection.close()
+
+
+def test_idle_keepalive_connection_reaches_end_of_stream_within_timeout():
+    client = StubClient(catalog=valid_catalog())
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", 8
+    ):
+        with RunningServer(client) as port:
+            connection = open_connection(port)
+            connection.sendall(raw_request(port, "GET / HTTP/1.1"))
+            data, elapsed = read_until_eof(connection, CONNECTION_TIMEOUT + 1)
+            connection.close()
+    assert data.startswith(b"HTTP/1.1 200")
+    assert elapsed is not None
+    assert elapsed <= CONNECTION_TIMEOUT + 1
+
+
+def test_stalled_body_put_is_answered_400_closed_without_saving(capsys):
+    settings = SettingsStub()
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", 8
+    ):
+        with RunningServer(StubClient(catalog=valid_catalog()), settings) as port:
+            connection = open_connection(port)
+            connection.sendall(
+                raw_request(port, "PUT /api/settings HTTP/1.1", content_length=100)
+            )
+            data, elapsed = read_until_eof(connection, CONNECTION_TIMEOUT + 1)
+            connection.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert data.count(b"HTTP/1.1") == 1
+    assert head.startswith(b"HTTP/1.1 400")
+    assert b"connection: close" in head.lower()
+    assert json.loads(body) == {"error": "invalid_payload"}
+    assert elapsed is not None
+    assert elapsed <= CONNECTION_TIMEOUT + 1
+    assert settings.calls == []
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_flood_beyond_cap_is_refused_and_slots_are_released():
+    cap = CONNECTION_CAP
+    client = StubClient(catalog=valid_catalog())
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", cap
+    ):
+        running = RunningServer(client)
+        with running as port:
+            baseline = handler_thread_count()
+            holders = [hold_connection(port) for _ in range(cap)]
+            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 5)
+            peak = handler_thread_count() - baseline
+            for _ in range(8):
+                assert flood_once(port), "an excess connection was not refused"
+                peak = max(peak, handler_thread_count() - baseline)
+            assert peak <= cap
+            assert wait_for(lambda: handler_thread_count() - baseline <= cap, 1)
+            # Close the flood holders client-side; the server's connection
+            # set drains within the timeout and every slot is released.
+            for connection in holders:
+                connection.close()
+            assert wait_for(
+                lambda: not running.server._active_connections, CONNECTION_TIMEOUT + 1
+            )
+            for _ in range(cap + 2):
+                assert request(port, "GET", "/")[0] == 200
+                assert wait_for(lambda: handler_thread_count() <= baseline, 5)
+
+
+def test_owned_shutdown_completes_while_the_cap_is_full():
+    cap = CONNECTION_CAP
+    client = StubClient(catalog=valid_catalog())
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", 30), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", cap
+    ):
+        running = RunningServer(client, SettingsStub())
+        holders = []
+        outcome = []
+        try:
+            port = running.server.server_port
+            baseline = handler_thread_count()
+            holders = [hold_connection(port) for _ in range(cap)]
+            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 10)
+            for _ in range(8):
+                assert flood_once(port), "an excess connection was not refused"
+            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 5)
+
+            def shut():
+                outcome.append(running.application.shutdown(time.monotonic() + 2))
+
+            helper = threading.Thread(target=shut)
+            helper.start()
+            helper.join(5)
+            assert not helper.is_alive(), "shutdown hung while the cap was full"
+            assert outcome == [True]
+            running.application.server = None
+        finally:
+            for connection in holders:
+                connection.close()
+            if not outcome:
+                assert running.application.shutdown(time.monotonic() + 2)
+                running.application.server = None
+
+
+def test_injected_handler_thread_start_failure_releases_the_slot():
+    cap = CONNECTION_CAP
+    client = StubClient(catalog=valid_catalog())
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            raise RuntimeError("injected thread-start failure")
+
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", cap
+    ):
+        with RunningServer(client) as port:
+            baseline = handler_thread_count()
+            with patch.object(threading, "Thread", FailingThread):
+                connection = open_connection(port)
+                connection.sendall(raw_request(port, "GET / HTTP/1.1"))
+                data, _ = read_until_eof(connection, CONNECTION_TIMEOUT + 1)
+                connection.close()
+            assert b"HTTP/1.1" not in data  # closed without a response
+            # The released slot leaves room for c concurrent partial
+            # connections, all accepted afterwards.
+            holders = [hold_connection(port) for _ in range(cap)]
+            assert wait_for(lambda: handler_thread_count() - baseline >= cap, 5)
+            for connection in holders:
+                connection.close()
+
+
+def test_default_timeout_and_cap_constants_are_pinned():
+    assert server._CONNECTION_TIMEOUT_SECONDS == 15.0
+    assert server._MAX_ACTIVE_CONNECTIONS == 32
+    created = create_server(StubClient(catalog=valid_catalog()))
+    try:
+        assert created.RequestHandlerClass.timeout == server._CONNECTION_TIMEOUT_SECONDS
+    finally:
+        created.server_close()
