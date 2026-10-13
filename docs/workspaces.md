@@ -17,10 +17,15 @@ discovery information. At the workspace, project, stage, and grouping levels, a
 linked or reparse entry whose name ends in `.md` (matched exactly, so
 `notes.MD` does not count) is instead treated as a document, like a regular
 file: it is not followed and does not make discovery incomplete. Names that Nyx
-already rejects as unsafe keep their diagnostic. Because Nyx never follows
-links, a linked folder named like `notes.md` is not scanned: its work items do
-not appear, and discovery still reports complete. A link named `spec.md` inside
-a stage, grouping, or work item directory, or `program.md` inside a program
+already rejects as unsafe keep their diagnostic. Grouping and work item folder
+names receive the same unsafe-name screening as project and stage names, and an
+entry whose path inside the workspace is too long to report safely (folder,
+file, or link, including an `.md` document link) is skipped with a diagnostic
+naming its parent folder and makes discovery incomplete. Because Nyx never
+follows links, a linked folder named like `notes.md` is not scanned: its work
+items do not appear, and discovery still reports complete. A link named
+`spec.md` inside a stage, grouping, or work item directory, or `program.md`
+inside a program
 directory, is treated as that directory's anchor rather than as a document: Nyx
 reports a nonregular anchor and does not read through the link. This is a
 trusted-local workspace contract, not
