@@ -87,8 +87,12 @@ and UUID program directories. At the workspace, project, stage, and grouping
 levels, a link whose name ends in `.md` (case-sensitive) is instead treated as
 a document: it is not followed and does not make discovery incomplete, so a
 linked folder with such a name contributes no work items. Names that Nyx
-already rejects as unsafe keep their diagnostic. A link named `spec.md` or
-`program.md` where Nyx expects an anchor is treated as a nonregular anchor
+already rejects as unsafe keep their diagnostic. Grouping and work item folder
+names receive the same unsafe-name screening as project and stage names, and an
+entry whose path inside the workspace is too long to report safely (folder,
+file, or link, including an `.md` document link) is skipped with a diagnostic
+naming its parent folder and makes discovery incomplete. A link named `spec.md`
+or `program.md` where Nyx expects an anchor is treated as a nonregular anchor
 rather than as a document. Symlinked or reparse anchors are not read. This is
 a trusted-local input contract and does not claim hostile concurrent
 path-substitution containment. Case is preserved literally; case-distinct

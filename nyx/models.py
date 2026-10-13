@@ -34,6 +34,9 @@ LIFECYCLES = frozenset(
 DECLARED_FIELDS = ("title", "target_project", "status")
 REPORTED_FIELD_KEYS = frozenset({"name", "value"})
 MAX_REPORTED_FIELDS = 64
+# Both Python and the browser cap one piece of text at this many UTF-16 code
+# units; every text bound below measures with the shared counter.
+MAX_TEXT_UNITS = 1024
 
 DIAGNOSTIC_CODES = frozenset(
     {
@@ -297,12 +300,7 @@ def _diagnostics(value: Any, name: str) -> tuple[Diagnostic, ...]:
         _keys(item, _DIAGNOSTIC_KEYS, f"{name}[{index}]")
         code = _string(item["code"], f"{name}[{index}].code")
         message = _string(item["message"], f"{name}[{index}].message")
-        if (
-            code not in DIAGNOSTIC_CODES
-            or not message
-            or len(message) > 1024
-            or any(ord(c) < 32 or ord(c) == 127 for c in code + message)
-        ):
+        if code not in DIAGNOSTIC_CODES or not _safe_text(message):
             raise ProtocolError(f"{name}[{index}] is not a safe diagnostic")
         result.append(Diagnostic(code, message))
     if [(item.code, item.message) for item in result] != sorted(
@@ -318,6 +316,7 @@ def _package_path(value: Any) -> str:
         not path
         or path.startswith("/")
         or "\\" in path
+        or _text_units(path) > MAX_TEXT_UNITS
         or any(
             ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF
             for c in path
@@ -378,17 +377,9 @@ def _coverage(value: Any, name: str) -> None:
 
 
 def _component(value: Any, name: str) -> str:
-    result = _string(value, name)
-    if (
-        not result
-        or len(result) > 1024
-        or result in {".", ".."}
-        or "/" in result
-        or "\\" in result
-        or any(ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF for character in result)
-    ):
+    if not _safe_component(value):
         raise ProtocolError(f"{name} must be one safe path component")
-    return result
+    return value
 
 
 def _inventory(value: Any) -> tuple[dict[str, Any], set[str], set[tuple[str, str]]]:
@@ -539,14 +530,7 @@ def _edge(value: Any, name: str) -> dict[str, Any]:
             "reason": reason,
         }
     observed_stage = _string(item["observed_stage"], f"{name}.observed_stage", nullable=True)
-    if observed_stage is not None and (
-        not observed_stage
-        or len(observed_stage) > 1024
-        or observed_stage in {".", ".."}
-        or "/" in observed_stage
-        or "\\" in observed_stage
-        or any(ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF for character in observed_stage)
-    ):
+    if observed_stage is not None and not _safe_component(observed_stage):
         raise ProtocolError(f"{name}.observed_stage is invalid")
     if reason not in _COMPLETION_EDGE_REASONS:
         raise ProtocolError(f"{name}.reason does not match kind")
@@ -615,13 +599,28 @@ def _relationship(
     return program_id, program_title, prerequisites, direct_state
 
 
-def _safe_text(value: Any, max_units: int = 1024) -> bool:
+def _text_units(value: str) -> int:
+    """Count a string's length in UTF-16 code units, surrogates included."""
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _safe_text(value: Any, max_units: int = MAX_TEXT_UNITS) -> bool:
     """Match browser text safety, measuring length in UTF-16 code units."""
     return (
         type(value) is str
         and bool(value)
         and not any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value)
-        and sum(2 if ord(c) > 0xFFFF else 1 for c in value) <= max_units
+        and _text_units(value) <= max_units
+    )
+
+
+def _safe_component(value: Any) -> bool:
+    """Match browser component safety: bounded text holding one path segment."""
+    return (
+        _safe_text(value, MAX_TEXT_UNITS)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
     )
 
 

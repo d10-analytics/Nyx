@@ -10,8 +10,16 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+import pytest
+
 from nyx import catalog
-from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
+from nyx.models import (
+    MAX_TEXT_UNITS,
+    SCHEMA_VERSION,
+    _text_units,
+    canonical_digest,
+    parse_catalog,
+)
 
 V1 = """# Example
 Status: approved
@@ -1769,3 +1777,278 @@ def test_pattern_trailing_whitespace_stripping_table(tmp_path):
             assert value["programs"] == [
                 {"program_id": program_id, "title": "Core", "member_package_ids": []}
             ], context
+
+
+def _leaf_package(directory: Path) -> Path:
+    """Place one healthy ``item/spec.md`` package inside ``directory``."""
+    item = directory / "item"
+    item.mkdir()
+    item.joinpath("spec.md").write_text("# Item\n", encoding="utf-8")
+    return item
+
+
+def _make_unsafe_directory(parent: Path, name) -> Path:
+    """Create one unsafe-named directory under ``parent``.
+
+    ``name`` is text for the forms a ``str`` path carries (backslash, control
+    character, unpaired surrogate) and bytes for a name the platform's
+    filesystem decoder cannot represent.
+    """
+    if isinstance(name, bytes):
+        raw = os.fsencode(parent) + b"/" + name
+        os.mkdir(raw)
+        return Path(os.fsdecode(raw))
+    path = parent / name
+    path.mkdir()
+    return path
+
+
+def _unsafe_name_forms() -> list[tuple[str, object, bool]]:
+    """Return ``(label, name, skippable)`` for the unsafe forms to attempt.
+
+    Windows rejects backslash and control characters in names, so only an
+    unpaired surrogate is attempted there (PEP 529 ``surrogatepass``).  macOS
+    accepts control characters; its backslash and undecodable forms are
+    skipped only if creation raises ``OSError``.  Linux creates every form.
+    """
+    if sys.platform == "win32":
+        return [("unpaired-surrogate", "unsafe-marker\ud800name", True)]
+    return [
+        ("backslash", "unsafe-marker\\name", sys.platform == "darwin"),
+        ("newline", "unsafe-marker\nname", False),
+        ("undecodable", b"unsafe-marker\xffname", sys.platform == "darwin"),
+    ]
+
+
+def _nested_directories(root: Path, components: list[str]) -> Path:
+    """Create a grouping-directory chain under one stage and return the leaf."""
+    directory = root / "Fictional" / "Queue"
+    for component in components:
+        directory = directory / component
+        directory.mkdir()
+    return directory
+
+
+def test_nested_admission_unsafe_names_name_the_containing_directory() -> None:
+    attempted = 0
+    for label, name, skippable in _unsafe_name_forms():
+        for depth, diagnostic in ((1, "Fictional/Queue"), (2, "Fictional/Queue/grp")):
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                package(root, "Queue", "ok", "# Ok\n")
+                parent = root / "Fictional" / "Queue"
+                if depth == 2:
+                    parent = parent / "grp"
+                    parent.mkdir()
+                try:
+                    unsafe = _make_unsafe_directory(parent, name)
+                except OSError:
+                    if not skippable:
+                        raise
+                    continue
+                attempted += 1
+                _leaf_package(unsafe)
+                value = json.loads(catalog.scan_catalog(root))
+                diagnostics = [{
+                    "code": "discovery_unavailable",
+                    "message": f"discovery unavailable: {diagnostic}",
+                }]
+                context = (label, depth)
+                assert value["discovery_diagnostics"] == diagnostics, context
+                assert {
+                    entry["package_path"] for entry in value["entries"]
+                } == {"Fictional/Queue/ok"}, context
+                assert value["identity_coverage"] == {
+                    "state": "incomplete",
+                    "diagnostics": diagnostics,
+                }, context
+                assert value["inventory"] == {
+                    "projects": [{"name": "Fictional", "availability": "incomplete"}],
+                    "stages": [{
+                        "project": "Fictional", "stage": "Queue",
+                        "availability": "incomplete",
+                    }],
+                }, context
+                assert "unsafe-marker" not in json.dumps(value), context
+                assert parse_catalog(value).as_dict() == value, context
+    if attempted == 0:
+        pytest.skip("no unsafe name form is creatable on this platform")
+
+
+def test_nested_admission_unsafe_link_and_file_in_grouping_folder(tmp_path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("Windows rejects backslash and control characters in names")
+    diagnostics = [{
+        "code": "discovery_unavailable",
+        "message": "discovery unavailable: Fictional/Queue/grp",
+    }]
+    for kind in ("link", "file"):
+        root = tmp_path / kind
+        package(root, "Queue", "ok", "# Ok\n")
+        package(root, "Queue", "grp/fine", "# Fine\n")
+        group = root / "Fictional" / "Queue" / "grp"
+        if kind == "link":
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            outside.joinpath("spec.md").write_text(
+                "# Escaped\nescaped-marker\n", encoding="utf-8"
+            )
+            link_directory(group / "unsafe-marker\x01.md", outside)
+        else:
+            group.joinpath("unsafe-marker\x01.txt").write_text(
+                "escaped-marker\n", encoding="utf-8"
+            )
+        value = json.loads(catalog.scan_catalog(root))
+        assert value["discovery_diagnostics"] == diagnostics, kind
+        assert {
+            entry["package_path"] for entry in value["entries"]
+        } == {"Fictional/Queue/ok", "Fictional/Queue/grp/fine"}, kind
+        assert value["identity_coverage"] == {
+            "state": "incomplete",
+            "diagnostics": diagnostics,
+        }, kind
+        assert value["inventory"]["stages"] == [{
+            "project": "Fictional", "stage": "Queue", "availability": "incomplete",
+        }], kind
+        assert "escaped-marker" not in json.dumps(value), kind
+        assert parse_catalog(value).as_dict() == value, kind
+
+
+def test_nested_admission_path_bound_is_derived_from_the_message_table() -> None:
+    longest = max(
+        _text_units(text) for text in catalog.CATALOG_DIAGNOSTIC_MESSAGES.values()
+    )
+    assert MAX_TEXT_UNITS == 1024
+    assert catalog._MAX_ADMITTED_PATH_UNITS == 996
+    assert catalog._MAX_ADMITTED_PATH_UNITS == MAX_TEXT_UNITS - (longest + 2)
+
+
+def _bound_diagnostics(root: Path, directory: Path):
+    (directory / "spec.md").write_text("# Bounded\n", encoding="utf-8")
+    value = json.loads(catalog.scan_catalog(root))
+    parent = directory.parent.relative_to(root).as_posix()
+    return value, [{
+        "code": "discovery_unavailable",
+        "message": f"discovery unavailable: {parent}",
+    }]
+
+
+def test_nested_admission_path_bound_admits_p_and_excludes_p_plus_one(tmp_path) -> None:
+    if sys.platform != "linux":
+        pytest.skip("over-limit trees are created only on Linux")
+
+    # Exactly P units is admitted and listed, with no diagnostic.
+    root = tmp_path / "at-limit"
+    package(root, "Queue", "ok", "# Ok\n")
+    target = _nested_directories(root, ["a" * 200, "b" * 200, "c" * 200, "d" * 200, "e" * 176])
+    at_limit = target.relative_to(root).as_posix()
+    assert _text_units(at_limit) == 996
+    target.joinpath("spec.md").write_text("# At limit\n", encoding="utf-8")
+    value = json.loads(catalog.scan_catalog(root))
+    assert value["discovery_diagnostics"] == []
+    assert {
+        entry["package_path"] for entry in value["entries"]
+    } == {"Fictional/Queue/ok", at_limit}
+    assert value["inventory"]["stages"] == [{
+        "project": "Fictional", "stage": "Queue", "availability": "complete",
+    }]
+    assert parse_catalog(value).as_dict() == value
+
+    # One unit over P is excluded and names its admitted parent.
+    root = tmp_path / "over-limit"
+    package(root, "Queue", "ok", "# Ok\n")
+    target = _nested_directories(root, ["a" * 200, "b" * 200, "c" * 200, "d" * 200, "e" * 177])
+    assert _text_units(target.relative_to(root).as_posix()) == 997
+    value, diagnostics = _bound_diagnostics(root, target)
+    assert value["discovery_diagnostics"] == diagnostics
+    assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
+    assert value["inventory"]["stages"] == [{
+        "project": "Fictional", "stage": "Queue", "availability": "incomplete",
+    }]
+    assert parse_catalog(value).as_dict() == value
+
+    # At most P code points but more than P UTF-16 units is excluded too.
+    root = tmp_path / "astral"
+    package(root, "Queue", "ok", "# Ok\n")
+    target = _nested_directories(
+        root, ["a" * 200, "b" * 200, "c" * 200, "d" * 200, "e" * 175 + "\U0001f600"]
+    )
+    astral = target.relative_to(root).as_posix()
+    assert len(astral) <= 996
+    assert _text_units(astral) == 997
+    value, diagnostics = _bound_diagnostics(root, target)
+    assert value["discovery_diagnostics"] == diagnostics
+    assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
+    assert parse_catalog(value).as_dict() == value
+
+    # A safe-named regular file one unit over P yields the parent diagnostic.
+    root = tmp_path / "regular-file"
+    package(root, "Queue", "ok", "# Ok\n")
+    target = _nested_directories(root, ["a" * 200, "b" * 200, "c" * 200, "d" * 200, "e" * 167])
+    notes = target / "notes.txt"
+    notes.write_text("notes\n", encoding="utf-8")
+    assert _text_units(notes.relative_to(root).as_posix()) == 997
+    value = json.loads(catalog.scan_catalog(root))
+    assert value["discovery_diagnostics"] == [{
+        "code": "discovery_unavailable",
+        "message": f"discovery unavailable: {target.relative_to(root).as_posix()}",
+    }]
+    assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
+    assert value["inventory"]["stages"] == [{
+        "project": "Fictional", "stage": "Queue", "availability": "incomplete",
+    }]
+    assert parse_catalog(value).as_dict() == value
+
+
+def test_nested_admission_deep_unreadable_folders_keep_messages_bounded(tmp_path) -> None:
+    if sys.platform != "linux":
+        pytest.skip("over-limit trees are created only on Linux")
+
+    def messages(value: dict) -> list[str]:
+        found = [diagnostic["message"] for diagnostic in value["discovery_diagnostics"]]
+        found += [item["message"] for item in value["identity_coverage"]["diagnostics"]]
+        found += [item["message"] for item in value["program_coverage"]["diagnostics"]]
+        assert found
+        return found
+
+    # The F-04 reproduction: five 200-character components, deepest unreadable.
+    root = tmp_path / "deep"
+    package(root, "Queue", "ok", "# Ok\n")
+    deepest = _nested_directories(root, ["a" * 200] * 5)
+    fourth = deepest.parent
+    fourth_relative = fourth.relative_to(root).as_posix()
+    assert _text_units(fourth_relative) == 819
+    deepest.chmod(0)
+    try:
+        value = json.loads(catalog.scan_catalog(root))
+    finally:
+        deepest.chmod(0o700)
+    assert value["discovery_diagnostics"] == [{
+        "code": "discovery_unavailable",
+        "message": f"discovery unavailable: {fourth_relative}",
+    }]
+    assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
+    assert parse_catalog(value).as_dict() == value
+    assert all(_text_units(message) <= MAX_TEXT_UNITS for message in messages(value))
+
+    # An unreadable directory exactly at P units yields its own diagnostic.
+    root = tmp_path / "at-bound"
+    package(root, "Queue", "ok", "# Ok\n")
+    unreadable = _nested_directories(
+        root, ["a" * 200, "b" * 200, "c" * 200, "d" * 200, "e" * 176]
+    )
+    unreadable_relative = unreadable.relative_to(root).as_posix()
+    assert _text_units(unreadable_relative) == 996
+    unreadable.chmod(0)
+    try:
+        value = json.loads(catalog.scan_catalog(root))
+    finally:
+        unreadable.chmod(0o700)
+    assert value["discovery_diagnostics"] == [{
+        "code": "discovery_unavailable",
+        "message": f"discovery unavailable: {unreadable_relative}",
+    }]
+    assert _text_units(value["discovery_diagnostics"][0]["message"]) == 1019
+    assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
+    assert parse_catalog(value).as_dict() == value
+    assert all(_text_units(message) <= MAX_TEXT_UNITS for message in messages(value))

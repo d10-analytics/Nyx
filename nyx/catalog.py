@@ -10,7 +10,15 @@ from collections.abc import Iterable
 from hashlib import sha256
 from pathlib import Path
 
-from .models import DECLARED_FIELDS, MAX_REPORTED_FIELDS, SCHEMA_VERSION, _safe_text
+from .models import (
+    DECLARED_FIELDS,
+    MAX_REPORTED_FIELDS,
+    MAX_TEXT_UNITS,
+    SCHEMA_VERSION,
+    _safe_component,
+    _safe_text,
+    _text_units,
+)
 from .state import (
     CompletedStageError,
     _validate_completed_stage_names,
@@ -27,7 +35,6 @@ _HEADER_CUT_SEPARATORS = (
     b"\xc2\x85", b"\xe2\x80\xa8", b"\xe2\x80\xa9",
 )
 
-_SAFE_COMPONENT_MAX = 1024
 CATALOG_DIAGNOSTIC_MESSAGES = {
     "invalid_package": "invalid package",
     "unreadable_anchor": "unreadable anchor",
@@ -36,6 +43,13 @@ CATALOG_DIAGNOSTIC_MESSAGES = {
     "discovery_unavailable": "discovery unavailable",
     "duplicate_program_id": "duplicate program identity",
 }
+# The longest diagnostic message plus its ``": "`` separator leaves this many
+# UTF-16 units for the path a nested diagnostic may name, so every message the
+# producer builds stays within the shared text bound.  Derived, not hard-coded:
+# a longer message text lowers the limit.
+_MAX_ADMITTED_PATH_UNITS = MAX_TEXT_UNITS - (
+    max(_text_units(text) for text in CATALOG_DIAGNOSTIC_MESSAGES.values()) + 2
+)
 
 _CANONICAL_UUID = re.compile(
     r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
@@ -63,7 +77,7 @@ def _screen_text(value: str) -> str:
     end = 0
     for character in value:
         units += 2 if ord(character) > 0xFFFF else 1
-        if units > 1024:
+        if units > MAX_TEXT_UNITS:
             break
         end += 1
     value = value[:end]
@@ -125,19 +139,7 @@ def _catalog_relative(path: Path, spec_root: Path) -> str:
 
 def _catalog_safe_component(value: str) -> bool:
     """Return whether a filesystem name can be admitted as a catalog component."""
-    return bool(
-        value
-        and len(value) <= _SAFE_COMPONENT_MAX
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and not any(
-            ord(character) < 32
-            or ord(character) == 127
-            or 0xD800 <= ord(character) <= 0xDFFF
-            for character in value
-        )
-    )
+    return _safe_component(value)
 
 
 def _catalog_diagnostic(code: str, package_path: str) -> dict[str, str]:
@@ -738,6 +740,19 @@ def _scan_stage(
             if child.name in {".pipeline", "Reference"}:
                 continue
             child_path = current / child.name
+            parent_relative = _catalog_relative(current, spec_root)
+            # Admit the child before ``stat``, the Markdown-link exemption and
+            # the directory test: an unadmitted name or an over-limit relative
+            # path yields a diagnostic naming the admitted parent, never the
+            # raw child, and marks the stage incomplete.
+            if not _safe_component(child.name) or _text_units(
+                f"{parent_relative}/{child.name}"
+            ) > _MAX_ADMITTED_PATH_UNITS:
+                discovery_diagnostics.append(
+                    _catalog_diagnostic("discovery_unavailable", parent_relative)
+                )
+                complete = False
+                continue
             try:
                 child_info = child.stat(follow_symlinks=False)
             except OSError:
