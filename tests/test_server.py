@@ -950,6 +950,65 @@ def reported_contract_cases():
         ("scalar-order", [{"name": "X�", "value": "a"}, {"name": "X😀", "value": "b"}]),
     ]:
         add(name, lambda v, e, fields=fields: e.update(reported_fields=fields), True)
+
+    # Text bound agreement for paths, diagnostics, terminal stages and
+    # completion stages: 1024 UTF-16 units accepted, one unit over, or a lone
+    # surrogate anywhere in the text, rejected.
+    def completion_edge(value, stage):
+        return {
+            "kind": "completion",
+            "target_package_id": value["entries"][1]["package_id"],
+            "observed_stage": stage,
+            "resolved_state": "satisfied",
+            "reason": "completion_satisfied",
+        }
+
+    add(
+        "text_limit_path_1024",
+        lambda v, e: e.update(package_path="Fictional/Queue/first/" + "😀" * 501),
+        True,
+    )
+    add(
+        "text_limit_message_1024",
+        lambda v, e: v.update(
+            discovery_diagnostics=[
+                {
+                    "code": "discovery_unavailable",
+                    "message": "discovery unavailable: " + "😀" * 500 + "a",
+                }
+            ]
+        ),
+        True,
+    )
+    add("text_limit_terminal_512", lambda v, e: v.update(terminal_stages=["😀" * 512]), True)
+    add(
+        "text_limit_observed_512",
+        lambda v, e: e["relationship"].update(prerequisites=[completion_edge(v, "😀" * 512)]),
+        True,
+    )
+    add(
+        "text_limit_path_over",
+        lambda v, e: e.update(package_path="Fictional/Queue/first/" + "😀" * 502),
+    )
+    add(
+        "text_limit_message_astral_513",
+        lambda v, e: v.update(
+            discovery_diagnostics=[{"code": "discovery_unavailable", "message": "😀" * 513}]
+        ),
+    )
+    add(
+        "text_limit_message_surrogate",
+        lambda v, e: v.update(
+            discovery_diagnostics=[
+                {"code": "discovery_unavailable", "message": "discovery unavailable: \ud800"}
+            ]
+        ),
+    )
+    add("text_limit_terminal_513", lambda v, e: v.update(terminal_stages=["😀" * 513]))
+    add(
+        "text_limit_observed_513",
+        lambda v, e: e["relationship"].update(prerequisites=[completion_edge(v, "😀" * 513)]),
+    )
     return cases
 
 

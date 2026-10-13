@@ -4266,7 +4266,15 @@ def test_reported_contract_at_browser_acceptance(open_page, monkeypatch, value, 
     if accepted:
         page = open_page(RawSequenceClient([value]))
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
-        assert page.locator("#board-issues").count() == 0
+        expected_issues = [
+            f"{item['code']} {item['message']}"
+            for item in (
+                value["discovery_diagnostics"]
+                + value["identity_coverage"]["diagnostics"]
+                + value["program_coverage"]["diagnostics"]
+            )
+        ]
+        assert page.locator("#board-issues li").all_text_contents() == expected_issues
     else:
         page = open_page(RawSequenceClient([raw_catalog(), value]))
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
