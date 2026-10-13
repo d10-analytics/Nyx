@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -4344,6 +4345,67 @@ def test_real_workspace_issues_and_default_relationship_cards_render(open_page, 
     page = open_page(ScanningClient(tmp_path))
     assert "discovery_unavailable" in page.locator("#board-issues").inner_text()
     assert sorted(page.locator(".card").evaluate_all("cards => cards.map(card => card.dataset.packagePath)")) == ["Alpha/Queue/empty", "Alpha/Queue/invalid"]
+
+
+def test_real_unsafe_and_overlong_folders_keep_the_healthy_card_after_refresh(open_page, tmp_path):
+    if sys.platform != "linux":
+        pytest.skip("unsafe names and over-limit trees are created only on Linux")
+
+    _write_package(tmp_path, "Alpha", "Queue", "healthy", STEP_ONE,
+                   f"# Healthy\nPackage ID: {STEP_ONE}\n")
+    page = open_page(ScanningClient(tmp_path))
+    healthy = page.locator('[data-package-path="Alpha/Queue/healthy"]')
+    assert healthy.count() == 1
+    assert healthy.locator(".card-title").inner_text() == "Healthy"
+
+    # An unsafe name below a grouping folder: the diagnostic names the parent,
+    # never the rejected name itself.
+    unsafe = tmp_path / "Alpha" / "Queue" / "grp" / "unsafe-marker\nname" / "item"
+    unsafe.mkdir(parents=True)
+    (unsafe / "spec.md").write_text("# Unsafe\n", encoding="utf-8")
+
+    # A package whose workspace-relative path is over the producer limit: the
+    # fifth 200-character component is excluded and the diagnostic names the
+    # deepest admitted ancestor.
+    component = "d" * 200
+    deepest = tmp_path / "Alpha" / "Queue" / "deep"
+    for _level in range(5):
+        deepest = deepest / component
+        deepest.mkdir(parents=True)
+    over_limit = deepest / ("p" * 80)
+    over_limit.mkdir()
+    (over_limit / "spec.md").write_text(
+        f"# Deep\nPackage ID: {STEP_ONE}\n", encoding="utf-8"
+    )
+
+    # The documented refresh flow: the button starts as Refresh view with no
+    # update waiting, the periodic poll advertises the changed catalog as
+    # Apply update, and choosing that button applies the new catalog.
+    refresh = page.locator("#refresh")
+    assert refresh.inner_text() == "Refresh view"
+    page.wait_for_selector("#refresh.pending", timeout=20000)
+    assert refresh.inner_text() == "Apply update"
+    refresh.click()
+    page.wait_for_function(
+        "() => !document.querySelector('#refresh').classList.contains('pending')",
+        timeout=15000,
+    )
+
+    issues = page.locator("#board-issues")
+    assert issues.count() == 1
+    if issues.get_attribute("open") is None:
+        issues.locator("summary").click()
+    # The producer mirrors each discovery diagnostic into identity coverage, so
+    # the same two issues render twice; no other issue appears.
+    assert set(page.locator("#board-issues li").all_inner_texts()) == {
+        "discovery_unavailable discovery unavailable: Alpha/Queue/grp",
+        "discovery_unavailable discovery unavailable: "
+        f"Alpha/Queue/deep/{component}/{component}/{component}/{component}",
+    }
+    assert page.locator(".refresh-issue-summary").count() == 0
+    assert page.locator('[data-package-path="Alpha/Queue/healthy"]').count() == 1
+    assert page.locator('[data-package-path^="Alpha/Queue/deep/"]').count() == 0
+    assert "unsafe-marker" not in page.locator("#board").inner_text()
 
 
 def test_worker_reported_snapshot_round_trips_into_browser(open_page, tmp_path, monkeypatch):
