@@ -2102,6 +2102,47 @@ def test_cli_service_children_leave_the_launch_directory_for_the_state_directory
         )
 
 
+def _skip_if_service_port_is_held() -> None:
+    """Skip when another process already owns the fixed control port."""
+
+    try:
+        _require_loopback_listener()
+    except OSError:
+        pytest.skip("the fixed Nyx control port is held by another process")
+
+
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
+def test_stop_recovery_then_start_reaches_readiness(tmp_path, monkeypatch):
+    """A recovered invalid record lets the next start reach readiness."""
+    _skip_if_service_port_is_held()
+    home = tmp_path / "home"
+    home.mkdir()
+    specification = tmp_path / "spec"
+    specification.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    state.setup(specification)
+    paths = state.state_paths()
+    record = paths.runtime_directory / "instance.json"
+    record.write_bytes(b"not json")
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    try:
+        assert runtime.stop() == "stopped"
+        assert not record.exists()
+        assert not leftover.exists()
+        assert runtime.start() == runtime.URL
+        assert paths.runtime_directory.joinpath("instance.json").exists()
+    finally:
+        try:
+            runtime.stop()
+        except runtime.RuntimeErrorBase:
+            pass
+
+
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -2781,6 +2822,23 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
         return runtime.observe_runtime()
 
 
+def _runtime_directory_snapshot(
+    paths: state.StatePaths,
+) -> dict[str, tuple[tuple[int, int, int, int], bytes | None]]:
+    snapshot = {}
+    for path in paths.runtime_directory.iterdir():
+        details = path.lstat()
+        identity = (
+            details.st_mode,
+            details.st_size,
+            details.st_mtime_ns,
+            details.st_ctime_ns,
+        )
+        payload = None if path.name == "operation.lock" else path.read_bytes()
+        snapshot[path.name] = identity, payload
+    return snapshot
+
+
 @pytest.mark.skipif(
     not hasattr(signal, "SIGKILL"),
     reason="SIGKILL not available on this platform",
@@ -2905,27 +2963,48 @@ def test_temporary_record_not_swept_while_lease_held(tmp_path, operation):
         os.close(lease_fd)
 
 
+def test_invalid_record_refused_by_start_retains_record_and_leftover(tmp_path):
+    """Start refuses a present invalid record and blocks the sweep."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    record.write_bytes(b"not json")
+
+    with pytest.raises(
+        runtime.UnhealthyInstanceError,
+        match=r"^Nyx instance record is unavailable; run 'nyx --stop' to recover$",
+    ):
+        _run_lifecycle(paths, "start")
+
+    assert record.read_bytes() == b"not json"
+    assert leftover.read_bytes() == b"leftover"
+
+
+def test_invalid_record_removed_by_stop_and_leftover_swept(tmp_path):
+    """Stop removes an invalid regular-file record and sweeps the leftover."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    record.write_bytes(b"not json")
+
+    assert _run_lifecycle(paths, "stop") == "stopped"
+
+    assert not record.exists()
+    assert not leftover.exists()
+
+
 @_LIFECYCLE_OPERATIONS
-@pytest.mark.parametrize(
-    ("kind", "message"),
-    [
-        pytest.param("malformed", r"^Nyx instance record is unavailable$", id="malformed"),
-        pytest.param("directory", r"^Nyx instance record is unsafe$", id="directory"),
-        pytest.param("symlink", r"^Nyx instance record is unsafe$", id="symlink"),
-    ],
-)
-def test_temporary_record_not_swept_after_refused_record(
-    tmp_path, operation, kind, message
-):
-    """A refused stale record blocks the sweep; record and leftover remain."""
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+def test_unsafe_record_refused_by_both_lifecycles(tmp_path, operation, kind):
+    """A non-regular record stays unsafe; record and leftover remain."""
     paths, _, _ = _fixture(tmp_path)
     record = paths.runtime_directory / "instance.json"
     leftover = paths.runtime_directory / ".instance.json.leftover"
     leftover.write_bytes(b"leftover")
     target = tmp_path / "foreign-record.json"
-    if kind == "malformed":
-        record.write_bytes(b"not json")
-    elif kind == "directory":
+    if kind == "directory":
         record.mkdir()
     else:
         _write_runtime_record(paths)
@@ -2934,19 +3013,331 @@ def test_temporary_record_not_swept_after_refused_record(
         record.symlink_to(target)
     target_bytes = target.read_bytes() if kind == "symlink" else None
 
-    with pytest.raises(runtime.UnhealthyInstanceError, match=message):
+    with pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record is unsafe$"
+    ):
         _run_lifecycle(paths, operation)
 
     assert leftover.read_bytes() == b"leftover"
-    if kind == "malformed":
-        assert record.read_bytes() == b"not json"
-    elif kind == "directory":
+    if kind == "directory":
         assert record.is_dir()
         assert list(record.iterdir()) == []
     else:
         assert record.is_symlink()
         assert os.path.samefile(record, target)
         assert target.read_bytes() == target_bytes
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires a native Windows junction")
+def test_free_lease_stop_refuses_native_record_junction(tmp_path):
+    """A junction record is non-regular and stays refused as unsafe."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    target = tmp_path / "foreign-record"
+    target.mkdir()
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(record), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert record.is_junction()
+
+    with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record is unsafe$"
+    ):
+        runtime.stop()
+
+    assert record.is_junction()
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "mode"),
+    [
+        pytest.param(
+            b'{"schema_version": 1, "instance_id": "trunc',
+            None,
+            id="truncated-json",
+        ),
+        pytest.param(
+            json.dumps({"schema_version": 99, "unexpected": True}).encode("utf-8"),
+            None,
+            id="wrong-schema",
+        ),
+        pytest.param(b"\xff\xfe\x00\x01", None, id="non-utf8"),
+        pytest.param(
+            None,
+            0o000,
+            id="mode-000",
+            marks=pytest.mark.skipif(
+                os.name == "nt" or os.geteuid() == 0,
+                reason="requires POSIX permissions enforced for a non-root user",
+            ),
+        ),
+    ],
+)
+def test_free_lease_stop_removes_each_invalid_record_form(tmp_path, payload, mode):
+    """Stop removes any regular-file record without reading or validating it."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    if payload is None:
+        _write_runtime_record(paths)
+        record.chmod(mode)
+    else:
+        record.write_bytes(payload)
+    try:
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_send_control"
+        ) as send_control, patch.object(
+            runtime.socket, "socket", side_effect=AssertionError("socket use")
+        ) as create_socket:
+            assert runtime.stop() == "stopped"
+        send_control.assert_not_called()
+        create_socket.assert_not_called()
+        assert not record.exists()
+        assert not leftover.exists()
+    finally:
+        if record.exists():
+            record.chmod(0o600)
+
+
+def test_held_lease_retains_invalid_record_and_refuses_stop(tmp_path):
+    """A held lifetime lease leaves an invalid record untouched."""
+    paths, _, _ = _fixture(tmp_path)
+    lease_fd, lease = _held_lease(paths)
+    record = paths.runtime_directory / "instance.json"
+    record.write_bytes(b"not json")
+    before = record.read_bytes()
+    try:
+        with patch.object(runtime, "_paths", return_value=paths), pytest.raises(
+            runtime.UnhealthyInstanceError,
+            match=r"^Nyx instance record is unavailable$",
+        ):
+            runtime.stop()
+        assert record.read_bytes() == before
+    finally:
+        lease.close()
+        os.close(lease_fd)
+
+
+@_LIFECYCLE_OPERATIONS
+def test_record_swap_before_unlink_aborts_with_changed(tmp_path, operation):
+    """The identity recheck is the last step before the unlink."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+
+    def swap_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            record.write_bytes(b"replacement-record")
+        real_require_deadline(deadline)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", swap_at_removal
+    ), pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record changed$"
+    ):
+        _run_lifecycle(paths, operation)
+
+    assert len(checks) >= 2
+    assert record.read_bytes() == b"replacement-record"
+    assert leftover.read_bytes() == b"leftover"
+
+
+def test_record_vanish_before_unlink_is_absent_for_stop(tmp_path):
+    """A record that vanished before the unlink is the absent case."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+
+    def vanish_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            record.unlink()
+        real_require_deadline(deadline)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", vanish_at_removal
+    ):
+        assert runtime.stop() == "stopped"
+
+    assert len(checks) >= 2
+    assert not record.exists()
+    assert not leftover.exists()
+
+
+def test_record_vanish_before_unlink_proceeds_to_spawn(tmp_path):
+    """A record that vanished before the unlink lets start reach the spawn."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+    captured: list[list[str]] = []
+
+    def vanish_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            record.unlink()
+        real_require_deadline(deadline)
+
+    def record_spawn(*_args, **_kwargs):
+        captured.append(sorted(entry.name for entry in paths.runtime_directory.iterdir()))
+        raise RuntimeError("sentinel")
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", vanish_at_removal
+    ), patch.object(runtime, "_spawn_daemon", record_spawn), pytest.raises(
+        RuntimeError, match="sentinel"
+    ):
+        runtime.start()
+
+    assert len(checks) >= 2
+    assert captured == [["lease.lock", "operation.lock"]]
+    assert not record.exists()
+
+
+def test_record_vanish_during_start_validation_is_absent(tmp_path):
+    """A record gone when start validates is absent, not unready."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_read_instance = runtime._read_instance
+    reads: list[object] = []
+    captured: list[list[str]] = []
+
+    def vanish_on_validation(state_paths, *, directory=None):
+        reads.append(state_paths)
+        if len(reads) == 1:
+            record.unlink()
+            raise runtime.UnhealthyInstanceError(
+                "Nyx instance is not ready"
+            ) from FileNotFoundError(record)
+        return real_read_instance(state_paths, directory=directory)
+
+    def record_spawn(*_args, **_kwargs):
+        captured.append(sorted(entry.name for entry in paths.runtime_directory.iterdir()))
+        raise RuntimeError("sentinel")
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_read_instance", vanish_on_validation
+    ), patch.object(runtime, "_spawn_daemon", record_spawn), pytest.raises(
+        RuntimeError, match="sentinel"
+    ):
+        runtime.start()
+
+    assert len(reads) == 1
+    assert captured == [["lease.lock", "operation.lock"]]
+    assert not record.exists()
+
+
+@pytest.mark.parametrize(
+    ("error_type", "error_number", "error_message"),
+    [
+        pytest.param(PermissionError, 13, "EACCES", id="eacces"),
+        pytest.param(OSError, 30, "EROFS", id="erofs"),
+        pytest.param(IsADirectoryError, 21, "EISDIR", id="eisdir"),
+    ],
+)
+@_LIFECYCLE_OPERATIONS
+def test_failed_removal_retains_record_and_leftover(
+    tmp_path, operation, error_type, error_number, error_message
+):
+    """A refused unlink keeps the record and the leftover temporary."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_unlink = Path.unlink
+
+    def refuse_record_unlink(path, *args, **kwargs):
+        if path == record:
+            raise error_type(error_number, error_message)
+        return real_unlink(path, *args, **kwargs)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        Path, "unlink", refuse_record_unlink
+    ), pytest.raises(
+        runtime.RuntimeErrorBase,
+        match=r"^Nyx stale instance record cannot be removed$",
+    ) as raised:
+        _run_lifecycle(paths, operation)
+
+    assert type(raised.value) is runtime.RuntimeErrorBase
+    assert record.exists()
+    assert leftover.read_bytes() == b"leftover"
+
+
+@_LIFECYCLE_OPERATIONS
+def test_removal_deadline_expiry_retains_record_and_leftover(tmp_path, operation):
+    """An expired deadline is not reported as an invalid record."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+
+    def expire_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            raise runtime._ControlTimeoutError("control deadline expired")
+        real_require_deadline(deadline)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", expire_at_removal
+    ), pytest.raises(
+        runtime._ControlTimeoutError, match=r"^control deadline expired$"
+    ):
+        _run_lifecycle(paths, operation)
+
+    assert len(checks) >= 2
+    assert record.exists()
+    assert leftover.read_bytes() == b"leftover"
+
+
+@_LIFECYCLE_OPERATIONS
+def test_timeout_is_never_reported_as_an_invalid_record(tmp_path, operation):
+    """A deadline failure keeps its own outcome, not the refusal message."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+
+    def expire_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            raise runtime._ControlTimeoutError(runtime._RECORD_UNAVAILABLE)
+        real_require_deadline(deadline)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", expire_at_removal
+    ), pytest.raises(runtime._ControlTimeoutError) as raised:
+        _run_lifecycle(paths, operation)
+
+    assert type(raised.value) is runtime._ControlTimeoutError
+    assert str(raised.value) == runtime._RECORD_UNAVAILABLE
+    assert record.exists()
 
 
 @_LIFECYCLE_OPERATIONS
@@ -3564,25 +3955,42 @@ def test_record_consumption_accepts_control_port_boundaries(control: str, port: 
         )
 
 
-def test_free_lease_start_and_stop_retain_invalid_stale_control_record():
+def test_free_lease_start_refuses_invalid_stale_control_record():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         record = paths.runtime_directory / "instance.json"
         _write_runtime_record(paths, control="127.0.0.1:0")
         before = record.read_bytes()
 
-        for operation in (runtime.start, runtime.stop):
-            with patch.object(runtime, "_paths", return_value=paths), patch.object(
-                runtime, "_send_control"
-            ) as send_control, patch.object(
-                runtime.socket, "socket", side_effect=AssertionError("socket use")
-            ) as create_socket, pytest.raises(
-                runtime.UnhealthyInstanceError, match="record is unavailable"
-            ):
-                operation()
-            send_control.assert_not_called()
-            create_socket.assert_not_called()
-            assert record.read_bytes() == before
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_send_control"
+        ) as send_control, patch.object(
+            runtime.socket, "socket", side_effect=AssertionError("socket use")
+        ) as create_socket, pytest.raises(
+            runtime.UnhealthyInstanceError,
+            match=r"^Nyx instance record is unavailable; run 'nyx --stop' to recover$",
+        ):
+            runtime.start()
+        send_control.assert_not_called()
+        create_socket.assert_not_called()
+        assert record.read_bytes() == before
+
+
+def test_free_lease_stop_removes_invalid_stale_control_record():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        record = paths.runtime_directory / "instance.json"
+        _write_runtime_record(paths, control="127.0.0.1:0")
+
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_send_control"
+        ) as send_control, patch.object(
+            runtime.socket, "socket", side_effect=AssertionError("socket use")
+        ) as create_socket:
+            assert runtime.stop() == "stopped"
+        send_control.assert_not_called()
+        create_socket.assert_not_called()
+        assert not record.exists()
 
 
 def _claim_snapshot(path: Path) -> tuple[int, int, int, int, int, int]:
@@ -3867,6 +4275,38 @@ def test_observe_runtime_reports_free_lease_stale_record_and_retains_bytes():
         assert record.read_bytes() == before
         assert stat.S_IMODE(record.stat().st_mode) == before_mode
         assert instance.instance_id == "instance"
+
+
+def test_observe_runtime_reports_unavailable_for_free_lease_invalid_record(tmp_path):
+    """Status reads only: an invalid record is unknown, not not-running."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    record.write_bytes(b"not json")
+    before = _runtime_directory_snapshot(paths)
+
+    observed = _observe(paths)
+
+    assert observed.status == "unknown"
+    assert observed.diagnostic == runtime.RUNTIME_STATE_UNAVAILABLE
+    assert _runtime_directory_snapshot(paths) == before
+    assert record.read_bytes() == b"not json"
+
+
+def test_observe_runtime_reports_changed_for_held_lease_without_record(tmp_path):
+    """A held lease without a locator is a changed runtime, not unavailable."""
+    paths, _, _ = _fixture(tmp_path)
+    lease_fd, lease = _held_lease(paths)
+    try:
+        before = _runtime_directory_snapshot(paths)
+
+        observed = _observe(paths)
+
+        assert observed.status == "unknown"
+        assert observed.diagnostic == runtime.RUNTIME_STATE_CHANGED
+        assert _runtime_directory_snapshot(paths) == before
+    finally:
+        lease.close()
+        os.close(lease_fd)
 
 
 def test_observe_runtime_rechecks_absent_runtime_before_reporting_stopped():
