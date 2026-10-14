@@ -3197,6 +3197,92 @@ def test_record_type_swap_before_unlink_aborts_with_changed(tmp_path, operation,
         assert list(foreign.iterdir()) == []
 
 
+@_LIFECYCLE_OPERATIONS
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_record_type_change_before_snapshot_aborts_with_changed(
+    tmp_path, operation, kind
+):
+    """A type change between the type check and the snapshot is a replacement."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    foreign = tmp_path / "foreign-record"
+    if kind == "symlink":
+        foreign.write_bytes(b"foreign-bytes")
+    else:
+        foreign.mkdir()
+    real_lstat = Path.lstat
+    swaps: list[bool] = []
+
+    def swap_after_type_check(path, *args, **kwargs):
+        details = real_lstat(path, *args, **kwargs)
+        if path == record and not swaps:
+            record.unlink()
+            if kind == "symlink":
+                record.symlink_to(foreign)
+            else:
+                record.mkdir()
+            swaps.append(True)
+        return details
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        Path, "lstat", swap_after_type_check
+    ), pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record changed$"
+    ):
+        _run_lifecycle(paths, operation)
+
+    assert swaps == [True]
+    assert leftover.read_bytes() == b"leftover"
+    if kind == "symlink":
+        assert record.is_symlink()
+        assert foreign.read_bytes() == b"foreign-bytes"
+    else:
+        assert record.is_dir()
+        assert list(foreign.iterdir()) == []
+
+
+class _ReparseStat:
+    """A stat result carrying the reparse attribute on any host."""
+
+    def __init__(self, details):
+        self._details = details
+        self.st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def __getattr__(self, name):
+        return getattr(self._details, name)
+
+
+@_LIFECYCLE_OPERATIONS
+def test_regular_file_reparse_record_refused_as_unsafe(tmp_path, operation):
+    """A regular-file reparse point is unsafe, not a raw runtime error."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    before = record.read_bytes()
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    real_lstat = Path.lstat
+
+    def reparse_lstat(path, *args, **kwargs):
+        details = real_lstat(path, *args, **kwargs)
+        if path == record:
+            return _ReparseStat(details)
+        return details
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        Path, "lstat", reparse_lstat
+    ), pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record is unsafe$"
+    ):
+        _run_lifecycle(paths, operation)
+
+    assert record.read_bytes() == before
+    assert leftover.read_bytes() == b"leftover"
+
+
 def test_record_vanish_before_unlink_is_absent_for_stop(tmp_path):
     """A record that vanished before the unlink is the absent case."""
     paths, _, _ = _fixture(tmp_path)
