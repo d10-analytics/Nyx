@@ -2825,6 +2825,13 @@ def _observe(paths: state.StatePaths) -> runtime.RuntimeObservation:
 def _runtime_directory_snapshot(
     paths: state.StatePaths,
 ) -> dict[str, tuple[tuple[int, int, int, int], bytes | None]]:
+    """Capture each entry's identity and its bytes when they are readable.
+
+    A lock held with a mandatory native claim cannot be opened for reading on
+    Windows, so an unreadable entry records no payload.  Its identity is still
+    compared, and every readable entry keeps its byte comparison.
+    """
+
     snapshot = {}
     for path in paths.runtime_directory.iterdir():
         details = path.lstat()
@@ -2834,7 +2841,10 @@ def _runtime_directory_snapshot(
             details.st_mtime_ns,
             details.st_ctime_ns,
         )
-        payload = None if path.name == "operation.lock" else path.read_bytes()
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            payload = None
         snapshot[path.name] = identity, payload
     return snapshot
 
@@ -4413,6 +4423,7 @@ def test_observe_runtime_reports_unavailable_for_free_lease_invalid_record(tmp_p
     record = paths.runtime_directory / "instance.json"
     record.write_bytes(b"not json")
     before = _runtime_directory_snapshot(paths)
+    assert before["instance.json"][1] == b"not json"
 
     observed = _observe(paths)
 
@@ -4428,6 +4439,7 @@ def test_observe_runtime_reports_changed_for_held_lease_without_record(tmp_path)
     lease_fd, lease = _held_lease(paths)
     try:
         before = _runtime_directory_snapshot(paths)
+        assert "lease.lock" in before
 
         observed = _observe(paths)
 
