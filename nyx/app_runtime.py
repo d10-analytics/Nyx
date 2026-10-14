@@ -356,7 +356,14 @@ class ApplicationRuntime:
                         cleanup()
                     except Exception:
                         listener_closed = False
-                if time.monotonic() >= deadline or not self._join_server_handlers(deadline):
+                # join_handlers enforces the deadline itself when handler work
+                # remains (False on expiry) and succeeds immediately when idle.
+                # No separate monotonic check here: startup-failure cleanup
+                # runs after the shared deadline has necessarily expired
+                # (e.g. static-readiness expiry), and an idle listener must
+                # still close so run() can report its failure phase instead
+                # of waiting on shutdown_done forever.
+                if not self._join_server_handlers(deadline):
                     listener_closed = False
                 else:
                     try:
