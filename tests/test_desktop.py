@@ -4082,7 +4082,15 @@ def test_required_native_change_workspace_save_replaces_the_rendered_board():
                 window._root.setText(str(second))
                 window._save.click()
 
-                assert state.load_configuration() == state.Configuration(second.resolve())
+                saved = state.load_configuration()
+                assert saved == state.Configuration(second.resolve()), (
+                    "the workspace save did not commit the replacement: "
+                    f"status={session.snapshot.status} "
+                    f"pending_error={session.pending_error!r} "
+                    f"switch_blocked={session.switch_blocked} "
+                    f"shutdown_blocked={session.shutdown_blocked} "
+                    f"saved_root={saved.specification_root}"
+                )
                 replaced = _wait_for_board_titles(
                     application, page, second_titles, probe=probe
                 )

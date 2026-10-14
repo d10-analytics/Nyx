@@ -356,20 +356,18 @@ class ApplicationRuntime:
                         cleanup()
                     except Exception:
                         listener_closed = False
-                # join_handlers enforces the deadline itself when handler work
-                # remains (False on expiry) and succeeds immediately when idle.
-                # No separate monotonic check here: startup-failure cleanup
-                # runs after the shared deadline has necessarily expired
-                # (e.g. static-readiness expiry), and an idle listener must
-                # still close so run() can report its failure phase instead
-                # of waiting on shutdown_done forever.
-                if not self._join_server_handlers(deadline):
+                # join_handlers drains parsed request work within the deadline
+                # and returns immediately when handlers are parked on kept-alive
+                # reads.  Startup-failure cleanup runs after the shared deadline
+                # has necessarily expired (e.g. static-readiness expiry), so its
+                # result must not retain the failure: run() waits for the
+                # terminal state this completes, and the accepted sockets are
+                # already closed above.
+                self._join_server_handlers(deadline)
+                try:
+                    self.server.server_close()
+                except Exception:
                     listener_closed = False
-                else:
-                    try:
-                        self.server.server_close()
-                    except Exception:
-                        listener_closed = False
             try:
                 workers_closed = self.workers.close(deadline)
             except Exception:
@@ -379,12 +377,21 @@ class ApplicationRuntime:
         return settings_closed and listener_closed and workers_closed
 
     def shutdown(self, deadline: float) -> bool:
-        """Close listener and workers before lifecycle ownership is released."""
+        """Close listener and workers before lifecycle ownership is released.
+
+        The accepted sockets close before the listener so a kept-alive handler
+        stops waiting, and the listener is released even when parsed request
+        work does not drain inside the deadline: the caller's precondition is
+        the released port, so an undrained request is reported through the
+        result instead of by skipping the listener close.  An expired deadline
+        still stops before the next cleanup phase begins.
+        """
 
         self.catalog_admitted = False
         if not self._close_settings_admission(deadline):
             return False
         self.workers.close_admission()
+        drained = True
         if self.server is not None:
             if time.monotonic() >= deadline:
                 return False
@@ -392,12 +399,17 @@ class ApplicationRuntime:
             if time.monotonic() >= deadline:
                 return False
             self.server.close_active_connections()
-            if time.monotonic() >= deadline or not self._join_server_handlers(deadline):
+            if time.monotonic() >= deadline:
                 return False
-            self.server.server_close()
+            drained = self._join_server_handlers(deadline)
+            try:
+                self.server.server_close()
+            except Exception:
+                return False
         if time.monotonic() >= deadline:
             return False
-        return self.workers.close(deadline) and time.monotonic() < deadline
+        workers_closed = self.workers.close(deadline)
+        return workers_closed and drained and time.monotonic() < deadline
 
 
 __all__ = [

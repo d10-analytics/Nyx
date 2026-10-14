@@ -105,6 +105,43 @@ def _handler_for(
         # timed-out connection is closed, never returned to the next readline.
         timeout = _CONNECTION_TIMEOUT_SECONDS
 
+        def setup(self) -> None:
+            super().setup()
+            # Work is claimed once a request is parsed, not when the handler
+            # starts waiting for one: a kept-alive connection parked on its
+            # next request line holds nothing an owned close must drain.
+            self._request_work_claimed = False
+
+        def parse_request(self) -> bool:
+            parsed = super().parse_request()
+            if parsed:
+                self._claim_request_work()
+            return parsed
+
+        def handle_one_request(self) -> None:
+            try:
+                super().handle_one_request()
+            finally:
+                # Every exit from a dispatched request, including a failed
+                # response write, releases the claim the parse took.
+                self._release_request_work()
+
+        def _claim_request_work(self) -> None:
+            if self._request_work_claimed:
+                return
+            self._request_work_claimed = True
+            begin = getattr(self.server, "begin_request_work", None)
+            if begin is not None:
+                begin()
+
+        def _release_request_work(self) -> None:
+            if not self._request_work_claimed:
+                return
+            self._request_work_claimed = False
+            end = getattr(self.server, "end_request_work", None)
+            if end is not None:
+                end()
+
         def send_response(self, code: int, message: str | None = None) -> None:
             # D-12: every real response (including stdlib send_error paths and
             # HEAD) carries the framing protection headers exactly once. The
@@ -376,16 +413,11 @@ class TrackerServer(ThreadingHTTPServer):
             # removes the socket from _active_connections via close_request.
             self.shutdown_request(request)
             return
-        with self._handler_condition:
-            self._handler_count += 1
         try:
             super().process_request(request, client_address)
         except Exception:
             # The handler thread never started, so its finally will not run.
             self._connection_slots.release()
-            with self._handler_condition:
-                self._handler_count -= 1
-                self._handler_condition.notify_all()
             raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
@@ -393,9 +425,19 @@ class TrackerServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._connection_slots.release()
-            with self._handler_condition:
-                self._handler_count -= 1
-                self._handler_condition.notify_all()
+
+    def begin_request_work(self) -> None:
+        """Claim one parsed request so an owned close can wait for it."""
+
+        with self._handler_condition:
+            self._request_work += 1
+
+    def end_request_work(self) -> None:
+        """Release one parsed request and wake an owned close waiting on it."""
+
+        with self._handler_condition:
+            self._request_work -= 1
+            self._handler_condition.notify_all()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # A handler woken by close_active_connections during an owned
@@ -410,9 +452,17 @@ class TrackerServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
     def join_handlers(self, deadline: float) -> bool:
-        """Wait until no handler work remains, within the owned deadline."""
+        """Wait until no parsed request is in flight, within the deadline.
+
+        A handler parked on a kept-alive connection holds no request, and
+        closing its accepted socket does not interrupt that wait on every
+        host, so a parked reader must not gate an owned shutdown: the listener
+        has to close for the released port to be usable, and a late wake only
+        needs the diagnostics handle_error already suppresses while closing.
+        """
+
         with self._handler_condition:
-            while self._handler_count:
+            while self._request_work:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -455,7 +505,7 @@ class TrackerServer(ThreadingHTTPServer):
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
         self._handler_condition = threading.Condition()
-        self._handler_count = 0
+        self._request_work = 0
         self._closing = False
         # D-03: bound the handler threads; acquired without blocking in
         # process_request so serve_forever (and thus owned shutdown) never

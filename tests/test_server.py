@@ -1619,6 +1619,46 @@ def test_owned_shutdown_completes_while_the_cap_is_full():
                 running.application.server = None
 
 
+def test_owned_shutdown_releases_the_listener_when_request_work_does_not_drain():
+    """A request that refuses to finish is reported, not left holding the port."""
+    release = threading.Event()
+
+    class BlockingClient:
+        def __init__(self, catalog):
+            self.catalog = catalog
+
+        def fetch_catalog(self):
+            assert release.wait(timeout=10)
+            return self.catalog
+
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", 30), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", 8
+    ):
+        running = RunningServer(BlockingClient(valid_catalog()), SettingsStub())
+        connection = None
+        try:
+            port = running.server.server_port
+            connection = open_connection(port)
+            connection.sendall(raw_request(port, "GET /api/catalog HTTP/1.1"))
+            assert wait_for(lambda: running.server._request_work == 1, 5)
+            # The undrained request keeps the shutdown result retryable.
+            assert running.application.shutdown(time.monotonic() + 0.5) is False
+            # The caller's precondition still holds: the released port is
+            # usable while the stuck request is reported through the result.
+            assert running.server.socket.fileno() == -1
+            release.set()
+            assert running.application.shutdown(time.monotonic() + 5) is True
+            assert wait_for(lambda: running.server._request_work == 0, 5)
+            running.application.server = None
+        finally:
+            release.set()
+            if connection is not None:
+                connection.close()
+            if running.application.server is not None:
+                assert running.application.shutdown(time.monotonic() + 5)
+                running.application.server = None
+
+
 def test_injected_handler_thread_start_failure_releases_the_slot():
     cap = CONNECTION_CAP
     # The patched timeout only has to outlast the proof; AC-03 floors it at 2 s.
@@ -1814,10 +1854,18 @@ def test_framing_headers_on_the_standard_library_414():
     assert_security_headers_exactly_once(head)
 
 
-def test_close_then_join_handlers_drains_idle_keepalive_without_stderr(capsys):
-    """An idle keep-alive handler is joined before server_close (no stderr race)."""
+def test_parked_keepalive_handler_does_not_gate_the_owned_close(capsys):
+    """A handler parked on its next request line holds no request to drain.
+
+    Closing the accepted socket does not interrupt that read on every host, so
+    the listener must still close, a replacement must be able to bind the
+    released port, and the parked reader's late failure must stay off stderr.
+    """
     client = StubClient(catalog=valid_catalog())
-    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+    # The read timeout must outlast the drain deadline, so a parked reader that
+    # a close cannot wake is decided by the drain rule and not by its own
+    # timeout ending the wait first.
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", 30), patch.object(
         server, "_MAX_ACTIVE_CONNECTIONS", 8
     ):
         running = RunningServer(client)
@@ -1834,19 +1882,31 @@ def test_close_then_join_handlers_drains_idle_keepalive_without_stderr(capsys):
                     assert piece
                     head += piece
                 assert head.split(b"\r\n", 1)[0] == b"HTTP/1.1 200 OK"
-                # The handler is now parked in handle_one_request on keep-alive.
-                assert wait_for(lambda: running.server._handler_count >= 1, 5)
+                # The handler thread is now parked in handle_one_request on
+                # keep-alive: the connection is live but holds no request.
+                assert wait_for(
+                    lambda: handler_thread_count() - baseline >= 1
+                    and running.server._request_work == 0,
+                    5,
+                )
+                assert running.server.join_handlers(time.monotonic() + 2) is True
                 running.server.close_active_connections()
-                assert running.server.join_handlers(time.monotonic() + 5) is True
-                assert running.server._handler_count == 0
-                assert wait_for(lambda: handler_thread_count() <= baseline, 5)
+                running.server.server_close()
+                # Releasing the listener is what lets a replacement runtime
+                # bind the port while the parked reader survives the close.
+                assert running.server.socket.fileno() == -1
+                # The reader that wakes after the close is the expected
+                # outcome; its failure must not reach stderr, where a write
+                # racing interpreter finalization aborts the process.
+                running.server.handle_error(connection, ("127.0.0.1", 0))
             finally:
                 connection.close()
+            assert wait_for(lambda: handler_thread_count() <= baseline, 5)
         finally:
             running.server.shutdown()
             running.thread.join(timeout=5)
             running.server.server_close()
-    assert "Traceback" not in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
 
 
 def test_join_handlers_times_out_while_handler_work_is_blocked():
@@ -1870,14 +1930,14 @@ def test_join_handlers_times_out_while_handler_work_is_blocked():
             connection = open_connection(port)
             try:
                 connection.sendall(raw_request(port, "GET /api/catalog HTTP/1.1"))
-                assert wait_for(lambda: running.server._handler_count >= 1, 5)
+                assert wait_for(lambda: running.server._request_work == 1, 5)
                 assert running.server.join_handlers(time.monotonic() + 0.3) is False
-                assert running.server._handler_count == 1
+                assert running.server._request_work == 1
             finally:
                 release.set()
                 connection.close()
             assert running.server.join_handlers(time.monotonic() + 5) is True
-            assert running.server._handler_count == 0
+            assert wait_for(lambda: running.server._request_work == 0, 5)
         finally:
             running.server.shutdown()
             running.thread.join(timeout=5)
