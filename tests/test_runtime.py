@@ -3153,6 +3153,50 @@ def test_record_swap_before_unlink_aborts_with_changed(tmp_path, operation):
     assert leftover.read_bytes() == b"leftover"
 
 
+@_LIFECYCLE_OPERATIONS
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_record_type_swap_before_unlink_aborts_with_changed(tmp_path, operation, kind):
+    """A record that became non-regular after the snapshot is changed, not removed."""
+    paths, _, _ = _fixture(tmp_path)
+    record = paths.runtime_directory / "instance.json"
+    _write_runtime_record(paths)
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    foreign = tmp_path / "foreign-record"
+    if kind == "symlink":
+        foreign.write_bytes(b"foreign-bytes")
+    else:
+        foreign.mkdir()
+    real_require_deadline = runtime._require_deadline
+    checks: list[float] = []
+
+    def swap_type_at_removal(deadline):
+        checks.append(deadline)
+        if len(checks) == 2:
+            record.unlink()
+            if kind == "symlink":
+                record.symlink_to(foreign)
+            else:
+                record.mkdir()
+        real_require_deadline(deadline)
+
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime, "_require_deadline", swap_type_at_removal
+    ), pytest.raises(
+        runtime.UnhealthyInstanceError, match=r"^Nyx instance record changed$"
+    ):
+        _run_lifecycle(paths, operation)
+
+    assert len(checks) >= 2
+    assert leftover.read_bytes() == b"leftover"
+    if kind == "symlink":
+        assert record.is_symlink()
+        assert foreign.read_bytes() == b"foreign-bytes"
+    else:
+        assert record.is_dir()
+        assert list(foreign.iterdir()) == []
+
+
 def test_record_vanish_before_unlink_is_absent_for_stop(tmp_path):
     """A record that vanished before the unlink is the absent case."""
     paths, _, _ = _fixture(tmp_path)
