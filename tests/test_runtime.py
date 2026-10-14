@@ -118,6 +118,35 @@ def _subprocess_environment(
     return environment
 
 
+def _wait_for_process_exit(pid: int, deadline: float) -> None:
+    """Wait until a foreign process (not our child) has fully exited.
+
+    A detached daemon holds the temp state directory as its working
+    directory, and Windows refuses to remove that tree while it lives.
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:  # ERROR_INVALID_PARAMETER: already exited
+            return
+        try:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            kernel32.WaitForSingleObject(handle, remaining)
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.01)
+
+
 def test_runtime_tests_collect_without_test_owned_posix_primitives():
     """Model Windows' absent fcntl/getuid boundary during real pytest collection."""
 
@@ -1214,13 +1243,7 @@ def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_a
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_normal_service_settings_survive_terminal_stop_and_restart():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        capability_probe.bind(("127.0.0.1", runtime.PORT))
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
+    _require_loopback_listener()
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1324,13 +1347,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        capability_probe.bind(("127.0.0.1", runtime.PORT))
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
+    _require_loopback_listener()
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -4924,6 +4941,15 @@ def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_ex
             if launcher.poll() is None:
                 launcher.kill()
                 launcher.wait(timeout=2)
+            # The child exits just after releasing its inherited claim fd;
+            # teardown must wait for the process itself or Windows refuses
+            # to remove the state directory it uses as its cwd.
+            try:
+                child_pid = int(marker.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                child_pid = None
+            if child_pid is not None:
+                _wait_for_process_exit(child_pid, time.monotonic() + 10)
 
 
 def test_actual_launcher_death_before_spawn_releases_lease():

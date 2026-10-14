@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import threading
+import time
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,6 +104,43 @@ def _handler_for(
         # connection indefinitely; combined with D-01's close rule the
         # timed-out connection is closed, never returned to the next readline.
         timeout = _CONNECTION_TIMEOUT_SECONDS
+
+        def setup(self) -> None:
+            super().setup()
+            # Work is claimed once a request is parsed, not when the handler
+            # starts waiting for one: a kept-alive connection parked on its
+            # next request line holds nothing an owned close must drain.
+            self._request_work_claimed = False
+
+        def parse_request(self) -> bool:
+            parsed = super().parse_request()
+            if parsed:
+                self._claim_request_work()
+            return parsed
+
+        def handle_one_request(self) -> None:
+            try:
+                super().handle_one_request()
+            finally:
+                # Every exit from a dispatched request, including a failed
+                # response write, releases the claim the parse took.
+                self._release_request_work()
+
+        def _claim_request_work(self) -> None:
+            if self._request_work_claimed:
+                return
+            self._request_work_claimed = True
+            begin = getattr(self.server, "begin_request_work", None)
+            if begin is not None:
+                begin()
+
+        def _release_request_work(self) -> None:
+            if not self._request_work_claimed:
+                return
+            self._request_work_claimed = False
+            end = getattr(self.server, "end_request_work", None)
+            if end is not None:
+                end()
 
         def send_response(self, code: int, message: str | None = None) -> None:
             # D-12: every real response (including stdlib send_error paths and
@@ -388,6 +426,49 @@ class TrackerServer(ThreadingHTTPServer):
         finally:
             self._connection_slots.release()
 
+    def begin_request_work(self) -> None:
+        """Claim one parsed request so an owned close can wait for it."""
+
+        with self._handler_condition:
+            self._request_work += 1
+
+    def end_request_work(self) -> None:
+        """Release one parsed request and wake an owned close waiting on it."""
+
+        with self._handler_condition:
+            self._request_work -= 1
+            self._handler_condition.notify_all()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A handler woken by close_active_connections during an owned
+        # shutdown must not write its traceback to stderr: a daemon thread
+        # racing interpreter finalization turns that write into a fatal
+        # _enter_buffered_busy abort. Dropping the diagnostic while closing
+        # removes the crash; the close itself is the expected outcome.
+        with self._connection_lock:
+            closing = self._closing
+        if closing:
+            return
+        super().handle_error(request, client_address)
+
+    def join_handlers(self, deadline: float) -> bool:
+        """Wait until no parsed request is in flight, within the deadline.
+
+        A handler parked on a kept-alive connection holds no request, and
+        closing its accepted socket does not interrupt that wait on every
+        host, so a parked reader must not gate an owned shutdown: the listener
+        has to close for the released port to be usable, and a late wake only
+        needs the diagnostics handle_error already suppresses while closing.
+        """
+
+        with self._handler_condition:
+            while self._request_work:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._handler_condition.wait(remaining)
+        return True
+
     def close_request(self, request: Any) -> None:
         with self._connection_lock:
             self._active_connections.discard(request)
@@ -396,6 +477,7 @@ class TrackerServer(ThreadingHTTPServer):
     def close_active_connections(self) -> None:
         """Close accepted idle/active sockets during an owned shutdown."""
         with self._connection_lock:
+            self._closing = True
             connections = tuple(self._active_connections)
         for connection in connections:
             try:
@@ -422,6 +504,9 @@ class TrackerServer(ThreadingHTTPServer):
     ) -> None:
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
+        self._handler_condition = threading.Condition()
+        self._request_work = 0
+        self._closing = False
         # D-03: bound the handler threads; acquired without blocking in
         # process_request so serve_forever (and thus owned shutdown) never
         # stalls waiting for a slot.
