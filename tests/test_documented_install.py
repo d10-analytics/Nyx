@@ -181,6 +181,18 @@ PORT_CONFLICT_GUIDANCE_MARKERS = (
     "excluded or reserved port range", "no owning program",
     "`netsh interface ipv4 show excludedportrange protocol=tcp`",
 )
+RECOVERY_GUIDANCE_HEADING = "### Recover an unreadable runtime record"
+RECOVERY_GUIDANCE_MARKERS = (
+    "unreadable or malformed and has no owning instance",
+    "`Runtime: unknown`",
+    "`runtime state unavailable`",
+    "`nyx --stop` removes that record exactly as it removes a valid stale record",
+    "prints the ordinary `stopped` result",
+    "no separate recovery message",
+    "`; run 'nyx --stop' to recover`",
+    "Recovery requires that no instance owns the runtime",
+    "a live owner still refuses both start and stop",
+)
 EVENT_COMPLETION_EXAMPLE = (
     "# Organize the neighborhood festival\n"
     "Package ID: 123e4567-e89b-42d3-a456-426614174100\n"
@@ -305,6 +317,20 @@ def test_port_conflict_guidance_matches_the_public_message():
     assert "```" not in section
     assert "If something looks wrong" in runtime.PORT_UNAVAILABLE_MESSAGE
     assert "Running Nyx" in runtime.PORT_UNAVAILABLE_MESSAGE
+
+
+def test_documents_publish_the_invalid_record_recovery_guidance():
+    document = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    # The recovery guidance must not displace the installation block: the first
+    # fenced block in each published language stays exactly as documented.
+    for language in EXPECTED:
+        _documented_commands(document, language)
+    assert RECOVERY_GUIDANCE_HEADING in document, "missing invalid-record recovery guidance"
+    section = document.split(RECOVERY_GUIDANCE_HEADING, 1)[1].split("\n#", 1)[0]
+    normalized = re.sub(r"\s+", " ", section)
+    for marker in RECOVERY_GUIDANCE_MARKERS:
+        assert marker in normalized, marker
+    assert "```" not in section
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
