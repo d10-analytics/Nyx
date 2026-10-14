@@ -1812,3 +1812,73 @@ def test_framing_headers_on_the_standard_library_414():
     head, _, _ = data.partition(b"\r\n\r\n")
     assert response_status(head) == 414
     assert_security_headers_exactly_once(head)
+
+
+def test_close_then_join_handlers_drains_idle_keepalive_without_stderr(capsys):
+    """An idle keep-alive handler is joined before server_close (no stderr race)."""
+    client = StubClient(catalog=valid_catalog())
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", 8
+    ):
+        running = RunningServer(client)
+        try:
+            port = running.server.server_port
+            baseline = handler_thread_count()
+            connection = open_connection(port)
+            try:
+                connection.sendall(raw_request(port, "GET / HTTP/1.1"))
+                head = b""
+                connection.settimeout(5)
+                while b"\r\n\r\n" not in head:
+                    piece = connection.recv(65536)
+                    assert piece
+                    head += piece
+                assert head.split(b"\r\n", 1)[0] == b"HTTP/1.1 200 OK"
+                # The handler is now parked in handle_one_request on keep-alive.
+                assert wait_for(lambda: running.server._handler_count >= 1, 5)
+                running.server.close_active_connections()
+                assert running.server.join_handlers(time.monotonic() + 5) is True
+                assert running.server._handler_count == 0
+                assert wait_for(lambda: handler_thread_count() <= baseline, 5)
+            finally:
+                connection.close()
+        finally:
+            running.server.shutdown()
+            running.thread.join(timeout=5)
+            running.server.server_close()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_join_handlers_times_out_while_handler_work_is_blocked():
+    """A handler that refuses to finish makes join_handlers fail at the deadline."""
+    release = threading.Event()
+
+    class BlockingClient:
+        def __init__(self, catalog):
+            self.catalog = catalog
+
+        def fetch_catalog(self):
+            assert release.wait(timeout=10)
+            return self.catalog
+
+    with patch.object(server, "_CONNECTION_TIMEOUT_SECONDS", CONNECTION_TIMEOUT), patch.object(
+        server, "_MAX_ACTIVE_CONNECTIONS", 8
+    ):
+        running = RunningServer(BlockingClient(valid_catalog()))
+        try:
+            port = running.server.server_port
+            connection = open_connection(port)
+            try:
+                connection.sendall(raw_request(port, "GET /api/catalog HTTP/1.1"))
+                assert wait_for(lambda: running.server._handler_count >= 1, 5)
+                assert running.server.join_handlers(time.monotonic() + 0.3) is False
+                assert running.server._handler_count == 1
+            finally:
+                release.set()
+                connection.close()
+            assert running.server.join_handlers(time.monotonic() + 5) is True
+            assert running.server._handler_count == 0
+        finally:
+            running.server.shutdown()
+            running.thread.join(timeout=5)
+            running.server.server_close()

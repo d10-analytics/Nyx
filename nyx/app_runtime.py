@@ -325,6 +325,16 @@ class ApplicationRuntime:
         if self.http_thread is not None:
             self.http_thread.join()
 
+    def _join_server_handlers(self, deadline: float) -> bool:
+        """Wait for in-flight handler work, tolerating test server doubles."""
+        join = getattr(self.server, "join_handlers", None)
+        if join is None:
+            return True
+        try:
+            return bool(join(deadline))
+        except Exception:
+            return False
+
     def cleanup_start_failure(self, deadline: float) -> bool:
         """Close failed-start resources, retaining ownership if work remains."""
 
@@ -341,10 +351,16 @@ class ApplicationRuntime:
                 for cleanup in (
                     self.server.shutdown,
                     self.server.close_active_connections,
-                    self.server.server_close,
                 ):
                     try:
                         cleanup()
+                    except Exception:
+                        listener_closed = False
+                if time.monotonic() >= deadline or not self._join_server_handlers(deadline):
+                    listener_closed = False
+                else:
+                    try:
+                        self.server.server_close()
                     except Exception:
                         listener_closed = False
             try:
@@ -369,7 +385,7 @@ class ApplicationRuntime:
             if time.monotonic() >= deadline:
                 return False
             self.server.close_active_connections()
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= deadline or not self._join_server_handlers(deadline):
                 return False
             self.server.server_close()
         if time.monotonic() >= deadline:

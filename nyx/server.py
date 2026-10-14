@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import threading
+import time
 from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -375,11 +376,16 @@ class TrackerServer(ThreadingHTTPServer):
             # removes the socket from _active_connections via close_request.
             self.shutdown_request(request)
             return
+        with self._handler_condition:
+            self._handler_count += 1
         try:
             super().process_request(request, client_address)
         except Exception:
             # The handler thread never started, so its finally will not run.
             self._connection_slots.release()
+            with self._handler_condition:
+                self._handler_count -= 1
+                self._handler_condition.notify_all()
             raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
@@ -387,6 +393,31 @@ class TrackerServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._connection_slots.release()
+            with self._handler_condition:
+                self._handler_count -= 1
+                self._handler_condition.notify_all()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A handler woken by close_active_connections during an owned
+        # shutdown must not write its traceback to stderr: a daemon thread
+        # racing interpreter finalization turns that write into a fatal
+        # _enter_buffered_busy abort. Dropping the diagnostic while closing
+        # removes the crash; the close itself is the expected outcome.
+        with self._connection_lock:
+            closing = self._closing
+        if closing:
+            return
+        super().handle_error(request, client_address)
+
+    def join_handlers(self, deadline: float) -> bool:
+        """Wait until no handler work remains, within the owned deadline."""
+        with self._handler_condition:
+            while self._handler_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._handler_condition.wait(remaining)
+        return True
 
     def close_request(self, request: Any) -> None:
         with self._connection_lock:
@@ -396,6 +427,7 @@ class TrackerServer(ThreadingHTTPServer):
     def close_active_connections(self) -> None:
         """Close accepted idle/active sockets during an owned shutdown."""
         with self._connection_lock:
+            self._closing = True
             connections = tuple(self._active_connections)
         for connection in connections:
             try:
@@ -422,6 +454,9 @@ class TrackerServer(ThreadingHTTPServer):
     ) -> None:
         self._active_connections: set[Any] = set()
         self._connection_lock = threading.Lock()
+        self._handler_condition = threading.Condition()
+        self._handler_count = 0
+        self._closing = False
         # D-03: bound the handler threads; acquired without blocking in
         # process_request so serve_forever (and thus owned shutdown) never
         # stalls waiting for a slot.
