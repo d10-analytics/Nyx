@@ -77,10 +77,10 @@ that is unreadable or malformed and has no owning instance reports
 `Runtime: unknown` with the `runtime state unavailable` diagnostic. While no
 instance owns the runtime, `nyx --stop` removes that record exactly as it
 removes a valid stale record and prints the ordinary `stopped` result; there is
-no separate recovery message. Starting with `nyx` still refuses while the record
-cannot be read and names the recovery step in its message, which ends
-`; run 'nyx --stop' to recover`. Recovery requires that no instance owns the
-runtime. For an unreadable record, a live owner still refuses both start and
+no separate recovery message. With no owning instance, starting with `nyx` still
+refuses while the record cannot be read, and its message names the recovery step
+and ends `; run 'nyx --stop' to recover`. Recovery requires that no instance owns
+the runtime. For an unreadable record, a live owner still refuses both start and
 stop and keeps the record in place. Removal is permanent, because Nyx cannot
 distinguish a genuinely damaged record from a temporarily unreadable one.
 
