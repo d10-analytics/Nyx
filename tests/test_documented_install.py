@@ -189,6 +189,9 @@ RECOVERY_GUIDANCE_MARKERS = (
     "`nyx --stop` removes that record exactly as it removes a valid stale record",
     "prints the ordinary `stopped` result",
     "no separate recovery message",
+    "With no owning instance, starting with `nyx` still refuses while the record "
+    "cannot be read, and its message names the recovery step and ends "
+    "`; run 'nyx --stop' to recover`",
     "`; run 'nyx --stop' to recover`",
     "Recovery requires that no instance owns the runtime",
     "a live owner still refuses both start and stop",
