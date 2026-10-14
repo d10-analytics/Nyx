@@ -612,12 +612,14 @@ def _remove_stale_instance(
         try:
             record = _record_path(paths)
             details = record.lstat()
-            if (
-                stat.S_ISLNK(details.st_mode)
-                or not stat.S_ISREG(details.st_mode)
-            ):
+            if not _safe_lock_metadata(details):
                 raise UnhealthyInstanceError("Nyx instance record is unsafe")
-            record_metadata = _read_metadata(record, read_data=False)
+            try:
+                record_metadata = _read_metadata(record, read_data=False)
+            except RuntimeErrorBase:
+                # The record changed type after the type check.  Abort as a
+                # replacement instead of surfacing a raw state error.
+                raise UnhealthyInstanceError("Nyx instance record changed")
             if record_metadata.exists and refuse_invalid:
                 # A caller that validates refuses a present invalid record; a
                 # record that vanished after the type check is the absent case
