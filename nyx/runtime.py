@@ -49,6 +49,12 @@ RUNTIME_CONTROL_UNAVAILABLE = "runtime control unavailable"
 RUNTIME_CONTROL_IDENTITY_MISMATCH = "runtime control identity mismatch"
 RUNTIME_UNHEALTHY = "runtime unhealthy"
 
+# A record that cannot be read is reported as unavailable.  Start names the
+# recovery command for a free-lease refusal; stop removes the same record
+# without reading it.
+_RECORD_UNAVAILABLE = "Nyx instance record is unavailable"
+_RECORD_RECOVERY = f"{_RECORD_UNAVAILABLE}; run 'nyx --stop' to recover"
+
 # Private exit statuses keep detached-child failures observable without retaining
 # child output, exception text, filesystem paths, or capability material.
 _DAEMON_FAILURES = {
@@ -324,6 +330,19 @@ def _metadata_unchanged(
     return current == original
 
 
+def _record_present(path: Path) -> bool:
+    """Report whether a record path still names a removable record.
+
+    A path that changed type or became unreadable counts as present so a caller
+    treats it as a replacement rather than as an absent record.
+    """
+
+    try:
+        return _read_metadata(path, read_data=False).exists
+    except (OSError, RuntimeErrorBase):
+        return True
+
+
 def _record_snapshot(
     path: Path, *, directory: NativeDirectory | None = None
 ) -> _Metadata:
@@ -520,7 +539,7 @@ def _read_instance(
     except FileNotFoundError as error:
         raise UnhealthyInstanceError("Nyx instance is not ready") from error
     except (OSError, RuntimeErrorBase, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise UnhealthyInstanceError("Nyx instance record is unavailable") from error
+        raise UnhealthyInstanceError(_RECORD_UNAVAILABLE) from error
 
 
 def _read_live_instance(paths: state.StatePaths) -> tuple[Instance, _Metadata]:
@@ -579,11 +598,16 @@ def _write_instance(
                 pass
 
 
-def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
+def _remove_stale_instance(
+    paths: state.StatePaths,
+    *,
+    deadline: float,
+    refuse_invalid: bool = False,
+) -> None:
     # The temp-file sweep runs only after the record step succeeds: the stale
-    # locator is absent, or it was validated and removed.  Any filesystem
-    # failure in either step, including listing the runtime directory, is
-    # reported as one bounded lifecycle error.
+    # locator is absent, or it was removed.  Any filesystem failure in either
+    # step, including listing the runtime directory, is reported as one bounded
+    # lifecycle error.
     try:
         try:
             record = _record_path(paths)
@@ -593,12 +617,26 @@ def _remove_stale_instance(paths: state.StatePaths, *, deadline: float) -> None:
                 or not stat.S_ISREG(details.st_mode)
             ):
                 raise UnhealthyInstanceError("Nyx instance record is unsafe")
-            # A stale record is still persisted control input.  Validate it at
-            # the same boundary as active lifecycle operations before removing
-            # it, so a malformed endpoint cannot be silently discarded.
-            _read_instance(paths)
-            _require_deadline(deadline)
-            record.unlink()
+            record_metadata = _read_metadata(record, read_data=False)
+            if record_metadata.exists and refuse_invalid:
+                # A caller that validates refuses a present invalid record; a
+                # record that vanished after the type check is the absent case
+                # and is classified below.
+                try:
+                    _read_instance(paths)
+                except UnhealthyInstanceError:
+                    if _record_present(record):
+                        raise
+            if record_metadata.exists:
+                _require_deadline(deadline)
+                # The identity recheck is the last step before the unlink.  A
+                # record that vanished is absent, not a replacement.
+                if not _metadata_unchanged(record, record_metadata):
+                    if _record_present(record):
+                        raise UnhealthyInstanceError("Nyx instance record changed")
+                    record_metadata = _Metadata(False)
+                if record_metadata.exists:
+                    record.unlink()
         except FileNotFoundError:
             pass
 
@@ -1545,7 +1583,14 @@ def start() -> str:
             return URL
         release_deferred = False
         try:
-            _remove_stale_instance(paths, deadline=deadline)
+            try:
+                _remove_stale_instance(paths, deadline=deadline, refuse_invalid=True)
+            except _ControlTimeoutError:
+                raise
+            except UnhealthyInstanceError as error:
+                if str(error) != _RECORD_UNAVAILABLE:
+                    raise
+                raise UnhealthyInstanceError(_RECORD_RECOVERY) from error
             _require_deadline(deadline)
             ack_read, ack_write = os.pipe()
             process: subprocess.Popen[bytes] | None = None
