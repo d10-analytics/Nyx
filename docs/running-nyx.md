@@ -80,9 +80,9 @@ removes a valid stale record and prints the ordinary `stopped` result; there is
 no separate recovery message. Starting with `nyx` still refuses while the record
 cannot be read and names the recovery step in its message, which ends
 `; run 'nyx --stop' to recover`. Recovery requires that no instance owns the
-runtime: a live owner still refuses both start and stop. Removal is permanent,
-because Nyx cannot distinguish a genuinely damaged record from a temporarily
-unreadable one.
+runtime. For an unreadable record, a live owner still refuses both start and
+stop and keeps the record in place. Removal is permanent, because Nyx cannot
+distinguish a genuinely damaged record from a temporarily unreadable one.
 
 ## Choose board row order
 
