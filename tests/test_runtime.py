@@ -19,10 +19,27 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from conftest import (
+    LOOPBACK_DENIED_REASON,
+    SERVICE_PORT_HELD_REASON,
+    skip_if_service_port_is_held,
+)
 from launch_shadow import plant_shadow, proof_environment, shadow_imports
 
 from nyx import _native_claim, catalog, runtime, state, worker
 from nyx.models import SCHEMA_VERSION, canonical_digest
+
+pytestmark = pytest.mark.usefixtures("isolated_port")
+
+# Children launched by these tests adopt the parent's port through the runtime's
+# own formula.  A direct ``nyx.runtime`` launch is left alone: the daemon takes
+# its port from ``--port``, and importing the module here would load it twice.
+_PORT_SITECUSTOMIZE = (
+    "import os as _nyx_os, sys as _nyx_sys\n"
+    "if 'nyx.runtime' not in _nyx_sys.orig_argv:\n"
+    "    from nyx import runtime as _nyx_runtime\n"
+    "    _nyx_runtime._use_port(int(_nyx_os.environ['NYX_TEST_PORT']))\n"
+)
 
 
 def _fixture(root: Path) -> tuple[state.StatePaths, Path, Path]:
@@ -108,11 +125,13 @@ def _subprocess_environment(
         "from pathlib import Path\n"
         "from nyx import state\n"
         "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
+        + _PORT_SITECUSTOMIZE
         + extra_sitecustomize,
         encoding="utf-8",
     )
     environment = os.environ.copy()
     environment["NYX_TEST_HOME"] = str(home)
+    environment["NYX_TEST_PORT"] = str(runtime.PORT)
     environment["PYTHONPATH"] = str(site_directory) + os.pathsep + environment.get("PYTHONPATH", "")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
@@ -557,7 +576,8 @@ def test_public_start_reports_sanitized_detached_child_failure(error_name, throu
         ), patch.object(
             runtime, "_daemon_command",
             side_effect=lambda deadline: [
-                sys.executable, "-c", script, "--deadline-ns", str(deadline)
+                sys.executable, "-c", script, "--deadline-ns", str(deadline),
+                "--port", str(runtime.PORT),
             ],
         ):
             if through_cli:
@@ -587,7 +607,21 @@ def test_public_start_reports_sanitized_detached_child_failure(error_name, throu
         _assert_claim_available(paths.runtime_directory / "lease.lock")
 
 
+@pytest.mark.fixed_port
+def test_public_port_constants_and_daemon_command_keep_the_fixed_port():
+    assert runtime.PORT == 8765
+    assert runtime.URL == "http://127.0.0.1:8765/"
+    assert runtime.PORT_UNAVAILABLE_MESSAGE == (
+        "Nyx could not start: port 8765 is already in use by another program. "
+        'Close that program and try again; "If something looks wrong" in the '
+        "Running Nyx guide shows how to find it."
+    )
+    command = runtime._daemon_command(1234)
+    assert command[command.index("--port") + 1] == "8765"
+    assert command[-4:] == ["--deadline-ns", "1234", "--port", "8765"]
 
+
+@pytest.mark.fixed_port
 def test_startup_port_conflict_uses_actionable_public_message():
     error = runtime._startup_failure(
         "Nyx daemon exited before readiness", SimpleNamespace(poll=lambda: 30), "readiness"
@@ -643,23 +677,66 @@ def test_module_entry_refuses_desktop_daemon_arguments_before_handle_conversion(
                 "1",
             ],
             ["nyx/runtime.py", "--claim-path", "/tmp/lease.lock", "--deadline-ns", "1"],
+            ["nyx/runtime.py", "--port", "8765"],
         ):
             assert runtime._module_entry(arguments) == 2
     receive.assert_not_called()
     entry.assert_not_called()
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"{runtime._DESKTOP_DAEMON_REFUSAL}\n" * 3
+    assert captured.err == f"{runtime._DESKTOP_DAEMON_REFUSAL}\n" * 4
 
 
-def test_module_entry_preserves_the_linux_daemon_dispatch(monkeypatch):
+def test_module_entry_applies_the_launcher_port_before_building_the_daemon(monkeypatch):
     monkeypatch.setattr(runtime, "desktop_host", lambda: False)
-    with patch.object(runtime, "_daemon_entry", return_value=25) as entry:
+    observed: list[tuple[int, str, str]] = []
+
+    class RecordingDaemon:
+        def __init__(self, fd, deadline_ns, *, ack_fd=None):
+            observed.append((runtime.PORT, runtime.URL, runtime.PORT_UNAVAILABLE_MESSAGE))
+            assert (fd, deadline_ns, ack_fd) == (7, 1234, None)
+
+        def run(self):
+            return 25
+
+    with patch.object(runtime, "_Daemon", RecordingDaemon):
         assert (
-            runtime._module_entry(["nyx/runtime.py", "--daemon-fd", "7", "--deadline-ns", "1234"])
+            runtime._module_entry(
+                ["nyx/runtime.py", "--daemon-fd", "7", "--deadline-ns", "1234", "--port", "43117"]
+            )
             == 25
         )
-    entry.assert_called_once_with(7, 1234, ack_fd=None, claim_path=None)
+    assert observed == [
+        (
+            43117,
+            "http://127.0.0.1:43117/",
+            "Nyx could not start: port 43117 is already in use by another program. "
+            'Close that program and try again; "If something looks wrong" in the '
+            "Running Nyx guide shows how to find it.",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "port_arguments",
+    [[], ["--port"], ["--port", "eighty"], ["--port", "-1"], ["--port", "0"], ["--port", "65536"]],
+    ids=["missing", "no-value", "not-a-number", "negative", "zero", "out-of-range"],
+)
+def test_module_entry_rejects_a_missing_or_malformed_port_before_building_the_daemon(
+    monkeypatch, port_arguments
+):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: False)
+    before = (runtime.PORT, runtime.URL, runtime.PORT_UNAVAILABLE_MESSAGE)
+    with patch.object(runtime, "_Daemon") as daemon, patch.object(
+        runtime, "_daemon_entry"
+    ) as entry, pytest.raises(SystemExit) as error:
+        runtime._module_entry(
+            ["nyx/runtime.py", "--daemon-fd", "7", "--deadline-ns", "1234", *port_arguments]
+        )
+    assert error.value.code == "invalid lifecycle arguments"
+    daemon.assert_not_called()
+    entry.assert_not_called()
+    assert (runtime.PORT, runtime.URL, runtime.PORT_UNAVAILABLE_MESSAGE) == before
 
 
 def test_module_entry_still_rejects_a_launch_without_daemon_arguments(monkeypatch):
@@ -1243,8 +1320,6 @@ def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_a
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_normal_service_settings_survive_terminal_stop_and_restart():
-    _require_loopback_listener()
-
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -1347,8 +1422,6 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
 def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup():
-    _require_loopback_listener()
-
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -1481,13 +1554,15 @@ def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup
 
                 app_runtime.ApplicationRuntime = ObservedApplicationRuntime
                 """
-            ),
+            )
+            + _PORT_SITECUSTOMIZE,
             encoding="utf-8",
         )
         environment = os.environ.copy()
         environment["HOME"] = str(home)
         environment["USERPROFILE"] = str(home)
         environment["NYX_TEST_HOME"] = str(home)
+        environment["NYX_TEST_PORT"] = str(runtime.PORT)
         environment["NYX_OWNER_PROBE"] = str(probe_file)
         environment["NYX_WORKER_PID"] = str(worker_pid_file)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1976,20 +2051,6 @@ def test_public_start_spawns_the_daemon_in_its_admitted_state_directory():
         contender.close()
 
 
-def _require_loopback_listener() -> None:
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Mirror the daemon's listener, an HTTPServer with allow_reuse_address:
-        # TIME_WAIT sockets left by earlier requests to this port must not block
-        # the probe, while a live listener on the port still makes it fail.
-        capability_probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        capability_probe.bind(("127.0.0.1", runtime.PORT))
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
-
-
 def _sample_workspace(root: Path) -> Path:
     workspace = root / "specifications"
     package = workspace / "Fictional" / "Queue" / "sample"
@@ -2053,12 +2114,13 @@ def _prove_isolated_cli_service(
                 break
 
 
+@pytest.mark.fixed_port
 @pytest.mark.skipif(
     runtime.desktop_host(),
     reason="the detached Linux service is not dispatched on desktop hosts",
 )
 def test_cli_service_ignores_shadow_modules_planted_in_its_state_directory():
-    _require_loopback_listener()
+    skip_if_service_port_is_held()
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -2077,12 +2139,13 @@ def test_cli_service_ignores_shadow_modules_planted_in_its_state_directory():
         )
 
 
+@pytest.mark.fixed_port
 @pytest.mark.skipif(
     runtime.desktop_host(),
     reason="the detached Linux service is not dispatched on desktop hosts",
 )
 def test_cli_service_children_leave_the_launch_directory_for_the_state_directory():
-    _require_loopback_listener()
+    skip_if_service_port_is_held()
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -2102,22 +2165,12 @@ def test_cli_service_children_leave_the_launch_directory_for_the_state_directory
         )
 
 
-def _skip_if_service_port_is_held() -> None:
-    """Skip when another process already owns the fixed control port."""
-
-    try:
-        _require_loopback_listener()
-    except OSError:
-        pytest.skip("the fixed Nyx control port is held by another process")
-
-
 @pytest.mark.skipif(
     runtime.desktop_host(),
     reason="the detached Linux service is not dispatched on desktop hosts",
 )
 def test_stop_recovery_then_start_reaches_readiness(tmp_path, monkeypatch):
     """A recovered invalid record lets the next start reach readiness."""
-    _skip_if_service_port_is_held()
     home = tmp_path / "home"
     home.mkdir()
     specification = tmp_path / "spec"
@@ -2135,12 +2188,60 @@ def test_stop_recovery_then_start_reaches_readiness(tmp_path, monkeypatch):
         assert not record.exists()
         assert not leftover.exists()
         assert runtime.start() == runtime.URL
-        assert paths.runtime_directory.joinpath("instance.json").exists()
+        published = json.loads(record.read_text(encoding="utf-8"))
+        # The detached daemon publishes the port it was told to serve, derived
+        # through the same formula as this process's URL.
+        assert published["url"] == runtime.URL != "http://127.0.0.1:8765/"
     finally:
         try:
             runtime.stop()
         except runtime.RuntimeErrorBase:
             pass
+
+
+@pytest.mark.fixed_port
+def test_service_tests_pass_while_another_listener_holds_the_fixed_port():
+    """Port isolation keeps service tests independent of a running Nyx.
+
+    This test holds the public port with an ordinary listener, then runs an
+    in-process daemon test, a desktop-session test and, where the detached
+    service exists, a test whose daemon child is spawned.  Each must pass.
+    """
+
+    try:
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip(LOOPBACK_DENIED_REASON)
+    try:
+        try:
+            holder.bind(("127.0.0.1", runtime.PORT))
+        except PermissionError:
+            pytest.skip(LOOPBACK_DENIED_REASON)
+        except OSError:
+            pytest.skip(SERVICE_PORT_HELD_REASON)
+        holder.listen(1)
+        nodes = [
+            "tests/test_runtime.py::"
+            "test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease",
+            "tests/test_desktop.py::"
+            "test_active_workspace_switch_restarts_real_catalog_worker_over_http",
+        ]
+        if not runtime.desktop_host():
+            nodes.append("tests/test_runtime.py::test_stop_recovery_then_start_reaches_readiness")
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rA", *nodes],
+            cwd=Path(__file__).parents[1],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    finally:
+        holder.close()
+    reported = completed.stdout.splitlines()
+    for node in nodes:
+        assert f"PASSED {node}" in reported, completed.stdout[-6000:] + completed.stderr[-2000:]
+    assert completed.returncode == 0, completed.stdout[-6000:]
 
 
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
@@ -2152,7 +2253,7 @@ def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease
             thread = threading.Thread(target=daemon.run)
             thread.start()
             instance = _wait_for_record(paths)
-            assert instance.url == "http://127.0.0.1:8765/"
+            assert instance.url == runtime.URL
             assert "pid" not in json.loads(paths.runtime_directory.joinpath("instance.json").read_text())
             assert runtime._send_control(instance, "status")["url"] == instance.url
             assert runtime.stop() == "stopped"
@@ -2869,6 +2970,7 @@ def test_temporary_record_cleaned_up_after_stop(tmp_path):
         from nyx import runtime, state
         from unittest.mock import patch
 
+        runtime._use_port(int(os.environ["NYX_TEST_PORT"]))
         paths = state.state_paths()
         instance = runtime.Instance(
             "iid", runtime.URL, "cap", "127.0.0.1:43210"
@@ -2885,6 +2987,7 @@ def test_temporary_record_cleaned_up_after_stop(tmp_path):
     """)
     environment = os.environ.copy()
     environment["HOME"] = str(paths.account_home)
+    environment["NYX_TEST_PORT"] = str(runtime.PORT)
     environment.pop("PYTHONHOME", None)
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -5801,12 +5904,16 @@ def test_natural_crashed_daemon_leaves_record_for_free_lease_cleanup():
         paths, _, _ = _fixture(Path(temporary))
         script = (
             "import os,sys,time; from pathlib import Path; from nyx import runtime,state; "
+            "runtime._use_port(int(os.environ['NYX_TEST_PORT'])); "
             "home=Path(sys.argv[1]); root=home/'.nyx'; paths=state.StatePaths(home,root/'config',root/'config/config.json',"
             "root,root/'runtime/deployment.json',root/'runtime'); "
             "runtime._paths=lambda **kwargs: paths; lease=runtime._lease_lock(paths,timeout=0); "
             "assert lease.acquire(blocking=False); runtime._Daemon(lease.fd,time.monotonic_ns()+5*10**9).start()"
         )
-        crashed = subprocess.Popen([sys.executable, "-c", script, str(paths.account_home)])
+        crashed = subprocess.Popen(
+            [sys.executable, "-c", script, str(paths.account_home)],
+            env={**os.environ, "NYX_TEST_PORT": str(runtime.PORT)},
+        )
         try:
             _wait_for_record(paths)
             crashed.kill()
