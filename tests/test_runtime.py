@@ -22,6 +22,7 @@ import pytest
 from conftest import (
     LOOPBACK_DENIED_REASON,
     SERVICE_PORT_HELD_REASON,
+    _free_loopback_port,
     skip_if_service_port_is_held,
 )
 from launch_shadow import plant_shadow, proof_environment, shadow_imports
@@ -2197,6 +2198,32 @@ def test_stop_recovery_then_start_reaches_readiness(tmp_path, monkeypatch):
             runtime.stop()
         except runtime.RuntimeErrorBase:
             pass
+
+
+@pytest.mark.parametrize("denied", ["create", "bind"])
+@pytest.mark.parametrize(
+    "probe",
+    [_free_loopback_port, skip_if_service_port_is_held],
+    ids=["port-choice", "fixed-port-probe"],
+)
+def test_loopback_denial_skips_with_the_sandbox_reason_not_the_port_held_reason(
+    monkeypatch, denied, probe
+):
+    real_socket = socket.socket
+
+    class DeniedSocket(real_socket):
+        def __init__(self, *args, **kwargs):
+            if denied == "create":
+                raise PermissionError("loopback sockets are denied")
+            super().__init__(*args, **kwargs)
+
+        def bind(self, address):
+            raise PermissionError("loopback sockets are denied")
+
+    monkeypatch.setattr(socket, "socket", DeniedSocket)
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        probe()
+    assert skipped.value.msg == LOOPBACK_DENIED_REASON
 
 
 @pytest.mark.fixed_port
