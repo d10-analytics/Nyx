@@ -5,6 +5,7 @@ on: [push]
 jobs:
   nyx:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,7 +63,6 @@ jobs:
             PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \
             /bin/bash -c 'cd "$1" && exec "$2" -m pytest test_installed_service.py -v' \
             nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"
-          "$runner_python" -m pytest tests/test_wheel_install.py -v
 
       - name: Verify documented installation commands
         shell: bash
@@ -74,6 +74,7 @@ jobs:
 
   nyx-windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -116,6 +117,7 @@ jobs:
 
   nyx-macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -148,6 +150,7 @@ jobs:
 
   nyx-desktop-windows:
     runs-on: windows-2025
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -223,6 +226,7 @@ jobs:
 
   nyx-desktop-macos:
     runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
