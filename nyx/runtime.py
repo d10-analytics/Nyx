@@ -28,6 +28,7 @@ from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
 from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
 
+
 def _port_bindings(port: int) -> tuple[str, str]:
     """Return the service URL and the public port-conflict message for ``port``.
 
