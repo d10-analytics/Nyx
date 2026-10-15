@@ -4,7 +4,10 @@ These tests parse the real workflow document and assert the operational
 contract that the native source/session lane and the desktop build/artifact
 extension establish: exact commands, installer extras, artifact inputs,
 required-native environment, interactive-session preflight, stage ordering,
-and non-zero exit propagation.  Each supported behavior is proved to be
+and non-zero exit propagation.  Checks read each step's effective lines (the
+stripped lines left after dropping blank lines and full-line comments) and
+match gating commands exactly, so a commented-out or failure-masked command
+does not satisfy them.  Each supported behavior is proved to be
 load-bearing by mutating the parsed document — a natural edit that removes or
 weakens the behavior — and asserting that the matching check rejects it.
 """
@@ -12,6 +15,7 @@ weakens the behavior — and asserting that the matching check rejects it.
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,44 +82,93 @@ BROWSER_INSTALL_COMMANDS = {
     "nyx-macos": '"$runner_python" -m playwright install chromium',
 }
 
-ONE_WHEEL_MARKERS = {
-    "nyx": ("find dist -maxdepth 1 -type f -name '*.whl'", 'test "$wheel_count" -eq 1'),
+# Gating commands are matched by exact equality against effective lines.  A
+# gate is a tuple of effective lines: a one-line gate is a single command, and
+# a command that continues over several physical lines is matched as a
+# contiguous block, so commenting out, ``|| true``, ``; exit 0`` or
+# backgrounding on any of its lines is detected.
+POSIX_ONE_WHEEL_GATES = (
+    ("wheel_count=\"$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)\"",),
+    ('test "$wheel_count" -eq 1',),
+)
+ONE_WHEEL_GATES = {
+    "nyx": POSIX_ONE_WHEEL_GATES,
     "nyx-windows": (
-        "Get-ChildItem -Path dist -Filter '*.whl' -File",
-        "$wheels.Count -ne 1",
-        'throw "Expected exactly one wheel, found $($wheels.Count)"',
+        (
+            "$wheels = @(Get-ChildItem -Path dist -Filter '*.whl' -File)",
+            "if ($wheels.Count -ne 1) {",
+            'throw "Expected exactly one wheel, found $($wheels.Count)"',
+            "}",
+        ),
     ),
-    "nyx-macos": ("find dist -maxdepth 1 -type f -name '*.whl'", 'test "$wheel_count" -eq 1'),
+    "nyx-macos": POSIX_ONE_WHEEL_GATES,
 }
 
-LINUX_SERVICE_MARKERS = (
-    "tests/test_installed_service.py",
-    "sudo useradd --create-home --shell /bin/bash",
-    "sudo userdel --remove",
-    "trap cleanup EXIT",
-    "timeout --preserve-status 90s",
-    '"$nyx_verify_root/venv/bin/nyx" --stop',
+LINUX_SERVICE_GATES = (
+    ('sudo userdel --remove "$nyx_verify_user"',),
+    ("trap cleanup EXIT",),
+    ('sudo useradd --create-home --shell /bin/bash "$nyx_verify_user"',),
+    (
+        'sudo install --owner="$nyx_verify_user" --group="$nyx_verify_user" --mode=0600 \\',
+        'tests/test_installed_service.py "$nyx_verify_root/exercise/test_installed_service.py"',
+    ),
+    (
+        'timeout --preserve-status 90s sudo -u "$nyx_verify_user" -H env -u PYTHONPATH -u PYTHONHOME \\',
+        'PLAYWRIGHT_BROWSERS_PATH="$nyx_verify_root/playwright-browsers" \\',
+        'PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \\',
+        "/bin/bash -c 'cd \"$1\" && exec \"$2\" -m pytest test_installed_service.py -v' \\",
+        'nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"',
+    ),
 )
+# The cleanup stop is deliberately best-effort (it ends in ``|| true``), so it
+# stays a substring marker rather than an exact gate.
+LINUX_SERVICE_MARKERS = ('"$nyx_verify_root/venv/bin/nyx" --stop',)
 
-SESSION_PREFLIGHT_MARKERS = {
+SESSION_PREFLIGHT_GATES = {
     "nyx-desktop-windows": (
-        "$env:ImageOS",
-        "$env:ImageVersion",
-        "[Environment]::UserInteractive",
-        "$interactive",
-        "'amd64', 'x86_64'",
-        "if (-not $interactive)",
-        "does not expose an interactive desktop session",
+        (
+            "if ([string]::IsNullOrWhiteSpace($env:ImageOS) -or",
+            "[string]::IsNullOrWhiteSpace($env:ImageVersion)) {",
+            "throw 'GitHub runner image identity is unavailable'",
+            "}",
+        ),
+        ("$interactive = [Environment]::UserInteractive",),
+        (
+            'python -c "import platform, sys; print(platform.platform()); '
+            "assert sys.version_info[:2] == (3, 12); "
+            "assert platform.machine().lower() in {'amd64', 'x86_64'}\"",
+        ),
+        (
+            "if (-not $interactive) {",
+            "throw 'windows-2025 does not expose an interactive desktop session'",
+            "}",
+        ),
     ),
     "nyx-desktop-macos": (
-        "${ImageOS:-}",
-        "${ImageVersion:-}",
-        "launchctl managername",
-        "/dev/console",
-        '"Aqua"',
-        "'arm64'",
+        ('test -n "${ImageOS:-}"',),
+        ('test -n "${ImageVersion:-}"',),
+        ('session_manager="$(launchctl managername)"',),
+        (
+            'python -c "import platform, sys; print(platform.platform()); '
+            "assert sys.version_info[:2] == (3, 12); "
+            "assert platform.machine() == 'arm64'\"",
+        ),
+        ('test "$session_manager" = "Aqua"',),
     ),
 }
+# The console user is an informational value that is echoed, not a gate.
+SESSION_PREFLIGHT_MARKERS = {
+    "nyx-desktop-windows": (),
+    "nyx-desktop-macos": ("/dev/console",),
+}
+
+PWSH_ERROR_PREFERENCE = "$ErrorActionPreference = 'Stop'"
+CONTINUE_ON_ERROR_KEY = "continue-on-error"
+
+# ``set`` invocations inside one effective line; the captured arguments stop at
+# the next command separator.
+_SET_INVOCATION = re.compile(r"(?:^|[\s;&|(`])set\s+([^;&|)`]*)")
+_FAILURE_PROPAGATION_OPTIONS = frozenset({"errexit", "pipefail"})
 
 
 class WorkflowContractViolation(AssertionError):
@@ -169,8 +222,69 @@ def _run_text(step: Any) -> str:
     return run if isinstance(run, str) else ""
 
 
-def _job_run_text(job: Any) -> str:
-    return "\n".join(_run_text(step) for step in _steps(job))
+def _effective_lines(step: Any) -> list[str]:
+    """Return the lines a step's shell actually executes, for bash and pwsh.
+
+    Each physical line is stripped; blank lines and full-line ``#`` comments
+    are dropped.  Continuation lines are not joined, so a multi-line command
+    is compared as a block of these lines.  PowerShell block comments
+    (``<# ... #>``) are not recognised.
+    """
+
+    lines: list[str] = []
+    for physical in _run_text(step).splitlines():
+        line = physical.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
+def _job_effective_lines(job: Any) -> list[list[str]]:
+    """Return the effective lines of every step in a job, one list per step."""
+
+    return [_effective_lines(step) for step in _steps(job)]
+
+
+def _contains_gate(segments: list[list[str]], gate: tuple[str, ...]) -> bool:
+    width = len(gate)
+    for lines in segments:
+        for start in range(len(lines) - width + 1):
+            if tuple(lines[start : start + width]) == gate:
+                return True
+    return False
+
+
+def _contains_marker(segments: list[list[str]], marker: str) -> bool:
+    return any(marker in line for lines in segments for line in lines)
+
+
+def _gate_violations(
+    label: str, segments: list[list[str]], gate: tuple[str, ...]
+) -> list[str]:
+    """Report a gate that is absent or that appears in an altered form.
+
+    A gate must appear as exact contiguous effective lines.  For a one-line
+    gate, every effective line that contains the command but differs from it
+    is also reported, so a weakened copy cannot hide behind an intact
+    duplicate elsewhere in the same scope.
+    """
+
+    problems: list[str] = []
+    if not _contains_gate(segments, gate):
+        if len(gate) == 1:
+            problems.append(f"{label} {gate[0]!r} is not an exact effective line")
+        else:
+            problems.append(
+                f"{label} block starting {gate[0]!r} is not present as "
+                f"{len(gate)} contiguous exact effective lines"
+            )
+    if len(gate) == 1:
+        command = gate[0]
+        for lines in segments:
+            for line in lines:
+                if command in line and line != command:
+                    problems.append(f"{label} {command!r} is altered as {line!r}")
+    return problems
 
 
 def _step_env(step: Any) -> dict[str, Any]:
@@ -258,8 +372,11 @@ def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: job is missing")
             continue
         command = SOURCE_SUITE_COMMAND.format(python=spec["python"])
-        if command not in _job_run_text(job):
-            problems.append(f"{name}: source-suite command {command!r} is missing")
+        problems.extend(
+            _gate_violations(
+                f"{name}: source-suite command", _job_effective_lines(job), (command,)
+            )
+        )
     return problems
 
 
@@ -270,8 +387,11 @@ def check_baseline_ruff(workflow: dict[str, Any]) -> list[str]:
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        if RUFF_COMMAND not in _job_run_text(job):
-            problems.append(f"{name}: Ruff command {RUFF_COMMAND!r} is missing")
+        problems.extend(
+            _gate_violations(
+                f"{name}: Ruff command", _job_effective_lines(job), (RUFF_COMMAND,)
+            )
+        )
     return problems
 
 
@@ -282,13 +402,15 @@ def check_baseline_wheel(workflow: dict[str, Any]) -> list[str]:
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        text = _job_run_text(job)
+        segments = _job_effective_lines(job)
         build = WHEEL_BUILD_COMMAND.format(python=spec["python"])
-        if build not in text:
-            problems.append(f"{name}: wheel build command {build!r} is missing")
-        for marker in ONE_WHEEL_MARKERS[name]:
-            if marker not in text:
-                problems.append(f"{name}: one-wheel assertion {marker!r} is missing")
+        problems.extend(
+            _gate_violations(f"{name}: wheel build command", segments, (build,))
+        )
+        for gate in ONE_WHEEL_GATES[name]:
+            problems.extend(
+                _gate_violations(f"{name}: one-wheel assertion", segments, gate)
+            )
     return problems
 
 
@@ -300,8 +422,11 @@ def check_baseline_installed_wheel(workflow: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: job is missing")
             continue
         command = INSTALLED_WHEEL_COMMAND.format(python=spec["python"])
-        if command not in _job_run_text(job):
-            problems.append(f"{name}: installed-wheel command {command!r} is missing")
+        problems.extend(
+            _gate_violations(
+                f"{name}: installed-wheel command", _job_effective_lines(job), (command,)
+            )
+        )
     return problems
 
 
@@ -312,7 +437,7 @@ def check_baseline_browser_prerequisites(workflow: dict[str, Any]) -> list[str]:
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        if command not in _job_run_text(job):
+        if not _contains_marker(_job_effective_lines(job), command):
             problems.append(f"{name}: browser prerequisite {command!r} is missing")
     return problems
 
@@ -321,12 +446,18 @@ def check_linux_service_lane(workflow: dict[str, Any]) -> list[str]:
     job = _job(workflow, "nyx")
     if job is None:
         return ["nyx: job is missing"]
-    text = _job_run_text(job)
-    return [
+    segments = _job_effective_lines(job)
+    problems: list[str] = []
+    for gate in LINUX_SERVICE_GATES:
+        problems.extend(
+            _gate_violations("nyx: Linux installed-service command", segments, gate)
+        )
+    problems.extend(
         f"nyx: Linux installed-service marker {marker!r} is missing"
         for marker in LINUX_SERVICE_MARKERS
-        if marker not in text
-    ]
+        if not _contains_marker(segments, marker)
+    )
+    return problems
 
 
 def check_documented_install_lane(workflow: dict[str, Any]) -> list[str]:
@@ -345,29 +476,27 @@ def check_documented_install_lane(workflow: dict[str, Any]) -> list[str]:
             problems.append(
                 f"{name}: documented installation step does not set {DOCUMENTED_INSTALL_ENV}=1"
             )
-        if DOCUMENTED_INSTALL_COMMAND not in _run_text(step):
-            problems.append(
-                f"{name}: documented installation command {DOCUMENTED_INSTALL_COMMAND!r} is missing"
+        problems.extend(
+            _gate_violations(
+                f"{name}: documented installation command",
+                [_effective_lines(step)],
+                (DOCUMENTED_INSTALL_COMMAND,),
             )
+        )
     return problems
 
 
 def _unguarded_pwsh_commands(name: str, step: dict[str, Any]) -> list[str]:
-    lines = [line.strip() for line in _run_text(step).splitlines()]
+    lines = _effective_lines(step)
     problems: list[str] = []
     for index, line in enumerate(lines):
         if not (line.startswith("python ") or line.startswith("ruff ")):
             continue
-        guard = ""
-        for follower in lines[index + 1 :]:
-            if not follower or follower.startswith("#"):
-                continue
-            guard = follower
-            break
-        if "$LASTEXITCODE" not in guard or "exit $LASTEXITCODE" not in guard:
+        guard = lines[index + 1] if index + 1 < len(lines) else ""
+        if guard != PWSH_FAILURE_GUARD:
             problems.append(
-                f"{name}: step {step.get('name')!r} command {line!r} lacks a "
-                "$LASTEXITCODE exit guard"
+                f"{name}: step {step.get('name')!r} command {line!r} is not followed "
+                f"by the exit guard {PWSH_FAILURE_GUARD!r}"
             )
     return problems
 
@@ -380,14 +509,44 @@ def check_powershell_failure_propagation(workflow: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: job is missing")
             continue
         for step in _steps(job):
-            if step.get("shell") != "pwsh" or not _run_text(step):
+            lines = _effective_lines(step)
+            if step.get("shell") != "pwsh" or not lines:
                 continue
-            if "$ErrorActionPreference = 'Stop'" not in _run_text(step):
+            if lines[0] != PWSH_ERROR_PREFERENCE:
                 problems.append(
-                    f"{name}: step {step.get('name')!r} does not set ErrorActionPreference=Stop"
+                    f"{name}: step {step.get('name')!r} does not start with "
+                    f"{PWSH_ERROR_PREFERENCE!r}"
                 )
+            for line in lines[1:]:
+                if "erroractionpreference" in line.lower():
+                    problems.append(
+                        f"{name}: step {step.get('name')!r} changes the error "
+                        f"preference after the guard: {line!r}"
+                    )
             problems.extend(_unguarded_pwsh_commands(name, step))
     return problems
+
+
+def _disables_failure_propagation(line: str) -> bool:
+    """Return whether a line runs ``set`` to clear errexit or pipefail."""
+
+    for invocation in _SET_INVOCATION.finditer(line):
+        tokens = invocation.group(1).split()
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if len(token) < 2 or token[0] not in "+-" or token.startswith("--"):
+                continue
+            flags = token[1:]
+            if token[0] == "+" and "e" in flags:
+                return True
+            if "o" in flags and index < len(tokens):
+                option = tokens[index]
+                index += 1
+                if token[0] == "+" and option in _FAILURE_PROPAGATION_OPTIONS:
+                    return True
+    return False
 
 
 def check_posix_failure_propagation(workflow: dict[str, Any]) -> list[str]:
@@ -398,12 +557,36 @@ def check_posix_failure_propagation(workflow: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: job is missing")
             continue
         for step in _steps(job):
-            if not _run_text(step) or step.get("shell") == "pwsh":
+            lines = _effective_lines(step)
+            if not lines or step.get("shell") == "pwsh":
                 continue
-            if POSIX_FAILURE_GUARD not in _run_text(step):
+            if lines[0] != POSIX_FAILURE_GUARD:
                 problems.append(
-                    f"{name}: step {step.get('name')!r} does not enable "
+                    f"{name}: step {step.get('name')!r} does not start with "
                     f"{POSIX_FAILURE_GUARD!r} shell failure propagation"
+                )
+            for line in lines:
+                if _disables_failure_propagation(line):
+                    problems.append(
+                        f"{name}: step {step.get('name')!r} disables shell failure "
+                        f"propagation: {line!r}"
+                    )
+    return problems
+
+
+def check_no_continue_on_error(workflow: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for job_name, job in _jobs(workflow).items():
+        if isinstance(job, dict) and CONTINUE_ON_ERROR_KEY in job:
+            problems.append(
+                f"{job_name}: job sets {CONTINUE_ON_ERROR_KEY}="
+                f"{job[CONTINUE_ON_ERROR_KEY]!r}"
+            )
+        for step in _steps(job):
+            if CONTINUE_ON_ERROR_KEY in step:
+                problems.append(
+                    f"{job_name}: step {step.get('name') or step.get('uses')!r} sets "
+                    f"{CONTINUE_ON_ERROR_KEY}={step[CONTINUE_ON_ERROR_KEY]!r}"
                 )
     return problems
 
@@ -440,10 +623,13 @@ def check_native_dependencies(workflow: dict[str, Any]) -> list[str]:
         if step is None:
             problems.append(f"{name}: {SOURCE_SESSION_STEP!r} step is missing")
             continue
-        if DESKTOP_EXTRA_INSTALL not in _run_text(step):
-            problems.append(
-                f"{name}: native source/session lane does not install {DESKTOP_EXTRA_INSTALL!r}"
+        problems.extend(
+            _gate_violations(
+                f"{name}: native source/session install",
+                [_effective_lines(step)],
+                (DESKTOP_EXTRA_INSTALL,),
             )
+        )
     return problems
 
 
@@ -454,23 +640,30 @@ def check_native_source_lane(workflow: dict[str, Any]) -> list[str]:
         if step is None:
             problems.append(f"{name}: {SOURCE_SESSION_STEP!r} step is missing")
             continue
-        if DESKTOP_SOURCE_COMMAND not in _run_text(step):
-            problems.append(
-                f"{name}: native source/session lane does not run {DESKTOP_SOURCE_COMMAND!r}"
+        problems.extend(
+            _gate_violations(
+                f"{name}: native source/session command",
+                [_effective_lines(step)],
+                (DESKTOP_SOURCE_COMMAND,),
             )
+        )
     return problems
 
 
 def check_native_session_preflight(workflow: dict[str, Any]) -> list[str]:
     problems: list[str] = []
-    for name, markers in SESSION_PREFLIGHT_MARKERS.items():
+    for name, gates in SESSION_PREFLIGHT_GATES.items():
         step = _step_named(_job(workflow, name), PREFLIGHT_STEP)
         if step is None:
             problems.append(f"{name}: {PREFLIGHT_STEP!r} step is missing")
             continue
-        text = _run_text(step)
-        for marker in markers:
-            if marker not in text:
+        segments = [_effective_lines(step)]
+        for gate in gates:
+            problems.extend(
+                _gate_violations(f"{name}: session preflight gate", segments, gate)
+            )
+        for marker in SESSION_PREFLIGHT_MARKERS[name]:
+            if not _contains_marker(segments, marker):
                 problems.append(
                     f"{name}: session preflight marker {marker!r} is missing"
                 )
@@ -484,19 +677,26 @@ def check_native_artifact_lane(workflow: dict[str, Any]) -> list[str]:
         if step is None:
             problems.append(f"{name}: {BUILD_ARTIFACT_STEP!r} step is missing")
             continue
-        text = _run_text(step)
-        if DESKTOP_BUILD_COMMAND not in text:
-            problems.append(f"{name}: artifact build command {DESKTOP_BUILD_COMMAND!r} is missing")
-        if spec["artifact"] not in text:
+        segments = [_effective_lines(step)]
+        problems.extend(
+            _gate_violations(
+                f"{name}: artifact build command", segments, (DESKTOP_BUILD_COMMAND,)
+            )
+        )
+        if not _contains_marker(segments, spec["artifact"]):
             problems.append(f"{name}: artifact path {spec['artifact']!r} is missing")
-        if DESKTOP_ARTIFACT_COMMAND not in text:
-            problems.append(
-                f"{name}: delivered artifact tests {DESKTOP_ARTIFACT_COMMAND!r} are missing"
+        problems.extend(
+            _gate_violations(
+                f"{name}: delivered artifact tests", segments, (DESKTOP_ARTIFACT_COMMAND,)
             )
-        if DESKTOP_SOURCE_COMMAND not in text:
-            problems.append(
-                f"{name}: artifact-mode desktop scenarios {DESKTOP_SOURCE_COMMAND!r} are missing"
+        )
+        problems.extend(
+            _gate_violations(
+                f"{name}: artifact-mode desktop scenarios",
+                segments,
+                (DESKTOP_SOURCE_COMMAND,),
             )
+        )
     return problems
 
 
@@ -507,12 +707,12 @@ def check_native_artifact_input(workflow: dict[str, Any]) -> list[str]:
         if step is None:
             problems.append(f"{name}: {BUILD_ARTIFACT_STEP!r} step is missing")
             continue
-        text = _run_text(step)
-        if spec["artifact_setup"] not in text:
+        segments = [_effective_lines(step)]
+        if not _contains_marker(segments, spec["artifact_setup"]):
             problems.append(
                 f"{name}: artifact input setup {spec['artifact_setup']!r} is missing"
             )
-        if spec["artifact_export"] not in text:
+        if not _contains_marker(segments, spec["artifact_export"]):
             problems.append(
                 f"{name}: {DESKTOP_ARTIFACT_ENV} export {spec['artifact_export']!r} is missing"
             )
@@ -537,14 +737,17 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
             problems.append(
                 f"{name}: artifact build stage runs before the native source/session stage"
             )
-        text = _run_text(steps[build_index])
-        markers = (
-            DESKTOP_BUILD_COMMAND,
-            spec["artifact_export"],
-            DESKTOP_ARTIFACT_COMMAND,
-            DESKTOP_SOURCE_COMMAND,
+        lines = _effective_lines(steps[build_index])
+        stages = (
+            lambda line: line == DESKTOP_BUILD_COMMAND,
+            lambda line: spec["artifact_export"] in line,
+            lambda line: line == DESKTOP_ARTIFACT_COMMAND,
+            lambda line: line == DESKTOP_SOURCE_COMMAND,
         )
-        positions = [text.find(marker) for marker in markers]
+        positions = [
+            next((index for index, line in enumerate(lines) if matches(line)), -1)
+            for matches in stages
+        ]
         if any(position < 0 for position in positions):
             continue
         if positions != sorted(positions) or len(set(positions)) != len(positions):
@@ -565,7 +768,7 @@ def check_no_offscreen_substitute(workflow: dict[str, Any]) -> list[str]:
                     problems.append(
                         f"{job_name}: step {step.get('name')!r} sets QT_QPA_PLATFORM={value!r}"
                     )
-            if "offscreen" in _run_text(step).lower():
+            if any("offscreen" in line.lower() for line in _effective_lines(step)):
                 problems.append(
                     f"{job_name}: step {step.get('name')!r} references an offscreen platform"
                 )
@@ -585,6 +788,7 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "documented_install_lane": check_documented_install_lane,
     "powershell_failure_propagation": check_powershell_failure_propagation,
     "posix_failure_propagation": check_posix_failure_propagation,
+    "no_continue_on_error": check_no_continue_on_error,
     "native_environment": check_native_environment,
     "native_dependencies": check_native_dependencies,
     "native_source_lane": check_native_source_lane,
@@ -833,6 +1037,216 @@ def _mutate_remove_pwsh_shell_declaration(workflow: dict[str, Any]) -> None:
     step.pop("shell")
 
 
+LINUX_SERVICE_STEP = "Verify package and installed service"
+BASELINE_LIFECYCLE_STEP = "Verify package and installed lifecycle"
+DOCUMENTED_INSTALL_STEP = "Verify documented installation commands"
+
+
+def _indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _comment_out(line: str) -> str:
+    return f"{_indent(line)}# {line.lstrip()}"
+
+
+def _append(suffix: str) -> Callable[[str], str]:
+    return lambda line: f"{line}{suffix}"
+
+
+def _insert_before(new_line: str) -> Callable[[str], str]:
+    return lambda line: f"{_indent(line)}{new_line}\n{line}"
+
+
+def _rewrite_run_line(
+    workflow: dict[str, Any],
+    job_name: str,
+    step_name: str,
+    target: str,
+    transform: Callable[[str], str],
+) -> None:
+    """Rewrite the first physical run line whose stripped text is ``target``."""
+
+    step = _step(workflow, job_name, step_name)
+    physical = _run_text(step).splitlines()
+    matches = [index for index, line in enumerate(physical) if line.strip() == target]
+    assert matches, f"{job_name}: step {step_name!r} has no line {target!r}"
+    index = matches[0]
+    physical[index : index + 1] = transform(physical[index]).split("\n")
+    step["run"] = "\n".join(physical) + "\n"
+
+
+def _mutate_comment_out_baseline_source_suite(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx", LINUX_SERVICE_STEP, '"$runner_python" -m pytest tests/ -v', _comment_out
+    )
+
+
+def _mutate_comment_out_windows_source_suite(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-windows", BASELINE_LIFECYCLE_STEP, "python -m pytest tests/ -v", _comment_out
+    )
+
+
+def _mutate_disable_errexit_before_source_suite(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        '"$runner_python" -m pytest tests/ -v',
+        _insert_before("set +e"),
+    )
+
+
+def _mutate_disable_errexit_by_name(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-macos",
+        BASELINE_LIFECYCLE_STEP,
+        RUFF_COMMAND,
+        _insert_before("set +o errexit"),
+    )
+
+
+def _mutate_disable_pipefail(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        BUILD_ARTIFACT_STEP,
+        DESKTOP_ARTIFACT_COMMAND,
+        _insert_before("set +o pipefail"),
+    )
+
+
+def _mutate_move_posix_guard(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-macos", BASELINE_LIFECYCLE_STEP)
+    lines = _run_text(step).splitlines()
+    assert lines[0] == POSIX_FAILURE_GUARD
+    step["run"] = "\n".join([lines[1], lines[0], *lines[2:]]) + "\n"
+
+
+def _mutate_ignore_baseline_ruff_failure(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-macos", BASELINE_LIFECYCLE_STEP, RUFF_COMMAND, _append(" || true")
+    )
+
+
+def _mutate_exit_zero_after_installed_wheel(workflow: dict[str, Any]) -> None:
+    # The nyx job carries an intact copy of this line later in the same step,
+    # so only the altered-copy rule can catch this edit.
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        '"$runner_python" -m pytest tests/test_wheel_install.py -v',
+        _append("; exit 0"),
+    )
+
+
+def _mutate_background_desktop_source_command(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-desktop-macos", SOURCE_SESSION_STEP, DESKTOP_SOURCE_COMMAND, _append(" &")
+    )
+
+
+def _mutate_ignore_artifact_test_failure(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        BUILD_ARTIFACT_STEP,
+        DESKTOP_ARTIFACT_COMMAND,
+        _append(" || true"),
+    )
+
+
+def _mutate_comment_out_desktop_build(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP, DESKTOP_BUILD_COMMAND, _comment_out
+    )
+
+
+def _mutate_comment_out_desktop_extras_install(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-desktop-macos", SOURCE_SESSION_STEP, DESKTOP_EXTRA_INSTALL, _comment_out
+    )
+
+
+def _mutate_comment_out_documented_install(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx-macos", DOCUMENTED_INSTALL_STEP, DOCUMENTED_INSTALL_COMMAND, _comment_out
+    )
+
+
+def _mutate_ignore_installed_service_failure(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        'nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"',
+        _append(" || true"),
+    )
+
+
+def _mutate_comment_out_installed_service_line(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        'PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \\',
+        _comment_out,
+    )
+
+
+def _mutate_ignore_one_wheel_count(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow, "nyx", LINUX_SERVICE_STEP, 'test "$wheel_count" -eq 1', _append(" || true")
+    )
+
+
+def _mutate_comment_out_aqua_gate(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        PREFLIGHT_STEP,
+        'test "$session_manager" = "Aqua"',
+        _comment_out,
+    )
+
+
+def _mutate_late_powershell_error_preference(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-windows", DOCUMENTED_INSTALL_STEP)
+    lines = _run_text(step).splitlines()
+    assert lines[0] == PWSH_ERROR_PREFERENCE
+    step["run"] = "\n".join([*lines[1:], lines[0]]) + "\n"
+
+
+def _mutate_reassign_powershell_error_preference(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-windows",
+        BASELINE_LIFECYCLE_STEP,
+        "python -m pytest tests/ -v",
+        _insert_before("$ErrorActionPreference = 'Continue'"),
+    )
+
+
+def _mutate_comment_out_powershell_exit_guard(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
+    physical = _run_text(step).splitlines()
+    build = physical.index(DESKTOP_BUILD_COMMAND)
+    assert physical[build + 1] == PWSH_FAILURE_GUARD
+    physical[build + 1] = _comment_out(physical[build + 1])
+    step["run"] = "\n".join(physical) + "\n"
+
+
+def _mutate_continue_job_on_error(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-macos")[CONTINUE_ON_ERROR_KEY] = True
+
+
+def _mutate_continue_step_on_error(workflow: dict[str, Any]) -> None:
+    _step(workflow, "nyx-desktop-windows", SOURCE_SESSION_STEP)[CONTINUE_ON_ERROR_KEY] = True
+
+
 MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict[str, Any]], None]]] = {
     "remove baseline source suite": (
         check_baseline_source_suite,
@@ -941,6 +1355,82 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_shell_matrix,
         _mutate_remove_pwsh_shell_declaration,
     ),
+    "comment out baseline source suite": (
+        check_baseline_source_suite,
+        _mutate_comment_out_baseline_source_suite,
+    ),
+    "comment out windows source suite": (
+        check_baseline_source_suite,
+        _mutate_comment_out_windows_source_suite,
+    ),
+    "set +e before baseline source suite": (
+        check_posix_failure_propagation,
+        _mutate_disable_errexit_before_source_suite,
+    ),
+    "set +o errexit": (check_posix_failure_propagation, _mutate_disable_errexit_by_name),
+    "set +o pipefail": (check_posix_failure_propagation, _mutate_disable_pipefail),
+    "move POSIX guard below first effective line": (
+        check_posix_failure_propagation,
+        _mutate_move_posix_guard,
+    ),
+    "ignore baseline ruff failure": (
+        check_baseline_ruff,
+        _mutate_ignore_baseline_ruff_failure,
+    ),
+    "exit zero after installed-wheel test": (
+        check_baseline_installed_wheel,
+        _mutate_exit_zero_after_installed_wheel,
+    ),
+    "background native source/session command": (
+        check_native_source_lane,
+        _mutate_background_desktop_source_command,
+    ),
+    "ignore delivered artifact test failure": (
+        check_native_artifact_lane,
+        _mutate_ignore_artifact_test_failure,
+    ),
+    "comment out desktop build command": (
+        check_native_artifact_lane,
+        _mutate_comment_out_desktop_build,
+    ),
+    "comment out desktop extras install": (
+        check_native_dependencies,
+        _mutate_comment_out_desktop_extras_install,
+    ),
+    "comment out documented install command": (
+        check_documented_install_lane,
+        _mutate_comment_out_documented_install,
+    ),
+    "ignore installed-service failure": (
+        check_linux_service_lane,
+        _mutate_ignore_installed_service_failure,
+    ),
+    "comment out installed-service command line": (
+        check_linux_service_lane,
+        _mutate_comment_out_installed_service_line,
+    ),
+    "ignore one-wheel count failure": (
+        check_baseline_wheel,
+        _mutate_ignore_one_wheel_count,
+    ),
+    "comment out Aqua session gate": (
+        check_native_session_preflight,
+        _mutate_comment_out_aqua_gate,
+    ),
+    "late powershell error preference": (
+        check_powershell_failure_propagation,
+        _mutate_late_powershell_error_preference,
+    ),
+    "reassign powershell error preference": (
+        check_powershell_failure_propagation,
+        _mutate_reassign_powershell_error_preference,
+    ),
+    "comment out powershell exit guard": (
+        check_powershell_failure_propagation,
+        _mutate_comment_out_powershell_exit_guard,
+    ),
+    "continue job on error": (check_no_continue_on_error, _mutate_continue_job_on_error),
+    "continue step on error": (check_no_continue_on_error, _mutate_continue_step_on_error),
 }
 
 
@@ -955,3 +1445,48 @@ def test_natural_workflow_mutation_is_rejected(label: str) -> None:
     mutate(mutated)
     problems = check(mutated)
     assert problems, f"{check.__name__} did not reject the mutation: {label}"
+
+
+# --------------------------------------------------------------------------
+# The effective-line reader and the rules it deliberately leaves alone
+# --------------------------------------------------------------------------
+
+
+def test_effective_lines_strip_and_drop_blank_and_comment_lines() -> None:
+    step = {
+        "run": (
+            "set -euo pipefail\n"
+            "\n"
+            "  # python -m pytest tests/ -v\n"
+            "    python -m pytest tests/ -v  \n"
+            "echo done # trailing comment stays\n"
+        )
+    }
+    assert _effective_lines(step) == [
+        "set -euo pipefail",
+        "python -m pytest tests/ -v",
+        "echo done # trailing comment stays",
+    ]
+
+
+def test_tracing_toggle_after_posix_guard_is_not_a_failure_propagation_violation() -> None:
+    mutated = copy.deepcopy(load_workflow())
+    _rewrite_run_line(
+        mutated,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        '"$runner_python" -m pytest tests/ -v',
+        _insert_before("set +x"),
+    )
+    assert check_posix_failure_propagation(mutated) == []
+
+
+def test_best_effort_cleanup_stop_remains_a_substring_marker() -> None:
+    workflow = load_workflow()
+    cleanup_stop = next(
+        line
+        for line in _effective_lines(_step(workflow, "nyx", LINUX_SERVICE_STEP))
+        if LINUX_SERVICE_MARKERS[0] in line
+    )
+    assert cleanup_stop.endswith("|| true")
+    assert check_linux_service_lane(workflow) == []
