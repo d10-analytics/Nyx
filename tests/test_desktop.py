@@ -2805,11 +2805,11 @@ def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
                 assert not session.claims.held
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
-    with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
-        with pytest.raises(desktop.DesktopDependencyError):
+    with patch.dict(sys.modules, {"PySide6": None}):
+        with pytest.raises(desktop.DesktopDependencyError, match=r"nyx\[desktop\]") as raised:
             desktop._load_qt()
+    assert isinstance(raised.value.__cause__, ImportError)
 
 
 @pytest.mark.skipif(
