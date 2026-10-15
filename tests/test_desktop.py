@@ -3829,7 +3829,6 @@ def test_required_native_embedded_board_renders_content_gated_finished_stage_and
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_compact_preference_survives_a_normal_reopen():
     _assert_native_host_has_no_offscreen_platform()
-    port = runtime.PORT
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
@@ -3899,7 +3898,6 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
 def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
     _assert_native_host_has_no_offscreen_platform()
     dead_port = distinct_free_port()
-    port = runtime.PORT
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
@@ -3986,7 +3984,6 @@ def _wait_for_board_titles(application, page, titles, timeout: float = 60.0, pro
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_change_workspace_save_replaces_the_rendered_board():
     _assert_native_host_has_no_offscreen_platform()
-    port = runtime.PORT
     first_titles = ("Amber harbor", "Amber lantern")
     second_titles = ("Cobalt meadow",)
     with _native_temp_home() as root:
