@@ -2,18 +2,21 @@
 
 The checks launch the staged application and its bundled console helper as
 black boxes: the environment removes checkout and interpreter discovery, and
-observations come from the process exit, the fixed loopback board, and the
-account claim files rather than from source imports inside the application.
+observations come from the process exit, the launched process's visible
+window, the fixed loopback board, and the account claim files rather than from
+source imports inside the application.
 """
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import http.client
 import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -42,6 +45,9 @@ pytestmark = pytest.mark.skipif(
 PORT = 8765
 _HOST = f"127.0.0.1:{PORT}"
 _START_TIMEOUT = 90.0
+# The application makes its only automatic start decision before it shows its
+# window, so a shown window bounds every "nothing is listening" check.
+_WINDOW_TIMEOUT = 30.0
 _SOURCE_ROOT = Path(__file__).parents[1]
 
 
@@ -244,6 +250,141 @@ class _RunningGui:
             return self.process.wait(timeout=timeout)
 
 
+def _windows_visible_top_level_windows() -> list[tuple[int, str]]:
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    found: list[tuple[int, str]] = []
+
+    def visit(window, _parameter):
+        if user32.IsWindowVisible(window):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+            title = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(window, title, len(title))
+            found.append((owner.value, title.value))
+        return True
+
+    if not user32.EnumWindows(callback_type(visit), 0):
+        raise OSError(ctypes.get_last_error(), "EnumWindows failed")
+    return found
+
+
+def _macos_visible_top_level_windows() -> list[tuple[int, str]]:
+    graphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    graphics.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    foundation.CFArrayGetCount.restype = ctypes.c_long
+    foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    foundation.CFNumberGetValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32),
+    ]
+    foundation.CFNumberGetValue.restype = ctypes.c_bool
+    foundation.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    foundation.CFStringGetCString.restype = ctypes.c_bool
+    foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    foundation.CFRelease.restype = None
+    on_screen_only = 1 << 0
+    exclude_desktop_elements = 1 << 4
+    number_sint32 = 3
+    utf8 = 0x08000100
+    owner_pid_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerPID").value
+    owner_name_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerName").value
+    layer_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowLayer").value
+
+    def integer(info, key) -> int | None:
+        value = foundation.CFDictionaryGetValue(info, key)
+        number = ctypes.c_int32()
+        if not value or not foundation.CFNumberGetValue(value, number_sint32, ctypes.byref(number)):
+            return None
+        return number.value
+
+    def text(info, key) -> str:
+        value = foundation.CFDictionaryGetValue(info, key)
+        buffer = ctypes.create_string_buffer(512)
+        if not value or not foundation.CFStringGetCString(value, buffer, len(buffer), utf8):
+            return ""
+        return buffer.value.decode("utf-8", errors="replace")
+
+    windows = graphics.CGWindowListCopyWindowInfo(
+        on_screen_only | exclude_desktop_elements, 0
+    )
+    if not windows:
+        raise OSError("CGWindowListCopyWindowInfo returned no window list")
+    found: list[tuple[int, str]] = []
+    try:
+        for index in range(foundation.CFArrayGetCount(windows)):
+            info = foundation.CFArrayGetValueAtIndex(windows, index)
+            owner = integer(info, owner_pid_key)
+            # Layer 0 is the normal application window level; menu bar, dock
+            # and overlay surfaces sit on other layers.
+            if owner is None or integer(info, layer_key) != 0:
+                continue
+            found.append((owner, text(info, owner_name_key)))
+    finally:
+        foundation.CFRelease(windows)
+    return found
+
+
+def _visible_top_level_windows() -> list[tuple[int, str]]:
+    """Return the owner process id and a label for each visible top-level window."""
+
+    if os.name == "nt":
+        return _windows_visible_top_level_windows()
+    if sys.platform == "darwin":
+        return _macos_visible_top_level_windows()
+    raise AssertionError("window readiness is observable only on Windows and macOS")
+
+
+def _wait_for_window(gui: _RunningGui, timeout: float = _WINDOW_TIMEOUT) -> None:
+    """Require a visible top-level window owned by the launched process.
+
+    The application decides whether to start its board before it builds and
+    shows its window, so once the window is visible an absent listener means
+    the application declined to start rather than that it has not started yet.
+    """
+
+    deadline = time.monotonic() + timeout
+    owners: list[tuple[int, str]] = []
+    while True:
+        exit_code = gui.process.poll()
+        if exit_code is not None:
+            raise AssertionError(
+                f"the application exited with {exit_code!r} before showing a window; "
+                f"application log:\n{gui.diagnostics()[-2000:]}"
+            )
+        owners = _visible_top_level_windows()
+        if any(owner == gui.process.pid for owner, _ in owners):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    observed = ", ".join(f"{owner}:{label!r}" for owner, label in sorted(set(owners)))
+    raise AssertionError(
+        f"no visible top-level window owned by pid {gui.process.pid} within {timeout:g}s; "
+        f"observed window owners: [{observed}]; "
+        f"application log:\n{gui.diagnostics()[-2000:]}"
+    )
+
+
 @contextlib.contextmanager
 def _running_gui(artifact: ArtifactLayout, root: Path, environment: dict[str, str]):
     log = root / "application.log"
@@ -362,7 +503,7 @@ def test_delivered_application_rejects_a_workspace_inside_its_installation(
         _write_configuration(home, inside)
         environment = _sanitized_environment(home, decoy)
         with _running_gui(artifact, root, environment) as gui:
-            time.sleep(5)
+            _wait_for_window(gui)
             with pytest.raises(OSError):
                 _request("/api/catalog")
             assert gui.process.poll() is None
@@ -452,7 +593,7 @@ def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
         before = preserved.read_bytes()
         environment = _sanitized_environment(home, decoy)
         with _running_gui(artifact, root, environment) as gui:
-            time.sleep(4)
+            _wait_for_window(gui)
             with pytest.raises(OSError):
                 _request("/api/catalog")
             assert gui.process.poll() is None, gui.diagnostics()
@@ -485,7 +626,7 @@ def test_delivered_recovery_blocks_start_until_former_workers_exit(
             assert former.acquire(blocking=False)
             try:
                 with _running_gui(artifact, root, environment) as gui:
-                    time.sleep(4)
+                    _wait_for_window(gui)
                     with pytest.raises(OSError):
                         _request("/api/catalog")
                     assert gui.process.poll() is None, gui.diagnostics()
@@ -525,7 +666,7 @@ def test_delivered_unverified_committed_state_revalidates_then_starts(
             before = committed.read_bytes()
             environment = _sanitized_environment(home, decoy)
             with _running_gui(artifact, root, environment) as gui:
-                time.sleep(4)
+                _wait_for_window(gui)
                 with pytest.raises(OSError):
                     _request("/api/catalog")
                 assert gui.process.poll() is None, gui.diagnostics()
@@ -585,17 +726,55 @@ def test_delivered_chooser_state_starts_no_runtime_or_workers(artifact: Artifact
         home.mkdir()
         decoy = _inert_path(root)
         environment = _sanitized_environment(home, decoy)
-        lease_path, _ = _claim_paths(home)
         with _running_gui(artifact, root, environment) as gui:
-            deadline = time.monotonic() + 10
-            while not lease_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.1)
-            time.sleep(3)
+            _wait_for_window(gui)
             with pytest.raises(OSError):
                 _request("/api/catalog")
             assert gui.process.poll() is None
             gui.close()
         _assert_claims_released(home)
+
+
+def test_window_readiness_fails_at_its_bound_for_a_process_without_a_window():
+    """A launched process that never shows a window fails the readiness wait."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        log = root / "application.log"
+        handle = log.open("wb")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; print('headless child ready', flush=True); time.sleep(120)",
+            ],
+            cwd=str(root),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        gui = _RunningGui(process, handle, log)
+        try:
+            deadline = time.monotonic() + 30
+            while b"headless child ready" not in log.read_bytes():
+                assert time.monotonic() < deadline, gui.diagnostics()
+                assert process.poll() is None, gui.diagnostics()
+                time.sleep(0.1)
+            bound = 2.0
+            started = time.monotonic()
+            with pytest.raises(AssertionError) as failure:
+                _wait_for_window(gui, timeout=bound)
+            elapsed = time.monotonic() - started
+            assert bound <= elapsed < bound + 15, elapsed
+            assert process.poll() is None, "the child must still be running at the bound"
+            message = str(failure.value)
+            assert f"no visible top-level window owned by pid {process.pid}" in message
+            assert "observed window owners: [" in message
+            assert "headless child ready" in message
+        finally:
+            process.kill()
+            process.wait(timeout=30)
+            handle.close()
 
 
 def test_delivered_worker_helper_emits_exact_utf8_catalog_bytes(artifact: ArtifactLayout):

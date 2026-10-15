@@ -33,6 +33,7 @@ from test_desktop_artifact import (
     _running_gui,
     _sanitized_environment,
     _wait_for_board,
+    _wait_for_window,
     _wait_port_free,
     _workspace,
     _write_configuration,
@@ -480,7 +481,7 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
 
     # First launch: the chooser owns the account but serves no board.
     with _running_gui(artifact, root, environment) as gui:
-        time.sleep(3)
+        _wait_for_window(gui)
         with pytest.raises(OSError):
             _request("/api/catalog")
         assert gui.process.poll() is None, gui.diagnostics()
@@ -523,7 +524,7 @@ def _exercise_documented_desktop_actions(tmp_path: Path) -> None:
         assert former.acquire(blocking=False)
         try:
             with _running_gui(artifact, root, environment) as gui:
-                time.sleep(4)
+                _wait_for_window(gui)
                 with pytest.raises(OSError):
                     _request("/api/catalog")
                 assert gui.process.poll() is None, gui.diagnostics()
