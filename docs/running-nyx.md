@@ -70,6 +70,20 @@ does not start or reconfigure Nyx. Stopping an already stopped instance is safe.
 Both commands are Linux service commands; the desktop application does not
 provide them.
 
+### Recover an unreadable runtime record
+
+`nyx --status` reads only, so it is the signal before recovery: a runtime record
+that is unreadable or malformed and has no owning instance reports
+`Runtime: unknown` with the `runtime state unavailable` diagnostic. While no
+instance owns the runtime, `nyx --stop` removes that record exactly as it
+removes a valid stale record and prints the ordinary `stopped` result; there is
+no separate recovery message. With no owning instance, starting with `nyx` still
+refuses while the record cannot be read, and its message names the recovery step
+and ends `; run 'nyx --stop' to recover`. Recovery requires that no instance owns
+the runtime. For an unreadable record, a live owner still refuses both start and
+stop and keeps the record in place. Removal is permanent, because Nyx cannot
+distinguish a genuinely damaged record from a temporarily unreadable one.
+
 ## Choose board row order
 
 When account settings are available, the toolbar includes a **Board row order**

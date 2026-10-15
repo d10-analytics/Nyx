@@ -66,6 +66,76 @@ def test_start_and_stop_are_terminal_commands(capsys):
     assert capsys.readouterr().out.splitlines() == [runtime.URL, "stopped"]
 
 
+@pytest.mark.parametrize(
+    ("payload", "mode"),
+    [
+        pytest.param(
+            b'{"schema_version": 1, "instance_id": "trunc',
+            None,
+            id="truncated-json",
+        ),
+        pytest.param(
+            json.dumps({"schema_version": 99, "unexpected": True}).encode("utf-8"),
+            None,
+            id="wrong-schema",
+        ),
+        pytest.param(b"\xff\xfe\x00\x01", None, id="non-utf8"),
+        pytest.param(
+            None,
+            0o000,
+            id="mode-000",
+            marks=pytest.mark.skipif(
+                os.name == "nt" or os.geteuid() == 0,
+                reason="requires POSIX permissions enforced for a non-root user",
+            ),
+        ),
+    ],
+)
+def test_stop_recovery_prints_stopped_and_removes_invalid_record(
+    tmp_path, capsys, payload, mode
+):
+    """--stop recovers an invalid record with the unchanged output contract."""
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+        state, "_current_uid", return_value=state._current_uid()
+    ):
+        state.setup(workspace)
+        paths = state.state_paths()
+    record = paths.runtime_directory / "instance.json"
+    leftover = paths.runtime_directory / ".instance.json.leftover"
+    leftover.write_bytes(b"leftover")
+    if payload is None:
+        record.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "instance_id": "stale",
+                    "url": runtime.URL,
+                    "capability": "stale-capability",
+                    "control": runtime._control_endpoint(1),
+                }
+            ),
+            encoding="utf-8",
+        )
+        record.chmod(mode)
+    else:
+        record.write_bytes(payload)
+    try:
+        with patch.object(runtime, "_paths", return_value=paths):
+            assert cli.main(["--stop"]) == 0
+        captured = capsys.readouterr()
+        assert captured.out == "stopped\n"
+        assert captured.err == ""
+        assert not record.exists()
+        assert not leftover.exists()
+    finally:
+        if record.exists():
+            record.chmod(0o600)
+
+
 def test_real_setup_cli_uses_portable_state_layout(capsys):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
