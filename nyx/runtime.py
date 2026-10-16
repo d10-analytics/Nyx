@@ -28,13 +28,36 @@ from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
 from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
 
+
+def _port_bindings(port: int) -> tuple[str, str]:
+    """Return the service URL and the public port-conflict message for ``port``.
+
+    ``PORT``, ``URL`` and ``PORT_UNAVAILABLE_MESSAGE`` are module attributes
+    read when used; this one formula keeps the two derived names in step with
+    the port.
+    """
+
+    url = f"http://127.0.0.1:{port}/"
+    message = (
+        f"Nyx could not start: port {port} is already in use by another program. "
+        'Close that program and try again; "If something looks wrong" in the '
+        "Running Nyx guide shows how to find it."
+    )
+    return url, message
+
+
 PORT = 8765
-URL = f"http://127.0.0.1:{PORT}/"
-PORT_UNAVAILABLE_MESSAGE = (
-    f"Nyx could not start: port {PORT} is already in use by another program. "
-    'Close that program and try again; "If something looks wrong" in the '
-    "Running Nyx guide shows how to find it."
-)
+URL, PORT_UNAVAILABLE_MESSAGE = _port_bindings(PORT)
+
+
+def _use_port(port: int) -> None:
+    """Point this process's ``PORT``, ``URL`` and conflict message at ``port``."""
+
+    global PORT, URL, PORT_UNAVAILABLE_MESSAGE
+    URL, PORT_UNAVAILABLE_MESSAGE = _port_bindings(port)
+    PORT = port
+
+
 SCHEMA_VERSION = 1
 LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
@@ -1379,7 +1402,8 @@ class _Daemon:
 
 def _daemon_command(deadline_ns: int) -> list[str]:
     # ``-P`` keeps the daemon's working directory off its import path so that
-    # modules there cannot replace the installed package.
+    # modules there cannot replace the installed package.  ``--port`` carries
+    # this process's port, read now, into the daemon.
     return [
         sys.executable,
         "-P",
@@ -1387,6 +1411,8 @@ def _daemon_command(deadline_ns: int) -> list[str]:
         "nyx.runtime",
         "--deadline-ns",
         str(deadline_ns),
+        "--port",
+        str(PORT),
     ]
 
 
@@ -1763,6 +1789,7 @@ _DAEMON_ENTRY_ARGUMENTS = (
     "--ack-handle",
     "--deadline-ns",
     "--claim-path",
+    "--port",
 )
 
 _DESKTOP_DAEMON_REFUSAL = (
@@ -1775,7 +1802,9 @@ def _module_entry(arguments: list[str]) -> int:
 
     The detached Linux service calls this with inherited handles; the desktop
     hosts refuse that launch before converting any handle.  A launch without any
-    daemon option is never a supported entry point on any host.
+    daemon option is never a supported entry point on any host.  The launcher
+    always passes its own ``PORT`` as ``--port``; this process adopts it before
+    the daemon is built, so parent and daemon agree on one port.
     """
 
     if desktop_host() and any(option in arguments for option in _DAEMON_ENTRY_ARGUMENTS):
@@ -1800,9 +1829,22 @@ def _module_entry(arguments: list[str]) -> int:
             if "--claim-path" in arguments
             else None
         )
+        port = _parse_port(arguments[arguments.index("--port") + 1])
     except (ValueError, IndexError):
         raise SystemExit("invalid lifecycle arguments") from None
+    _use_port(port)
     return _daemon_entry(fd, deadline, ack_fd=ack, claim_path=claim)
+
+
+def _parse_port(text: str) -> int:
+    """Parse the launcher's ``--port`` value as a decimal TCP port number."""
+
+    if not text.isascii() or not text.isdigit():
+        raise ValueError("port is not a decimal number")
+    port = int(text)
+    if not 1 <= port <= 65535:
+        raise ValueError("port is out of range")
+    return port
 
 
 def _daemon_entry(

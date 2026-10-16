@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+from conftest import skip_if_service_port_is_held
 from launch_shadow import plant_shadow, shadow_imports
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
@@ -181,6 +182,7 @@ def test_built_wheel_python_and_static_members_have_current_terms():
 )
 def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_imports():
     wheel = _wheel_path()
+    skip_if_service_port_is_held()
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         venv = root / "venv"
@@ -552,6 +554,7 @@ def test_installed_wheel_serves_catalog_when_launched_from_a_shadow_directory():
     """
 
     wheel = _wheel_path()
+    skip_if_service_port_is_held()
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         venv = root / "venv"

@@ -6,7 +6,6 @@ import contextlib
 import http.client
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -17,11 +16,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from conftest import distinct_free_port
 from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
 from nyx import _native_claim, app_runtime, desktop, runtime, state
 from nyx._native_claim import NativeClaim
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
+
+pytestmark = pytest.mark.usefixtures("isolated_port")
 
 _NATIVE_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 try:
@@ -339,7 +341,7 @@ desktop.runtime.desktop_host = lambda: True
 
 phase = os.environ["NYX_TEST_CRASH_PHASE"]
 marker_root = Path(os.environ["NYX_TEST_MARKER_ROOT"])
-desktop.runtime.PORT = int(os.environ["NYX_TEST_PORT"])
+desktop.runtime._use_port(int(os.environ["NYX_TEST_PORT"]))
 real_popen = subprocess.Popen
 
 def scheduled_popen(*args, **kwargs):
@@ -918,16 +920,7 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
     stage_marker,
     worker_expected,
 ):
-    probe = None
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    finally:
-        if probe is not None:
-            probe.close()
+    port = runtime.PORT
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1000,7 +993,6 @@ def test_actual_desktop_http_parent_loss_blocks_replacement_until_worker_termina
 
             with (
                 _home_patches(home)[0],
-                patch.object(runtime, "PORT", port),
                 patch.dict(
                     os.environ,
                     {"HOME": str(home), "USERPROFILE": str(home)},
@@ -2273,17 +2265,7 @@ def test_retryable_change_with_unreadable_configuration_offers_switch_retry():
 
 
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    try:
-        capability_probe.bind(("127.0.0.1", 0))
-        port = capability_probe.getsockname()[1]
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    finally:
-        capability_probe.close()
+    port = runtime.PORT
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -2302,7 +2284,6 @@ def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
 
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(first)
@@ -2323,17 +2304,7 @@ def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
 
 
 def test_active_workspace_switch_http_response_comes_from_new_workspace():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    try:
-        capability_probe.bind(("127.0.0.1", 0))
-        port = capability_probe.getsockname()[1]
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    finally:
-        capability_probe.close()
+    port = runtime.PORT
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -2363,7 +2334,6 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
 
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(first)
@@ -2388,17 +2358,7 @@ def test_active_workspace_switch_http_response_comes_from_new_workspace():
 def test_desktop_catalog_worker_runs_in_state_directory_not_launch_directory(
     tmp_path, monkeypatch
 ):
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    try:
-        capability_probe.bind(("127.0.0.1", 0))
-        port = capability_probe.getsockname()[1]
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    finally:
-        capability_probe.close()
+    port = runtime.PORT
 
     home = _home(tmp_path)
     workspace = _workspace(tmp_path, "workspace")
@@ -2416,7 +2376,7 @@ def test_desktop_catalog_worker_runs_in_state_directory_not_launch_directory(
     assert Path.cwd() == launch.resolve()
     assert os.environ["PYTHONPATH"] == "."
 
-    with _home_patches(home)[0], patch.object(runtime, "PORT", port):
+    with _home_patches(home)[0]:
         state.setup(workspace)
         session = desktop.DesktopSession()
         try:
@@ -2445,7 +2405,7 @@ def test_desktop_catalog_worker_runs_in_state_directory_not_launch_directory(
 
 
 def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order():
-    port = _free_loopback_port()
+    port = runtime.PORT
 
     def request_settings(method="GET", payload=None):
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2468,7 +2428,6 @@ def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order
         second = _workspace(root, "second")
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(first)
@@ -2846,11 +2805,11 @@ def test_failed_runtime_start_retains_cleanup_owner_when_workers_remain():
                 assert not session.claims.held
 
 
-@pytest.mark.skipif(os.name == "nt", reason="source-only Qt session is validated on hosted native lanes")
 def test_qt_is_optional_for_linux_source_collection():
-    with patch.object(desktop, "_load_qt", side_effect=desktop.DesktopDependencyError("missing")):
-        with pytest.raises(desktop.DesktopDependencyError):
+    with patch.dict(sys.modules, {"PySide6": None}):
+        with pytest.raises(desktop.DesktopDependencyError, match=r"nyx\[desktop\]") as raised:
             desktop._load_qt()
+    assert isinstance(raised.value.__cause__, ImportError)
 
 
 @pytest.mark.skipif(
@@ -2943,20 +2902,6 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             assert released
             if owns_application:
                 application.quit()
-
-
-def _free_loopback_port() -> int:
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    try:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    finally:
-        probe.close()
 
 
 def _request_catalog(port: int):
@@ -3152,14 +3097,13 @@ def test_board_load_failure_without_an_opened_board_keeps_the_chooser():
 
 
 def test_post_admission_board_load_failure_reaps_shared_runtime():
-    port = _free_loopback_port()
+    port = runtime.PORT
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
         workspace = _workspace(root, "workspace")
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3261,14 +3205,13 @@ def test_board_diagnostic_names_url_load_and_renderer_observations():
 def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
     assert desktop.ApplicationRuntime is app_runtime.ApplicationRuntime
     assert runtime.ApplicationRuntime is app_runtime.ApplicationRuntime
-    port = _free_loopback_port()
+    port = runtime.PORT
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
         workspace = _board_workspace(root)
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3658,14 +3601,13 @@ def test_required_native_engine_sanity_separates_renderer_from_loopback_serving(
     """
 
     _assert_native_host_has_no_offscreen_platform()
-    port = _free_loopback_port()
+    port = runtime.PORT
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3786,14 +3728,13 @@ def test_required_native_board_json_snapshot_separates_rendering_from_observatio
     """
 
     _assert_native_host_has_no_offscreen_platform()
-    port = _free_loopback_port()
+    port = runtime.PORT
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3828,14 +3769,13 @@ def test_required_native_board_json_snapshot_separates_rendering_from_observatio
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_embedded_board_renders_content_gated_finished_stage_and_dependency():
     _assert_native_host_has_no_offscreen_platform()
-    port = _free_loopback_port()
+    port = runtime.PORT
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3889,14 +3829,12 @@ def test_required_native_embedded_board_renders_content_gated_finished_stage_and
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_compact_preference_survives_a_normal_reopen():
     _assert_native_host_has_no_offscreen_platform()
-    port = _free_loopback_port()
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -3959,15 +3897,13 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
     _assert_native_host_has_no_offscreen_platform()
-    dead_port = _free_loopback_port()
-    port = _free_loopback_port()
+    dead_port = distinct_free_port()
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(workspace)
@@ -4048,7 +3984,6 @@ def _wait_for_board_titles(application, page, titles, timeout: float = 60.0, pro
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_change_workspace_save_replaces_the_rendered_board():
     _assert_native_host_has_no_offscreen_platform()
-    port = _free_loopback_port()
     first_titles = ("Amber harbor", "Amber lantern")
     second_titles = ("Cobalt meadow",)
     with _native_temp_home() as root:
@@ -4058,7 +3993,6 @@ def test_required_native_change_workspace_save_replaces_the_rendered_board():
         application = _native_application()
         with (
             _home_patches(home)[0],
-            patch.object(runtime, "PORT", port),
             patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
         ):
             state.setup(first)

@@ -1119,9 +1119,12 @@ def test_source_installation_footprints_do_not_add_application_roots(tmp_path, m
     external = tmp_path / "external"
     external.mkdir()
     assert state._packaged_footprints() == ()
-    assert external.resolve() in state._installation_footprints() or state.resolve_specification_root(
-        external
-    ) == external.resolve()
+    expected = [Path(state.__file__).resolve().parent]
+    prefix = Path(sys.prefix)
+    if prefix.exists():
+        expected.append(prefix.resolve())
+    assert state._installation_footprints() == tuple(dict.fromkeys(expected))
+    assert state.resolve_specification_root(external) == external.resolve()
 
 
 def test_footprint_rejection_preserves_prior_configuration_bytes(tmp_path, monkeypatch):
