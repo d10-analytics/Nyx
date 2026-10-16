@@ -1328,8 +1328,8 @@ def _mutate_comment_out_powershell_exit_guard(workflow: dict[str, Any]) -> None:
 
 
 def _mutate_duplicate_installed_wheel_after_service_proof(workflow: dict[str, Any]) -> None:
-    # Reproduces the earlier workflow, which ran the installed-wheel tests a
-    # second time after the separate-account installed-service proof.
+    # A second installed-wheel run after the separate-account
+    # installed-service proof.
     command = INSTALLED_WHEEL_COMMAND.format(python=BASELINE_JOBS["nyx"]["python"])
     _rewrite_run_line(
         workflow,
