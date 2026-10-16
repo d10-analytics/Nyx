@@ -193,10 +193,16 @@ report that the desktop application has no lifecycle commands.
 - The recovery button reads **Retry** or **Close**, and is unavailable when
   there is nothing to recover. **Retry** repeats a stopped workspace change or a
   runtime start.
-- **Close** finishes a blocked close or a board-display failure: it retries the
-  cleanup and exits once the work has stopped.
+- If the board cannot be displayed, the window stays open with the message
+  "Nyx board could not be displayed; choose Close", the recovery button reads
+  **Close**, and the board's work keeps running until you choose.
+- **Close** finishes a blocked close or a board-display failure: it stops the
+  work and closes the window once the work has stopped. If cleanup is still
+  blocked, the window stays open, reports that Nyx workers are still stopping,
+  and keeps **Close** available to retry.
 - **Quit**, and closing the only window, request the same visible shutdown. The
-  window exits only after its owned cleanup has finished.
+  window exits only after its owned cleanup has finished. After a board-display
+  failure they stop the board's work the same way **Close** does.
 - One application owns the account on this host. A separately launched second
   process reports that Nyx is already open and exits without changing state;
   normal operating-system activation of the running application still works.
