@@ -33,13 +33,12 @@ def _is_packaged_application() -> bool:
     """Report whether this module runs inside a standalone application.
 
     A frozen interpreter no longer exposes a Python launcher, so the worker
-    command must not be reconstructed from ``sys.executable`` there.
+    command must not be reconstructed from ``sys.executable`` there.  The
+    shared state check is consulted at call time so every packaged-build
+    decision follows one predicate.
     """
 
-    if getattr(sys, "frozen", False):
-        return True
-    compiled = globals().get("__compiled__")
-    return bool(getattr(compiled, "standalone", False))
+    return state._is_packaged_application()
 
 
 def _packaged_executable_roots() -> tuple[Path, ...]:

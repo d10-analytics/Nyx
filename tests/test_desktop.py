@@ -19,7 +19,7 @@ import pytest
 from conftest import distinct_free_port
 from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
-from nyx import _native_claim, app_runtime, desktop, runtime, state
+from nyx import _native_claim, app_runtime, desktop, runtime, state, worker
 from nyx._native_claim import NativeClaim
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 
@@ -851,6 +851,366 @@ def test_separate_process_reports_busy_without_writing_or_starting_runtime():
                 assert second.claims.held
             finally:
                 second.close()
+
+
+_STARTUP_FAILURE_QT_CODE = r'''
+from types import SimpleNamespace
+
+
+class _WindowModality:
+    NonModal = "NonModal"
+    ApplicationModal = "ApplicationModal"
+
+
+class _FakeSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in self.callbacks:
+            callback(*args)
+
+
+def build_startup_failure_qt(record, mode, existing=None):
+    """Return a recording Qt double with no blocking or static message box."""
+
+    shown = []
+
+    class MessageBox:
+        class StandardButton:
+            Ok = 1 << 10
+            Cancel = 1 << 22
+
+        def __init__(self, *args):
+            if mode == "box_fails":
+                raise RuntimeError("message box cannot be presented")
+            self.title = None
+            self.text = None
+            self.buttons = 0
+            # A parentless QMessageBox starts application-modal.
+            self.modality = _WindowModality.ApplicationModal
+            self.finished = _FakeSignal()
+            self.done = False
+
+        def setWindowTitle(self, value):
+            self.title = value
+
+        def setText(self, value):
+            self.text = value
+
+        def setStandardButtons(self, value):
+            self.buttons = bin(int(value)).count("1")
+
+        def setWindowModality(self, value):
+            self.modality = value
+
+        def show(self):
+            record("box", self.title, self.text, self.buttons, self.modality)
+            shown.append(self)
+
+    class Application:
+        current = existing
+
+        @classmethod
+        def instance(cls):
+            return cls.current
+
+        def __init__(self, *args):
+            Application.current = self
+            self.quit_requested = False
+            record("application")
+
+        def quit(self, *args):
+            # Only a finished message box may end the loop; a quit requested
+            # before then would leave the real box waiting with no running loop.
+            if not any(box.done for box in shown):
+                raise RuntimeError("the application quit before its message box finished")
+            self.quit_requested = True
+
+        def exec(self):
+            record("loop")
+            if mode == "platform_exit":
+                # What AppKit does when it answers an application quit request
+                # itself: the C library's exit(0), with the box still shown and
+                # without the interpreter's own shutdown.
+                import ctypes
+
+                ctypes.CDLL(None).exit(0)
+            for box in shown:
+                box.done = True
+                box.finished.emit(1)
+            if not self.quit_requested:
+                raise RuntimeError("the event loop never received a quit request")
+            record("loop-finished")
+            return 0
+
+    def load_qt():
+        record("load_qt")
+        if mode == "unavailable":
+            raise DesktopDependencyError("test Qt double is unavailable")
+        return {
+            "QtCore": SimpleNamespace(Qt=SimpleNamespace(WindowModality=_WindowModality)),
+            "QtWidgets": SimpleNamespace(QApplication=Application, QMessageBox=MessageBox),
+        }
+
+    return load_qt
+'''
+
+_STARTUP_FAILURE_ENTRY_CODE = r'''
+import ctypes  # noqa: F401 - loaded under the real platform identity
+import os
+import sys
+
+from nyx import desktop, runtime
+
+runtime.desktop_host = lambda: True
+if os.environ.get("NYX_TEST_PLATFORM"):
+    sys.platform = os.environ["NYX_TEST_PLATFORM"]
+if os.environ["NYX_TEST_PACKAGED"] == "1":
+    sys.frozen = True
+elif hasattr(sys, "frozen"):
+    del sys.frozen
+
+
+def record(*fields):
+    print("\t".join(str(field) for field in fields), flush=True)
+
+
+namespace = {"DesktopDependencyError": desktop.DesktopDependencyError}
+exec(os.environ["NYX_TEST_QT_CODE"], namespace)
+desktop._load_qt = namespace["build_startup_failure_qt"](record, os.environ["NYX_TEST_QT_MODE"])
+raise SystemExit(desktop.main([]))
+'''
+
+
+def _startup_failure_records(*fields):
+    return "\t".join(str(field) for field in fields)
+
+
+def _presented(message):
+    return [
+        "load_qt",
+        "application",
+        _startup_failure_records("box", "Nyx", message, 1, "NonModal"),
+        "loop",
+        "loop-finished",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trigger", "packaged", "qt_mode", "expected_records", "expected_stderr"),
+    [
+        pytest.param(
+            "conflict", True, "ok", _presented(desktop.ALREADY_OPEN_MESSAGE), "",
+            id="packaged-already-open-shows-box",
+        ),
+        pytest.param(
+            "session_failure", True, "ok", _presented(desktop.UNAVAILABLE_MESSAGE), "",
+            id="packaged-session-failure-shows-box",
+        ),
+        pytest.param(
+            "conflict", False, "ok", [], f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="source-already-open-writes-stderr",
+        ),
+        pytest.param(
+            "session_failure", False, "ok", [], f"nyx-desktop: {desktop.UNAVAILABLE_MESSAGE}\n",
+            id="source-session-failure-writes-stderr",
+        ),
+        pytest.param(
+            "conflict", True, "unavailable", ["load_qt"], f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="packaged-box-unloadable-writes-stderr",
+        ),
+        pytest.param(
+            "conflict", True, "box_fails", ["load_qt", "application"],
+            f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="packaged-box-unpresentable-writes-stderr",
+        ),
+        pytest.param(
+            "free", True, "unavailable", ["load_qt"],
+            "nyx-desktop: test Qt double is unavailable\n",
+            id="packaged-post-session-qt-failure-stays-stderr",
+        ),
+    ],
+)
+def test_desktop_entry_presents_pre_window_failures_only_when_packaged(
+    trigger, packaged, qt_mode, expected_records, expected_stderr
+):
+    result = _run_startup_failure_entry(trigger, packaged, qt_mode)
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == expected_records
+    assert result.stderr == expected_stderr
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="the platform-level exit under test is the POSIX C library's exit()",
+)
+@pytest.mark.parametrize(
+    ("platform", "qt_mode", "expected_records", "expected_status"),
+    [
+        pytest.param(
+            "darwin", "platform_exit", _presented(desktop.ALREADY_OPEN_MESSAGE)[:4], 1,
+            id="macos-platform-exit-with-box-up-keeps-failure-status",
+        ),
+        pytest.param(
+            "darwin", "ok", _presented(desktop.ALREADY_OPEN_MESSAGE), 1,
+            id="macos-dismissed-box-keeps-failure-status-and-output",
+        ),
+        pytest.param(
+            "linux", "platform_exit", _presented(desktop.ALREADY_OPEN_MESSAGE)[:4], 0,
+            id="non-macos-exit-status-is-not-rewritten",
+        ),
+    ],
+)
+def test_packaged_startup_failure_keeps_its_status_when_the_platform_exits(
+    platform, qt_mode, expected_records, expected_status
+):
+    result = _run_startup_failure_entry("conflict", True, qt_mode, platform=platform)
+
+    assert result.stdout.splitlines() == expected_records
+    assert result.stderr == ""
+    assert result.returncode == expected_status
+
+
+def _run_startup_failure_entry(trigger, packaged, qt_mode, platform=None):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        if trigger == "session_failure":
+            home.joinpath(".nyx").write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["USERPROFILE"] = str(home)
+        environment.pop("PYTHONHOME", None)
+        environment["NYX_TEST_PACKAGED"] = "1" if packaged else "0"
+        environment["NYX_TEST_QT_MODE"] = qt_mode
+        environment["NYX_TEST_QT_CODE"] = _STARTUP_FAILURE_QT_CODE
+        if platform is not None:
+            environment["NYX_TEST_PLATFORM"] = platform
+        else:
+            environment.pop("NYX_TEST_PLATFORM", None)
+
+        def run_entry():
+            return subprocess.run(
+                [sys.executable, "-c", _STARTUP_FAILURE_ENTRY_CODE],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        with _home_patches(home)[0]:
+            if trigger == "conflict":
+                first = desktop.DesktopSession()
+                try:
+                    result = run_entry()
+                    assert first.claims.held
+                    assert not state.state_paths().config_file.exists()
+                finally:
+                    first.close()
+            else:
+                result = run_entry()
+            if trigger == "free":
+                paths = state.state_paths()
+                lease_path = paths.runtime_directory / desktop.APPLICATION_CLAIM_FILENAME
+                recovery_path = paths.runtime_directory / desktop.RECOVERY_CLAIM_FILENAME
+                assert NativeClaim.probe(lease_path) == "free"
+                assert NativeClaim.probe(recovery_path) == "free"
+    return result
+
+
+def _in_process_startup_failure_qt(mode="ok", existing=None):
+    records = []
+    namespace = {"DesktopDependencyError": desktop.DesktopDependencyError}
+    exec(_STARTUP_FAILURE_QT_CODE, namespace)
+    load_qt = namespace["build_startup_failure_qt"](
+        lambda *fields: records.append(_startup_failure_records(*fields)), mode, existing
+    )
+    return records, load_qt
+
+
+def test_shared_packaged_check_drives_presentation_and_worker_selection(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.joinpath(".nyx").write_text("", encoding="utf-8")
+    application_root = tmp_path / "application"
+    application_root.mkdir()
+    executable = application_root / ("Nyx.exe" if os.name == "nt" else "Nyx")
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
+
+    armed = []
+    monkeypatch.setattr(
+        desktop, "_keep_failure_status_on_platform_exit", lambda: armed.append(True)
+    )
+
+    # Packaged by the shared check alone: no interpreter frozen marker.
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
+    records, load_qt = _in_process_startup_failure_qt()
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+    assert records == _presented(desktop.UNAVAILABLE_MESSAGE)
+    assert armed == [True]
+    assert capsys.readouterr().err == ""
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sys, "executable", str(executable))
+        with pytest.raises(worker.WorkerError) as error:
+            worker.default_worker_command()
+    assert error.value.code == "producer_unavailable"
+
+    # Not packaged by the shared check, although the interpreter is frozen.
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: False)
+    records, load_qt = _in_process_startup_failure_qt()
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+    assert records == []
+    assert armed == [True]
+    assert capsys.readouterr().err == f"nyx-desktop: {desktop.UNAVAILABLE_MESSAGE}\n"
+    assert worker.default_worker_command() == [sys.executable, "-P", "-m", "nyx.worker"]
+
+
+def test_packaged_startup_failure_reuses_a_running_application_without_its_loop(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.joinpath(".nyx").write_text("", encoding="utf-8")
+    loop_runs = []
+    existing = SimpleNamespace(
+        quit=lambda *args: None,
+        exec=lambda: loop_runs.append("exec"),
+    )
+    records, load_qt = _in_process_startup_failure_qt(existing=existing)
+    armed = []
+    monkeypatch.setattr(
+        desktop, "_keep_failure_status_on_platform_exit", lambda: armed.append(True)
+    )
+    monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+
+    assert records == [
+        "load_qt",
+        _startup_failure_records("box", "Nyx", desktop.UNAVAILABLE_MESSAGE, 1, "NonModal"),
+    ]
+    assert loop_runs == []
+    # The status of a process whose loop belongs to someone else is not touched.
+    assert armed == []
+    assert capsys.readouterr().err == ""
 
 
 def test_unrelated_helper_inherits_no_desktop_claim_or_liveness_object():
@@ -2053,9 +2413,14 @@ def test_recovery_button_label_enablement_and_action_agree_with_cancel_disabled(
 
             if state_name == "board_failed_shutdown_blocked":
                 control["shutdown"] = False
+                admitted = session.runtime
                 window._board.loadFinished.emit(False)
                 assert window._board_failed
-                assert session.shutdown_blocked
+                # No cleanup ran: a refused shutdown would have blocked it.
+                assert not session.shutdown_blocked
+                assert session.snapshot.status == "configured"
+                assert session.runtime is admitted is not None
+                assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
             elif state_name == "switch_blocked":
                 control["shutdown"] = False
                 window._change.click()
@@ -2149,22 +2514,141 @@ def test_board_failure_during_change_disables_cancel_and_offers_close():
             window._change.click()
             assert window._cancel.isEnabled()
 
-            control["shutdown"] = False
+            admitted = session.runtime
             window._board.loadFinished.emit(False)
 
             assert window._board_failed
-            assert session.shutdown_blocked
-            assert window._visible
-            assert not window._cancel.isEnabled()
-            assert not window._change.isEnabled()
-            assert not window._save.isEnabled()
-            assert window._retry.text() == "Close"
-            assert window._retry.isEnabled()
+            _assert_board_failure_screen(window, session, admitted)
+
+            control["shutdown"] = False
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
 
             control["shutdown"] = True
             window._retry.click()
             assert not window._visible
             assert not session.claims.held
+            assert session.runtime is None
+
+
+def _assert_board_failure_screen(window, session, admitted):
+    """The window shows the board-failure screen while admitted work still runs."""
+
+    assert window._visible
+    assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+    assert not window._root.isEnabled()
+    assert not window._change.isEnabled()
+    assert not window._save.isEnabled()
+    assert not window._cancel.isEnabled()
+    assert window._retry.text() == "Close"
+    assert window._retry.isEnabled()
+    assert session.claims.held
+    assert session.runtime is admitted is not None
+    assert session.snapshot.status != "shutdown_blocked"
+
+
+def _assert_blocked_close_retry(window, session):
+    """A Close whose cleanup is refused keeps a visible retry with its message."""
+
+    assert session.shutdown_blocked
+    assert session.snapshot.status == "shutdown_blocked"
+    assert window._visible
+    assert session.claims.held
+    assert session.runtime is not None
+    assert window._status.text() == "Nyx workers are still stopping; retry Close"
+    assert window._retry.text() == "Close"
+    assert window._retry.isEnabled()
+
+
+def test_board_failure_after_a_rejected_save_shows_the_failure_not_the_rejection():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._change.click()
+            window._root.setText(str(root / "missing"))
+            window._save.click()
+            assert session.pending_error == "Nyx workspace could not be validated"
+            assert window._status.text() == "Nyx workspace could not be validated"
+
+            window._board.loadFinished.emit(False)
+            _assert_board_failure_screen(window, session, admitted)
+            # The rejection is still pending; it just never explains the failure.
+            assert session.pending_error == "Nyx workspace could not be validated"
+
+            control["shutdown"] = False
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
+
+
+def test_board_failure_after_a_blocked_workspace_change_shows_the_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+
+            control["shutdown"] = False
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+            assert session.snapshot.status == "switch_blocked"
+            assert session.shutdown_blocked
+            assert window._status.text() == (
+                "Nyx workers are still stopping; retry workspace change"
+            )
+            assert session.runtime is admitted is not None
+
+            window._board.loadFinished.emit(False)
+            assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+            assert window._retry.text() == "Close"
+            assert window._retry.isEnabled()
+            assert not window._root.isEnabled()
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+            assert window._visible
+            assert session.claims.held
+            assert session.runtime is admitted
+
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
 
 
 @pytest.mark.parametrize("blocked", ["switch_blocked", "runtime_blocked"])
@@ -3096,7 +3580,15 @@ def test_board_load_failure_without_an_opened_board_keeps_the_chooser():
             assert not session.claims.held
 
 
-def test_post_admission_board_load_failure_reaps_shared_runtime():
+_BOARD_FAILURE_TRIGGERS = {
+    "close_button": lambda window: window._retry.click(),
+    "quit_button": lambda window: window._quit.click(),
+    "window_close": lambda window: window.close(),
+}
+
+
+@pytest.mark.parametrize("trigger", list(_BOARD_FAILURE_TRIGGERS))
+def test_post_admission_board_load_failure_reaps_shared_runtime(trigger):
     port = runtime.PORT
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -3116,7 +3608,15 @@ def test_post_admission_board_load_failure_reaps_shared_runtime():
             try:
                 assert window._open_board()
                 assert window._board.url() == application.board_url()
-                window._board.loadFinished.emit(False)
+                for _ in range(2):
+                    # A repeated failed load changes nothing.
+                    window._board.loadFinished.emit(False)
+                    assert window._board_failed
+                    _assert_board_failure_screen(window, session, application)
+                    assert session.runtime is application
+                    assert _request_catalog(port)[0] == 200
+
+                _BOARD_FAILURE_TRIGGERS[trigger](window)
                 assert not session.claims.held
                 assert session.runtime is None
                 assert not window._visible
@@ -3124,6 +3624,49 @@ def test_post_admission_board_load_failure_reaps_shared_runtime():
                     _request_catalog(port)
             finally:
                 session.close()
+
+
+@pytest.mark.parametrize("trigger", list(_BOARD_FAILURE_TRIGGERS))
+def test_blocked_board_failure_cleanup_keeps_retry_close_for_every_trigger(trigger):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._board.loadFinished.emit(False)
+            _assert_board_failure_screen(window, session, admitted)
+
+            # Quit and closing the window block exactly as Close does: the
+            # failure screen stays, now explaining the refused cleanup.
+            control["shutdown"] = False
+            _BOARD_FAILURE_TRIGGERS[trigger](window)
+            _assert_blocked_close_retry(window, session)
+            assert session.runtime is admitted
+            assert not window._root.isEnabled()
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+
+            # Another failed load while cleanup is blocked changes nothing.
+            window._board.loadFinished.emit(False)
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
 
 
 def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
@@ -3156,11 +3699,13 @@ def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
             window.show()
             assert window._open_board()
             window._board.loadFinished.emit(False)
-            assert session.shutdown_blocked
-            assert session.claims.held
-            assert window._visible
-            assert window._retry.isEnabled()
-            assert "retry" in window._status.text().lower()
+            # No cleanup has run before Close.
+            assert not session.shutdown_blocked
+            _assert_board_failure_screen(window, session, application)
+
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+            assert session.runtime is application
             application.allow_close = True
             window._retry.click()
             assert not session.claims.held
@@ -3917,14 +4462,29 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                 # Trigger the later view failure by sending the admitted board to
                 # a dead loopback port; a first successful board load is not
                 # required to exercise the post-admission cleanup obligation.
+                admitted = session.runtime
                 window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{dead_port}/"))
                 deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and session.runtime is not None:
+                while time.monotonic() < deadline and not window._board_failed:
                     _pump_native_events(application, 50)
+                assert window._board_failed, "the dead-port board load never failed"
+                # The failure screen stays up and the admitted work keeps running
+                # until the user chooses Close.
+                assert window.isVisible()
+                assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+                assert window._retry.text() == "Close"
+                assert window._retry.isEnabled()
+                assert session.claims.held
+                assert session.runtime is admitted is not None
+                window._retry.click()
+                _pump_native_events(application, 50)
                 if session.shutdown_blocked:
                     assert session.claims.held
                     assert window.isVisible()
                     assert window._retry.isEnabled()
+                    assert window._status.text() == (
+                        "Nyx workers are still stopping; retry Close"
+                    )
                 else:
                     assert not session.claims.held
                     assert session.runtime is None

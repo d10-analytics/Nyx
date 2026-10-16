@@ -737,8 +737,10 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 return
             if self._session.runtime is None:
                 return
+            # Show the failure screen and keep the admitted work running; the
+            # Close action, Quit, or closing the window reaps it.
             self._board_failed = True
-            self._settle_board_failure()
+            self._render()
 
         def _settle_board_failure(self) -> None:
             """Reap admitted work through the shared owner, retrying if needed."""
@@ -752,9 +754,16 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
         def _render(self) -> None:
             snapshot = self._session.snapshot
             if self._board_failed:
-                self._status.setText(
-                    self._session.pending_error or BOARD_FAILURE_MESSAGE
-                )
+                # Only a blocked session close records ``shutdown_blocked``, and
+                # its retry message replaces the failure explanation.  Any other
+                # pending error (a rejected choice or a blocked workspace
+                # change) predates the failure and must not explain it.
+                if snapshot.status == "shutdown_blocked":
+                    self._status.setText(
+                        self._session.pending_error or BOARD_FAILURE_MESSAGE
+                    )
+                else:
+                    self._status.setText(BOARD_FAILURE_MESSAGE)
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
@@ -1007,6 +1016,96 @@ def _report_desktop_error(message: str) -> None:
         pass
 
 
+def _startup_failure_text(error: DesktopError) -> str:
+    """Return the standard-error text for a pre-window startup failure."""
+
+    if isinstance(error, AlreadyOpenError):
+        return str(error)
+    return f"nyx-desktop: {error}"
+
+
+def _keep_failure_status_on_platform_exit() -> None:
+    """Make a native process exit taken from here on report status 1.
+
+    On macOS an application quit request is answered by AppKit, which can end
+    the process through the C library's ``exit(0)`` while the startup failure
+    box is shown, before this entry returns its failure status and without
+    running the interpreter's own exit handlers.  Registering the C library's
+    ``_exit`` with status 1 as the latest C exit handler makes that exit, and
+    the ordinary exit after ``main`` returns 1, report 1.  It is armed only
+    for the packaged startup failure whose only remaining outcome is status 1,
+    so no other status changes.  Other hosts close the box through their own
+    window close, which returns through ``main``.
+    """
+
+    if sys.platform != "darwin":
+        return
+    import ctypes
+
+    library = ctypes.CDLL(None)
+    register = getattr(library, "__cxa_atexit")
+    register.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    register.restype = ctypes.c_int
+    exit_without_cleanup = ctypes.cast(getattr(library, "_exit"), ctypes.c_void_p)
+    if register(exit_without_cleanup, ctypes.c_void_p(1), None) != 0:
+        raise OSError("the startup failure status could not be preserved")
+
+
+def _present_startup_failure(message: str) -> None:
+    """Show ``message`` in a Nyx message box and wait until it is dismissed.
+
+    The box is explicitly non-modal: a parentless message box is otherwise
+    application-modal, and a modal panel is neither listed as an ordinary
+    top-level window on macOS nor finished by an application quit request.
+    Its single button is also its escape button, so closing the window
+    finishes it, and finishing it quits the application.  The event loop runs
+    only when this call created the application, as the shell entry does; only
+    then is the failure status kept across a native exit of that loop.
+    """
+
+    qt = _load_qt()
+    QtCore = qt["QtCore"]
+    QtWidgets = qt["QtWidgets"]
+    application = QtWidgets.QApplication.instance()
+    owns_application = application is None
+    if application is None:
+        application = QtWidgets.QApplication(sys.argv[:1])
+    box = QtWidgets.QMessageBox()
+    box.setWindowTitle("Nyx")
+    box.setText(message)
+    box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+    box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+    box.finished.connect(application.quit)
+    box.show()
+    if owns_application:
+        try:
+            _keep_failure_status_on_platform_exit()
+        except (AttributeError, OSError):
+            # The message stays visible even where the C library offers no
+            # exit-handler registration; only the macOS quit status is at stake.
+            pass
+        application.exec()
+
+
+def _report_startup_failure(error: DesktopError) -> None:
+    """Report a failure that happened before the desktop window existed.
+
+    A packaged application has no console a person can read, so it presents
+    the message natively; a source run writes its standard-error text.  When
+    the message box cannot be loaded or shown, the standard-error text is
+    written instead.  The caller's exit status never depends on presentation.
+    """
+
+    if state._is_packaged_application():
+        try:
+            _present_startup_failure(str(error))
+        except Exception:
+            pass
+        else:
+            return
+    _report_desktop_error(_startup_failure_text(error))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the optional GUI entry while retaining the console entry unchanged."""
 
@@ -1032,11 +1131,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         session = DesktopSession()
-    except AlreadyOpenError as error:
-        _report_desktop_error(str(error))
-        return 1
     except DesktopError as error:
-        _report_desktop_error(f"nyx-desktop: {error}")
+        _report_startup_failure(error)
         return 1
     application: Any = None
     window: Any = None

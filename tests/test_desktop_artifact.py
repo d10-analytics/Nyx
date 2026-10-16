@@ -511,6 +511,33 @@ def test_delivered_application_rejects_a_workspace_inside_its_installation(
         _assert_claims_released(home)
 
 
+def _request_close_by_pid(pid: int) -> None:
+    """Ask exactly one process to close gracefully, addressed by its id.
+
+    Two delivered instances share one application name, so a request by name
+    could reach the wrong one.  Windows receives the window-close request
+    ``taskkill /PID`` sends without ``/F``; macOS receives an application
+    terminate request for the running application with that process id.
+    """
+
+    if os.name == "nt":
+        command = ["taskkill", "/PID", str(pid)]
+    else:
+        script = (
+            "ObjC.import('AppKit');"
+            f"var target = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid});"
+            f"if (!target || target.processIdentifier !== {pid}) "
+            f"{{ throw new Error('no running application has pid {pid}'); }}"
+            "if (!target.terminate) { throw new Error('the terminate request was refused'); }"
+        )
+        command = ["osascript", "-l", "JavaScript", "-e", script]
+    request = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+    assert request.returncode == 0, (
+        f"the close request for pid {pid} failed with {request.returncode}: "
+        f"stdout={request.stdout!r} stderr={request.stderr!r}"
+    )
+
+
 def test_delivered_second_process_reports_already_open_without_competing_writes(
     artifact: ArtifactLayout,
 ):
@@ -519,24 +546,16 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
         home = root / "home"
         home.mkdir()
         decoy = _inert_path(root)
+        # The second launch keeps its own log so it cannot truncate the first
+        # application's diagnostics.
+        second_root = root / "second-launch"
+        second_root.mkdir()
         with _workspace(root) as workspace:
             config_file, _ = _write_configuration(home, workspace)
             environment = _sanitized_environment(home, decoy)
             lease_path, recovery_path = _claim_paths(home)
-            with _running_gui(artifact, root, environment) as gui:
-                _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
-                before = config_file.read_bytes()
-                runtime_before = sorted(
-                    path.name for path in lease_path.parent.iterdir()
-                )
-                second = subprocess.run(
-                    [str(artifact.executable)],
-                    cwd=str(root),
-                    env=environment,
-                    capture_output=True,
-                    timeout=60,
-                )
-                assert second.returncode == 1
+
+            def assert_first_application_state_unchanged() -> None:
                 # Only the held qualified application claim reports already
                 # open, and the refused launch changes no state and starts no
                 # competing work while the first application keeps serving.
@@ -547,6 +566,46 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
                     sorted(path.name for path in lease_path.parent.iterdir())
                     == runtime_before
                 )
+
+            with _running_gui(artifact, root, environment) as gui:
+                _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                before = config_file.read_bytes()
+                runtime_before = sorted(
+                    path.name for path in lease_path.parent.iterdir()
+                )
+                with _running_gui(artifact, second_root, environment) as second:
+                    try:
+                        # The refusal is visible: the second process owns a
+                        # top-level window before it exits.
+                        _wait_for_window(second)
+                        if os.name == "nt":
+                            titles = [
+                                title
+                                for owner, title in _visible_top_level_windows()
+                                if owner == second.process.pid
+                            ]
+                            assert "Nyx" in titles, (
+                                f"second launch windows {titles!r}; "
+                                f"application log:\n{second.diagnostics()[-2000:]}"
+                            )
+                        assert_first_application_state_unchanged()
+                        _request_close_by_pid(second.process.pid)
+                        try:
+                            second_code = second.process.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            pytest.fail(
+                                "the second launch did not exit after its close request; "
+                                f"application log:\n{second.diagnostics()[-2000:]}"
+                            )
+                    finally:
+                        # Cleanup after a failed proof only; a by-name close
+                        # here could reach the first application.
+                        if second.process.poll() is None:
+                            second.process.kill()
+                            second.process.wait(timeout=30)
+                assert second_code == 1, second.diagnostics()
+                assert_first_application_state_unchanged()
+                assert gui.process.poll() is None, gui.diagnostics()
                 status, _, _ = _wait_for_board(time.monotonic() + 30, gui)
                 assert status == 200
                 assert gui.close() == 0, gui.diagnostics()
