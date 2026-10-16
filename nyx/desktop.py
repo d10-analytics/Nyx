@@ -1024,6 +1024,33 @@ def _startup_failure_text(error: DesktopError) -> str:
     return f"nyx-desktop: {error}"
 
 
+def _keep_failure_status_on_platform_exit() -> None:
+    """Make a native process exit taken from here on report status 1.
+
+    On macOS an application quit request is answered by AppKit, which can end
+    the process through the C library's ``exit(0)`` while the startup failure
+    box is shown, before this entry returns its failure status and without
+    running the interpreter's own exit handlers.  Registering the C library's
+    ``_exit`` with status 1 as the latest C exit handler makes that exit, and
+    the ordinary exit after ``main`` returns 1, report 1.  It is armed only
+    for the packaged startup failure whose only remaining outcome is status 1,
+    so no other status changes.  Other hosts close the box through their own
+    window close, which returns through ``main``.
+    """
+
+    if sys.platform != "darwin":
+        return
+    import ctypes
+
+    library = ctypes.CDLL(None)
+    register = getattr(library, "__cxa_atexit")
+    register.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    register.restype = ctypes.c_int
+    exit_without_cleanup = ctypes.cast(getattr(library, "_exit"), ctypes.c_void_p)
+    if register(exit_without_cleanup, ctypes.c_void_p(1), None) != 0:
+        raise OSError("the startup failure status could not be preserved")
+
+
 def _present_startup_failure(message: str) -> None:
     """Show ``message`` in a Nyx message box and wait until it is dismissed.
 
@@ -1032,7 +1059,8 @@ def _present_startup_failure(message: str) -> None:
     top-level window on macOS nor finished by an application quit request.
     Its single button is also its escape button, so closing the window
     finishes it, and finishing it quits the application.  The event loop runs
-    only when this call created the application, as the shell entry does.
+    only when this call created the application, as the shell entry does; only
+    then is the failure status kept across a native exit of that loop.
     """
 
     qt = _load_qt()
@@ -1050,6 +1078,12 @@ def _present_startup_failure(message: str) -> None:
     box.finished.connect(application.quit)
     box.show()
     if owns_application:
+        try:
+            _keep_failure_status_on_platform_exit()
+        except (AttributeError, OSError):
+            # The message stays visible even where the C library offers no
+            # exit-handler registration; only the macOS quit status is at stake.
+            pass
         application.exec()
 
 
