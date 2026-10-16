@@ -1007,6 +1007,62 @@ def _report_desktop_error(message: str) -> None:
         pass
 
 
+def _startup_failure_text(error: DesktopError) -> str:
+    """Return the standard-error text for a pre-window startup failure."""
+
+    if isinstance(error, AlreadyOpenError):
+        return str(error)
+    return f"nyx-desktop: {error}"
+
+
+def _present_startup_failure(message: str) -> None:
+    """Show ``message`` in a Nyx message box and wait until it is dismissed.
+
+    The box is explicitly non-modal: a parentless message box is otherwise
+    application-modal, and a modal panel is neither listed as an ordinary
+    top-level window on macOS nor finished by an application quit request.
+    Its single button is also its escape button, so closing the window
+    finishes it, and finishing it quits the application.  The event loop runs
+    only when this call created the application, as the shell entry does.
+    """
+
+    qt = _load_qt()
+    QtCore = qt["QtCore"]
+    QtWidgets = qt["QtWidgets"]
+    application = QtWidgets.QApplication.instance()
+    owns_application = application is None
+    if application is None:
+        application = QtWidgets.QApplication(sys.argv[:1])
+    box = QtWidgets.QMessageBox()
+    box.setWindowTitle("Nyx")
+    box.setText(message)
+    box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+    box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+    box.finished.connect(application.quit)
+    box.show()
+    if owns_application:
+        application.exec()
+
+
+def _report_startup_failure(error: DesktopError) -> None:
+    """Report a failure that happened before the desktop window existed.
+
+    A packaged application has no console a person can read, so it presents
+    the message natively; a source run writes its standard-error text.  When
+    the message box cannot be loaded or shown, the standard-error text is
+    written instead.  The caller's exit status never depends on presentation.
+    """
+
+    if state._is_packaged_application():
+        try:
+            _present_startup_failure(str(error))
+        except Exception:
+            pass
+        else:
+            return
+    _report_desktop_error(_startup_failure_text(error))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the optional GUI entry while retaining the console entry unchanged."""
 
@@ -1032,11 +1088,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         session = DesktopSession()
-    except AlreadyOpenError as error:
-        _report_desktop_error(str(error))
-        return 1
     except DesktopError as error:
-        _report_desktop_error(f"nyx-desktop: {error}")
+        _report_startup_failure(error)
         return 1
     application: Any = None
     window: Any = None
