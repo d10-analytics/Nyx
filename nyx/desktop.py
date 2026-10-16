@@ -737,8 +737,10 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 return
             if self._session.runtime is None:
                 return
+            # Show the failure screen and keep the admitted work running; the
+            # Close action, Quit, or closing the window reaps it.
             self._board_failed = True
-            self._settle_board_failure()
+            self._render()
 
         def _settle_board_failure(self) -> None:
             """Reap admitted work through the shared owner, retrying if needed."""
@@ -752,9 +754,16 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
         def _render(self) -> None:
             snapshot = self._session.snapshot
             if self._board_failed:
-                self._status.setText(
-                    self._session.pending_error or BOARD_FAILURE_MESSAGE
-                )
+                # Only a blocked session close records ``shutdown_blocked``, and
+                # its retry message replaces the failure explanation.  Any other
+                # pending error (a rejected choice or a blocked workspace
+                # change) predates the failure and must not explain it.
+                if snapshot.status == "shutdown_blocked":
+                    self._status.setText(
+                        self._session.pending_error or BOARD_FAILURE_MESSAGE
+                    )
+                else:
+                    self._status.setText(BOARD_FAILURE_MESSAGE)
                 self._root.setEnabled(False)
                 self._change.setEnabled(False)
                 self._save.setEnabled(False)
