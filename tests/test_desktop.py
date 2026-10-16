@@ -2350,9 +2350,14 @@ def test_recovery_button_label_enablement_and_action_agree_with_cancel_disabled(
 
             if state_name == "board_failed_shutdown_blocked":
                 control["shutdown"] = False
+                admitted = session.runtime
                 window._board.loadFinished.emit(False)
                 assert window._board_failed
-                assert session.shutdown_blocked
+                # No cleanup ran: a refused shutdown would have blocked it.
+                assert not session.shutdown_blocked
+                assert session.snapshot.status == "configured"
+                assert session.runtime is admitted is not None
+                assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
             elif state_name == "switch_blocked":
                 control["shutdown"] = False
                 window._change.click()
@@ -2446,22 +2451,141 @@ def test_board_failure_during_change_disables_cancel_and_offers_close():
             window._change.click()
             assert window._cancel.isEnabled()
 
-            control["shutdown"] = False
+            admitted = session.runtime
             window._board.loadFinished.emit(False)
 
             assert window._board_failed
-            assert session.shutdown_blocked
-            assert window._visible
-            assert not window._cancel.isEnabled()
-            assert not window._change.isEnabled()
-            assert not window._save.isEnabled()
-            assert window._retry.text() == "Close"
-            assert window._retry.isEnabled()
+            _assert_board_failure_screen(window, session, admitted)
+
+            control["shutdown"] = False
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
 
             control["shutdown"] = True
             window._retry.click()
             assert not window._visible
             assert not session.claims.held
+            assert session.runtime is None
+
+
+def _assert_board_failure_screen(window, session, admitted):
+    """The window shows the board-failure screen while admitted work still runs."""
+
+    assert window._visible
+    assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+    assert not window._root.isEnabled()
+    assert not window._change.isEnabled()
+    assert not window._save.isEnabled()
+    assert not window._cancel.isEnabled()
+    assert window._retry.text() == "Close"
+    assert window._retry.isEnabled()
+    assert session.claims.held
+    assert session.runtime is admitted is not None
+    assert session.snapshot.status != "shutdown_blocked"
+
+
+def _assert_blocked_close_retry(window, session):
+    """A Close whose cleanup is refused keeps a visible retry with its message."""
+
+    assert session.shutdown_blocked
+    assert session.snapshot.status == "shutdown_blocked"
+    assert window._visible
+    assert session.claims.held
+    assert session.runtime is not None
+    assert window._status.text() == "Nyx workers are still stopping; retry Close"
+    assert window._retry.text() == "Close"
+    assert window._retry.isEnabled()
+
+
+def test_board_failure_after_a_rejected_save_shows_the_failure_not_the_rejection():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._change.click()
+            window._root.setText(str(root / "missing"))
+            window._save.click()
+            assert session.pending_error == "Nyx workspace could not be validated"
+            assert window._status.text() == "Nyx workspace could not be validated"
+
+            window._board.loadFinished.emit(False)
+            _assert_board_failure_screen(window, session, admitted)
+            # The rejection is still pending; it just never explains the failure.
+            assert session.pending_error == "Nyx workspace could not be validated"
+
+            control["shutdown"] = False
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
+
+
+def test_board_failure_after_a_blocked_workspace_change_shows_the_failure():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+
+            control["shutdown"] = False
+            window._change.click()
+            window._root.setText(str(second))
+            window._save.click()
+            assert session.snapshot.status == "switch_blocked"
+            assert session.shutdown_blocked
+            assert window._status.text() == (
+                "Nyx workers are still stopping; retry workspace change"
+            )
+            assert session.runtime is admitted is not None
+
+            window._board.loadFinished.emit(False)
+            assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+            assert window._retry.text() == "Close"
+            assert window._retry.isEnabled()
+            assert not window._root.isEnabled()
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+            assert window._visible
+            assert session.claims.held
+            assert session.runtime is admitted
+
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
 
 
 @pytest.mark.parametrize("blocked", ["switch_blocked", "runtime_blocked"])
@@ -3393,7 +3517,15 @@ def test_board_load_failure_without_an_opened_board_keeps_the_chooser():
             assert not session.claims.held
 
 
-def test_post_admission_board_load_failure_reaps_shared_runtime():
+_BOARD_FAILURE_TRIGGERS = {
+    "close_button": lambda window: window._retry.click(),
+    "quit_button": lambda window: window._quit.click(),
+    "window_close": lambda window: window.close(),
+}
+
+
+@pytest.mark.parametrize("trigger", list(_BOARD_FAILURE_TRIGGERS))
+def test_post_admission_board_load_failure_reaps_shared_runtime(trigger):
     port = runtime.PORT
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -3413,7 +3545,15 @@ def test_post_admission_board_load_failure_reaps_shared_runtime():
             try:
                 assert window._open_board()
                 assert window._board.url() == application.board_url()
-                window._board.loadFinished.emit(False)
+                for _ in range(2):
+                    # A repeated failed load changes nothing.
+                    window._board.loadFinished.emit(False)
+                    assert window._board_failed
+                    _assert_board_failure_screen(window, session, application)
+                    assert session.runtime is application
+                    assert _request_catalog(port)[0] == 200
+
+                _BOARD_FAILURE_TRIGGERS[trigger](window)
                 assert not session.claims.held
                 assert session.runtime is None
                 assert not window._visible
@@ -3453,11 +3593,13 @@ def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
             window.show()
             assert window._open_board()
             window._board.loadFinished.emit(False)
-            assert session.shutdown_blocked
-            assert session.claims.held
-            assert window._visible
-            assert window._retry.isEnabled()
-            assert "retry" in window._status.text().lower()
+            # No cleanup has run before Close.
+            assert not session.shutdown_blocked
+            _assert_board_failure_screen(window, session, application)
+
+            window._retry.click()
+            _assert_blocked_close_retry(window, session)
+            assert session.runtime is application
             application.allow_close = True
             window._retry.click()
             assert not session.claims.held
@@ -4214,14 +4356,29 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                 # Trigger the later view failure by sending the admitted board to
                 # a dead loopback port; a first successful board load is not
                 # required to exercise the post-admission cleanup obligation.
+                admitted = session.runtime
                 window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{dead_port}/"))
                 deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and session.runtime is not None:
+                while time.monotonic() < deadline and not window._board_failed:
                     _pump_native_events(application, 50)
+                assert window._board_failed, "the dead-port board load never failed"
+                # The failure screen stays up and the admitted work keeps running
+                # until the user chooses Close.
+                assert window.isVisible()
+                assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+                assert window._retry.text() == "Close"
+                assert window._retry.isEnabled()
+                assert session.claims.held
+                assert session.runtime is admitted is not None
+                window._retry.click()
+                _pump_native_events(application, 50)
                 if session.shutdown_blocked:
                     assert session.claims.held
                     assert window.isVisible()
                     assert window._retry.isEnabled()
+                    assert window._status.text() == (
+                        "Nyx workers are still stopping; retry Close"
+                    )
                 else:
                     assert not session.claims.held
                     assert session.runtime is None
