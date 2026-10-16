@@ -4,12 +4,13 @@ These tests parse the real workflow document and assert the operational
 contract that the native source/session lane and the desktop build/artifact
 extension establish: exact commands, installer extras, artifact inputs,
 required-native environment, interactive-session preflight, stage ordering,
-and non-zero exit propagation.  Checks read each step's effective lines (the
-stripped lines left after dropping blank lines and full-line comments) and
-match gating commands exactly, so a commented-out or failure-masked command
-does not satisfy them.  Each supported behavior is proved to be
-load-bearing by mutating the parsed document — a natural edit that removes or
-weakens the behavior — and asserting that the matching check rejects it.
+job time limits and non-zero exit propagation.  Checks read each step's
+effective lines (the stripped lines left after dropping blank lines and
+full-line comments) and match gating commands exactly, so a commented-out or
+failure-masked command does not satisfy them.  Each supported behavior is
+proved to be load-bearing by mutating the parsed document — a natural edit
+that removes or weakens the behavior — and asserting that the matching check
+rejects it.
 """
 
 from __future__ import annotations
@@ -164,6 +165,26 @@ SESSION_PREFLIGHT_MARKERS = {
 
 PWSH_ERROR_PREFERENCE = "$ErrorActionPreference = 'Stop'"
 CONTINUE_ON_ERROR_KEY = "continue-on-error"
+
+# Every job caps its wall-clock duration so a hung run fails instead of holding
+# a hosted runner for hours.  Each cap is twice the job's longest recent
+# successful duration, rounded up to the next five minutes.
+TIMEOUT_KEY = "timeout-minutes"
+TIMEOUT_MINIMUM_MINUTES = 1
+TIMEOUT_MAXIMUM_MINUTES = 60
+JOB_TIMEOUT_MINUTES = {
+    "nyx": 30,
+    "nyx-windows": 30,
+    "nyx-macos": 30,
+    "nyx-desktop-windows": 40,
+    "nyx-desktop-macos": 15,
+}
+# A cancelled run is not evidence for the commit it ran on, so the workflow
+# never cancels in-progress runs through a concurrency group.
+CONCURRENCY_KEY = "concurrency"
+
+# Any effective line naming this file runs the installed-wheel proof.
+INSTALLED_WHEEL_TARGET = "tests/test_wheel_install.py"
 
 # ``set`` invocations inside one effective line; the captured arguments stop at
 # the next command separator.
@@ -415,18 +436,47 @@ def check_baseline_wheel(workflow: dict[str, Any]) -> list[str]:
 
 
 def check_baseline_installed_wheel(workflow: dict[str, Any]) -> list[str]:
+    """Require one exact installed-wheel run per baseline job, after the build.
+
+    Positions are ``(step, line)`` pairs over the job's effective lines, so the
+    order holds across steps as well as within one.
+    """
+
     problems: list[str] = []
     for name, spec in BASELINE_JOBS.items():
         job = _job(workflow, name)
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
+        segments = _job_effective_lines(job)
         command = INSTALLED_WHEEL_COMMAND.format(python=spec["python"])
+        build = WHEEL_BUILD_COMMAND.format(python=spec["python"])
         problems.extend(
-            _gate_violations(
-                f"{name}: installed-wheel command", _job_effective_lines(job), (command,)
-            )
+            _gate_violations(f"{name}: installed-wheel command", segments, (command,))
         )
+        invocations = [
+            (step, index)
+            for step, lines in enumerate(segments)
+            for index, line in enumerate(lines)
+            if INSTALLED_WHEEL_TARGET in line
+        ]
+        if len(invocations) > 1:
+            problems.append(
+                f"{name}: {INSTALLED_WHEEL_TARGET} runs {len(invocations)} times; "
+                "expected exactly once"
+            )
+        builds = [
+            (step, index)
+            for step, lines in enumerate(segments)
+            for index, line in enumerate(lines)
+            if line == build
+        ]
+        for position in invocations:
+            if not any(built < position for built in builds):
+                problems.append(
+                    f"{name}: {INSTALLED_WHEEL_TARGET} runs before the wheel build "
+                    f"{build!r}"
+                )
     return problems
 
 
@@ -588,6 +638,42 @@ def check_no_continue_on_error(workflow: dict[str, Any]) -> list[str]:
                     f"{job_name}: step {step.get('name') or step.get('uses')!r} sets "
                     f"{CONTINUE_ON_ERROR_KEY}={step[CONTINUE_ON_ERROR_KEY]!r}"
                 )
+    return problems
+
+
+def check_job_time_limits(workflow: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for job_name, job in _jobs(workflow).items():
+        if not isinstance(job, dict) or TIMEOUT_KEY not in job:
+            problems.append(f"{job_name}: job does not declare {TIMEOUT_KEY}")
+            continue
+        minutes = job[TIMEOUT_KEY]
+        if isinstance(minutes, bool) or not isinstance(minutes, int):
+            problems.append(f"{job_name}: {TIMEOUT_KEY} {minutes!r} is not an integer")
+            continue
+        if not TIMEOUT_MINIMUM_MINUTES <= minutes <= TIMEOUT_MAXIMUM_MINUTES:
+            problems.append(
+                f"{job_name}: {TIMEOUT_KEY} {minutes} is outside "
+                f"{TIMEOUT_MINIMUM_MINUTES}-{TIMEOUT_MAXIMUM_MINUTES}"
+            )
+            continue
+        expected = JOB_TIMEOUT_MINUTES.get(job_name)
+        if expected is not None and minutes != expected:
+            problems.append(
+                f"{job_name}: {TIMEOUT_KEY} is {minutes}, expected {expected}"
+            )
+    return problems
+
+
+def check_no_concurrency_cancellation(workflow: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    if CONCURRENCY_KEY in workflow:
+        problems.append(f"workflow declares {CONCURRENCY_KEY}={workflow[CONCURRENCY_KEY]!r}")
+    for job_name, job in _jobs(workflow).items():
+        if isinstance(job, dict) and CONCURRENCY_KEY in job:
+            problems.append(
+                f"{job_name}: job declares {CONCURRENCY_KEY}={job[CONCURRENCY_KEY]!r}"
+            )
     return problems
 
 
@@ -789,6 +875,8 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "powershell_failure_propagation": check_powershell_failure_propagation,
     "posix_failure_propagation": check_posix_failure_propagation,
     "no_continue_on_error": check_no_continue_on_error,
+    "job_time_limits": check_job_time_limits,
+    "no_concurrency_cancellation": check_no_concurrency_cancellation,
     "native_environment": check_native_environment,
     "native_dependencies": check_native_dependencies,
     "native_source_lane": check_native_source_lane,
@@ -1132,8 +1220,8 @@ def _mutate_ignore_baseline_ruff_failure(workflow: dict[str, Any]) -> None:
 
 
 def _mutate_exit_zero_after_installed_wheel(workflow: dict[str, Any]) -> None:
-    # The nyx job carries an intact copy of this line later in the same step,
-    # so only the altered-copy rule can catch this edit.
+    # This is the nyx job's only installed-wheel line, so the missing exact line
+    # and the altered copy are both reported.
     _rewrite_run_line(
         workflow,
         "nyx",
@@ -1237,6 +1325,70 @@ def _mutate_comment_out_powershell_exit_guard(workflow: dict[str, Any]) -> None:
     assert physical[build + 1] == PWSH_FAILURE_GUARD
     physical[build + 1] = _comment_out(physical[build + 1])
     step["run"] = "\n".join(physical) + "\n"
+
+
+def _mutate_duplicate_installed_wheel_after_service_proof(workflow: dict[str, Any]) -> None:
+    # A second installed-wheel run after the separate-account
+    # installed-service proof.
+    command = INSTALLED_WHEEL_COMMAND.format(python=BASELINE_JOBS["nyx"]["python"])
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        'nyx-service-test "$nyx_verify_root/exercise" "$nyx_verify_root/venv/bin/python"',
+        _append(f"\n{command}"),
+    )
+
+
+def _mutate_move_installed_wheel_before_build(workflow: dict[str, Any]) -> None:
+    command = INSTALLED_WHEEL_COMMAND.format(python=BASELINE_JOBS["nyx-macos"]["python"])
+    build = WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-macos"]["python"])
+    step = _step(workflow, "nyx-macos", BASELINE_LIFECYCLE_STEP)
+    text = _run_text(step)
+    assert f"{command}\n" in text
+    step["run"] = text.replace(f"{command}\n", "", 1)
+    _rewrite_run_line(
+        workflow, "nyx-macos", BASELINE_LIFECYCLE_STEP, build, _insert_before(command)
+    )
+
+
+def _mutate_remove_job_time_limit(workflow: dict[str, Any]) -> None:
+    job = _job(workflow, "nyx-windows")
+    assert TIMEOUT_KEY in job
+    del job[TIMEOUT_KEY]
+
+
+def _mutate_raise_job_time_limit_to_six_hours(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx")[TIMEOUT_KEY] = 360
+
+
+def _mutate_quote_job_time_limit(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-macos")[TIMEOUT_KEY] = "30"
+
+
+def _mutate_change_job_time_limit_within_range(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-macos")[TIMEOUT_KEY] = 30
+
+
+def _mutate_add_job_without_time_limit(workflow: dict[str, Any]) -> None:
+    _jobs(workflow)["nyx-extra"] = {
+        "runs-on": "ubuntu-latest",
+        "steps": [{"uses": "actions/checkout@v4"}],
+    }
+
+
+def _mutate_add_workflow_concurrency(workflow: dict[str, Any]) -> None:
+    workflow[CONCURRENCY_KEY] = {
+        "group": "${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
+
+
+def _mutate_add_job_concurrency(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-windows")[CONCURRENCY_KEY] = {
+        "group": "${{ github.ref }}-desktop-windows",
+        "cancel-in-progress": True,
+    }
 
 
 def _mutate_continue_job_on_error(workflow: dict[str, Any]) -> None:
@@ -1431,6 +1583,36 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     ),
     "continue job on error": (check_no_continue_on_error, _mutate_continue_job_on_error),
     "continue step on error": (check_no_continue_on_error, _mutate_continue_step_on_error),
+    "duplicate installed-wheel test after service proof": (
+        check_baseline_installed_wheel,
+        _mutate_duplicate_installed_wheel_after_service_proof,
+    ),
+    "move installed-wheel test before wheel build": (
+        check_baseline_installed_wheel,
+        _mutate_move_installed_wheel_before_build,
+    ),
+    "remove job time limit": (check_job_time_limits, _mutate_remove_job_time_limit),
+    "raise job time limit to 360": (
+        check_job_time_limits,
+        _mutate_raise_job_time_limit_to_six_hours,
+    ),
+    "quote job time limit": (check_job_time_limits, _mutate_quote_job_time_limit),
+    "change job time limit within range": (
+        check_job_time_limits,
+        _mutate_change_job_time_limit_within_range,
+    ),
+    "add job without time limit": (
+        check_job_time_limits,
+        _mutate_add_job_without_time_limit,
+    ),
+    "add workflow concurrency cancellation": (
+        check_no_concurrency_cancellation,
+        _mutate_add_workflow_concurrency,
+    ),
+    "add job concurrency cancellation": (
+        check_no_concurrency_cancellation,
+        _mutate_add_job_concurrency,
+    ),
 }
 
 
@@ -1490,3 +1672,87 @@ def test_best_effort_cleanup_stop_remains_a_substring_marker() -> None:
     )
     assert cleanup_stop.endswith("|| true")
     assert check_linux_service_lane(workflow) == []
+
+
+# --------------------------------------------------------------------------
+# Job time limits and the single installed-wheel proof
+# --------------------------------------------------------------------------
+
+
+def test_every_job_declares_its_measured_time_limit() -> None:
+    limits = {
+        name: job.get(TIMEOUT_KEY) for name, job in _jobs(load_workflow()).items()
+    }
+    assert limits == {
+        "nyx": 30,
+        "nyx-windows": 30,
+        "nyx-macos": 30,
+        "nyx-desktop-windows": 40,
+        "nyx-desktop-macos": 15,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_mutate_remove_job_time_limit, ["nyx-windows: job does not declare timeout-minutes"]),
+        (_mutate_raise_job_time_limit_to_six_hours, ["nyx: timeout-minutes 360 is outside 1-60"]),
+        (_mutate_quote_job_time_limit, ["nyx-macos: timeout-minutes '30' is not an integer"]),
+        (
+            _mutate_change_job_time_limit_within_range,
+            ["nyx-desktop-macos: timeout-minutes is 30, expected 15"],
+        ),
+        (_mutate_add_job_without_time_limit, ["nyx-extra: job does not declare timeout-minutes"]),
+    ],
+)
+def test_time_limit_check_names_the_offending_job(
+    mutate: Callable[[dict[str, Any]], None], expected: list[str]
+) -> None:
+    mutated = copy.deepcopy(load_workflow())
+    mutate(mutated)
+    assert check_job_time_limits(mutated) == expected
+
+
+def test_installed_wheel_proof_runs_once_after_the_build_in_each_baseline_job() -> None:
+    workflow = load_workflow()
+    for name, spec in BASELINE_JOBS.items():
+        lines = [
+            line for lines in _job_effective_lines(_job(workflow, name)) for line in lines
+        ]
+        command = INSTALLED_WHEEL_COMMAND.format(python=spec["python"])
+        build = WHEEL_BUILD_COMMAND.format(python=spec["python"])
+        assert [line for line in lines if INSTALLED_WHEEL_TARGET in line] == [command]
+        assert lines.index(build) < lines.index(command)
+
+
+def test_duplicated_installed_wheel_line_is_rejected_as_a_second_run() -> None:
+    mutated = copy.deepcopy(load_workflow())
+    _mutate_duplicate_installed_wheel_after_service_proof(mutated)
+    assert check_baseline_installed_wheel(mutated) == [
+        "nyx: tests/test_wheel_install.py runs 2 times; expected exactly once"
+    ]
+
+
+def test_installed_wheel_run_before_the_build_is_rejected() -> None:
+    mutated = copy.deepcopy(load_workflow())
+    _mutate_move_installed_wheel_before_build(mutated)
+    assert check_baseline_installed_wheel(mutated) == [
+        "nyx-macos: tests/test_wheel_install.py runs before the wheel build "
+        "'\"$runner_python\" -m build --wheel'"
+    ]
+
+
+def test_altered_copy_beside_an_intact_gate_is_rejected() -> None:
+    # An intact exact line remains, so only the altered-copy rule can catch a
+    # failure-masked duplicate of a one-line gate.
+    mutated = copy.deepcopy(load_workflow())
+    _rewrite_run_line(
+        mutated,
+        "nyx-macos",
+        BASELINE_LIFECYCLE_STEP,
+        RUFF_COMMAND,
+        _insert_before(f"{RUFF_COMMAND} || true"),
+    )
+    assert check_baseline_ruff(mutated) == [
+        "nyx-macos: Ruff command 'ruff check .' is altered as 'ruff check . || true'"
+    ]
