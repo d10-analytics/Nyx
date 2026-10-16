@@ -200,6 +200,9 @@ report that the desktop application has no lifecycle commands.
 - One application owns the account on this host. A separately launched second
   process reports that Nyx is already open and exits without changing state;
   normal operating-system activation of the running application still works.
+  The packaged application shows that message, or a startup failure such as
+  `Nyx is unavailable`, in a Nyx message box and exits when the box is
+  dismissed. A source run prints the message to standard error instead.
 - After an unexpected crash, reopening visibly blocks the runtime start and
   workspace changes until the former workers have terminated, then permits
   **Retry**. An incomplete recovery stays visibly blocked rather than reported
