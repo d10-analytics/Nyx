@@ -893,6 +893,7 @@ def build_startup_failure_qt(record, mode, existing=None):
             # A parentless QMessageBox starts application-modal.
             self.modality = _WindowModality.ApplicationModal
             self.finished = _FakeSignal()
+            self.done = False
 
         def setWindowTitle(self, value):
             self.title = value
@@ -923,11 +924,16 @@ def build_startup_failure_qt(record, mode, existing=None):
             record("application")
 
         def quit(self, *args):
+            # Only a finished message box may end the loop; a quit requested
+            # before then would leave the real box waiting with no running loop.
+            if not any(box.done for box in shown):
+                raise RuntimeError("the application quit before its message box finished")
             self.quit_requested = True
 
         def exec(self):
             record("loop")
             for box in shown:
+                box.done = True
                 box.finished.emit(1)
             if not self.quit_requested:
                 raise RuntimeError("the event loop never received a quit request")
