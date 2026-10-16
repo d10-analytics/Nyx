@@ -3563,6 +3563,49 @@ def test_post_admission_board_load_failure_reaps_shared_runtime(trigger):
                 session.close()
 
 
+@pytest.mark.parametrize("trigger", list(_BOARD_FAILURE_TRIGGERS))
+def test_blocked_board_failure_cleanup_keeps_retry_close_for_every_trigger(trigger):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            window._board.loadFinished.emit(False)
+            _assert_board_failure_screen(window, session, admitted)
+
+            # Quit and closing the window block exactly as Close does: the
+            # failure screen stays, now explaining the refused cleanup.
+            control["shutdown"] = False
+            _BOARD_FAILURE_TRIGGERS[trigger](window)
+            _assert_blocked_close_retry(window, session)
+            assert session.runtime is admitted
+            assert not window._root.isEnabled()
+            assert not window._change.isEnabled()
+            assert not window._save.isEnabled()
+            assert not window._cancel.isEnabled()
+
+            # Another failed load while cleanup is blocked changes nothing.
+            window._board.loadFinished.emit(False)
+            _assert_blocked_close_retry(window, session)
+
+            control["shutdown"] = True
+            window._retry.click()
+            assert not window._visible
+            assert not session.claims.held
+            assert session.runtime is None
+
+
 def test_incomplete_post_admission_view_cleanup_keeps_a_visible_retry():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
