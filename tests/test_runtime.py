@@ -23,6 +23,7 @@ from conftest import (
     LOOPBACK_DENIED_REASON,
     SERVICE_PORT_HELD_REASON,
     _free_loopback_port,
+    managed_daemon_run,
     skip_if_service_port_is_held,
 )
 from launch_shadow import plant_shadow, proof_environment, shadow_imports
@@ -1019,13 +1020,6 @@ def test_publication_failure_tears_down_before_releasing_lifetime_claim():
 
 
 def test_external_catalog_request_stays_closed_during_failed_publication():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
-
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         paths, _, _ = _fixture(root)
@@ -1050,10 +1044,9 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
             assert allow_failure.wait(timeout=10)
             raise runtime.StartupError("injected publication failure")
 
-        result: list[int] = []
-        with patch.object(runtime, "_write_instance", side_effect=fail_publication):
-            daemon_thread = threading.Thread(target=lambda: result.append(daemon.run()))
-            daemon_thread.start()
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_write_instance", side_effect=fail_publication
+        ), managed_daemon_run(daemon) as run:
             try:
                 assert publication_entered.wait(timeout=15)
                 connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=2)
@@ -1075,10 +1068,8 @@ def test_external_catalog_request_stays_closed_during_failed_publication():
                 contender.close()
             finally:
                 allow_failure.set()
-                daemon_thread.join(timeout=15)
+            assert run.join(timeout=15) == 28
 
-        assert not daemon_thread.is_alive()
-        assert result == [28]
         assert not worker_marker.exists()
         assert daemon.workers.active_count == 0
         assert daemon.http_thread is not None
@@ -1351,30 +1342,28 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 finally:
                     connection.close()
 
-            def start_daemon() -> tuple[runtime._Daemon, threading.Thread, list[int]]:
+            def new_daemon() -> runtime._Daemon:
                 lease_fd = _transferred_claim_fd(
                     paths.runtime_directory / "lease.lock"
                 )
-                daemon = runtime._Daemon(
+                return runtime._Daemon(
                     lease_fd, time.monotonic_ns() + 20_000_000_000
                 )
-                result: list[int] = []
-                thread = threading.Thread(target=lambda: result.append(daemon.run()))
-                thread.start()
+
+            def wait_for_settings() -> None:
                 _wait_for_record(paths)
                 deadline = time.monotonic() + 5
                 while True:
                     status, current = settings_request("GET")
                     if status == 200:
-                        return daemon, thread, result
+                        return
                     assert status == 503
                     if time.monotonic() >= deadline:
                         raise AssertionError("service settings did not become ready")
                     time.sleep(0.01)
 
-            running: tuple[runtime._Daemon, threading.Thread, list[int]] | None = None
-            try:
-                running = start_daemon()
+            with managed_daemon_run(new_daemon()) as run:
+                wait_for_settings()
                 first_status, first = settings_request("GET")
                 assert first_status == 200
                 assert first == {
@@ -1398,11 +1387,10 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 assert saved["revision"] == state.configuration_revision(paths)
 
                 assert runtime.stop() == "stopped"
-                running[1].join(timeout=5)
-                assert not running[1].is_alive()
-                assert running[2] == [0]
+                assert run.join(timeout=5) == 0
 
-                running = start_daemon()
+            with managed_daemon_run(new_daemon()) as run:
+                wait_for_settings()
                 restarted_status, restarted = settings_request("GET")
                 assert restarted_status == 200
                 assert restarted == {
@@ -1412,13 +1400,7 @@ def test_normal_service_settings_survive_terminal_stop_and_restart():
                 }
 
                 assert runtime.stop() == "stopped"
-                running[1].join(timeout=5)
-                assert not running[1].is_alive()
-                assert running[2] == [0]
-            finally:
-                if running is not None and running[1].is_alive():
-                    running[0].shutdown(time.monotonic() + 3)
-                    running[1].join(timeout=5)
+                assert run.join(timeout=5) == 0
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux background-service proof")
@@ -1935,7 +1917,7 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
         assert lease.fd is not None
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 50_000_000)
-        with patch.object(
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
             daemon.application, "_server_factory", return_value=Server()
         ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
             daemon, "_bind_control", return_value=Control()
@@ -1945,21 +1927,21 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
             return_value={"status": "ready", "url": runtime.URL},
         ), patch.object(
             runtime, "_write_instance", side_effect=runtime.StartupError("publication failed")
-        ):
-            daemon_thread = threading.Thread(target=daemon.run)
-            daemon_thread.start()
-            assert cleanup_entered.wait(timeout=1)
-            deadline = time.monotonic() + 1
-            while daemon.shutdown_result != "timeout" and time.monotonic() < deadline:
-                time.sleep(0.005)
-            assert daemon.shutdown_result == "timeout"
-            contender = runtime._lease_lock(paths, timeout=0.0)
-            assert not contender.acquire(blocking=False)
-            contender.close()
-            allow_cleanup.set()
-            daemon_thread.join(timeout=2)
+        ), managed_daemon_run(daemon) as run:
+            try:
+                assert cleanup_entered.wait(timeout=1)
+                deadline = time.monotonic() + 1
+                while daemon.shutdown_result != "timeout" and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert daemon.shutdown_result == "timeout"
+                contender = runtime._lease_lock(paths, timeout=0.0)
+                assert not contender.acquire(blocking=False)
+                contender.close()
+            finally:
+                allow_cleanup.set()
+            run.join(timeout=2)
+            assert not run.is_alive()
 
-        assert not daemon_thread.is_alive()
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             contender = runtime._lease_lock(paths, timeout=0.0)
@@ -2271,36 +2253,183 @@ def test_service_tests_pass_while_another_listener_holds_the_fixed_port():
     assert completed.returncode == 0, completed.stdout[-6000:]
 
 
+class _ScriptedDaemon:
+    """A daemon stand-in whose shutdown results are scripted in order.
+
+    ``run()`` blocks until ``released`` is set.  A shutdown that reports
+    ``"stopped"`` releases it unless the run is scripted to ignore shutdown.
+    """
+
+    def __init__(self, results: list[str], *, run_honors_shutdown: bool = True) -> None:
+        self.results = list(results)
+        self.run_honors_shutdown = run_honors_shutdown
+        self.shutdown_deadlines: list[float] = []
+        self.released = threading.Event()
+
+    def run(self) -> int:
+        self.released.wait(timeout=30)
+        return 0
+
+    def shutdown(self, deadline: float) -> str:
+        self.shutdown_deadlines.append(deadline)
+        result = self.results.pop(0)
+        if result == "stopped" and self.run_honors_shutdown:
+            self.released.set()
+        return result
+
+
+def test_managed_daemon_run_retries_timed_out_shutdown_until_stopped():
+    daemon = _ScriptedDaemon(["timeout", "stopped"])
+    with managed_daemon_run(daemon, shutdown_timeout=5, join_timeout=5) as run:
+        assert run.is_alive()
+        assert daemon.shutdown_deadlines == []
+
+    # A third call would exhaust the script and raise inside the cleanup.
+    assert len(daemon.shutdown_deadlines) == 2
+    assert daemon.results == []
+    assert not run.is_alive()
+    assert run.returncode == 0
+
+
+def test_managed_daemon_run_stops_retrying_at_its_shutdown_deadline():
+    daemon = _ScriptedDaemon(["timeout"] * 1000, run_honors_shutdown=False)
+    runs = []
+    started = time.monotonic()
+    try:
+        with pytest.raises(pytest.fail.Exception, match="last shutdown result: 'timeout'"):
+            with managed_daemon_run(
+                daemon, shutdown_timeout=0.3, join_timeout=0.1, retry_interval=0.05
+            ) as run:
+                runs.append(run)
+        elapsed = time.monotonic() - started
+        assert 2 <= len(daemon.shutdown_deadlines) < 1000
+        assert len(set(daemon.shutdown_deadlines)) == 1
+        assert elapsed < 5
+    finally:
+        daemon.released.set()
+        for run in runs:
+            run.join(timeout=5)
+    assert runs and not runs[0].is_alive()
+
+
+def test_managed_daemon_run_fails_the_test_when_the_run_thread_outlives_shutdown():
+    daemon = _ScriptedDaemon(["stopped"], run_honors_shutdown=False)
+    runs = []
+    try:
+        with pytest.raises(pytest.fail.Exception, match="still alive") as failure:
+            with managed_daemon_run(daemon, shutdown_timeout=1, join_timeout=0.2) as run:
+                runs.append(run)
+        assert "last shutdown result: 'stopped'" in str(failure.value)
+        assert len(daemon.shutdown_deadlines) == 1
+        assert runs[0].is_alive()
+        assert not runs[0].thread.daemon
+    finally:
+        daemon.released.set()
+        for run in runs:
+            run.join(timeout=5)
+    assert not runs[0].is_alive()
+    assert runs[0].returncode == 0
+
+
+_FAILING_AFTER_READINESS = """
+import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import conftest
+import pytest
+from conftest import SERVICE_PORT, managed_daemon_run
+from test_runtime import _fixture, _transferred_claim_fd, _wait_for_record
+
+from nyx import runtime
+
+pytestmark = pytest.mark.usefixtures("isolated_port")
+
+
+def test_assertion_fails_after_daemon_readiness():
+    assert Path(conftest.__file__).resolve() == Path({conftest_path!r})
+    assert runtime.PORT != SERVICE_PORT
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
+            with managed_daemon_run(daemon):
+                instance = _wait_for_record(paths)
+                assert instance.url != runtime.URL, "deliberate failure after readiness"
+"""
+
+
+def test_failing_assertion_after_daemon_readiness_ends_pytest_with_the_failure(tmp_path):
+    tests_directory = Path(__file__).resolve().parent
+    generated = tmp_path / "test_failing_after_readiness.py"
+    generated.write_text(
+        _FAILING_AFTER_READINESS.format(
+            conftest_path=str(tests_directory / "conftest.py")
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(tests_directory.parent), str(tests_directory), environment.get("PYTHONPATH", "")]
+    )
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "conftest",
+                "-p",
+                "no:cacheprovider",
+                "-q",
+                "--rootdir",
+                str(tmp_path),
+                str(generated),
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as expired:
+        pytest.fail(
+            f"pytest was still running {expired.timeout} s after the failing assertion",
+            pytrace=False,
+        )
+    report = completed.stdout[-6000:] + completed.stderr[-2000:]
+    assert completed.returncode == 1, report
+    assert "AssertionError: deliberate failure after readiness" in completed.stdout, report
+    assert "1 failed" in completed.stdout, report
+
+
 def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            thread = threading.Thread(target=daemon.run)
-            thread.start()
-            instance = _wait_for_record(paths)
-            assert instance.url == runtime.URL
-            assert "pid" not in json.loads(paths.runtime_directory.joinpath("instance.json").read_text())
-            assert runtime._send_control(instance, "status")["url"] == instance.url
-            assert runtime.stop() == "stopped"
-            thread.join(timeout=5)
-            assert not thread.is_alive()
-            probe = runtime._lease_lock(paths, timeout=0.0)
-            assert probe.acquire(blocking=False)
-            probe.close()
-            assert not paths.runtime_directory.joinpath("instance.json").exists()
+            with managed_daemon_run(daemon) as run:
+                instance = _wait_for_record(paths)
+                assert instance.url == runtime.URL
+                assert "pid" not in json.loads(
+                    paths.runtime_directory.joinpath("instance.json").read_text()
+                )
+                assert runtime._send_control(instance, "status")["url"] == instance.url
+                assert runtime.stop() == "stopped"
+                assert run.join(timeout=5) == 0
+                probe = runtime._lease_lock(paths, timeout=0.0)
+                assert probe.acquire(blocking=False)
+                probe.close()
+                assert not paths.runtime_directory.joinpath("instance.json").exists()
 
 
 def test_public_stop_waits_for_terminal_record_removal_and_original_lease_release():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        capability_probe.bind(("127.0.0.1", 0))
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
-
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         record = paths.runtime_directory / "instance.json"
@@ -2324,34 +2453,32 @@ def test_public_stop_waits_for_terminal_record_removal_and_original_lease_releas
             daemon = runtime._Daemon(
                 lease_fd, int((time.monotonic() + 10) * 1_000_000_000)
             )
-            daemon_thread = threading.Thread(target=daemon.run)
-            daemon_thread.start()
-            _wait_for_record(paths)
+            with managed_daemon_run(daemon) as run:
+                _wait_for_record(paths)
 
-            def public_stop() -> None:
+                def public_stop() -> None:
+                    try:
+                        result.append(runtime.stop())
+                    except BaseException as error:  # noqa: BLE001 - asserted below
+                        errors.append(error)
+
+                stop_thread = threading.Thread(target=public_stop)
+                stop_thread.start()
                 try:
-                    result.append(runtime.stop())
-                except BaseException as error:  # noqa: BLE001 - asserted below
-                    errors.append(error)
-
-            stop_thread = threading.Thread(target=public_stop)
-            stop_thread.start()
-            try:
-                assert record_removed.wait(timeout=3)
-                assert not record.exists()
-                contender = runtime._lease_lock(paths, timeout=0.0)
-                assert not contender.acquire(blocking=False)
-                contender.close()
-                assert stop_thread.is_alive()
-                assert result == []
-                assert errors == []
-            finally:
-                allow_terminal_release.set()
-            stop_thread.join(timeout=5)
-            daemon_thread.join(timeout=5)
+                    assert record_removed.wait(timeout=3)
+                    assert not record.exists()
+                    contender = runtime._lease_lock(paths, timeout=0.0)
+                    assert not contender.acquire(blocking=False)
+                    contender.close()
+                    assert stop_thread.is_alive()
+                    assert result == []
+                    assert errors == []
+                finally:
+                    allow_terminal_release.set()
+                stop_thread.join(timeout=5)
+                assert run.join(timeout=5) == 0
 
         assert not stop_thread.is_alive()
-        assert not daemon_thread.is_alive()
         assert errors == []
         assert result == ["stopped"]
         _assert_claim_available(paths.runtime_directory / "lease.lock")
@@ -2366,16 +2493,14 @@ def test_active_daemon_setup_revalidates_same_root_and_rejects_changed_root():
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            thread = threading.Thread(target=daemon.run)
-            thread.start()
-            _wait_for_record(paths)
-            assert runtime.setup(first).specification_root == first.resolve()
-            with pytest.raises(runtime.ActiveInstanceError):
-                runtime.setup(second)
-            assert paths.config_file.read_bytes() == before
-            assert runtime.stop() == "stopped"
-            thread.join(timeout=5)
-            assert not thread.is_alive()
+            with managed_daemon_run(daemon) as run:
+                _wait_for_record(paths)
+                assert runtime.setup(first).specification_root == first.resolve()
+                with pytest.raises(runtime.ActiveInstanceError):
+                    runtime.setup(second)
+                assert paths.config_file.read_bytes() == before
+                assert runtime.stop() == "stopped"
+                assert run.join(timeout=5) == 0
 
 
 def test_natural_unhealthy_daemon_keeps_record_and_lease():
@@ -2384,20 +2509,18 @@ def test_natural_unhealthy_daemon_keeps_record_and_lease():
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            thread = threading.Thread(target=daemon.run)
-            thread.start()
-            _wait_for_record(paths)
-            assert daemon.control is not None
-            daemon.control.close()
-            with pytest.raises(runtime.UnhealthyInstanceError):
-                runtime.stop()
-            assert paths.runtime_directory.joinpath("instance.json").exists()
-            probe = runtime._lease_lock(paths, timeout=0.0)
-            assert not probe.acquire(blocking=False)
-            probe.close()
-            assert daemon.shutdown() == "stopped"
-            thread.join(timeout=5)
-            assert not thread.is_alive()
+            with managed_daemon_run(daemon) as run:
+                _wait_for_record(paths)
+                assert daemon.control is not None
+                daemon.control.close()
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime.stop()
+                assert paths.runtime_directory.joinpath("instance.json").exists()
+                probe = runtime._lease_lock(paths, timeout=0.0)
+                assert not probe.acquire(blocking=False)
+                probe.close()
+                assert daemon.shutdown() == "stopped"
+                assert run.join(timeout=5) == 0
 
 
 def test_held_lease_excludes_changed_setup_without_mutating_configuration():
@@ -2731,21 +2854,19 @@ def test_wrong_capability_cannot_control_a_ready_instance():
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            thread = threading.Thread(target=daemon.run)
-            thread.start()
-            instance = _wait_for_record(paths)
-            forged = runtime.Instance(
-                instance_id=instance.instance_id,
-                url=instance.url,
-                capability="wrong-capability",
-                control=instance.control,
-            )
-            with pytest.raises(runtime.UnhealthyInstanceError):
-                runtime._send_control(forged, "stop")
-            assert runtime._send_control(instance, "status")["status"] == "ready"
-            assert runtime.stop() == "stopped"
-            thread.join(timeout=5)
-            assert not thread.is_alive()
+            with managed_daemon_run(daemon) as run:
+                instance = _wait_for_record(paths)
+                forged = runtime.Instance(
+                    instance_id=instance.instance_id,
+                    url=instance.url,
+                    capability="wrong-capability",
+                    control=instance.control,
+                )
+                with pytest.raises(runtime.UnhealthyInstanceError):
+                    runtime._send_control(forged, "stop")
+                assert runtime._send_control(instance, "status")["status"] == "ready"
+                assert runtime.stop() == "stopped"
+                assert run.join(timeout=5) == 0
 
 
 def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
@@ -2884,15 +3005,11 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
         occupant.bind(("127.0.0.1", runtime.PORT))
         occupant.listen(1)
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
-        result: list[int] = []
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-                thread = threading.Thread(target=lambda: result.append(daemon.run()))
-                thread.start()
-                thread.join(timeout=8)
-                assert not thread.is_alive()
-            assert result in ([25], [30])
+                with managed_daemon_run(daemon) as run:
+                    assert run.join(timeout=8) in (25, 30)
             if daemon.server is not None:
                 assert daemon.server.server_address == ("127.0.0.1", runtime.PORT)
             assert not paths.runtime_directory.joinpath("instance.json").exists()
@@ -3670,38 +3787,26 @@ def test_unlistable_runtime_directory_reports_bounded_cli_error(
 
 @pytest.mark.parametrize("damage", ["absent", "malformed", "replaced"])
 def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damage):
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        capability_probe.bind(("127.0.0.1", 0))
-    except PermissionError:
-        pytest.skip("sandbox does not permit local control sockets")
-    else:
-        capability_probe.close()
-
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         paths, home, first = _fixture(root)
         record = paths.runtime_directory / "instance.json"
-        lease_fd: int | None = _transferred_claim_fd(
-            paths.runtime_directory / "lease.lock"
-        )
-        daemon_thread: threading.Thread | None = None
-        daemon: runtime._Daemon | None = None
-        original_bytes: bytes | None = None
-        damaged_bytes: bytes | None = None
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(
                     lease_fd,
                     int((time.monotonic() + 10) * 1_000_000_000),
                 )
-                daemon_thread = threading.Thread(target=daemon.run)
-                daemon_thread.start()
-                # A running daemon owns the transferred descriptor and closes
-                # it in _Daemon.run(); test cleanup owns it only if startup
-                # never handed execution to that thread.
-                lease_fd = None
-                instance = _wait_for_record(paths)
+        except BaseException:
+            # The running daemon owns the transferred descriptor and closes it
+            # in _Daemon.run(); the test owns it only if construction failed.
+            os.close(lease_fd)
+            raise
+        with patch.object(runtime, "_paths", return_value=paths), managed_daemon_run(
+            daemon
+        ) as run:
+            instance = _wait_for_record(paths)
             original_bytes = record.read_bytes()
             if damage == "absent":
                 record.unlink()
@@ -3725,9 +3830,7 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
                 ).encode()
                 record.write_bytes(damaged_bytes)
             configuration_before = paths.config_file.read_bytes()
-            with patch.object(
-                runtime, "_paths", return_value=paths
-            ), patch.object(state, "resolve_account_home", return_value=home):
+            with patch.object(state, "resolve_account_home", return_value=home):
                 assert runtime.setup(first).specification_root == first.resolve()
                 assert paths.config_file.read_bytes() == configuration_before
                 with pytest.raises(runtime.UnhealthyInstanceError):
@@ -3743,17 +3846,11 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
 
             # Restore only the originally published locator so the real
             # authenticated control path can terminate the still-live daemon.
-            assert original_bytes is not None
             record.write_bytes(original_bytes)
-            with patch.object(
-                runtime, "_paths", return_value=paths
-            ), patch.object(state, "resolve_account_home", return_value=home):
+            with patch.object(state, "resolve_account_home", return_value=home):
                 assert runtime.stop() == "stopped"
             assert not record.exists()
-            assert daemon_thread is not None
-            daemon_thread.join(timeout=5)
-            assert not daemon_thread.is_alive()
-            assert lease_fd is None
+            assert run.join(timeout=5) == 0
             assert daemon.control_thread is not None
             assert not daemon.control_thread.is_alive()
             assert daemon.http_thread is not None
@@ -3764,26 +3861,6 @@ def test_live_locator_damage_never_authorizes_public_lifecycle_replacement(damag
             assert daemon.server.fileno() == -1
             assert daemon.workers.active_count == 0
             _assert_claim_available(paths.runtime_directory / "lease.lock")
-        finally:
-            if daemon_thread is not None and daemon_thread.is_alive():
-                try:
-                    if original_bytes is not None:
-                        record.write_bytes(original_bytes)
-                        with patch.object(
-                            runtime, "_paths", return_value=paths
-                        ), patch.object(state, "resolve_account_home", return_value=home):
-                            runtime.stop()
-                except (OSError, runtime.RuntimeErrorBase):
-                    pass
-                if daemon_thread.is_alive() and daemon is not None:
-                    try:
-                        daemon.shutdown(deadline=time.monotonic() + 3)
-                    except (OSError, runtime.RuntimeErrorBase):
-                        pass
-                daemon_thread.join(timeout=3)
-                assert not daemon_thread.is_alive()
-            if lease_fd is not None:
-                os.close(lease_fd)
 
 
 def test_live_replaced_locator_is_rejected_before_start_authorization():
@@ -4875,7 +4952,6 @@ def test_foreign_control_holder_causes_startup_failure_without_record():
         occupant.bind(("127.0.0.1", 0))
         occupant.listen(1)
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
-        result: list[int] = []
 
         def bind_occupied_control() -> socket.socket:
             control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -4889,12 +4965,10 @@ def test_foreign_control_holder_causes_startup_failure_without_record():
         try:
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-                with patch.object(daemon, "_bind_control", side_effect=bind_occupied_control):
-                    thread = threading.Thread(target=lambda: result.append(daemon.run()))
-                    thread.start()
-                    thread.join(timeout=5)
-                    assert not thread.is_alive()
-            assert result == [26]
+                with patch.object(
+                    daemon, "_bind_control", side_effect=bind_occupied_control
+                ), managed_daemon_run(daemon) as run:
+                    assert run.join(timeout=5) == 26
             assert not paths.runtime_directory.joinpath("instance.json").exists()
         finally:
             occupant.close()
@@ -4907,14 +4981,14 @@ def test_idle_http_connection_does_not_block_authenticated_stop():
         idle = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
-            thread = threading.Thread(target=daemon.run)
-            thread.start()
-            _wait_for_record(paths)
-            idle.connect(("127.0.0.1", runtime.PORT))
-            assert runtime.stop() == "stopped"
-            thread.join(timeout=5)
-            assert not thread.is_alive()
-        idle.close()
+            try:
+                with managed_daemon_run(daemon) as run:
+                    _wait_for_record(paths)
+                    idle.connect(("127.0.0.1", runtime.PORT))
+                    assert runtime.stop() == "stopped"
+                    assert run.join(timeout=5) == 0
+            finally:
+                idle.close()
 
 
 def test_close_admission_reaps_registered_direct_child():
@@ -6094,19 +6168,20 @@ def test_retained_shutdown_retry_wakes_owner_and_releases_original_claim():
         paths, _, _ = _fixture(Path(temporary))
         lease_path = paths.runtime_directory / "lease.lock"
         lease_fd = _transferred_claim_fd(lease_path)
-        daemon_thread = None
         with patch.object(runtime, "_paths", return_value=paths):
             daemon = runtime._Daemon(
                 lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
             )
-        try:
-            with patch.object(daemon, "start"), patch.object(
-                daemon.application, "shutdown", side_effect=[False, True]
-            ):
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            daemon, "start"
+        ), patch.object(daemon.application, "shutdown", side_effect=[False, True]):
+            try:
                 assert daemon.shutdown(deadline=time.monotonic() + 1) == "timeout"
-                daemon_thread = threading.Thread(target=daemon.run)
-                daemon_thread.start()
-
+            except BaseException:
+                # The descriptor passes to the daemon only when run() starts.
+                os.close(lease_fd)
+                raise
+            with managed_daemon_run(daemon) as run:
                 # The retained owner consumes the first attempt's notification
                 # and waits for retry completion while continuing to hold the
                 # exact transferred lifetime object.
@@ -6119,177 +6194,147 @@ def test_retained_shutdown_retry_wakes_owner_and_releases_original_claim():
                 contender.close()
 
                 assert daemon.shutdown(deadline=time.monotonic() + 1) == "stopped"
-                daemon_thread.join(timeout=0.5)
-                assert not daemon_thread.is_alive()
-            _assert_claim_available(lease_path)
-        finally:
-            if daemon_thread is not None and daemon_thread.is_alive():
-                daemon.shutdown_result = "stopped"
-                daemon.shutdown_done.set()
-                daemon_thread.join(timeout=2)
-            if daemon_thread is None:
-                os.close(lease_fd)
+                assert run.join(timeout=0.5) == 0
+        _assert_claim_available(lease_path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM-resistant worker proof")
 def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
-    try:
-        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        capability_probe.bind(("127.0.0.1", 0))
-    except PermissionError:
-        pytest.skip("sandbox does not permit loopback sockets")
-    else:
-        capability_probe.close()
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         second_root = Path(temporary) / "second-specification"
         second_root.mkdir()
         worker_ready = Path(temporary) / "resistant-worker-ready"
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
-        daemon = None
-        daemon_thread = None
         worker_child = None
-        try:
-            with patch.object(
-                state, "resolve_account_home", return_value=paths.account_home
-            ), patch.object(runtime, "_paths", return_value=paths), patch.object(
-                # Budget comfortably above the HTTP listener's 0.5 s
-                # serve_forever poll interval so the first stop times out
-                # because the SIGTERM-resistant worker refuses to die, and the
-                # retry never inherits a leftover poll tail that would make its
-                # convergence depend on scheduler jitter.
-                runtime,
-                "SHUTDOWN_TIMEOUT",
-                1.0,
-            ):
-                daemon = runtime._Daemon(
-                    lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
-                )
-                daemon.workers = runtime.CatalogWorkerManager(
-                    command_factory=lambda: [
-                        sys.executable,
-                        "-c",
-                        "import signal,time,pathlib; "
-                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                        f"pathlib.Path({str(worker_ready)!r}).write_text('ready'); "
-                        "time.sleep(30)",
-                    ],
-                    timeout=30,
-                )
-                daemon_thread = threading.Thread(target=daemon.run)
-                daemon_thread.start()
-                instance = _wait_for_record(paths)
-                record_before = paths.runtime_directory.joinpath("instance.json").read_bytes()
-                record_metadata_before = runtime._record_snapshot(
-                    paths.runtime_directory.joinpath("instance.json")
-                )
-
-                request_done: list[object] = []
-
-                def request_catalog() -> None:
-                    connection = http.client.HTTPConnection(
-                        "127.0.0.1", runtime.PORT, timeout=10
-                    )
-                    try:
-                        connection.request(
-                            "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"}
-                        )
-                        request_done.append(connection.getresponse().status)
-                    except OSError:
-                        request_done.append(None)
-                    finally:
-                        connection.close()
-
-                request_thread = threading.Thread(target=request_catalog)
-                request_thread.start()
-                deadline = time.monotonic() + 2
-                while daemon.workers.active_count == 0 and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                assert daemon.workers.active_count == 1
-                with daemon.workers._lock:
-                    worker_child = daemon.workers._children[0]
-                # SIGTERM must be ignored before the stop tears the worker
-                # down; otherwise the interpreter's default disposition kills a
-                # child that has not yet installed its handler, and the premise
-                # of a resistant worker is never actually established.
-                ready_deadline = time.monotonic() + 5
-                while not worker_ready.exists() and time.monotonic() < ready_deadline:
-                    time.sleep(0.01)
-                assert worker_ready.exists(), "resistant worker did not install its handler"
-
-                stop_errors: list[BaseException] = []
-
-                def request_stop() -> None:
-                    try:
-                        runtime.stop()
-                    except BaseException as error:  # noqa: BLE001 - assert public error below
-                        stop_errors.append(error)
-
-                stop_thread = threading.Thread(target=request_stop)
-                stop_thread.start()
-                assert daemon.stop_requested.wait(timeout=1)
-                status_deadline = time.monotonic() + 1
-                while time.monotonic() < status_deadline:
-                    cleanup_status = runtime.observe_runtime()
-                    if cleanup_status.diagnostic == runtime.RUNTIME_UNHEALTHY:
-                        break
-                    time.sleep(0.01)
-                else:
-                    raise AssertionError("public status did not authenticate cleanup in progress")
-                assert cleanup_status.status == "unknown"
-                stop_thread.join(timeout=2)
-                assert not stop_thread.is_alive()
-                assert len(stop_errors) == 1
-                assert isinstance(stop_errors[0], runtime.ShutdownTimeoutError)
-                assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
-                assert runtime._record_snapshot(
-                    paths.runtime_directory.joinpath("instance.json")
-                ) == record_metadata_before
-
-                timed_out_status = runtime.observe_runtime()
-                assert timed_out_status.status == "unknown"
-                assert timed_out_status.diagnostic == runtime.RUNTIME_UNHEALTHY
-
-                configuration_before = paths.config_file.read_bytes()
-                with pytest.raises(runtime.UnhealthyInstanceError):
-                    runtime.start()
-                with pytest.raises(runtime.ActiveInstanceError):
-                    runtime.setup(second_root)
-                assert paths.config_file.read_bytes() == configuration_before
-                assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
-                probe = runtime._lease_lock(paths, timeout=0.0)
-                assert not probe.acquire(blocking=False)
-                probe.close()
-
-                # Release only the real worker obstacle; the public stop below
-                # must perform the retry and terminal cleanup.
-                worker_child.process.kill()
-                request_thread.join(timeout=3)
-                assert not request_thread.is_alive()
-                assert runtime.stop() == "stopped"
-                assert not paths.runtime_directory.joinpath("instance.json").exists()
-                _assert_claim_available(paths.runtime_directory / "lease.lock")
-                daemon_thread.join(timeout=3)
-                assert not daemon_thread.is_alive()
-                with pytest.raises(runtime.UnhealthyInstanceError):
-                    runtime._send_control(instance, "status")
-                assert runtime.observe_runtime().status == "not_running"
-        finally:
-            if worker_child is not None and worker_child.process.poll() is None:
-                worker_child.process.kill()
-            if daemon is not None and daemon_thread is not None and daemon_thread.is_alive():
+        with patch.object(
+            state, "resolve_account_home", return_value=paths.account_home
+        ), patch.object(runtime, "_paths", return_value=paths), patch.object(
+            # Budget comfortably above the HTTP listener's 0.5 s
+            # serve_forever poll interval so the first stop times out
+            # because the SIGTERM-resistant worker refuses to die, and the
+            # retry never inherits a leftover poll tail that would make its
+            # convergence depend on scheduler jitter.
+            runtime,
+            "SHUTDOWN_TIMEOUT",
+            1.0,
+        ):
+            daemon = runtime._Daemon(
+                lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+            )
+            daemon.workers = runtime.CatalogWorkerManager(
+                command_factory=lambda: [
+                    sys.executable,
+                    "-c",
+                    "import signal,time,pathlib; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    f"pathlib.Path({str(worker_ready)!r}).write_text('ready'); "
+                    "time.sleep(30)",
+                ],
+                timeout=30,
+            )
+            with managed_daemon_run(daemon) as run:
                 try:
-                    with patch.object(runtime, "_paths", return_value=paths), patch.object(
-                        runtime, "SHUTDOWN_TIMEOUT", 1.0
-                    ):
-                        runtime.stop()
-                except runtime.RuntimeErrorBase:
-                    pass
-                daemon_thread.join(timeout=3)
-            try:
-                os.close(lease_fd)
-            except OSError:
-                pass
+                    instance = _wait_for_record(paths)
+                    record_before = paths.runtime_directory.joinpath("instance.json").read_bytes()
+                    record_metadata_before = runtime._record_snapshot(
+                        paths.runtime_directory.joinpath("instance.json")
+                    )
+
+                    request_done: list[object] = []
+
+                    def request_catalog() -> None:
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1", runtime.PORT, timeout=10
+                        )
+                        try:
+                            connection.request(
+                                "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"}
+                            )
+                            request_done.append(connection.getresponse().status)
+                        except OSError:
+                            request_done.append(None)
+                        finally:
+                            connection.close()
+
+                    request_thread = threading.Thread(target=request_catalog)
+                    request_thread.start()
+                    deadline = time.monotonic() + 2
+                    while daemon.workers.active_count == 0 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    assert daemon.workers.active_count == 1
+                    with daemon.workers._lock:
+                        worker_child = daemon.workers._children[0]
+                    # SIGTERM must be ignored before the stop tears the worker
+                    # down; otherwise the interpreter's default disposition kills a
+                    # child that has not yet installed its handler, and the premise
+                    # of a resistant worker is never actually established.
+                    ready_deadline = time.monotonic() + 5
+                    while not worker_ready.exists() and time.monotonic() < ready_deadline:
+                        time.sleep(0.01)
+                    assert worker_ready.exists(), "resistant worker did not install its handler"
+
+                    stop_errors: list[BaseException] = []
+
+                    def request_stop() -> None:
+                        try:
+                            runtime.stop()
+                        except BaseException as error:  # noqa: BLE001 - assert public error below
+                            stop_errors.append(error)
+
+                    stop_thread = threading.Thread(target=request_stop)
+                    stop_thread.start()
+                    assert daemon.stop_requested.wait(timeout=1)
+                    status_deadline = time.monotonic() + 1
+                    while time.monotonic() < status_deadline:
+                        cleanup_status = runtime.observe_runtime()
+                        if cleanup_status.diagnostic == runtime.RUNTIME_UNHEALTHY:
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise AssertionError("public status did not authenticate cleanup in progress")
+                    assert cleanup_status.status == "unknown"
+                    stop_thread.join(timeout=2)
+                    assert not stop_thread.is_alive()
+                    assert len(stop_errors) == 1
+                    assert isinstance(stop_errors[0], runtime.ShutdownTimeoutError)
+                    assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
+                    assert runtime._record_snapshot(
+                        paths.runtime_directory.joinpath("instance.json")
+                    ) == record_metadata_before
+
+                    timed_out_status = runtime.observe_runtime()
+                    assert timed_out_status.status == "unknown"
+                    assert timed_out_status.diagnostic == runtime.RUNTIME_UNHEALTHY
+
+                    configuration_before = paths.config_file.read_bytes()
+                    with pytest.raises(runtime.UnhealthyInstanceError):
+                        runtime.start()
+                    with pytest.raises(runtime.ActiveInstanceError):
+                        runtime.setup(second_root)
+                    assert paths.config_file.read_bytes() == configuration_before
+                    assert paths.runtime_directory.joinpath("instance.json").read_bytes() == record_before
+                    probe = runtime._lease_lock(paths, timeout=0.0)
+                    assert not probe.acquire(blocking=False)
+                    probe.close()
+
+                    # Release only the real worker obstacle; the public stop below
+                    # must perform the retry and terminal cleanup.
+                    worker_child.process.kill()
+                    request_thread.join(timeout=3)
+                    assert not request_thread.is_alive()
+                    assert runtime.stop() == "stopped"
+                    assert not paths.runtime_directory.joinpath("instance.json").exists()
+                    _assert_claim_available(paths.runtime_directory / "lease.lock")
+                    assert run.join(timeout=3) == 0
+                    with pytest.raises(runtime.UnhealthyInstanceError):
+                        runtime._send_control(instance, "status")
+                    assert runtime.observe_runtime().status == "not_running"
+                finally:
+                    # The resistant worker is the obstacle this test owns; release it
+                    # before the managed exit retries the shutdown.
+                    if worker_child is not None and worker_child.process.poll() is None:
+                        worker_child.process.kill()
 
 
 def test_public_stop_publishes_unhealthy_before_competing_start_handoff():

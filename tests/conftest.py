@@ -4,11 +4,19 @@ The service binds the fixed public port held in ``runtime.PORT``.  Modules that
 start the service opt into ``isolated_port`` so they never contend for that
 port with a running Nyx; the few deliberate fixed-port proofs carry the
 ``fixed_port`` marker and skip when the port is already held.
+
+Tests that run a daemon on a thread go through ``managed_daemon_run`` so a
+failing assertion still shuts the daemon down and joins its thread.
 """
 
 from __future__ import annotations
 
 import socket
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
 
@@ -93,3 +101,68 @@ def skip_if_service_port_is_held() -> None:
         pytest.skip(SERVICE_PORT_HELD_REASON)
     finally:
         probe.close()
+
+
+class DaemonRun:
+    """A daemon's ``run()`` executing on a test-owned thread."""
+
+    def __init__(self, daemon: Any) -> None:
+        self.daemon = daemon
+        self.returncode: int | None = None
+        self.thread = threading.Thread(
+            target=self._run, name="nyx-test-daemon-run", daemon=False
+        )
+
+    def _run(self) -> None:
+        self.returncode = self.daemon.run()
+
+    def join(self, timeout: float) -> int | None:
+        """Wait up to ``timeout`` seconds and return ``run()``'s exit code, if any."""
+
+        self.thread.join(timeout=timeout)
+        return self.returncode
+
+    def is_alive(self) -> bool:
+        return self.thread.is_alive()
+
+
+@contextmanager
+def managed_daemon_run(
+    daemon: Any,
+    *,
+    shutdown_timeout: float = 10.0,
+    join_timeout: float = 10.0,
+    retry_interval: float = 0.05,
+) -> Iterator[DaemonRun]:
+    """Run ``daemon.run()`` on a thread that is always shut down and joined.
+
+    Use it innermost, inside the temporary directory and any ``_paths`` patch,
+    so cleanup still sees the daemon's state.  On exit, however the block
+    ends, ``daemon.shutdown`` is called and called again while it reports
+    ``"timeout"`` until ``shutdown_timeout`` elapses; the thread is then joined
+    for at most ``join_timeout`` seconds and the test fails if it is still
+    alive.  Repeated shutdown is safe, so a block that already stopped the
+    daemon costs one immediate call.  Gates the test holds must be released in
+    the test's own ``finally`` inside the block, before this cleanup runs.
+    """
+
+    run = DaemonRun(daemon)
+    run.thread.start()
+    try:
+        yield run
+    finally:
+        deadline = time.monotonic() + shutdown_timeout
+        result = None
+        try:
+            result = daemon.shutdown(deadline)
+            while result == "timeout" and time.monotonic() < deadline:
+                time.sleep(retry_interval)
+                result = daemon.shutdown(deadline)
+        finally:
+            run.thread.join(timeout=join_timeout)
+            if run.thread.is_alive():
+                pytest.fail(
+                    "daemon run thread is still alive after shutdown "
+                    f"(last shutdown result: {result!r})",
+                    pytrace=False,
+                )
