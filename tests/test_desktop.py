@@ -932,6 +932,13 @@ def build_startup_failure_qt(record, mode, existing=None):
 
         def exec(self):
             record("loop")
+            if mode == "platform_exit":
+                # What AppKit does when it answers an application quit request
+                # itself: the C library's exit(0), with the box still shown and
+                # without the interpreter's own shutdown.
+                import ctypes
+
+                ctypes.CDLL(None).exit(0)
             for box in shown:
                 box.done = True
                 box.finished.emit(1)
@@ -953,12 +960,15 @@ def build_startup_failure_qt(record, mode, existing=None):
 '''
 
 _STARTUP_FAILURE_ENTRY_CODE = r'''
+import ctypes  # noqa: F401 - loaded under the real platform identity
 import os
 import sys
 
 from nyx import desktop, runtime
 
 runtime.desktop_host = lambda: True
+if os.environ.get("NYX_TEST_PLATFORM"):
+    sys.platform = os.environ["NYX_TEST_PLATFORM"]
 if os.environ["NYX_TEST_PACKAGED"] == "1":
     sys.frozen = True
 elif hasattr(sys, "frozen"):
@@ -1028,6 +1038,45 @@ def _presented(message):
 def test_desktop_entry_presents_pre_window_failures_only_when_packaged(
     trigger, packaged, qt_mode, expected_records, expected_stderr
 ):
+    result = _run_startup_failure_entry(trigger, packaged, qt_mode)
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == expected_records
+    assert result.stderr == expected_stderr
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="the platform-level exit under test is the POSIX C library's exit()",
+)
+@pytest.mark.parametrize(
+    ("platform", "qt_mode", "expected_records", "expected_status"),
+    [
+        pytest.param(
+            "darwin", "platform_exit", _presented(desktop.ALREADY_OPEN_MESSAGE)[:4], 1,
+            id="macos-platform-exit-with-box-up-keeps-failure-status",
+        ),
+        pytest.param(
+            "darwin", "ok", _presented(desktop.ALREADY_OPEN_MESSAGE), 1,
+            id="macos-dismissed-box-keeps-failure-status-and-output",
+        ),
+        pytest.param(
+            "linux", "platform_exit", _presented(desktop.ALREADY_OPEN_MESSAGE)[:4], 0,
+            id="non-macos-exit-status-is-not-rewritten",
+        ),
+    ],
+)
+def test_packaged_startup_failure_keeps_its_status_when_the_platform_exits(
+    platform, qt_mode, expected_records, expected_status
+):
+    result = _run_startup_failure_entry("conflict", True, qt_mode, platform=platform)
+
+    assert result.stdout.splitlines() == expected_records
+    assert result.stderr == ""
+    assert result.returncode == expected_status
+
+
+def _run_startup_failure_entry(trigger, packaged, qt_mode, platform=None):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         home = _home(root)
@@ -1040,6 +1089,10 @@ def test_desktop_entry_presents_pre_window_failures_only_when_packaged(
         environment["NYX_TEST_PACKAGED"] = "1" if packaged else "0"
         environment["NYX_TEST_QT_MODE"] = qt_mode
         environment["NYX_TEST_QT_CODE"] = _STARTUP_FAILURE_QT_CODE
+        if platform is not None:
+            environment["NYX_TEST_PLATFORM"] = platform
+        else:
+            environment.pop("NYX_TEST_PLATFORM", None)
 
         def run_entry():
             return subprocess.run(
@@ -1069,10 +1122,7 @@ def test_desktop_entry_presents_pre_window_failures_only_when_packaged(
                 recovery_path = paths.runtime_directory / desktop.RECOVERY_CLAIM_FILENAME
                 assert NativeClaim.probe(lease_path) == "free"
                 assert NativeClaim.probe(recovery_path) == "free"
-
-    assert result.returncode == 1
-    assert result.stdout.splitlines() == expected_records
-    assert result.stderr == expected_stderr
+    return result
 
 
 def _in_process_startup_failure_qt(mode="ok", existing=None):
@@ -1097,6 +1147,11 @@ def test_shared_packaged_check_drives_presentation_and_worker_selection(
     executable.write_text("", encoding="utf-8")
     monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
 
+    armed = []
+    monkeypatch.setattr(
+        desktop, "_keep_failure_status_on_platform_exit", lambda: armed.append(True)
+    )
+
     # Packaged by the shared check alone: no interpreter frozen marker.
     monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
@@ -1105,6 +1160,7 @@ def test_shared_packaged_check_drives_presentation_and_worker_selection(
     with _home_patches(home)[0]:
         assert desktop.main([]) == 1
     assert records == _presented(desktop.UNAVAILABLE_MESSAGE)
+    assert armed == [True]
     assert capsys.readouterr().err == ""
     with monkeypatch.context() as scoped:
         scoped.setattr(sys, "executable", str(executable))
@@ -1120,6 +1176,7 @@ def test_shared_packaged_check_drives_presentation_and_worker_selection(
     with _home_patches(home)[0]:
         assert desktop.main([]) == 1
     assert records == []
+    assert armed == [True]
     assert capsys.readouterr().err == f"nyx-desktop: {desktop.UNAVAILABLE_MESSAGE}\n"
     assert worker.default_worker_command() == [sys.executable, "-P", "-m", "nyx.worker"]
 
@@ -1136,6 +1193,10 @@ def test_packaged_startup_failure_reuses_a_running_application_without_its_loop(
         exec=lambda: loop_runs.append("exec"),
     )
     records, load_qt = _in_process_startup_failure_qt(existing=existing)
+    armed = []
+    monkeypatch.setattr(
+        desktop, "_keep_failure_status_on_platform_exit", lambda: armed.append(True)
+    )
     monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
     monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
     monkeypatch.setattr(desktop, "_load_qt", load_qt)
@@ -1147,6 +1208,8 @@ def test_packaged_startup_failure_reuses_a_running_application_without_its_loop(
         _startup_failure_records("box", "Nyx", desktop.UNAVAILABLE_MESSAGE, 1, "NonModal"),
     ]
     assert loop_runs == []
+    # The status of a process whose loop belongs to someone else is not touched.
+    assert armed == []
     assert capsys.readouterr().err == ""
 
 
