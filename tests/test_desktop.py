@@ -19,7 +19,7 @@ import pytest
 from conftest import distinct_free_port
 from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
-from nyx import _native_claim, app_runtime, desktop, runtime, state
+from nyx import _native_claim, app_runtime, desktop, runtime, state, worker
 from nyx._native_claim import NativeClaim
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 
@@ -851,6 +851,297 @@ def test_separate_process_reports_busy_without_writing_or_starting_runtime():
                 assert second.claims.held
             finally:
                 second.close()
+
+
+_STARTUP_FAILURE_QT_CODE = r'''
+from types import SimpleNamespace
+
+
+class _WindowModality:
+    NonModal = "NonModal"
+    ApplicationModal = "ApplicationModal"
+
+
+class _FakeSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in self.callbacks:
+            callback(*args)
+
+
+def build_startup_failure_qt(record, mode, existing=None):
+    """Return a recording Qt double with no blocking or static message box."""
+
+    shown = []
+
+    class MessageBox:
+        class StandardButton:
+            Ok = 1 << 10
+            Cancel = 1 << 22
+
+        def __init__(self, *args):
+            if mode == "box_fails":
+                raise RuntimeError("message box cannot be presented")
+            self.title = None
+            self.text = None
+            self.buttons = 0
+            # A parentless QMessageBox starts application-modal.
+            self.modality = _WindowModality.ApplicationModal
+            self.finished = _FakeSignal()
+
+        def setWindowTitle(self, value):
+            self.title = value
+
+        def setText(self, value):
+            self.text = value
+
+        def setStandardButtons(self, value):
+            self.buttons = bin(int(value)).count("1")
+
+        def setWindowModality(self, value):
+            self.modality = value
+
+        def show(self):
+            record("box", self.title, self.text, self.buttons, self.modality)
+            shown.append(self)
+
+    class Application:
+        current = existing
+
+        @classmethod
+        def instance(cls):
+            return cls.current
+
+        def __init__(self, *args):
+            Application.current = self
+            self.quit_requested = False
+            record("application")
+
+        def quit(self, *args):
+            self.quit_requested = True
+
+        def exec(self):
+            record("loop")
+            for box in shown:
+                box.finished.emit(1)
+            if not self.quit_requested:
+                raise RuntimeError("the event loop never received a quit request")
+            record("loop-finished")
+            return 0
+
+    def load_qt():
+        record("load_qt")
+        if mode == "unavailable":
+            raise DesktopDependencyError("test Qt double is unavailable")
+        return {
+            "QtCore": SimpleNamespace(Qt=SimpleNamespace(WindowModality=_WindowModality)),
+            "QtWidgets": SimpleNamespace(QApplication=Application, QMessageBox=MessageBox),
+        }
+
+    return load_qt
+'''
+
+_STARTUP_FAILURE_ENTRY_CODE = r'''
+import os
+import sys
+
+from nyx import desktop, runtime
+
+runtime.desktop_host = lambda: True
+if os.environ["NYX_TEST_PACKAGED"] == "1":
+    sys.frozen = True
+elif hasattr(sys, "frozen"):
+    del sys.frozen
+
+
+def record(*fields):
+    print("\t".join(str(field) for field in fields), flush=True)
+
+
+namespace = {"DesktopDependencyError": desktop.DesktopDependencyError}
+exec(os.environ["NYX_TEST_QT_CODE"], namespace)
+desktop._load_qt = namespace["build_startup_failure_qt"](record, os.environ["NYX_TEST_QT_MODE"])
+raise SystemExit(desktop.main([]))
+'''
+
+
+def _startup_failure_records(*fields):
+    return "\t".join(str(field) for field in fields)
+
+
+def _presented(message):
+    return [
+        "load_qt",
+        "application",
+        _startup_failure_records("box", "Nyx", message, 1, "NonModal"),
+        "loop",
+        "loop-finished",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trigger", "packaged", "qt_mode", "expected_records", "expected_stderr"),
+    [
+        pytest.param(
+            "conflict", True, "ok", _presented(desktop.ALREADY_OPEN_MESSAGE), "",
+            id="packaged-already-open-shows-box",
+        ),
+        pytest.param(
+            "session_failure", True, "ok", _presented(desktop.UNAVAILABLE_MESSAGE), "",
+            id="packaged-session-failure-shows-box",
+        ),
+        pytest.param(
+            "conflict", False, "ok", [], f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="source-already-open-writes-stderr",
+        ),
+        pytest.param(
+            "session_failure", False, "ok", [], f"nyx-desktop: {desktop.UNAVAILABLE_MESSAGE}\n",
+            id="source-session-failure-writes-stderr",
+        ),
+        pytest.param(
+            "conflict", True, "unavailable", ["load_qt"], f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="packaged-box-unloadable-writes-stderr",
+        ),
+        pytest.param(
+            "conflict", True, "box_fails", ["load_qt", "application"],
+            f"{desktop.ALREADY_OPEN_MESSAGE}\n",
+            id="packaged-box-unpresentable-writes-stderr",
+        ),
+        pytest.param(
+            "free", True, "unavailable", ["load_qt"],
+            "nyx-desktop: test Qt double is unavailable\n",
+            id="packaged-post-session-qt-failure-stays-stderr",
+        ),
+    ],
+)
+def test_desktop_entry_presents_pre_window_failures_only_when_packaged(
+    trigger, packaged, qt_mode, expected_records, expected_stderr
+):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        if trigger == "session_failure":
+            home.joinpath(".nyx").write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["USERPROFILE"] = str(home)
+        environment.pop("PYTHONHOME", None)
+        environment["NYX_TEST_PACKAGED"] = "1" if packaged else "0"
+        environment["NYX_TEST_QT_MODE"] = qt_mode
+        environment["NYX_TEST_QT_CODE"] = _STARTUP_FAILURE_QT_CODE
+
+        def run_entry():
+            return subprocess.run(
+                [sys.executable, "-c", _STARTUP_FAILURE_ENTRY_CODE],
+                cwd=Path(__file__).parents[1],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        with _home_patches(home)[0]:
+            if trigger == "conflict":
+                first = desktop.DesktopSession()
+                try:
+                    result = run_entry()
+                    assert first.claims.held
+                    assert not state.state_paths().config_file.exists()
+                finally:
+                    first.close()
+            else:
+                result = run_entry()
+            if trigger == "free":
+                paths = state.state_paths()
+                lease_path = paths.runtime_directory / desktop.APPLICATION_CLAIM_FILENAME
+                recovery_path = paths.runtime_directory / desktop.RECOVERY_CLAIM_FILENAME
+                assert NativeClaim.probe(lease_path) == "free"
+                assert NativeClaim.probe(recovery_path) == "free"
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == expected_records
+    assert result.stderr == expected_stderr
+
+
+def _in_process_startup_failure_qt(mode="ok", existing=None):
+    records = []
+    namespace = {"DesktopDependencyError": desktop.DesktopDependencyError}
+    exec(_STARTUP_FAILURE_QT_CODE, namespace)
+    load_qt = namespace["build_startup_failure_qt"](
+        lambda *fields: records.append(_startup_failure_records(*fields)), mode, existing
+    )
+    return records, load_qt
+
+
+def test_shared_packaged_check_drives_presentation_and_worker_selection(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.joinpath(".nyx").write_text("", encoding="utf-8")
+    application_root = tmp_path / "application"
+    application_root.mkdir()
+    executable = application_root / ("Nyx.exe" if os.name == "nt" else "Nyx")
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
+
+    # Packaged by the shared check alone: no interpreter frozen marker.
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
+    records, load_qt = _in_process_startup_failure_qt()
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+    assert records == _presented(desktop.UNAVAILABLE_MESSAGE)
+    assert capsys.readouterr().err == ""
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sys, "executable", str(executable))
+        with pytest.raises(worker.WorkerError) as error:
+            worker.default_worker_command()
+    assert error.value.code == "producer_unavailable"
+
+    # Not packaged by the shared check, although the interpreter is frozen.
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: False)
+    records, load_qt = _in_process_startup_failure_qt()
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+    assert records == []
+    assert capsys.readouterr().err == f"nyx-desktop: {desktop.UNAVAILABLE_MESSAGE}\n"
+    assert worker.default_worker_command() == [sys.executable, "-P", "-m", "nyx.worker"]
+
+
+def test_packaged_startup_failure_reuses_a_running_application_without_its_loop(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.joinpath(".nyx").write_text("", encoding="utf-8")
+    loop_runs = []
+    existing = SimpleNamespace(
+        quit=lambda *args: None,
+        exec=lambda: loop_runs.append("exec"),
+    )
+    records, load_qt = _in_process_startup_failure_qt(existing=existing)
+    monkeypatch.setattr(desktop.runtime, "desktop_host", lambda: True)
+    monkeypatch.setattr(state, "_is_packaged_application", lambda: True)
+    monkeypatch.setattr(desktop, "_load_qt", load_qt)
+    with _home_patches(home)[0]:
+        assert desktop.main([]) == 1
+
+    assert records == [
+        "load_qt",
+        _startup_failure_records("box", "Nyx", desktop.UNAVAILABLE_MESSAGE, 1, "NonModal"),
+    ]
+    assert loop_runs == []
+    assert capsys.readouterr().err == ""
 
 
 def test_unrelated_helper_inherits_no_desktop_claim_or_liveness_object():
