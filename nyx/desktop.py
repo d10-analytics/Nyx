@@ -11,9 +11,12 @@ therefore safe in the dependency-light Linux console and wheel paths.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
+import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +30,9 @@ RECOVERY_CLAIM_FILENAME = "recovery.lock"
 ALREADY_OPEN_MESSAGE = "Nyx is already open"
 UNAVAILABLE_MESSAGE = "Nyx is unavailable"
 BOARD_FAILURE_MESSAGE = "Nyx board could not be displayed; choose Close"
+CLOSING_PROGRESS_MESSAGE = "Closing Nyx; waiting for its work to stop"
+SAVE_PROGRESS_MESSAGE = "Changing workspace; restarting Nyx work"
+RETRY_PROGRESS_MESSAGE = "Retrying; waiting for Nyx work"
 UNSUPPORTED_PLATFORM_MESSAGE = "nyx-desktop: the desktop application runs only on Windows and macOS; on Linux use 'nyx'"
 PRESENTATION_PROFILE_NAME = "nyx-presentation"
 PRESENTATION_DIRECTORY = "presentation"
@@ -65,6 +71,14 @@ class DesktopSnapshot:
 class _PendingSwitch:
     configuration: state.Configuration
     runtime_expected: bool
+
+
+@dataclass(frozen=True)
+class _OperationOutcome:
+    """How one window lifecycle operation ended on the pool thread."""
+
+    kind: str
+    error: BaseException | None = None
 
 
 class DesktopClaims:
@@ -189,7 +203,9 @@ class DesktopSession:
         self._shutdown_blocked = False
         self._switch_blocked = False
         self._switch_in_progress = False
-        self._quit_requested = False
+        # Set from the window's thread while a workspace change runs on
+        # another; the change reads it at each of its acceptance points.
+        self._quit_requested = threading.Event()
         self._pending_switch: _PendingSwitch | None = None
         self.snapshot = self._observe()
         if self.claims.recovery_blocked:
@@ -424,7 +440,6 @@ class DesktopSession:
         self._switch_in_progress = False
         self._pending_switch = None
         self._switch_blocked = False
-        self._quit_requested = False
         self.close()
 
     def _switch_to(
@@ -442,7 +457,7 @@ class DesktopSession:
                     "Nyx workers are still stopping; retry workspace change"
                 )
                 raise SelectionUnavailableError(self._pending_error or UNAVAILABLE_MESSAGE)
-            if self._quit_requested:
+            if self._quit_requested.is_set():
                 self._finish_switch_close()
                 raise SelectionUnavailableError("Nyx workspace change canceled")
             try:
@@ -474,18 +489,18 @@ class DesktopSession:
             self._unverified = False
             self._pending_error = None
             self.snapshot = DesktopSnapshot("configured", committed)
-            if self._quit_requested:
+            if self._quit_requested.is_set():
                 self._finish_switch_close()
                 return committed
             if runtime_expected:
                 try:
                     self.start_runtime()
                 except DesktopError:
-                    if self._quit_requested:
+                    if self._quit_requested.is_set():
                         self._finish_switch_close()
                     raise
             self._switch_in_progress = False
-            if self._quit_requested:
+            if self._quit_requested.is_set():
                 self._finish_switch_close()
             return committed
         finally:
@@ -506,11 +521,11 @@ class DesktopSession:
             )
         if self._unverified:
             raise SelectionUnavailableError(
-                "Nyx configuration is unverified; revalidate before saving"
+                "Nyx configuration is unverified; retry the workspace change or reopen Nyx"
             )
         if self.snapshot.status == "unavailable":
             raise SelectionUnavailableError(
-                "Nyx configuration is unavailable; repair or revalidate it first"
+                "Nyx configuration is unavailable; repair it and reopen Nyx"
             )
         if self._switch_in_progress or self._switch_blocked:
             raise SelectionUnavailableError(
@@ -574,12 +589,31 @@ class DesktopSession:
         if self.snapshot.status == "configured" and not self._switch_in_progress:
             self._pending_error = None
 
+    def request_quit(self) -> None:
+        """Ask a running workspace change to end by closing the session.
+
+        This only records the request, so it never waits and may be called
+        from another thread while the change runs.  Before the new workspace
+        is saved the change is abandoned and the previous one stays saved;
+        after it, the saved workspace stays.  Nothing else acts on the
+        request; the next :meth:`close` that proceeds consumes it, stops any
+        runtime, and closes the session.  If that stop is incomplete, the
+        session instead stays open in the ``shutdown_blocked`` state with
+        its runtime still running, which after the save is the new
+        workspace's, and a later close must succeed before the session is
+        closed.  The desktop window chains one such close when the change
+        ends with the session still open.
+        """
+
+        self._quit_requested.set()
+
     def close(self) -> None:
         if self._closed:
             return
         if self._switch_in_progress:
-            self._quit_requested = True
+            self.request_quit()
             return
+        self._quit_requested.clear()
         self._pending_switch = None
         self._switch_blocked = False
         if self._application_runtime is not None:
@@ -636,12 +670,31 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
     QtWebEngineCore = qt["QtWebEngineCore"]
     QtWebEngineWidgets = qt["QtWebEngineWidgets"]
 
+    class OperationRelay(QtCore.QObject):
+        """Carry an operation's outcome from the pool thread to the GUI thread."""
+
+        completed = QtCore.Signal(object)
+
     class DesktopWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Nyx")
             self.resize(720, 460)
             self._session = session
+            # Lifecycle calls that wait on runtime cleanup or startup run one
+            # at a time on this pool, so the window keeps serving events.  The
+            # session belongs to the pool thread from submission until the
+            # relay, which lives on this thread, delivers the outcome here.
+            self._operation: str | None = None
+            # A Quit or window close that arrived while an operation ran; the
+            # operation's completion carries it out.
+            self._quit_recorded = False
+            self._pool = QtCore.QThreadPool(self)
+            self._pool.setMaxThreadCount(1)
+            self._relay = OperationRelay(self)
+            self._relay.completed.connect(
+                self._operation_completed, QtCore.Qt.ConnectionType.QueuedConnection
+            )
             self._board_failed = False
             # The runtime object the view last navigated to; a different
             # admitted runtime after a user action means the board is stale.
@@ -733,9 +786,21 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._open_board()
 
         def _board_load_finished(self, ok: bool) -> None:
-            if ok or self._board_failed:
+            if self._operation is not None:
+                # The session belongs to the running operation, so the result
+                # is ignored without reading it; the operation's outcome
+                # screen stands until the next load result.
                 return
-            if self._session.runtime is None:
+            if ok:
+                # A load result carries no navigation identity, so a failure
+                # reported for a navigation the view has since replaced is
+                # cleared by the current board's successful load.  The view
+                # already shows that board, so nothing navigates again.
+                if self._board_failed:
+                    self._board_failed = False
+                    self._render()
+                return
+            if self._board_failed or self._session.runtime is None:
                 return
             # Show the failure screen and keep the admitted work running; the
             # Close action, Quit, or closing the window reaps it.
@@ -743,15 +808,27 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._render()
 
         def _settle_board_failure(self) -> None:
-            """Reap admitted work through the shared owner, retrying if needed."""
+            """Reap admitted work through the window's ordinary Close."""
 
-            self._session.close()
-            if self._session.shutdown_blocked:
-                self._render()
-                return
             self.close()
 
         def _render(self) -> None:
+            if self._operation is not None:
+                # The session belongs to the pool thread until the operation
+                # completes, so this reads only the window's own state.  Quit
+                # and the window close stay available to record a Quit.
+                if self._operation == "close" or self._quit_recorded:
+                    self._status.setText(CLOSING_PROGRESS_MESSAGE)
+                elif self._operation == "save":
+                    self._status.setText(SAVE_PROGRESS_MESSAGE)
+                else:
+                    self._status.setText(RETRY_PROGRESS_MESSAGE)
+                self._root.setEnabled(False)
+                self._change.setEnabled(False)
+                self._save.setEnabled(False)
+                self._cancel.setEnabled(False)
+                self._retry.setEnabled(False)
+                return
             snapshot = self._session.snapshot
             if self._board_failed:
                 # Only a blocked session close records ``shutdown_blocked``, and
@@ -838,28 +915,93 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._retry.setEnabled(action is not None)
 
         def _recover(self) -> None:
+            if self._operation is not None:
+                return
             action = self._recovery_action()
             if action is not None:
                 action[1]()
 
         def _begin_change(self) -> None:
+            if self._operation is not None:
+                return
             self._changing = True
             self._render()
 
         def _end_change(self) -> None:
+            if self._operation is not None:
+                return
             self._session.cancel()
             self._changing = False
             self._render()
 
-        def _save_selection(self) -> None:
-            try:
-                self._session.choose_workspace(self._root.text())
-            except DesktopError as error:
-                self._status.setText(str(error))
-            else:
-                self._changing = False
-            self._open_replaced_board()
+        def _submit(self, kind: str, call: Any) -> None:
+            """Run one session lifecycle call on the pool thread."""
+
+            self._operation = kind
             self._render()
+            relay = self._relay
+
+            def run() -> None:
+                try:
+                    call()
+                except BaseException as error:  # delivered to the GUI thread
+                    outcome = _OperationOutcome(kind, error)
+                else:
+                    outcome = _OperationOutcome(kind)
+                relay.completed.emit(outcome)
+
+            self._pool.start(run)
+
+        def _operation_completed(self, outcome: _OperationOutcome) -> None:
+            # Clear the marker first, so an unexpected failure cannot leave
+            # every later action, including Close, refused.  A recorded Quit
+            # is consumed here, so at most one close follows it.
+            self._operation = None
+            quit_recorded = self._quit_recorded
+            self._quit_recorded = False
+            error = outcome.error
+            if error is not None and not isinstance(error, DesktopError):
+                if quit_recorded:
+                    self._carry_out_quit()
+                # Show the current session state before the failure surfaces;
+                # a packaged build may have nowhere to report it.
+                self._render()
+                raise error
+            if outcome.kind != "close":
+                if error is not None:
+                    self._status.setText(str(error))
+                else:
+                    self._changing = False
+                self._open_replaced_board()
+            if quit_recorded:
+                if self._carry_out_quit():
+                    return
+            elif outcome.kind == "close" and self._session._closed:
+                self.close()
+                return
+            self._render()
+
+        def _carry_out_quit(self) -> bool:
+            """Act on a Quit recorded during the operation that just ended.
+
+            Return whether the window closed.  When the operation could not
+            close the session itself, one more full close carries out the
+            Quit, and that close's own outcome is final.
+            """
+
+            if self._session._closed:
+                self.close()
+                return True
+            self._submit("close", self._session.close)
+            return False
+
+        def _save_selection(self) -> None:
+            if self._operation is not None:
+                return
+            self._submit(
+                "save",
+                functools.partial(self._session.choose_workspace, self._root.text()),
+            )
 
         def _retry_workspace_switch(self) -> None:
             self._run_retry(self._session.retry_workspace_switch)
@@ -868,22 +1010,24 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._run_retry(self._session.retry_runtime)
 
         def _run_retry(self, operation: Any) -> None:
-            try:
-                operation()
-            except DesktopError as error:
-                self._status.setText(str(error))
-            else:
-                self._changing = False
-            self._open_replaced_board()
-            self._render()
+            self._submit("retry", operation)
 
         def closeEvent(self, event: Any) -> None:
-            self._session.close()
-            if self._session.shutdown_blocked or self._session.switch_in_progress:
+            # Every Close path arrives here.  The close itself runs on the
+            # pool; its completion closes the window again once the session
+            # has closed, and only that second close is accepted.
+            event.ignore()
+            if self._operation is not None:
+                # The session belongs to the running operation; only record
+                # the Quit, and let that operation's completion act on it.
+                self._quit_recorded = True
+                self._session.request_quit()
                 self._render()
-                event.ignore()
-            else:
+                return
+            if self._session._closed:
                 event.accept()
+                return
+            self._submit("close", self._session.close)
 
     # Keep the QtCore reference live for native binding implementations that
     # inspect the class module while delivering close events.
@@ -976,6 +1120,13 @@ def _safe_window_attribute(window: Any, name: str) -> Any:
 def _release_presentation(application: Any, window: Any) -> None:
     """Tear down the presentation profile so its on-disk storage flushes.
 
+    A lifecycle operation still running on the window's pool finishes first,
+    and its relay is disconnected.  A Quit recorded during that operation is
+    withdrawn, because Qt still delivers a completion posted before the
+    disconnect and that completion must not start a close during teardown.
+    The window is then hidden rather than closed, for the same reason; the
+    caller owns the final session close.
+
     Qt WebEngine only guarantees that persistent page storage is written when
     the disk-based profile is destroyed, so the window's page, view, and
     profile are destroyed here in child-before-owner order instead of waiting
@@ -985,10 +1136,30 @@ def _release_presentation(application: Any, window: Any) -> None:
 
     if window is None:
         return
+    pool = _safe_window_attribute(window, "_pool")
     try:
-        close = getattr(window, "close", None)
-        if callable(close):
-            close()
+        wait = getattr(pool, "waitForDone", None)
+        if callable(wait):
+            wait()
+    except RuntimeError:
+        pass
+    try:
+        if _safe_window_attribute(window, "_quit_recorded") is not None:
+            window._quit_recorded = False
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    relay = _safe_window_attribute(window, "_relay")
+    try:
+        with warnings.catch_warnings():
+            # A repeated release finds nothing left to disconnect.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            relay.completed.disconnect()
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    try:
+        hide = getattr(window, "hide", None)
+        if callable(hide):
+            hide()
     except RuntimeError:
         pass
     page = _safe_window_attribute(window, "_page")
