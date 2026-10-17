@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import DEFAULT, patch
 
 import pytest
 from conftest import distinct_free_port
@@ -107,6 +107,9 @@ class _MainWindow(_Widget):
 
     def show(self):
         self._visible = True
+
+    def hide(self):
+        self._visible = False
 
     def close(self):
         # Like QWidget.close, an ignored close event keeps the window visible.
@@ -254,12 +257,134 @@ class _WebEngineView(_Widget):
         return self._url
 
 
+class _QueuedEvents:
+    """The fake GUI thread's queue of cross-thread signal deliveries.
+
+    A delivery posted while a pool submission runs waits until the pool has
+    cleared ``inside_submission``, as a queued Qt delivery reaches the GUI
+    thread only after the emitting call returns.  ``deferred`` holds every
+    delivery until the test calls :meth:`flush`, as a native delivery waits
+    for a later event-loop turn.
+    """
+
+    def __init__(self):
+        self.inside_submission = False
+        self.deferred = False
+        self.pending = []
+
+    def post(self, callbacks, args):
+        self.pending.extend((callback, args) for callback in callbacks)
+        self.deliver()
+
+    def deliver(self):
+        if not self.inside_submission and not self.deferred:
+            self.flush()
+
+    def flush(self):
+        while self.pending:
+            callback, args = self.pending.pop(0)
+            callback(*args)
+
+
+class _QueuedSignal:
+    def __init__(self, events):
+        self._events = events
+        self.callbacks = []
+
+    def connect(self, callback, *_connection_type):
+        self.callbacks.append(callback)
+
+    def disconnect(self, callback=None):
+        if callback is None:
+            self.callbacks.clear()
+        else:
+            self.callbacks.remove(callback)
+
+    def emit(self, *args):
+        # Like a queued Qt delivery, an emission already posted still reaches
+        # the receivers connected when it was emitted.
+        self._events.post(list(self.callbacks), args)
+
+
+class _SignalDescriptor:
+    """A class-level ``Signal(...)`` whose instances get their own signal."""
+
+    def __init__(self, events, *_types):
+        self._events = events
+        self._name = None
+
+    def __set_name__(self, _owner, name):
+        self._name = name
+
+    def __get__(self, instance, _owner=None):
+        if instance is None:
+            return self
+        signal = instance.__dict__.get(self._name)
+        if signal is None:
+            signal = instance.__dict__[self._name] = _QueuedSignal(self._events)
+        return signal
+
+
+class _QObject:
+    def __init__(self, *_):
+        pass
+
+
+class _ThreadPool:
+    """A single-slot pool that runs each submission inline.
+
+    ``hold`` queues submissions until :meth:`waitForDone` runs them, so a test
+    can keep an operation in flight without a thread.  ``waitForDone`` never
+    delivers queued signals: the GUI thread is the one waiting.
+    """
+
+    events = None
+
+    def __init__(self, *_):
+        self.max_thread_count = None
+        self.submissions = 0
+        self.hold = False
+        self.held = []
+        self.waits = 0
+
+    def setMaxThreadCount(self, count):
+        self.max_thread_count = count
+
+    def _run(self, runnable):
+        self.events.inside_submission = True
+        try:
+            runnable()
+        finally:
+            self.events.inside_submission = False
+
+    def start(self, runnable):
+        self.submissions += 1
+        if self.hold:
+            self.held.append(runnable)
+            return
+        self._run(runnable)
+        self.events.deliver()
+
+    def waitForDone(self, *_):
+        self.waits += 1
+        while self.held:
+            self._run(self.held.pop(0))
+        return True
+
+
 def _fake_qt(observe=None):
     view = _WebEngineView
     if observe is not None:
         view = type("_ObservedWebEngineView", (_WebEngineView,), {"observe": staticmethod(observe)})
+    events = _QueuedEvents()
     return {
-        "QtCore": SimpleNamespace(QUrl=lambda value: value),
+        "QtCore": SimpleNamespace(
+            QUrl=lambda value: value,
+            QObject=_QObject,
+            QThreadPool=type("_BoundThreadPool", (_ThreadPool,), {"events": events}),
+            Qt=SimpleNamespace(ConnectionType=SimpleNamespace(QueuedConnection="queued")),
+            Signal=lambda *types: _SignalDescriptor(events, *types),
+        ),
         "QtWidgets": SimpleNamespace(
             QFormLayout=_Layout,
             QHBoxLayout=_Layout,
@@ -378,6 +503,7 @@ class MainWindow(Widget):
     def resize(self, *args): pass
     def setCentralWidget(self, value): pass
     def close(self): pass
+    def hide(self): pass
     def show(self):
         (marker_root / "shell-visible").write_text(str(os.getpid()), encoding="utf-8")
 class LineEdit(Widget):
@@ -406,6 +532,25 @@ class WebView(Widget):
     def __init__(self, *args): super().__init__(*args); self.loadFinished = Signal()
     def setPage(self, value): pass
     def setUrl(self, value): pass
+class QObject:
+    def __init__(self, *args): pass
+class BoundSignal:
+    def __init__(self): self.callbacks = []
+    def connect(self, callback, *args): self.callbacks.append(callback)
+    def disconnect(self, *args): self.callbacks.clear()
+    def emit(self, *args):
+        for callback in list(self.callbacks): callback(*args)
+class SignalDescriptor:
+    def __init__(self, *types): self.name = None
+    def __set_name__(self, owner, name): self.name = name
+    def __get__(self, instance, owner=None):
+        if instance is None: return self
+        return instance.__dict__.setdefault(self.name, BoundSignal())
+class ThreadPool:
+    def __init__(self, *args): pass
+    def setMaxThreadCount(self, count): pass
+    def start(self, runnable): runnable()
+    def waitForDone(self, *args): return True
 class Application:
     @classmethod
     def instance(cls): return None
@@ -421,8 +566,13 @@ widgets = SimpleNamespace(
 web_widgets = SimpleNamespace(QWebEngineView=WebView)
 web_core = SimpleNamespace(QWebEnginePage=WebPage, QWebEngineProfile=WebProfile,
                            QWebEngineSettings=SimpleNamespace(WebAttribute=SimpleNamespace(JavascriptCanAccessClipboard=3)))
+core = SimpleNamespace(
+    QUrl=lambda value: value, QObject=QObject, QThreadPool=ThreadPool,
+    Qt=SimpleNamespace(ConnectionType=SimpleNamespace(QueuedConnection="queued")),
+    Signal=SignalDescriptor,
+)
 desktop._load_qt = lambda: {
-    "QtCore": SimpleNamespace(QUrl=lambda value: value),
+    "QtCore": core,
     "QtWidgets": widgets,
     "QtWebEngineCore": web_core,
     "QtWebEngineWidgets": web_widgets,
@@ -2748,6 +2898,324 @@ def test_retryable_change_with_unreadable_configuration_offers_switch_retry():
             assert not session.claims.held
 
 
+_LIFECYCLE_METHODS = ("close", "choose_workspace", "retry_workspace_switch", "retry_runtime")
+
+
+def _window_controls(window):
+    """The visible status, recovery label, and every control's enablement."""
+
+    return {
+        "status": window._status.text(),
+        "retry_label": window._retry.text(),
+        "root": window._root.isEnabled(),
+        "change": window._change.isEnabled(),
+        "save": window._save.isEnabled(),
+        "cancel": window._cancel.isEnabled(),
+        "retry": window._retry.isEnabled(),
+        "quit": window._quit.isEnabled(),
+        "visible": window._visible,
+    }
+
+
+@contextlib.contextmanager
+def _lifecycle_spies(session, events, names=_LIFECYCLE_METHODS):
+    """Record each session lifecycle call and whether a pool submission ran it."""
+
+    calls = []
+    with contextlib.ExitStack() as stack:
+        for name in names:
+
+            def record(*_args, _name=name, **_kwargs):
+                calls.append((_name, events.inside_submission))
+                return DEFAULT
+
+            stack.enter_context(
+                patch.object(session, name, wraps=getattr(session, name), side_effect=record)
+            )
+        yield calls
+
+
+_CLOSING_POOL_TRIGGERS = ("quit_button", "window_close", "shutdown_blocked_close", "board_failure_close")
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [*_CLOSING_POOL_TRIGGERS, "save", "switch_retry", "runtime_retry"],
+)
+def test_window_runs_every_lifecycle_call_inside_its_pool_submission(trigger):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        failures = {}
+        control = {"shutdown": True}
+        runtime_type = _replaceable_runtime_type(
+            instances, start_failures=failures, control=control
+        )
+        with _home_patches(home)[0], patch.object(desktop, "ApplicationRuntime", runtime_type):
+            state.setup(first)
+            if trigger == "runtime_retry":
+                failures[first.resolve()] = [RuntimeError("injected startup failure")]
+            session = desktop.DesktopSession()
+            with contextlib.suppress(desktop.DesktopUnavailableError):
+                session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            window._open_board()
+            pool = window._pool
+            assert pool.max_thread_count == 1
+            try:
+                with _lifecycle_spies(session, pool.events) as calls:
+                    if trigger == "quit_button":
+                        window._quit.click()
+                        expected = ["close"]
+                    elif trigger == "window_close":
+                        window.close()
+                        expected = ["close"]
+                    elif trigger == "shutdown_blocked_close":
+                        control["shutdown"] = False
+                        window._quit.click()
+                        assert session.snapshot.status == "shutdown_blocked"
+                        assert window._visible
+                        assert window._retry.text() == "Close"
+                        control["shutdown"] = True
+                        window._retry.click()
+                        expected = ["close", "close"]
+                    elif trigger == "board_failure_close":
+                        window._board.loadFinished.emit(False)
+                        assert window._board_failed
+                        assert window._retry.text() == "Close"
+                        window._retry.click()
+                        expected = ["close"]
+                    elif trigger == "save":
+                        window._change.click()
+                        window._root.setText(str(second))
+                        window._save.click()
+                        expected = ["choose_workspace"]
+                    elif trigger == "switch_retry":
+                        control["shutdown"] = False
+                        window._change.click()
+                        window._root.setText(str(second))
+                        window._save.click()
+                        assert session.snapshot.status == "switch_blocked"
+                        assert window._retry.text() == "Retry"
+                        control["shutdown"] = True
+                        window._retry.click()
+                        expected = ["choose_workspace", "retry_workspace_switch"]
+                    else:
+                        assert session.snapshot.status == "runtime_blocked"
+                        window._retry.click()
+                        expected = ["retry_runtime"]
+
+                # Each call ran inside a pool submission, never in the click
+                # handler or in the completion delivered after it.
+                assert calls == [(name, True) for name in expected]
+                assert pool.submissions == len(expected)
+                assert not pool.events.inside_submission
+                assert pool.events.pending == []
+                if trigger in _CLOSING_POOL_TRIGGERS:
+                    assert not window._visible
+                    assert not session.claims.held
+                    assert session.runtime is None
+                else:
+                    current = first if trigger == "runtime_retry" else second
+                    assert state.load_configuration() == state.Configuration(current.resolve())
+                    assert session.snapshot.status == "configured"
+                    assert session.runtime is instances[-1]
+                    assert window._status.text() == f"Workspace: {current.resolve()}"
+                    assert window._change.isEnabled()
+                    assert not window._save.isEnabled()
+                    assert window._visible
+            finally:
+                control["shutdown"] = True
+                session.close()
+            assert not session.claims.held
+
+
+def test_window_submits_nothing_while_a_lifecycle_operation_is_in_flight():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        control = {"shutdown": False}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            with contextlib.suppress(desktop.DesktopError):
+                session.choose_workspace(second)
+            assert session.snapshot.status == "switch_blocked"
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            pool = window._pool
+            control["shutdown"] = True
+            # The pool keeps the retry in flight without running it, so the
+            # session is still blocked and every refused click would act.
+            pool.hold = True
+            spied = (*_LIFECYCLE_METHODS, "cancel")
+            with _lifecycle_spies(session, pool.events, spied) as calls:
+                window._retry.click()
+                assert pool.submissions == 1
+                assert calls == []
+                in_flight = _window_controls(window)
+
+                for button in (
+                    window._change,
+                    window._save,
+                    window._retry,
+                    window._cancel,
+                    window._quit,
+                ):
+                    button.clicked.emit()
+                assert not window.close()
+
+                assert pool.submissions == 1
+                assert calls == []
+                assert _window_controls(window) == in_flight
+                assert session.snapshot.status == "switch_blocked"
+                assert window._visible
+
+                pool.hold = False
+                pool.waitForDone()
+                assert calls == [("retry_workspace_switch", True)]
+                pool.events.flush()
+
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            assert session.runtime is instances[1]
+            assert window._status.text() == f"Workspace: {second.resolve()}"
+            window._quit.click()
+            assert pool.submissions == 2
+            assert not window._visible
+            assert not session.claims.held
+
+
+def test_unexpected_lifecycle_failure_renders_the_current_state_and_reopens_actions():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            pool = window._pool
+            events = pool.events
+            window._change.click()
+            window._root.setText(str(second))
+            before = _window_controls(window)
+            real_choose = session.choose_workspace
+
+            def broken_choose(_specification_root):
+                # Leave a visible session change behind, then fail unexpectedly.
+                with contextlib.suppress(desktop.DesktopError):
+                    real_choose(str(root / "missing"))
+                raise RuntimeError("injected unexpected failure")
+
+            # Deliver completions only when flushed, after the click handler
+            # has returned, as a queued native delivery does.
+            events.deferred = True
+            with patch.object(session, "choose_workspace", side_effect=broken_choose):
+                window._save.click()
+                assert pool.submissions == 1
+                assert session.pending_error == "Nyx workspace could not be validated"
+                window._save.clicked.emit()
+                assert pool.submissions == 1
+                with pytest.raises(RuntimeError, match="injected unexpected failure"):
+                    events.flush()
+
+            after = _window_controls(window)
+            assert after != before
+            assert after["status"] == "Nyx workspace could not be validated"
+            window._render()
+            assert _window_controls(window) == after
+
+            events.deferred = False
+            window._save.click()
+            assert pool.submissions == 2
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            assert session.runtime is instances[1]
+            assert window._status.text() == f"Workspace: {second.resolve()}"
+            window._quit.click()
+            assert not session.claims.held
+
+
+def test_presentation_release_waits_for_the_operation_then_hides_without_submitting():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert window._open_board()
+            pool = window._pool
+            window._change.click()
+            window._root.setText(str(second))
+            order = []
+            real_choose = session.choose_workspace
+            real_hide = window.hide
+
+            def recorded_choose(*args):
+                try:
+                    return real_choose(*args)
+                finally:
+                    order.append("operation_completed")
+
+            def recorded_hide():
+                order.append("hide")
+                real_hide()
+
+            pool.hold = True
+            with (
+                patch.object(session, "choose_workspace", side_effect=recorded_choose),
+                patch.object(window, "hide", side_effect=recorded_hide),
+                patch.object(window, "close", wraps=window.close) as close,
+            ):
+                window._save.click()
+                assert pool.submissions == 1
+                assert order == []
+                assert window._visible
+
+                desktop._release_presentation(None, window)
+
+                assert order == ["operation_completed", "hide"]
+                assert pool.waits >= 1
+                assert close.call_count == 0
+                assert not window._visible
+                assert pool.submissions == 1
+                assert window._relay.completed.callbacks == []
+                # A completion posted before the disconnect is still delivered
+                # by a later event-loop turn; it starts no operation.
+                pool.events.flush()
+                assert pool.submissions == 1
+                assert close.call_count == 0
+                assert not window._visible
+
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            session.close()
+            assert not session.claims.held
+
+
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
     port = runtime.PORT
 
@@ -3332,7 +3800,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             window._change.click()
             window._root.setText(str(second))
             window._save.click()
-            application.processEvents()
+            _wait_for_window_operation(application, window)
             assert state.load_configuration() == state.Configuration(
                 second.resolve()
             )
@@ -3369,7 +3837,7 @@ def test_required_native_session_activates_existing_configured_shell_and_closes(
             assert id(session.claims) == claims_identity
             assert session.claims.held
             window.close()
-            application.processEvents()
+            _wait_for_window_operation(application, window)
             capabilities["close_delivered"] = not session.claims.held and not window.isVisible()
             print(f"NYX_NATIVE_DESKTOP_CAPABILITIES={json.dumps(capabilities, sort_keys=True)}")
             assert not session.claims.held
@@ -3845,6 +4313,19 @@ def _pump_native_events(application, milliseconds: int = 20) -> None:
     application.processEvents()
     QtTest.QTest.qWait(milliseconds)
     time.sleep(0.01)
+
+
+def _wait_for_window_operation(application, window, timeout: float = 30.0) -> None:
+    """Pump events until the window's lifecycle operation has completed.
+
+    A window that runs its lifecycle calls synchronously never has one in
+    flight, so the wait returns at once there.
+    """
+
+    deadline = time.monotonic() + timeout
+    while getattr(window, "_operation", None) is not None:
+        assert time.monotonic() < deadline, "the window's lifecycle operation never completed"
+        _pump_native_events(application, 20)
 
 
 class _NavigationProbe:
@@ -4477,7 +4958,7 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
                 assert session.claims.held
                 assert session.runtime is admitted is not None
                 window._retry.click()
-                _pump_native_events(application, 50)
+                _wait_for_window_operation(application, window)
                 if session.shutdown_blocked:
                     assert session.claims.held
                     assert window.isVisible()
@@ -4575,6 +5056,7 @@ def test_required_native_change_workspace_save_replaces_the_rendered_board():
                 window._change.click()
                 window._root.setText(str(second))
                 window._save.click()
+                _wait_for_window_operation(application, window)
 
                 saved = state.load_configuration()
                 assert saved == state.Configuration(second.resolve()), (
@@ -4594,6 +5076,168 @@ def test_required_native_change_workspace_save_replaces_the_rendered_board():
                 assert session.runtime is not None
                 assert session.runtime is not first_runtime
             finally:
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
+            assert released
+
+
+class _HeldCleanup:
+    """Control a runtime double whose shutdown can be held on a release event."""
+
+    def __init__(self):
+        self.hold = False
+        self.complete = False
+        self.holding = False
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.started_roots = []
+
+    def arm(self, *, complete):
+        self.entered.clear()
+        self.release.clear()
+        self.complete = complete
+        self.hold = True
+
+    def disarm(self):
+        self.hold = False
+        self.complete = True
+        self.release.set()
+
+
+def _held_cleanup_runtime_type(control):
+    class HeldCleanupRuntime:
+        def __init__(self, **_kwargs):
+            self.configuration = None
+
+        def capture_configuration(self, configuration, _paths):
+            self.configuration = configuration
+
+        def start(self, *, static_ready=None):
+            assert static_ready is None or static_ready()
+            control.started_roots.append(self.configuration.specification_root)
+
+        def admit_catalog(self):
+            pass
+
+        def shutdown(self, deadline):
+            if not control.hold:
+                return control.complete
+            control.holding = True
+            control.entered.set()
+            try:
+                released = control.release.wait(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            finally:
+                control.holding = False
+            return released and control.complete
+
+        def cleanup_start_failure(self, _deadline):
+            return True
+
+    return HeldCleanupRuntime
+
+
+def _assert_responsive_while_cleanup_held(application, window, control, action):
+    """Run ``action`` and prove the GUI thread kept serving events meanwhile."""
+
+    started = time.monotonic()
+    action()
+    returned = time.monotonic() - started
+    assert control.entered.wait(timeout=10), "the held cleanup was never entered"
+    observed = {}
+    QtCore.QTimer.singleShot(
+        0, lambda: observed.setdefault("fired_while_cleanup_held", control.holding)
+    )
+    deadline = time.monotonic() + 5
+    while "fired_while_cleanup_held" not in observed and time.monotonic() < deadline:
+        _pump_native_events(application, 10)
+    assert observed.get("fired_while_cleanup_held") is True, observed
+    assert returned < 0.25, f"the click handler blocked for {returned:.3f}s"
+    assert window.isVisible()
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+@pytest.mark.parametrize("action", ["save", "retry", "close"])
+def test_required_native_lifecycle_action_keeps_the_window_responsive_while_cleanup_is_held(
+    action,
+):
+    _assert_native_host_has_no_offscreen_platform()
+    control = _HeldCleanup()
+    with _native_temp_home() as root:
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.object(desktop, "ApplicationRuntime", _held_cleanup_runtime_type(control)),
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            first_bytes = paths.config_file.read_bytes()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            _pump_native_events(application)
+            released = None
+            try:
+                if action == "retry":
+                    # Reach the blocked workspace change without holding cleanup.
+                    window._change.click()
+                    window._root.setText(str(second))
+                    window._save.click()
+                    _wait_for_window_operation(application, window)
+                    assert session.snapshot.status == "switch_blocked"
+                    assert window._retry.text() == "Retry"
+                    assert window._retry.isEnabled()
+                    trigger = window._retry.click
+                elif action == "save":
+                    window._change.click()
+                    window._root.setText(str(second))
+                    trigger = window._save.click
+                else:
+                    trigger = window.close
+
+                control.arm(complete=False)
+                _assert_responsive_while_cleanup_held(application, window, control, trigger)
+                control.release.set()
+                _wait_for_window_operation(application, window)
+
+                assert window.isVisible()
+                assert session.claims.held
+                assert control.started_roots == [first.resolve()]
+                assert paths.config_file.read_bytes() == first_bytes
+                if action == "close":
+                    assert session.snapshot.status == "shutdown_blocked"
+                    assert window._status.text() == (
+                        "Nyx workers are still stopping; retry Close"
+                    )
+                    assert window._retry.text() == "Close"
+                    assert window._retry.isEnabled()
+
+                    control.arm(complete=True)
+                    _assert_responsive_while_cleanup_held(
+                        application, window, control, window.close
+                    )
+                    control.release.set()
+                    _wait_for_window_operation(application, window)
+                    assert not window.isVisible()
+                    assert not session.claims.held
+                    assert session.runtime is None
+                else:
+                    assert session.snapshot.status == "switch_blocked"
+                    assert window._retry.text() == "Retry"
+                    assert window._retry.isEnabled()
+            finally:
+                control.disarm()
                 released = _destroy_native_window(
                     application,
                     window,
