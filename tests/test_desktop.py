@@ -3834,6 +3834,89 @@ def test_quit_requested_while_b_starts_keeps_b_and_shuts_it_down():
             assert not session.claims.held
 
 
+def test_quit_requested_while_b_starts_and_then_fails_closes_the_session():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        control = _ScriptedLifecycle()
+
+        class FailingStart(_Gate):
+            """Hold B's start, then fail it once released."""
+
+            def wait(self, deadline=None):
+                super().wait(deadline)
+                raise RuntimeError("injected startup failure")
+
+        gate = FailingStart()
+        control.start_script[second.resolve()] = [gate]
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", control.runtime_type()
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            thread, outcome = _switch_on_thread(session, second)
+            try:
+                assert gate.entered.wait(timeout=10)
+                session.request_quit()
+                assert session.claims.held
+            finally:
+                gate.release.set()
+                thread.join(timeout=10)
+            assert not thread.is_alive()
+            # B's start failed after the commit, so the change reports the
+            # failure, but the recorded Quit still closes the session.
+            assert isinstance(outcome.get("error"), desktop.DesktopUnavailableError)
+            saved = json.loads(paths.config_file.read_text(encoding="utf-8"))
+            assert saved["specification_root"] == str(second.resolve())
+            assert control.started_roots == [first.resolve(), second.resolve()]
+            assert control.shutdown_roots == [first.resolve()]
+            assert session.runtime is None
+            assert not session.claims.held
+
+
+def test_a_close_that_proceeds_consumes_the_requested_quit():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        control = _ScriptedLifecycle()
+        # The first stop stays blocked; later stops complete.
+        control.shutdown_script.append((None, False))
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", control.runtime_type()
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            # A Quit recorded while no workspace change runs, as the window
+            # records one during a running close or retry, is carried out by
+            # the next close that proceeds, even when its stop stays blocked.
+            session.request_quit()
+            session.close()
+            assert session.snapshot.status == "shutdown_blocked"
+            assert session.claims.held
+
+            # A later workspace change is therefore not cancelled by a Quit
+            # that a close has already acted on.
+            assert session.choose_workspace(second) == state.Configuration(second.resolve())
+            saved = json.loads(paths.config_file.read_text(encoding="utf-8"))
+            assert saved["specification_root"] == str(second.resolve())
+            assert control.started_roots == [first.resolve(), second.resolve()]
+            assert control.shutdown_roots == [first.resolve()]
+            assert session.runtime is not None
+            assert session.claims.held
+
+            session.close()
+            assert control.shutdown_roots == [first.resolve(), second.resolve()]
+            assert not session.claims.held
+
+
 def test_active_workspace_switch_restarts_real_catalog_worker_over_http():
     port = runtime.PORT
 
