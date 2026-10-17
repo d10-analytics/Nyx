@@ -3137,6 +3137,52 @@ def test_change_during_an_in_flight_close_leaves_the_chooser_closed():
             assert not session.claims.held
 
 
+def test_save_submits_the_workspace_shown_when_it_was_clicked():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        third = _workspace(root, "third")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            pool = window._pool
+            window._change.click()
+            window._root.setText(str(second))
+            # The field is a GUI-thread widget: Save reads it in the click
+            # handler, never on the pool thread that runs the save.
+            reads = []
+            real_text = window._root.text
+
+            def recorded_text():
+                reads.append(pool.events.inside_submission)
+                return real_text()
+
+            pool.hold = True
+            with patch.object(window._root, "text", side_effect=recorded_text):
+                window._save.click()
+                assert reads == [False]
+                window._root.setText(str(third))
+                pool.hold = False
+                pool.waitForDone()
+                pool.events.flush()
+                assert reads == [False]
+
+            assert pool.submissions == 1
+            assert state.load_configuration() == state.Configuration(second.resolve())
+            assert session.runtime is instances[1]
+            assert window._status.text() == f"Workspace: {second.resolve()}"
+            window._quit.click()
+            assert not session.claims.held
+
+
 def test_unexpected_lifecycle_failure_renders_the_current_state_and_reopens_actions():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
