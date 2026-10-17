@@ -380,6 +380,10 @@ repeatable browser session; it does not add a permanent screenshot framework.
 - **An edit has not appeared:** request a refresh and apply any pending update.
   If the catalog cannot be refreshed, the browser reports the problem; do not
   treat the retained view as confirmation of the latest file contents.
+- **A refresh reports `producer_output_too_large`:** the workspace's catalog
+  is larger than the 2 MiB catalog limit, so Nyx did not produce it. The
+  browser keeps any board it already shows. Reduce the number of work items
+  and folders in the workspace, then refresh.
 - **Setup rejects a change:** on Linux, stop the running instance, repeat setup,
   then start it. In the desktop application, choose **Change workspace**, then
   **Retry** if the stop is incomplete.
