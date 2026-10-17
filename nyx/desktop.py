@@ -521,11 +521,11 @@ class DesktopSession:
             )
         if self._unverified:
             raise SelectionUnavailableError(
-                "Nyx configuration is unverified; revalidate before saving"
+                "Nyx configuration is unverified; retry the workspace change or reopen Nyx"
             )
         if self.snapshot.status == "unavailable":
             raise SelectionUnavailableError(
-                "Nyx configuration is unavailable; repair or revalidate it first"
+                "Nyx configuration is unavailable; repair it and reopen Nyx"
             )
         if self._switch_in_progress or self._switch_blocked:
             raise SelectionUnavailableError(
