@@ -11,9 +11,11 @@ therefore safe in the dependency-light Linux console and wheel paths.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,6 +67,14 @@ class DesktopSnapshot:
 class _PendingSwitch:
     configuration: state.Configuration
     runtime_expected: bool
+
+
+@dataclass(frozen=True)
+class _OperationOutcome:
+    """How one window lifecycle operation ended on the pool thread."""
+
+    kind: str
+    error: BaseException | None = None
 
 
 class DesktopClaims:
@@ -636,12 +646,28 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
     QtWebEngineCore = qt["QtWebEngineCore"]
     QtWebEngineWidgets = qt["QtWebEngineWidgets"]
 
+    class OperationRelay(QtCore.QObject):
+        """Carry an operation's outcome from the pool thread to the GUI thread."""
+
+        completed = QtCore.Signal(object)
+
     class DesktopWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Nyx")
             self.resize(720, 460)
             self._session = session
+            # Lifecycle calls that wait on runtime cleanup or startup run one
+            # at a time on this pool, so the window keeps serving events.  The
+            # session belongs to the pool thread from submission until the
+            # relay, which lives on this thread, delivers the outcome here.
+            self._operation: str | None = None
+            self._pool = QtCore.QThreadPool(self)
+            self._pool.setMaxThreadCount(1)
+            self._relay = OperationRelay(self)
+            self._relay.completed.connect(
+                self._operation_completed, QtCore.Qt.ConnectionType.QueuedConnection
+            )
             self._board_failed = False
             # The runtime object the view last navigated to; a different
             # admitted runtime after a user action means the board is stale.
@@ -743,12 +769,8 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._render()
 
         def _settle_board_failure(self) -> None:
-            """Reap admitted work through the shared owner, retrying if needed."""
+            """Reap admitted work through the window's ordinary Close."""
 
-            self._session.close()
-            if self._session.shutdown_blocked:
-                self._render()
-                return
             self.close()
 
         def _render(self) -> None:
@@ -838,28 +860,72 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._retry.setEnabled(action is not None)
 
         def _recover(self) -> None:
+            if self._operation is not None:
+                return
             action = self._recovery_action()
             if action is not None:
                 action[1]()
 
         def _begin_change(self) -> None:
+            if self._operation is not None:
+                return
             self._changing = True
             self._render()
 
         def _end_change(self) -> None:
+            if self._operation is not None:
+                return
             self._session.cancel()
             self._changing = False
             self._render()
 
-        def _save_selection(self) -> None:
-            try:
-                self._session.choose_workspace(self._root.text())
-            except DesktopError as error:
+        def _submit(self, kind: str, call: Any) -> None:
+            """Run one session lifecycle call on the pool thread."""
+
+            self._operation = kind
+            relay = self._relay
+
+            def run() -> None:
+                try:
+                    call()
+                except BaseException as error:  # delivered to the GUI thread
+                    outcome = _OperationOutcome(kind, error)
+                else:
+                    outcome = _OperationOutcome(kind)
+                relay.completed.emit(outcome)
+
+            self._pool.start(run)
+
+        def _operation_completed(self, outcome: _OperationOutcome) -> None:
+            # Clear the marker first, so an unexpected failure cannot leave
+            # every later action, including Close, refused.
+            self._operation = None
+            error = outcome.error
+            if error is not None and not isinstance(error, DesktopError):
+                # Show the current session state before the failure surfaces;
+                # a packaged build may have nowhere to report it.
+                self._render()
+                raise error
+            if outcome.kind == "close":
+                if self._session._closed:
+                    self.close()
+                else:
+                    self._render()
+                return
+            if error is not None:
                 self._status.setText(str(error))
             else:
                 self._changing = False
             self._open_replaced_board()
             self._render()
+
+        def _save_selection(self) -> None:
+            if self._operation is not None:
+                return
+            self._submit(
+                "save",
+                functools.partial(self._session.choose_workspace, self._root.text()),
+            )
 
         def _retry_workspace_switch(self) -> None:
             self._run_retry(self._session.retry_workspace_switch)
@@ -868,22 +934,19 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
             self._run_retry(self._session.retry_runtime)
 
         def _run_retry(self, operation: Any) -> None:
-            try:
-                operation()
-            except DesktopError as error:
-                self._status.setText(str(error))
-            else:
-                self._changing = False
-            self._open_replaced_board()
-            self._render()
+            self._submit("retry", operation)
 
         def closeEvent(self, event: Any) -> None:
-            self._session.close()
-            if self._session.shutdown_blocked or self._session.switch_in_progress:
-                self._render()
-                event.ignore()
-            else:
+            # Every Close path arrives here.  The close itself runs on the
+            # pool; its completion closes the window again once the session
+            # has closed, and only that second close is accepted.
+            event.ignore()
+            if self._operation is not None:
+                return
+            if self._session._closed:
                 event.accept()
+                return
+            self._submit("close", self._session.close)
 
     # Keep the QtCore reference live for native binding implementations that
     # inspect the class module while delivering close events.
@@ -976,6 +1039,11 @@ def _safe_window_attribute(window: Any, name: str) -> Any:
 def _release_presentation(application: Any, window: Any) -> None:
     """Tear down the presentation profile so its on-disk storage flushes.
 
+    A lifecycle operation still running on the window's pool finishes first,
+    and its relay is disconnected.  The window is then hidden rather than
+    closed, because closing would start an asynchronous session close during
+    teardown; the caller owns the final session close.
+
     Qt WebEngine only guarantees that persistent page storage is written when
     the disk-based profile is destroyed, so the window's page, view, and
     profile are destroyed here in child-before-owner order instead of waiting
@@ -985,10 +1053,25 @@ def _release_presentation(application: Any, window: Any) -> None:
 
     if window is None:
         return
+    pool = _safe_window_attribute(window, "_pool")
     try:
-        close = getattr(window, "close", None)
-        if callable(close):
-            close()
+        wait = getattr(pool, "waitForDone", None)
+        if callable(wait):
+            wait()
+    except RuntimeError:
+        pass
+    relay = _safe_window_attribute(window, "_relay")
+    try:
+        with warnings.catch_warnings():
+            # A repeated release finds nothing left to disconnect.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            relay.completed.disconnect()
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    try:
+        hide = getattr(window, "hide", None)
+        if callable(hide):
+            hide()
     except RuntimeError:
         pass
     page = _safe_window_attribute(window, "_page")
