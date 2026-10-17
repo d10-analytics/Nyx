@@ -195,7 +195,9 @@ report that the desktop application has no lifecycle commands.
   runtime start.
 - If the board cannot be displayed, the window stays open with the message
   "Nyx board could not be displayed; choose Close", the recovery button reads
-  **Close**, and the board's work keeps running until you choose.
+  **Close**, and the board's work keeps running until you choose. If the board
+  then loads successfully again, the window leaves the failure screen and shows
+  its usual controls.
 - **Close** finishes a blocked close or a board-display failure: it stops the
   work and closes the window once the work has stopped. If cleanup is still
   blocked, the window stays open, reports that Nyx workers are still stopping,
