@@ -3095,6 +3095,48 @@ def test_window_submits_nothing_while_a_lifecycle_operation_is_in_flight():
             assert not session.claims.held
 
 
+def test_change_during_an_in_flight_close_leaves_the_chooser_closed():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            assert not window._changing
+            pool = window._pool
+            # Keep the Quit's close in flight from the ordinary configured
+            # screen, where Change would otherwise open the chooser.
+            pool.hold = True
+            spied = (*_LIFECYCLE_METHODS, "cancel")
+            with _lifecycle_spies(session, pool.events, spied) as calls:
+                window._quit.click()
+                assert pool.submissions == 1
+                in_flight = _window_controls(window)
+
+                for button in (window._change, window._cancel, window._save, window._retry):
+                    button.clicked.emit()
+
+                assert not window._changing
+                assert _window_controls(window) == in_flight
+                assert pool.submissions == 1
+                assert calls == []
+
+                pool.hold = False
+                pool.waitForDone()
+                pool.events.flush()
+
+            assert calls == [("close", True)]
+            assert not window._visible
+            assert not session.claims.held
+
+
 def test_unexpected_lifecycle_failure_renders_the_current_state_and_reopens_actions():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
