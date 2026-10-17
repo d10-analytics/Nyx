@@ -8,6 +8,7 @@ import http.client
 import inspect
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -2683,20 +2684,32 @@ def test_board_failure_during_change_disables_cancel_and_offers_close():
             assert session.runtime is None
 
 
-def _assert_board_failure_screen(window, session, admitted):
+def _assert_board_failure_screen(window, session, admitted, diagnostic=""):
     """The window shows the board-failure screen while admitted work still runs."""
 
-    assert window._visible
-    assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
-    assert not window._root.isEnabled()
-    assert not window._change.isEnabled()
-    assert not window._save.isEnabled()
-    assert not window._cancel.isEnabled()
-    assert window._retry.text() == "Close"
-    assert window._retry.isEnabled()
-    assert session.claims.held
-    assert session.runtime is admitted is not None
-    assert session.snapshot.status != "shutdown_blocked"
+    observed = {
+        **_window_controls(window),
+        "board_failed": window._board_failed,
+        "claims_held": session.claims.held,
+        "runtime_is_admitted": admitted is not None and session.runtime is admitted,
+        "shutdown_blocked": session.snapshot.status == "shutdown_blocked",
+    }
+    expected = {
+        "status": desktop.BOARD_FAILURE_MESSAGE,
+        "retry_label": "Close",
+        "root": False,
+        "change": False,
+        "save": False,
+        "cancel": False,
+        "retry": True,
+        "quit": True,
+        "visible": True,
+        "board_failed": True,
+        "claims_held": True,
+        "runtime_is_admitted": True,
+        "shutdown_blocked": False,
+    }
+    assert observed == expected, diagnostic
 
 
 def _assert_blocked_close_retry(window, session):
@@ -2801,6 +2814,124 @@ def test_board_failure_after_a_blocked_workspace_change_shows_the_failure():
             assert not window._visible
             assert not session.claims.held
             assert session.runtime is None
+
+
+def _assert_healthy_board_screen(window, session, admitted, specification_root, diagnostic=""):
+    """A board that loaded successfully shows the ordinary configured screen."""
+
+    observed = {
+        **_window_controls(window),
+        "board_failed": window._board_failed,
+        "claims_held": session.claims.held,
+        "runtime_is_admitted": admitted is not None and session.runtime is admitted,
+    }
+    expected = {
+        "status": f"Workspace: {specification_root}",
+        "retry_label": "Retry",
+        "root": False,
+        "change": True,
+        "save": False,
+        "cancel": False,
+        "retry": False,
+        "quit": True,
+        "visible": True,
+        "board_failed": False,
+        "claims_held": True,
+        "runtime_is_admitted": True,
+    }
+    assert observed == expected, diagnostic
+
+
+def test_successful_board_load_clears_the_failure_screen_without_renavigating():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                assert len(window._board.navigations) == 1
+
+                # A failure reported for a navigation the view has since
+                # replaced shows the failure screen until the current load
+                # finishes.
+                window._board.loadFinished.emit(False)
+                _assert_board_failure_screen(window, session, admitted)
+
+                window._board.loadFinished.emit(True)
+                _assert_healthy_board_screen(window, session, admitted, first.resolve())
+                # Clearing restored the screen without navigating again.
+                assert len(window._board.navigations) == 1
+
+                # Another success while healthy leaves everything as it is.
+                window._board.loadFinished.emit(True)
+                _assert_healthy_board_screen(window, session, admitted, first.resolve())
+                assert len(window._board.navigations) == 1
+
+                # A later failure enters the failure state again as before.
+                window._board.loadFinished.emit(False)
+                _assert_board_failure_screen(window, session, admitted)
+                assert window._board_failed
+            finally:
+                session.close()
+            assert not session.claims.held
+
+
+def test_successful_board_load_after_a_refused_close_keeps_the_close_retry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        instances = []
+        control = {"shutdown": True}
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", _replaceable_runtime_type(instances, control=control)
+        ):
+            state.setup(first)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            try:
+                assert window._open_board()
+                window._board.loadFinished.emit(False)
+                _assert_board_failure_screen(window, session, admitted)
+
+                control["shutdown"] = False
+                window._retry.click()
+                _assert_blocked_close_retry(window, session)
+                assert window._board_failed
+
+                window._board.loadFinished.emit(True)
+                # The failure state cleared, and the blocked close still shows
+                # its own retry rather than the ordinary configured screen.
+                assert not window._board_failed
+                _assert_blocked_close_retry(window, session)
+                assert not window._root.isEnabled()
+                assert not window._change.isEnabled()
+                assert not window._save.isEnabled()
+                assert not window._cancel.isEnabled()
+                assert len(window._board.navigations) == 1
+
+                control["shutdown"] = True
+                window._retry.click()
+                assert not window._visible
+                assert not session.claims.held
+                assert session.runtime is None
+            finally:
+                control["shutdown"] = True
+                session.close()
+            assert not session.claims.held
 
 
 @pytest.mark.parametrize("blocked", ["switch_blocked", "runtime_blocked"])
@@ -3699,6 +3830,137 @@ def test_quit_recorded_during_an_operation_starts_no_close_once_teardown_begins(
             assert session.claims.held
             control["shutdown"] = True
             session.close()
+            assert not session.claims.held
+
+
+def _run_held_submission_on_thread(pool):
+    """Run the fake pool's next held submission on its own thread.
+
+    The submission's completion stays queued until the test flushes it on
+    this thread, as a real pool's queued delivery waits for the GUI thread.
+    """
+
+    runnable = pool.held.pop(0)
+    thread = threading.Thread(target=pool._run, args=(runnable,), daemon=True)
+    thread.start()
+    return thread
+
+
+def _finish_thread(thread):
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the held submission never finished"
+
+
+@pytest.mark.parametrize("case", ["save", "board_failure_close", "post_commit_quit_chained_close"])
+def test_load_results_during_a_held_operation_change_nothing_and_read_no_session_state(case):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        control = _ScriptedLifecycle()
+        gate = _Gate()
+        start_gate = _Gate()
+        with _home_patches(home)[0], patch.object(
+            desktop, "ApplicationRuntime", control.runtime_type()
+        ):
+            state.setup(first)
+            if case == "post_commit_quit_chained_close":
+                # The Quit arrives while B starts, after B is saved; B's stop
+                # inside the change then fails, so the window chains one more
+                # close, which is the held cleanup.
+                control.start_script[second.resolve()] = [start_gate]
+                control.shutdown_script.extend([(None, True), (None, False), (gate, True)])
+            else:
+                control.shutdown_script.append((gate, True))
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            recorder = _SessionAccessRecorder(session)
+            window = desktop._build_window(_fake_qt(), session)
+            window.show()
+            pool = window._pool
+            gui = threading.current_thread()
+            threads = []
+            try:
+                pool.hold = True
+                if case == "board_failure_close":
+                    window._board.loadFinished.emit(False)
+                    assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
+                    assert window._retry.text() == "Close"
+                    window._retry.click()
+                    progress, failed = _CLOSING_PROGRESS, True
+                else:
+                    window._change.click()
+                    window._root.setText(str(second))
+                    window._save.click()
+                    progress, failed = _SAVE_PROGRESS, False
+                assert pool.submissions == 1
+                threads.append(_run_held_submission_on_thread(pool))
+
+                if case == "post_commit_quit_chained_close":
+                    assert start_gate.entered.wait(timeout=10), "B's start was never entered"
+                    window._quit.click()
+                    start_gate.release.set()
+                    _finish_thread(threads[-1])
+                    pool.events.flush()
+                    assert session.snapshot.status == "shutdown_blocked"
+                    assert pool.submissions == 2
+                    threads.append(_run_held_submission_on_thread(pool))
+                    progress = _CLOSING_PROGRESS
+
+                assert gate.entered.wait(timeout=10), "the held cleanup was never entered"
+                assert gate.holding
+                assert window._operation is not None
+                assert window._board_failed is failed
+                assert window._status.text() == progress
+                held = recorder.mark()
+
+                window._board.loadFinished.emit(False)
+                assert window._board_failed is failed
+                assert window._status.text() == progress
+                assert recorder.names_from(held, gui) == []
+
+                window._board.loadFinished.emit(True)
+                assert window._board_failed is failed
+                assert window._status.text() == progress
+                # Neither result read the session, which the held operation
+                # owns, and in particular never its runtime.
+                assert recorder.names_from(held, gui) == []
+                assert gate.holding
+
+                gate.release.set()
+                _finish_thread(threads[-1])
+                pool.events.flush()
+
+                if case == "save":
+                    assert pool.submissions == 1
+                    assert state.load_configuration() == state.Configuration(second.resolve())
+                    assert control.started_roots == [first.resolve(), second.resolve()]
+                    assert not window._board_failed
+                    assert window._status.text() == f"Workspace: {second.resolve()}"
+                    assert window._change.isEnabled()
+                    assert window._visible
+                    assert session.claims.held
+                else:
+                    assert not window._visible
+                    assert not session.claims.held
+                    assert session.runtime is None
+                    if case == "post_commit_quit_chained_close":
+                        assert pool.submissions == 2
+                        assert state.load_configuration() == state.Configuration(
+                            second.resolve()
+                        )
+                        assert control.shutdown_roots == [first.resolve(), second.resolve()]
+                    else:
+                        assert pool.submissions == 1
+                        assert control.shutdown_roots == [first.resolve()]
+            finally:
+                gate.release.set()
+                start_gate.release.set()
+                for thread in threads:
+                    thread.join(timeout=30)
+                pool.events.flush()
+                session.close()
             assert not session.claims.held
 
 
@@ -5621,10 +5883,108 @@ def test_required_native_compact_preference_survives_a_normal_reopen():
             assert second_released
 
 
+def _settle_native_events(application, seconds: float = 1.0) -> None:
+    """Keep serving events for ``seconds`` so any late load result arrives."""
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        _pump_native_events(application, 50)
+
+
+@contextlib.contextmanager
+def _native_navigation_calls(view):
+    """Record every navigation request made on the native view meanwhile."""
+
+    with (
+        patch.object(view, "setUrl", wraps=view.setUrl) as set_url,
+        patch.object(view, "load", wraps=view.load) as load,
+        patch.object(view, "reload", wraps=view.reload) as reload,
+    ):
+        yield lambda: {
+            "setUrl": set_url.call_count,
+            "load": load.call_count,
+            "reload": reload.call_count,
+        }
+
+
+def _wait_for_board_failure(application, window, probe, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not window._board_failed:
+        _pump_native_events(application, 50)
+    assert window._board_failed, (
+        f"the dead-port board load never failed: navigation={probe.describe()!r}"
+    )
+
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_replaced_navigation_failure_never_outlasts_the_current_board_load():
+    _assert_native_host_has_no_offscreen_platform()
+    with _native_temp_home() as root:
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            assert admitted is not None and admitted.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            released = None
+            # Accepts connections but never answers, so a load sent here stays
+            # in flight until the view replaces it.
+            silent = socket.create_server(("127.0.0.1", 0))
+            try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=admitted.board_url())
+                silent_port = silent.getsockname()[1]
+                window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{silent_port}/"))
+                _pump_until(application, lambda: probe.load_started >= 1)
+                assert probe.load_started >= 1, (
+                    f"the unanswered load never started: navigation={probe.describe()!r}"
+                )
+                assert probe.load_finished == [], (
+                    f"the unanswered load finished before it was replaced: "
+                    f"navigation={probe.describe()!r}"
+                )
+
+                with _native_navigation_calls(window._board) as navigations:
+                    assert window._open_board(), f"navigation={probe.describe()!r}"
+                    assert navigations() == {"setUrl": 1, "load": 0, "reload": 0}, (
+                        f"navigation={probe.describe()!r}"
+                    )
+                    _wait_for_json_board(application, page, probe=probe)
+                    _settle_native_events(application)
+                    diagnostic = f"navigation={probe.describe()!r}"
+                    # Whatever the replaced load reported, the current board's
+                    # successful load leaves the ordinary screen.
+                    _assert_healthy_board_screen(
+                        window, session, admitted, workspace.resolve(), diagnostic
+                    )
+                    # The window navigated only the once _open_board() asked.
+                    assert navigations() == {"setUrl": 1, "load": 0, "reload": 0}, diagnostic
+            finally:
+                silent.close()
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
+            assert released
+
+
 @pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
 def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
     _assert_native_host_has_no_offscreen_platform()
     dead_port = distinct_free_port()
+    dead_url = f"http://127.0.0.1:{dead_port}/"
     with _native_temp_home() as root:
         home = _home(root)
         workspace = _board_workspace(root)
@@ -5640,24 +6000,44 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
             window.show()
             released = None
             try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=dead_url)
                 assert window._open_board()
                 # Trigger the later view failure by sending the admitted board to
                 # a dead loopback port; a first successful board load is not
                 # required to exercise the post-admission cleanup obligation.
                 admitted = session.runtime
-                window._board.setUrl(QtCore.QUrl(f"http://127.0.0.1:{dead_port}/"))
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and not window._board_failed:
-                    _pump_native_events(application, 50)
-                assert window._board_failed, "the dead-port board load never failed"
+                window._board.setUrl(QtCore.QUrl(dead_url))
+                _wait_for_board_failure(application, window, probe)
                 # The failure screen stays up and the admitted work keeps running
-                # until the user chooses Close.
-                assert window.isVisible()
-                assert window._status.text() == desktop.BOARD_FAILURE_MESSAGE
-                assert window._retry.text() == "Close"
-                assert window._retry.isEnabled()
-                assert session.claims.held
-                assert session.runtime is admitted is not None
+                # until the user chooses Close, whatever the engine's error page
+                # reports afterwards.
+                _assert_board_failure_screen(
+                    window, session, admitted, f"navigation={probe.describe()!r}"
+                )
+                _settle_native_events(application, 1.0)
+                _assert_board_failure_screen(
+                    window, session, admitted, f"navigation={probe.describe()!r}"
+                )
+
+                # The board loading successfully again leaves the failure
+                # screen without the window navigating anywhere itself.
+                window._board.setUrl(QtCore.QUrl(admitted.board_url()))
+                with _native_navigation_calls(window._board) as navigations:
+                    _wait_for_json_board(application, page, probe=probe)
+                    _settle_native_events(application)
+                    diagnostic = f"navigation={probe.describe()!r}"
+                    _assert_healthy_board_screen(
+                        window, session, admitted, workspace.resolve(), diagnostic
+                    )
+                    assert navigations() == {"setUrl": 0, "load": 0, "reload": 0}, diagnostic
+
+                # A later failure enters the failure screen again.
+                window._board.setUrl(QtCore.QUrl(dead_url))
+                _wait_for_board_failure(application, window, probe)
+                _assert_board_failure_screen(
+                    window, session, admitted, f"navigation={probe.describe()!r}"
+                )
                 window._retry.click()
                 _wait_for_window_operation(application, window)
                 if session.shutdown_blocked:
@@ -5772,6 +6152,11 @@ def test_required_native_change_workspace_save_replaces_the_rendered_board():
                     application, page, second_titles, probe=probe
                 )
                 assert not set(first_titles) & set(replaced["titles"]), replaced["titles"]
+                # No load result from the replaced board leaves a failure behind.
+                _settle_native_events(application)
+                diagnostic = f"navigation={probe.describe()!r}"
+                assert not window._board_failed, diagnostic
+                assert window._status.text() == f"Workspace: {second.resolve()}", diagnostic
                 assert window.isVisible()
                 assert session.claims.held
                 assert session.runtime is not None
