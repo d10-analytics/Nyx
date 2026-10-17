@@ -1659,8 +1659,12 @@ def test_post_replacement_failure_keeps_committed_bytes_unverified_and_revalidat
                 assert json.loads(paths.config_file.read_text(encoding="utf-8"))["specification_root"] == str(
                     second.resolve()
                 )
-                with pytest.raises(desktop.SelectionUnavailableError):
+                with pytest.raises(desktop.SelectionUnavailableError) as refused:
                     session.choose_workspace(first)
+                assert str(refused.value) == (
+                    "Nyx configuration is unverified; retry the workspace change or reopen Nyx"
+                )
+                assert "revalidate" not in str(refused.value).lower()
             assert session.revalidate().specification_root == second.resolve()
             assert not session.unverified
             session.close()
@@ -1678,8 +1682,10 @@ def test_malformed_configuration_is_unavailable_and_cannot_be_overwritten_by_cho
             before = paths.config_file.read_bytes()
             session = desktop.DesktopSession()
             assert session.snapshot.status == "unavailable"
-            with pytest.raises(desktop.SelectionUnavailableError):
+            with pytest.raises(desktop.SelectionUnavailableError) as refused:
                 session.choose_workspace(workspace)
+            assert str(refused.value) == "Nyx configuration is unavailable; repair it and reopen Nyx"
+            assert "revalidate" not in str(refused.value).lower()
             assert paths.config_file.read_bytes() == before
             session.close()
 
