@@ -595,9 +595,14 @@ class DesktopSession:
         This only records the request, so it never waits and may be called
         from another thread while the change runs.  Before the new workspace
         is saved the change is abandoned and the previous one stays saved;
-        after it, the saved workspace stays and no runtime is left running.
-        Nothing else acts on the request; the next :meth:`close` that
-        proceeds consumes it.
+        after it, the saved workspace stays.  Nothing else acts on the
+        request; the next :meth:`close` that proceeds consumes it, stops any
+        runtime, and closes the session.  If that stop is incomplete, the
+        session instead stays open in the ``shutdown_blocked`` state with
+        its runtime still running, which after the save is the new
+        workspace's, and a later close must succeed before the session is
+        closed.  The desktop window chains one such close when the change
+        ends with the session still open.
         """
 
         self._quit_requested.set()
