@@ -781,9 +781,21 @@ def _build_window(qt: dict[str, Any], session: DesktopSession) -> Any:
                 self._open_board()
 
         def _board_load_finished(self, ok: bool) -> None:
-            if ok or self._board_failed:
+            if self._operation is not None:
+                # The session belongs to the running operation, so the result
+                # is ignored without reading it; the operation's outcome
+                # screen stands until the next load result.
                 return
-            if self._session.runtime is None:
+            if ok:
+                # A load result carries no navigation identity, so a failure
+                # reported for a navigation the view has since replaced is
+                # cleared by the current board's successful load.  The view
+                # already shows that board, so nothing navigates again.
+                if self._board_failed:
+                    self._board_failed = False
+                    self._render()
+                return
+            if self._board_failed or self._session.runtime is None:
                 return
             # Show the failure screen and keep the admitted work running; the
             # Close action, Quit, or closing the window reaps it.
