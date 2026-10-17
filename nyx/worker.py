@@ -296,11 +296,12 @@ class _Child:
     )
 
 
-@dataclass
 class _Reservation:
-    """Admission reservation held while a direct child is being spawned."""
+    """Admission reservation held while a direct child is being spawned.
 
-    completed: bool = False
+    Each reservation is compared by identity, so a request only ever removes
+    its own reservation however overlapping spawns complete.
+    """
 
 
 class CatalogWorkerManager:
@@ -394,7 +395,6 @@ class CatalogWorkerManager:
         child = _Child(process)
         with self._lock:
             self._reservations.remove(reservation)
-            reservation.completed = True
             self._children.append(child)
             self._start_readers_locked(child)
             if self._closing:
