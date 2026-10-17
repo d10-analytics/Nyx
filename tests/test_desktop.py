@@ -6062,6 +6062,71 @@ def test_required_native_post_admission_view_failure_reaps_or_retains_retry():
             assert released
 
 
+
+@pytest.mark.skipif(not _NATIVE_BOARD, reason=_NATIVE_BOARD_SKIP)
+def test_required_native_error_page_never_clears_a_failure_from_a_healthy_board():
+    _assert_native_host_has_no_offscreen_platform()
+    dead_port = distinct_free_port()
+    dead_url = f"http://127.0.0.1:{dead_port}/"
+    with _native_temp_home() as root:
+        home = _home(root)
+        workspace = _board_workspace(root)
+        application = _native_application()
+        with (
+            _home_patches(home)[0],
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            session.start_runtime()
+            admitted = session.runtime
+            assert admitted is not None and admitted.catalog_admitted
+            window = desktop._build_window(_native_qt(), session)
+            window.show()
+            released = None
+            try:
+                page = window._board.page()
+                probe = _NavigationProbe(page, requested_url=dead_url)
+                assert window._open_board(), f"navigation={probe.describe()!r}"
+                # Let the board finish its own load first, so no earlier
+                # navigation is still pending when the dead port is visited and
+                # the only failure that can follow is the dead port's own.
+                _wait_for_json_board(application, page, probe=probe)
+                _pump_until(application, lambda: True in probe.load_finished, timeout=30.0)
+                _settle_native_events(application)
+                _assert_healthy_board_screen(
+                    window, session, admitted, workspace.resolve(),
+                    f"navigation={probe.describe()!r}",
+                )
+
+                reported = len(probe.load_finished)
+                window._board.setUrl(QtCore.QUrl(dead_url))
+                # A refused loopback connection can take seconds on some hosts,
+                # so the settle starts only once the dead port's navigation has
+                # reported its own result.
+                _pump_until(
+                    application, lambda: len(probe.load_finished) > reported, timeout=30.0
+                )
+                assert len(probe.load_finished) > reported, (
+                    f"the dead-port navigation never reported: navigation={probe.describe()!r}"
+                )
+                _settle_native_events(application, 1.0)
+                # Whatever the engine's error page reports after that failure,
+                # the failure screen stays up.
+                _assert_board_failure_screen(
+                    window, session, admitted, f"navigation={probe.describe()!r}"
+                )
+            finally:
+                released = _destroy_native_window(
+                    application,
+                    window,
+                    store_path=session.paths.state_directory
+                    / desktop.PRESENTATION_DIRECTORY,
+                )
+                session.close()
+            assert not session.claims.held
+            assert released
+
 def _titled_workspace(root: Path, name: str, titles) -> Path:
     """A workspace whose Queue packages carry exactly the given card titles."""
 
