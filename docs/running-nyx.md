@@ -203,6 +203,18 @@ report that the desktop application has no lifecycle commands.
 - **Quit**, and closing the only window, request the same visible shutdown. The
   window exits only after its owned cleanup has finished. After a board-display
   failure they stop the board's work the same way **Close** does.
+- **Close**, **Quit**, closing the window, **Save workspace**, and **Retry**
+  return at once and keep the window responsive while Nyx's work stops or
+  starts. The window shows what it is waiting for ("Closing Nyx; waiting for
+  its work to stop", "Changing workspace; restarting Nyx work", or "Retrying;
+  waiting for Nyx work") and disables the other actions until that finishes.
+  The window closes once cleanup finishes; if cleanup is incomplete, it stays
+  open, reports that Nyx workers are still stopping, and keeps **Close**
+  available to retry.
+- **Quit** stays available while Nyx is working. During a workspace change it
+  takes effect as soon as it can: before the new workspace is saved, the change
+  is abandoned and the previous workspace stays saved; after it is saved, the
+  new workspace stays saved and its work is stopped before the window closes.
 - One application owns the account on this host. A separately launched second
   process reports that Nyx is already open and exits without changing state;
   normal operating-system activation of the running application still works.
