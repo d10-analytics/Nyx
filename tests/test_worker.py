@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
 
-from nyx import state, worker
+from nyx import catalog, state, worker
 from nyx._native_claim import NativeClaim
 from nyx.models import SCHEMA_VERSION, parse_catalog
 
@@ -259,6 +259,34 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
         )
         assert source_entry["reported_fields"] == [{"name": "Owner Note", "value": "worker text"}]
         assert source_entry["relationship"]["prerequisites"][0]["reason"] == "completion_satisfied"
+
+
+def test_worker_reports_oversized_catalog_with_size_status() -> None:
+    with TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        home.mkdir()
+        workspace = base / "workspace"
+        source = workspace / "Fictional" / "Queue" / "source"
+        source.mkdir(parents=True)
+        source.joinpath("spec.md").write_text(
+            "# Source\nPackage ID: 11111111-1111-4111-8111-111111111111\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            state.setup(workspace)
+            state.save_configuration_owned(
+                workspace,
+                paths=state.state_paths(),
+                completed_stage_names=["Done"],
+            )
+            stdout = _Stdout()
+            with patch.object(worker.sys, "stdout", stdout), patch.object(
+                catalog, "MAX_OUTPUT_BYTES", 10
+            ):
+                assert worker._worker_main() == 3
+        assert stdout.buffer.writes == []
+        assert stdout.buffer.flush_count == 0
 
 
 def test_partial_inherited_worker_objects_are_rejected_without_loading_config() -> None:

@@ -5161,7 +5161,14 @@ def test_worker_retains_no_bytes_beyond_stream_caps_and_completes_readers():
 
 
 def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
-    for exit_code, expected in ((4, "producer_unavailable"), (7, "producer_failed")):
+    cases = (
+        (3, "producer_output_too_large"),
+        (4, "producer_unavailable"),
+        (5, "producer_failed"),
+        (6, "producer_failed"),
+        (7, "producer_failed"),
+    )
+    for exit_code, expected in cases:
         manager = runtime.CatalogWorkerManager(
             command_factory=lambda exit_code=exit_code: [
                 sys.executable,
@@ -5170,10 +5177,11 @@ def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
             ],
             timeout=2,
         )
-        with pytest.raises(runtime.WorkerError, match=expected):
+        with pytest.raises(runtime.WorkerError) as raised:
             manager.fetch_catalog()
-        assert manager.close(time.monotonic() + 2)
-        assert manager.active_count == 0
+        assert raised.value.code == expected, exit_code
+        assert manager.close(time.monotonic() + 2) is True, exit_code
+        assert manager.active_count == 0, exit_code
 
 
 def test_worker_cancellation_after_eof_wins_before_success_publication():

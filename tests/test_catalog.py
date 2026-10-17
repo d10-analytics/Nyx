@@ -987,9 +987,10 @@ class CatalogTests(TestCase):
             root = Path(temporary)
             package(root, "Queue", "one", V1)
             with patch.object(catalog, "MAX_OUTPUT_BYTES", 10), self.assertRaisesRegex(
-                ValueError, "exceeds 2 MiB"
-            ):
+                catalog.CatalogOutputTooLargeError, "exceeds 2 MiB"
+            ) as raised:
                 catalog.scan_catalog(root)
+            self.assertIsInstance(raised.exception, ValueError)
 
     def test_catalog_only_does_not_lookup_declared_target_checkout(self) -> None:
         with TemporaryDirectory() as temporary:
