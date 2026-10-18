@@ -1324,6 +1324,19 @@ def test_application_settings_save_reports_conflict_for_competing_record_after_r
         reloaded = state.load_configuration(paths)
         assert reloaded.stage_order == ("Archive", "Review")
         assert reloaded.completed_stage_names == ("Archive",)
+        # The runtime adopts the competing record, so its reported revision is current.
+        assert application.get_settings() == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": result["revision"],
+        }
+        retried = application.save_settings(result["revision"], ["Queue", "Done"], ["Done"])
+        assert retried == {
+            "order": ["Queue", "Done"],
+            "completed": ["Done"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "success",
+        }
         assert application.shutdown(time.monotonic() + 2)
 
 
