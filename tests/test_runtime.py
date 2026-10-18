@@ -4138,6 +4138,46 @@ def test_shared_record_read_permits_terminal_unlink():
             os.close(descriptor)
 
 
+def _wait_for_clock_advance(limit: float = 5.0) -> None:
+    """Return only once time.monotonic() has moved past its value on entry.
+
+    Bounded so a coarse clock (about 15.6 ms on Windows) still advances.
+    """
+    entry = time.monotonic()
+    give_up = entry + limit
+    while time.monotonic() <= entry:
+        assert time.monotonic() < give_up, "monotonic clock did not advance"
+        time.sleep(0.001)
+
+
+def test_public_start_hands_one_deadline_to_every_phase():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        seen: dict[str, float] = {}
+
+        def spawn(lease_fd, deadline_ns, **_kwargs):
+            seen["spawn"] = deadline_ns / 1_000_000_000
+            return SimpleNamespace()
+
+        def acknowledge(_process, _ack_fd, deadline):
+            seen["ack"] = deadline
+            _wait_for_clock_advance()
+            return True
+
+        def ready(_paths, _process, deadline):
+            seen["ready"] = deadline
+            return SimpleNamespace(url=runtime.URL)
+
+        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+            runtime, "_spawn_daemon", side_effect=spawn
+        ), patch.object(
+            runtime, "_wait_for_ack", side_effect=acknowledge
+        ), patch.object(runtime, "_wait_ready", side_effect=ready):
+            assert runtime.start() == runtime.URL
+        assert set(seen) == {"spawn", "ack", "ready"}
+        assert seen["spawn"] == seen["ack"] == seen["ready"]
+
+
 def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -4145,10 +4185,22 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         record = paths.runtime_directory / "instance.json"
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
 
+        control_deadlines: list[float] = []
+        lock_calls: list[tuple[float | None, float]] = []
+        real_operation_lock = runtime._operation_lock
+
+        def recording_operation_lock(lock_paths, **kwargs):
+            lock_calls.append(
+                (kwargs.get("deadline"), kwargs.get("timeout", runtime.LOCK_TIMEOUT))
+            )
+            return real_operation_lock(lock_paths, **kwargs)
+
         def complete_terminal_cleanup(instance, command, **_kwargs):
             nonlocal lease_fd
             assert instance == original
             assert command == "stop"
+            control_deadlines.append(_kwargs["deadline"])
+            _wait_for_clock_advance()
             record.unlink()
             os.close(lease_fd)
             lease_fd = -1
@@ -4161,6 +4213,8 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         try:
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "_send_control", side_effect=complete_terminal_cleanup
+            ), patch.object(
+                runtime, "_operation_lock", side_effect=recording_operation_lock
             ):
                 assert runtime.stop() == "stopped"
         finally:
@@ -4168,6 +4222,10 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
                 os.close(lease_fd)
         assert not record.exists()
         _assert_claim_available(paths.runtime_directory / "lease.lock")
+        assert len(control_deadlines) == 1
+        assert lock_calls
+        assert {deadline for deadline, _ in lock_calls} == set(control_deadlines)
+        assert any(timeout == 0.0 for _, timeout in lock_calls)
 
 
 def test_public_stop_accepts_record_disappearance_during_terminal_snapshot():
