@@ -386,6 +386,55 @@ def test_root_keyed_completed_stages_are_optional_canonical_and_root_local():
         }
 
 
+def test_completed_stage_roots_out_of_sorted_order_are_rejected_on_load():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+            state.save_configuration_owned(
+                first,
+                paths=paths,
+                stage_order=["Queue", "Done"],
+                completed_stage_names=["Done", "Queue"],
+            )
+            state.save_configuration_owned(
+                second,
+                paths=paths,
+                stage_order=["Archive"],
+                completed_stage_names=["Review"],
+            )
+            saved = json.loads(paths.config_file.read_text(encoding="utf-8"))
+            completed = saved["completed_stages"]
+            reversed_payload = {
+                **saved,
+                "completed_stages": dict(reversed(list(completed.items()))),
+            }
+            paths.config_file.write_text(
+                json.dumps(reversed_payload) + "\n", encoding="utf-8"
+            )
+            with pytest.raises(state.ConfigurationError) as rejected:
+                state.load_configuration(paths)
+            sorted_payload = {**saved, "completed_stages": dict(sorted(completed.items()))}
+            paths.config_file.write_text(json.dumps(sorted_payload) + "\n", encoding="utf-8")
+            loaded = state.load_configuration(paths)
+
+        first_key, second_key = str(first.resolve()), str(second.resolve())
+        assert list(reversed_payload["completed_stages"]) == [second_key, first_key]
+        assert list(sorted_payload["completed_stages"]) == [first_key, second_key]
+        assert reversed_payload == sorted_payload
+        assert type(rejected.value) is state.ConfigurationError
+        assert str(rejected.value) == "Nyx configuration completed stages are not canonical"
+        assert loaded.completed_stages == {
+            first_key: ("Done", "Queue"),
+            second_key: ("Review",),
+        }
+
+
 @pytest.mark.parametrize("invalid", [["Done", "Done"], ["bad/name"], ["bad\\name"], [""]])
 def test_invalid_completed_stage_policy_fails_before_replacement(invalid):
     with TemporaryDirectory() as temporary:
