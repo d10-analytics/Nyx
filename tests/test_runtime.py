@@ -5161,7 +5161,14 @@ def test_worker_retains_no_bytes_beyond_stream_caps_and_completes_readers():
 
 
 def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
-    for exit_code, expected in ((4, "producer_unavailable"), (7, "producer_failed")):
+    cases = (
+        (3, "producer_output_too_large"),
+        (4, "producer_unavailable"),
+        (5, "producer_failed"),
+        (6, "producer_failed"),
+        (7, "producer_failed"),
+    )
+    for exit_code, expected in cases:
         manager = runtime.CatalogWorkerManager(
             command_factory=lambda exit_code=exit_code: [
                 sys.executable,
@@ -5170,10 +5177,11 @@ def test_worker_maps_eof_before_nonzero_exit_and_reaps_child():
             ],
             timeout=2,
         )
-        with pytest.raises(runtime.WorkerError, match=expected):
+        with pytest.raises(runtime.WorkerError) as raised:
             manager.fetch_catalog()
-        assert manager.close(time.monotonic() + 2)
-        assert manager.active_count == 0
+        assert raised.value.code == expected, exit_code
+        assert manager.close(time.monotonic() + 2) is True, exit_code
+        assert manager.active_count == 0, exit_code
 
 
 def test_worker_cancellation_after_eof_wins_before_success_publication():
@@ -5466,6 +5474,113 @@ def test_close_between_real_spawn_and_registration_reaps_the_child():
     assert [error.code for error in errors] == ["producer_cancelled"]
     assert len(processes) == 1 and processes[0].poll() is not None
     assert manager.active_count == 0
+
+
+def _run_reversed_spawns(*, held_call_fails: bool) -> SimpleNamespace:
+    """Complete a second fetch entirely while the first is held inside ``Popen``.
+
+    The first request enters the patched ``Popen`` (so its reservation is the
+    first one appended) and stays there until the second ``fetch_catalog`` has
+    returned.  The held call then either spawns its real child or raises
+    ``OSError``.  Every real child is reaped before this helper returns.
+    """
+
+    real_popen = subprocess.Popen
+    processes: list[subprocess.Popen[bytes]] = []
+    calls_lock = threading.Lock()
+    calls = 0
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_first_call(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        nonlocal calls
+        with calls_lock:
+            index = calls
+            calls += 1
+        if index == 0:
+            entered.set()
+            assert release.wait(timeout=5)
+            if held_call_fails:
+                raise OSError("injected held spawn failure")
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    manager = runtime.CatalogWorkerManager(
+        command_factory=lambda: [sys.executable, "-c", "import sys; sys.stdout.write('x')"]
+    )
+    first_results: list[bytes] = []
+    first_errors: list[BaseException] = []
+
+    def first_fetch() -> None:
+        try:
+            first_results.append(manager.fetch_catalog())
+        except BaseException as error:
+            first_errors.append(error)
+
+    first_thread = threading.Thread(target=first_fetch, daemon=True)
+    try:
+        with patch.object(worker.subprocess, "Popen", side_effect=hold_first_call):
+            first_thread.start()
+            assert entered.wait(timeout=2)
+            second_result = manager.fetch_catalog()
+            release.set()
+            first_thread.join(timeout=5)
+        assert not first_thread.is_alive()
+        settle_deadline = time.monotonic() + 2
+        while manager.active_count and time.monotonic() < settle_deadline:
+            time.sleep(0.01)
+        settled_count = manager.active_count
+        close_result = manager.close(time.monotonic() + 3)
+        final_count = manager.active_count
+        children_exited = [process.poll() is not None for process in processes]
+    finally:
+        release.set()
+        first_thread.join(timeout=5)
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+    return SimpleNamespace(
+        first_results=first_results,
+        first_errors=first_errors,
+        second_result=second_result,
+        settled_count=settled_count,
+        close_result=close_result,
+        final_count=final_count,
+        children_exited=children_exited,
+    )
+
+
+def test_reversed_spawn_registration_removes_only_each_requests_reservation():
+    outcome = _run_reversed_spawns(held_call_fails=False)
+
+    assert outcome.first_errors == []
+    assert outcome.first_results == [b"x"]
+    assert outcome.second_result == b"x"
+    assert outcome.settled_count == 0
+    assert outcome.close_result is True
+    assert outcome.final_count == 0
+    assert outcome.children_exited == [True, True]
+
+
+def test_reversed_spawn_failure_raises_its_own_error_without_leaking():
+    outcome = _run_reversed_spawns(held_call_fails=True)
+
+    assert outcome.first_results == []
+    assert len(outcome.first_errors) == 1
+    error = outcome.first_errors[0]
+    assert isinstance(error, OSError)
+    assert not isinstance(error, ValueError)
+    assert str(error) == "injected held spawn failure"
+    assert outcome.second_result == b"x"
+    assert outcome.settled_count == 0
+    assert outcome.close_result is True
+    assert outcome.final_count == 0
+    assert outcome.children_exited == [True]
 
 
 @pytest.mark.skipif(

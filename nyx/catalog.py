@@ -25,6 +25,12 @@ from .state import (
 )
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+
+
+class CatalogOutputTooLargeError(ValueError):
+    """The rendered catalog would exceed ``MAX_OUTPUT_BYTES``."""
+
+
 _INVALID_POLICY = object()
 _HEADER_BYTE_LIMIT = 65536
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -1215,7 +1221,7 @@ def _build_catalog(
     ).hexdigest()
     rendered = json.dumps(catalog, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     if len(rendered.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:
-        raise ValueError("catalog output exceeds 2 MiB")
+        raise CatalogOutputTooLargeError("catalog output exceeds 2 MiB")
     return rendered
 
 

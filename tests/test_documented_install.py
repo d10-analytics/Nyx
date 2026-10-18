@@ -301,6 +301,18 @@ def test_documented_header_limits_match_the_catalog():
     assert f"A whole `program.md` descriptor obeys the same {limit}-byte limit" in normalized
 
 
+def test_documented_output_limit_matches_the_catalog():
+    document = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    heading = "## If something looks wrong"
+    assert heading in document
+    section = document.split(heading, 1)[1].split("\n## ", 1)[0]
+    normalized = re.sub(r"\s+", " ", section)
+    mebibytes = catalog.MAX_OUTPUT_BYTES / (1024 * 1024)
+    limit = f"{mebibytes:g} MiB"
+    assert "`producer_output_too_large`" in normalized
+    assert f"larger than the {limit} catalog limit" in normalized
+
+
 def test_event_walkthrough_shows_whole_item_and_named_outcomes():
     document = (REPOSITORY_ROOT / "docs" / "workspaces.md").read_text(encoding="utf-8")
     assert EVENT_COMPLETION_EXAMPLE in document

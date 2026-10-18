@@ -15,18 +15,23 @@ from typing import Any
 
 from . import state
 from ._native_claim import NativeClaim
-from .catalog import scan_catalog
+from .catalog import MAX_OUTPUT_BYTES, CatalogOutputTooLargeError, scan_catalog
 
 if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
     import ctypes
     from ctypes import wintypes
 
-MAX_STDOUT_BYTES = 2 * 1024 * 1024
+MAX_STDOUT_BYTES = MAX_OUTPUT_BYTES
 MAX_STDERR_BYTES = 8 * 1024
 WORKER_TIMEOUT = 5.0
 _READ_CHUNK_BYTES = 64 * 1024
 WORKER_EXECUTABLE_NAME = "NyxWorker"
 WORKER_HELPER_DIRECTORY = "NyxWorker"
+# Categories for a worker's nonzero exit status; any other status is a failure.
+_EXIT_STATUS_CATEGORIES = {
+    3: "producer_output_too_large",
+    4: "producer_unavailable",
+}
 
 
 def _is_packaged_application() -> bool:
@@ -260,13 +265,13 @@ def _worker_main(
             configuration_revision=configuration.revision,
         )
         encoded = rendered.encode("utf-8")
-        if len(encoded) > MAX_STDOUT_BYTES:
-            return 3
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
         return 0
     except (state.ConfigurationError, state.AccountHomeError, state.UnsupportedPlatformError):
         return 4
+    except CatalogOutputTooLargeError:
+        return 3
     except (OSError, ValueError, UnicodeError):
         return 5
     except Exception:  # noqa: BLE001 - worker boundary has a category-safe envelope
@@ -296,11 +301,12 @@ class _Child:
     )
 
 
-@dataclass
 class _Reservation:
-    """Admission reservation held while a direct child is being spawned."""
+    """Admission reservation held while a direct child is being spawned.
 
-    completed: bool = False
+    Each reservation is compared by identity, so a request only ever removes
+    its own reservation however overlapping spawns complete.
+    """
 
 
 class CatalogWorkerManager:
@@ -394,7 +400,6 @@ class CatalogWorkerManager:
         child = _Child(process)
         with self._lock:
             self._reservations.remove(reservation)
-            reservation.completed = True
             self._children.append(child)
             self._start_readers_locked(child)
             if self._closing:
@@ -613,8 +618,8 @@ class CatalogWorkerManager:
                         child.terminal_reason = "success"
                         self._start_finalizer_locked(child)
                         return bytes(child.captured["stdout"])
-                    code = (
-                        "producer_unavailable" if child.process.returncode == 4 else "producer_failed"
+                    code = _EXIT_STATUS_CATEGORIES.get(
+                        child.process.returncode, "producer_failed"
                     )
                     self._select_terminal_locked(child, code)
                     raise WorkerError(code)
