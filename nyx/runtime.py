@@ -1067,6 +1067,9 @@ class _Daemon:
         if time.monotonic_ns() >= deadline_ns:
             raise StartupError("Nyx startup timed out")
         self.paths = _paths(create=True, deadline_ns=deadline_ns)
+        # Every catalog worker inherits only the read end.  This daemon alone
+        # holds the write end, so its exit, however abrupt, ends each worker.
+        self.parent_liveness_read, self.parent_liveness_write = os.pipe()
         self.stop_requested = threading.Event()
         self.shutdown_lock = threading.Lock()
         self.shutdown_deadline_lock = threading.Lock()
@@ -1076,6 +1079,7 @@ class _Daemon:
             port=PORT,
             deadline=self._deadline,
             thread_factory=lambda **kwargs: threading.Thread(**kwargs),
+            workers=CatalogWorkerManager(parent_liveness_fd=self.parent_liveness_read),
         )
         self.control: socket.socket | None = None
         self.instance: Instance | None = None
@@ -1393,10 +1397,14 @@ class _Daemon:
                 self.shutdown_done.clear()
                 if self.shutdown_result == "timeout":
                     self.shutdown_done.wait()
-            try:
-                os.close(self.lease_fd)
-            except OSError:
-                pass
+            # Release the liveness pipe only after the cleanup wait above, once
+            # admission and every worker have closed, so no spawn can be
+            # handed a descriptor that is being released.
+            for fd in (self.parent_liveness_write, self.parent_liveness_read, self.lease_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         return 0
 
 
