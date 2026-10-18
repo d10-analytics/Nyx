@@ -1265,6 +1265,126 @@ def test_application_settings_save_revalidates_after_post_replace_failure():
         assert application.shutdown(time.monotonic() + 2)
 
 
+def _settings_replaced_record_hook(paths, requested_order, replacement):
+    """Overwrite the just-replaced record, then fail its commit verification once.
+
+    The fired flag is tested before the record is read, so every later
+    verification (including revalidation of an unreadable record) sees the
+    real result.
+    """
+
+    original_verify = state._verify_record
+    fires = []
+
+    def verify(path, *args, **kwargs):
+        details = original_verify(path, *args, **kwargs)
+        if fires or path != paths.config_file:
+            return details
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if list(requested_order) not in payload.get("stage_orders", {}).values():
+            return details
+        fires.append(path)
+        path.write_bytes(replacement)
+        raise OSError("injected post-replacement verification failure")
+
+    return verify, fires
+
+
+def _settings_application(paths):
+    initial = state.load_configuration(paths)
+    application = runtime.ApplicationRuntime(
+        port=runtime.PORT, deadline=time.monotonic() + 5
+    )
+    application.capture_configuration(initial, paths)
+    application.admit_catalog()
+    return initial, application
+
+
+def test_application_settings_save_reports_conflict_for_competing_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        root = str(initial.specification_root)
+        competing = state._configuration_bytes(
+            initial.specification_root,
+            {root: ["Archive", "Review"]},
+            {root: ["Archive"]},
+        )
+        verify, fires = _settings_replaced_record_hook(paths, ["Queue", "Done"], competing)
+        with patch.object(state, "_verify_record", side_effect=verify):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "conflict",
+        }
+        assert paths.config_file.read_bytes() == competing
+        reloaded = state.load_configuration(paths)
+        assert reloaded.stage_order == ("Archive", "Review")
+        assert reloaded.completed_stage_names == ("Archive",)
+        # The runtime adopts the competing record, so its reported revision is current.
+        assert application.get_settings() == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": result["revision"],
+        }
+        retried = application.save_settings(result["revision"], ["Queue", "Done"], ["Done"])
+        assert retried == {
+            "order": ["Queue", "Done"],
+            "completed": ["Done"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "success",
+        }
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_reload_needed_for_unreadable_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        verify, fires = _settings_replaced_record_hook(paths, ["Queue", "Done"], b"{")
+        with patch.object(state, "_verify_record", side_effect=verify):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": [],
+            "completed": [],
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_reload_needed_for_unreadable_record_before_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        original_replace = state.os.replace
+        fires = []
+
+        def replace(source, destination, *args, **kwargs):
+            if fires or Path(destination) != paths.config_file:
+                return original_replace(source, destination, *args, **kwargs)
+            fires.append(Path(destination))
+            paths.config_file.write_bytes(b"{")
+            raise OSError("injected replacement failure")
+
+        with patch.object(state.os, "replace", side_effect=replace):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": [],
+            "completed": [],
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+        assert application.shutdown(time.monotonic() + 2)
+
+
 def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_admission():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))

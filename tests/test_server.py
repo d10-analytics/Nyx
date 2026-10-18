@@ -841,6 +841,98 @@ def test_real_application_settings_http_revalidates_after_commit_verification_fa
             assert application.shutdown(time.monotonic() + 2)
 
 
+def _settings_http_replaced_record(root: Path, replacement):
+    """PUT settings while the replaced record is overwritten before verification fails once.
+
+    ``replacement`` maps the saved configuration to the bytes written over the
+    just-replaced record. Returns the HTTP status, decoded body, injected fire
+    count, and state paths.
+    """
+
+    home = root / "home"
+    home.mkdir()
+    specification_root = root / "specifications"
+    specification_root.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home):
+        initial = state.setup(specification_root)
+        paths = state.state_paths()
+    replacement_bytes = replacement(initial)
+
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+    application.capture_configuration(initial, paths)
+    application.admit_catalog()
+    original_verify = state._verify_record
+    fires = []
+
+    def overwrite_then_fail_once(path, *args, **kwargs):
+        details = original_verify(path, *args, **kwargs)
+        if fires or path != paths.config_file:
+            return details
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if ["Queue", "Done"] not in payload.get("stage_orders", {}).values():
+            return details
+        fires.append(path)
+        path.write_bytes(replacement_bytes)
+        raise OSError("injected post-replacement verification failure")
+
+    try:
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            with patch.object(state, "_verify_record", side_effect=overwrite_then_fail_once):
+                status, _, body = request(
+                    port,
+                    "PUT",
+                    "/api/settings",
+                    body=json.dumps(
+                        {
+                            "revision": initial.revision,
+                            "order": ["Queue", "Done"],
+                            "completed": ["Done"],
+                        }
+                    ),
+                )
+    finally:
+        assert application.shutdown(time.monotonic() + 2)
+    return status, json.loads(body), len(fires), paths
+
+
+def test_real_application_settings_http_reports_conflict_for_competing_record_after_replace():
+    def competing(initial):
+        root = str(initial.specification_root)
+        return state._configuration_bytes(
+            initial.specification_root,
+            {root: ["Archive", "Review"]},
+            {root: ["Archive"]},
+        )
+
+    with TemporaryDirectory() as temporary:
+        status, body, fires, paths = _settings_http_replaced_record(Path(temporary), competing)
+        assert fires == 1
+        assert status == 409
+        assert body == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "conflict",
+        }
+        assert state.load_configuration(paths).stage_order == ("Archive", "Review")
+
+
+def test_real_application_settings_http_reports_reload_needed_for_unreadable_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        status, body, fires, paths = _settings_http_replaced_record(
+            Path(temporary), lambda initial: b"{"
+        )
+        assert fires == 1
+        assert status == 409
+        assert body == {
+            "order": [],
+            "completed": [],
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+
+
 @pytest.mark.parametrize(
     "category",
     [
