@@ -174,6 +174,29 @@ class AppendingReader:
         return False
 
 
+class RewritingReader:
+    """Wrap a real opened stream and rewrite the file once after it closes."""
+
+    def __init__(self, stream, path: Path, content: bytes) -> None:
+        self._stream = stream
+        self._path = path
+        self._content = content
+
+    def read(self, *args):
+        return self._stream.read(*args)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stream.close()
+        # The built-in ``open`` keeps this write out of the patched
+        # ``catalog.Path.open`` call count.
+        with open(self._path, "wb") as sink:
+            sink.write(self._content)
+        return False
+
+
 class CatalogTests(TestCase):
     def test_public_producers_use_one_portable_scanner_and_reject_root_links(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -2053,3 +2076,212 @@ def test_nested_admission_deep_unreadable_folders_keep_messages_bounded(tmp_path
     assert {entry["package_path"] for entry in value["entries"]} == {"Fictional/Queue/ok"}
     assert parse_catalog(value).as_dict() == value
     assert all(_text_units(message) <= MAX_TEXT_UNITS for message in messages(value))
+
+
+def prerequisite_edge(entry: dict, kind: str, claim_name: str | None = None) -> dict:
+    """Select the single rendered edge with this kind and claim name."""
+    matches = [
+        edge
+        for edge in entry["relationship"]["prerequisites"]
+        if edge["kind"] == kind and edge.get("claim_name") == claim_name
+    ]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+def test_self_missing_and_unknown_claim_edges_keep_distinct_reasons(tmp_path):
+    source_id = "11111111-1111-4111-8111-111111111111"
+    target_id = "22222222-2222-4222-8222-222222222222"
+    source_ref = f"sha256:{'a' * 64}"
+    target_ref = f"sha256:{'b' * 64}"
+    root = tmp_path / "specs"
+    package(
+        root,
+        "Queue",
+        "source",
+        f"# Source\nPackage ID: {source_id}\n"
+        f"Claim: release | satisfied | {source_ref}\n"
+        f"Prerequisite: {source_id} | release\n"
+        f"Completion Prerequisite: {source_id}\n"
+        f"Prerequisite: {target_id} | absent\n"
+        f"Prerequisite: {target_id} | pending\n",
+    )
+    package(
+        root,
+        "Queue",
+        "target",
+        f"# Target\nPackage ID: {target_id}\n"
+        f"Claim: release | satisfied | {target_ref}\n"
+        f"Claim: pending | unknown\n",
+    )
+    # The policy names the source's own stage, so a self completion edge
+    # would resolve as satisfied if self edges were not singled out.
+    value = json.loads(catalog.scan_catalog(root, completed_stage_names=["Queue"]))
+    source = entry_by_path(value, "Fictional/Queue/source")
+    assert prerequisite_edge(source, "claim", "release") == {
+        "kind": "claim",
+        "target_package_id": source_id,
+        "claim_name": "release",
+        "observed_state": "satisfied",
+        "observed_evidence_ref": source_ref,
+        "resolved_state": "unknown",
+        "reason": "self_edge",
+    }
+    assert prerequisite_edge(source, "completion") == {
+        "kind": "completion",
+        "target_package_id": source_id,
+        "observed_stage": "Queue",
+        "resolved_state": "unknown",
+        "reason": "self_edge",
+    }
+    assert prerequisite_edge(source, "claim", "absent") == {
+        "kind": "claim",
+        "target_package_id": target_id,
+        "claim_name": "absent",
+        "observed_state": None,
+        "observed_evidence_ref": None,
+        "resolved_state": "unknown",
+        "reason": "missing_claim",
+    }
+    assert prerequisite_edge(source, "claim", "pending") == {
+        "kind": "claim",
+        "target_package_id": target_id,
+        "claim_name": "pending",
+        "observed_state": "unknown",
+        "observed_evidence_ref": None,
+        "resolved_state": "unknown",
+        "reason": "claim_unknown",
+    }
+
+
+def test_duplicate_package_id_rows_leave_target_identity_invalid(tmp_path):
+    source_id = "11111111-1111-4111-8111-111111111111"
+    target_id = "22222222-2222-4222-8222-222222222222"
+    root = tmp_path / "specs"
+    package(
+        root,
+        "Queue",
+        "source",
+        f"# Source\nPackage ID: {source_id}\nPrerequisite: {target_id} | release\n",
+    )
+    package(
+        root,
+        "Queue",
+        "target",
+        f"# Target\nPackage ID: {target_id}\nPackage ID: {target_id}\n"
+        f"Claim: release | satisfied | sha256:{'b' * 64}\n",
+    )
+    value = json.loads(catalog.build_catalog(root))
+    target = entry_by_path(value, "Fictional/Queue/target")
+    assert target["package_id"] is None
+    assert target["relationship"]["participation"] == "invalid"
+    source = entry_by_path(value, "Fictional/Queue/source")
+    assert prerequisite_edge(source, "claim", "release") == {
+        "kind": "claim",
+        "target_package_id": target_id,
+        "claim_name": "release",
+        "observed_state": None,
+        "observed_evidence_ref": None,
+        "resolved_state": "unknown",
+        "reason": "target_invalid_identity",
+    }
+
+
+@pytest.mark.parametrize("reserved", ["Reference", ".pipeline"])
+def test_reserved_names_inside_a_stage_are_skipped_at_every_level(tmp_path, reserved):
+    root = tmp_path / "specs"
+    package(root, "Queue", f"{reserved}/hidden-a", "# Hidden A\n")
+    package(root, "Queue", f"group/{reserved}/hidden-b", "# Hidden B\n")
+    package(root, "Queue", "group/visible", "# Visible\n")
+    value = json.loads(catalog.scan_catalog(root))
+    assert {entry["package_path"] for entry in value["entries"]} == {
+        "Fictional/Queue/group/visible"
+    }
+    assert value["discovery_diagnostics"] == []
+    assert value["inventory"]["stages"] == [
+        {"project": "Fictional", "stage": "Queue", "availability": "complete"}
+    ]
+
+
+def test_workspace_root_reference_folder_is_not_a_project(tmp_path):
+    root = tmp_path / "specs"
+    hidden = root / "Reference" / "Queue" / "hidden"
+    hidden.mkdir(parents=True)
+    hidden.joinpath("spec.md").write_text("# Hidden\n", encoding="utf-8")
+    package(root, "Queue", "visible", "# Visible\n")
+    value = json.loads(catalog.build_catalog(root))
+    assert value["inventory"]["projects"] == [
+        {"name": "Fictional", "availability": "complete"}
+    ]
+    assert [entry["package_path"] for entry in value["entries"]] == [
+        "Fictional/Queue/visible"
+    ]
+
+
+def test_anchor_changed_once_after_read_is_retried_and_read_again(tmp_path):
+    root = tmp_path / "specs"
+    spec = package(root, "Queue", "changing", "# Before\n") / "spec.md"
+    rewritten = b"# After the rewrite\n"
+    assert len(rewritten) != spec.stat().st_size
+    original_open = catalog.Path.open
+    opens: list[Path] = []
+
+    def rewriting_open(target, *args, **kwargs):
+        stream = original_open(target, *args, **kwargs)
+        if Path(target) == spec:
+            opens.append(Path(target))
+            if len(opens) == 1:
+                return RewritingReader(stream, spec, rewritten)
+        return stream
+
+    with patch.object(catalog.Path, "open", autospec=True, side_effect=rewriting_open):
+        value = json.loads(catalog.scan_catalog(root))
+    assert len(opens) == 2
+    assert entry_by_path(value, "Fictional/Queue/changing")["declared"]["title"] == (
+        "After the rewrite"
+    )
+    assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
+    assert value["discovery_diagnostics"] == []
+
+
+def test_completion_policy_and_stage_names_match_case_sensitively(tmp_path):
+    source_id = "11111111-1111-4111-8111-111111111111"
+    lower_id = "22222222-2222-4222-8222-222222222222"
+    title_id = "33333333-3333-4333-8333-333333333333"
+    root = tmp_path / "specs"
+    package(
+        root,
+        "Queue",
+        "source",
+        f"# Source\nPackage ID: {source_id}\n"
+        f"Completion Prerequisite: {lower_id}\n"
+        f"Completion Prerequisite: {title_id}\n",
+    )
+    package(root, "done", "lower", f"# Lower\nPackage ID: {lower_id}\n")
+    package(root, "Review", "title", f"# Title\nPackage ID: {title_id}\n")
+    value = json.loads(
+        catalog.scan_catalog(root, completed_stage_names=["Done", "review"])
+    )
+    edges = {
+        edge["target_package_id"]: edge
+        for edge in entry_by_path(value, "Fictional/Queue/source")["relationship"][
+            "prerequisites"
+        ]
+        if edge["kind"] == "completion"
+    }
+    assert edges == {
+        lower_id: {
+            "kind": "completion",
+            "target_package_id": lower_id,
+            "observed_stage": "done",
+            "resolved_state": "unsatisfied",
+            "reason": "completion_unsatisfied",
+        },
+        title_id: {
+            "kind": "completion",
+            "target_package_id": title_id,
+            "observed_stage": "Review",
+            "resolved_state": "unsatisfied",
+            "reason": "completion_unsatisfied",
+        },
+    }
