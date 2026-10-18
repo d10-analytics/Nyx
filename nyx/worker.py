@@ -147,7 +147,7 @@ class WorkerError(RuntimeError):
 
 
 class _ParentLossObserver:
-    """Terminate a desktop worker when its shell closes or disappears."""
+    """Terminate a worker once its liveness pipe's write end is closed by its holder."""
 
     def __init__(self, fd: int) -> None:
         self.fd = fd
@@ -201,11 +201,19 @@ def _receive_worker_inheritance(
     recovery_path: Path | None,
     parent_liveness_fd: int | None,
 ) -> tuple[NativeClaim | None, _ParentLossObserver | None] | None:
-    """Validate desktop inheritance before configuration can be loaded."""
+    """Validate a worker's inherited objects before configuration can be loaded.
 
-    if recovery_fd is None and recovery_path is None and parent_liveness_fd is None:
-        return (None, None)
-    if recovery_fd is None or recovery_path is None or parent_liveness_fd is None:
+    The accepted set is chosen only by which arguments are present: none,
+    parent liveness alone, or a recovery claim with its path and parent
+    liveness.  Any other set is refused, and a claim that fails reception or
+    adoption is refused rather than accepted as parent liveness alone.
+    """
+
+    if parent_liveness_fd is None:
+        if recovery_fd is None and recovery_path is None:
+            return (None, None)
+        return None
+    if (recovery_fd is None) != (recovery_path is None):
         return None
     received_fd: int | None = None
     liveness_fd: int | None = None
@@ -213,12 +221,15 @@ def _receive_worker_inheritance(
     observer: _ParentLossObserver | None = None
     succeeded = False
     try:
-        received_fd = NativeClaim.receive_handle(recovery_fd)
-        liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
-        claim = NativeClaim(recovery_path)
-        if not claim.adopt_received(received_fd):
-            return None
-        received_fd = None
+        if recovery_fd is not None and recovery_path is not None:
+            received_fd = NativeClaim.receive_handle(recovery_fd)
+            liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
+            claim = NativeClaim(recovery_path)
+            if not claim.adopt_received(received_fd):
+                return None
+            received_fd = None
+        else:
+            liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
         observer = _ParentLossObserver(liveness_fd)
         observer.start()
         liveness_fd = None
@@ -309,6 +320,38 @@ class _Reservation:
     """
 
 
+@dataclass(frozen=True)
+class _InheritedObjects:
+    """The objects one catalog worker inherits from its manager.
+
+    One derived value supplies both the descriptors the platform passes to
+    the child and the arguments that name them, so the two cannot disagree.
+    """
+
+    recovery_fd: int | None = None
+    recovery_path: Path | None = None
+    parent_liveness_fd: int | None = None
+
+    @property
+    def descriptors(self) -> tuple[int, ...]:
+        return tuple(
+            fd for fd in (self.recovery_fd, self.parent_liveness_fd) if fd is not None
+        )
+
+    def arguments(self) -> list[str]:
+        arguments: list[str] = []
+        if self.recovery_fd is not None:
+            arguments += ["--recovery-fd", str(NativeClaim.transfer_handle(self.recovery_fd))]
+        if self.recovery_path is not None:
+            arguments += ["--recovery-path", str(self.recovery_path)]
+        if self.parent_liveness_fd is not None:
+            arguments += [
+                "--parent-liveness-fd",
+                str(NativeClaim.transfer_handle(self.parent_liveness_fd)),
+            ]
+        return arguments
+
+
 class CatalogWorkerManager:
     """Admit, register, cancel and reap catalog worker children."""
 
@@ -366,18 +409,13 @@ class CatalogWorkerManager:
             if self._working_directory is not None:
                 spawn_kwargs["cwd"] = self._working_directory
             inherited_handles: list[int] = []
-            if self._recovery_claim is not None:
-                if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
-                    raise WorkerError("producer_unavailable")
+            inherited = self._inherited_objects()
+            if inherited.descriptors:
                 if os.name != "nt":
-                    spawn_kwargs["pass_fds"] = (
-                        self._recovery_claim.fd,
-                        self._parent_liveness_fd,
-                    )
+                    spawn_kwargs["pass_fds"] = inherited.descriptors
                 else:  # pragma: no cover - exercised by the native Windows lane
                     inherited_handles = [
-                        NativeClaim.transfer_handle(self._recovery_claim.fd),
-                        NativeClaim.transfer_handle(self._parent_liveness_fd),
+                        NativeClaim.transfer_handle(fd) for fd in inherited.descriptors
                     ]
                     for handle in inherited_handles:
                         os.set_handle_inheritable(handle, True)
@@ -385,7 +423,7 @@ class CatalogWorkerManager:
                     startup.lpAttributeList = {"handle_list": inherited_handles}
                     spawn_kwargs["startupinfo"] = startup
             process = subprocess.Popen(
-                self._worker_command(),
+                self._worker_command(inherited),
                 **spawn_kwargs,
             )
         except BaseException:
@@ -418,35 +456,31 @@ class CatalogWorkerManager:
                 else:
                     self._start_finalizer_locked(child)
 
-    def _worker_command(self) -> list[str]:
-        """Add only the catalog worker's inherited desktop objects."""
+    def _inherited_objects(self) -> _InheritedObjects:
+        """Derive what a worker inherits: nothing, liveness, or claim and liveness.
 
-        command = list(self._command_factory())
+        A configured recovery claim requires its descriptor, its path and the
+        parent liveness descriptor; without all three no worker may start.
+        """
+
         if self._recovery_claim is None:
-            return command
-        if self._recovery_claim.fd is None or self._parent_liveness_fd is None:
+            return _InheritedObjects(parent_liveness_fd=self._parent_liveness_fd)
+        if (
+            self._recovery_claim.fd is None
+            or self._recovery_path is None
+            or self._parent_liveness_fd is None
+        ):
             raise WorkerError("producer_unavailable")
-        if self._recovery_path is None:
-            raise WorkerError("producer_unavailable")
-        command.extend(
-            [
-                "--recovery-fd",
-                str(
-                    self._recovery_claim.fd
-                    if os.name != "nt"
-                    else NativeClaim.transfer_handle(self._recovery_claim.fd)
-                ),
-                "--recovery-path",
-                str(self._recovery_path),
-                "--parent-liveness-fd",
-                str(
-                    self._parent_liveness_fd
-                    if os.name != "nt"
-                    else NativeClaim.transfer_handle(self._parent_liveness_fd)
-                ),
-            ]
+        return _InheritedObjects(
+            recovery_fd=self._recovery_claim.fd,
+            recovery_path=self._recovery_path,
+            parent_liveness_fd=self._parent_liveness_fd,
         )
-        return command
+
+    def _worker_command(self, inherited: _InheritedObjects) -> list[str]:
+        """Add only the arguments naming the worker's inherited objects."""
+
+        return [*self._command_factory(), *inherited.arguments()]
 
     def _start_readers_locked(self, child: _Child) -> None:
         """Start one blocking reader per pipe while the child is registered."""
