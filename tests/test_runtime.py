@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -2427,6 +2428,71 @@ def test_daemon_publishes_authenticated_fixed_url_and_releases_transferred_lease
                 assert probe.acquire(blocking=False)
                 probe.close()
                 assert not paths.runtime_directory.joinpath("instance.json").exists()
+
+
+def _descriptors_referring_to(identity: tuple[int, int]) -> list[int]:
+    """List this process's descriptors that refer to one ``(st_dev, st_ino)``."""
+
+    found: list[int] = []
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            details = os.stat(f"/proc/self/fd/{name}")
+        except OSError:
+            continue
+        if (details.st_dev, details.st_ino) == identity:
+            found.append(int(name))
+    return found
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="the detached service and the /proc descriptor table are Linux-only",
+)
+@pytest.mark.parametrize("ending", ["normal_stop", "start_failure"])
+def test_daemon_owns_one_liveness_pipe_and_releases_it_when_run_returns(ending):
+    import fcntl
+
+    original_manager = runtime.CatalogWorkerManager
+    built: list[tuple[dict[str, object], object]] = []
+
+    def build_manager(**kwargs):
+        manager = original_manager(**kwargs)
+        built.append((kwargs, manager))
+        return manager
+
+    def fail_server(**_kwargs):
+        raise OSError(errno.ENOMEM, "injected listener failure")
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        with patch.object(runtime, "_paths", return_value=paths):
+            with patch.object(runtime, "CatalogWorkerManager", side_effect=build_manager):
+                daemon = runtime._Daemon(
+                    lease_fd, int((time.monotonic() + 5) * 1_000_000_000)
+                )
+            assert len(built) == 1
+            kwargs, manager = built[0]
+            assert daemon.workers is manager
+            liveness_fd = kwargs.get("parent_liveness_fd")
+            assert isinstance(liveness_fd, int)
+            assert fcntl.fcntl(liveness_fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+            details = os.fstat(liveness_fd)
+            assert stat.S_ISFIFO(details.st_mode)
+            identity = (details.st_dev, details.st_ino)
+            assert len(_descriptors_referring_to(identity)) == 2
+
+            if ending == "normal_stop":
+                with managed_daemon_run(daemon) as run:
+                    _wait_for_record(paths)
+                    assert runtime.stop() == "stopped"
+                    assert run.join(timeout=5) == 0
+            else:
+                daemon.application._server_factory = fail_server
+                assert daemon.run() == 24
+                assert daemon.server is None
+
+        assert _descriptors_referring_to(identity) == []
 
 
 def test_public_stop_waits_for_terminal_record_removal_and_original_lease_release():
@@ -5777,6 +5843,302 @@ def test_public_start_daemon_survives_launcher_exit_after_acknowledgement():
             "public stop did not converge after retry; the daemon was force-terminated"
         )
         _assert_claim_available(paths.runtime_directory / "lease.lock")
+
+
+# Worker processes replace the catalog scan with a probe that records the
+# inherited liveness descriptor and, once a block file exists, keeps scanning.
+# ``-P -m nyx.worker`` binds ``scan_catalog`` from ``nyx.catalog`` in a fresh
+# ``__main__`` after this file runs, so the module attribute is replaced rather
+# than ``nyx.worker``'s.  The daemon process records its own pid once started.
+_CONTAINMENT_SITECUSTOMIZE = (
+    "import json as _probe_json, sys as _probe_sys\n"
+    "_probe_directory = Path(os.environ['NYX_CONTAINMENT_PROBE'])\n"
+    "def _probe_write(name, value):\n"
+    "    pending = _probe_directory / (name + '.pending')\n"
+    "    pending.write_text(_probe_json.dumps(value), encoding='utf-8')\n"
+    "    os.replace(pending, _probe_directory / name)\n"
+    "if 'nyx.worker' in _probe_sys.orig_argv:\n"
+    "    import fcntl as _probe_fcntl, time as _probe_time\n"
+    "    from nyx import catalog as _probe_catalog\n"
+    "    _probe_real_scan = _probe_catalog.scan_catalog\n"
+    "    def _probe_liveness():\n"
+    "        argv = _probe_sys.argv\n"
+    "        if '--parent-liveness-fd' not in argv:\n"
+    "            return None\n"
+    "        fd = int(argv[argv.index('--parent-liveness-fd') + 1])\n"
+    "        details = os.fstat(fd)\n"
+    "        identity = (details.st_dev, details.st_ino)\n"
+    "        count = 0\n"
+    "        for name in os.listdir('/proc/self/fd'):\n"
+    "            try:\n"
+    "                entry = os.stat('/proc/self/fd/' + name)\n"
+    "            except OSError:\n"
+    "                continue\n"
+    "            if (entry.st_dev, entry.st_ino) == identity:\n"
+    "                count += 1\n"
+    "        access = _probe_fcntl.fcntl(fd, _probe_fcntl.F_GETFL) & os.O_ACCMODE\n"
+    "        return {'device': details.st_dev, 'inode': details.st_ino,\n"
+    "                'access': access, 'count': count}\n"
+    "    def _probe_scan(*args, **kwargs):\n"
+    "        _probe_write('worker-%d.json' % os.getpid(), {\n"
+    "            'pid': os.getpid(), 'ppid': os.getppid(), 'liveness': _probe_liveness()})\n"
+    "        if (_probe_directory / 'block').exists():\n"
+    "            _probe_time.sleep(60)\n"
+    "        return _probe_real_scan(*args, **kwargs)\n"
+    "    _probe_catalog.scan_catalog = _probe_scan\n"
+    "elif 'nyx.runtime' in _probe_sys.orig_argv:\n"
+    "    from nyx import app_runtime as _probe_app_runtime\n"
+    "    _probe_original_start = _probe_app_runtime.ApplicationRuntime.start\n"
+    "    def _probe_start(self, **kwargs):\n"
+    "        result = _probe_original_start(self, **kwargs)\n"
+    "        _probe_write('daemon.json', {'pid': os.getpid()})\n"
+    "        return result\n"
+    "    _probe_app_runtime.ApplicationRuntime.start = _probe_start\n"
+)
+
+# A separate subreaper adopts the daemon after the launcher exits and the
+# daemon's workers after the daemon dies, so their raw wait statuses stay
+# observable.  The pytest process itself never becomes a subreaper.
+_SUBREAPER_HARNESS = (
+    "import ctypes, json, os, sys, time\n"
+    "PR_SET_CHILD_SUBREAPER = 36\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    "if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:\n"
+    "    raise SystemExit('prctl failed: %d' % ctypes.get_errno())\n"
+    "report = open(sys.argv[1], 'a', encoding='utf-8')\n"
+    "def emit(value):\n"
+    "    report.write(json.dumps(value) + '\\n')\n"
+    "    report.flush()\n"
+    "output = os.O_WRONLY | os.O_CREAT | os.O_TRUNC\n"
+    "launcher = os.posix_spawn(\n"
+    "    sys.executable,\n"
+    "    [sys.executable, '-c', 'from nyx import runtime; print(runtime.start())'],\n"
+    "    os.environ,\n"
+    "    file_actions=[\n"
+    "        (os.POSIX_SPAWN_OPEN, 1, sys.argv[2], output, 0o600),\n"
+    "        (os.POSIX_SPAWN_OPEN, 2, sys.argv[3], output, 0o600),\n"
+    "    ],\n"
+    ")\n"
+    "emit({'launcher': launcher})\n"
+    "while True:\n"
+    "    try:\n"
+    "        pid, status = os.waitpid(-1, 0)\n"
+    "    except ChildProcessError:\n"
+    "        time.sleep(0.01)\n"
+    "        continue\n"
+    "    emit({'pid': pid, 'status': status, 'time': time.monotonic()})\n"
+)
+
+
+def _harness_report(report: Path) -> tuple[int | None, dict[int, tuple[int, float]]]:
+    """Return the harness's launcher pid and every reaped pid's status and time."""
+
+    launcher: int | None = None
+    reaped: dict[int, tuple[int, float]] = {}
+    try:
+        lines = report.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return launcher, reaped
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "launcher" in event:
+            launcher = event["launcher"]
+        else:
+            reaped[event["pid"]] = (event["status"], event["time"])
+    return launcher, reaped
+
+
+def _worker_markers(probe: Path) -> dict[int, dict[str, object]]:
+    markers: dict[int, dict[str, object]] = {}
+    for path in probe.glob("worker-*.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        markers[record["pid"]] = record
+    return markers
+
+
+def _request_catalog() -> tuple[int, bytes]:
+    connection = http.client.HTTPConnection("127.0.0.1", runtime.PORT, timeout=15)
+    try:
+        connection.request(
+            "GET", "/api/catalog", headers={"Host": f"127.0.0.1:{runtime.PORT}"}
+        )
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="the detached service, child subreaping and /proc are Linux-only",
+)
+@pytest.mark.parametrize("daemon_signal", ["SIGKILL", "SIGTERM"])
+def test_daemon_loss_terminates_its_scanning_worker_through_one_shared_liveness_pipe(
+    daemon_signal,
+):
+    try:
+        capability_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except PermissionError:
+        pytest.skip("sandbox does not permit loopback sockets")
+    else:
+        capability_probe.close()
+
+    signal_number = getattr(signal, daemon_signal)
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        workspace = _sample_workspace(root)
+        probe = root / "probe"
+        probe.mkdir()
+        report = root / "reaped.jsonl"
+        launcher_stdout = root / "launcher.out"
+        launcher_stderr = root / "launcher.err"
+        environment = _subprocess_environment(
+            home, root / "site", extra_sitecustomize=_CONTAINMENT_SITECUSTOMIZE
+        )
+        environment["NYX_CONTAINMENT_PROBE"] = str(probe)
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(workspace)
+        harness = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _SUBREAPER_HARNESS,
+                str(report),
+                str(launcher_stdout),
+                str(launcher_stderr),
+            ],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
+        recorded: set[int] = set()
+        blocked_outcome: list[object] = []
+        request_thread: threading.Thread | None = None
+        try:
+            launcher_pid: int | None = None
+            reaped: dict[int, tuple[int, float]] = {}
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and harness.poll() is None:
+                launcher_pid, reaped = _harness_report(report)
+                if launcher_pid is not None and launcher_pid in reaped:
+                    break
+                time.sleep(0.02)
+            assert harness.poll() is None, harness.returncode
+            assert launcher_pid is not None and launcher_pid in reaped
+            launcher_status = reaped[launcher_pid][0]
+            assert os.waitstatus_to_exitcode(launcher_status) == 0, (
+                launcher_stderr.read_text(encoding="utf-8")
+            )
+            assert launcher_stdout.read_text(encoding="utf-8").strip() == runtime.URL
+
+            daemon_pid: int | None = None
+            deadline = time.monotonic() + 5
+            while daemon_pid is None and time.monotonic() < deadline:
+                try:
+                    daemon_pid = int(
+                        json.loads((probe / "daemon.json").read_text(encoding="utf-8"))["pid"]
+                    )
+                except (OSError, ValueError, KeyError):
+                    time.sleep(0.01)
+            assert daemon_pid is not None
+            recorded.add(daemon_pid)
+
+            status, body = _request_catalog()
+            assert status == 200, body
+            payload = json.loads(body)
+            assert [entry["package_path"] for entry in payload["entries"]] == [
+                "Fictional/Queue/sample"
+            ]
+            first_markers = _worker_markers(probe)
+            assert len(first_markers) == 1
+            (first,) = first_markers.values()
+            recorded.add(first["pid"])
+
+            (probe / "block").write_text("", encoding="utf-8")
+
+            def request_blocked_catalog() -> None:
+                try:
+                    blocked_outcome.append(_request_catalog())
+                except OSError as error:
+                    blocked_outcome.append(error)
+
+            request_thread = threading.Thread(
+                target=request_blocked_catalog, name="nyx-test-blocked-catalog", daemon=True
+            )
+            request_thread.start()
+            second: dict[str, object] | None = None
+            deadline = time.monotonic() + 10
+            while second is None and time.monotonic() < deadline:
+                markers = _worker_markers(probe)
+                for pid, record in markers.items():
+                    if pid not in first_markers:
+                        second = record
+                if second is None:
+                    time.sleep(0.005)
+            assert second is not None
+            worker_pid = second["pid"]
+            recorded.add(worker_pid)
+            assert second["ppid"] == daemon_pid
+            os.kill(daemon_pid, signal_number)
+            signalled = time.monotonic()
+
+            deadline = signalled + 3
+            while time.monotonic() < deadline:
+                _, reaped = _harness_report(report)
+                if worker_pid in reaped and daemon_pid in reaped:
+                    break
+                time.sleep(0.01)
+            assert worker_pid in reaped, "the scanning worker outlived its daemon"
+            worker_status, worker_reaped_at = reaped[worker_pid]
+            assert os.WIFEXITED(worker_status), worker_status
+            assert os.WEXITSTATUS(worker_status) == 7
+            assert worker_reaped_at - signalled <= 2.0
+            assert daemon_pid in reaped
+            daemon_status, daemon_reaped_at = reaped[daemon_pid]
+            assert os.WIFSIGNALED(daemon_status), daemon_status
+            assert os.WTERMSIG(daemon_status) == signal_number
+            assert daemon_reaped_at - signalled <= 2.0
+            for pid in (first["pid"], worker_pid):
+                with pytest.raises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+            first_liveness = first["liveness"]
+            second_liveness = second["liveness"]
+            assert first_liveness is not None and second_liveness is not None
+            assert (first_liveness["device"], first_liveness["inode"]) == (
+                second_liveness["device"],
+                second_liveness["inode"],
+            )
+            for liveness in (first_liveness, second_liveness):
+                assert liveness["access"] == os.O_RDONLY
+                assert liveness["count"] == 1
+        finally:
+            # Test-only cleanup of any recorded process the proof left running.
+            _, reaped = _harness_report(report)
+            killed: list[int] = []
+            for pid in recorded:
+                if pid in reaped:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    continue
+                killed.append(pid)
+            deadline = time.monotonic() + 5
+            while killed and time.monotonic() < deadline and harness.poll() is None:
+                _, reaped = _harness_report(report)
+                if all(pid in reaped for pid in killed):
+                    break
+                time.sleep(0.02)
+            harness.kill()
+            harness.wait(timeout=5)
+            if request_thread is not None:
+                request_thread.join(timeout=20)
 
 
 def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_exit():

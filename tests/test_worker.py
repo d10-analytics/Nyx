@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -394,6 +395,197 @@ def test_parent_loss_terminates_a_scanning_desktop_worker_and_releases_recovery_
             if write_fd >= 0:
                 os.close(write_fd)
             os.close(read_fd)
+            claim.close()
+
+
+_OBSERVER_THREAD_NAME = "nyx-worker-parent-observer"
+
+
+def _observer_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == _OBSERVER_THREAD_NAME and thread.is_alive()
+    ]
+
+
+def test_liveness_only_worker_observes_parent_before_one_configuration_load() -> None:
+    with TemporaryDirectory() as temporary:
+        configuration = state.Configuration(Path(temporary))
+        read_fd, write_fd = os.pipe()
+        stdout = _Stdout()
+        observer_alive_at_load: list[bool] = []
+
+        def load_configuration() -> state.Configuration:
+            observer_alive_at_load.append(bool(_observer_threads()))
+            return configuration
+
+        assert _observer_threads() == []
+        try:
+            with (
+                patch.object(
+                    worker.NativeClaim,
+                    "receive_handle",
+                    side_effect=lambda fd, **_kwargs: os.dup(fd),
+                ) as receive,
+                patch.object(worker.state, "load_configuration", side_effect=load_configuration),
+                patch.object(worker, "scan_catalog", return_value="exact bytes"),
+                patch.object(worker.sys, "stdout", stdout),
+            ):
+                assert worker._worker_main(parent_liveness_fd=read_fd) == 0
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
+        assert stdout.buffer.writes == [b"exact bytes"]
+        assert receive.call_count == 1
+        assert receive.call_args.args == (read_fd,)
+        assert receive.call_args.kwargs == {"read_only": True}
+        assert observer_alive_at_load == [True]
+        assert _observer_threads() == []
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="direct descriptor fixture is POSIX-only; native handle proof uses the shell path",
+)
+def test_parent_loss_terminates_a_scanning_liveness_only_worker():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        marker = root / "scan-started"
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(workspace)
+        read_fd, write_fd = os.pipe()
+        script = (
+            "import os,sys,time\n"
+            "from pathlib import Path\n"
+            "from nyx import state,worker\n"
+            "state.resolve_account_home=lambda: Path(os.environ['NYX_TEST_HOME'])\n"
+            "marker=Path(sys.argv[1])\n"
+            "def scan(*args,**kwargs):\n"
+            "    marker.write_text('started')\n"
+            "    time.sleep(30)\n"
+            "    return 'late'\n"
+            "worker.scan_catalog=scan\n"
+            "raise SystemExit(worker.worker_entrypoint(sys.argv[2:]))\n"
+        )
+        environment = os.environ.copy()
+        environment["NYX_TEST_HOME"] = str(home)
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(marker), "--parent-liveness-fd", str(read_fd)],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            pass_fds=(read_fd,),
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not marker.exists()
+                and child.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert marker.exists(), child.poll()
+            time.sleep(0.5)
+            assert child.poll() is None
+            os.close(write_fd)
+            write_fd = -1
+            assert child.wait(timeout=5) == 7
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    "present",
+    [
+        ("recovery_fd",),
+        ("recovery_path",),
+        ("recovery_fd", "parent_liveness_fd"),
+        ("recovery_path", "parent_liveness_fd"),
+    ],
+    ids=["recovery-fd", "recovery-path", "recovery-fd-liveness", "recovery-path-liveness"],
+)
+def test_incomplete_claim_inheritance_is_rejected_without_observer_or_load(present) -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        claim = NativeClaim(root / "recovery.lock")
+        assert claim.acquire(blocking=False)
+        read_fd, write_fd = os.pipe()
+        available = {
+            "recovery_fd": claim.fd,
+            "recovery_path": claim.path,
+            "parent_liveness_fd": read_fd,
+        }
+        loads = 0
+        original_start = worker._ParentLossObserver.start
+
+        def load_configuration() -> state.Configuration:
+            nonlocal loads
+            loads += 1
+            raise AssertionError("configuration must not load")
+
+        try:
+            with (
+                patch.object(
+                    worker.NativeClaim,
+                    "receive_handle",
+                    side_effect=lambda fd, **_kwargs: os.dup(fd),
+                ),
+                patch.object(
+                    worker._ParentLossObserver,
+                    "start",
+                    autospec=True,
+                    side_effect=original_start,
+                ) as observer_start,
+                patch.object(worker.state, "load_configuration", side_effect=load_configuration),
+            ):
+                arguments = {name: available[name] for name in present}
+                assert worker._worker_main(**arguments) == 4
+            assert loads == 0
+            observer_start.assert_not_called()
+            assert _observer_threads() == []
+            assert claim.held
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+            claim.close()
+
+
+def test_manager_refuses_a_recovery_claim_without_parent_liveness() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        claim = NativeClaim(root / "recovery.lock")
+        assert claim.acquire(blocking=False)
+        marker = root / "worker-started"
+        manager = worker.CatalogWorkerManager(
+            command_factory=lambda: [
+                sys.executable,
+                "-c",
+                "import sys; from pathlib import Path; Path(sys.argv[1]).write_text('started')",
+                str(marker),
+            ],
+            timeout=5,
+            recovery_claim=claim,
+        )
+        try:
+            with pytest.raises(worker.WorkerError) as error:
+                manager.fetch_catalog()
+            assert error.value.code == "producer_unavailable"
+            assert manager.active_count == 0
+            time.sleep(0.5)
+            assert not marker.exists()
+            assert claim.held
+        finally:
+            assert manager.close(time.monotonic() + 5)
             claim.close()
 
 
