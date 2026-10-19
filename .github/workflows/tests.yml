@@ -150,7 +150,7 @@ jobs:
 
   nyx-desktop-windows:
     runs-on: windows-2025
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -188,6 +188,15 @@ jobs:
           python -m pytest tests/test_desktop.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Build the documented desktop artifact
+        shell: pwsh
+        env:
+          NYX_VERIFY_DOCUMENTED_BUILD: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pytest tests/test_documented_install.py -v -s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build and verify the native desktop artifact
         shell: pwsh
         env:
@@ -196,19 +205,6 @@ jobs:
           NYX_VERIFY_DOCUMENTED_INSTALL: '1'
         run: |
           $ErrorActionPreference = 'Stop'
-          # Nuitka needs the MSVC toolchain, and the deployment tool uses
-          # dumpbin to discover Qt module dependencies.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe is unavailable' }
-          $installation = & $vswhere -latest -products * -property installationPath
-          if (-not $installation) { throw 'a Visual Studio installation was not found' }
-          cmd /c "`"$installation\VC\Auxiliary\Build\vcvars64.bat`" && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
-            }
-          }
-          python scripts/build_desktop.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $artifact = (Resolve-Path 'dist/desktop/Nyx/Nyx.exe').Path
           Get-FileHash -Algorithm SHA256 (Join-Path (Split-Path $artifact) 'NyxWorker/NyxWorker.exe')
           Get-FileHash -Algorithm SHA256 $artifact
@@ -226,7 +222,7 @@ jobs:
 
   nyx-desktop-macos:
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -256,6 +252,14 @@ jobs:
           python -m pip install -e '.[test,desktop,build]'
           python -m pytest tests/test_desktop.py -v -s
 
+      - name: Build the documented desktop artifact
+        shell: bash
+        env:
+          NYX_VERIFY_DOCUMENTED_BUILD: '1'
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_documented_install.py -v -s
+
       - name: Build and verify the native desktop artifact
         shell: bash
         env:
@@ -264,7 +268,6 @@ jobs:
           NYX_VERIFY_DOCUMENTED_INSTALL: '1'
         run: |
           set -euo pipefail
-          python scripts/build_desktop.py
           artifact="$PWD/dist/desktop/Nyx.app"
           test -d "$artifact"
           shasum -a 256 "$artifact/Contents/MacOS/NyxWorker/NyxWorker"
