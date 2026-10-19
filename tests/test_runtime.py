@@ -3186,8 +3186,9 @@ def test_held_lease_retains_valid_stale_record_without_control_or_signal():
 def _occupied_port_scenario():
     """Run the real daemon against a held fixed port; return its observations.
 
-    Returns ``(exit_code, bound_address, record_exists, temporary_files)`` where
-    ``bound_address`` is the daemon server's address if it ever bound one.
+    Returns ``(exit_code, bound_address, held, record_exists, temporary_files)``
+    where ``bound_address`` is the daemon server's address if it ever bound one
+    and ``held`` is whether the occupant still held the fixed port address.
     """
 
     with TemporaryDirectory() as temporary:

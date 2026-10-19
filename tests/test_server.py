@@ -429,6 +429,16 @@ def _watch_connection_ends(server):
     return escapes, finished, changed
 
 
+def _only_escaped(escapes, matches):
+    """True when something escaped and every escaped exception satisfies ``matches``."""
+
+    return bool(escapes) and all(matches(error) for error in escapes)
+
+
+def _is_winerror_10053(error):
+    return isinstance(error, ConnectionAbortedError) and getattr(error, "winerror", None) == 10053
+
+
 def _wait_until_finished(connection, finished, changed):
     deadline = time.monotonic() + 5
     while connection not in finished and time.monotonic() < deadline:
@@ -470,6 +480,8 @@ def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers()
             _wait_until_finished(observer.server_sockets[0], finished, changed)
             _require_later_request_ok(port)
         if escapes:
+            if not _only_escaped(escapes, lambda error: error is injected):
+                pytest.fail(f"an unexpected exception reached handle_error: {escapes!r}")
             raise U8AbortEscapeDefect(
                 f"injected ConnectionAbortedError escaped _send: {escapes!r}"
             )
@@ -532,6 +544,8 @@ def test_real_client_abort_after_dispatch_does_not_escape_and_server_recovers():
                 pytest.fail(f"the real write did not raise an abort: {observer.outcomes!r}")
             _require_later_request_ok(port)
         if escapes:
+            if not _only_escaped(escapes, _is_winerror_10053):
+                pytest.fail(f"an unexpected exception reached handle_error: {escapes!r}")
             raise U8AbortEscapeDefect(f"real client abort escaped _send: {escapes!r}")
     finally:
         provider.release.set()
