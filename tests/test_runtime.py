@@ -3063,6 +3063,10 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
     both_shutdowns_started = threading.Event()
     both_shutdowns_finished = threading.Event()
     release_shutdowns = threading.Event()
+    # Future deadlines inside the daemon's accepted window; a past or
+    # over-ceiling deadline would be dropped before any acknowledgement.
+    first_deadline_ns = time.monotonic_ns() + 2_000_000_000
+    second_deadline_ns = time.monotonic_ns() + 3_000_000_000
 
     class Connection:
         def __init__(self, deadline_ns: int, *, fail_response: bool = False):
@@ -3102,8 +3106,8 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
         def __init__(self):
             self.connections = iter(
                 [
-                    Connection(2_000_000_000, fail_response=True),
-                    Connection(3_000_000_000),
+                    Connection(first_deadline_ns, fail_response=True),
+                    Connection(second_deadline_ns),
                 ]
             )
 
@@ -3147,8 +3151,9 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
                 release_shutdowns.set()
                 assert both_shutdowns_finished.wait(timeout=2)
             assert published_at_send == [True, True]
-            assert sorted(shutdown_deadlines) == [2.0, 3.0]
-            assert sorted(finished_deadlines) == [2.0, 3.0]
+            expected = [first_deadline_ns / 1_000_000_000, second_deadline_ns / 1_000_000_000]
+            assert sorted(shutdown_deadlines) == expected
+            assert sorted(finished_deadlines) == expected
         finally:
             release_shutdowns.set()
             os.close(lease_fd)
@@ -7080,7 +7085,7 @@ def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
                         "version": 1,
                         "capability": "capability",
                         "command": "stop",
-                        "deadline_ns": time.monotonic_ns() + 1_000_000_000,
+                        "deadline_ns": time.monotonic_ns() + 150_000_000,
                     }
                 )
                 + "\n"
@@ -7468,3 +7473,191 @@ def test_control_handler_start_failure_closes_connection_and_returns_its_slot(
     observation = _observe(control_daemon.paths)
     assert observation.status == "running", observation
     assert time.monotonic() - started < runtime.RUNTIME_CONTROL_TIMEOUT
+
+
+def _stop_request(instance: runtime.Instance, deadline_ns: object) -> bytes:
+    request = {
+        "version": 1,
+        "capability": instance.capability,
+        "command": "stop",
+    }
+    if deadline_ns is not None:
+        request["deadline_ns"] = deadline_ns
+    return (json.dumps(request) + "\n").encode()
+
+
+@pytest.mark.parametrize(
+    "deadline_ns",
+    [
+        pytest.param(lambda now: now - 1_000_000_000, id="already-past"),
+        pytest.param(lambda now: 1, id="long-past"),
+        pytest.param(lambda now: 2**2000, id="huge"),
+        pytest.param(
+            lambda now: now + int((runtime.SHUTDOWN_TIMEOUT + 5) * 1_000_000_000),
+            id="beyond-ceiling",
+        ),
+        pytest.param(lambda now: None, id="missing"),
+        pytest.param(lambda now: "soon", id="string"),
+        pytest.param(lambda now: float(now + 1_000_000_000), id="float"),
+        pytest.param(lambda now: True, id="json-true"),
+    ],
+)
+def test_control_stop_with_invalid_or_expired_deadline_is_dropped_without_state_change(
+    control_daemon, deadline_ns
+):
+    payload = _stop_request(
+        control_daemon.instance, deadline_ns(time.monotonic_ns())
+    )
+    assert _control_exchange(control_daemon.instance, payload) == b""
+    # Status must still be "ready" (never "unhealthy"): the dropped stop
+    # neither set the stop transition nor started cleanup.
+    assert not control_daemon.daemon.stop_requested.is_set()
+    _assert_control_survives(control_daemon)
+    assert runtime.stop() == "stopped"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+def test_control_stop_with_a_valid_future_deadline_is_acknowledged_and_executed(
+    control_daemon,
+):
+    deadline_ns = time.monotonic_ns() + int(runtime.SHUTDOWN_TIMEOUT * 1_000_000_000) // 2
+    reply = _control_exchange(
+        control_daemon.instance, _stop_request(control_daemon.instance, deadline_ns)
+    )
+    assert json.loads(reply)["status"] == "stopping"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+@pytest.fixture
+def control_peer():
+    """A published instance record with a held lease and a test-owned control listener."""
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        instance = runtime.Instance(
+            instance_id="peer",
+            url=runtime.URL,
+            capability="peer-capability",
+            control=runtime._control_endpoint(listener.getsockname()[1]),
+        )
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime._write_instance(paths, instance, deadline=time.monotonic() + 5)
+            release = threading.Event()
+            state_: dict[str, object] = {"lease_fd": lease_fd}
+
+            def terminal_cleanup() -> None:
+                (paths.runtime_directory / "instance.json").unlink()
+                os.close(state_.pop("lease_fd"))  # type: ignore[arg-type]
+
+            def serve(acknowledge_after: float | None, *, cleanup: bool) -> threading.Thread:
+                def run() -> None:
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.settimeout(5)
+                        line = b""
+                        while not line.endswith(b"\n"):
+                            line += connection.recv(8192)
+                        state_["request"] = json.loads(line)
+                        state_["received_at"] = time.monotonic()
+                        if acknowledge_after is None:
+                            release.wait(timeout=10)
+                            return
+                        time.sleep(acknowledge_after)
+                        connection.sendall(
+                            (
+                                json.dumps(
+                                    {
+                                        "status": "stopping",
+                                        "instance_id": instance.instance_id,
+                                        "url": runtime.URL,
+                                    }
+                                )
+                                + "\n"
+                            ).encode()
+                        )
+                    state_["acknowledged_at"] = time.monotonic()
+                    if cleanup:
+                        terminal_cleanup()
+
+                thread = threading.Thread(target=run, daemon=True)
+                thread.start()
+                return thread
+
+            try:
+                yield SimpleNamespace(paths=paths, serve=serve, state=state_, release=release)
+            finally:
+                release.set()
+                listener.close()
+                if "lease_fd" in state_:
+                    os.close(state_.pop("lease_fd"))  # type: ignore[arg-type]
+
+
+def test_control_stop_waits_for_a_late_acknowledgement_until_the_published_deadline(
+    control_peer,
+):
+    # The acknowledgement arrives after RUNTIME_CONTROL_TIMEOUT but inside the
+    # published deadline, and cleanup then completes: a clean stop.
+    delay = runtime.RUNTIME_CONTROL_TIMEOUT + 0.6
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 4.0):
+        peer = control_peer.serve(delay, cleanup=True)
+        started = time.monotonic()
+        assert runtime.stop() == "stopped"
+        elapsed = time.monotonic() - started
+    peer.join(timeout=5)
+    assert elapsed >= delay
+    assert control_peer.state["request"]["command"] == "stop"
+
+
+def test_control_stop_without_an_acknowledgement_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 1.6):
+        control_peer.serve(None, cleanup=False)
+        started = time.monotonic()
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        elapsed = time.monotonic() - started
+        # The command waited for the published deadline, not the shorter
+        # control timeout, before it reported the unknown outcome.
+        assert elapsed >= 1.6 - 0.1
+        assert str(caught.value) == runtime.SHUTDOWN_TIMEOUT_MESSAGE
+        control_peer.serve(None, cleanup=False)
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+    error_output = capsys.readouterr().err
+    assert error_output == f"nyx: {runtime.SHUTDOWN_TIMEOUT_MESSAGE}\n"
+    assert "control timed out" not in error_output
+
+
+def test_control_stop_acknowledged_but_never_cleaned_up_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    message = runtime.SHUTDOWN_TIMEOUT_MESSAGE
+    assert "ownership was retained" in message
+    assert "outcome is unknown" in message
+    assert "nyx --status" in message
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 1.0):
+        control_peer.serve(0.0, cleanup=False)
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        assert str(caught.value) == message
+        control_peer.serve(0.0, cleanup=False)
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+    assert capsys.readouterr().err == f"nyx: {message}\n"
+
+
+def test_control_stop_before_any_contact_keeps_its_own_timeout_text():
+    with patch.object(
+        runtime, "_paths", side_effect=TimeoutError("lock wait expired")
+    ), pytest.raises(runtime.ShutdownTimeoutError) as caught:
+        runtime.stop()
+    assert str(caught.value) == "Nyx shutdown timed out; ownership was retained"

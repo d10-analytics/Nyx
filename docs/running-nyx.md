@@ -70,6 +70,13 @@ does not start or reconfigure Nyx. Stopping an already stopped instance is safe.
 Both commands are Linux service commands; the desktop application does not
 provide them.
 
+`nyx --stop` waits up to five seconds for the running instance to accept the stop
+and finish cleanup. If that time runs out it prints `Nyx shutdown timed out;
+ownership was retained and the outcome is unknown; check with nyx --status` and
+exits 1. The instance kept ownership of the runtime and may still stop, so the
+outcome is unknown rather than failed; `nyx --status` is the authority, and you
+can rerun `nyx --stop` safely.
+
 ### Recover an unreadable runtime record
 
 `nyx --status` reads only, so it is the signal before recovery: a runtime record
