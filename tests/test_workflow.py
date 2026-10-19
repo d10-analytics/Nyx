@@ -184,13 +184,15 @@ CONTINUE_ON_ERROR_KEY = "continue-on-error"
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
-# The desktop caps are provisional until each is set from a measured duration.
+# Each desktop cap follows the rule above from its measured duration: CI run
+# 39324066360 took 12m37s (757 s) for nyx-desktop-windows and 6m34s (394 s)
+# for nyx-desktop-macos, so twice each rounds up to 30 and 15 minutes.
 JOB_TIMEOUT_MINUTES = {
     "nyx": 30,
     "nyx-windows": 30,
     "nyx-macos": 30,
-    "nyx-desktop-windows": 60,
-    "nyx-desktop-macos": 60,
+    "nyx-desktop-windows": 30,
+    "nyx-desktop-macos": 15,
 }
 # A cancelled run is not evidence for the commit it ran on, so the workflow
 # never cancels in-progress runs through a concurrency group.
@@ -1886,8 +1888,8 @@ def test_every_job_declares_its_measured_time_limit() -> None:
         "nyx": 30,
         "nyx-windows": 30,
         "nyx-macos": 30,
-        "nyx-desktop-windows": 60,
-        "nyx-desktop-macos": 60,
+        "nyx-desktop-windows": 30,
+        "nyx-desktop-macos": 15,
     }
 
 
@@ -1899,11 +1901,11 @@ def test_every_job_declares_its_measured_time_limit() -> None:
         (_mutate_quote_job_time_limit, ["nyx-macos: timeout-minutes '30' is not an integer"]),
         (
             _mutate_change_job_time_limit_within_range,
-            ["nyx-desktop-macos: timeout-minutes is 30, expected 60"],
+            ["nyx-desktop-macos: timeout-minutes is 30, expected 15"],
         ),
         (
             _mutate_change_desktop_windows_time_limit_within_range,
-            ["nyx-desktop-windows: timeout-minutes is 40, expected 60"],
+            ["nyx-desktop-windows: timeout-minutes is 40, expected 30"],
         ),
         (_mutate_add_job_without_time_limit, ["nyx-extra: job does not declare timeout-minutes"]),
     ],
