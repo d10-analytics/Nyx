@@ -1799,21 +1799,22 @@ class CdpPage:
         self.close()
 
 
-def enlarge_until_viewport_grows(
+def enlarge_for_usable_viewport(
     driver: Any,
     pid: int,
     viewport: Callable[[], tuple[float, float]],
     *,
-    minimum_growth: float = 100.0,
+    minimum_height: float = 160.0,
     timeout: float = 10.0,
     pause: float = 0.25,
 ) -> dict[str, Any]:
-    """Enlarge the window by OS window management and wait for the page to follow.
+    """Enlarge the window by OS window management and require a usable page viewport.
 
-    The page's viewport height must grow by ``minimum_growth`` CSS pixels
-    within ``timeout``; otherwise the window cannot give the board a usable
-    viewport and the caller must fail.  Return the window frame and viewport
-    before and after, for the geometry probe.
+    After the enlargement the page's viewport height must reach
+    ``minimum_height`` CSS pixels and hold the same size across two reads, so a
+    layout still in transition is not mistaken for the final size.  Otherwise
+    the caller must fail.  Return the window frame and viewport before and
+    after, for the geometry probe.
     """
 
     before_frame = driver.window_frame(pid)
@@ -1821,22 +1822,53 @@ def enlarge_until_viewport_grows(
     driver.enlarge_window(pid)
     deadline = time.monotonic() + timeout
     after = before
+    previous: tuple[float, float] | None = None
     while time.monotonic() < deadline:
         time.sleep(pause)
         after = viewport()
-        if after[1] >= before[1] + minimum_growth:
+        if after[1] >= minimum_height and after == previous:
+            after_frame = driver.window_frame(pid)
             return {
                 "frame_before": [before_frame.left, before_frame.top,
                                  before_frame.width, before_frame.height],
-                "frame_after": (lambda f: [f.left, f.top, f.width, f.height])(
-                    driver.window_frame(pid)),
+                "frame_after": [after_frame.left, after_frame.top,
+                                after_frame.width, after_frame.height],
                 "viewport_before": list(before),
                 "viewport_after": list(after),
             }
+        previous = after
     raise DriverError(
-        f"the window could not be enlarged: page viewport {before} -> {after} "
-        f"(needed {minimum_growth:g} more CSS pixels of height)"
+        f"the window could not be enlarged to a usable board: page viewport {before} -> "
+        f"{after}, needed a stable height of at least {minimum_height:g} CSS pixels"
     )
+
+
+def card_click_candidates(
+    geometry: dict[str, Any], *, margin: float = 4.0, inset: float = 4.0, minimum: float = 6.0
+) -> list[tuple[float, float]]:
+    """Return click points inside the card, below the sticky toolbar and above any bottom cover.
+
+    The card rectangle is intersected with the viewport band that no fixed or
+    sticky element covers.  A card taller than the band still yields points
+    from the band, because the band, not the card, bounds the search.  An
+    empty or too small intersection returns no points.
+    """
+
+    left, top, width, height = geometry["rect"]
+    viewport_width, _ = geometry["client"]
+    band_top = geometry["toolbarBottom"] + margin
+    band_bottom = geometry["bottomLimit"] - margin
+    y_low = max(top + inset, band_top)
+    y_high = min(top + height - inset, band_bottom)
+    x_low = max(left + inset, 0.0)
+    x_high = min(left + width - inset, viewport_width)
+    if y_high - y_low < minimum or x_high - x_low < minimum:
+        return []
+    return [
+        (x_low + (x_high - x_low) * fx, y_low + (y_high - y_low) * fy)
+        for fy in (0.5, 0.25, 0.75, 0.1, 0.9)
+        for fx in (0.5, 0.25, 0.75)
+    ]
 
 
 @dataclass
