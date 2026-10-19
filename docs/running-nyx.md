@@ -70,14 +70,23 @@ does not start or reconfigure Nyx. Stopping an already stopped instance is safe.
 Both commands are Linux service commands; the desktop application does not
 provide them.
 
-`nyx --stop` waits up to five seconds for the running instance to accept the stop
-and finish cleanup. If that time runs out after Nyx has contacted the instance,
-it prints `Nyx shutdown timed out; ownership was retained and the outcome is
-unknown; check with nyx --status` and exits 1. If it runs out before the
-instance is contacted, it prints the shorter `Nyx shutdown timed out; ownership
-was retained` and exits 1. In both cases the instance kept ownership of the
-runtime and may still stop, so the outcome is unknown rather than failed;
-`nyx --status` is the authority, and you can rerun `nyx --stop` safely.
+`nyx --stop` has five seconds in total: that time covers waiting for any other
+Nyx command to finish, sending the stop, and waiting for the running instance
+to finish cleanup. If the time runs out once Nyx has started sending the stop,
+it prints `nyx: Nyx shutdown timed out; ownership was retained and the outcome
+is unknown; check with nyx --status` and exits 1. The instance kept ownership
+of the runtime and may still finish stopping, so the outcome is unknown rather
+than failed; `nyx --status` is the authority, and you can rerun `nyx --stop`
+safely.
+
+If the time runs out before Nyx starts sending the stop, the instance was never
+asked to stop: it keeps running and keeps ownership of the runtime. The command
+exits 1 with a message for the step it was on. Waiting for another Nyx command
+prints `nyx: another Nyx operation is in progress`; running out just after that
+wait prints `nyx: control deadline expired`; running out while preparing the
+Nyx state directories prints `nyx: Nyx shutdown timed out; ownership was
+retained`. Check with `nyx --status`, then rerun `nyx --stop` once the other
+command has finished.
 
 ### Recover an unreadable runtime record
 
