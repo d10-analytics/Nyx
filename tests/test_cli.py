@@ -825,16 +825,21 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
     folder.mkdir()
     repository = clone(remote, folder / "many")
     head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    updates = "".join(
-        f"create refs/heads/{index:05d}-{'x' * 180} {head}\n" for index in range(7000)
+    # Packed references need no file per branch, so no host path limit applies.
+    git(repository, "pack-refs", "--all")
+    packed_file = repository / ".git" / "packed-refs"
+    entries = {
+        line.split(" ", 1)[1]: line.split(" ", 1)[0]
+        for line in packed_file.read_text().splitlines()
+        if line and line[0] not in "#^"
+    }
+    for index in range(7000):
+        entries[f"refs/heads/{index:05d}-{'x' * 180}"] = head
+    packed_file.write_text(
+        "# pack-refs with: peeled fully-peeled sorted \n"
+        + "".join(f"{sha} {name}\n" for name, sha in sorted(entries.items()))
     )
-    subprocess.run(
-        ["git", "update-ref", "--stdin"],
-        cwd=repository,
-        input=updates,
-        text=True,
-        check=True,
-    )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 7001
     _configure(tmp_path, [folder])
 
     for arguments in ((), ("--json",)):
