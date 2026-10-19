@@ -7236,9 +7236,11 @@ def _control_exchange(
                 received += part
         except (TimeoutError, socket.timeout):
             return received
-        except ConnectionResetError:
-            # Closing with unread request bytes resets the connection; that
-            # is still a dropped connection with no reply.
+        except (ConnectionResetError, ConnectionAbortedError):
+            # Closing with unread request bytes resets the connection
+            # (ConnectionResetError on POSIX, ConnectionAbortedError for
+            # WinError 10053 on Windows); that is still a dropped connection,
+            # and any reply bytes already read are returned unchanged.
             return received
 
 
