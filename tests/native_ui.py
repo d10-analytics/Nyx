@@ -1,0 +1,1636 @@
+"""Native window observation and OS-level automation for the delivered desktop tests.
+
+One owner answers "which windows does process X show" (``visible_top_level_windows``)
+for the readiness wait, the Windows console-window observation and the input
+driver.  The driver offers a Windows and a macOS backend with the same surface:
+an authority check, window bring-forward, OS mouse and keyboard input, Qt widget
+lookup through the platform accessibility tree, and the native clipboard.  A
+minimal page-level DevTools client may locate and read web content, but it can
+never inject input: every click and keystroke is OS-level.
+
+Only the standard library is imported at module import so Linux collection of
+the tests that import this module keeps working.  Platform libraries are loaded
+lazily inside the backends.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import ctypes
+import hashlib
+import http.client
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, NamedTuple
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class DriverError(Exception):
+    """A driver or precondition failure; never an expected failure."""
+
+
+class AuthorityError(DriverError):
+    """The host did not grant the driver accessibility trust or input delivery."""
+
+
+class CdpError(DriverError):
+    """The page-level DevTools connection failed or reported an error."""
+
+
+# ---------------------------------------------------------------------------
+# Window enumeration (shared owner)
+# ---------------------------------------------------------------------------
+
+
+class WindowInfo(NamedTuple):
+    """One visible top-level window."""
+
+    owner: int
+    title: str
+    window_class: str
+    handle: int
+
+
+_CONSOLE_WINDOW_CLASSES = frozenset({"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"})
+
+
+def is_console_window_class(window_class: str) -> bool:
+    return window_class in _CONSOLE_WINDOW_CLASSES
+
+
+def _windows_api() -> Any:
+    """Return typed user32/kernel32 entry points for window queries."""
+
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    return user32, kernel32, callback_type, wintypes
+
+
+def _windows_describe(user32: Any, wintypes: Any, window: Any) -> WindowInfo:
+    owner = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+    title = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(window, title, len(title))
+    window_class = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(window, window_class, len(window_class))
+    return WindowInfo(owner.value, title.value, window_class.value, int(window or 0))
+
+
+def _windows_visible_top_level_windows() -> list[WindowInfo]:
+    user32, _, callback_type, wintypes = _windows_api()
+    found: list[WindowInfo] = []
+
+    def visit(window, _parameter):
+        if user32.IsWindowVisible(window):
+            found.append(_windows_describe(user32, wintypes, window))
+        return True
+
+    if not user32.EnumWindows(callback_type(visit), 0):
+        raise OSError(ctypes.get_last_error(), "EnumWindows failed")
+    return found
+
+
+def _macos_visible_top_level_windows() -> list[WindowInfo]:
+    graphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    graphics.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    foundation.CFArrayGetCount.restype = ctypes.c_long
+    foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    foundation.CFNumberGetValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32),
+    ]
+    foundation.CFNumberGetValue.restype = ctypes.c_bool
+    foundation.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    foundation.CFStringGetCString.restype = ctypes.c_bool
+    foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    foundation.CFRelease.restype = None
+    on_screen_only = 1 << 0
+    exclude_desktop_elements = 1 << 4
+    number_sint32 = 3
+    utf8 = 0x08000100
+    owner_pid_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerPID").value
+    owner_name_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerName").value
+    layer_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowLayer").value
+
+    def integer(info, key) -> int | None:
+        value = foundation.CFDictionaryGetValue(info, key)
+        number = ctypes.c_int32()
+        if not value or not foundation.CFNumberGetValue(value, number_sint32, ctypes.byref(number)):
+            return None
+        return number.value
+
+    def text(info, key) -> str:
+        value = foundation.CFDictionaryGetValue(info, key)
+        buffer = ctypes.create_string_buffer(512)
+        if not value or not foundation.CFStringGetCString(value, buffer, len(buffer), utf8):
+            return ""
+        return buffer.value.decode("utf-8", errors="replace")
+
+    windows = graphics.CGWindowListCopyWindowInfo(
+        on_screen_only | exclude_desktop_elements, 0
+    )
+    if not windows:
+        raise OSError("CGWindowListCopyWindowInfo returned no window list")
+    found: list[WindowInfo] = []
+    try:
+        for index in range(foundation.CFArrayGetCount(windows)):
+            info = foundation.CFArrayGetValueAtIndex(windows, index)
+            owner = integer(info, owner_pid_key)
+            # Layer 0 is the normal application window level; menu bar, dock
+            # and overlay surfaces sit on other layers.
+            if owner is None or integer(info, layer_key) != 0:
+                continue
+            # CoreGraphics carries no window class; the label is the owner name.
+            found.append(WindowInfo(owner, text(info, owner_name_key), "", 0))
+    finally:
+        foundation.CFRelease(windows)
+    return found
+
+
+def visible_top_level_windows() -> list[WindowInfo]:
+    """Return owner process id, label, window class and handle of each visible window."""
+
+    if os.name == "nt":
+        return _windows_visible_top_level_windows()
+    if sys.platform == "darwin":
+        return _macos_visible_top_level_windows()
+    raise AssertionError("window readiness is observable only on Windows and macOS")
+
+
+def gui_window(pid: int, title: str = "Nyx") -> WindowInfo:
+    """Return the visible top-level window of ``pid`` carrying ``title``."""
+
+    matches = [
+        window
+        for window in visible_top_level_windows()
+        if window.owner == pid and window.title == title
+    ]
+    if not matches:
+        raise DriverError(f"process {pid} shows no visible window titled {title!r}")
+    return matches[0]
+
+
+def process_image_path(pid: int) -> str:
+    """Return the executable image path the operating system reports for ``pid``."""
+
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            raise DriverError(f"OpenProcess({pid}) failed: {ctypes.get_last_error()}")
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buffer))
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                raise DriverError(
+                    f"QueryFullProcessImageNameW({pid}) failed: {ctypes.get_last_error()}"
+                )
+            return buffer.value
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform == "darwin":
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libproc.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = libproc.proc_pidpath(pid, buffer, len(buffer))
+        if length <= 0:
+            raise DriverError(f"proc_pidpath({pid}) failed: {ctypes.get_errno()}")
+        return buffer.value.decode("utf-8", errors="replace")
+    raise DriverError("process image paths are observable only on Windows and macOS")
+
+
+# ---------------------------------------------------------------------------
+# Windows process snapshots, job object and window-show sampling
+# ---------------------------------------------------------------------------
+
+
+def windows_process_table() -> dict[int, tuple[int, str]]:
+    """Return ``{pid: (parent pid, image name)}`` from a Toolhelp snapshot."""
+
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    th32cs_snapprocess = 0x2
+    snapshot = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    table: dict[int, tuple[int, str]] = {}
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            table[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile)
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return table
+
+
+class JobEvent(NamedTuple):
+    at: float
+    message: int
+    pid: int
+
+
+JOB_OBJECT_MSG_NEW_PROCESS = 6
+JOB_OBJECT_MSG_EXIT_PROCESS = 7
+
+
+class JobObserver:
+    """Place a launched process in a job object and report its descendants.
+
+    ``attach`` is called immediately after launch.  The job's completion port
+    reports each descendant process ID with a timestamp from ``time.monotonic``,
+    so a short-lived helper is attributed even if it exits before any poll.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[JobEvent] = []
+        self.attached_pid: int | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._job: Any = None
+        self._port: Any = None
+        self._api: Any = None
+
+    def attach(self, process: subprocess.Popen) -> None:
+        if os.name != "nt":
+            raise DriverError("job objects exist only on Windows")
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateIoCompletionPort.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD,
+        ]
+        kernel32.CreateIoCompletionPort.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.GetQueuedCompletionStatus.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.DWORD,
+        ]
+        kernel32.GetQueuedCompletionStatus.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class AssociateCompletionPort(ctypes.Structure):
+            _fields_ = [("CompletionKey", ctypes.c_void_p), ("CompletionPort", wintypes.HANDLE)]
+
+        invalid_handle = ctypes.c_void_p(-1).value
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise DriverError(f"CreateJobObjectW failed: {ctypes.get_last_error()}")
+        port = kernel32.CreateIoCompletionPort(invalid_handle, None, 0, 1)
+        if not port:
+            raise DriverError(f"CreateIoCompletionPort failed: {ctypes.get_last_error()}")
+        association = AssociateCompletionPort(1, port)
+        job_object_associate_completion_port_information = 7
+        if not kernel32.SetInformationJobObject(
+            job,
+            job_object_associate_completion_port_information,
+            ctypes.byref(association),
+            ctypes.sizeof(association),
+        ):
+            raise DriverError(f"SetInformationJobObject failed: {ctypes.get_last_error()}")
+        process_terminate = 0x0001
+        process_set_quota = 0x0100
+        handle = kernel32.OpenProcess(process_set_quota | process_terminate, False, process.pid)
+        if not handle:
+            raise DriverError(f"OpenProcess({process.pid}) failed: {ctypes.get_last_error()}")
+        try:
+            if not kernel32.AssignProcessToJobObject(job, handle):
+                raise DriverError(
+                    f"AssignProcessToJobObject({process.pid}) failed: {ctypes.get_last_error()}"
+                )
+        finally:
+            kernel32.CloseHandle(handle)
+        self._job = job
+        self._port = port
+        self._api = (kernel32, wintypes)
+        self.attached_pid = process.pid
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        kernel32, wintypes = self._api
+        while not self._stop.is_set():
+            message = wintypes.DWORD()
+            key = ctypes.c_size_t()
+            overlapped = ctypes.c_void_p()
+            kernel32.GetQueuedCompletionStatus(
+                self._port,
+                ctypes.byref(message),
+                ctypes.byref(key),
+                ctypes.byref(overlapped),
+                100,
+            )
+            if overlapped.value is None:
+                continue  # timeout or a port error; job messages carry the pid here
+            with self._lock:
+                self.events.append(JobEvent(time.monotonic(), message.value, int(overlapped.value)))
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self._api is not None:
+            kernel32, _ = self._api
+            for handle in (self._port, self._job):
+                if handle:
+                    kernel32.CloseHandle(handle)
+            self._api = None
+
+    def __enter__(self) -> "JobObserver":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def descendant_pids(self) -> set[int]:
+        with self._lock:
+            return {e.pid for e in self.events if e.message == JOB_OBJECT_MSG_NEW_PROCESS}
+
+    def started_between(self, begin: float, end: float) -> set[int]:
+        """Descendant process IDs the job reported as started inside ``[begin, end]``."""
+
+        with self._lock:
+            return {
+                e.pid
+                for e in self.events
+                if e.message == JOB_OBJECT_MSG_NEW_PROCESS and begin <= e.at <= end
+            }
+
+
+@dataclass(frozen=True)
+class WindowSample:
+    """A window seen being shown, with the owner relation resolved at sample time."""
+
+    at: float
+    source: str
+    handle: int
+    window_class: str
+    title: str
+    owner_pid: int
+    owner_image: str
+    owner_parent: int | None
+
+
+def attribute_window(sample: WindowSample, family: set[int]) -> str | None:
+    """Name the relation tying a sampled window to a process family, or ``None``.
+
+    Console windows belong to the console host rather than to the process that
+    spawned the console, so both the window owner and the owner's parent are
+    compared with the family.
+    """
+
+    if sample.owner_pid in family:
+        return "owner-in-family"
+    if sample.owner_parent is not None and sample.owner_parent in family:
+        return "owner-parent-in-family"
+    return None
+
+
+class WindowShowSampler:
+    """Sample every top-level window shown for the whole run (Windows only).
+
+    A WinEvent hook records create and show events as they happen, and a fast
+    enumeration pass backs it up, because a console window can live for only a
+    fraction of the readiness poll's interval.
+    """
+
+    _POLL_INTERVAL = 0.015
+
+    def __init__(self) -> None:
+        self.samples: list[WindowSample] = []
+        self.errors: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._hook_thread: threading.Thread | None = None
+        self._poll_thread: threading.Thread | None = None
+        self._hook_thread_id: int | None = None
+        self._ready = threading.Event()
+        self._seen: set[tuple[int, int]] = set()
+        self._hook_failure: str | None = None
+
+    def start(self) -> None:
+        if os.name != "nt":
+            raise DriverError("window-show sampling exists only on Windows")
+        self._hook_thread = threading.Thread(target=self._run_hook, daemon=True)
+        self._hook_thread.start()
+        if not self._ready.wait(timeout=10):
+            raise DriverError("the window-show hook thread never became ready")
+        if self._hook_failure is not None:
+            raise DriverError(self._hook_failure)
+        self._poll_thread = threading.Thread(target=self._run_poll, daemon=True)
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._hook_thread_id is not None:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.PostThreadMessageW.argtypes = [
+                wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+            ]
+            user32.PostThreadMessageW.restype = wintypes.BOOL
+            wm_quit = 0x0012
+            user32.PostThreadMessageW(self._hook_thread_id, wm_quit, 0, 0)
+        for thread in (self._hook_thread, self._poll_thread):
+            if thread is not None:
+                thread.join(timeout=5)
+
+    def __enter__(self) -> "WindowShowSampler":
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
+
+    def snapshot(self) -> list[WindowSample]:
+        with self._lock:
+            return list(self.samples)
+
+    def _record(self, user32: Any, wintypes: Any, window: Any, source: str) -> None:
+        if not window or user32.GetAncestor(window, 2) != window:  # GA_ROOT
+            return
+        info = _windows_describe(user32, wintypes, window)
+        key = (info.handle, info.owner)
+        with self._lock:
+            if key in self._seen:
+                return
+            self._seen.add(key)
+        image = ""
+        parent: int | None = None
+        if is_console_window_class(info.window_class):
+            # Resolve the relation now: a console host can be gone before the
+            # run ends.
+            table = windows_process_table()
+            if info.owner in table:
+                parent, image = table[info.owner]
+        sample = WindowSample(
+            time.monotonic(), source, info.handle, info.window_class, info.title,
+            info.owner, image, parent,
+        )
+        with self._lock:
+            self.samples.append(sample)
+
+    def _run_hook(self) -> None:
+        try:
+            user32, kernel32, _, wintypes = _windows_api()
+            kernel32.GetCurrentThreadId.argtypes = []
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            callback_type = ctypes.WINFUNCTYPE(
+                None,
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.HWND,
+                wintypes.LONG,
+                wintypes.LONG,
+                wintypes.DWORD,
+                wintypes.DWORD,
+            )
+            user32.SetWinEventHook.argtypes = [
+                wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE, callback_type,
+                wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+            ]
+            user32.SetWinEventHook.restype = wintypes.HANDLE
+            user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+            user32.UnhookWinEvent.restype = wintypes.BOOL
+            user32.GetMessageW.argtypes = [
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+            ]
+            user32.GetMessageW.restype = wintypes.BOOL
+            user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.restype = ctypes.c_ssize_t
+            event_object_create = 0x8000
+            event_object_show = 0x8002
+            objid_window = 0
+            childid_self = 0
+            winevent_outofcontext = 0
+
+            def on_event(_hook, event, window, id_object, id_child, _thread, _time):
+                if id_object != objid_window or id_child != childid_self:
+                    return
+                if event not in (event_object_create, event_object_show):
+                    return
+                try:
+                    self._record(user32, wintypes, window, "hook")
+                except Exception as error:  # pragma: no cover - hook diagnostics
+                    self.errors.append(repr(error))
+
+            procedure = callback_type(on_event)
+            self._hook_thread_id = kernel32.GetCurrentThreadId()
+            # Pump once so the thread owns a message queue before WM_QUIT arrives.
+            message = wintypes.MSG()
+            hook = user32.SetWinEventHook(
+                event_object_create, event_object_show, None, procedure, 0, 0,
+                winevent_outofcontext,
+            )
+            if not hook:
+                self._hook_failure = f"SetWinEventHook failed: {ctypes.get_last_error()}"
+                self._ready.set()
+                return
+            self._ready.set()
+            try:
+                while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                    user32.TranslateMessage(ctypes.byref(message))
+                    user32.DispatchMessageW(ctypes.byref(message))
+            finally:
+                user32.UnhookWinEvent(hook)
+        except Exception as error:  # pragma: no cover - platform failure
+            self._hook_failure = f"window-show hook thread failed: {error!r}"
+            self._ready.set()
+
+    def _run_poll(self) -> None:
+        user32, _, callback_type, wintypes = _windows_api()
+        while not self._stop.is_set():
+
+            def visit(window, _parameter):
+                if user32.IsWindowVisible(window):
+                    try:
+                        self._record(user32, wintypes, window, "poll")
+                    except Exception as error:  # pragma: no cover - diagnostics
+                        self.errors.append(repr(error))
+                return True
+
+            user32.EnumWindows(callback_type(visit), 0)
+            time.sleep(self._POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Geometry and shared driver surface
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Rect:
+    left: float
+    top: float
+    width: float
+    height: float
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return self.left + self.width / 2, self.top + self.height / 2
+
+
+@dataclass(frozen=True)
+class Widget:
+    """A located native widget: screen rectangle, enabled state and text value."""
+
+    name: str
+    rect: Rect
+    enabled: bool
+    value: str | None
+
+
+def _json_or_raise(text: str, what: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError as error:
+        raise DriverError(f"{what} returned unparsable output: {text[:500]!r}") from error
+
+
+# ---------------------------------------------------------------------------
+# Windows backend
+# ---------------------------------------------------------------------------
+
+_UIA_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class NyxDpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
+[void][NyxDpi]::SetProcessDPIAware()
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$request = ConvertFrom-Json $env:NYX_UIA_REQUEST
+$automation = [System.Windows.Automation.AutomationElement]
+$scope = [System.Windows.Automation.TreeScope]
+$root = $automation::RootElement
+$owner = New-Object System.Windows.Automation.PropertyCondition($automation::ProcessIdProperty, [int]$request.pid)
+$windows = $root.FindAll($scope::Children, $owner)
+if ($windows.Count -eq 0) { throw "no accessible top-level window for pid $($request.pid)" }
+if ($request.mode -eq 'probe') {
+    $names = @(); foreach ($w in $windows) { $names += $w.Current.Name }
+    ConvertTo-Json -InputObject @($names) -Compress
+    exit 0
+}
+$types = @{
+    button = [System.Windows.Automation.ControlType]::Button
+    edit = [System.Windows.Automation.ControlType]::Edit
+}
+$typed = New-Object System.Windows.Automation.PropertyCondition($automation::ControlTypeProperty, $types[$request.role])
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+$exact = @(); $native = @()
+foreach ($window in $windows) {
+    foreach ($element in $window.FindAll($scope::Descendants, $typed)) {
+        $current = $element.Current
+        $rect = $current.BoundingRectangle
+        if ($current.IsOffscreen -or $rect.IsEmpty -or [double]::IsInfinity($rect.Left)) { continue }
+        $value = $null
+        try {
+            $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+            $value = $pattern.Current.Value
+        } catch { }
+        $entry = [pscustomobject]@{
+            name = $current.Name; left = $rect.Left; top = $rect.Top
+            width = $rect.Width; height = $rect.Height
+            enabled = [bool]$current.IsEnabled; value = $value
+        }
+        if ($current.Name -eq $request.name) { $exact += $entry; continue }
+        if ($request.role -eq 'edit') {
+            $inside = $false
+            $parent = $walker.GetParent($element)
+            while ($parent -ne $null) {
+                if ($parent.Current.ControlType -eq [System.Windows.Automation.ControlType]::Document) { $inside = $true; break }
+                $parent = $walker.GetParent($parent)
+            }
+            if (-not $inside) { $native += $entry }
+        }
+    }
+}
+$result = $exact
+if ($result.Count -eq 0 -and $native.Count -eq 1) { $result = $native }
+ConvertTo-Json -InputObject @($result) -Compress -Depth 4
+"""
+
+
+class _WindowsBackend:
+    """Windows UI Automation lookup with ``SendInput`` and the native clipboard."""
+
+    name = "windows"
+
+    def __init__(self) -> None:
+        from ctypes import wintypes
+
+        self._wintypes = wintypes
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._declare()
+        self._make_dpi_aware()
+
+    # -- setup -------------------------------------------------------------
+
+    def _declare(self) -> None:
+        wintypes = self._wintypes
+        user32, kernel32 = self.user32, self.kernel32
+
+        class MouseInput(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class KeyboardInput(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class InputUnion(ctypes.Union):
+            _fields_ = [("mi", MouseInput), ("ki", KeyboardInput)]
+
+        class Input(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", InputUnion)]
+
+        self._Input = Input
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        user32.OpenInputDesktop.restype = wintypes.HANDLE
+        user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+        user32.CloseDesktop.restype = wintypes.BOOL
+        user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+        user32.keybd_event.restype = None
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+    def _make_dpi_aware(self) -> None:
+        """Use physical pixels everywhere so window, accessibility and input agree."""
+
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the handle value -4.
+        try:
+            self.user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            self.user32.SetProcessDpiAwarenessContext.restype = self._wintypes.BOOL
+            if self.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+        except AttributeError:
+            pass
+        self.user32.SetProcessDPIAware()
+
+    # -- authority ---------------------------------------------------------
+
+    def check_authority(self, pid: int | None = None) -> str:
+        """Verify an interactive desktop, delivered input and an accessibility tree."""
+
+        wintypes = self._wintypes
+        generic_read = 0x80000000
+        desktop = self.user32.OpenInputDesktop(0, False, generic_read)
+        if not desktop:
+            raise AuthorityError(
+                f"the input desktop is not accessible (error {ctypes.get_last_error()})"
+            )
+        self.user32.CloseDesktop(desktop)
+        target = (60, 60)
+        self.move(*target)
+        point = wintypes.POINT()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise AuthorityError("GetCursorPos failed")
+        if abs(point.x - target[0]) > 2 or abs(point.y - target[1]) > 2:
+            raise AuthorityError(
+                f"input was not delivered: cursor at ({point.x},{point.y}), expected {target}"
+            )
+        if pid is not None:
+            try:
+                self._run_uia({"mode": "probe", "pid": pid})
+            except DriverError as error:
+                raise AuthorityError(f"UI Automation is unavailable: {error}") from error
+        return "interactive desktop, SendInput delivery and UI Automation"
+
+    # -- windows -----------------------------------------------------------
+
+    def window_frame(self, pid: int) -> Rect:
+        window = gui_window(pid)
+        rect = self._wintypes.RECT()
+        if not self.user32.GetWindowRect(window.handle, ctypes.byref(rect)):
+            raise DriverError(f"GetWindowRect failed: {ctypes.get_last_error()}")
+        return Rect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+    def bring_forward(self, pid: int) -> None:
+        window = gui_window(pid)
+        handle = window.handle
+        sw_restore = 9
+        if self.user32.IsIconic(handle):
+            self.user32.ShowWindow(handle, sw_restore)
+        # A synthetic Alt tap lifts the foreground lock that otherwise makes
+        # SetForegroundWindow fail for a background process.
+        vk_menu = 0x12
+        keyeventf_keyup = 0x2
+        self.user32.keybd_event(vk_menu, 0, 0, 0)
+        self.user32.keybd_event(vk_menu, 0, keyeventf_keyup, 0)
+        self.user32.SetForegroundWindow(handle)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self.user32.GetForegroundWindow() == handle:
+                return
+            time.sleep(0.1)
+            self.user32.SetForegroundWindow(handle)
+        raise DriverError(f"window {handle:#x} of pid {pid} did not become the foreground window")
+
+    # -- input -------------------------------------------------------------
+
+    def _send(self, *inputs: Any) -> None:
+        array = (self._Input * len(inputs))(*inputs)
+        sent = self.user32.SendInput(len(inputs), array, ctypes.sizeof(self._Input))
+        if sent != len(inputs):
+            raise DriverError(
+                f"SendInput delivered {sent} of {len(inputs)} events: {ctypes.get_last_error()}"
+            )
+
+    def _mouse(self, flags: int) -> Any:
+        event = self._Input()
+        event.type = 0  # INPUT_MOUSE
+        event.mi.dwFlags = flags
+        return event
+
+    def _key(self, virtual_key: int, scan: int, flags: int) -> Any:
+        event = self._Input()
+        event.type = 1  # INPUT_KEYBOARD
+        event.ki.wVk = virtual_key
+        event.ki.wScan = scan
+        event.ki.dwFlags = flags
+        return event
+
+    def move(self, x: float, y: float) -> None:
+        if not self.user32.SetCursorPos(int(round(x)), int(round(y))):
+            raise DriverError(f"SetCursorPos failed: {ctypes.get_last_error()}")
+        time.sleep(0.1)
+
+    def click(self, x: float, y: float, button: str = "left") -> None:
+        self.move(x, y)
+        down, up = (0x0002, 0x0004) if button == "left" else (0x0008, 0x0010)
+        self._send(self._mouse(down))
+        time.sleep(0.05)
+        self._send(self._mouse(up))
+        time.sleep(0.15)
+
+    def select_all(self) -> None:
+        vk_control, vk_a, keyup = 0x11, 0x41, 0x2
+        self._send(
+            self._key(vk_control, 0, 0),
+            self._key(vk_a, 0, 0),
+            self._key(vk_a, 0, keyup),
+            self._key(vk_control, 0, keyup),
+        )
+        time.sleep(0.1)
+
+    def type_text(self, text: str) -> None:
+        keyeventf_unicode, keyup = 0x4, 0x2
+        encoded = text.encode("utf-16-le")
+        for index in range(0, len(encoded), 2):
+            unit = int.from_bytes(encoded[index:index + 2], "little")
+            self._send(
+                self._key(0, unit, keyeventf_unicode),
+                self._key(0, unit, keyeventf_unicode | keyup),
+            )
+            time.sleep(0.01)
+        time.sleep(0.1)
+
+    # -- accessibility -----------------------------------------------------
+
+    def _run_uia(self, request: dict[str, Any]) -> Any:
+        shell = shutil.which("powershell.exe") or "powershell.exe"
+        encoded = base64.b64encode(_UIA_SCRIPT.encode("utf-16-le")).decode("ascii")
+        environment = dict(os.environ)
+        environment["NYX_UIA_REQUEST"] = json.dumps(request)
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded],
+            capture_output=True, text=True, env=environment, timeout=120, check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(
+                f"UI Automation query exited {completed.returncode}: "
+                f"stdout={completed.stdout[-500:]!r} stderr={completed.stderr[-1500:]!r}"
+            )
+        return _json_or_raise(completed.stdout.strip(), "UI Automation query")
+
+    def find_widget(self, pid: int, role: str, name: str) -> Widget:
+        matches = self._run_uia({"mode": "find", "pid": pid, "role": role, "name": name})
+        if not matches:
+            raise DriverError(f"no visible {role} named {name!r} in the window of pid {pid}")
+        if len(matches) != 1:
+            raise DriverError(
+                f"{len(matches)} visible {role} widgets match {name!r}: "
+                f"{[m['name'] for m in matches]!r}"
+            )
+        match = matches[0]
+        return Widget(
+            match["name"],
+            Rect(match["left"], match["top"], match["width"], match["height"]),
+            bool(match["enabled"]),
+            match.get("value"),
+        )
+
+    # -- clipboard ---------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _clipboard(self):
+        deadline = time.monotonic() + 5
+        while not self.user32.OpenClipboard(None):
+            if time.monotonic() >= deadline:
+                raise DriverError(f"OpenClipboard failed: {ctypes.get_last_error()}")
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            self.user32.CloseClipboard()
+
+    def set_clipboard(self, text: str) -> None:
+        cf_unicodetext, gmem_moveable = 13, 0x0002
+        data = (text + "\0").encode("utf-16-le")
+        with self._clipboard():
+            if not self.user32.EmptyClipboard():
+                raise DriverError(f"EmptyClipboard failed: {ctypes.get_last_error()}")
+            memory = self.kernel32.GlobalAlloc(gmem_moveable, len(data))
+            if not memory:
+                raise DriverError(f"GlobalAlloc failed: {ctypes.get_last_error()}")
+            address = self.kernel32.GlobalLock(memory)
+            if not address:
+                self.kernel32.GlobalFree(memory)
+                raise DriverError(f"GlobalLock failed: {ctypes.get_last_error()}")
+            ctypes.memmove(address, data, len(data))
+            self.kernel32.GlobalUnlock(memory)
+            if not self.user32.SetClipboardData(cf_unicodetext, memory):
+                self.kernel32.GlobalFree(memory)
+                raise DriverError(f"SetClipboardData failed: {ctypes.get_last_error()}")
+
+    def get_clipboard(self) -> str | None:
+        cf_unicodetext = 13
+        with self._clipboard():
+            memory = self.user32.GetClipboardData(cf_unicodetext)
+            if not memory:
+                return None
+            address = self.kernel32.GlobalLock(memory)
+            if not address:
+                raise DriverError(f"GlobalLock failed: {ctypes.get_last_error()}")
+            try:
+                return ctypes.wstring_at(address)
+            finally:
+                self.kernel32.GlobalUnlock(memory)
+
+
+# ---------------------------------------------------------------------------
+# macOS backend
+# ---------------------------------------------------------------------------
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _MacBackend:
+    """Accessibility (AX) lookup, CGEvent input and the native pasteboard."""
+
+    name = "macos"
+    _UTF8 = 0x08000100
+
+    def __init__(self) -> None:
+        self.services = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        self.foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        self._declare()
+
+    def _declare(self) -> None:
+        sv, cf = self.services, self.foundation
+        void_p = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = void_p
+        cf.CFStringGetCString.argtypes = [void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetTypeID.argtypes = []
+        cf.CFStringGetTypeID.restype = ctypes.c_ulong
+        cf.CFArrayGetTypeID.argtypes = []
+        cf.CFArrayGetTypeID.restype = ctypes.c_ulong
+        cf.CFGetTypeID.argtypes = [void_p]
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFArrayGetCount.argtypes = [void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetValueAtIndex.argtypes = [void_p, ctypes.c_long]
+        cf.CFArrayGetValueAtIndex.restype = void_p
+        cf.CFRelease.argtypes = [void_p]
+        cf.CFRelease.restype = None
+        cf.CFBooleanGetValue.argtypes = [void_p]
+        cf.CFBooleanGetValue.restype = ctypes.c_ubyte
+        sv.AXIsProcessTrusted.argtypes = []
+        sv.AXIsProcessTrusted.restype = ctypes.c_ubyte
+        sv.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+        sv.AXUIElementCreateApplication.restype = void_p
+        sv.AXUIElementCopyAttributeValue.argtypes = [void_p, void_p, ctypes.POINTER(void_p)]
+        sv.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+        sv.AXValueGetValue.argtypes = [void_p, ctypes.c_int, void_p]
+        sv.AXValueGetValue.restype = ctypes.c_ubyte
+        sv.CGEventCreate.argtypes = [void_p]
+        sv.CGEventCreate.restype = void_p
+        sv.CGEventGetLocation.argtypes = [void_p]
+        sv.CGEventGetLocation.restype = _CGPoint
+        sv.CGEventCreateMouseEvent.argtypes = [void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32]
+        sv.CGEventCreateMouseEvent.restype = void_p
+        sv.CGEventCreateKeyboardEvent.argtypes = [void_p, ctypes.c_uint16, ctypes.c_ubyte]
+        sv.CGEventCreateKeyboardEvent.restype = void_p
+        sv.CGEventKeyboardSetUnicodeString.argtypes = [
+            void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
+        ]
+        sv.CGEventKeyboardSetUnicodeString.restype = None
+        sv.CGEventSetFlags.argtypes = [void_p, ctypes.c_uint64]
+        sv.CGEventSetFlags.restype = None
+        sv.CGEventSetIntegerValueField.argtypes = [void_p, ctypes.c_uint32, ctypes.c_int64]
+        sv.CGEventSetIntegerValueField.restype = None
+        sv.CGEventPost.argtypes = [ctypes.c_uint32, void_p]
+        sv.CGEventPost.restype = None
+
+    # -- CoreFoundation helpers -------------------------------------------
+
+    def _cfstring(self, text: str) -> Any:
+        return self.foundation.CFStringCreateWithCString(None, text.encode("utf-8"), self._UTF8)
+
+    def _read_string(self, value: Any) -> str | None:
+        if not value or self.foundation.CFGetTypeID(value) != self.foundation.CFStringGetTypeID():
+            return None
+        buffer = ctypes.create_string_buffer(2048)
+        if not self.foundation.CFStringGetCString(value, buffer, len(buffer), self._UTF8):
+            return None
+        return buffer.value.decode("utf-8", errors="replace")
+
+    def _attribute(self, element: Any, attribute: str) -> Any:
+        key = self._cfstring(attribute)
+        out = ctypes.c_void_p()
+        try:
+            error = self.services.AXUIElementCopyAttributeValue(element, key, ctypes.byref(out))
+        finally:
+            self.foundation.CFRelease(key)
+        return out.value if error == 0 else None
+
+    def _frame(self, element: Any) -> Rect | None:
+        position = self._attribute(element, "AXPosition")
+        size = self._attribute(element, "AXSize")
+        if not position or not size:
+            return None
+        origin, extent = _CGPoint(), _CGSize()
+        k_ax_value_cgpoint, k_ax_value_cgsize = 1, 2
+        if not self.services.AXValueGetValue(position, k_ax_value_cgpoint, ctypes.byref(origin)):
+            return None
+        if not self.services.AXValueGetValue(size, k_ax_value_cgsize, ctypes.byref(extent)):
+            return None
+        return Rect(origin.x, origin.y, extent.width, extent.height)
+
+    def _children(self, element: Any) -> list[Any]:
+        array = self._attribute(element, "AXChildren")
+        if not array or self.foundation.CFGetTypeID(array) != self.foundation.CFArrayGetTypeID():
+            return []
+        return [
+            self.foundation.CFArrayGetValueAtIndex(array, index)
+            for index in range(self.foundation.CFArrayGetCount(array))
+        ]
+
+    def _windows(self, pid: int) -> list[Any]:
+        application = self.services.AXUIElementCreateApplication(pid)
+        if not application:
+            raise DriverError(f"AXUIElementCreateApplication({pid}) returned nothing")
+        array = self._attribute(application, "AXWindows")
+        if not array:
+            raise DriverError(f"the accessibility tree of pid {pid} lists no windows")
+        return [
+            self.foundation.CFArrayGetValueAtIndex(array, index)
+            for index in range(self.foundation.CFArrayGetCount(array))
+        ]
+
+    # -- authority ---------------------------------------------------------
+
+    def check_authority(self, pid: int | None = None) -> str:
+        if not self.services.AXIsProcessTrusted():
+            raise AuthorityError("AXIsProcessTrusted() is false: no accessibility authority")
+        preflight = getattr(self.services, "CGPreflightPostEventAccess", None)
+        if preflight is not None:
+            preflight.argtypes = []
+            preflight.restype = ctypes.c_ubyte
+            if not preflight():
+                raise AuthorityError("CGPreflightPostEventAccess() is false: events cannot be posted")
+        target = (60.0, 60.0)
+        self.move(*target)
+        point = self._cursor()
+        if abs(point[0] - target[0]) > 2 or abs(point[1] - target[1]) > 2:
+            raise AuthorityError(f"input was not delivered: cursor at {point}, expected {target}")
+        if pid is not None:
+            try:
+                self._windows(pid)
+            except DriverError as error:
+                raise AuthorityError(f"the accessibility tree is unavailable: {error}") from error
+        return "accessibility trust, CGEvent delivery and an AX window tree"
+
+    def _cursor(self) -> tuple[float, float]:
+        event = self.services.CGEventCreate(None)
+        point = self.services.CGEventGetLocation(event)
+        self.foundation.CFRelease(event)
+        return point.x, point.y
+
+    # -- windows -----------------------------------------------------------
+
+    def window_frame(self, pid: int) -> Rect:
+        for window in self._windows(pid):
+            frame = self._frame(window)
+            if frame is not None:
+                return frame
+        raise DriverError(f"no accessible window of pid {pid} reports a frame")
+
+    def bring_forward(self, pid: int) -> None:
+        script = (
+            "ObjC.import('AppKit');"
+            f"var target = $.NSRunningApplication.runningApplicationWithProcessIdentifier({pid});"
+            f"if (!target) {{ throw new Error('no running application has pid {pid}'); }}"
+            "target.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);"
+        )
+        check = (
+            "ObjC.import('AppKit');"
+            "$.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;"
+        )
+        activate = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if activate.returncode != 0:
+            raise DriverError(f"activation of pid {pid} failed: {activate.stderr!r}")
+        deadline = time.monotonic() + 5
+        frontmost = ""
+        while time.monotonic() < deadline:
+            frontmost = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", check],
+                capture_output=True, text=True, timeout=30, check=False,
+            ).stdout.strip()
+            if frontmost == str(pid):
+                return
+            time.sleep(0.2)
+        raise DriverError(f"pid {pid} did not become frontmost (frontmost pid {frontmost!r})")
+
+    # -- input -------------------------------------------------------------
+
+    def _post_mouse(self, kind: int, x: float, y: float, button: int, state: int = 0) -> None:
+        event = self.services.CGEventCreateMouseEvent(None, kind, _CGPoint(x, y), button)
+        if not event:
+            raise DriverError("CGEventCreateMouseEvent returned nothing")
+        k_cg_mouse_event_click_state = 1
+        if state:
+            self.services.CGEventSetIntegerValueField(event, k_cg_mouse_event_click_state, state)
+        self.services.CGEventPost(0, event)  # kCGHIDEventTap
+        self.foundation.CFRelease(event)
+
+    def move(self, x: float, y: float) -> None:
+        self._post_mouse(5, x, y, 0)  # kCGEventMouseMoved
+        time.sleep(0.1)
+
+    def click(self, x: float, y: float, button: str = "left") -> None:
+        self.move(x, y)
+        if button == "left":
+            down, up, code = 1, 2, 0
+        else:
+            down, up, code = 3, 4, 1
+        self._post_mouse(down, x, y, code, state=1)
+        time.sleep(0.05)
+        self._post_mouse(up, x, y, code, state=1)
+        time.sleep(0.15)
+
+    def _post_key(self, key_code: int, down: bool, flags: int = 0, text: str | None = None) -> None:
+        event = self.services.CGEventCreateKeyboardEvent(None, key_code, 1 if down else 0)
+        if not event:
+            raise DriverError("CGEventCreateKeyboardEvent returned nothing")
+        if flags:
+            self.services.CGEventSetFlags(event, flags)
+        if text is not None:
+            raw = text.encode("utf-16-le")
+            units = (ctypes.c_uint16 * (len(raw) // 2)).from_buffer_copy(raw)
+            self.services.CGEventKeyboardSetUnicodeString(event, len(units), units)
+        self.services.CGEventPost(0, event)
+        self.foundation.CFRelease(event)
+
+    def select_all(self) -> None:
+        command_flag, key_a = 0x100000, 0
+        self._post_key(key_a, True, command_flag)
+        self._post_key(key_a, False, command_flag)
+        time.sleep(0.1)
+
+    def type_text(self, text: str) -> None:
+        for character in text:
+            self._post_key(0, True, text=character)
+            self._post_key(0, False, text=character)
+            time.sleep(0.01)
+        time.sleep(0.1)
+
+    # -- accessibility -----------------------------------------------------
+
+    def find_widget(self, pid: int, role: str, name: str) -> Widget:
+        want = {"button": "AXButton", "edit": "AXTextField"}[role]
+        exact: list[Widget] = []
+        native: list[Widget] = []
+
+        def visit(element: Any) -> None:
+            element_role = self._read_string(self._attribute(element, "AXRole"))
+            if element_role == "AXWebArea":
+                return  # web content is located through the page, not here
+            if element_role == want:
+                frame = self._frame(element)
+                if frame is not None and frame.width > 0 and frame.height > 0:
+                    label = ""
+                    for attribute in ("AXTitle", "AXDescription", "AXLabel"):
+                        label = self._read_string(self._attribute(element, attribute)) or ""
+                        if label:
+                            break
+                    enabled_value = self._attribute(element, "AXEnabled")
+                    enabled = (
+                        True if enabled_value is None
+                        else bool(self.foundation.CFBooleanGetValue(enabled_value))
+                    )
+                    value = self._read_string(self._attribute(element, "AXValue"))
+                    widget = Widget(label, frame, enabled, value)
+                    (exact if label == name else native).append(widget)
+            for child in self._children(element):
+                visit(child)
+
+        for window in self._windows(pid):
+            visit(window)
+        matches = exact or (native if role == "edit" and len(native) == 1 else [])
+        if not matches:
+            raise DriverError(f"no visible {role} named {name!r} in the window of pid {pid}")
+        if len(matches) != 1:
+            raise DriverError(
+                f"{len(matches)} visible {role} widgets match {name!r}: "
+                f"{[m.name for m in matches]!r}"
+            )
+        return matches[0]
+
+    # -- clipboard ---------------------------------------------------------
+
+    @staticmethod
+    def _pasteboard_environment() -> dict[str, str]:
+        environment = dict(os.environ)
+        environment["LANG"] = "en_US.UTF-8"
+        environment["LC_ALL"] = "en_US.UTF-8"
+        return environment
+
+    def set_clipboard(self, text: str) -> None:
+        completed = subprocess.run(
+            ["pbcopy"], input=text.encode("utf-8"), capture_output=True,
+            env=self._pasteboard_environment(), timeout=30, check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(f"pbcopy exited {completed.returncode}: {completed.stderr!r}")
+
+    def get_clipboard(self) -> str | None:
+        completed = subprocess.run(
+            ["pbpaste"], capture_output=True, env=self._pasteboard_environment(),
+            timeout=30, check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(f"pbpaste exited {completed.returncode}: {completed.stderr!r}")
+        return completed.stdout.decode("utf-8", errors="replace") or None
+
+
+def create_driver() -> Any:
+    """Return the backend for this host."""
+
+    if os.name == "nt":
+        return _WindowsBackend()
+    if sys.platform == "darwin":
+        return _MacBackend()
+    raise DriverError("the native driver exists only for Windows and macOS")
+
+
+# ---------------------------------------------------------------------------
+# Page-level DevTools client (locate and read only)
+# ---------------------------------------------------------------------------
+
+_WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_FORBIDDEN_DOMAINS = frozenset({"Input", "Emulation"})
+
+
+def encode_frame(opcode: int, payload: bytes, mask_key: bytes) -> bytes:
+    """Encode one masked, final client WebSocket frame (RFC 6455)."""
+
+    if len(mask_key) != 4:
+        raise ValueError("the mask key is four bytes")
+    length = len(payload)
+    header = bytes([0x80 | opcode])
+    if length < 126:
+        header += bytes([0x80 | length])
+    elif length < 1 << 16:
+        header += bytes([0x80 | 126]) + struct.pack(">H", length)
+    else:
+        header += bytes([0x80 | 127]) + struct.pack(">Q", length)
+    masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    return header + mask_key + masked
+
+
+def read_frame(read_exact: Callable[[int], bytes]) -> tuple[bool, int, bytes]:
+    """Read one frame through ``read_exact`` and return ``(fin, opcode, payload)``."""
+
+    first, second = read_exact(2)
+    fin = bool(first & 0x80)
+    opcode = first & 0x0F
+    masked = bool(second & 0x80)
+    length = second & 0x7F
+    if length == 126:
+        (length,) = struct.unpack(">H", read_exact(2))
+    elif length == 127:
+        (length,) = struct.unpack(">Q", read_exact(8))
+    mask_key = read_exact(4) if masked else b""
+    payload = read_exact(length) if length else b""
+    if masked:
+        payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    return fin, opcode, payload
+
+
+def free_loopback_port(*, avoid: int) -> int:
+    """Return an unused loopback TCP port different from ``avoid``."""
+
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        if port != avoid:
+            return port
+    raise DriverError("no free loopback port was available")
+
+
+class CdpPage:
+    """A minimal page-level DevTools WebSocket client.
+
+    It evaluates expressions to locate and read web content.  Methods in the
+    ``Input`` and ``Emulation`` domains are refused so that no input is ever
+    injected through the page: every click and keystroke is OS-level.
+    """
+
+    def __init__(self, port: int, page_url_prefix: str, timeout: float = 15.0) -> None:
+        self.port = port
+        self.timeout = timeout
+        self._next_id = 0
+        self._buffer = b""
+        self._socket: socket.socket | None = None
+        self.target_url = ""
+        websocket_path = self._discover(page_url_prefix)
+        self._connect(websocket_path)
+
+    def _discover(self, page_url_prefix: str) -> str:
+        deadline = time.monotonic() + self.timeout
+        last: object = None
+        while time.monotonic() < deadline:
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            try:
+                connection.request("GET", "/json/list")
+                response = connection.getresponse()
+                body = response.read()
+                if response.status == 200:
+                    targets = json.loads(body)
+                    pages = [
+                        target for target in targets
+                        if target.get("type") == "page"
+                        and str(target.get("url", "")).startswith(page_url_prefix)
+                    ]
+                    if pages:
+                        self.target_url = pages[0]["url"]
+                        url = pages[0]["webSocketDebuggerUrl"]
+                        return "/" + url.split("/", 3)[3]
+                    last = f"no page target under {page_url_prefix!r}: {targets!r}"
+                else:
+                    last = f"status {response.status}"
+            except (OSError, ValueError, KeyError) as error:
+                last = error
+            finally:
+                connection.close()
+            time.sleep(0.25)
+        raise CdpError(f"no DevTools page target on port {self.port}: {last!r}")
+
+    def _connect(self, path: str) -> None:
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=self.timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise CdpError(f"the DevTools handshake closed early: {data!r}")
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        if " 101 " not in lines[0] + " ":
+            sock.close()
+            raise CdpError(f"the DevTools handshake was refused: {lines[0]!r}")
+        accept = base64.b64encode(
+            hashlib.sha1((key + _WEBSOCKET_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        headers = {
+            line.split(":", 1)[0].strip().lower(): line.split(":", 1)[1].strip()
+            for line in lines[1:] if ":" in line
+        }
+        if headers.get("sec-websocket-accept") != accept:
+            sock.close()
+            raise CdpError("the DevTools handshake returned a wrong accept key")
+        self._buffer = rest
+        self._socket = sock
+
+    def _read_exact(self, count: int) -> bytes:
+        assert self._socket is not None
+        while len(self._buffer) < count:
+            chunk = self._socket.recv(65536)
+            if not chunk:
+                raise CdpError("the DevTools connection closed")
+            self._buffer += chunk
+        data, self._buffer = self._buffer[:count], self._buffer[count:]
+        return data
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        assert self._socket is not None
+        self._socket.sendall(encode_frame(opcode, payload, os.urandom(4)))
+
+    def _receive_message(self) -> str:
+        fragments = b""
+        while True:
+            fin, opcode, payload = read_frame(self._read_exact)
+            if opcode == 0x9:  # ping
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:  # pong
+                continue
+            if opcode == 0x8:
+                raise CdpError("the DevTools endpoint closed the connection")
+            fragments += payload
+            if fin:
+                return fragments.decode("utf-8")
+
+    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if method.split(".", 1)[0] in _FORBIDDEN_DOMAINS:
+            raise CdpError(f"{method} would inject input; all input must be OS-level")
+        self._next_id += 1
+        identifier = self._next_id
+        message = {"id": identifier, "method": method, "params": params or {}}
+        self._send_frame(0x1, json.dumps(message).encode("utf-8"))
+        assert self._socket is not None
+        self._socket.settimeout(self.timeout)
+        while True:
+            reply = json.loads(self._receive_message())
+            if reply.get("id") != identifier:
+                continue  # an event or a stale reply
+            if "error" in reply:
+                raise CdpError(f"{method} failed: {reply['error']!r}")
+            return reply.get("result", {})
+
+    def evaluate(self, expression: str) -> Any:
+        """Evaluate a side-effect-free expression and return its JSON value."""
+
+        result = self.call(
+            "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True, "awaitPromise": False},
+        )
+        if "exceptionDetails" in result:
+            raise CdpError(f"the page rejected the expression: {result['exceptionDetails']!r}")
+        return result.get("result", {}).get("value")
+
+    def close(self) -> None:
+        if self._socket is not None:
+            with contextlib.suppress(OSError):
+                self._send_frame(0x8, b"")
+            self._socket.close()
+            self._socket = None
+
+    def __enter__(self) -> "CdpPage":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+@dataclass
+class PageCalibration:
+    """Map page CSS pixels to screen pixels from two observed pointer moves."""
+
+    origin_x: float
+    origin_y: float
+    scale: float = 1.0
+    moves: list[tuple[float, float, float, float]] = field(default_factory=list)
+
+    def to_screen(self, css_x: float, css_y: float) -> tuple[float, float]:
+        return self.origin_x + self.scale * css_x, self.origin_y + self.scale * css_y
+
+
+_INSTALL_POINTER_RECORDER = (
+    "(() => { window.__nyxPointer = null;"
+    " document.addEventListener('mousemove', (event) => {"
+    "   window.__nyxPointer = [event.clientX, event.clientY]; }, true);"
+    " return true; })()"
+)
+
+
+def calibrate_page(driver: Any, page: CdpPage, frame: Rect) -> PageCalibration:
+    """Learn where the page sits on screen by moving the OS pointer over it.
+
+    The page only records pointer positions it receives; the moves themselves
+    are OS input, so a mapping error shows up as a hard failure here rather
+    than as a missed click later.
+    """
+
+    page.evaluate(_INSTALL_POINTER_RECORDER)
+    base_x = frame.left + frame.width * 0.75
+    base_y = frame.top + frame.height * 0.8
+    observed: list[tuple[float, float, float, float]] = []
+    for offset_x, offset_y in ((0.0, 0.0), (-60.0, -40.0)):
+        screen_x, screen_y = base_x + offset_x, base_y + offset_y
+        driver.move(screen_x + 5, screen_y + 5)  # enter the page before the measured move
+        driver.move(screen_x, screen_y)
+        client = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            client = page.evaluate("window.__nyxPointer")
+            if client:
+                break
+            time.sleep(0.1)
+        if not client:
+            raise DriverError(
+                f"the page received no pointer move at screen ({screen_x:.0f},{screen_y:.0f})"
+            )
+        observed.append((screen_x, screen_y, float(client[0]), float(client[1])))
+        page.evaluate("window.__nyxPointer = null")
+    (sx1, sy1, cx1, cy1), (sx2, sy2, cx2, cy2) = observed
+    if abs(cx1 - cx2) < 1 or abs(cy1 - cy2) < 1:
+        raise DriverError(f"the page pointer did not follow the OS pointer: {observed!r}")
+    scale_x = (sx1 - sx2) / (cx1 - cx2)
+    scale_y = (sy1 - sy2) / (cy1 - cy2)
+    if abs(scale_x - scale_y) > 0.05 * max(scale_x, scale_y):
+        raise DriverError(f"inconsistent page scale {scale_x:.3f} vs {scale_y:.3f}: {observed!r}")
+    scale = (scale_x + scale_y) / 2
+    return PageCalibration(sx1 - scale * cx1, sy1 - scale * cy1, scale, observed)
