@@ -3063,6 +3063,10 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
     both_shutdowns_started = threading.Event()
     both_shutdowns_finished = threading.Event()
     release_shutdowns = threading.Event()
+    # Future deadlines inside the daemon's accepted window; a past or
+    # over-ceiling deadline would be dropped before any acknowledgement.
+    first_deadline_ns = time.monotonic_ns() + 2_000_000_000
+    second_deadline_ns = time.monotonic_ns() + 3_000_000_000
 
     class Connection:
         def __init__(self, deadline_ns: int, *, fail_response: bool = False):
@@ -3102,8 +3106,8 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
         def __init__(self):
             self.connections = iter(
                 [
-                    Connection(2_000_000_000, fail_response=True),
-                    Connection(3_000_000_000),
+                    Connection(first_deadline_ns, fail_response=True),
+                    Connection(second_deadline_ns),
                 ]
             )
 
@@ -3147,8 +3151,9 @@ def test_stop_ack_failure_and_duplicate_requests_retain_published_cleanup():
                 release_shutdowns.set()
                 assert both_shutdowns_finished.wait(timeout=2)
             assert published_at_send == [True, True]
-            assert sorted(shutdown_deadlines) == [2.0, 3.0]
-            assert sorted(finished_deadlines) == [2.0, 3.0]
+            expected = [first_deadline_ns / 1_000_000_000, second_deadline_ns / 1_000_000_000]
+            assert sorted(shutdown_deadlines) == expected
+            assert sorted(finished_deadlines) == expected
         finally:
             release_shutdowns.set()
             os.close(lease_fd)
@@ -7080,7 +7085,7 @@ def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
                         "version": 1,
                         "capability": "capability",
                         "command": "stop",
-                        "deadline_ns": time.monotonic_ns() + 1_000_000_000,
+                        "deadline_ns": time.monotonic_ns() + 150_000_000,
                     }
                 )
                 + "\n"
@@ -7201,6 +7206,594 @@ def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
                 os.close(lease_fd)
             except OSError:
                 pass
+
+
+def _control_exchange(
+    instance: runtime.Instance,
+    payload: bytes,
+    *,
+    chunks: list[bytes] | None = None,
+    read_for: float = 3.0,
+) -> bytes:
+    """Send raw bytes to the daemon's control socket and return whatever it replies.
+
+    The reply is read until the daemon closes the connection or ``read_for``
+    elapses, so a dropped connection returns ``b""``.
+    """
+
+    _, address = runtime._parse_control_endpoint(instance.control)
+    with socket.create_connection(address, timeout=read_for) as peer:
+        for piece in chunks if chunks is not None else [payload]:
+            peer.sendall(piece)
+            if chunks is not None:
+                time.sleep(0.2)
+        received = b""
+        try:
+            while True:
+                part = peer.recv(8192)
+                if not part:
+                    return received
+                received += part
+        except (TimeoutError, socket.timeout):
+            return received
+        except (ConnectionResetError, ConnectionAbortedError):
+            # Closing with unread request bytes resets the connection
+            # (ConnectionResetError on POSIX, ConnectionAbortedError for
+            # WinError 10053 on Windows); that is still a dropped connection,
+            # and any reply bytes already read are returned unchanged.
+            return received
+
+
+def _status_request(instance: runtime.Instance, **overrides: object) -> dict[str, object]:
+    request: dict[str, object] = {
+        "version": 1,
+        "capability": instance.capability,
+        "command": "status",
+    }
+    request.update(overrides)
+    return request
+
+
+def _padded_status_line(instance: runtime.Instance, total: int) -> bytes:
+    """A valid authenticated status line of exactly ``total`` bytes including the newline."""
+
+    body = json.dumps(_status_request(instance), separators=(",", ":")).encode()
+    padding = total - len(body) - 1
+    assert padding >= 0
+    return body + b" " * padding + b"\n"
+
+
+_CONTROL_HANDLER_THREAD = "nyx-control-handler"
+
+
+@pytest.fixture
+def control_daemon(monkeypatch):
+    """A real in-process daemon on the isolated port, yielding its record and run.
+
+    Each control connection is served on its own handler thread, so an
+    exception escaping a handler kills only that thread and pytest reports it
+    as a warning, not a failure.  The fixture records every such escape in
+    ``handler_failures`` so the proofs can fail on it, and fails the test at
+    teardown if one was never checked.
+    """
+
+    handler_failures: list[str] = []
+    previous_hook = threading.excepthook
+
+    def record_handler_failure(args: threading.ExceptHookArgs) -> None:
+        if args.thread is not None and args.thread.name == _CONTROL_HANDLER_THREAD:
+            handler_failures.append(f"{args.exc_type.__name__}: {args.exc_value}")
+        previous_hook(args)
+
+    monkeypatch.setattr(threading, "excepthook", record_handler_failure)
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 30) * 1_000_000_000))
+            with managed_daemon_run(daemon) as run:
+                instance = _wait_for_record(paths)
+                yield SimpleNamespace(
+                    daemon=daemon,
+                    instance=instance,
+                    run=run,
+                    paths=paths,
+                    handler_failures=handler_failures,
+                )
+    assert handler_failures == [], "an exception escaped a control connection handler"
+
+
+def _assert_no_control_handler_failure(context: SimpleNamespace) -> None:
+    """Fail when any exception escaped a control connection's handler thread.
+
+    The handler closes the connection before an escaping exception reaches
+    the thread hook, so the peer can see end-of-stream first.  Joining the
+    finished handler threads orders their hooks before the assertion.
+    """
+
+    budget = time.monotonic() + 2 * runtime.RUNTIME_CONTROL_TIMEOUT
+    for thread in threading.enumerate():
+        if thread.name == _CONTROL_HANDLER_THREAD:
+            thread.join(timeout=max(0.0, budget - time.monotonic()))
+    assert context.handler_failures == [], (
+        "an exception escaped a control connection handler"
+    )
+
+
+def _assert_control_survives(context: SimpleNamespace) -> None:
+    _assert_no_control_handler_failure(context)
+    assert context.daemon.control_thread is not None
+    assert context.daemon.control_thread.is_alive()
+    assert _observe(context.paths).status == "running"
+    reply = _control_exchange(
+        context.instance, (json.dumps(_status_request(context.instance)) + "\n").encode()
+    )
+    assert json.loads(reply)["status"] == "ready"
+
+
+_DIGIT_LIMIT_LITERAL = b"9" * 5000
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda i: b"\xff\n", id="bad-utf8"),
+        pytest.param(lambda i: b"x" * 9000, id="over-bound-without-newline"),
+        pytest.param(
+            lambda i: _padded_status_line(i, runtime.CONTROL_REQUEST_LIMIT + 1),
+            id="padded-status-past-bound",
+        ),
+        pytest.param(
+            lambda i: b'{"version":1,"capability":"c","command":"status","n":'
+            + _DIGIT_LIMIT_LITERAL
+            + b"}\n",
+            id="integer-beyond-digit-limit",
+        ),
+        pytest.param(lambda i: b"[1, 2]\n", id="non-object-json"),
+        pytest.param(
+            lambda i: (json.dumps(_status_request(i, version=2)) + "\n").encode(),
+            id="wrong-version",
+        ),
+        pytest.param(
+            lambda i: (json.dumps(_status_request(i, capability="wrong")) + "\n").encode(),
+            id="wrong-capability",
+        ),
+    ],
+)
+def test_malformed_control_request_is_dropped_without_ending_the_control_loop(
+    control_daemon, build
+):
+    payload = build(control_daemon.instance)
+    assert _control_exchange(control_daemon.instance, payload) == b""
+    _assert_control_survives(control_daemon)
+    assert runtime.stop() == "stopped"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+def test_control_status_request_at_exactly_the_read_bound_is_answered(control_daemon):
+    line = _padded_status_line(control_daemon.instance, runtime.CONTROL_REQUEST_LIMIT)
+    assert len(line) == 8192
+    reply = _control_exchange(control_daemon.instance, line)
+    assert json.loads(reply)["status"] == "ready"
+    _assert_control_survives(control_daemon)
+
+
+def test_control_status_request_split_across_two_writes_is_answered(control_daemon):
+    line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
+    middle = len(line) // 2
+    reply = _control_exchange(
+        control_daemon.instance, b"", chunks=[line[:middle], line[middle:]]
+    )
+    assert json.loads(reply)["status"] == "ready"
+    _assert_no_control_handler_failure(control_daemon)
+
+
+def test_control_request_bytes_after_the_newline_are_ignored(control_daemon):
+    line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
+    reply = _control_exchange(control_daemon.instance, line + b"trailing bytes, not JSON")
+    assert json.loads(reply)["status"] == "ready"
+    _assert_control_survives(control_daemon)
+
+def test_trickling_sender_is_closed_within_one_control_timeout_of_accept(control_daemon):
+    _, address = runtime._parse_control_endpoint(control_daemon.instance.control)
+    started = time.monotonic()
+    closed_at: float | None = None
+    with socket.create_connection(address, timeout=5) as peer:
+        peer.settimeout(0.05)
+        while time.monotonic() - started < 3.0:
+            try:
+                peer.sendall(b" ")
+            except OSError:
+                closed_at = time.monotonic()
+                break
+            try:
+                if peer.recv(1) == b"":
+                    closed_at = time.monotonic()
+                    break
+            except (TimeoutError, socket.timeout):
+                pass
+            except OSError:
+                closed_at = time.monotonic()
+                break
+            time.sleep(0.3)
+    assert closed_at is not None, "daemon never closed the trickling connection"
+    assert closed_at - started < runtime.RUNTIME_CONTROL_TIMEOUT + 0.6
+    _assert_control_survives(control_daemon)
+
+
+@pytest.fixture
+def stalled_peers():
+    """Open connections to the control port that never send; closed on exit."""
+
+    peers: list[socket.socket] = []
+
+    def open_peers(instance: runtime.Instance, count: int) -> list[socket.socket]:
+        _, address = runtime._parse_control_endpoint(instance.control)
+        opened = [socket.create_connection(address, timeout=2) for _ in range(count)]
+        peers.extend(opened)
+        return opened
+
+    try:
+        yield open_peers
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+def test_control_status_is_prompt_with_sixteen_stalled_peers(control_daemon, stalled_peers):
+    stalled_peers(control_daemon.instance, 16)
+    started = time.monotonic()
+    observation = _observe(control_daemon.paths)
+    elapsed = time.monotonic() - started
+    assert observation.status == "running", observation
+    assert elapsed < runtime.RUNTIME_CONTROL_TIMEOUT
+
+
+def test_stalled_peers_never_grow_the_control_threads_past_the_handler_cap(
+    control_daemon, stalled_peers
+):
+    def live_handlers() -> int:
+        return sum(
+            1
+            for thread in threading.enumerate()
+            if thread.name == "nyx-control-handler" and thread.is_alive()
+        )
+
+    def refused(peers: list[socket.socket]) -> int:
+        closed = 0
+        for peer in peers:
+            try:
+                if peer.recv(1) == b"":
+                    closed += 1
+            except BlockingIOError:
+                pass
+            except ConnectionError:
+                closed += 1
+        return closed
+
+    total = 20
+    over_cap = total - runtime.CONTROL_HANDLER_LIMIT
+    # Keep the stalled handlers alive for the whole observation window, so a
+    # slow host cannot see them expire before every peer has been accepted.
+    with patch.object(runtime, "RUNTIME_CONTROL_TIMEOUT", 6.0):
+        peers = stalled_peers(control_daemon.instance, total)
+        for peer in peers:
+            peer.setblocking(False)
+        most_handlers = 0
+        closed = 0
+        deadline = time.monotonic() + 4.0
+        # Every connection has been accepted once the over-cap peers see their
+        # connection closed; until then, record the largest handler count.
+        while time.monotonic() < deadline:
+            most_handlers = max(most_handlers, live_handlers())
+            closed = refused(peers)
+            if closed >= over_cap and most_handlers >= runtime.CONTROL_HANDLER_LIMIT:
+                break
+            time.sleep(0.02)
+        settle_until = time.monotonic() + 0.3
+        while time.monotonic() < settle_until:
+            most_handlers = max(most_handlers, live_handlers())
+            time.sleep(0.02)
+        assert most_handlers <= runtime.CONTROL_HANDLER_LIMIT
+        assert live_handlers() == runtime.CONTROL_HANDLER_LIMIT
+        assert closed == over_cap
+    assert runtime.CONTROL_HANDLER_LIMIT > runtime.CONTROL_BACKLOG
+    assert control_daemon.daemon.control_thread.is_alive()
+
+
+def test_control_full_handler_pool_refuses_at_once_and_terminal_close_does_not_wait(
+    control_daemon, stalled_peers
+):
+    # Lengthen the peers' deadline so shutdown fits well inside their window.
+    with patch.object(runtime, "RUNTIME_CONTROL_TIMEOUT", 4.0):
+        peers = stalled_peers(control_daemon.instance, runtime.CONTROL_HANDLER_LIMIT)
+        time.sleep(0.3)
+        extra = stalled_peers(control_daemon.instance, 1)[0]
+        extra.settimeout(0.25)
+        started = time.monotonic()
+        try:
+            assert extra.recv(1) == b""
+        except ConnectionResetError:
+            pass
+        assert time.monotonic() - started < 0.25
+
+        control_thread = control_daemon.daemon.control_thread
+        result = control_daemon.daemon.shutdown(time.monotonic() + 2.0)
+        assert result == "stopped"
+        assert not control_thread.is_alive()
+        for peer in peers:
+            peer.setblocking(False)
+            with pytest.raises(BlockingIOError):
+                peer.recv(1)
+
+
+def test_control_handler_start_failure_closes_connection_and_returns_its_slot(
+    control_daemon, stalled_peers
+):
+    # A handler thread that cannot start must not leak its slot: after a full
+    # pool's worth of start failures, every slot is still available.
+    original_start = threading.Thread.start
+    failed: list[threading.Thread] = []
+
+    def failing_start(thread: threading.Thread) -> None:
+        if thread.name == "nyx-control-handler" and len(failed) < runtime.CONTROL_HANDLER_LIMIT:
+            failed.append(thread)
+            raise RuntimeError("can't start new thread")
+        original_start(thread)
+
+    with patch.object(threading.Thread, "start", failing_start):
+        for _ in range(runtime.CONTROL_HANDLER_LIMIT):
+            reply = _control_exchange(
+                control_daemon.instance,
+                (json.dumps(_status_request(control_daemon.instance)) + "\n").encode(),
+                read_for=0.5,
+            )
+            assert reply == b""
+    assert len(failed) == runtime.CONTROL_HANDLER_LIMIT
+    assert control_daemon.daemon.control_thread.is_alive()
+
+    stalled_peers(control_daemon.instance, runtime.CONTROL_BACKLOG)
+    started = time.monotonic()
+    observation = _observe(control_daemon.paths)
+    assert observation.status == "running", observation
+    assert time.monotonic() - started < runtime.RUNTIME_CONTROL_TIMEOUT
+
+
+def _stop_request(instance: runtime.Instance, deadline_ns: object) -> bytes:
+    request = {
+        "version": 1,
+        "capability": instance.capability,
+        "command": "stop",
+    }
+    if deadline_ns is not None:
+        request["deadline_ns"] = deadline_ns
+    return (json.dumps(request) + "\n").encode()
+
+
+@pytest.mark.parametrize(
+    "deadline_ns",
+    [
+        pytest.param(lambda now: now - 1_000_000_000, id="already-past"),
+        pytest.param(lambda now: 1, id="long-past"),
+        pytest.param(lambda now: 2**2000, id="huge"),
+        pytest.param(
+            lambda now: now + int((runtime.SHUTDOWN_TIMEOUT + 5) * 1_000_000_000),
+            id="beyond-ceiling",
+        ),
+        pytest.param(lambda now: None, id="missing"),
+        pytest.param(lambda now: "soon", id="string"),
+        pytest.param(lambda now: float(now + 1_000_000_000), id="float"),
+        pytest.param(lambda now: True, id="json-true"),
+    ],
+)
+def test_control_stop_with_invalid_or_expired_deadline_is_dropped_without_state_change(
+    control_daemon, deadline_ns
+):
+    payload = _stop_request(
+        control_daemon.instance, deadline_ns(time.monotonic_ns())
+    )
+    assert _control_exchange(control_daemon.instance, payload) == b""
+    # Status must still be "ready" (never "unhealthy"): the dropped stop
+    # neither set the stop transition nor started cleanup.
+    assert not control_daemon.daemon.stop_requested.is_set()
+    _assert_control_survives(control_daemon)
+    assert runtime.stop() == "stopped"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+def test_control_stop_with_a_valid_future_deadline_is_acknowledged_and_executed(
+    control_daemon,
+):
+    deadline_ns = time.monotonic_ns() + int(runtime.SHUTDOWN_TIMEOUT * 1_000_000_000) // 2
+    reply = _control_exchange(
+        control_daemon.instance, _stop_request(control_daemon.instance, deadline_ns)
+    )
+    assert json.loads(reply)["status"] == "stopping"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+@pytest.fixture
+def control_peer():
+    """A published instance record with a held lease and a test-owned control listener."""
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        instance = runtime.Instance(
+            instance_id="peer",
+            url=runtime.URL,
+            capability="peer-capability",
+            control=runtime._control_endpoint(listener.getsockname()[1]),
+        )
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime._write_instance(paths, instance, deadline=time.monotonic() + 5)
+            release = threading.Event()
+            state_: dict[str, object] = {"lease_fd": lease_fd}
+
+            def terminal_cleanup() -> None:
+                (paths.runtime_directory / "instance.json").unlink()
+                os.close(state_.pop("lease_fd"))  # type: ignore[arg-type]
+
+            def serve(acknowledge_after: float | None, *, cleanup: bool) -> threading.Thread:
+                def run() -> None:
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.settimeout(5)
+                        line = b""
+                        while not line.endswith(b"\n"):
+                            line += connection.recv(8192)
+                        state_["request"] = json.loads(line)
+                        state_["received_at"] = time.monotonic()
+                        if acknowledge_after is None:
+                            release.wait(timeout=10)
+                            return
+                        time.sleep(acknowledge_after)
+                        connection.sendall(
+                            (
+                                json.dumps(
+                                    {
+                                        "status": "stopping",
+                                        "instance_id": instance.instance_id,
+                                        "url": runtime.URL,
+                                    }
+                                )
+                                + "\n"
+                            ).encode()
+                        )
+                    state_["acknowledged_at"] = time.monotonic()
+                    if cleanup:
+                        terminal_cleanup()
+
+                thread = threading.Thread(target=run, daemon=True)
+                thread.start()
+                return thread
+
+            try:
+                yield SimpleNamespace(
+                    paths=paths,
+                    serve=serve,
+                    state=state_,
+                    release=release,
+                    listener=listener,
+                )
+            finally:
+                release.set()
+                listener.close()
+                if "lease_fd" in state_:
+                    os.close(state_.pop("lease_fd"))  # type: ignore[arg-type]
+
+
+def test_control_stop_waits_for_a_late_acknowledgement_until_the_published_deadline(
+    control_peer,
+):
+    # The acknowledgement arrives after RUNTIME_CONTROL_TIMEOUT but inside the
+    # published deadline, and cleanup then completes: a clean stop.
+    # Withhold for a full second past the old control budget; the bounds below
+    # keep a half-second margin so timer granularity cannot decide the result.
+    delay = runtime.RUNTIME_CONTROL_TIMEOUT + 1.0
+    past_control_budget = runtime.RUNTIME_CONTROL_TIMEOUT + 0.5
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 4.0):
+        peer = control_peer.serve(delay, cleanup=True)
+        started = time.monotonic()
+        assert runtime.stop() == "stopped"
+        elapsed = time.monotonic() - started
+    peer.join(timeout=5)
+    assert control_peer.state["request"]["command"] == "stop"
+    withheld = control_peer.state["acknowledged_at"] - control_peer.state["received_at"]
+    assert withheld > past_control_budget
+    assert elapsed > past_control_budget
+
+
+def test_control_stop_without_an_acknowledgement_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 1.6):
+        control_peer.serve(None, cleanup=False)
+        started = time.monotonic()
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        elapsed = time.monotonic() - started
+        # The command waited for the published deadline, not the shorter
+        # control timeout, before it reported the unknown outcome.
+        assert elapsed > runtime.RUNTIME_CONTROL_TIMEOUT + 0.3
+        assert str(caught.value) == runtime.SHUTDOWN_TIMEOUT_MESSAGE
+        control_peer.serve(None, cleanup=False)
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+    error_output = capsys.readouterr().err
+    assert error_output == f"nyx: {runtime.SHUTDOWN_TIMEOUT_MESSAGE}\n"
+    assert "control timed out" not in error_output
+
+
+def test_control_stop_dropped_without_a_reply_after_the_deadline_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    # The peer receives the stop, finds the caller's published deadline already
+    # passed, and closes without replying.  A controlled clock makes the
+    # deadline pass deterministically between the send and the empty read, so
+    # the client's own socket timer cannot decide the result.
+    offset = [0.0]
+    real_monotonic = time.monotonic
+
+    def drop_after_deadline() -> None:
+        connection, _ = control_peer.listener.accept()
+        with connection:
+            connection.settimeout(5)
+            line = b""
+            while not line.endswith(b"\n"):
+                line += connection.recv(8192)
+            offset[0] = runtime.SHUTDOWN_TIMEOUT + 10.0
+
+    with patch.object(runtime.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
+        peers = [threading.Thread(target=drop_after_deadline, daemon=True) for _ in range(2)]
+        peers[0].start()
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        peers[0].join(timeout=5)
+        assert str(caught.value) == runtime.SHUTDOWN_TIMEOUT_MESSAGE
+        offset[0] = 0.0
+        peers[1].start()
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+        peers[1].join(timeout=5)
+    error_output = capsys.readouterr().err
+    assert error_output == f"nyx: {runtime.SHUTDOWN_TIMEOUT_MESSAGE}\n"
+    assert "control did not respond" not in error_output
+
+
+def test_control_stop_acknowledged_but_never_cleaned_up_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    message = runtime.SHUTDOWN_TIMEOUT_MESSAGE
+    assert "ownership was retained" in message
+    assert "outcome is unknown" in message
+    assert "nyx --status" in message
+    with patch.object(runtime, "SHUTDOWN_TIMEOUT", 1.0):
+        control_peer.serve(0.0, cleanup=False)
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        assert str(caught.value) == message
+        control_peer.serve(0.0, cleanup=False)
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+    assert capsys.readouterr().err == f"nyx: {message}\n"
+
+
+def test_control_stop_before_any_contact_keeps_its_own_timeout_text():
+    with patch.object(
+        runtime, "_paths", side_effect=TimeoutError("lock wait expired")
+    ), pytest.raises(runtime.ShutdownTimeoutError) as caught:
+        runtime.stop()
+    assert str(caught.value) == "Nyx shutdown timed out; ownership was retained"
 
 
 def test_setup_of_active_and_moved_workspace_succeeds_after_stored_key_stops_resolving():

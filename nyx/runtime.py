@@ -63,6 +63,15 @@ LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 RUNTIME_CONTROL_TIMEOUT = 1.0
+SHUTDOWN_TIMEOUT_MESSAGE = (
+    "Nyx shutdown timed out; ownership was retained and the outcome is unknown; "
+    "check with nyx --status"
+)
+CONTROL_REQUEST_LIMIT = 8192
+CONTROL_BACKLOG = 16
+# One more slot than the listener backlog, so a full backlog of stalled peers
+# still leaves a handler for a status request.
+CONTROL_HANDLER_LIMIT = CONTROL_BACKLOG + 1
 
 RUNTIME_OPERATION_IN_PROGRESS = "runtime operation in progress"
 RUNTIME_STATE_UNAVAILABLE = "runtime state unavailable"
@@ -702,6 +711,12 @@ def _send_control(
             raise _ControlTimeoutError("control deadline expired")
         return value
 
+    def published_deadline_passed() -> bool:
+        # A command that published its deadline to the peer (a stop) has no
+        # reply to wait for once that deadline passes: the peer drops the
+        # request without answering, so the exchange ending then is a timeout.
+        return deadline_ns is not None and deadline is not None and time.monotonic() >= deadline
+
     connection: socket.socket | None = None
     try:
         family, address = _parse_control_endpoint(instance.control)
@@ -718,6 +733,8 @@ def _send_control(
         connection.settimeout(remaining())
         data = connection.recv(8192)
         if not data:
+            if published_deadline_passed():
+                raise _ControlTimeoutError("control deadline expired")
             raise _ControlUnavailableError("control did not respond")
         response = json.loads(data.splitlines()[0])
         if not isinstance(response, dict):
@@ -732,6 +749,8 @@ def _send_control(
     except (TimeoutError, socket.timeout) as error:
         raise _ControlTimeoutError("control timed out") from error
     except (OSError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        if isinstance(error, OSError) and published_deadline_passed():
+            raise _ControlTimeoutError("control deadline expired") from error
         raise _ControlUnavailableError("control is unavailable") from error
     finally:
         if connection is not None:
@@ -1131,7 +1150,7 @@ class _Daemon:
         try:
             control.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             control.bind(("127.0.0.1", 0))
-            control.listen(16)
+            control.listen(CONTROL_BACKLOG)
         except OSError:
             control.close()
             raise StartupError("Nyx control endpoint is already occupied") from None
@@ -1191,6 +1210,7 @@ class _Daemon:
         # terminal cleanup closes the listener; stop_requested only marks that
         # cleanup has begun and must not make the endpoint disappear while the
         # daemon still owns the lease and record.
+        slots = threading.BoundedSemaphore(CONTROL_HANDLER_LIMIT)
         while self.shutdown_result != "stopped":
             try:
                 connection, _ = self.control.accept()
@@ -1198,54 +1218,138 @@ class _Daemon:
                 continue
             except OSError:
                 break
-            with connection:
-                try:
-                    connection.settimeout(1.0)
-                    data = connection.recv(8192)
-                    request = json.loads(data.splitlines()[0])
-                    if (
-                        not isinstance(request, dict)
-                        or request.get("version") != 1
-                        or request.get("capability") != (self.instance.capability if self.instance else None)
+            accepted_at = time.monotonic()
+            # Never wait for a slot: the accept thread must stay free to take
+            # the terminal wake-up connection.
+            if not slots.acquire(blocking=False):
+                self._close_refused_control_connection(connection)
+                continue
+            try:
+                threading.Thread(
+                    target=self._run_control_handler,
+                    args=(connection, accepted_at, slots),
+                    name="nyx-control-handler",
+                    daemon=True,
+                ).start()
+            except Exception:
+                slots.release()
+                self._close_refused_control_connection(connection)
+
+    @staticmethod
+    def _close_refused_control_connection(connection: socket.socket) -> None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    def _run_control_handler(
+        self,
+        connection: socket.socket,
+        accepted_at: float,
+        slots: threading.BoundedSemaphore,
+    ) -> None:
+        try:
+            self._handle_control_connection(connection, accepted_at)
+        finally:
+            slots.release()
+
+    def _read_control_request(
+        self, connection: socket.socket, expires_at: float
+    ) -> bytes | None:
+        """Read one newline-terminated request line within the byte and time bounds.
+
+        Returns the line without its newline, or ``None`` when the peer closes
+        early, exceeds ``CONTROL_REQUEST_LIMIT`` bytes (newline included), or
+        outlasts the connection deadline.  Each ``recv`` gets only the time
+        that remains, so a trickling sender cannot extend the connection.
+        """
+
+        buffer = b""
+        while True:
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0 or len(buffer) >= CONTROL_REQUEST_LIMIT:
+                return None
+            connection.settimeout(remaining)
+            chunk = connection.recv(CONTROL_REQUEST_LIMIT - len(buffer))
+            if not chunk:
+                return None
+            buffer += chunk
+            newline = buffer.find(b"\n")
+            if newline >= 0:
+                return buffer[:newline]
+
+    def _handle_control_connection(self, connection: socket.socket, accepted_at: float) -> None:
+        """Serve one control connection; no failure here may end the accept loop."""
+
+        expires_at = accepted_at + RUNTIME_CONTROL_TIMEOUT
+        with connection:
+            try:
+                line = self._read_control_request(connection, expires_at)
+                if line is None:
+                    return
+                request = json.loads(line.decode("utf-8"))
+                if (
+                    not isinstance(request, dict)
+                    or request.get("version") != 1
+                    or request.get("capability") != (self.instance.capability if self.instance else None)
+                ):
+                    return
+                command = request.get("command")
+                if command == "status":
+                    status = (
+                        "unhealthy"
+                        if self.stop_requested.is_set() or self.shutdown_result == "timeout"
+                        else "ready"
+                    )
+                    response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
+                elif command == "stop":
+                    requested_deadline = request.get("deadline_ns")
+                    now_ns = time.monotonic_ns()
+                    if type(requested_deadline) is not int or not (
+                        now_ns
+                        < requested_deadline
+                        <= now_ns + int(SHUTDOWN_TIMEOUT * 1_000_000_000)
                     ):
-                        continue
-                    command = request.get("command")
-                    if command == "status":
-                        status = (
-                            "unhealthy"
-                            if self.stop_requested.is_set() or self.shutdown_result == "timeout"
-                            else "ready"
-                        )
-                        response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
-                    elif command == "stop":
-                        requested_deadline = request.get("deadline_ns")
-                        if type(requested_deadline) is not int:
-                            requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
-                        # Publish the unhealthy transition before the caller
-                        # can observe its acknowledgement and release lifecycle
-                        # exclusion.  Cleanup starts after the send attempt so
-                        # terminal listener closure cannot race the response,
-                        # but a failed response must still begin cleanup.
-                        self.stop_requested.set()
-                        response = {
-                            "status": "stopping",
-                            "instance_id": self.instance.instance_id,
-                            "url": URL,
-                        }
-                        try:
-                            connection.sendall((json.dumps(response) + "\n").encode())
-                        finally:
-                            threading.Thread(
-                                target=self.shutdown,
-                                args=(requested_deadline / 1_000_000_000,),
-                                daemon=True,
-                            ).start()
-                        continue
-                    else:
-                        continue
-                    connection.sendall((json.dumps(response) + "\n").encode())
-                except (OSError, IndexError, KeyError, TypeError, json.JSONDecodeError):
-                    continue
+                        # An invalid or expired stop changes no state: the
+                        # caller has stopped waiting, so it must not execute.
+                        return
+                    shutdown_deadline = requested_deadline / 1_000_000_000
+                    # Publish the unhealthy transition before the caller
+                    # can observe its acknowledgement and release lifecycle
+                    # exclusion.  Cleanup starts after the send attempt so
+                    # terminal listener closure cannot race the response,
+                    # but a failed response must still begin cleanup.
+                    self.stop_requested.set()
+                    response = {
+                        "status": "stopping",
+                        "instance_id": self.instance.instance_id,
+                        "url": URL,
+                    }
+                    try:
+                        self._send_control_reply(connection, response, expires_at)
+                    finally:
+                        threading.Thread(
+                            target=self.shutdown,
+                            args=(shutdown_deadline,),
+                            daemon=True,
+                        ).start()
+                    return
+                else:
+                    return
+                self._send_control_reply(connection, response, expires_at)
+            except Exception:
+                # One connection's defect must never end the control loop.
+                return
+
+    @staticmethod
+    def _send_control_reply(
+        connection: socket.socket, response: dict[str, Any], expires_at: float
+    ) -> None:
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("control connection deadline expired")
+        connection.settimeout(remaining)
+        connection.sendall((json.dumps(response) + "\n").encode())
 
     def start(self) -> None:
         if time.monotonic() >= self._deadline():
@@ -1697,12 +1801,16 @@ def stop() -> str:
         ):
             raise UnhealthyInstanceError("Nyx lifetime lease changed")
         instance, record_snapshot = _read_live_instance(paths)
-        _send_control(
-            instance,
-            "stop",
-            deadline=deadline,
-            deadline_ns=deadline_ns,
-        )
+        try:
+            _send_control(
+                instance,
+                "stop",
+                timeout=SHUTDOWN_TIMEOUT,
+                deadline=deadline,
+                deadline_ns=deadline_ns,
+            )
+        except _ControlTimeoutError as error:
+            raise ShutdownTimeoutError(SHUTDOWN_TIMEOUT_MESSAGE) from error
     # Waiting does not mutate lifecycle state, so release the operation claim.
     # Public status can then authenticate the retained daemon while cleanup is
     # in progress.  Each terminal probe reacquires the claim before inspecting
@@ -1773,7 +1881,7 @@ def stop() -> str:
         time.sleep(0.03)
     if terminal_absence_seen:
         raise UnhealthyInstanceError("Nyx instance record changed")
-    raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
+    raise ShutdownTimeoutError(SHUTDOWN_TIMEOUT_MESSAGE)
 
 
 def desktop_host() -> bool:
