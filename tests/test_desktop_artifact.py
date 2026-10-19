@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -981,7 +982,7 @@ _CONSOLE_CONTROL_SOURCE = (
     "kernel32 = ctypes.windll.kernel32\n"
     "kernel32.GetConsoleWindow.restype = ctypes.c_void_p\n"
     "open(sys.argv[1], 'w').write(str(kernel32.GetConsoleWindow() or 0))\n"
-    "time.sleep(3.0)\n"
+    "time.sleep(7.0)\n"
 )
 
 
@@ -1015,6 +1016,15 @@ def _run_console_control(
         stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NEW_CONSOLE,
     )
+    # Detect by polling every top-level window (hidden pseudo-console windows
+    # included) and by attaching to the control's console, rather than relying on
+    # a show event arriving while the control is alive.
+    observation = native_ui.observe_console_relations(
+        control.pid,
+        enumerate_windows=native_ui.all_top_level_windows,
+        process_table=native_ui.windows_process_table,
+        attach=native_ui.console_window_of,
+    )
     try:
         control.wait(timeout=60)
     except subprocess.TimeoutExpired:
@@ -1030,8 +1040,11 @@ def _run_console_control(
     samples = sampler.snapshot()
     shown_at = dict(sampler.shown_at)
     attributed = native_ui.attribute_console_windows(samples, {control.pid})
-    relations = {relation for _, relation in attributed}
-    control_handles = {sample.handle for sample, _ in attributed}
+    polled = observation["windows"]
+    relations = {relation for _, relation in attributed} | observation["relations"]
+    control_handles = {sample.handle for sample, _ in attributed} | {
+        sample.handle for sample, _, _ in polled
+    }
     during = [
         sample for sample in samples
         if sample.handle not in sampler.baseline and started - 0.25 <= sample.at <= ended + 1.5
@@ -1039,6 +1052,9 @@ def _run_console_control(
     print(
         f"NYX-PROBE console-control pid={control.pid} console_hwnd={control_hwnd:#x} "
         f"relations={sorted(relations)} "
+        f"polled={[_describe_sample(sample) + ' via ' + rel + '/' + how for sample, rel, how in polled]!r} "
+        f"attach_attempts={observation['attach_attempts']!r} "
+        f"attached_but_unattributed={[_describe_sample(s) for s in observation['unattributed_attached']]!r} "
         f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in attributed]!r} "
         f"observed_by_handle={[_describe_sample(sample) for sample in samples if sample.handle == control_hwnd]!r} "
         f"new_windows_during_control={[_describe_sample(sample) for sample in during]!r} "
@@ -1050,7 +1066,8 @@ def _run_console_control(
         pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
     if not relations:
         pytest.fail(
-            "the positive control was not seen: no console or pseudo-console window is owned by "
+            "the positive control was not seen: neither polling every top-level window for 5 s "
+            "nor attaching to its console found a console or pseudo-console window owned by "
             f"the control child (pid {control.pid}), by its parent chain or by a console host "
             "serving it; the sampler cannot judge the application"
         )
@@ -1223,11 +1240,9 @@ def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.
     pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
 
 
-_MEASURE_CARD_EXPRESSION = (
-    "(function (target, mode) {"
-    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
-    "   .find((c) => c.dataset.packagePath === target);"
-    " if (!card) return {error: 'the target card is not rendered'};"
+# Statements that compute the viewport size and the bands that fixed or sticky
+# page elements cover at the top and bottom of the viewport.
+_COVER_SCRIPT = (
     " const root = document.documentElement;"
     " const vw = root.clientWidth, vh = root.clientHeight;"
     " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
@@ -1245,8 +1260,17 @@ _MEASURE_CARD_EXPRESSION = (
     "   if (!n) continue; const b = n.getBoundingClientRect();"
     "   if (b.top <= 2 && b.bottom > toolbarBottom) toolbarBottom = b.bottom; }"
     " let bottomLimit = vh;"
-    " if (bottomCover) { const b = bottomCover.getBoundingClientRect();"
+    " if (bottomCover && bottomCover !== topCover) {"
+    "   const b = bottomCover.getBoundingClientRect();"
     "   if (b.bottom >= vh - 2 && b.top < bottomLimit) bottomLimit = b.top; }"
+)
+
+_MEASURE_CARD_EXPRESSION = (
+    "(function (target, mode) {"
+    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
+    "   .find((c) => c.dataset.packagePath === target);"
+    " if (!card) return {error: 'the target card is not rendered'};"
+    + _COVER_SCRIPT +
     " if (mode === 'center') {"
     "   card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
     " } else {"
@@ -1265,6 +1289,10 @@ _MEASURE_CARD_EXPRESSION = (
     "   covers: [describe(topCover), describe(bottomCover)]}; })"
 )
 
+_BOARD_STATE_EXPRESSION = (
+    "(function () {" + _COVER_SCRIPT + " return [vw, vh, toolbarBottom]; })()"
+)
+
 _HIT_POINTS_EXPRESSION = (
     "(function (points) { return points.map(([x, y]) => {"
     " const e = document.elementFromPoint(x, y);"
@@ -1273,15 +1301,36 @@ _HIT_POINTS_EXPRESSION = (
 )
 
 
+def _try_locate_card(
+    page: native_ui.CdpPage,
+    target: str,
+    window: dict | None,
+    reachable: Callable[[float, float], bool] | None,
+) -> dict | None:
+    """Locate ``target`` or return ``None`` when no point qualifies (a measuring error still fails)."""
+
+    try:
+        return _locate_card(page, target, window, reachable)
+    except pytest.fail.Exception as failure:
+        if "is clickable below the toolbar" in str(failure):
+            return None
+        raise
+
+
 def _locate_card(
-    page: native_ui.CdpPage, target: str, window: dict | None = None
+    page: native_ui.CdpPage,
+    target: str,
+    window: dict | None = None,
+    reachable: Callable[[float, float], bool] | None = None,
 ) -> dict:
     """Bring ``target`` into the usable viewport band and pick a point that really hits it.
 
     The usable band is the viewport below the page's sticky toolbar and above
     any bottom cover.  The card is first centred; when its intersection with the
     band is too small the document is scrolled once so the card starts just
-    below the toolbar.  Each candidate point is verified with
+    below the toolbar.  ``reachable`` drops points the OS pointer cannot reach,
+    such as page areas of a window that extends past the screen.  Each
+    candidate point is verified with
     ``elementFromPoint`` and ``closest`` before it is returned; a card that no
     candidate hits is a hard failure.
     """
@@ -1295,6 +1344,10 @@ def _locate_card(
             pytest.fail(f"the target card could not be measured: {geometry!r}")
         geometry["window"] = window
         candidates = native_ui.card_click_candidates(geometry)
+        geometry["unreachable"] = [
+            point for point in candidates if reachable is not None and not reachable(*point)
+        ]
+        candidates = [point for point in candidates if point not in geometry["unreachable"]]
         hits = (
             page.evaluate(f"({_HIT_POINTS_EXPRESSION})({json.dumps(candidates)})")
             if candidates else []
@@ -1369,20 +1422,21 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                     with _driver_step("the window or page could not be prepared"):
                         _wait_for_cards(page, len(catalog_paths))
                         driver.bring_forward(pid)
-                        # The delivered window opens with a board viewport too small to
-                        # show a card below the page's own toolbar, so enlarge it by OS
-                        # window management and wait for the page to follow.
-                        window_size = native_ui.enlarge_for_usable_viewport(
+                        # The delivered window gives the board only part of its height
+                        # and the page's sticky toolbar can fill that part, so prepare
+                        # the viewport by window management and, if needed, OS zoom.
+                        screen = driver.screen_bounds()
+                        window_size = native_ui.prepare_board_viewport(
                             driver,
                             pid,
-                            lambda: tuple(page.evaluate(
-                                "[document.documentElement.clientWidth,"
-                                " document.documentElement.clientHeight]"
-                            )),
+                            lambda: tuple(page.evaluate(_BOARD_STATE_EXPRESSION)),
+                            lambda: native_ui.find_pointer_base(
+                                driver, page, driver.window_frame(pid), screen
+                            )[:2],
                         )
-                        calibration = native_ui.calibrate_page(
-                            driver, page, driver.window_frame(pid)
-                        )
+                        window_size["screen"] = [
+                            screen.left, screen.top, screen.width, screen.height
+                        ]
                         shown = [p for p in page.evaluate(_CARD_PATHS_EXPRESSION)
                                  if p in catalog_paths]
                         if not shown:
@@ -1402,14 +1456,32 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         driver.bring_forward(pid)
                         # Measure last, immediately before the click, so nothing
                         # that happened while the window came forward can move the card.
-                        geometry = _locate_card(page, target, window_size)
+                        # The window may extend past the screen, so the point is moved
+                        # on screen by window management before the click.
+                        placement = native_ui.place_click_point_on_screen(
+                            driver,
+                            pid,
+                            screen,
+                            calibrate=lambda: native_ui.calibrate_page(
+                                driver, page, driver.window_frame(pid), screen
+                            ),
+                            choose=lambda reachable: _try_locate_card(
+                                page, target, window_size, reachable
+                            ),
+                            settle=lambda: native_ui.settle_measurement(
+                                lambda: tuple(page.evaluate(_BOARD_STATE_EXPRESSION))
+                            ),
+                        )
+                        geometry = placement["geometry"]
+                        calibration = placement["calibration"]
                         css_x, css_y = geometry["point"]
-                        screen_x, screen_y = calibration.to_screen(css_x, css_y)
+                        screen_x, screen_y = placement["screen_point"]
                         print(
                             f"NYX-PROBE click-point css=({css_x:.1f},{css_y:.1f}) "
                             f"screen=({screen_x:.1f},{screen_y:.1f}) "
                             f"scale={calibration.scale:.3f} origin=({calibration.origin_x:.1f},"
-                            f"{calibration.origin_y:.1f}) moves={calibration.moves!r}"
+                            f"{calibration.origin_y:.1f}) moves={json.dumps(placement['moves'])} "
+                            f"calibration_moves={calibration.moves!r}"
                         )
                         driver.click(screen_x, screen_y, "right")
                     with _driver_step("the click could not be confirmed"):
