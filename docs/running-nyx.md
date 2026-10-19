@@ -250,12 +250,14 @@ placeholder can carry that bit, so the record decides whether Nyx hides or
 refuses placeholder content.
 
 **Setup (once per provider).** Create `<sync folder>\nyx-probe\specs` holding
-one repository folder with a stage folder and one Markdown specification in it,
-and create an empty `<sync folder>\nyx-probe\empty` folder. Wait until the
+one repository folder, one stage folder inside it, and one package folder
+inside that containing a file named exactly `spec.md`
+(`specs\<repository>\<stage>\<package>\spec.md`; a card exists only for such
+a file). Also create an empty `<sync folder>\nyx-probe\empty` folder. Wait until the
 provider reports the files as synced.
 
 **States (repeat for each provider, OneDrive then Dropbox).** Set the state on
-the `specs` folder and on the specification file, then record the table before
+the `specs` folder, the repository folder and `spec.md`, then record the table before
 each Nyx observation:
 
 | State | How to reach it |
@@ -264,8 +266,8 @@ each Nyx observation:
 | Pinned | OneDrive: **Always keep on this device**. Dropbox: **Make available offline**. |
 | Hydrated | Open the file so the content is downloaded, without pinning (OneDrive **Free up space** and Dropbox **Make online-only** both undone). |
 
-**Fields to record (Python, for each of the workspace root `specs` and one
-entry inside it, per provider and state).** Run `os.lstat(path)` and record
+**Fields to record (Python, for each of the workspace root `specs`, the
+repository folder and `spec.md` itself, per provider and state).** Run `os.lstat(path)` and record
 exactly these values:
 
 | Field | Record |
@@ -278,18 +280,22 @@ exactly these values:
 
 **Nyx observations (same provider and state).** Save the root as the
 workspace and open the board, then record for each row below what Nyx shows.
-The code expects a root with the reparse bit to be refused and an entry with
-it to be skipped (a linked entry whose name ends in `.md` silently, any other
-linked entry as an incomplete-discovery issue); the record states whether each
-state matches that expectation.
+The code expects the following when the reparse bit is set. Save accepts the
+root, but the catalog scan refuses it, so the board shows `producer_failed`
+instead of cards. A reparse repository or stage folder is skipped silently if
+its name ends in `.md`; any other one is reported as an incomplete-discovery
+issue. A reparse `spec.md` still produces a card, carrying a nonregular-anchor
+diagnostic. The record states whether each state matches those expectations.
 
 | Observation | Record |
 | --- | --- |
-| Save with `specs` as the workspace root | Accepted, or refused with the message shown (expected for a reparse root: `specification root cannot be read`) |
+| Save with `specs` as the workspace root | Accepted or refused, and any message shown (expected: accepted, even for a reparse root) |
+| Board after Save | Cards listed, or the `producer_failed` state (expected for a reparse root) |
 | Cards listed | Card count against the number of specifications that exist |
 | Workspace or refresh issues panel | Present or absent, and the issue codes and paths shown |
-| Specification file entry | Listed, skipped silently, or reported as an issue |
-| Reading a card's specification header | Content shown, or the unreadable or non-regular anchor message |
+| Repository folder entry | Listed, skipped silently, or reported as an issue |
+| `spec.md` entry | Card present or absent, and the diagnostic shown (expected for a reparse file: card with a nonregular anchor) |
+| Reading a card's specification header | Content shown, or the unreadable or nonregular anchor message |
 | Open a card, then refresh | Whether either action downloads the file (provider status changes to hydrated) |
 | Empty `empty` folder as a control | Accepted with zero cards and no issue panel |
 
