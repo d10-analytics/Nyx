@@ -67,6 +67,7 @@ _CONSOLE_WINDOW_CLASSES = frozenset({"ConsoleWindowClass", "CASCADIA_HOSTING_WIN
 # Hidden window a console host creates for a pseudo console; it is recorded with
 # its owner relations as evidence but is never a visible console window itself.
 _PSEUDO_CONSOLE_CLASS = "PseudoConsoleWindow"
+LARGE_WINDOW_SIZE = (1400, 1800)
 _CONSOLE_HOST_IMAGES = frozenset({"conhost.exe", "openconsole.exe"})
 
 
@@ -858,6 +859,13 @@ class _WindowsBackend:
         user32.IsIconic.restype = wintypes.BOOL
         user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         user32.GetWindowRect.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
         user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         user32.OpenInputDesktop.restype = wintypes.HANDLE
         user32.CloseDesktop.argtypes = [wintypes.HANDLE]
@@ -935,10 +943,48 @@ class _WindowsBackend:
         return Rect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
 
     def enlarge_window(self, pid: int) -> None:
-        """Maximize the application's top-level window."""
+        """Place the window at the origin with a fixed generous size, past the screen if need be."""
 
-        sw_maximize = 3
-        self.user32.ShowWindow(gui_window(pid).handle, sw_maximize)
+        handle = gui_window(pid).handle
+        sw_restore, swp_nozorder, swp_showwindow = 9, 0x0004, 0x0040
+        self.user32.ShowWindow(handle, sw_restore)  # a maximized window ignores a resize
+        width, height = LARGE_WINDOW_SIZE
+        if not self.user32.SetWindowPos(
+            handle, None, 0, 0, width, height, swp_nozorder | swp_showwindow
+        ):
+            raise DriverError(f"SetWindowPos failed: {ctypes.get_last_error()}")
+
+    def screen_bounds(self) -> Rect:
+        """Return the virtual desktop rectangle in physical pixels."""
+
+        sm_xvirtualscreen, sm_yvirtualscreen, sm_cxvirtualscreen, sm_cyvirtualscreen = 76, 77, 78, 79
+        metric = self.user32.GetSystemMetrics
+        return Rect(
+            metric(sm_xvirtualscreen), metric(sm_yvirtualscreen),
+            metric(sm_cxvirtualscreen), metric(sm_cyvirtualscreen),
+        )
+
+    def zoom_out_shortcut(self) -> None:
+        """Press Ctrl+minus."""
+
+        vk_control, vk_oem_minus, keyup = 0x11, 0xBD, 0x2
+        self._send(
+            self._key(vk_control, 0, 0),
+            self._key(vk_oem_minus, 0, 0),
+            self._key(vk_oem_minus, 0, keyup),
+            self._key(vk_control, 0, keyup),
+        )
+        time.sleep(0.2)
+
+    def zoom_out_wheel(self, x: float, y: float) -> None:
+        """Turn the wheel down one notch with Ctrl held, over the point ``(x, y)``."""
+
+        vk_control, keyup, wheel = 0x11, 0x2, 0x0800
+        self.move(x, y)
+        notch = self._mouse(wheel)
+        notch.mi.mouseData = (-120) & 0xFFFFFFFF
+        self._send(self._key(vk_control, 0, 0), notch, self._key(vk_control, 0, keyup))
+        time.sleep(0.2)
 
     def bring_forward(self, pid: int) -> None:
         window = gui_window(pid)
@@ -1125,6 +1171,10 @@ class _CGSize(ctypes.Structure):
     _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
 
 
+class _CGRect(ctypes.Structure):
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+
 class _MacBackend:
     """Accessibility (AX) lookup, CGEvent input and the native pasteboard."""
 
@@ -1188,6 +1238,14 @@ class _MacBackend:
         sv.CGEventSetIntegerValueField.restype = None
         sv.CGEventPost.argtypes = [ctypes.c_uint32, void_p]
         sv.CGEventPost.restype = None
+        sv.CGMainDisplayID.argtypes = []
+        sv.CGMainDisplayID.restype = ctypes.c_uint32
+        sv.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        sv.CGDisplayBounds.restype = _CGRect
+        sv.CGEventSetType.argtypes = [void_p, ctypes.c_uint32]
+        sv.CGEventSetType.restype = None
+        sv.CGEventSetLocation.argtypes = [void_p, _CGPoint]
+        sv.CGEventSetLocation.restype = None
         sv.AXValueCreate.argtypes = [ctypes.c_int, void_p]
         sv.AXValueCreate.restype = void_p
         sv.AXUIElementSetAttributeValue.argtypes = [void_p, void_p, void_p]
@@ -1292,39 +1350,22 @@ class _MacBackend:
         raise DriverError(f"no accessible window of pid {pid} reports a frame")
 
     def enlarge_window(self, pid: int) -> None:
-        """Resize the window to the main screen's visible frame, inset a little."""
+        """Place the window at the origin with a fixed generous size, past the screen if need be."""
 
-        script = (
-            "ObjC.import('AppKit');"
-            "var visible = $.NSScreen.mainScreen.visibleFrame;"
-            "var full = $.NSScreen.screens.objectAtIndex(0).frame;"
-            "JSON.stringify([visible.origin.x, visible.origin.y, visible.size.width,"
-            " visible.size.height, full.size.height]);"
-        )
-        completed = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-        if completed.returncode != 0:
-            raise DriverError(f"the screen frame could not be read: {completed.stderr!r}")
-        x, y, width, height, full_height = _json_or_raise(
-            completed.stdout.strip(), "the screen frame query"
-        )
-        inset = 10.0
-        # AppKit frames count from the bottom-left; accessibility counts from the top-left.
-        top_left = _CGPoint(x + inset, full_height - (y + height) + inset)
-        size = _CGSize(width - 2 * inset, height - 2 * inset)
+        width, height = LARGE_WINDOW_SIZE
+        top_left = _CGPoint(0.0, 0.0)
+        size = _CGSize(float(width), float(height))
         k_ax_value_cgpoint, k_ax_value_cgsize = 1, 2
         windows = self._windows(pid)
         window = next((w for w in windows if self._frame(w) is not None), None)
         if window is None:
             raise DriverError(f"no accessible window of pid {pid} reports a frame")
-        # Size first, then position, then size again: the window manager may clamp
-        # the first size against the old position.
+        # Position first so the size is not clamped against the old origin, then
+        # size, then position again in case the window manager moved it.
         for attribute, kind, value in (
-            ("AXSize", k_ax_value_cgsize, size),
             ("AXPosition", k_ax_value_cgpoint, top_left),
             ("AXSize", k_ax_value_cgsize, size),
+            ("AXPosition", k_ax_value_cgpoint, top_left),
         ):
             packed = self.services.AXValueCreate(kind, ctypes.byref(value))
             key = self._cfstring(attribute)
@@ -1336,6 +1377,43 @@ class _MacBackend:
                     self.foundation.CFRelease(packed)
             if status != 0:
                 raise DriverError(f"setting {attribute} failed with AXError {status}")
+
+    def screen_bounds(self) -> Rect:
+        """Return the main display rectangle in points."""
+
+        bounds = self.services.CGDisplayBounds(self.services.CGMainDisplayID())
+        return Rect(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height)
+
+    def zoom_out_shortcut(self) -> None:
+        """Press Command+minus."""
+
+        command_flag, key_minus = 0x100000, 27
+        self._post_key(key_minus, True, command_flag)
+        self._post_key(key_minus, False, command_flag)
+        time.sleep(0.2)
+
+    def zoom_out_wheel(self, x: float, y: float) -> None:
+        """Scroll down one notch with Command held over ``(x, y)``.
+
+        The event is built from a blank event and typed as a scroll wheel event,
+        because ``CGEventCreateScrollWheelEvent`` is variadic and cannot be
+        called portably through ``ctypes``.
+        """
+
+        self.move(x, y)
+        event = self.services.CGEventCreate(None)
+        if not event:
+            raise DriverError("CGEventCreate returned nothing")
+        k_cg_event_scroll_wheel = 22
+        k_scroll_delta_axis_1, k_scroll_point_delta_axis_1 = 11, 96
+        self.services.CGEventSetType(event, k_cg_event_scroll_wheel)
+        self.services.CGEventSetLocation(event, _CGPoint(x, y))
+        self.services.CGEventSetFlags(event, 0x100000)
+        self.services.CGEventSetIntegerValueField(event, k_scroll_delta_axis_1, -2)
+        self.services.CGEventSetIntegerValueField(event, k_scroll_point_delta_axis_1, -20)
+        self.services.CGEventPost(0, event)
+        self.foundation.CFRelease(event)
+        time.sleep(0.2)
 
     def bring_forward(self, pid: int) -> None:
         script = (
@@ -1799,48 +1877,100 @@ class CdpPage:
         self.close()
 
 
-def enlarge_for_usable_viewport(
+def prepare_board_viewport(
     driver: Any,
     pid: int,
-    viewport: Callable[[], tuple[float, float]],
+    measure: Callable[[], tuple[float, float, float]],
+    board_point: Callable[[], tuple[float, float]],
     *,
-    minimum_height: float = 160.0,
+    minimum_height: float = 300.0,
+    minimum_band: float = 80.0,
     timeout: float = 10.0,
     pause: float = 0.25,
 ) -> dict[str, Any]:
-    """Enlarge the window by OS window management and require a usable page viewport.
+    """Give the board a viewport in which a card can be clicked below the page toolbar.
 
-    After the enlargement the page's viewport height must reach
-    ``minimum_height`` CSS pixels and hold the same size across two reads, so a
-    layout still in transition is not mistaken for the final size.  Otherwise
-    the caller must fail.  Return the window frame and viewport before and
-    after, for the geometry probe.
+    ``measure`` returns ``(viewport width, viewport height, toolbar bottom)`` in
+    CSS pixels.  The window is first placed at a fixed generous size.  When the
+    viewport is still unusable, OS input zooms the page out: the zoom-out
+    shortcut up to three times and, only if the viewport did not change at all,
+    Ctrl/Command+wheel notches over the board up to three times.  The result is
+    usable when the viewport is at least ``minimum_height`` tall and the toolbar
+    bottom leaves ``minimum_band`` CSS pixels above the viewport bottom; any
+    other outcome is a ``DriverError`` carrying every measured step.
     """
 
-    before_frame = driver.window_frame(pid)
-    before = viewport()
+    steps: list[dict[str, Any]] = []
+
+    def usable(state: tuple[float, float, float]) -> bool:
+        return state[1] >= minimum_height and state[1] - state[2] >= minimum_band
+
+    def settle(limit: float) -> tuple[float, float, float]:
+        previous = None
+        latest = measure()
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline:
+            time.sleep(pause)
+            latest = measure()
+            if latest == previous:
+                break
+            previous = latest
+        return latest
+
+    def record(name: str, state: tuple[float, float, float], **extra: Any) -> None:
+        step = {"step": name, "viewport": [state[0], state[1]], "toolbar_bottom": state[2], **extra}
+        steps.append(step)
+        print(f"NYX-PROBE board-preparation {json.dumps(step)}")
+
+    def frame_list() -> list[float]:
+        frame = driver.window_frame(pid)
+        return [frame.left, frame.top, frame.width, frame.height]
+
+    before_frame = frame_list()
+    before = measure()
+    record("before", before, frame=before_frame)
     driver.enlarge_window(pid)
-    deadline = time.monotonic() + timeout
-    after = before
-    previous: tuple[float, float] | None = None
-    while time.monotonic() < deadline:
-        time.sleep(pause)
-        after = viewport()
-        if after[1] >= minimum_height and after == previous:
-            after_frame = driver.window_frame(pid)
-            return {
-                "frame_before": [before_frame.left, before_frame.top,
-                                 before_frame.width, before_frame.height],
-                "frame_after": [after_frame.left, after_frame.top,
-                                after_frame.width, after_frame.height],
-                "viewport_before": list(before),
-                "viewport_after": list(after),
-            }
-        previous = after
-    raise DriverError(
-        f"the window could not be enlarged to a usable board: page viewport {before} -> "
-        f"{after}, needed a stable height of at least {minimum_height:g} CSS pixels"
-    )
+    state = settle(timeout)
+    enlarged = state
+    record("enlarged", state, frame=frame_list(), requested=list(LARGE_WINDOW_SIZE))
+    if not usable(state):
+        for attempt in range(1, 4):
+            driver.zoom_out_shortcut()
+            state = settle(3.0)
+            record(f"shortcut-{attempt}", state)
+            if usable(state):
+                break
+        if not usable(state) and state[:2] == enlarged[:2]:
+            x, y = board_point()
+            for attempt in range(1, 4):
+                driver.zoom_out_wheel(x, y)
+                state = settle(3.0)
+                record(f"wheel-{attempt}", state, pointer=[x, y])
+                if usable(state):
+                    break
+    if not usable(state):
+        raise DriverError(
+            "the board has no usable viewport: need a height of at least "
+            f"{minimum_height:g} CSS px with the toolbar bottom {minimum_band:g} px above the "
+            f"viewport bottom; measured steps {json.dumps(steps)}"
+        )
+    return {
+        "steps": steps,
+        "frame_before": before_frame,
+        "frame_after": frame_list(),
+        "viewport_before": [before[0], before[1]],
+        "viewport_after": [state[0], state[1]],
+        "toolbar_bottom": state[2],
+    }
+
+
+def _intersect(first: Rect, second: Rect) -> Rect | None:
+    left, top = max(first.left, second.left), max(first.top, second.top)
+    right = min(first.left + first.width, second.left + second.width)
+    bottom = min(first.top + first.height, second.top + second.height)
+    if right - left < 1 or bottom - top < 1:
+        return None
+    return Rect(left, top, right - left, bottom - top)
 
 
 def card_click_candidates(
@@ -1892,7 +2022,45 @@ _INSTALL_POINTER_RECORDER = (
 )
 
 
-def calibrate_page(driver: Any, page: CdpPage, frame: Rect) -> PageCalibration:
+def find_pointer_base(
+    driver: Any, page: CdpPage, frame: Rect, screen: Rect | None = None
+) -> tuple[float, float, float, float]:
+    """Find a visible on-screen point over the page and return it with its page coordinates.
+
+    A window larger than the screen leaves part of the page unreachable, so the
+    search covers the part of the window on the screen, trying several heights
+    until the page reports receiving the OS pointer.
+    """
+
+    page.evaluate(_INSTALL_POINTER_RECORDER)
+    visible = _intersect(frame, screen) if screen is not None else frame
+    if visible is None:
+        raise DriverError(f"the window {frame} lies outside the screen {screen}")
+    tried: list[tuple[float, float]] = []
+    for fraction in (0.85, 0.7, 0.55, 0.4, 0.25):
+        screen_x = visible.left + visible.width * 0.75
+        screen_y = visible.top + visible.height * fraction
+        tried.append((round(screen_x), round(screen_y)))
+        driver.move(screen_x + 5, screen_y + 5)  # enter the page before the measured move
+        driver.move(screen_x, screen_y)
+        client = None
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            client = page.evaluate("window.__nyxPointer")
+            if client:
+                break
+            time.sleep(0.1)
+        page.evaluate("window.__nyxPointer = null")
+        if client:
+            return screen_x, screen_y, float(client[0]), float(client[1])
+    raise DriverError(
+        f"the page received no pointer move at any of {tried} (window {frame}, screen {screen})"
+    )
+
+
+def calibrate_page(
+    driver: Any, page: CdpPage, frame: Rect, screen: Rect | None = None
+) -> PageCalibration:
     """Learn where the page sits on screen by moving the OS pointer over it.
 
     The page only records pointer positions it receives; the moves themselves
@@ -1900,27 +2068,28 @@ def calibrate_page(driver: Any, page: CdpPage, frame: Rect) -> PageCalibration:
     than as a missed click later.
     """
 
-    page.evaluate(_INSTALL_POINTER_RECORDER)
-    base_x = frame.left + frame.width * 0.75
-    base_y = frame.top + frame.height * 0.8
-    observed: list[tuple[float, float, float, float]] = []
-    for offset_x, offset_y in ((0.0, 0.0), (-60.0, -40.0)):
-        screen_x, screen_y = base_x + offset_x, base_y + offset_y
-        driver.move(screen_x + 5, screen_y + 5)  # enter the page before the measured move
+    first = find_pointer_base(driver, page, frame, screen)
+    observed = [first]
+    sx1, sy1 = first[0], first[1]
+    second = None
+    for offset_x, offset_y in ((-60.0, -40.0), (60.0, 40.0), (-60.0, 40.0)):
+        screen_x, screen_y = sx1 + offset_x, sy1 + offset_y
+        driver.move(screen_x + 5, screen_y + 5)
         driver.move(screen_x, screen_y)
         client = None
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
             client = page.evaluate("window.__nyxPointer")
             if client:
                 break
             time.sleep(0.1)
-        if not client:
-            raise DriverError(
-                f"the page received no pointer move at screen ({screen_x:.0f},{screen_y:.0f})"
-            )
-        observed.append((screen_x, screen_y, float(client[0]), float(client[1])))
         page.evaluate("window.__nyxPointer = null")
+        if client:
+            second = (screen_x, screen_y, float(client[0]), float(client[1]))
+            break
+    if second is None:
+        raise DriverError(f"the page received no second pointer move near {first[:2]}")
+    observed.append(second)
     (sx1, sy1, cx1, cy1), (sx2, sy2, cx2, cy2) = observed
     if abs(cx1 - cx2) < 1 or abs(cy1 - cy2) < 1:
         raise DriverError(f"the page pointer did not follow the OS pointer: {observed!r}")
