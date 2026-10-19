@@ -711,6 +711,12 @@ def _send_control(
             raise _ControlTimeoutError("control deadline expired")
         return value
 
+    def published_deadline_passed() -> bool:
+        # A command that published its deadline to the peer (a stop) has no
+        # reply to wait for once that deadline passes: the peer drops the
+        # request without answering, so the exchange ending then is a timeout.
+        return deadline_ns is not None and deadline is not None and time.monotonic() >= deadline
+
     connection: socket.socket | None = None
     try:
         family, address = _parse_control_endpoint(instance.control)
@@ -727,6 +733,8 @@ def _send_control(
         connection.settimeout(remaining())
         data = connection.recv(8192)
         if not data:
+            if published_deadline_passed():
+                raise _ControlTimeoutError("control deadline expired")
             raise _ControlUnavailableError("control did not respond")
         response = json.loads(data.splitlines()[0])
         if not isinstance(response, dict):
@@ -741,6 +749,8 @@ def _send_control(
     except (TimeoutError, socket.timeout) as error:
         raise _ControlTimeoutError("control timed out") from error
     except (OSError, IndexError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        if isinstance(error, OSError) and published_deadline_passed():
+            raise _ControlTimeoutError("control deadline expired") from error
         raise _ControlUnavailableError("control is unavailable") from error
     finally:
         if connection is not None:
