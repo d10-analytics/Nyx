@@ -39,10 +39,10 @@ if _ARTIFACT_REQUIRED and not _ARTIFACT_ENV:
         "NYX_DESKTOP_ARTIFACT must identify the staged application in a required native lane"
     )
 
-pytestmark = pytest.mark.skipif(
-    not _ARTIFACT_ENV,
-    reason="the delivered desktop artifact is not staged on this host",
-)
+_ARTIFACT_ABSENT_REASON = "the delivered desktop artifact is not staged on this host"
+# The `artifact` fixture skips when nothing is staged, so the pure unit checks
+# in this module still run on a host without a desktop.
+_requires_artifact = pytest.mark.skipif(not _ARTIFACT_ENV, reason=_ARTIFACT_ABSENT_REASON)
 
 PORT = 8765
 _HOST = f"127.0.0.1:{PORT}"
@@ -85,6 +85,8 @@ def _bundle_executable(bundle: Path) -> str:
 
 @pytest.fixture(scope="module")
 def artifact() -> ArtifactLayout:
+    if not _ARTIFACT_ENV:
+        pytest.skip(_ARTIFACT_ABSENT_REASON)
     layout = ArtifactLayout(Path(_ARTIFACT_ENV).resolve())
     assert layout.executable.is_file(), f"staged application executable is missing: {layout.executable}"
     assert layout.helper.is_file(), f"bundled worker helper is missing: {layout.helper}"
@@ -791,6 +793,7 @@ def test_delivered_chooser_state_starts_no_runtime_or_workers(artifact: Artifact
         _assert_claims_released(home)
 
 
+@_requires_artifact
 def test_window_readiness_fails_at_its_bound_for_a_process_without_a_window():
     """A launched process that never shows a window fails the readiness wait."""
 
@@ -986,6 +989,73 @@ _CONSOLE_CONTROL_SOURCE = (
 )
 
 
+def _unit_sample(
+    handle: int, window_class: str, owner: int, image: str = "", parent: int | None = None
+) -> native_ui.WindowSample:
+    return native_ui.WindowSample(
+        1.0, "synthetic", handle, window_class, "", owner, image, parent, {}
+    )
+
+
+def test_console_attribution_follows_family_relations_and_never_runner_terminals():
+    """Unit check of the attribution rules; needs no desktop and no artifact."""
+
+    helper, gui = 5001, 4000
+    family = {gui, helper}
+    # The recorded U1 shape: a pseudo-console window owned by a helper process.
+    u1 = _unit_sample(0x30220, "PseudoConsoleWindow", helper, "NyxWorker.exe", gui)
+    visible = _unit_sample(0x30221, "ConsoleWindowClass", helper, "NyxWorker.exe", gui)
+    # A console window owned by a console host whose parent is the family process.
+    hosted = _unit_sample(0x30222, "ConsoleWindowClass", 7000, "conhost.exe", helper)
+    # The runner's own terminal windows, owned by an unrelated process tree.
+    runner = [
+        _unit_sample(0x100 + index, "CASCADIA_HOSTING_WINDOW_CLASS", 2396,
+                     "WindowsTerminal.exe", 1)
+        for index in range(8)
+    ]
+    other = _unit_sample(0x40000, "Qt6QWindowIcon", helper, "NyxWorker.exe", gui)
+    attributed = native_ui.attribute_console_windows(
+        [u1, visible, hosted, other, *runner], family
+    )
+    assert {(sample.handle, relation) for sample, relation in attributed} == {
+        (0x30220, "owner-in-family"),
+        (0x30221, "owner-in-family"),
+        (0x30222, "owner-parent-in-family"),
+    }
+    # Removing the family relation stops the attribution (the check is failing-capable).
+    assert native_ui.attribute_console_windows([u1, visible, hosted], {99999}) == []
+    # The control's own console window, owned by OpenConsole.exe, is attributed
+    # only through the handle the control reports, and only when it matches.
+    control_window = _unit_sample(0x1201DC, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    unrelated_pseudo = _unit_sample(0x1201DD, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    samples = [control_window, unrelated_pseudo, *runner]
+    assert native_ui.attribute_console_windows(samples, {1268}) == []
+    matched = native_ui.attribute_console_windows(
+        samples, {1268}, reported_handles={0x1201DC}
+    )
+    assert [(sample.handle, relation) for sample, relation in matched] == [
+        (0x1201DC, native_ui.REPORTED_HANDLE_RELATION)
+    ]
+    assert native_ui.attribute_console_windows(
+        samples, {1268}, reported_handles={0x999999}
+    ) == []
+    # A reported handle never attributes a window that is not console-class.
+    assert native_ui.attribute_console_windows(
+        [_unit_sample(0x1201DC, "Qt6QWindowIcon", 9124)], {1268}, reported_handles={0x1201DC}
+    ) == []
+    # The application is judged by the control's relations plus ownership, so a
+    # control seen only through its reported handle still lets a helper-owned
+    # console window raise U1, and still never admits a runner terminal.
+    judged = native_ui.judging_relations({native_ui.REPORTED_HANDLE_RELATION})
+    assert native_ui.REPORTED_HANDLE_RELATION in judged and "owner-in-family" in judged
+    assert [
+        sample.handle
+        for sample, _ in native_ui.attribute_console_windows(
+            [u1, *runner], family, allowed=judged
+        )
+    ] == [0x30220]
+
+
 def _describe_sample(sample: native_ui.WindowSample) -> str:
     return (
         f"class={sample.window_class!r} hwnd={sample.handle:#x} owner_pid={sample.owner_pid} "
@@ -996,15 +1066,17 @@ def _describe_sample(sample: native_ui.WindowSample) -> str:
 
 def _run_console_control(
     sampler: native_ui.WindowShowSampler, root: Path
-) -> tuple[set[str], set[int]]:
+) -> tuple[set[str], set[tuple[int, float]]]:
     """Start a console-subsystem child in a new console and require the sampler to see it.
 
-    A hosted terminal owns the visible window in a process tree unrelated to the
-    child, but the console the child creates for itself exhibits a pseudo-console
-    window owned by that child.  Attribution uses only such process relations
-    (window owner, owner's parent, a console host's attached clients); timing
-    never attributes.  Return the relations the control exhibited, so the
-    application is judged by the same relations, and the handles it caused.
+    The runner's console topology varies.  The child's console window is either
+    tied to it by a process relation (window owner, owner's parent, a console
+    host's attached clients) or is owned by a console host such as
+    ``OpenConsole.exe``, in which case the handle the child itself reports
+    through ``GetConsoleWindow`` identifies it once the sampler observed that
+    handle.  Timing never attributes.  Return the relations the control
+    exhibited, so the application is judged by the same relations, and the
+    (handle, time) identities of the windows it caused.
     """
 
     hwnd_file = root / "control-console-window"
@@ -1039,11 +1111,15 @@ def _run_console_control(
         control_hwnd = 0
     samples = sampler.snapshot()
     shown_at = dict(sampler.shown_at)
-    attributed = native_ui.attribute_console_windows(samples, {control.pid})
+    attributed = native_ui.attribute_console_windows(
+        samples,
+        {control.pid},
+        reported_handles={control_hwnd} if control_hwnd else frozenset(),
+    )
     polled = observation["windows"]
     relations = {relation for _, relation in attributed} | observation["relations"]
-    control_handles = {sample.handle for sample, _ in attributed} | {
-        sample.handle for sample, _, _ in polled
+    control_handles = {(sample.handle, sample.at) for sample, _ in attributed} | {
+        (sample.handle, sample.at) for sample, _, _ in polled
     }
     during = [
         sample for sample in samples
@@ -1051,7 +1127,8 @@ def _run_console_control(
     ]
     print(
         f"NYX-PROBE console-control pid={control.pid} console_hwnd={control_hwnd:#x} "
-        f"relations={sorted(relations)} "
+        f"relations={sorted(relations)} reported_handle_matches="
+        f"{[_describe_sample(sample) for sample, rel in attributed if rel == native_ui.REPORTED_HANDLE_RELATION]!r} "
         f"polled={[_describe_sample(sample) + ' via ' + rel + '/' + how for sample, rel, how in polled]!r} "
         f"attach_attempts={observation['attach_attempts']!r} "
         f"attached_but_unattributed={[_describe_sample(s) for s in observation['unattributed_attached']]!r} "
@@ -1066,10 +1143,12 @@ def _run_console_control(
         pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
     if not relations:
         pytest.fail(
-            "the positive control was not seen: neither polling every top-level window for 5 s "
-            "nor attaching to its console found a console or pseudo-console window owned by "
+            "the positive control was not seen: no console or pseudo-console window is owned by "
             f"the control child (pid {control.pid}), by its parent chain or by a console host "
-            "serving it; the sampler cannot judge the application"
+            "serving it (polling every top-level window for 5 s and attaching to its console "
+            "included), and the console handle it reports through GetConsoleWindow "
+            f"({control_hwnd:#x}) was not observed by the sampler as a console-class window; "
+            "the sampler cannot judge the application"
         )
     return relations, control_handles
 
@@ -1142,9 +1221,9 @@ def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayou
             judged = [
                 (sample, relation)
                 for sample, relation in native_ui.attribute_console_windows(
-                    samples, family, allowed=relations
+                    samples, family, allowed=native_ui.judging_relations(relations)
                 )
-                if sample.handle not in control_handles
+                if (sample.handle, sample.at) not in control_handles
             ]
             newly_appearing = [
                 sample for sample in console_samples if sample.handle not in sampler.baseline
@@ -1152,7 +1231,8 @@ def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayou
             attributed = [sample for sample, _ in judged]
             print(
                 f"NYX-PROBE console-observation gui_pid={pid} helper_pids={sorted(helpers)} "
-                f"control_relations={sorted(relations)} requests={statuses} "
+                f"control_relations={sorted(relations)} "
+                f"judged_by={sorted(native_ui.judging_relations(relations))} requests={statuses} "
                 f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in judged]!r} "
                 f"newly_appearing_context_only={[_describe_sample(s) for s in newly_appearing]!r} "
                 f"all_console_class_samples={[_describe_sample(s) for s in console_samples]!r}"
@@ -1395,6 +1475,19 @@ class NativeClipboardWriteDefect(Exception):
     """A correctly delivered right-click whose write never reached the native clipboard (S2-N2)."""
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin" and os.environ.get("NYX_EXPECTED_NATIVE_HOST") == "macos-15",
+    reason=(
+        "R-06 on the hosted macos-15 lane is recorded unverifiable (D-16, D-17): the 1024x768 "
+        "runner screen leaves the delivered window's frame at [0,25,1024,683] and the board web "
+        "view at 985x173 CSS px while the page's sticky toolbar ends at 181.5 CSS px, so the "
+        "toolbar covers the board and no card is ever visible, and Cmd-minus x3 and Cmd+wheel x3 "
+        "changed the viewport by 0 px; the driver authority check passed, so this is a display "
+        "limitation. Owner native driver run: python -m pytest tests/test_desktop_artifact.py "
+        "-v -s -k \"native_clipboard or switches_to_second_workspace\" with "
+        "NYX_EXPECTED_NATIVE_HOST unset on a larger macOS display. A SKIP result is not evidence."
+    ),
+)
 def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: ArtifactLayout):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
