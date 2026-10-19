@@ -448,6 +448,7 @@ def _require_later_request_ok(port):
 
 
 @pytest.mark.xfail(
+    condition=sys.platform.startswith("linux") or sys.platform in ("win32", "darwin"),
     strict=True,
     raises=U8AbortEscapeDefect,
     reason="U8: _send does not absorb ConnectionAbortedError (linux, win32, darwin)",
