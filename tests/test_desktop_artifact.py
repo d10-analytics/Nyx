@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -1223,11 +1224,9 @@ def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.
     pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
 
 
-_MEASURE_CARD_EXPRESSION = (
-    "(function (target, mode) {"
-    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
-    "   .find((c) => c.dataset.packagePath === target);"
-    " if (!card) return {error: 'the target card is not rendered'};"
+# Statements that compute the viewport size and the bands that fixed or sticky
+# page elements cover at the top and bottom of the viewport.
+_COVER_SCRIPT = (
     " const root = document.documentElement;"
     " const vw = root.clientWidth, vh = root.clientHeight;"
     " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
@@ -1245,8 +1244,17 @@ _MEASURE_CARD_EXPRESSION = (
     "   if (!n) continue; const b = n.getBoundingClientRect();"
     "   if (b.top <= 2 && b.bottom > toolbarBottom) toolbarBottom = b.bottom; }"
     " let bottomLimit = vh;"
-    " if (bottomCover) { const b = bottomCover.getBoundingClientRect();"
+    " if (bottomCover && bottomCover !== topCover) {"
+    "   const b = bottomCover.getBoundingClientRect();"
     "   if (b.bottom >= vh - 2 && b.top < bottomLimit) bottomLimit = b.top; }"
+)
+
+_MEASURE_CARD_EXPRESSION = (
+    "(function (target, mode) {"
+    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
+    "   .find((c) => c.dataset.packagePath === target);"
+    " if (!card) return {error: 'the target card is not rendered'};"
+    + _COVER_SCRIPT +
     " if (mode === 'center') {"
     "   card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
     " } else {"
@@ -1265,6 +1273,10 @@ _MEASURE_CARD_EXPRESSION = (
     "   covers: [describe(topCover), describe(bottomCover)]}; })"
 )
 
+_BOARD_STATE_EXPRESSION = (
+    "(function () {" + _COVER_SCRIPT + " return [vw, vh, toolbarBottom]; })()"
+)
+
 _HIT_POINTS_EXPRESSION = (
     "(function (points) { return points.map(([x, y]) => {"
     " const e = document.elementFromPoint(x, y);"
@@ -1273,15 +1285,27 @@ _HIT_POINTS_EXPRESSION = (
 )
 
 
+def _on_screen(screen: native_ui.Rect, x: float, y: float, margin: float = 2.0) -> bool:
+    return (
+        screen.left + margin <= x < screen.left + screen.width - margin
+        and screen.top + margin <= y < screen.top + screen.height - margin
+    )
+
+
 def _locate_card(
-    page: native_ui.CdpPage, target: str, window: dict | None = None
+    page: native_ui.CdpPage,
+    target: str,
+    window: dict | None = None,
+    reachable: Callable[[float, float], bool] | None = None,
 ) -> dict:
     """Bring ``target`` into the usable viewport band and pick a point that really hits it.
 
     The usable band is the viewport below the page's sticky toolbar and above
     any bottom cover.  The card is first centred; when its intersection with the
     band is too small the document is scrolled once so the card starts just
-    below the toolbar.  Each candidate point is verified with
+    below the toolbar.  ``reachable`` drops points the OS pointer cannot reach,
+    such as page areas of a window that extends past the screen.  Each
+    candidate point is verified with
     ``elementFromPoint`` and ``closest`` before it is returned; a card that no
     candidate hits is a hard failure.
     """
@@ -1295,6 +1319,10 @@ def _locate_card(
             pytest.fail(f"the target card could not be measured: {geometry!r}")
         geometry["window"] = window
         candidates = native_ui.card_click_candidates(geometry)
+        geometry["unreachable"] = [
+            point for point in candidates if reachable is not None and not reachable(*point)
+        ]
+        candidates = [point for point in candidates if point not in geometry["unreachable"]]
         hits = (
             page.evaluate(f"({_HIT_POINTS_EXPRESSION})({json.dumps(candidates)})")
             if candidates else []
@@ -1369,19 +1397,23 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                     with _driver_step("the window or page could not be prepared"):
                         _wait_for_cards(page, len(catalog_paths))
                         driver.bring_forward(pid)
-                        # The delivered window opens with a board viewport too small to
-                        # show a card below the page's own toolbar, so enlarge it by OS
-                        # window management and wait for the page to follow.
-                        window_size = native_ui.enlarge_for_usable_viewport(
+                        # The delivered window gives the board only part of its height
+                        # and the page's sticky toolbar can fill that part, so prepare
+                        # the viewport by window management and, if needed, OS zoom.
+                        screen = driver.screen_bounds()
+                        window_size = native_ui.prepare_board_viewport(
                             driver,
                             pid,
-                            lambda: tuple(page.evaluate(
-                                "[document.documentElement.clientWidth,"
-                                " document.documentElement.clientHeight]"
-                            )),
+                            lambda: tuple(page.evaluate(_BOARD_STATE_EXPRESSION)),
+                            lambda: native_ui.find_pointer_base(
+                                driver, page, driver.window_frame(pid), screen
+                            )[:2],
                         )
+                        window_size["screen"] = [
+                            screen.left, screen.top, screen.width, screen.height
+                        ]
                         calibration = native_ui.calibrate_page(
-                            driver, page, driver.window_frame(pid)
+                            driver, page, driver.window_frame(pid), screen
                         )
                         shown = [p for p in page.evaluate(_CARD_PATHS_EXPRESSION)
                                  if p in catalog_paths]
@@ -1402,7 +1434,14 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         driver.bring_forward(pid)
                         # Measure last, immediately before the click, so nothing
                         # that happened while the window came forward can move the card.
-                        geometry = _locate_card(page, target, window_size)
+                        geometry = _locate_card(
+                            page,
+                            target,
+                            window_size,
+                            reachable=lambda x, y: _on_screen(
+                                screen, *calibration.to_screen(x, y)
+                            ),
+                        )
                         css_x, css_y = geometry["point"]
                         screen_x, screen_y = calibration.to_screen(css_x, css_y)
                         print(
