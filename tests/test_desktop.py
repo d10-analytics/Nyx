@@ -755,7 +755,7 @@ def test_first_launch_valid_selection_uses_canonical_schema_three_state():
             assert result.specification_root == workspace.resolve()
             assert state.load_configuration(paths) == result
             assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-                "schema_version": 3,
+                "schema_version": 4,
                 "specification_root": str(workspace.resolve()),
             }
             session.close()
@@ -907,11 +907,48 @@ def test_replacing_workspace_preserves_saved_order_and_completion():
             session.choose_workspace(second)
             assert state.load_configuration().specification_root == second.resolve()
             expected.pop("hidden_stages")
-            expected["schema_version"] = 3
+            expected["schema_version"] = 4
             expected["specification_root"] = str(second.resolve())
             assert json.loads(paths.config_file.read_bytes()) == expected
             assert state.load_configuration().stage_order == ("Archive", "Queue")
             assert state.load_configuration().completed_stage_names == ("Archive",)
+            session.close()
+
+
+def test_workspace_change_preserves_checkout_settings_for_every_workspace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first)
+            paths = state.state_paths()
+            settings = {
+                str(first.resolve()): {"folders": [str(root / "one"), str(root / "two")], "github_lookup": True},
+                str(second.resolve()): {"folders": [str(root / "three")], "github_lookup": False},
+            }
+            paths.config_file.write_bytes(
+                (
+                    json.dumps(
+                        {
+                            "schema_version": 4,
+                            "specification_root": str(first.resolve()),
+                            "checkout_settings": settings,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            session = desktop.DesktopSession()
+            session.choose_workspace(second)
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["schema_version"] == 4
+            assert stored["specification_root"] == str(second.resolve())
+            assert stored["checkout_settings"] == settings
+            assert state.load_configuration().checkout_folders == (str(root / "three"),)
             session.close()
 
 

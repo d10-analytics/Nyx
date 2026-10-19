@@ -155,7 +155,7 @@ def test_real_setup_cli_uses_portable_state_layout(capsys):
         )
         assert paths.config_file.is_file()
         assert json.loads(paths.config_file.read_bytes()) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(specification.resolve()),
         }
         assert paths.runtime_directory.is_dir()
@@ -274,6 +274,44 @@ def test_active_setup_rejects_changed_root_without_cli_mutation(capsys):
             lease.close()
         assert paths.config_file.read_bytes() == before
         assert "stop Nyx" in capsys.readouterr().err
+
+
+def test_active_setup_with_same_root_leaves_checkout_record_unchanged(capsys):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        first = root / "first"
+        first.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+        settings = {str(first.resolve()): {"folders": [str(root / "one")], "github_lookup": True}}
+        paths.config_file.write_bytes(
+            (
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "specification_root": str(first.resolve()),
+                        "checkout_settings": settings,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        before = paths.config_file.read_bytes()
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                assert cli.main(["--setup", str(first)]) == 0
+        finally:
+            lease.close()
+        assert paths.config_file.read_bytes() == before
 
 
 def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifecycle(
