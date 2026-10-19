@@ -309,7 +309,6 @@ class JobEvent(NamedTuple):
 
 JOB_OBJECT_MSG_NEW_PROCESS = 6
 JOB_OBJECT_MSG_EXIT_PROCESS = 7
-JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8
 
 
 class JobObserver:
@@ -438,22 +437,6 @@ class JobObserver:
         with self._lock:
             return {e.pid for e in self.events if e.message == JOB_OBJECT_MSG_NEW_PROCESS}
 
-    def lifetimes(self) -> dict[int, tuple[float, float | None]]:
-        """Return ``{pid: (start, end)}`` for each reported descendant; ``end`` is open if unseen."""
-
-        with self._lock:
-            events = list(self.events)
-        spans: dict[int, tuple[float, float | None]] = {}
-        for event in events:
-            if event.message == JOB_OBJECT_MSG_NEW_PROCESS:
-                spans[event.pid] = (event.at, None)
-        for event in events:
-            if event.message in (
-                JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
-            ) and event.pid in spans and spans[event.pid][1] is None:
-                spans[event.pid] = (spans[event.pid][0], event.at)
-        return spans
-
     def started_between(self, begin: float, end: float) -> set[int]:
         """Descendant process IDs the job reported as started inside ``[begin, end]``."""
 
@@ -501,58 +484,34 @@ def attribute_window(sample: WindowSample, family: set[int]) -> str | None:
     return None
 
 
-_TEMPORAL_RELATION = "new-window-during-family-lifetime"
-_LIFETIME_LEAD = 0.25
-_LIFETIME_GRACE = 1.5
+def is_console_evidence_class(window_class: str) -> bool:
+    """Whether a window of this class is a console window or a console's pseudo window."""
 
-
-def attribute_window_in_time(
-    sample: WindowSample,
-    shown_at: dict[int, float],
-    baseline: frozenset[int],
-    lifetimes: list[tuple[float, float | None]],
-) -> str | None:
-    """Tie a console window to a family by when it first appeared.
-
-    A hosted terminal owns its window in a process tree unrelated to the
-    spawning child, so ownership cannot attribute it.  A window that did not
-    exist before the run and was first shown during a family process's
-    lifetime (plus a short grace for the host to present it) is attributed;
-    windows that predate the run, such as the runner's own terminal, are not.
-    """
-
-    if sample.handle in baseline:
-        return None
-    shown = shown_at.get(sample.handle)
-    if shown is None:
-        return None
-    for start, end in lifetimes:
-        if start - _LIFETIME_LEAD <= shown <= (end if end is not None else shown) + _LIFETIME_GRACE:
-            return _TEMPORAL_RELATION
-    return None
+    return is_console_window_class(window_class) or window_class == _PSEUDO_CONSOLE_CLASS
 
 
 def attribute_console_windows(
     samples: list[WindowSample],
-    shown_at: dict[int, float],
-    baseline: frozenset[int],
     family: set[int],
-    lifetimes: list[tuple[float, float | None]],
     allowed: set[str] | None = None,
 ) -> list[tuple[WindowSample, str]]:
-    """Return the shown console-class windows attributed to ``family`` and their relation.
+    """Return console windows tied to ``family`` by a concrete process relation.
 
-    ``allowed`` restricts the relations, so the application is judged only by
-    relations a positive control has shown the sampler can observe.
+    Only ownership relations count: the window's owner is in the family, the
+    owner's parent is, or the owner is a console host whose attached client is.
+    A console a process creates for itself exhibits a pseudo-console window
+    owned by that process.  Appearing at about the same time as a family
+    process never attributes a window: a hosted terminal such as the runner's
+    own can open windows while the family runs.  ``allowed`` restricts the
+    relations, so the application is judged only by relations a positive
+    control has shown the sampler can observe.
     """
 
     attributed: list[tuple[WindowSample, str]] = []
     for sample in samples:
-        if not is_console_window_class(sample.window_class) or sample.handle not in shown_at:
+        if not is_console_evidence_class(sample.window_class):
             continue
-        relation = attribute_window(sample, family) or attribute_window_in_time(
-            sample, shown_at, baseline, lifetimes
-        )
+        relation = attribute_window(sample, family)
         if relation is not None and (allowed is None or relation in allowed):
             attributed.append((sample, relation))
     return attributed
@@ -975,6 +934,12 @@ class _WindowsBackend:
             raise DriverError(f"GetWindowRect failed: {ctypes.get_last_error()}")
         return Rect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
 
+    def enlarge_window(self, pid: int) -> None:
+        """Maximize the application's top-level window."""
+
+        sw_maximize = 3
+        self.user32.ShowWindow(gui_window(pid).handle, sw_maximize)
+
     def bring_forward(self, pid: int) -> None:
         window = gui_window(pid)
         handle = window.handle
@@ -1223,6 +1188,8 @@ class _MacBackend:
         sv.CGEventSetIntegerValueField.restype = None
         sv.CGEventPost.argtypes = [ctypes.c_uint32, void_p]
         sv.CGEventPost.restype = None
+        sv.AXValueCreate.argtypes = [ctypes.c_int, void_p]
+        sv.AXValueCreate.restype = void_p
         sv.AXUIElementSetAttributeValue.argtypes = [void_p, void_p, void_p]
         sv.AXUIElementSetAttributeValue.restype = ctypes.c_int32
         self._post_to_pid = getattr(sv, "CGEventPostToPid", None)
@@ -1323,6 +1290,52 @@ class _MacBackend:
             if frame is not None:
                 return frame
         raise DriverError(f"no accessible window of pid {pid} reports a frame")
+
+    def enlarge_window(self, pid: int) -> None:
+        """Resize the window to the main screen's visible frame, inset a little."""
+
+        script = (
+            "ObjC.import('AppKit');"
+            "var visible = $.NSScreen.mainScreen.visibleFrame;"
+            "var full = $.NSScreen.screens.objectAtIndex(0).frame;"
+            "JSON.stringify([visible.origin.x, visible.origin.y, visible.size.width,"
+            " visible.size.height, full.size.height]);"
+        )
+        completed = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if completed.returncode != 0:
+            raise DriverError(f"the screen frame could not be read: {completed.stderr!r}")
+        x, y, width, height, full_height = _json_or_raise(
+            completed.stdout.strip(), "the screen frame query"
+        )
+        inset = 10.0
+        # AppKit frames count from the bottom-left; accessibility counts from the top-left.
+        top_left = _CGPoint(x + inset, full_height - (y + height) + inset)
+        size = _CGSize(width - 2 * inset, height - 2 * inset)
+        k_ax_value_cgpoint, k_ax_value_cgsize = 1, 2
+        windows = self._windows(pid)
+        window = next((w for w in windows if self._frame(w) is not None), None)
+        if window is None:
+            raise DriverError(f"no accessible window of pid {pid} reports a frame")
+        # Size first, then position, then size again: the window manager may clamp
+        # the first size against the old position.
+        for attribute, kind, value in (
+            ("AXSize", k_ax_value_cgsize, size),
+            ("AXPosition", k_ax_value_cgpoint, top_left),
+            ("AXSize", k_ax_value_cgsize, size),
+        ):
+            packed = self.services.AXValueCreate(kind, ctypes.byref(value))
+            key = self._cfstring(attribute)
+            try:
+                status = self.services.AXUIElementSetAttributeValue(window, key, packed)
+            finally:
+                self.foundation.CFRelease(key)
+                if packed:
+                    self.foundation.CFRelease(packed)
+            if status != 0:
+                raise DriverError(f"setting {attribute} failed with AXError {status}")
 
     def bring_forward(self, pid: int) -> None:
         script = (
@@ -1784,6 +1797,46 @@ class CdpPage:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+def enlarge_until_viewport_grows(
+    driver: Any,
+    pid: int,
+    viewport: Callable[[], tuple[float, float]],
+    *,
+    minimum_growth: float = 100.0,
+    timeout: float = 10.0,
+    pause: float = 0.25,
+) -> dict[str, Any]:
+    """Enlarge the window by OS window management and wait for the page to follow.
+
+    The page's viewport height must grow by ``minimum_growth`` CSS pixels
+    within ``timeout``; otherwise the window cannot give the board a usable
+    viewport and the caller must fail.  Return the window frame and viewport
+    before and after, for the geometry probe.
+    """
+
+    before_frame = driver.window_frame(pid)
+    before = viewport()
+    driver.enlarge_window(pid)
+    deadline = time.monotonic() + timeout
+    after = before
+    while time.monotonic() < deadline:
+        time.sleep(pause)
+        after = viewport()
+        if after[1] >= before[1] + minimum_growth:
+            return {
+                "frame_before": [before_frame.left, before_frame.top,
+                                 before_frame.width, before_frame.height],
+                "frame_after": (lambda f: [f.left, f.top, f.width, f.height])(
+                    driver.window_frame(pid)),
+                "viewport_before": list(before),
+                "viewport_after": list(after),
+            }
+    raise DriverError(
+        f"the window could not be enlarged: page viewport {before} -> {after} "
+        f"(needed {minimum_growth:g} more CSS pixels of height)"
+    )
 
 
 @dataclass
