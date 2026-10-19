@@ -254,12 +254,15 @@ def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn()
             )
             expected_output = _Stdout()
             with patch.object(worker.sys, "stdout", expected_output):
-                assert worker._worker_main() == 0
+                expected_status = worker._worker_main()
+            if expected_status != 0:
+                pytest.fail(f"expected-payload worker run returned {expected_status}")
             expected = json.loads(expected_output.buffer.writes[0])
 
             paths = state.state_paths()
             claim = NativeClaim(paths.runtime_directory / "recovery.lock")
-            assert claim.acquire(blocking=False)
+            if not claim.acquire(blocking=False):
+                pytest.fail("recovery claim could not be acquired")
             read_fd, write_fd = os.pipe()
             manager = worker.CatalogWorkerManager(
                 timeout=30,
@@ -355,18 +358,19 @@ def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn()
                     f"{collapsed!r}, timed-out release {bool(released_by_timeout)}"
                 )
 
-            for name in ("B", "A"):
-                error = failures.get(name)
-                if error is None:
-                    continue
+            if failures:
+                error = failures.get("B")
                 if (
-                    isinstance(error, OSError)
+                    set(failures) == {"B"}
+                    and isinstance(error, OSError)
                     and getattr(error, "winerror", None) == _WINDOWS_ERROR_BAD_PARAMETER
                 ):
+                    if "A" not in results or json.loads(results["A"]) != expected:
+                        pytest.fail("fetch A did not return the expected catalog")
                     raise _HandleInheritanceRaceError(
-                        f"fetch {name} hit process-creation error 87: {error!r}"
+                        f"fetch B hit process-creation error 87: {error!r}"
                     ) from error
-                pytest.fail(f"fetch {name} failed unexpectedly: {error!r}")
+                pytest.fail(f"unexpected fetch failures: {failures!r}")
 
             assert json.loads(results["A"]) == expected
             assert json.loads(results["B"]) == expected
