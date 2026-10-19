@@ -12,6 +12,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from pathlib import PurePosixPath
 from typing import Any
@@ -262,10 +263,36 @@ def _reject_constant(value: str) -> None:
     raise ProtocolError(f"invalid JSON number: {value}")
 
 
-def canonical_digest(value: Mapping[str, Any]) -> str:
-    """Compute the producer-compatible digest, omitting its digest field."""
-    payload = dict(value)
-    payload.pop("catalog_digest", None)
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ProtocolError(f"invalid JSON number: {value}")
+    return number
+
+
+def load_strict_json(payload: bytes | str, name: str) -> Any:
+    """Decode one JSON document, rejecting duplicate keys and non-finite numbers."""
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ProtocolError(f"{name} is not UTF-8") from error
+    try:
+        return json.loads(
+            payload,
+            object_pairs_hook=_strict_pairs,
+            parse_constant=_reject_constant,
+            parse_float=_finite_float,
+        )
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise ProtocolError(f"{name} is not valid JSON") from error
+
+
+def canonical_digest(
+    value: Mapping[str, Any], omit: tuple[str, ...] = ("catalog_digest",)
+) -> str:
+    """Compute the producer-compatible digest, omitting the named top-level fields."""
+    payload = {key: item for key, item in value.items() if key not in omit}
     encoded = json.dumps(
         payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -694,24 +721,8 @@ def _entry(value: Any, index: int) -> CatalogEntry:
 
 def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
     """Parse, strictly validate, and authenticate one producer response."""
-    if isinstance(payload, bytes):
-        try:
-            text = payload.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ProtocolError("catalog is not UTF-8") from error
-        try:
-            raw: Any = json.loads(
-                text, object_pairs_hook=_strict_pairs, parse_constant=_reject_constant
-            )
-        except (json.JSONDecodeError, RecursionError) as error:
-            raise ProtocolError("catalog is not valid JSON") from error
-    elif isinstance(payload, str):
-        try:
-            raw = json.loads(
-                payload, object_pairs_hook=_strict_pairs, parse_constant=_reject_constant
-            )
-        except (json.JSONDecodeError, RecursionError) as error:
-            raise ProtocolError("catalog is not valid JSON") from error
+    if isinstance(payload, (bytes, str)):
+        raw: Any = load_strict_json(payload, "catalog")
     elif isinstance(payload, Mapping):
         raw = dict(payload)
     else:
@@ -766,3 +777,467 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
         inventory=inventory,
         configuration_revision=configuration_revision,
     )
+
+
+# ---------------------------------------------------------------------------
+# Checkout facts document (schema 1)
+# ---------------------------------------------------------------------------
+
+CHECKOUTS_SCHEMA_VERSION = 1
+CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
+
+_NUMBER_RUN = re.compile(r"([0-9]+)")
+_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_GIT_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)+\S*")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+_CHECKOUTS_KEYS = frozenset(
+    {
+        "schema_version",
+        "checkouts_digest",
+        "observed_at",
+        "git",
+        "remote_checks",
+        "folders",
+        "repositories",
+        "diagnostics",
+    }
+)
+_GIT_KEYS = frozenset({"status", "version"})
+_GIT_STATUSES = frozenset({"available", "missing", "too_old"})
+_REMOTE_CHECKS = frozenset({"on", "off"})
+_FOLDER_KEYS = frozenset({"path", "status"})
+_FOLDER_STATUSES = frozenset({"ok", "missing", "unreadable", "not_directory"})
+_CHECKOUTS_DIAGNOSTIC_KEYS = frozenset({"code", "path"})
+CHECKOUTS_DIAGNOSTIC_CODES = frozenset({"not_a_repository", "unrepresentable_path"})
+_REPOSITORY_KEYS = frozenset({"remote", "default_branch", "clones"})
+_REMOTE_KEYS = frozenset({"key", "display", "check"})
+_CHECK_KEYS = frozenset({"status", "reason"})
+_CHECK_STATUSES = frozenset({"live", "failed", "off"})
+_CHECK_FAILURE_REASONS = frozenset(
+    {"unreachable", "not_found", "authentication_failed", "timed_out", "failed"}
+)
+_DEFAULT_BRANCH_KEYS = frozenset({"name", "live_sha"})
+_CLONE_KEYS = frozenset(
+    {
+        "path",
+        "bare",
+        "status",
+        "partial_clone",
+        "shallow",
+        "cached_default",
+        "local_default",
+        "cached_vs_live",
+        "stash_count",
+        "worktrees",
+        "branches",
+    }
+)
+_ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
+_CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
+_LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_live", "vs_cached"})
+_WORKTREE_KEYS = frozenset(
+    {"path", "main", "head", "locked", "prunable", "status", "changes", "operations", "index_lock"}
+)
+_HEAD_KEYS = frozenset({"branch", "sha"})
+_CHANGE_KEYS = frozenset({"staged", "unstaged", "untracked", "conflicted"})
+OPERATIONS = ("am", "bisect", "cherry_pick", "merge", "rebase", "revert")
+_BRANCH_KEYS = frozenset(
+    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote"}
+)
+_COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
+_COMPARISON_BASES = frozenset({"live", "cached"})
+_COMPARISON_RELATIONS = frozenset(
+    {"equal", "ahead", "behind", "diverged", "differs", "absent", "unknown"}
+)
+
+
+def natural_key(text: str) -> tuple[Any, ...]:
+    """Order text with digit runs as numbers, other runs by code point, ties by raw text."""
+    parts: list[Any] = []
+    for index, part in enumerate(_NUMBER_RUN.split(text)):
+        if index % 2:
+            digits = part.lstrip("0")
+            parts.append((len(digits), digits))
+        else:
+            parts.append(part)
+    return (tuple(parts), text)
+
+
+def folder_sort_key(folder: Mapping[str, Any]) -> tuple[Any, ...]:
+    return natural_key(folder["path"])
+
+
+def diagnostic_sort_key(diagnostic: Mapping[str, Any]) -> tuple[Any, ...]:
+    path = diagnostic["path"]
+    return (
+        natural_key(diagnostic["code"]),
+        (0, ()) if path is None else (1, natural_key(path)),
+    )
+
+
+def repository_sort_key(repository: Mapping[str, Any]) -> tuple[Any, ...]:
+    remote = repository["remote"]
+    if remote is not None:
+        return (0, natural_key(remote["display"]), natural_key(remote["key"]))
+    return (1, natural_key(repository["clones"][0]["path"]))
+
+
+def clone_sort_key(clone: Mapping[str, Any]) -> tuple[Any, ...]:
+    return natural_key(clone["path"])
+
+
+def worktree_sort_key(worktree: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (0 if worktree["main"] else 1, natural_key(worktree["path"]))
+
+
+def branch_sort_key(branch: Mapping[str, Any]) -> tuple[Any, ...]:
+    return natural_key(branch["name"])
+
+
+def _nullable(value: Any, check, name: str) -> Any:
+    return None if value is None else check(value, name)
+
+
+def _bool(value: Any, name: str) -> bool:
+    if type(value) is not bool:
+        raise ProtocolError(f"{name} must be a boolean")
+    return value
+
+
+def _count(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ProtocolError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _text(value: Any, name: str) -> str:
+    if not _safe_text(value):
+        raise ProtocolError(f"{name} must be safe text")
+    return value
+
+
+def _choice(value: Any, allowed: frozenset[str], name: str) -> str:
+    if type(value) is not str or value not in allowed:
+        raise ProtocolError(f"{name} is invalid")
+    return value
+
+
+def _timestamp(value: Any, name: str) -> str:
+    if type(value) is not str or _TIMESTAMP.fullmatch(value) is None:
+        raise ProtocolError(f"{name} must be a UTC timestamp")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ProtocolError(f"{name} must be a UTC timestamp") from None
+    return value
+
+
+def _object_id(value: Any, name: str) -> str:
+    if (
+        type(value) is not str
+        or _OBJECT_ID.fullmatch(value) is None
+        or not value.strip("0")
+    ):
+        raise ProtocolError(f"{name} must be an object ID")
+    return value
+
+
+def _list(value: Any, name: str) -> list[Any]:
+    if type(value) is not list:
+        raise ProtocolError(f"{name} must be a list")
+    return value
+
+
+def _ordered(items: list[Any], key, name: str) -> None:
+    keys = [key(item) for item in items]
+    if any(left >= right for left, right in zip(keys, keys[1:])):
+        raise ProtocolError(f"{name} must be unique and in canonical order")
+
+
+def _comparison(value: Any, name: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
+    item = _object(value, name)
+    _keys(item, _COMPARISON_KEYS, name)
+    _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
+    relation = _choice(item["relation"], _COMPARISON_RELATIONS, f"{name}.relation")
+    ahead, behind = item["ahead"], item["behind"]
+    _nullable(item["objects_from"], _text, f"{name}.objects_from")
+    if relation in {"differs", "absent", "unknown"}:
+        if ahead is not None or behind is not None or item["objects_from"] is not None:
+            raise ProtocolError(f"{name} must not carry counts for {relation}")
+        return
+    ahead = _count(ahead, f"{name}.ahead")
+    behind = _count(behind, f"{name}.behind")
+    expected = {
+        "equal": ahead == 0 and behind == 0,
+        "ahead": ahead > 0 and behind == 0,
+        "behind": ahead == 0 and behind > 0,
+        "diverged": ahead > 0 and behind > 0,
+    }[relation]
+    if not expected:
+        raise ProtocolError(f"{name} counts contradict {relation}")
+
+
+def _head(value: Any, name: str) -> None:
+    item = _object(value, name)
+    _keys(item, _HEAD_KEYS, name)
+    branch = _nullable(item["branch"], _text, f"{name}.branch")
+    sha = _nullable(item["sha"], _object_id, f"{name}.sha")
+    if branch is None and sha is None:
+        raise ProtocolError(f"{name} names neither a branch nor a commit")
+
+
+def _worktree(value: Any, name: str) -> dict[str, Any]:
+    item = _object(value, name)
+    _keys(item, _WORKTREE_KEYS, name)
+    _text(item["path"], f"{name}.path")
+    _bool(item["main"], f"{name}.main")
+    _bool(item["locked"], f"{name}.locked")
+    prunable = _bool(item["prunable"], f"{name}.prunable")
+    status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
+    nullable_fields = ("head", "changes", "operations", "index_lock")
+    if status != "ok":
+        if any(item[field] is not None for field in nullable_fields):
+            raise ProtocolError(f"{name} must leave its facts null when status is {status}")
+        return item
+    if prunable:
+        raise ProtocolError(f"{name} is prunable but reports status ok")
+    _head(item["head"], f"{name}.head")
+    changes = _object(item["changes"], f"{name}.changes")
+    _keys(changes, _CHANGE_KEYS, f"{name}.changes")
+    for field in sorted(_CHANGE_KEYS):
+        _count(changes[field], f"{name}.changes.{field}")
+    operations = _list(item["operations"], f"{name}.operations")
+    if (
+        any(type(op) is not str or op not in OPERATIONS for op in operations)
+        or operations != sorted(set(operations))
+    ):
+        raise ProtocolError(f"{name}.operations is invalid")
+    _bool(item["index_lock"], f"{name}.index_lock")
+    return item
+
+
+def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
+    item = _object(value, name)
+    _keys(item, _BRANCH_KEYS, name)
+    _text(item["name"], f"{name}.name")
+    _object_id(item["sha"], f"{name}.sha")
+    paths = _list(item["checked_out_in"], f"{name}.checked_out_in")
+    for index, path in enumerate(paths):
+        _text(path, f"{name}.checked_out_in[{index}]")
+    _ordered(paths, natural_key, f"{name}.checked_out_in")
+    _nullable(item["upstream"], _text, f"{name}.upstream")
+    mismatch = _bool(item["upstream_mismatch"], f"{name}.upstream_mismatch")
+    _comparison(item["vs_remote"], f"{name}.vs_remote", nullable=True)
+    if not has_remote and (item["vs_remote"] is not None or mismatch):
+        raise ProtocolError(f"{name} compares with a remote the clone does not have")
+    if has_remote and item["vs_remote"] is None:
+        raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
+    return item
+
+
+def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str]) -> dict[str, Any]:
+    item = _object(value, name)
+    _keys(item, _CLONE_KEYS, name)
+    path = _text(item["path"], f"{name}.path")
+    status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
+    facts = (
+        "bare",
+        "partial_clone",
+        "shallow",
+        "cached_default",
+        "local_default",
+        "cached_vs_live",
+        "stash_count",
+        "worktrees",
+        "branches",
+    )
+    if status != "ok":
+        if any(item[field] is not None for field in facts):
+            raise ProtocolError(f"{name} must leave its facts null when status is {status}")
+        return item
+    bare = _bool(item["bare"], f"{name}.bare")
+    _bool(item["partial_clone"], f"{name}.partial_clone")
+    _bool(item["shallow"], f"{name}.shallow")
+    _count(item["stash_count"], f"{name}.stash_count")
+    _comparison(item["cached_vs_live"], f"{name}.cached_vs_live", nullable=True)
+
+    cached = item["cached_default"]
+    local = item["local_default"]
+    if not has_remote:
+        if cached is not None or local is not None or item["cached_vs_live"] is not None:
+            raise ProtocolError(f"{name} has remote facts without a remote")
+    else:
+        cached = _object(cached, f"{name}.cached_default")
+        _keys(cached, _CACHED_DEFAULT_KEYS, f"{name}.cached_default")
+        cached_name = _nullable(cached["name"], _text, f"{name}.cached_default.name")
+        cached_sha = _nullable(cached["sha"], _object_id, f"{name}.cached_default.sha")
+        fetched = _nullable(
+            cached["last_fetched_at"], _timestamp, f"{name}.cached_default.last_fetched_at"
+        )
+        since = _bool(cached["fetched_since_clone"], f"{name}.cached_default.fetched_since_clone")
+        if cached_name is None and cached_sha is not None:
+            raise ProtocolError(f"{name}.cached_default has a commit without a name")
+        if since != (fetched is not None):
+            raise ProtocolError(f"{name}.cached_default freshness is inconsistent")
+        if local is not None:
+            local = _object(local, f"{name}.local_default")
+            _keys(local, _LOCAL_DEFAULT_KEYS, f"{name}.local_default")
+            _text(local["name"], f"{name}.local_default.name")
+            _nullable(local["sha"], _object_id, f"{name}.local_default.sha")
+            _comparison(local["vs_live"], f"{name}.local_default.vs_live", nullable=True)
+            _comparison(local["vs_cached"], f"{name}.local_default.vs_cached")
+
+    worktrees = _list(item["worktrees"], f"{name}.worktrees")
+    parsed = [
+        _worktree(raw, f"{name}.worktrees[{index}]") for index, raw in enumerate(worktrees)
+    ]
+    _ordered(parsed, worktree_sort_key, f"{name}.worktrees")
+    mains = [worktree for worktree in parsed if worktree["main"]]
+    if bare:
+        if mains:
+            raise ProtocolError(f"{name} is bare but lists a main worktree")
+    elif len(mains) != 1 or mains[0]["path"] != path:
+        raise ProtocolError(f"{name} must list its own path as its one main worktree")
+    for worktree in parsed:
+        if worktree["path"] in worktree_paths:
+            raise ProtocolError("worktree paths must be unique across the document")
+        worktree_paths.add(worktree["path"])
+
+    local_paths = {worktree["path"] for worktree in parsed}
+    branches = _list(item["branches"], f"{name}.branches")
+    parsed_branches = [
+        _branch(raw, f"{name}.branches[{index}]", has_remote=has_remote)
+        for index, raw in enumerate(branches)
+    ]
+    _ordered(parsed_branches, branch_sort_key, f"{name}.branches")
+    for branch in parsed_branches:
+        if not set(branch["checked_out_in"]) <= local_paths:
+            raise ProtocolError(f"{name} has a branch checked out in an unlisted worktree")
+    return item
+
+
+def _repository(value: Any, index: int, clone_paths: set[str], worktree_paths: set[str]) -> dict[str, Any]:
+    name = f"repositories[{index}]"
+    item = _object(value, name)
+    _keys(item, _REPOSITORY_KEYS, name)
+    remote = item["remote"]
+    default_branch = item["default_branch"]
+    if remote is None:
+        if default_branch is not None:
+            raise ProtocolError(f"{name} has a default branch without a remote")
+    else:
+        remote = _object(remote, f"{name}.remote")
+        _keys(remote, _REMOTE_KEYS, f"{name}.remote")
+        _text(remote["key"], f"{name}.remote.key")
+        _text(remote["display"], f"{name}.remote.display")
+        check = _object(remote["check"], f"{name}.remote.check")
+        _keys(check, _CHECK_KEYS, f"{name}.remote.check")
+        status = _choice(check["status"], _CHECK_STATUSES, f"{name}.remote.check.status")
+        reason = check["reason"]
+        if status == "live":
+            valid = reason is None
+        elif status == "off":
+            valid = reason == "remote_checks_off"
+        else:
+            valid = type(reason) is str and reason in _CHECK_FAILURE_REASONS
+        if not valid:
+            raise ProtocolError(f"{name}.remote.check.reason does not match its status")
+        default_branch = _object(default_branch, f"{name}.default_branch")
+        _keys(default_branch, _DEFAULT_BRANCH_KEYS, f"{name}.default_branch")
+        _nullable(default_branch["name"], _text, f"{name}.default_branch.name")
+        _nullable(default_branch["live_sha"], _object_id, f"{name}.default_branch.live_sha")
+    clones = _list(item["clones"], f"{name}.clones")
+    if not clones or (remote is None and len(clones) != 1):
+        raise ProtocolError(f"{name}.clones has the wrong size")
+    parsed = [
+        _clone(
+            raw,
+            f"{name}.clones[{clone_index}]",
+            has_remote=remote is not None,
+            worktree_paths=worktree_paths,
+        )
+        for clone_index, raw in enumerate(clones)
+    ]
+    _ordered(parsed, clone_sort_key, f"{name}.clones")
+    for clone in parsed:
+        if clone["path"] in clone_paths:
+            raise ProtocolError("clone paths must be unique across the document")
+        clone_paths.add(clone["path"])
+    return item
+
+
+def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
+    """Parse, strictly validate, and authenticate one checkout facts document."""
+    if isinstance(payload, (bytes, str)):
+        raw: Any = load_strict_json(payload, "checkouts")
+    elif isinstance(payload, Mapping):
+        raw = dict(payload)
+    else:
+        raise ProtocolError("checkouts must be a JSON object")
+    document = _object(raw, "checkouts")
+    _keys(document, _CHECKOUTS_KEYS, "checkouts")
+    if type(document["schema_version"]) is not int or (
+        document["schema_version"] != CHECKOUTS_SCHEMA_VERSION
+    ):
+        raise ProtocolError("unsupported schema version")
+    digest = _string(document["checkouts_digest"], "checkouts_digest")
+    if _SHA256_HEX.fullmatch(digest) is None:
+        raise ProtocolError("invalid checkouts digest")
+    _timestamp(document["observed_at"], "observed_at")
+
+    git = _object(document["git"], "git")
+    _keys(git, _GIT_KEYS, "git")
+    git_status = _choice(git["status"], _GIT_STATUSES, "git.status")
+    version = git["version"]
+    if version is not None and (
+        not _safe_text(version) or _GIT_VERSION.fullmatch(version) is None
+    ):
+        raise ProtocolError("git.version is invalid")
+    if git_status == "missing" and version is not None:
+        raise ProtocolError("git.version must be null when git is missing")
+    if git_status == "available" and version is None:
+        raise ProtocolError("git.version is required when git is available")
+    _choice(document["remote_checks"], _REMOTE_CHECKS, "remote_checks")
+
+    folders = _list(document["folders"], "folders")
+    for index, raw_folder in enumerate(folders):
+        folder = _object(raw_folder, f"folders[{index}]")
+        _keys(folder, _FOLDER_KEYS, f"folders[{index}]")
+        _text(folder["path"], f"folders[{index}].path")
+        _choice(folder["status"], _FOLDER_STATUSES, f"folders[{index}].status")
+    _ordered(folders, folder_sort_key, "folders")
+
+    diagnostics = _list(document["diagnostics"], "diagnostics")
+    for index, raw_diagnostic in enumerate(diagnostics):
+        diagnostic = _object(raw_diagnostic, f"diagnostics[{index}]")
+        _keys(diagnostic, _CHECKOUTS_DIAGNOSTIC_KEYS, f"diagnostics[{index}]")
+        _choice(
+            diagnostic["code"], CHECKOUTS_DIAGNOSTIC_CODES, f"diagnostics[{index}].code"
+        )
+        _nullable(diagnostic["path"], _text, f"diagnostics[{index}].path")
+    _ordered(diagnostics, diagnostic_sort_key, "diagnostics")
+
+    repositories = _list(document["repositories"], "repositories")
+    if git_status != "available" and repositories:
+        raise ProtocolError("repositories must be empty when git is unavailable")
+    clone_paths: set[str] = set()
+    worktree_paths: set[str] = set()
+    remote_keys: set[str] = set()
+    parsed = [
+        _repository(raw_repository, index, clone_paths, worktree_paths)
+        for index, raw_repository in enumerate(repositories)
+    ]
+    for repository in parsed:
+        if repository["remote"] is not None:
+            key = repository["remote"]["key"]
+            if key in remote_keys:
+                raise ProtocolError("remote keys must be unique across the document")
+            remote_keys.add(key)
+    _ordered(parsed, repository_sort_key, "repositories")
+    if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
+        raise ProtocolError("checkouts digest mismatch")
+    return dict(document)
