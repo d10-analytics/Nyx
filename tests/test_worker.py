@@ -214,6 +214,159 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
                 claim.close()
 
 
+class _HandleInheritanceRaceError(Exception):
+    """Defect U5: a concurrent fetch cleared a handle another fetch passes."""
+
+
+_WINDOWS_ERROR_BAD_PARAMETER = 87
+_RACE_WAIT_SECONDS = 20.0
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="handle inheritance toggling is the Windows spawn branch; run on nyx-windows",
+)
+def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn() -> None:
+    with TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        home = base / "home"
+        home.mkdir()
+        workspace = base / "workspace"
+        source = workspace / "Fictional" / "Queue" / "source"
+        source.mkdir(parents=True)
+        source.joinpath("spec.md").write_text(
+            "# Source\nPackage ID: 11111111-1111-4111-8111-111111111111\n",
+            encoding="utf-8",
+        )
+        environment = {"HOME": str(home), "USERPROFILE": str(home)}
+        with patch.dict(os.environ, environment):
+            state.setup(workspace)
+            state.save_configuration_owned(
+                workspace,
+                paths=state.state_paths(),
+                completed_stage_names=["Done"],
+            )
+            expected_output = _Stdout()
+            with patch.object(worker.sys, "stdout", expected_output):
+                assert worker._worker_main() == 0
+            expected = json.loads(expected_output.buffer.writes[0])
+
+            paths = state.state_paths()
+            claim = NativeClaim(paths.runtime_directory / "recovery.lock")
+            assert claim.acquire(blocking=False)
+            read_fd, write_fd = os.pipe()
+            manager = worker.CatalogWorkerManager(
+                timeout=30,
+                recovery_claim=claim,
+                recovery_path=claim.path,
+                parent_liveness_fd=read_fd,
+            )
+
+            events: list[tuple[str, str]] = []
+            events_lock = threading.Lock()
+            marks = {"A": 0, "B": 0}
+            clears = {"A": 0, "B": 0}
+            b_marked = threading.Event()
+            a_cleared = threading.Event()
+            released_by_timeout: list[bool] = []
+            real_set = os.set_handle_inheritable
+            real_popen = subprocess.Popen
+
+            def record(name: str, kind: str) -> None:
+                with events_lock:
+                    events.append((name, kind))
+
+            def wrapped_set(handle: int, inheritable: bool) -> None:
+                name = threading.current_thread().name
+                real_set(handle, inheritable)
+                if name not in marks:
+                    return
+                record(name, "set" if inheritable else "clear")
+                if inheritable:
+                    marks[name] += 1
+                    return
+                clears[name] += 1
+                if name == "A" and clears["A"] == marks["A"]:
+                    a_cleared.set()
+
+            def wrapped_popen(*arguments: object, **keywords: object) -> object:
+                name = threading.current_thread().name
+                if name == "B":
+                    b_marked.set()
+                    if not a_cleared.wait(_RACE_WAIT_SECONDS):
+                        released_by_timeout.append(True)
+                if name in marks:
+                    record(name, "popen")
+                return real_popen(*arguments, **keywords)
+
+            results: dict[str, str] = {}
+            failures: dict[str, BaseException] = {}
+
+            def fetch(name: str) -> None:
+                try:
+                    results[name] = manager.fetch_catalog()
+                except BaseException as error:
+                    failures[name] = error
+
+            threads = {
+                name: threading.Thread(target=fetch, args=(name,), name=name, daemon=True)
+                for name in ("B", "A")
+            }
+            try:
+                with patch.object(os, "set_handle_inheritable", wrapped_set), patch.object(
+                    subprocess, "Popen", wrapped_popen
+                ):
+                    threads["B"].start()
+                    if not b_marked.wait(_RACE_WAIT_SECONDS):
+                        pytest.fail("fetch B never reached its spawn after marking handles")
+                    threads["A"].start()
+                    for thread in threads.values():
+                        thread.join(_RACE_WAIT_SECONDS * 2)
+                    if any(thread.is_alive() for thread in threads.values()):
+                        pytest.fail("a forced fetch did not finish within the bounded wait")
+            finally:
+                manager.close(time.monotonic() + 5)
+                os.close(write_fd)
+                os.close(read_fd)
+                claim.close()
+
+            with events_lock:
+                observed = list(events)
+            collapsed: list[tuple[str, str]] = []
+            for event in observed:
+                if not collapsed or collapsed[-1] != event:
+                    collapsed.append(event)
+            expected_sequence = [
+                ("B", "set"),
+                ("A", "set"),
+                ("A", "popen"),
+                ("A", "clear"),
+                ("B", "popen"),
+            ]
+            if released_by_timeout or collapsed[: len(expected_sequence)] != expected_sequence:
+                pytest.fail(
+                    "forced interleaving did not occur; observed "
+                    f"{collapsed!r}, timed-out release {bool(released_by_timeout)}"
+                )
+
+            for name in ("B", "A"):
+                error = failures.get(name)
+                if error is None:
+                    continue
+                if (
+                    isinstance(error, OSError)
+                    and getattr(error, "winerror", None) == _WINDOWS_ERROR_BAD_PARAMETER
+                ):
+                    raise _HandleInheritanceRaceError(
+                        f"fetch {name} hit process-creation error 87: {error!r}"
+                    ) from error
+                pytest.fail(f"fetch {name} failed unexpectedly: {error!r}")
+
+            assert json.loads(results["A"]) == expected
+            assert json.loads(results["B"]) == expected
+            assert manager.active_count == 0
+
+
 def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() -> None:
     with TemporaryDirectory() as temporary:
         base = Path(temporary)
