@@ -270,6 +270,27 @@ def test_unusable_configured_folders_are_reported(tmp_path):
     assert document["repositories"] == []
 
 
+def test_candidate_whose_work_tree_is_elsewhere_is_not_a_repository(tmp_path):
+    # Git succeeds from the candidate yet names another folder as its top level:
+    # only the top-level comparison keeps that folder out of the document.
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    redirected = folder / "redirected"
+    git(folder, "init", "-q", "-b", "trunk", str(redirected))
+    git(redirected, "config", "core.worktree", str(elsewhere))
+    shown = git(redirected, "rev-parse", "--show-toplevel").stdout.strip()
+    assert real(shown) == real(elsewhere), "control: git reports the other folder"
+
+    document = collect([folder])
+
+    assert all_clones(document) == []
+    assert document["diagnostics"] == [
+        {"code": "not_a_repository", "path": str(redirected)}
+    ]
+
+
 @pytest.mark.skipif(not ON_WINDOWS, reason="directory junctions are a Windows feature")
 def test_directory_junction_child_is_not_a_candidate(tmp_path):
     remote = make_remote(tmp_path)
@@ -605,6 +626,26 @@ def test_collection_contacts_no_remote_and_changes_no_repository(tmp_path):
 
     assert not marker.exists()
     assert {item: repository_fingerprint(item) for item in [*clones, remote]} == before
+
+
+def test_redirected_index_and_injected_configuration_are_each_ignored(repo, tmp_path, monkeypatch):
+    # Each variable alone, with a control showing plain git honours it, so the
+    # removal of every one is observable on its own.
+    clean = collect([repo.parent])
+
+    with monkeypatch.context() as environment:
+        environment.setenv("GIT_INDEX_FILE", str(tmp_path / "other-index"))
+        assert git(repo, "status", "--porcelain").stdout, "control: plain git reads that index"
+        redirected = collect([repo.parent])
+    assert redirected["checkouts_digest"] == clean["checkouts_digest"]
+
+    injected_url = "ssh://injected.example/o/r"
+    with monkeypatch.context() as environment:
+        environment.setenv("GIT_CONFIG_PARAMETERS", f"'remote.origin.url={injected_url}'")
+        shown = git(repo, "config", "remote.origin.url").stdout.strip()
+        assert shown == injected_url, "control: the injected setting reaches plain git"
+        injected = collect([repo.parent])
+    assert injected["checkouts_digest"] == clean["checkouts_digest"]
 
 
 # ---------------------------------------------------------------------------
