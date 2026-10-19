@@ -2061,7 +2061,13 @@ class CdpPage:
             return reply.get("result", {})
 
     def evaluate(self, expression: str) -> Any:
-        """Evaluate a side-effect-free expression and return its JSON value."""
+        """Evaluate page script and return its JSON value.
+
+        Callers use it to read web content and to prepare the page, such as
+        scrolling an element into view or adding an event listener.  Input is
+        never injected through it: ``call`` refuses the ``Input`` and
+        ``Emulation`` domains.
+        """
 
         result = self.call(
             "Runtime.evaluate",
