@@ -1715,3 +1715,41 @@ def test_git_output_that_is_not_valid_text_never_raises(monkeypatch):
     monkeypatch.setattr(os, "fsdecode", lambda data: data.decode("utf-8", "strict"))
     assert checkouts._decode(b"a\xffb") == "a\udcffb"
     assert checkouts._decode("nämé".encode()) == "nämé"
+
+
+def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tmp_path):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    long_origin = clone(remote, folder / "long origin")
+    git(long_origin, "remote", "set-url", "origin", "ssh://host/" + "o" * 1100)
+    sibling = clone(remote, folder / "sibling")
+    orphan = clone(remote, folder / "orphan")
+    git(orphan, "remote", "remove", "origin")
+
+    text = checkouts.collect_checkouts(
+        [str(folder)], deadline_ns=time.monotonic_ns() + 60 * 10**9
+    )
+    document = models.parse_checkouts(text)
+
+    groups = {c["path"]: repo for repo in document["repositories"] for c in repo["clones"]}
+    failed = find_clone(document, long_origin)
+    assert failed["status"] == "failed"
+    for fact in (
+        "bare", "partial_clone", "shallow", "cached_default", "local_default",
+        "cached_vs_live", "stash_count", "worktrees", "branches",
+    ):
+        assert failed[fact] is None
+    assert groups[real(long_origin)]["remote"] is None
+    assert groups[real(long_origin)]["clones"] == [failed]
+    assert "o" * 1100 not in text
+    assert groups[real(sibling)]["remote"]["key"] == f"file:{real(remote).removesuffix('.git')}"
+    assert find_clone(document, sibling)["status"] == "ok"
+    kept = find_clone(document, orphan)
+    assert kept["status"] == "ok" and groups[real(orphan)]["remote"] is None
+    assert kept["cached_default"] is None and kept["local_default"] is None
+    assert kept["cached_vs_live"] is None
+    assert kept["branches"] and all(
+        branch["vs_remote"] is None and branch["upstream_mismatch"] is False
+        for branch in kept["branches"]
+    )
