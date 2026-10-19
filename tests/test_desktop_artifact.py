@@ -998,12 +998,12 @@ def _run_console_control(
 ) -> tuple[set[str], set[int]]:
     """Start a console-subsystem child in a new console and require the sampler to see it.
 
-    A hosted terminal owns the console window in a process tree unrelated to the
-    child, so attribution combines structural relations (window owner, owner's
-    parent, a console host's attached clients) with first appearance during the
-    child's lifetime of a window that did not exist before the run.  Return the
-    relations the control exhibited, so the application is judged by the same
-    relations, and the handles the control caused.
+    A hosted terminal owns the visible window in a process tree unrelated to the
+    child, but the console the child creates for itself exhibits a pseudo-console
+    window owned by that child.  Attribution uses only such process relations
+    (window owner, owner's parent, a console host's attached clients); timing
+    never attributes.  Return the relations the control exhibited, so the
+    application is judged by the same relations, and the handles it caused.
     """
 
     hwnd_file = root / "control-console-window"
@@ -1029,9 +1029,7 @@ def _run_console_control(
         control_hwnd = 0
     samples = sampler.snapshot()
     shown_at = dict(sampler.shown_at)
-    attributed = native_ui.attribute_console_windows(
-        samples, shown_at, sampler.baseline, {control.pid}, [(started, ended)]
-    )
+    attributed = native_ui.attribute_console_windows(samples, {control.pid})
     relations = {relation for _, relation in attributed}
     control_handles = {sample.handle for sample, _ in attributed}
     during = [
@@ -1045,15 +1043,16 @@ def _run_console_control(
         f"observed_by_handle={[_describe_sample(sample) for sample in samples if sample.handle == control_hwnd]!r} "
         f"new_windows_during_control={[_describe_sample(sample) for sample in during]!r} "
         f"baseline_count={len(sampler.baseline)} "
-        f"shown_console_class={[_describe_sample(sample) for sample in samples if native_ui.is_console_window_class(sample.window_class) and sample.handle in shown_at]!r}"
+        f"shown_console_class={[_describe_sample(sample) for sample in samples if native_ui.is_console_window_class(sample.window_class) and sample.handle in shown_at]!r} "
+        "(new_windows_during_control is context only and never attributes a window)"
     )
     if sampler.errors:
         pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
     if not relations:
         pytest.fail(
-            "the positive control was not seen: no console-class window was attributed to the "
-            f"control child (pid {control.pid}) by ownership, console-host clients or first "
-            "appearance during its lifetime; the sampler cannot judge the application"
+            "the positive control was not seen: no console or pseudo-console window is owned by "
+            f"the control child (pid {control.pid}), by its parent chain or by a console host "
+            "serving it; the sampler cannot judge the application"
         )
     return relations, control_handles
 
@@ -1115,20 +1114,19 @@ def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayou
             judged = [
                 (sample, relation)
                 for sample, relation in native_ui.attribute_console_windows(
-                    samples,
-                    dict(sampler.shown_at),
-                    sampler.baseline,
-                    family,
-                    list(observer.lifetimes().values()),
-                    allowed=relations,
+                    samples, family, allowed=relations
                 )
                 if sample.handle not in control_handles
+            ]
+            newly_appearing = [
+                sample for sample in console_samples if sample.handle not in sampler.baseline
             ]
             attributed = [sample for sample, _ in judged]
             print(
                 f"NYX-PROBE console-observation gui_pid={pid} helper_pids={sorted(helpers)} "
                 f"control_relations={sorted(relations)} requests={statuses} "
                 f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in judged]!r} "
+                f"newly_appearing_context_only={[_describe_sample(s) for s in newly_appearing]!r} "
                 f"all_console_class_samples={[_describe_sample(s) for s in console_samples]!r}"
             )
             if attributed:
@@ -1214,7 +1212,9 @@ def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.
     pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
 
 
-def _locate_card(page: native_ui.CdpPage, target: str) -> dict:
+def _locate_card(
+    page: native_ui.CdpPage, target: str, window: dict | None = None
+) -> dict:
     """Scroll ``target`` into view and pick a point that really hits that card.
 
     Rectangle, viewport, scroll offsets and a grid of hit tests are read in one
@@ -1255,6 +1255,8 @@ def _locate_card(page: native_ui.CdpPage, target: str) -> dict:
         "   points: points}; })(" + json.dumps(target) + ")"
     )
     geometry = page.evaluate(expression)
+    if isinstance(geometry, dict):
+        geometry["window"] = window
     print(f"NYX-PROBE card-geometry target={target!r} geometry={json.dumps(geometry)}")
     if not isinstance(geometry, dict) or "error" in geometry:
         pytest.fail(f"the target card could not be measured: {geometry!r}")
@@ -1321,6 +1323,17 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                     with _driver_step("the window or page could not be prepared"):
                         _wait_for_cards(page, len(catalog_paths))
                         driver.bring_forward(pid)
+                        # The delivered window opens with a board viewport too small to
+                        # show a card below the page's own toolbar, so enlarge it by OS
+                        # window management and wait for the page to follow.
+                        window_size = native_ui.enlarge_until_viewport_grows(
+                            driver,
+                            pid,
+                            lambda: tuple(page.evaluate(
+                                "[document.documentElement.clientWidth,"
+                                " document.documentElement.clientHeight]"
+                            )),
+                        )
                         calibration = native_ui.calibrate_page(
                             driver, page, driver.window_frame(pid)
                         )
@@ -1343,7 +1356,7 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         driver.bring_forward(pid)
                         # Measure last, immediately before the click, so nothing
                         # that happened while the window came forward can move the card.
-                        geometry = _locate_card(page, target)
+                        geometry = _locate_card(page, target, window_size)
                         css_x, css_y = geometry["point"]
                         screen_x, screen_y = calibration.to_screen(css_x, css_y)
                         print(
