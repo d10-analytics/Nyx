@@ -63,6 +63,7 @@ LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 RUNTIME_CONTROL_TIMEOUT = 1.0
+CONTROL_REQUEST_LIMIT = 8192
 
 RUNTIME_OPERATION_IN_PROGRESS = "runtime operation in progress"
 RUNTIME_STATE_UNAVAILABLE = "runtime state unavailable"
@@ -1198,54 +1199,97 @@ class _Daemon:
                 continue
             except OSError:
                 break
-            with connection:
-                try:
-                    connection.settimeout(1.0)
-                    data = connection.recv(8192)
-                    request = json.loads(data.splitlines()[0])
-                    if (
-                        not isinstance(request, dict)
-                        or request.get("version") != 1
-                        or request.get("capability") != (self.instance.capability if self.instance else None)
-                    ):
-                        continue
-                    command = request.get("command")
-                    if command == "status":
-                        status = (
-                            "unhealthy"
-                            if self.stop_requested.is_set() or self.shutdown_result == "timeout"
-                            else "ready"
-                        )
-                        response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
-                    elif command == "stop":
-                        requested_deadline = request.get("deadline_ns")
-                        if type(requested_deadline) is not int:
-                            requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
-                        # Publish the unhealthy transition before the caller
-                        # can observe its acknowledgement and release lifecycle
-                        # exclusion.  Cleanup starts after the send attempt so
-                        # terminal listener closure cannot race the response,
-                        # but a failed response must still begin cleanup.
-                        self.stop_requested.set()
-                        response = {
-                            "status": "stopping",
-                            "instance_id": self.instance.instance_id,
-                            "url": URL,
-                        }
-                        try:
-                            connection.sendall((json.dumps(response) + "\n").encode())
-                        finally:
-                            threading.Thread(
-                                target=self.shutdown,
-                                args=(requested_deadline / 1_000_000_000,),
-                                daemon=True,
-                            ).start()
-                        continue
-                    else:
-                        continue
-                    connection.sendall((json.dumps(response) + "\n").encode())
-                except (OSError, IndexError, KeyError, TypeError, json.JSONDecodeError):
-                    continue
+            self._handle_control_connection(connection, time.monotonic())
+
+    def _read_control_request(
+        self, connection: socket.socket, expires_at: float
+    ) -> bytes | None:
+        """Read one newline-terminated request line within the byte and time bounds.
+
+        Returns the line without its newline, or ``None`` when the peer closes
+        early, exceeds ``CONTROL_REQUEST_LIMIT`` bytes (newline included), or
+        outlasts the connection deadline.  Each ``recv`` gets only the time
+        that remains, so a trickling sender cannot extend the connection.
+        """
+
+        buffer = b""
+        while True:
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0 or len(buffer) >= CONTROL_REQUEST_LIMIT:
+                return None
+            connection.settimeout(remaining)
+            chunk = connection.recv(CONTROL_REQUEST_LIMIT - len(buffer))
+            if not chunk:
+                return None
+            buffer += chunk
+            newline = buffer.find(b"\n")
+            if newline >= 0:
+                return buffer[:newline]
+
+    def _handle_control_connection(self, connection: socket.socket, accepted_at: float) -> None:
+        """Serve one control connection; no failure here may end the accept loop."""
+
+        expires_at = accepted_at + RUNTIME_CONTROL_TIMEOUT
+        with connection:
+            try:
+                line = self._read_control_request(connection, expires_at)
+                if line is None:
+                    return
+                request = json.loads(line.decode("utf-8"))
+                if (
+                    not isinstance(request, dict)
+                    or request.get("version") != 1
+                    or request.get("capability") != (self.instance.capability if self.instance else None)
+                ):
+                    return
+                command = request.get("command")
+                if command == "status":
+                    status = (
+                        "unhealthy"
+                        if self.stop_requested.is_set() or self.shutdown_result == "timeout"
+                        else "ready"
+                    )
+                    response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
+                elif command == "stop":
+                    requested_deadline = request.get("deadline_ns")
+                    if type(requested_deadline) is not int:
+                        requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
+                    # Publish the unhealthy transition before the caller
+                    # can observe its acknowledgement and release lifecycle
+                    # exclusion.  Cleanup starts after the send attempt so
+                    # terminal listener closure cannot race the response,
+                    # but a failed response must still begin cleanup.
+                    self.stop_requested.set()
+                    response = {
+                        "status": "stopping",
+                        "instance_id": self.instance.instance_id,
+                        "url": URL,
+                    }
+                    try:
+                        self._send_control_reply(connection, response, expires_at)
+                    finally:
+                        threading.Thread(
+                            target=self.shutdown,
+                            args=(requested_deadline / 1_000_000_000,),
+                            daemon=True,
+                        ).start()
+                    return
+                else:
+                    return
+                self._send_control_reply(connection, response, expires_at)
+            except Exception:
+                # One connection's defect must never end the control loop.
+                return
+
+    @staticmethod
+    def _send_control_reply(
+        connection: socket.socket, response: dict[str, Any], expires_at: float
+    ) -> None:
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("control connection deadline expired")
+        connection.settimeout(remaining)
+        connection.sendall((json.dumps(response) + "\n").encode())
 
     def start(self) -> None:
         if time.monotonic() >= self._deadline():
