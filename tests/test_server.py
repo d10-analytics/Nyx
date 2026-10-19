@@ -1,11 +1,9 @@
 import http.client
 import json
 import socket
-import struct
 import sys
 import threading
 import time
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -431,6 +429,29 @@ def _watch_connection_ends(server):
     return escapes, finished, changed
 
 
+def _wait_until_finished(connection, finished, changed):
+    deadline = time.monotonic() + 5
+    while connection not in finished and time.monotonic() < deadline:
+        changed.wait(0.05)
+        changed.clear()
+    if connection not in finished:
+        pytest.fail("the aborted connection was never shut down by the server")
+
+
+def _require_later_request_ok(port):
+    try:
+        status = request(port, "GET", "/api/catalog")[0]
+    except (http.client.HTTPException, OSError) as error:
+        pytest.fail(f"the later request failed after the abort: {error!r}")
+    if status != 200:
+        pytest.fail(f"the later request returned {status}, not 200")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=U8AbortEscapeDefect,
+    reason="U8: _send does not absorb ConnectionAbortedError (linux, win32, darwin)",
+)
 def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers():
     client = StubClient(catalog=valid_catalog())
     running = RunningServer(client)
@@ -445,19 +466,8 @@ def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers()
                 pass
             if not observer.reached.is_set():
                 pytest.fail("the injected abort was never reached in the real socket write")
-            first = observer.server_sockets[0]
-            deadline = time.monotonic() + 5
-            while first not in finished and time.monotonic() < deadline:
-                changed.wait(0.05)
-                changed.clear()
-            if first not in finished:
-                pytest.fail("the aborted connection was never shut down by the server")
-            try:
-                status = request(port, "GET", "/api/catalog")[0]
-            except (http.client.HTTPException, OSError) as error:
-                pytest.fail(f"the later request failed after the injected abort: {error!r}")
-            if status != 200:
-                pytest.fail(f"the later request returned {status}, not 200")
+            _wait_until_finished(observer.server_sockets[0], finished, changed)
+            _require_later_request_ok(port)
         if escapes:
             raise U8AbortEscapeDefect(
                 f"injected ConnectionAbortedError escaped _send: {escapes!r}"
@@ -479,66 +489,52 @@ class _HeldCatalog:
         return valid_catalog()
 
 
-def _abort_after_dispatch(port):
-    connection = socket.create_connection(("127.0.0.1", port), timeout=5)
-    connection.sendall(
-        b"GET /api/catalog HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % port
-    )
-    return connection
-
-
-def test_probe_real_client_abort_error_mix_is_reported(capsys):
-    """One-off first-push probe: report the real-abort error mix; never fails."""
-
-    repeats = 20
-    mixes = {}
-    for variant in ("rst-linger-zero", "plain-close"):
-        counts = Counter()
-        provider = _HeldCatalog()
-        running = RunningServer(provider)
-        try:
-            port = running.server.server_port
-            escapes, finished, changed = _watch_connection_ends(running.server)
-            for _ in range(repeats):
-                try:
-                    provider.entered.clear()
-                    provider.release.clear()
-                    del escapes[:], finished[:]
-                    changed.clear()
-                    with _SendObserver(port) as observer:
-                        connection = _abort_after_dispatch(port)
-                        try:
-                            provider.entered.wait(5)
-                            if variant == "rst-linger-zero":
-                                connection.setsockopt(
-                                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
-                                )
-                            connection.close()
-                        finally:
-                            provider.release.set()
-                        deadline = time.monotonic() + 5
-                        while not finished and time.monotonic() < deadline:
-                            changed.wait(0.05)
-                            changed.clear()
-                        counts[
-                            (
-                                tuple(map(str, observer.outcomes)),
-                                tuple(type(error).__name__ for error in escapes),
-                            )
-                        ] += 1
-                except BaseException as error:  # noqa: BLE001 - a probe only reports
-                    counts[("probe-error", type(error).__name__)] += 1
-        finally:
-            provider.release.set()
-            running.__exit__(None, None, None)
-        mixes[variant] = counts
-    with capsys.disabled():
-        for variant, counts in mixes.items():
-            print(
-                f"PROBE real-abort platform={sys.platform} variant={variant} "
-                f"repeats={repeats} mix={dict(counts)}",
-                flush=True,
-            )
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="a real client abort yields a stable ConnectionAbortedError only on Windows",
+)
+@pytest.mark.xfail(
+    condition=sys.platform == "win32",
+    strict=True,
+    raises=U8AbortEscapeDefect,
+    reason="U8: _send does not absorb ConnectionAbortedError (win32)",
+)
+def test_real_client_abort_after_dispatch_does_not_escape_and_server_recovers():
+    provider = _HeldCatalog()
+    running = RunningServer(provider)
+    try:
+        port = running.server.server_port
+        escapes, finished, changed = _watch_connection_ends(running.server)
+        with _SendObserver(port) as observer:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+            try:
+                connection.sendall(
+                    b"GET /api/catalog HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % port
+                )
+                if not provider.entered.wait(5):
+                    pytest.fail("the request never reached the provider")
+            finally:
+                connection.close()
+                provider.release.set()
+            deadline = time.monotonic() + 5
+            while not observer.server_sockets and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not observer.server_sockets:
+                pytest.fail("the server never wrote to the aborted connection")
+            _wait_until_finished(observer.server_sockets[0], finished, changed)
+            aborted = [
+                outcome
+                for outcome in observer.outcomes
+                if isinstance(outcome, tuple) and outcome[0] == "ConnectionAbortedError"
+            ]
+            if not aborted:
+                pytest.fail(f"the real write did not raise an abort: {observer.outcomes!r}")
+            _require_later_request_ok(port)
+        if escapes:
+            raise U8AbortEscapeDefect(f"real client abort escaped _send: {escapes!r}")
+    finally:
+        provider.release.set()
+        running.__exit__(None, None, None)
 
 
 def test_catalog_route_returns_the_projection_and_uses_one_fetch():
