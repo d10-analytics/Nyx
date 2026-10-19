@@ -155,7 +155,7 @@ def test_real_setup_cli_uses_portable_state_layout(capsys):
         )
         assert paths.config_file.is_file()
         assert json.loads(paths.config_file.read_bytes()) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(specification.resolve()),
         }
         assert paths.runtime_directory.is_dir()

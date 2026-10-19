@@ -429,7 +429,7 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
     assert setup.stdout.strip() == f"configured {sample}"
     configuration = json.loads((home / ".nyx/config/config.json").read_text(encoding="utf-8"))
     assert configuration["specification_root"] == str(sample)
-    assert configuration == {"schema_version": 3, "specification_root": str(sample)}
+    assert configuration == {"schema_version": 4, "specification_root": str(sample)}
     locator = home / ".nyx/runtime/instance.json"
     claim = home / ".nyx/runtime/lease.lock"
     try:

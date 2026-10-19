@@ -1168,7 +1168,7 @@ def test_schema_two_owner_settings_rewrite_only_on_setup_with_equal_revision():
         with patch.object(runtime, "_paths", return_value=paths):
             rewritten = runtime.setup(specification_root)
         expected.pop("hidden_stages")
-        expected["schema_version"] = 3
+        expected["schema_version"] = 4
         assert json.loads(paths.config_file.read_bytes()) == expected
         assert rewritten.stage_orders == loaded.stage_orders
         assert rewritten.completed_stages == loaded.completed_stages
@@ -1192,7 +1192,7 @@ def test_application_settings_save_conflict_and_restart_persistence():
         assert saved["order"] == ["Done", "Queue"]
         assert saved["completed"] == ["Done"]
         expected.pop("hidden_stages")
-        expected["schema_version"] = 3
+        expected["schema_version"] = 4
         expected["stage_orders"][str(specification_root.resolve())] = ["Done", "Queue"]
         expected["completed_stages"][str(specification_root.resolve())] = ["Done"]
         assert json.loads(paths.config_file.read_bytes()) == expected

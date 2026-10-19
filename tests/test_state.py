@@ -73,7 +73,7 @@ def test_setup_uses_controlled_home_and_persists_canonical_empty_symlink_root():
         assert loaded == result
         payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
         assert payload == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(actual.resolve()),
         }
         assert paths.config_file.is_relative_to(home)
@@ -205,7 +205,7 @@ def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates()
 
         assert migrated == state.Configuration(second.resolve())
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(second.resolve()),
         }
 
@@ -519,7 +519,7 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
                 state.setup(second)
 
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(second.resolve()),
         }
 
@@ -853,7 +853,7 @@ def test_configuration_observation_returns_valid_schema_data_only_when_configure
         {"schema_version": 2, "hidden_stages": {}, "specification_root": "/tmp/root"},
         {"schema_version": 3, "hidden_stages": [], "specification_root": "/tmp/root"},
         {"schema_version": 3, "hidden_stages": ["Done"], "specification_root": "/tmp/root"},
-        {"schema_version": 4, "specification_root": "/tmp/root"},
+        {"schema_version": 5, "specification_root": "/tmp/root"},
         *[{"schema_version": version, "specification_root": "/tmp/root"}
           for version in (0, -1, None, True, 2.0, "3")],
     ],

@@ -755,7 +755,7 @@ def test_first_launch_valid_selection_uses_canonical_schema_three_state():
             assert result.specification_root == workspace.resolve()
             assert state.load_configuration(paths) == result
             assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-                "schema_version": 3,
+                "schema_version": 4,
                 "specification_root": str(workspace.resolve()),
             }
             session.close()
@@ -907,7 +907,7 @@ def test_replacing_workspace_preserves_saved_order_and_completion():
             session.choose_workspace(second)
             assert state.load_configuration().specification_root == second.resolve()
             expected.pop("hidden_stages")
-            expected["schema_version"] = 3
+            expected["schema_version"] = 4
             expected["specification_root"] = str(second.resolve())
             assert json.loads(paths.config_file.read_bytes()) == expected
             assert state.load_configuration().stage_order == ("Archive", "Queue")

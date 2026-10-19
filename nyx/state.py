@@ -21,9 +21,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 LEGACY_CONFIG_SCHEMA_VERSION = 1
 POLICY_CONFIG_SCHEMA_VERSION = 2
+CHECKOUT_CONFIG_SCHEMA_VERSION = 4
+_SCHEMA_VERSION_3 = 3
 _LEGACY_POLICY_KEY = "hidden_stages"
 CONFIG_FILENAME = "config.json"
 DEPLOYMENT_FILENAME = "deployment.json"
@@ -98,12 +100,34 @@ class StatePaths:
 
 
 @dataclass(frozen=True)
+class CheckoutSettings:
+    """One workspace's checkout-discovery folders and lookup preference."""
+
+    folders: tuple[str, ...]
+    github_lookup: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.folders, (str, bytes)):
+            raise ConfigurationError("Nyx configuration checkout folders are invalid")
+        folders = tuple(self.folders)
+        if (
+            not folders
+            or type(self.github_lookup) is not bool
+            or any(not _is_canonical_root(folder) for folder in folders)
+            or list(folders) != sorted(set(folders))
+        ):
+            raise ConfigurationError("Nyx configuration checkout settings are invalid")
+        object.__setattr__(self, "folders", folders)
+
+
+@dataclass(frozen=True)
 class Configuration:
     """The validated contents of the Nyx setup record."""
 
     specification_root: Path
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
     completed_stages: Mapping[str, tuple[str, ...]] | None = None
+    checkout_settings: Mapping[str, CheckoutSettings] | None = None
 
     def __post_init__(self) -> None:
         # Keep the public object immutable at the field level while ensuring a
@@ -124,6 +148,14 @@ class Configuration:
                 "completed_stages",
                 MappingProxyType(_validate_completed_stages(self.completed_stages)),
             )
+        if self.checkout_settings is None:
+            object.__setattr__(self, "checkout_settings", MappingProxyType({}))
+        else:
+            object.__setattr__(
+                self,
+                "checkout_settings",
+                MappingProxyType(_validate_checkout_settings(self.checkout_settings)),
+            )
 
     @property
     def stage_order(self) -> tuple[str, ...]:
@@ -138,6 +170,14 @@ class Configuration:
 
         assert self.completed_stages is not None
         return self.completed_stages.get(str(self.specification_root), ())
+
+    @property
+    def checkout_folders(self) -> tuple[str, ...]:
+        """Return the active workspace's configured checkout folders."""
+
+        assert self.checkout_settings is not None
+        entry = self.checkout_settings.get(str(self.specification_root))
+        return () if entry is None else entry.folders
 
     @property
     def revision(self) -> str:
@@ -160,6 +200,14 @@ class Configuration:
                 root: list(names)
                 for root, names in sorted(self.completed_stages.items())
             }
+        if self.checkout_settings:
+            payload["checkout_settings"] = {
+                root: {
+                    "folders": list(entry.folders),
+                    "github_lookup": entry.github_lookup,
+                }
+                for root, entry in sorted(self.checkout_settings.items())
+            }
         return payload
 
 
@@ -172,6 +220,7 @@ class ConfigurationObservation:
     diagnostic: str | None = None
     stage_orders: Mapping[str, tuple[str, ...]] | None = None
     completed_stages: Mapping[str, tuple[str, ...]] | None = None
+    checkout_settings: Mapping[str, CheckoutSettings] | None = None
 
     @property
     def state(self) -> str:
@@ -190,6 +239,7 @@ class ConfigurationObservation:
             self.specification_root,
             self.stage_orders or {},
             self.completed_stages or {},
+            self.checkout_settings or {},
         )
 
 
@@ -501,6 +551,15 @@ def _validate_stage_order(values: Iterable[str]) -> tuple[str, ...]:
     return names
 
 
+def _is_canonical_root(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and "\x00" not in value
+        and os.path.isabs(value)
+        and os.path.normpath(value) == value
+    )
+
+
 def _canonical_order_root(
     value: str, error: type[ConfigurationError] = StageOrderError
 ) -> str:
@@ -573,6 +632,36 @@ def _validate_completed_stages(
     return dict(sorted(result.items()))
 
 
+def _validate_checkout_settings(
+    values: Mapping[str, CheckoutSettings],
+) -> dict[str, CheckoutSettings]:
+    if not isinstance(values, Mapping):
+        raise ConfigurationError("Nyx configuration checkout settings are invalid")
+    result: dict[str, CheckoutSettings] = {}
+    for root, entry in values.items():
+        if not _is_canonical_root(root) or not isinstance(entry, CheckoutSettings):
+            raise ConfigurationError("Nyx configuration checkout settings are invalid")
+        result[root] = entry
+    return dict(sorted(result.items()))
+
+
+def _checkout_settings_from_payload(raw: Any) -> dict[str, CheckoutSettings]:
+    """Strictly parse the stored map; every deviation is a refusal."""
+
+    if not isinstance(raw, dict):
+        raise ConfigurationError("Nyx configuration checkout settings are invalid")
+    result: dict[str, CheckoutSettings] = {}
+    for root, entry in raw.items():
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"folders", "github_lookup"}
+            or not isinstance(entry["folders"], list)
+        ):
+            raise ConfigurationError("Nyx configuration checkout settings are invalid")
+        result[root] = CheckoutSettings(tuple(entry["folders"]), entry["github_lookup"])
+    return _validate_checkout_settings(result)
+
+
 def _configuration_from_payload(payload: Any) -> Configuration:
     if not isinstance(payload, dict) or "schema_version" not in payload:
         raise ConfigurationError("Nyx configuration schema is invalid")
@@ -584,7 +673,12 @@ def _configuration_from_payload(payload: Any) -> Configuration:
             raise ConfigurationError("Nyx configuration schema is invalid")
         stage_orders: dict[str, tuple[str, ...]] = {}
         completed_stages: dict[str, tuple[str, ...]] = {}
-    elif schema_version in {POLICY_CONFIG_SCHEMA_VERSION, CONFIG_SCHEMA_VERSION}:
+        checkout_settings: dict[str, CheckoutSettings] = {}
+    elif schema_version in {
+        POLICY_CONFIG_SCHEMA_VERSION,
+        _SCHEMA_VERSION_3,
+        CONFIG_SCHEMA_VERSION,
+    }:
         required = {"schema_version", "specification_root"}
         allowed = {
             "schema_version",
@@ -592,6 +686,8 @@ def _configuration_from_payload(payload: Any) -> Configuration:
             "stage_orders",
             "completed_stages",
         }
+        if schema_version >= CHECKOUT_CONFIG_SCHEMA_VERSION:
+            allowed.add("checkout_settings")
         if schema_version == POLICY_CONFIG_SCHEMA_VERSION:
             required.add(_LEGACY_POLICY_KEY)
             allowed.add(_LEGACY_POLICY_KEY)
@@ -625,6 +721,9 @@ def _configuration_from_payload(payload: Any) -> Configuration:
             root: list(names) for root, names in completed_stages.items()
         }:
             raise ConfigurationError("Nyx configuration completed stages are not canonical")
+        checkout_settings = _checkout_settings_from_payload(
+            payload.get("checkout_settings", {})
+        )
     else:
         raise ConfigurationError("Nyx configuration schema version is unsupported")
     root = payload.get("specification_root")
@@ -640,7 +739,7 @@ def _configuration_from_payload(payload: Any) -> Configuration:
     # instead of being served after a restart.
     if any(_is_within(canonical, footprint) for footprint in _installation_footprints()):
         raise ConfigurationError("Nyx configuration root is inside the Nyx installation")
-    return Configuration(canonical, stage_orders, completed_stages)
+    return Configuration(canonical, stage_orders, completed_stages, checkout_settings)
 
 
 def load_configuration(paths: StatePaths | None = None) -> Configuration:
@@ -686,6 +785,7 @@ def observe_configuration() -> ConfigurationObservation:
         specification_root=configuration.specification_root,
         stage_orders=configuration.stage_orders,
         completed_stages=configuration.completed_stages,
+        checkout_settings=configuration.checkout_settings,
     )
 
 
@@ -724,12 +824,13 @@ def _configuration_bytes(
     root: Path,
     stage_orders: Mapping[str, Iterable[str]] | None = None,
     completed_stages: Mapping[str, Iterable[str]] | None = None,
+    checkout_settings: Mapping[str, CheckoutSettings] | None = None,
 ) -> bytes:
     orders = {} if stage_orders is None else _validate_stage_orders(stage_orders)
     completed = {} if completed_stages is None else _validate_completed_stages(completed_stages)
     return (
         json.dumps(
-            Configuration(root, orders, completed).as_dict(),
+            Configuration(root, orders, completed, checkout_settings).as_dict(),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
@@ -757,6 +858,7 @@ def _atomic_write_configuration(
     root: Path,
     stage_orders: Mapping[str, Iterable[str]] | None = None,
     completed_stages: Mapping[str, Iterable[str]] | None = None,
+    checkout_settings: Mapping[str, CheckoutSettings] | None = None,
     *,
     deadline: float | None = None,
     deadline_ns: int | None = None,
@@ -773,7 +875,7 @@ def _atomic_write_configuration(
             prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
         )
         try:
-            data = _configuration_bytes(root, stage_orders, completed_stages)
+            data = _configuration_bytes(root, stage_orders, completed_stages, checkout_settings)
             written = 0
             while written < len(data):
                 _check_deadline(deadline, deadline_ns)
@@ -813,6 +915,7 @@ def _save_configuration(
     root: Path,
     stage_orders: Mapping[str, Iterable[str]] | None | object = _OMITTED,
     completed_stages: Mapping[str, Iterable[str]] | None | object = _OMITTED,
+    checkout_settings: Mapping[str, CheckoutSettings] | None | object = _OMITTED,
     *,
     deadline: float | None = None,
     deadline_ns: int | None = None,
@@ -822,7 +925,9 @@ def _save_configuration(
     if _lstat(paths.config_file) is not None:
         _verify_record(paths.config_file)
         current = load_configuration(paths) if (
-            stage_orders is _OMITTED or completed_stages is _OMITTED
+            stage_orders is _OMITTED
+            or completed_stages is _OMITTED
+            or checkout_settings is _OMITTED
         ) else None
     else:
         current = None
@@ -836,15 +941,22 @@ def _save_configuration(
         validated_completed = (
             {} if completed_stages is None else _validate_completed_stages(completed_stages)
         )
+    if checkout_settings is _OMITTED:
+        validated_checkout = {} if current is None else dict(current.checkout_settings or {})
+    else:
+        validated_checkout = (
+            {} if checkout_settings is None else _validate_checkout_settings(checkout_settings)
+        )
     _atomic_write_configuration(
         paths,
         root,
         validated_orders,
         validated_completed,
+        validated_checkout,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
-    return Configuration(root, validated_orders, validated_completed)
+    return Configuration(root, validated_orders, validated_completed, validated_checkout)
 
 
 def validate_configuration_candidate(
@@ -900,7 +1012,8 @@ def validate_configuration_candidate(
             validated_completed[str(root)] = validated_names
         else:
             validated_completed.pop(str(root), None)
-    return Configuration(root, validated_orders, validated_completed)
+    validated_checkout = {} if current is None else dict(current.checkout_settings or {})
+    return Configuration(root, validated_orders, validated_completed, validated_checkout)
 
 
 def save_configuration_owned(
@@ -940,6 +1053,7 @@ def save_configuration_owned(
         candidate.specification_root,
         candidate.stage_orders,
         candidate.completed_stages,
+        candidate.checkout_settings,
         deadline=deadline,
         deadline_ns=deadline_ns,
     )
@@ -968,6 +1082,7 @@ def _configuration_revision(configuration: Configuration) -> str:
             configuration.specification_root,
             configuration.stage_orders,
             configuration.completed_stages,
+            configuration.checkout_settings,
         )
     ).hexdigest()
 
@@ -1014,7 +1129,9 @@ def setup(
 
 
 __all__ = [
+    "CHECKOUT_CONFIG_SCHEMA_VERSION",
     "CONFIG_SCHEMA_VERSION",
+    "CheckoutSettings",
     "CONFIGURATION_STATES",
     "CONFIGURATION_UNAVAILABLE",
     "AccountHomeError",
