@@ -1661,3 +1661,57 @@ def test_slow_status_is_cut_by_the_deadline_and_later_counts_are_unknown(tmp_pat
     if git_shim is not None:
         for pid in exited_status_pids(git_shim, slow):
             assert_exited(pid)
+
+
+# ---------------------------------------------------------------------------
+# Repairs: counts that contradict a relation, unbounded text, decoding, identity
+# ---------------------------------------------------------------------------
+
+
+def test_different_objects_naming_the_same_commits_differ_without_counts(repo):
+    git(repo, "tag", "-a", "-m", "annotated", "release", "HEAD")
+    tag_object = git(repo, "rev-parse", "release").stdout.strip()
+    git(repo, "branch", "tagged")
+    git(repo, "update-ref", "refs/remotes/origin/tagged", tag_object)
+    assert git(
+        repo, "rev-list", "--left-right", "--count", f"tagged...{tag_object}"
+    ).stdout.split() == ["0", "0"], "control: git counts nothing between them"
+
+    item = state_of(repo)
+
+    comparison = branch_of(item, "tagged")["vs_remote"]
+    assert (comparison["relation"], comparison["ahead"], comparison["behind"]) == (
+        "differs", None, None
+    )
+
+
+def test_text_beyond_the_document_bound_fails_the_clone_not_the_document(tmp_path):
+    if ON_WINDOWS:
+        pytest.skip("the long reference path exceeds Windows path limits")
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    main = clone(remote, tmp_path / "main")
+    sibling = clone(remote, folder / "sibling")
+    name = "/".join("x" * 203 for _ in range(5))  # 1019 characters: a safe name
+    git(main, "checkout", "-q", "-b", name)
+    commit_file(main, "long.txt", "long\n")
+    git(main, "push", "-q", "-u", "origin", name)  # "origin/" + name is over the bound
+    linked = folder / "linked"
+    git(main, "worktree", "add", "-q", "--detach", str(linked))
+
+    document = collect([folder])
+
+    item = find_clone(document, main)
+    assert item["status"] == "failed"
+    assert item["path"] == real(main), "identity does not follow the candidate that found it"
+    assert item["branches"] is None and item["worktrees"] is None
+    assert find_clone(document, sibling)["status"] == "ok"
+    assert all(real(linked) != c["path"] for c in all_clones(document))
+
+
+def test_git_output_that_is_not_valid_text_never_raises(monkeypatch):
+    # Windows' fsdecode raises on such bytes; the collector must not depend on it.
+    monkeypatch.setattr(os, "fsdecode", lambda data: data.decode("utf-8", "strict"))
+    assert checkouts._decode(b"a\xffb") == "a\udcffb"
+    assert checkouts._decode("nämé".encode()) == "nämé"
