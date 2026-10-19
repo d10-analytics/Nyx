@@ -7201,3 +7201,165 @@ def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
                 os.close(lease_fd)
             except OSError:
                 pass
+
+
+def _control_exchange(
+    instance: runtime.Instance,
+    payload: bytes,
+    *,
+    chunks: list[bytes] | None = None,
+    read_for: float = 3.0,
+) -> bytes:
+    """Send raw bytes to the daemon's control socket and return whatever it replies.
+
+    The reply is read until the daemon closes the connection or ``read_for``
+    elapses, so a dropped connection returns ``b""``.
+    """
+
+    _, address = runtime._parse_control_endpoint(instance.control)
+    with socket.create_connection(address, timeout=read_for) as peer:
+        for piece in chunks if chunks is not None else [payload]:
+            peer.sendall(piece)
+            if chunks is not None:
+                time.sleep(0.2)
+        received = b""
+        try:
+            while True:
+                part = peer.recv(8192)
+                if not part:
+                    return received
+                received += part
+        except (TimeoutError, socket.timeout):
+            return received
+        except ConnectionResetError:
+            # Closing with unread request bytes resets the connection; that
+            # is still a dropped connection with no reply.
+            return received
+
+
+def _status_request(instance: runtime.Instance, **overrides: object) -> dict[str, object]:
+    request: dict[str, object] = {
+        "version": 1,
+        "capability": instance.capability,
+        "command": "status",
+    }
+    request.update(overrides)
+    return request
+
+
+def _padded_status_line(instance: runtime.Instance, total: int) -> bytes:
+    """A valid authenticated status line of exactly ``total`` bytes including the newline."""
+
+    body = json.dumps(_status_request(instance), separators=(",", ":")).encode()
+    padding = total - len(body) - 1
+    assert padding >= 0
+    return body + b" " * padding + b"\n"
+
+
+@pytest.fixture
+def control_daemon():
+    """A real in-process daemon on the isolated port, yielding its record and run."""
+
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
+        with patch.object(runtime, "_paths", return_value=paths):
+            daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 30) * 1_000_000_000))
+            with managed_daemon_run(daemon) as run:
+                instance = _wait_for_record(paths)
+                yield SimpleNamespace(
+                    daemon=daemon, instance=instance, run=run, paths=paths
+                )
+
+
+def _assert_control_survives(context: SimpleNamespace) -> None:
+    assert context.daemon.control_thread is not None
+    assert context.daemon.control_thread.is_alive()
+    assert _observe(context.paths).status == "running"
+    reply = _control_exchange(
+        context.instance, (json.dumps(_status_request(context.instance)) + "\n").encode()
+    )
+    assert json.loads(reply)["status"] == "ready"
+
+
+_DIGIT_LIMIT_LITERAL = b"9" * 5000
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda i: b"\xff\n", id="bad-utf8"),
+        pytest.param(lambda i: b"x" * 9000, id="over-bound-without-newline"),
+        pytest.param(
+            lambda i: _padded_status_line(i, runtime.CONTROL_REQUEST_LIMIT + 1),
+            id="padded-status-past-bound",
+        ),
+        pytest.param(
+            lambda i: b'{"version":1,"capability":"c","command":"status","n":'
+            + _DIGIT_LIMIT_LITERAL
+            + b"}\n",
+            id="integer-beyond-digit-limit",
+        ),
+        pytest.param(lambda i: b"[1, 2]\n", id="non-object-json"),
+        pytest.param(
+            lambda i: (json.dumps(_status_request(i, version=2)) + "\n").encode(),
+            id="wrong-version",
+        ),
+        pytest.param(
+            lambda i: (json.dumps(_status_request(i, capability="wrong")) + "\n").encode(),
+            id="wrong-capability",
+        ),
+    ],
+)
+def test_malformed_control_request_is_dropped_without_ending_the_control_loop(
+    control_daemon, build
+):
+    payload = build(control_daemon.instance)
+    assert _control_exchange(control_daemon.instance, payload) == b""
+    _assert_control_survives(control_daemon)
+    assert runtime.stop() == "stopped"
+    assert control_daemon.run.join(timeout=10) == 0
+
+
+def test_status_request_at_exactly_the_read_bound_is_answered(control_daemon):
+    line = _padded_status_line(control_daemon.instance, runtime.CONTROL_REQUEST_LIMIT)
+    assert len(line) == 8192
+    reply = _control_exchange(control_daemon.instance, line)
+    assert json.loads(reply)["status"] == "ready"
+    _assert_control_survives(control_daemon)
+
+
+def test_status_request_split_across_two_writes_is_answered(control_daemon):
+    line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
+    middle = len(line) // 2
+    reply = _control_exchange(
+        control_daemon.instance, b"", chunks=[line[:middle], line[middle:]]
+    )
+    assert json.loads(reply)["status"] == "ready"
+
+
+def test_trickling_sender_is_closed_within_one_control_timeout_of_accept(control_daemon):
+    _, address = runtime._parse_control_endpoint(control_daemon.instance.control)
+    started = time.monotonic()
+    closed_at: float | None = None
+    with socket.create_connection(address, timeout=5) as peer:
+        peer.settimeout(0.05)
+        while time.monotonic() - started < 3.0:
+            try:
+                peer.sendall(b" ")
+            except OSError:
+                closed_at = time.monotonic()
+                break
+            try:
+                if peer.recv(1) == b"":
+                    closed_at = time.monotonic()
+                    break
+            except (TimeoutError, socket.timeout):
+                pass
+            except OSError:
+                closed_at = time.monotonic()
+                break
+            time.sleep(0.3)
+    assert closed_at is not None, "daemon never closed the trickling connection"
+    assert closed_at - started < runtime.RUNTIME_CONTROL_TIMEOUT + 0.6
+    _assert_control_survives(control_daemon)
