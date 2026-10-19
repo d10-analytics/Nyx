@@ -64,6 +64,10 @@ class WindowInfo(NamedTuple):
 
 
 _CONSOLE_WINDOW_CLASSES = frozenset({"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"})
+# Hidden window a console host creates for a pseudo console; it is recorded with
+# its owner relations as evidence but is never a visible console window itself.
+_PSEUDO_CONSOLE_CLASS = "PseudoConsoleWindow"
+_CONSOLE_HOST_IMAGES = frozenset({"conhost.exe", "openconsole.exe"})
 
 
 def is_console_window_class(window_class: str) -> bool:
@@ -305,6 +309,7 @@ class JobEvent(NamedTuple):
 
 JOB_OBJECT_MSG_NEW_PROCESS = 6
 JOB_OBJECT_MSG_EXIT_PROCESS = 7
+JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8
 
 
 class JobObserver:
@@ -433,6 +438,22 @@ class JobObserver:
         with self._lock:
             return {e.pid for e in self.events if e.message == JOB_OBJECT_MSG_NEW_PROCESS}
 
+    def lifetimes(self) -> dict[int, tuple[float, float | None]]:
+        """Return ``{pid: (start, end)}`` for each reported descendant; ``end`` is open if unseen."""
+
+        with self._lock:
+            events = list(self.events)
+        spans: dict[int, tuple[float, float | None]] = {}
+        for event in events:
+            if event.message == JOB_OBJECT_MSG_NEW_PROCESS:
+                spans[event.pid] = (event.at, None)
+        for event in events:
+            if event.message in (
+                JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+            ) and event.pid in spans and spans[event.pid][1] is None:
+                spans[event.pid] = (spans[event.pid][0], event.at)
+        return spans
+
     def started_between(self, begin: float, end: float) -> set[int]:
         """Descendant process IDs the job reported as started inside ``[begin, end]``."""
 
@@ -456,21 +477,85 @@ class WindowSample:
     owner_pid: int
     owner_image: str
     owner_parent: int | None
+    # Process table captured when the window was seen: ``{pid: (parent, image)}``.
+    process_table: dict[int, tuple[int, str]] | None = None
 
 
 def attribute_window(sample: WindowSample, family: set[int]) -> str | None:
-    """Name the relation tying a sampled window to a process family, or ``None``.
+    """Name the structural relation tying a sampled window to a process family.
 
     Console windows belong to the console host rather than to the process that
-    spawned the console, so both the window owner and the owner's parent are
-    compared with the family.
+    spawned the console, so the window owner, the owner's parent and, for a
+    console host owner, the host's attached client processes are compared with
+    the family.
     """
 
     if sample.owner_pid in family:
         return "owner-in-family"
     if sample.owner_parent is not None and sample.owner_parent in family:
         return "owner-parent-in-family"
+    if sample.owner_image.lower() in _CONSOLE_HOST_IMAGES and sample.process_table:
+        for pid, (parent, _) in sample.process_table.items():
+            if parent == sample.owner_pid and pid in family:
+                return "host-has-family-client"
     return None
+
+
+_TEMPORAL_RELATION = "new-window-during-family-lifetime"
+_LIFETIME_LEAD = 0.25
+_LIFETIME_GRACE = 1.5
+
+
+def attribute_window_in_time(
+    sample: WindowSample,
+    shown_at: dict[int, float],
+    baseline: frozenset[int],
+    lifetimes: list[tuple[float, float | None]],
+) -> str | None:
+    """Tie a console window to a family by when it first appeared.
+
+    A hosted terminal owns its window in a process tree unrelated to the
+    spawning child, so ownership cannot attribute it.  A window that did not
+    exist before the run and was first shown during a family process's
+    lifetime (plus a short grace for the host to present it) is attributed;
+    windows that predate the run, such as the runner's own terminal, are not.
+    """
+
+    if sample.handle in baseline:
+        return None
+    shown = shown_at.get(sample.handle)
+    if shown is None:
+        return None
+    for start, end in lifetimes:
+        if start - _LIFETIME_LEAD <= shown <= (end if end is not None else shown) + _LIFETIME_GRACE:
+            return _TEMPORAL_RELATION
+    return None
+
+
+def attribute_console_windows(
+    samples: list[WindowSample],
+    shown_at: dict[int, float],
+    baseline: frozenset[int],
+    family: set[int],
+    lifetimes: list[tuple[float, float | None]],
+    allowed: set[str] | None = None,
+) -> list[tuple[WindowSample, str]]:
+    """Return the shown console-class windows attributed to ``family`` and their relation.
+
+    ``allowed`` restricts the relations, so the application is judged only by
+    relations a positive control has shown the sampler can observe.
+    """
+
+    attributed: list[tuple[WindowSample, str]] = []
+    for sample in samples:
+        if not is_console_window_class(sample.window_class) or sample.handle not in shown_at:
+            continue
+        relation = attribute_window(sample, family) or attribute_window_in_time(
+            sample, shown_at, baseline, lifetimes
+        )
+        if relation is not None and (allowed is None or relation in allowed):
+            attributed.append((sample, relation))
+    return attributed
 
 
 class WindowShowSampler:
@@ -494,6 +579,10 @@ class WindowShowSampler:
         self._ready = threading.Event()
         self._seen: set[tuple[int, int]] = set()
         self._hook_failure: str | None = None
+        # First time each handle was seen shown, and the handles that existed
+        # when ``mark_baseline`` ran.
+        self.shown_at: dict[int, float] = {}
+        self.baseline: frozenset[int] = frozenset()
 
     def start(self) -> None:
         if os.name != "nt":
@@ -530,30 +619,42 @@ class WindowShowSampler:
     def __exit__(self, *_: object) -> None:
         self.stop()
 
+    def mark_baseline(self) -> None:
+        """Record every window seen so far as pre-existing, not caused by the run."""
+
+        with self._lock:
+            self.baseline = frozenset(sample.handle for sample in self.samples)
+
     def snapshot(self) -> list[WindowSample]:
         with self._lock:
             return list(self.samples)
 
-    def _record(self, user32: Any, wintypes: Any, window: Any, source: str) -> None:
+    def _record(
+        self, user32: Any, wintypes: Any, window: Any, source: str, shown: bool
+    ) -> None:
         if not window or user32.GetAncestor(window, 2) != window:  # GA_ROOT
             return
         info = _windows_describe(user32, wintypes, window)
         key = (info.handle, info.owner)
+        now = time.monotonic()
         with self._lock:
+            if shown:
+                self.shown_at.setdefault(info.handle, now)
             if key in self._seen:
                 return
             self._seen.add(key)
         image = ""
         parent: int | None = None
-        if is_console_window_class(info.window_class):
-            # Resolve the relation now: a console host can be gone before the
+        table: dict[int, tuple[int, str]] | None = None
+        if is_console_window_class(info.window_class) or info.window_class == _PSEUDO_CONSOLE_CLASS:
+            # Resolve the relations now: a console host can be gone before the
             # run ends.
             table = windows_process_table()
             if info.owner in table:
                 parent, image = table[info.owner]
         sample = WindowSample(
-            time.monotonic(), source, info.handle, info.window_class, info.title,
-            info.owner, image, parent,
+            now, source, info.handle, info.window_class, info.title,
+            info.owner, image, parent, table,
         )
         with self._lock:
             self.samples.append(sample)
@@ -599,7 +700,9 @@ class WindowShowSampler:
                 if event not in (event_object_create, event_object_show):
                     return
                 try:
-                    self._record(user32, wintypes, window, "hook")
+                    self._record(
+                        user32, wintypes, window, "hook", event == event_object_show
+                    )
                 except Exception as error:  # pragma: no cover - hook diagnostics
                     self.errors.append(repr(error))
 
@@ -633,7 +736,7 @@ class WindowShowSampler:
             def visit(window, _parameter):
                 if user32.IsWindowVisible(window):
                     try:
-                        self._record(user32, wintypes, window, "poll")
+                        self._record(user32, wintypes, window, "poll", True)
                     except Exception as error:  # pragma: no cover - diagnostics
                         self.errors.append(repr(error))
                 return True
@@ -667,6 +770,7 @@ class Widget:
     rect: Rect
     enabled: bool
     value: str | None
+    element: Any = None  # platform handle (macOS AX element) for focus queries
 
 
 def _json_or_raise(text: str, what: str) -> Any:
@@ -951,6 +1055,14 @@ class _WindowsBackend:
             time.sleep(0.01)
         time.sleep(0.1)
 
+    def replace_text(self, pid: int, name: str, text: str) -> None:
+        """Click the named edit field, select its content and type ``text`` over it."""
+
+        field = self.find_widget(pid, "edit", name)
+        self.click(*field.rect.center)
+        self.select_all()
+        self.type_text(text)
+
     # -- accessibility -----------------------------------------------------
 
     def _run_uia(self, request: dict[str, Any]) -> Any:
@@ -1082,6 +1194,7 @@ class _MacBackend:
         cf.CFArrayGetValueAtIndex.restype = void_p
         cf.CFRelease.argtypes = [void_p]
         cf.CFRelease.restype = None
+        self._true = void_p.in_dll(cf, "kCFBooleanTrue")
         cf.CFBooleanGetValue.argtypes = [void_p]
         cf.CFBooleanGetValue.restype = ctypes.c_ubyte
         sv.AXIsProcessTrusted.argtypes = []
@@ -1110,6 +1223,12 @@ class _MacBackend:
         sv.CGEventSetIntegerValueField.restype = None
         sv.CGEventPost.argtypes = [ctypes.c_uint32, void_p]
         sv.CGEventPost.restype = None
+        sv.AXUIElementSetAttributeValue.argtypes = [void_p, void_p, void_p]
+        sv.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+        self._post_to_pid = getattr(sv, "CGEventPostToPid", None)
+        if self._post_to_pid is not None:
+            self._post_to_pid.argtypes = [ctypes.c_int, void_p]
+            self._post_to_pid.restype = None
 
     # -- CoreFoundation helpers -------------------------------------------
 
@@ -1261,7 +1380,36 @@ class _MacBackend:
         self._post_mouse(up, x, y, code, state=1)
         time.sleep(0.15)
 
-    def _post_key(self, key_code: int, down: bool, flags: int = 0, text: str | None = None) -> None:
+    # US-layout virtual key codes, so the application sees a real key together
+    # with the Unicode text rather than key code 0 ("A") for every character.
+    _KEY_CODES = {
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+        "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19,
+        "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25, "7": 26, "-": 27, "8": 28,
+        "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "l": 37, "j": 38,
+        "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46, ".": 47,
+        " ": 49, "`": 50,
+    }
+    _SHIFTED = {"_": "-", "+": "=", ":": ";", "~": "`", "?": "/", "<": ",", ">": ".",
+                "{": "[", "}": "]", "|": "\\", '"': "'", "!": "1", "@": "2", "#": "3",
+                "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0"}
+
+    def _key_for(self, character: str) -> tuple[int, int]:
+        """Return ``(virtual key, flags)`` for a character, falling back to code 0."""
+
+        shift = 0x20000
+        if character in self._KEY_CODES:
+            return self._KEY_CODES[character], 0
+        if character.isupper() and character.lower() in self._KEY_CODES:
+            return self._KEY_CODES[character.lower()], shift
+        if character in self._SHIFTED:
+            return self._KEY_CODES[self._SHIFTED[character]], shift
+        return 0, 0
+
+    def _post_key(
+        self, key_code: int, down: bool, flags: int = 0, text: str | None = None,
+        pid: int | None = None,
+    ) -> None:
         event = self.services.CGEventCreateKeyboardEvent(None, key_code, 1 if down else 0)
         if not event:
             raise DriverError("CGEventCreateKeyboardEvent returned nothing")
@@ -1271,21 +1419,84 @@ class _MacBackend:
             raw = text.encode("utf-16-le")
             units = (ctypes.c_uint16 * (len(raw) // 2)).from_buffer_copy(raw)
             self.services.CGEventKeyboardSetUnicodeString(event, len(units), units)
-        self.services.CGEventPost(0, event)
+        if pid is not None and self._post_to_pid is not None:
+            self._post_to_pid(pid, event)
+        else:
+            self.services.CGEventPost(0, event)
         self.foundation.CFRelease(event)
 
-    def select_all(self) -> None:
+    def select_all(self, pid: int | None = None) -> None:
         command_flag, key_a = 0x100000, 0
-        self._post_key(key_a, True, command_flag)
-        self._post_key(key_a, False, command_flag)
-        time.sleep(0.1)
+        self._post_key(key_a, True, command_flag, pid=pid)
+        self._post_key(key_a, False, command_flag, pid=pid)
+        time.sleep(0.2)
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, pid: int | None = None) -> None:
         for character in text:
-            self._post_key(0, True, text=character)
-            self._post_key(0, False, text=character)
-            time.sleep(0.01)
-        time.sleep(0.1)
+            key_code, flags = self._key_for(character)
+            self._post_key(key_code, True, flags, text=character, pid=pid)
+            self._post_key(key_code, False, flags, text=character, pid=pid)
+            time.sleep(0.015)
+        time.sleep(0.2)
+
+    def _focus_state(self, widget: Widget) -> str:
+        focused = self._attribute(widget.element, "AXFocused")
+        return "unknown" if focused is None else str(bool(self.foundation.CFBooleanGetValue(focused)))
+
+    def _frontmost_pid(self) -> str:
+        script = (
+            "ObjC.import('AppKit');"
+            "$.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;"
+        )
+        return subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout.strip()
+
+    def replace_text(self, pid: int, name: str, text: str) -> None:
+        """Replace the named text field's content with real keyboard events.
+
+        Each bounded attempt activates the application, clicks the field,
+        requires it to hold keyboard focus (setting the accessibility focus
+        attribute when the click did not give it), selects all and types.  The
+        first attempt posts through the HID tap; later ones post directly to
+        the process.  A probe line records the focus state and the read-back
+        value of every attempt.
+        """
+
+        diagnostics: list[str] = []
+        for attempt, direct in enumerate((False, True, True), start=1):
+            self.bring_forward(pid)
+            field = self.find_widget(pid, "edit", name)
+            self.click(*field.rect.center)
+            time.sleep(0.3)
+            focus = self._focus_state(field)
+            if focus != "True":
+                key = self._cfstring("AXFocused")
+                try:
+                    status = self.services.AXUIElementSetAttributeValue(
+                        field.element, key, self._true
+                    )
+                finally:
+                    self.foundation.CFRelease(key)
+                time.sleep(0.2)
+                focus = f"{focus}->{self._focus_state(field)} (AXFocused set status {status})"
+            target = pid if direct else None
+            self.select_all(target)
+            self.type_text(text, target)
+            time.sleep(0.3)
+            value = self.find_widget(pid, "edit", name).value
+            line = (
+                f"attempt={attempt} post={'pid' if direct else 'hid'} focus={focus} "
+                f"frontmost={self._frontmost_pid()} read_back={value!r}"
+            )
+            diagnostics.append(line)
+            print(f"NYX-PROBE macos-input {line}")
+            if value == text:
+                return
+        raise DriverError(
+            f"the {name!r} field never took the typed text {text!r}: " + "; ".join(diagnostics)
+        )
 
     # -- accessibility -----------------------------------------------------
 
@@ -1312,7 +1523,7 @@ class _MacBackend:
                         else bool(self.foundation.CFBooleanGetValue(enabled_value))
                     )
                     value = self._read_string(self._attribute(element, "AXValue"))
-                    widget = Widget(label, frame, enabled, value)
+                    widget = Widget(label, frame, enabled, value, element)
                     (exact if label == name else native).append(widget)
             for child in self._children(element):
                 visit(child)

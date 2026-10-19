@@ -981,7 +981,7 @@ _CONSOLE_CONTROL_SOURCE = (
     "kernel32 = ctypes.windll.kernel32\n"
     "kernel32.GetConsoleWindow.restype = ctypes.c_void_p\n"
     "open(sys.argv[1], 'w').write(str(kernel32.GetConsoleWindow() or 0))\n"
-    "time.sleep(2.0)\n"
+    "time.sleep(3.0)\n"
 )
 
 
@@ -993,14 +993,21 @@ def _describe_sample(sample: native_ui.WindowSample) -> str:
     )
 
 
-def _run_console_control(sampler: native_ui.WindowShowSampler, root: Path) -> list[str]:
+def _run_console_control(
+    sampler: native_ui.WindowShowSampler, root: Path
+) -> tuple[set[str], set[int]]:
     """Start a console-subsystem child in a new console and require the sampler to see it.
 
-    Return the relations through which the sampled console windows were tied to
-    the control, so the application's windows are judged by the same relations.
+    A hosted terminal owns the console window in a process tree unrelated to the
+    child, so attribution combines structural relations (window owner, owner's
+    parent, a console host's attached clients) with first appearance during the
+    child's lifetime of a window that did not exist before the run.  Return the
+    relations the control exhibited, so the application is judged by the same
+    relations, and the handles the control caused.
     """
 
     hwnd_file = root / "control-console-window"
+    started = time.monotonic()
     control = subprocess.Popen(
         [sys.executable, "-c", _CONSOLE_CONTROL_SOURCE, str(hwnd_file)],
         stdin=subprocess.DEVNULL,
@@ -1014,37 +1021,41 @@ def _run_console_control(sampler: native_ui.WindowShowSampler, root: Path) -> li
         control.kill()
         control.wait(timeout=30)
         pytest.fail("the console control child did not finish")
-    time.sleep(0.5)
+    ended = time.monotonic()
+    time.sleep(1.0)
     try:
         control_hwnd = int(hwnd_file.read_text(encoding="utf-8") or "0")
     except (OSError, ValueError):
         control_hwnd = 0
-    consoles = [
-        sample for sample in sampler.snapshot()
-        if native_ui.is_console_window_class(sample.window_class)
-    ]
-    relations = sorted(
-        {
-            relation
-            for sample in consoles
-            if (relation := native_ui.attribute_window(sample, {control.pid})) is not None
-        }
+    samples = sampler.snapshot()
+    shown_at = dict(sampler.shown_at)
+    attributed = native_ui.attribute_console_windows(
+        samples, shown_at, sampler.baseline, {control.pid}, [(started, ended)]
     )
-    by_handle = [sample for sample in consoles if sample.handle == control_hwnd]
+    relations = {relation for _, relation in attributed}
+    control_handles = {sample.handle for sample, _ in attributed}
+    during = [
+        sample for sample in samples
+        if sample.handle not in sampler.baseline and started - 0.25 <= sample.at <= ended + 1.5
+    ]
     print(
         f"NYX-PROBE console-control pid={control.pid} console_hwnd={control_hwnd:#x} "
-        f"relations={relations} observed_by_handle="
-        f"{[_describe_sample(sample) for sample in by_handle]!r} "
-        f"all_console_class_samples={[_describe_sample(sample) for sample in consoles]!r}"
+        f"relations={sorted(relations)} "
+        f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in attributed]!r} "
+        f"observed_by_handle={[_describe_sample(sample) for sample in samples if sample.handle == control_hwnd]!r} "
+        f"new_windows_during_control={[_describe_sample(sample) for sample in during]!r} "
+        f"baseline_count={len(sampler.baseline)} "
+        f"shown_console_class={[_describe_sample(sample) for sample in samples if native_ui.is_console_window_class(sample.window_class) and sample.handle in shown_at]!r}"
     )
     if sampler.errors:
         pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
     if not relations:
         pytest.fail(
-            "the positive control was not seen with an owner or owner-parent relation to the "
-            f"control child (pid {control.pid}); the sampler cannot judge the application"
+            "the positive control was not seen: no console-class window was attributed to the "
+            f"control child (pid {control.pid}) by ownership, console-host clients or first "
+            "appearance during its lifetime; the sampler cannot judge the application"
         )
-    return relations
+    return relations, control_handles
 
 
 @pytest.mark.skipif(
@@ -1064,7 +1075,9 @@ def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayou
             observer = native_ui.JobObserver()
             try:
                 with native_ui.WindowShowSampler() as sampler:
-                    relations = _run_console_control(sampler, root)
+                    time.sleep(1.0)
+                    sampler.mark_baseline()
+                    relations, control_handles = _run_console_control(sampler, root)
                     with _running_gui(artifact, root, environment, job_observer=observer) as gui:
                         _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
                         if json.loads(body) != expected:
@@ -1099,14 +1112,23 @@ def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayou
                 sample for sample in samples
                 if native_ui.is_console_window_class(sample.window_class)
             ]
-            attributed = [
-                sample for sample in console_samples
-                if native_ui.attribute_window(sample, family) is not None
+            judged = [
+                (sample, relation)
+                for sample, relation in native_ui.attribute_console_windows(
+                    samples,
+                    dict(sampler.shown_at),
+                    sampler.baseline,
+                    family,
+                    list(observer.lifetimes().values()),
+                    allowed=relations,
+                )
+                if sample.handle not in control_handles
             ]
+            attributed = [sample for sample, _ in judged]
             print(
                 f"NYX-PROBE console-observation gui_pid={pid} helper_pids={sorted(helpers)} "
-                f"control_relations={relations} requests={statuses} "
-                f"attributed={[_describe_sample(sample) for sample in attributed]!r} "
+                f"control_relations={sorted(relations)} requests={statuses} "
+                f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in judged]!r} "
                 f"all_console_class_samples={[_describe_sample(s) for s in console_samples]!r}"
             )
             if attributed:
@@ -1192,6 +1214,62 @@ def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.
     pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
 
 
+def _locate_card(page: native_ui.CdpPage, target: str) -> dict:
+    """Scroll ``target`` into view and pick a point that really hits that card.
+
+    Rectangle, viewport, scroll offsets and a grid of hit tests are read in one
+    evaluation after an instant scroll, so a smooth-scroll animation or a board
+    re-render cannot move the card between measuring and testing it.  The probe
+    line records the geometry; a card that no sampled point hits is a hard
+    failure.
+    """
+
+    expression = (
+        "(function (target) {"
+        " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
+        "   .find((c) => c.dataset.packagePath === target);"
+        " if (!card) return {error: 'the target card is not rendered'};"
+        " card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
+        " const r = card.getBoundingClientRect();"
+        " const root = document.documentElement;"
+        " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
+        "   (typeof e.className === 'string' && e.className.trim()"
+        "     ? '.' + e.className.trim().split(/\\s+/).join('.') : '') : null;"
+        " const fractions = [[.5, .5], [.5, .25], [.5, .75], [.25, .5], [.75, .5],"
+        "   [.25, .25], [.75, .25], [.25, .75], [.75, .75]];"
+        " const points = fractions.map(([fx, fy]) => {"
+        "   const x = r.left + r.width * fx, y = r.top + r.height * fy;"
+        "   const e = document.elementFromPoint(x, y);"
+        "   const c = e && e.closest('.card[data-package-path]');"
+        "   return {x: x, y: y, hit: c ? c.dataset.packagePath : null, top: describe(e)}; });"
+        " const vv = window.visualViewport;"
+        " const style = getComputedStyle(card);"
+        " return {rect: [r.left, r.top, r.width, r.height],"
+        "   inner: [window.innerWidth, window.innerHeight],"
+        "   client: [root.clientWidth, root.clientHeight],"
+        "   visual: vv ? [vv.offsetLeft, vv.offsetTop, vv.pageLeft, vv.pageTop, vv.scale] : null,"
+        "   scroll: [window.scrollX, window.scrollY], ratio: window.devicePixelRatio,"
+        "   style: [style.display, style.visibility, style.pointerEvents],"
+        "   stack: document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2)"
+        "     .slice(0, 6).map(describe),"
+        "   points: points}; })(" + json.dumps(target) + ")"
+    )
+    geometry = page.evaluate(expression)
+    print(f"NYX-PROBE card-geometry target={target!r} geometry={json.dumps(geometry)}")
+    if not isinstance(geometry, dict) or "error" in geometry:
+        pytest.fail(f"the target card could not be measured: {geometry!r}")
+    width, height = geometry["client"]
+    for point in geometry["points"]:
+        if point["hit"] == target and 0 <= point["x"] < width and 0 <= point["y"] < height:
+            geometry["point"] = (point["x"], point["y"])
+            return geometry
+    pytest.fail(
+        f"no sampled point of the card hits it: card {target!r}, rectangle {geometry['rect']}, "
+        f"viewport {geometry['client']}, scroll {geometry['scroll']}, "
+        f"stack at the centre {geometry['stack']}, points {geometry['points']}"
+    )
+
+
 def test_native_driver_authority_probe_records_the_lane_result(artifact: ArtifactLayout):
     """First-push probe: record whether this lane grants the driver its authority."""
 
@@ -1251,34 +1329,6 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         if not shown:
                             pytest.fail("no rendered card matches a catalog package path")
                         target = sorted(shown)[0]
-                        located = page.evaluate(
-                            "(() => { const card = Array.from(document.querySelectorAll("
-                            "'.card[data-package-path]')).find((c) => c.dataset.packagePath === "
-                            f"{json.dumps(target)});"
-                            " card.scrollIntoView({block: 'center', inline: 'center'});"
-                            " return true; })()"
-                        )
-                        if located is not True:
-                            pytest.fail(f"the target card {target!r} could not be located")
-                        time.sleep(0.5)
-                        rectangle = page.evaluate(
-                            "(() => { const card = Array.from(document.querySelectorAll("
-                            "'.card[data-package-path]')).find((c) => c.dataset.packagePath === "
-                            f"{json.dumps(target)});"
-                            " const r = card.getBoundingClientRect();"
-                            " return [r.left + r.width / 2, r.top + r.height / 2,"
-                            " window.innerWidth, window.innerHeight]; })()"
-                        )
-                        css_x, css_y, width, height = rectangle
-                        if not (0 <= css_x < width and 0 <= css_y < height):
-                            pytest.fail(f"the target card is outside the viewport: {rectangle!r}")
-                        hit = page.evaluate(
-                            f"(() => {{ const e = document.elementFromPoint({css_x}, {css_y});"
-                            " const c = e && e.closest('.card[data-package-path]');"
-                            " return c ? c.dataset.packagePath : null; })()"
-                        )
-                        if hit != target:
-                            pytest.fail(f"the card centre hits {hit!r}, not the target {target!r}")
                         page.evaluate(
                             "(() => { window.__nyxContext = [];"
                             " document.addEventListener('contextmenu', (event) => {"
@@ -1290,8 +1340,18 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         driver.set_clipboard(sentinel)
                         if driver.get_clipboard() != sentinel:
                             pytest.fail("the native clipboard did not accept the sentinel")
-                        screen_x, screen_y = calibration.to_screen(css_x, css_y)
                         driver.bring_forward(pid)
+                        # Measure last, immediately before the click, so nothing
+                        # that happened while the window came forward can move the card.
+                        geometry = _locate_card(page, target)
+                        css_x, css_y = geometry["point"]
+                        screen_x, screen_y = calibration.to_screen(css_x, css_y)
+                        print(
+                            f"NYX-PROBE click-point css=({css_x:.1f},{css_y:.1f}) "
+                            f"screen=({screen_x:.1f},{screen_y:.1f}) "
+                            f"scale={calibration.scale:.3f} origin=({calibration.origin_x:.1f},"
+                            f"{calibration.origin_y:.1f}) moves={calibration.moves!r}"
+                        )
                         driver.click(screen_x, screen_y, "right")
                     with _driver_step("the click could not be confirmed"):
                         deadline = time.monotonic() + 10
@@ -1396,9 +1456,7 @@ def test_delivered_change_workspace_save_switches_to_second_workspace(artifact: 
                     time.sleep(0.25)
                 if field is None:
                     pytest.fail("the Workspace root field never became available")
-                driver.click(*field.rect.center)
-                driver.select_all()
-                driver.type_text(second_root)
+                driver.replace_text(pid, "Workspace root", second_root)
                 deadline = time.monotonic() + 10
                 read_back = None
                 while time.monotonic() < deadline:
