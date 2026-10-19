@@ -321,6 +321,14 @@ def test_build_selection_rejects_missing_heading_or_missing_language_block():
         _published_build_block(_synthetic_guide().replace("```powershell", "```text"), "powershell")
 
 
+def test_build_selection_keeps_comment_lines_inside_the_selected_block():
+    # A shell comment inside the block looks like a heading; it must neither end
+    # the section nor drop the commands after it.
+    macos = "mac-venv\n# then build\nmac-build"
+    guide = _synthetic_guide(macos=macos)
+    assert _published_build_block(guide, "bash") == macos + "\n"
+
+
 def test_real_guide_selects_the_macos_build_block_not_the_linux_one():
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     selected = _published_build_block(guide, "bash")
@@ -496,6 +504,13 @@ def _run_session(
         arguments, cwd=root, env=environment, capture_output=True, text=True,
         check=False, timeout=timeout,
     )
+
+
+def test_session_fails_hard_when_the_lane_shell_is_missing(tmp_path, monkeypatch):
+    shell = _session_arguments("unused")[0]
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(pytest.fail.Exception, match=rf"the lane's shell '{shell}' is not available"):
+        _run_session("unused", root=tmp_path, timeout=120)
 
 
 def _native_exit(code: int) -> str:
