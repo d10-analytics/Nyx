@@ -3183,7 +3183,13 @@ def test_held_lease_retains_valid_stale_record_without_control_or_signal():
         assert record.exists()
 
 
-def test_fixed_port_occupant_causes_startup_failure_without_fallback():
+def _occupied_port_scenario():
+    """Run the real daemon against a held fixed port; return its observations.
+
+    Returns ``(exit_code, bound_address, record_exists, temporary_files)`` where
+    ``bound_address`` is the daemon server's address if it ever bound one.
+    """
+
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3195,13 +3201,47 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
                 with managed_daemon_run(daemon) as run:
-                    assert run.join(timeout=8) in (25, 30)
-            if daemon.server is not None:
-                assert daemon.server.server_address == ("127.0.0.1", runtime.PORT)
-            assert not paths.runtime_directory.joinpath("instance.json").exists()
-            assert not list(paths.runtime_directory.glob(".instance.json.*"))
+                    code = run.join(timeout=8)
+            bound = None if daemon.server is None else daemon.server.server_address
+            record_exists = paths.runtime_directory.joinpath("instance.json").exists()
+            leftovers = list(paths.runtime_directory.glob(".instance.json.*"))
+            return code, bound, record_exists, leftovers
         finally:
             occupant.close()
+
+
+def test_fixed_port_occupant_causes_startup_failure_without_fallback():
+    code, bound, record_exists, leftovers = _occupied_port_scenario()
+    assert code in (25, 30)
+    if bound is not None:
+        assert bound == ("127.0.0.1", runtime.PORT)
+    assert not record_exists
+    assert not leftovers
+
+
+def test_probe_occupied_port_exit_codes_are_reported(capsys):
+    """One-off first-push probe: report the exit-code mix; it never fails."""
+
+    repeats = 20
+    codes: list[object] = []
+    bound_flags: list[bool] = []
+    for _ in range(repeats):
+        try:
+            code, bound, _, _ = _occupied_port_scenario()
+        except BaseException as error:  # noqa: BLE001 - a probe only reports
+            codes.append(f"error:{type(error).__name__}")
+            bound_flags.append(False)
+            continue
+        codes.append(code)
+        bound_flags.append(bound is not None)
+    summary = {str(value): codes.count(value) for value in set(codes)}
+    with capsys.disabled():
+        print(
+            f"PROBE occupied-port exit codes platform={sys.platform} "
+            f"repeats={repeats} counts={summary} "
+            f"server_bound_runs={sum(bound_flags)} sequence={codes}",
+            flush=True,
+        )
 
 
 def _write_runtime_record(
