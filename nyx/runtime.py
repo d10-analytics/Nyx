@@ -64,6 +64,10 @@ STARTUP_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 RUNTIME_CONTROL_TIMEOUT = 1.0
 CONTROL_REQUEST_LIMIT = 8192
+CONTROL_BACKLOG = 16
+# One more slot than the listener backlog, so a full backlog of stalled peers
+# still leaves a handler for a status request.
+CONTROL_HANDLER_LIMIT = CONTROL_BACKLOG + 1
 
 RUNTIME_OPERATION_IN_PROGRESS = "runtime operation in progress"
 RUNTIME_STATE_UNAVAILABLE = "runtime state unavailable"
@@ -1132,7 +1136,7 @@ class _Daemon:
         try:
             control.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             control.bind(("127.0.0.1", 0))
-            control.listen(16)
+            control.listen(CONTROL_BACKLOG)
         except OSError:
             control.close()
             raise StartupError("Nyx control endpoint is already occupied") from None
@@ -1192,6 +1196,7 @@ class _Daemon:
         # terminal cleanup closes the listener; stop_requested only marks that
         # cleanup has begun and must not make the endpoint disappear while the
         # daemon still owns the lease and record.
+        slots = threading.BoundedSemaphore(CONTROL_HANDLER_LIMIT)
         while self.shutdown_result != "stopped":
             try:
                 connection, _ = self.control.accept()
@@ -1199,7 +1204,40 @@ class _Daemon:
                 continue
             except OSError:
                 break
-            self._handle_control_connection(connection, time.monotonic())
+            accepted_at = time.monotonic()
+            # Never wait for a slot: the accept thread must stay free to take
+            # the terminal wake-up connection.
+            if not slots.acquire(blocking=False):
+                self._close_refused_control_connection(connection)
+                continue
+            try:
+                threading.Thread(
+                    target=self._run_control_handler,
+                    args=(connection, accepted_at, slots),
+                    name="nyx-control-handler",
+                    daemon=True,
+                ).start()
+            except Exception:
+                slots.release()
+                self._close_refused_control_connection(connection)
+
+    @staticmethod
+    def _close_refused_control_connection(connection: socket.socket) -> None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    def _run_control_handler(
+        self,
+        connection: socket.socket,
+        accepted_at: float,
+        slots: threading.BoundedSemaphore,
+    ) -> None:
+        try:
+            self._handle_control_connection(connection, accepted_at)
+        finally:
+            slots.release()
 
     def _read_control_request(
         self, connection: socket.socket, expires_at: float
