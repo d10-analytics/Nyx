@@ -7338,6 +7338,12 @@ def test_status_request_split_across_two_writes_is_answered(control_daemon):
     assert json.loads(reply)["status"] == "ready"
 
 
+def test_bytes_after_the_request_newline_are_ignored(control_daemon):
+    line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
+    reply = _control_exchange(control_daemon.instance, line + b"trailing bytes, not JSON")
+    assert json.loads(reply)["status"] == "ready"
+    _assert_control_survives(control_daemon)
+
 def test_trickling_sender_is_closed_within_one_control_timeout_of_accept(control_daemon):
     _, address = runtime._parse_control_endpoint(control_daemon.instance.control)
     started = time.monotonic()
