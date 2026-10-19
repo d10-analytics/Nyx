@@ -7603,15 +7603,20 @@ def test_control_stop_waits_for_a_late_acknowledgement_until_the_published_deadl
 ):
     # The acknowledgement arrives after RUNTIME_CONTROL_TIMEOUT but inside the
     # published deadline, and cleanup then completes: a clean stop.
-    delay = runtime.RUNTIME_CONTROL_TIMEOUT + 0.6
+    # Withhold for a full second past the old control budget; the bounds below
+    # keep a half-second margin so timer granularity cannot decide the result.
+    delay = runtime.RUNTIME_CONTROL_TIMEOUT + 1.0
+    past_control_budget = runtime.RUNTIME_CONTROL_TIMEOUT + 0.5
     with patch.object(runtime, "SHUTDOWN_TIMEOUT", 4.0):
         peer = control_peer.serve(delay, cleanup=True)
         started = time.monotonic()
         assert runtime.stop() == "stopped"
         elapsed = time.monotonic() - started
     peer.join(timeout=5)
-    assert elapsed >= delay
     assert control_peer.state["request"]["command"] == "stop"
+    withheld = control_peer.state["acknowledged_at"] - control_peer.state["received_at"]
+    assert withheld > past_control_budget
+    assert elapsed > past_control_budget
 
 
 def test_control_stop_without_an_acknowledgement_reports_the_shared_timeout_message(
@@ -7625,7 +7630,7 @@ def test_control_stop_without_an_acknowledgement_reports_the_shared_timeout_mess
         elapsed = time.monotonic() - started
         # The command waited for the published deadline, not the shorter
         # control timeout, before it reported the unknown outcome.
-        assert elapsed >= 1.6 - 0.1
+        assert elapsed > runtime.RUNTIME_CONTROL_TIMEOUT + 0.3
         assert str(caught.value) == runtime.SHUTDOWN_TIMEOUT_MESSAGE
         control_peer.serve(None, cleanup=False)
         with patch.object(runtime, "desktop_host", return_value=False):
