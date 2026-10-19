@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -208,7 +209,9 @@ class _GitRunner:
 
 
 def _decode(data: bytes) -> str:
-    return os.fsdecode(data)
+    # Explicit on every OS: Windows' default handler would raise on bytes
+    # that are not valid in the filesystem encoding.
+    return data.decode(sys.getfilesystemencoding(), "surrogateescape")
 
 
 def _representable(text: str) -> bool:
@@ -689,8 +692,8 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
 
     remote = remote_for(cwd)
 
-    def degraded(status: str, clone_path: str = path) -> _CloneOutcome:
-        return _CloneOutcome(_unavailable_clone(clone_path, status), remote)
+    def degraded(status: str) -> _CloneOutcome:
+        return _CloneOutcome(_unavailable_clone(path, status), remote)
 
     listing = call(["worktree", "list", "--porcelain", "-z"])
     if not listing.ok:
@@ -795,10 +798,15 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                 memo[key] = _comparison("unknown")
             elif counted.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
                 ahead, behind = int(fields[0]), int(fields[1])
-                relation = (
-                    "diverged" if ahead and behind else "ahead" if ahead else "behind"
-                )
-                memo[key] = _comparison(relation, ahead, behind)
+                if ahead == 0 and behind == 0:
+                    # Different objects naming the same commits (for example a
+                    # tag object): nothing was counted, so say only that they differ.
+                    memo[key] = _comparison("differs")
+                else:
+                    relation = (
+                        "diverged" if ahead and behind else "ahead" if ahead else "behind"
+                    )
+                    memo[key] = _comparison(relation, ahead, behind)
             else:
                 memo[key] = _comparison("differs")
         return memo[key]
@@ -859,7 +867,20 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "worktrees": worktrees,
         "branches": branches,
     }
+    if not _all_text_safe(clone):
+        return degraded("failed")
     return _CloneOutcome(clone, remote, diagnostics)
+
+
+def _all_text_safe(value: Any) -> bool:
+    """Check every string a clone would emit against the document's text bound."""
+    if isinstance(value, str):
+        return _safe_text(value)
+    if isinstance(value, dict):
+        return all(_all_text_safe(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_all_text_safe(item) for item in value)
+    return True
 
 
 def _last_fetched(
