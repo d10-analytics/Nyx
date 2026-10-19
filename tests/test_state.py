@@ -1411,11 +1411,14 @@ def test_deep_stored_record_is_a_configuration_error_not_a_recursion_error():
             assert state.observe_configuration().state == "unavailable"
 
 
+# Built from the platform's own absolute root so each key is absolute and fails
+# only the clause under test (drive-less "/x" is not absolute on Windows).
+FILESYSTEM_ROOT = os.path.abspath(os.sep)
 INVALID_KEYS = (
     "relative/path",
-    "/a/../b",
-    "/trailing/",
-    "/nul\x00key",
+    os.path.join(FILESYSTEM_ROOT, "a", "..", "b"),
+    os.path.join(FILESYSTEM_ROOT, "trailing") + os.sep,
+    os.path.join(FILESYSTEM_ROOT, "nul\x00key"),
 )
 
 
@@ -1468,7 +1471,7 @@ def test_invalid_keys_are_rejected_by_the_configuration_constructor(key):
 
 
 def test_normalized_absolute_key_naming_no_directory_is_accepted_unchanged():
-    key = "/nonexistent/never/created"
+    key = os.path.join(FILESYSTEM_ROOT, "nonexistent", "never", "created")
     configuration = state.Configuration(
         Path("/workspace"),
         stage_orders={key: ("Queue",)},
