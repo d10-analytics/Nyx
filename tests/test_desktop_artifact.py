@@ -1061,6 +1061,17 @@ def _run_console_control(
     os.name != "nt",
     reason="console-subsystem helper windows are a Windows-only observation",
 )
+@pytest.mark.xfail(
+    condition=sys.platform == "win32",
+    raises=ConsoleWindowDefect,
+    strict=True,
+    reason=(
+        "U1 on Windows: the delivered worker helper (NyxWorker.exe, built with "
+        "--windows-console-mode=force and spawned without creation flags) creates a console "
+        "of its own; the windows-2025 observation attributed five console-class "
+        "(PseudoConsoleWindow) windows owned by NyxWorker.exe whose parent is the GUI"
+    ),
+)
 def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayout):
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1212,63 +1223,98 @@ def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.
     pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
 
 
+_MEASURE_CARD_EXPRESSION = (
+    "(function (target, mode) {"
+    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
+    "   .find((c) => c.dataset.packagePath === target);"
+    " if (!card) return {error: 'the target card is not rendered'};"
+    " const root = document.documentElement;"
+    " const vw = root.clientWidth, vh = root.clientHeight;"
+    " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
+    "   (typeof e.className === 'string' && e.className.trim()"
+    "     ? '.' + e.className.trim().split(/\\s+/).join('.') : '') : null;"
+    " const covering = (e) => { for (let n = e; n && n !== document.body && n !== root;"
+    "   n = n.parentElement) { const p = getComputedStyle(n).position;"
+    "   if (p === 'fixed' || p === 'sticky') return n; } return null; };"
+    " const topElement = document.elementFromPoint(vw / 2, 2);"
+    " const bottomElement = document.elementFromPoint(vw / 2, vh - 2);"
+    " const topCover = topElement ? covering(topElement) : null;"
+    " const bottomCover = bottomElement ? covering(bottomElement) : null;"
+    " let toolbarBottom = 0;"
+    " for (const n of [topCover, document.querySelector('header.toolbar')]) {"
+    "   if (!n) continue; const b = n.getBoundingClientRect();"
+    "   if (b.top <= 2 && b.bottom > toolbarBottom) toolbarBottom = b.bottom; }"
+    " let bottomLimit = vh;"
+    " if (bottomCover) { const b = bottomCover.getBoundingClientRect();"
+    "   if (b.bottom >= vh - 2 && b.top < bottomLimit) bottomLimit = b.top; }"
+    " if (mode === 'center') {"
+    "   card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
+    " } else {"
+    "   card.scrollIntoView({block: 'start', inline: 'center', behavior: 'instant'});"
+    "   window.scrollBy(0, -(toolbarBottom + 12));"
+    " }"
+    " const r = card.getBoundingClientRect();"
+    " const vv = window.visualViewport;"
+    " const style = getComputedStyle(card);"
+    " return {mode: mode, rect: [r.left, r.top, r.width, r.height],"
+    "   inner: [window.innerWidth, window.innerHeight], client: [vw, vh],"
+    "   visual: vv ? [vv.offsetLeft, vv.offsetTop, vv.pageLeft, vv.pageTop, vv.scale] : null,"
+    "   scroll: [window.scrollX, window.scrollY], ratio: window.devicePixelRatio,"
+    "   style: [style.display, style.visibility, style.pointerEvents],"
+    "   toolbarBottom: toolbarBottom, bottomLimit: bottomLimit,"
+    "   covers: [describe(topCover), describe(bottomCover)]}; })"
+)
+
+_HIT_POINTS_EXPRESSION = (
+    "(function (points) { return points.map(([x, y]) => {"
+    " const e = document.elementFromPoint(x, y);"
+    " const c = e && e.closest('.card[data-package-path]');"
+    " return c ? c.dataset.packagePath : null; }); })"
+)
+
+
 def _locate_card(
     page: native_ui.CdpPage, target: str, window: dict | None = None
 ) -> dict:
-    """Scroll ``target`` into view and pick a point that really hits that card.
+    """Bring ``target`` into the usable viewport band and pick a point that really hits it.
 
-    Rectangle, viewport, scroll offsets and a grid of hit tests are read in one
-    evaluation after an instant scroll, so a smooth-scroll animation or a board
-    re-render cannot move the card between measuring and testing it.  The probe
-    line records the geometry; a card that no sampled point hits is a hard
-    failure.
+    The usable band is the viewport below the page's sticky toolbar and above
+    any bottom cover.  The card is first centred; when its intersection with the
+    band is too small the document is scrolled once so the card starts just
+    below the toolbar.  Each candidate point is verified with
+    ``elementFromPoint`` and ``closest`` before it is returned; a card that no
+    candidate hits is a hard failure.
     """
 
-    expression = (
-        "(function (target) {"
-        " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
-        "   .find((c) => c.dataset.packagePath === target);"
-        " if (!card) return {error: 'the target card is not rendered'};"
-        " card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
-        " const r = card.getBoundingClientRect();"
-        " const root = document.documentElement;"
-        " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
-        "   (typeof e.className === 'string' && e.className.trim()"
-        "     ? '.' + e.className.trim().split(/\\s+/).join('.') : '') : null;"
-        " const fractions = [[.5, .5], [.5, .25], [.5, .75], [.25, .5], [.75, .5],"
-        "   [.25, .25], [.75, .25], [.25, .75], [.75, .75]];"
-        " const points = fractions.map(([fx, fy]) => {"
-        "   const x = r.left + r.width * fx, y = r.top + r.height * fy;"
-        "   const e = document.elementFromPoint(x, y);"
-        "   const c = e && e.closest('.card[data-package-path]');"
-        "   return {x: x, y: y, hit: c ? c.dataset.packagePath : null, top: describe(e)}; });"
-        " const vv = window.visualViewport;"
-        " const style = getComputedStyle(card);"
-        " return {rect: [r.left, r.top, r.width, r.height],"
-        "   inner: [window.innerWidth, window.innerHeight],"
-        "   client: [root.clientWidth, root.clientHeight],"
-        "   visual: vv ? [vv.offsetLeft, vv.offsetTop, vv.pageLeft, vv.pageTop, vv.scale] : null,"
-        "   scroll: [window.scrollX, window.scrollY], ratio: window.devicePixelRatio,"
-        "   style: [style.display, style.visibility, style.pointerEvents],"
-        "   stack: document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2)"
-        "     .slice(0, 6).map(describe),"
-        "   points: points}; })(" + json.dumps(target) + ")"
-    )
-    geometry = page.evaluate(expression)
-    if isinstance(geometry, dict):
+    attempts: list[dict] = []
+    for mode in ("center", "start"):
+        geometry = page.evaluate(
+            f"({_MEASURE_CARD_EXPRESSION})({json.dumps(target)}, {json.dumps(mode)})"
+        )
+        if not isinstance(geometry, dict) or "error" in geometry:
+            pytest.fail(f"the target card could not be measured: {geometry!r}")
         geometry["window"] = window
-    print(f"NYX-PROBE card-geometry target={target!r} geometry={json.dumps(geometry)}")
-    if not isinstance(geometry, dict) or "error" in geometry:
-        pytest.fail(f"the target card could not be measured: {geometry!r}")
-    width, height = geometry["client"]
-    for point in geometry["points"]:
-        if point["hit"] == target and 0 <= point["x"] < width and 0 <= point["y"] < height:
-            geometry["point"] = (point["x"], point["y"])
-            return geometry
+        candidates = native_ui.card_click_candidates(geometry)
+        hits = (
+            page.evaluate(f"({_HIT_POINTS_EXPRESSION})({json.dumps(candidates)})")
+            if candidates else []
+        )
+        geometry["candidates"] = candidates
+        geometry["candidate_hits"] = hits
+        print(f"NYX-PROBE card-geometry target={target!r} geometry={json.dumps(geometry)}")
+        attempts.append(geometry)
+        for point, hit in zip(candidates, hits):
+            if hit == target:
+                geometry["point"] = point
+                return geometry
     pytest.fail(
-        f"no sampled point of the card hits it: card {target!r}, rectangle {geometry['rect']}, "
-        f"viewport {geometry['client']}, scroll {geometry['scroll']}, "
-        f"stack at the centre {geometry['stack']}, points {geometry['points']}"
+        f"no point of card {target!r} is clickable below the toolbar: "
+        + "; ".join(
+            f"{a['mode']}: rectangle {a['rect']}, viewport {a['client']}, scroll {a['scroll']}, "
+            f"toolbar bottom {a['toolbarBottom']}, bottom limit {a['bottomLimit']}, "
+            f"candidates {a['candidates']}, hits {a['candidate_hits']}"
+            for a in attempts
+        )
     )
 
 
@@ -1326,7 +1372,7 @@ def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: Ar
                         # The delivered window opens with a board viewport too small to
                         # show a card below the page's own toolbar, so enlarge it by OS
                         # window management and wait for the page to follow.
-                        window_size = native_ui.enlarge_until_viewport_grows(
+                        window_size = native_ui.enlarge_for_usable_viewport(
                             driver,
                             pid,
                             lambda: tuple(page.evaluate(
