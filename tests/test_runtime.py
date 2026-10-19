@@ -4154,6 +4154,26 @@ def test_public_start_hands_one_deadline_to_every_phase():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         seen: dict[str, float] = {}
+        real_operation_lock = runtime._operation_lock
+        real_lease_lock = runtime._lease_lock
+        real_remove_stale = runtime._remove_stale_instance
+
+        def recording_paths(**kwargs):
+            seen["paths"] = kwargs["deadline"]
+            assert kwargs["deadline_ns"] / 1_000_000_000 == kwargs["deadline"]
+            return paths
+
+        def recording_operation_lock(lock_paths, **kwargs):
+            seen["operation_lock"] = kwargs["deadline"]
+            return real_operation_lock(lock_paths, **kwargs)
+
+        def recording_lease_lock(lock_paths, **kwargs):
+            seen["lease_lock"] = kwargs["deadline"]
+            return real_lease_lock(lock_paths, **kwargs)
+
+        def recording_remove_stale(stale_paths, **kwargs):
+            seen["remove_stale"] = kwargs["deadline"]
+            return real_remove_stale(stale_paths, **kwargs)
 
         def spawn(lease_fd, deadline_ns, **_kwargs):
             seen["spawn"] = deadline_ns / 1_000_000_000
@@ -4168,14 +4188,30 @@ def test_public_start_hands_one_deadline_to_every_phase():
             seen["ready"] = deadline
             return SimpleNamespace(url=runtime.URL)
 
-        with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        with patch.object(
+            runtime, "_paths", side_effect=recording_paths
+        ), patch.object(
+            runtime, "_operation_lock", side_effect=recording_operation_lock
+        ), patch.object(
+            runtime, "_lease_lock", side_effect=recording_lease_lock
+        ), patch.object(
+            runtime, "_remove_stale_instance", side_effect=recording_remove_stale
+        ), patch.object(
             runtime, "_spawn_daemon", side_effect=spawn
         ), patch.object(
             runtime, "_wait_for_ack", side_effect=acknowledge
         ), patch.object(runtime, "_wait_ready", side_effect=ready):
             assert runtime.start() == runtime.URL
-        assert set(seen) == {"spawn", "ack", "ready"}
-        assert seen["spawn"] == seen["ack"] == seen["ready"]
+        assert set(seen) == {
+            "paths",
+            "operation_lock",
+            "lease_lock",
+            "remove_stale",
+            "spawn",
+            "ack",
+            "ready",
+        }
+        assert {seen[name] for name in seen} == {seen["spawn"]}
 
 
 def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
