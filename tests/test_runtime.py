@@ -3203,45 +3203,37 @@ def _occupied_port_scenario():
                 with managed_daemon_run(daemon) as run:
                     code = run.join(timeout=8)
             bound = None if daemon.server is None else daemon.server.server_address
+            held = occupant.getsockname() == ("127.0.0.1", runtime.PORT)
             record_exists = paths.runtime_directory.joinpath("instance.json").exists()
             leftovers = list(paths.runtime_directory.glob(".instance.json.*"))
-            return code, bound, record_exists, leftovers
+            return code, bound, held, record_exists, leftovers
         finally:
             occupant.close()
 
 
+class U3FixedPortCoBindDefect(Exception):
+    """The daemon bound the fixed port while another listener still held it."""
+
+
+@pytest.mark.xfail(
+    condition=sys.platform == "win32",
+    strict=True,
+    raises=U3FixedPortCoBindDefect,
+    reason="U3: the reusable daemon listener co-binds a held port on win32 (exit 25)",
+)
 def test_fixed_port_occupant_causes_startup_failure_without_fallback():
-    code, bound, record_exists, leftovers = _occupied_port_scenario()
-    assert code in (25, 30)
-    if bound is not None:
-        assert bound == ("127.0.0.1", runtime.PORT)
-    assert not record_exists
-    assert not leftovers
-
-
-def test_probe_occupied_port_exit_codes_are_reported(capsys):
-    """One-off first-push probe: report the exit-code mix; it never fails."""
-
-    repeats = 20
-    codes: list[object] = []
-    bound_flags: list[bool] = []
-    for _ in range(repeats):
-        try:
-            code, bound, _, _ = _occupied_port_scenario()
-        except BaseException as error:  # noqa: BLE001 - a probe only reports
-            codes.append(f"error:{type(error).__name__}")
-            bound_flags.append(False)
-            continue
-        codes.append(code)
-        bound_flags.append(bound is not None)
-    summary = {str(value): codes.count(value) for value in set(codes)}
-    with capsys.disabled():
-        print(
-            f"PROBE occupied-port exit codes platform={sys.platform} "
-            f"repeats={repeats} counts={summary} "
-            f"server_bound_runs={sum(bound_flags)} sequence={codes}",
-            flush=True,
+    code, bound, held, record_exists, leftovers = _occupied_port_scenario()
+    if record_exists:
+        pytest.fail("instance.json exists after the failed startup")
+    if leftovers:
+        pytest.fail(f"temporary record files remain: {leftovers!r}")
+    if code == 30:
+        return
+    if code == 25 and bound == ("127.0.0.1", runtime.PORT) and held:
+        raise U3FixedPortCoBindDefect(
+            f"daemon bound {bound!r} while the occupant held it; exit {code}"
         )
+    pytest.fail(f"unexpected exit {code!r} (bound={bound!r}, occupant held={held})")
 
 
 def _write_runtime_record(
