@@ -60,8 +60,10 @@ EXPECTED = {
     ),
 }
 BUILD_HEADING = "### Build the private artifact"
-# The desktop build is bounded for a native compile, not for one command.
-_BUILD_TIMEOUT = 45 * 60
+# The desktop build is bounded for a native compile, not for one command.  Each
+# bound stays below its desktop job's time limit so a hung build fails here with
+# its captured output instead of being cut off by the job limit.
+_BUILD_TIMEOUT_MINUTES = {"powershell": 20, "bash": 10}
 # The documented private artifacts and the application actions the guide
 # promises.  The desktop lane consumes these paths against the staged build.
 DESKTOP_ARTIFACT_PATHS = {
@@ -445,29 +447,20 @@ def test_documents_publish_the_invalid_record_recovery_guidance():
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
-    if os.name == "nt":
-        arguments = [
-            "pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference = 'Stop'\n" + command
-            + "\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-        ]
-    else:
-        arguments = ["bash", "-euo", "pipefail", "-c", command]
+    """Run one published Linux installation command in its own bash."""
+
     result = subprocess.run(
-        arguments, cwd=root, env=environment, capture_output=True, text=True,
-        check=False, timeout=180,
+        ["bash", "-euo", "pipefail", "-c", command], cwd=root, env=environment,
+        capture_output=True, text=True, check=False, timeout=180,
     )
     assert result.returncode == 0, (command, result.returncode, result.stdout, result.stderr)
     return result
 
 
+@pytest.mark.skipif(os.name == "nt", reason="per-line commands run only on the Linux installation path")
 def test_native_shell_propagates_failed_command(tmp_path):
-    if os.name == "nt":
-        command = "& '" + sys.executable.replace("'", "''") + "' -c 'import sys; sys.exit(17)'"
-    else:
-        command = shlex.quote(sys.executable) + " -c 'import sys; sys.exit(17)'"
     with pytest.raises(AssertionError, match=r"\b17\b"):
-        _run_command(command, root=tmp_path, environment=_installed_environment(tmp_path))
+        _run_command(_native_exit(17), root=tmp_path, environment=_installed_environment(tmp_path))
 
 
 _PWSH_SESSION_PREFIX = (
@@ -495,7 +488,7 @@ def _session_arguments(block: str) -> list[str]:
 
 def _run_session(
     block: str, *, root: Path, environment: dict[str, str] | None = None,
-    timeout: float = _BUILD_TIMEOUT,
+    timeout: float,
 ) -> subprocess.CompletedProcess:
     arguments = _session_arguments(block)
     if shutil.which(arguments[0]) is None:
@@ -579,10 +572,13 @@ def test_documented_desktop_build_blocks_run_literally():
         pytest.skip("the documented build runs only on the Windows and macOS desktop lanes")
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     block = _published_build_block(guide, language)
+    bound = _BUILD_TIMEOUT_MINUTES[language] * 60
     try:
-        result = _run_session(block, root=REPOSITORY_ROOT, environment=dict(os.environ))
+        result = _run_session(
+            block, root=REPOSITORY_ROOT, environment=dict(os.environ), timeout=bound
+        )
     except subprocess.TimeoutExpired as expired:
-        pytest.fail(f"the documented {language} build exceeded {_BUILD_TIMEOUT} s: {expired.stdout!r}")
+        pytest.fail(f"the documented {language} build exceeded {bound} s: {expired.stdout!r}")
     print(result.stdout)
     print(result.stderr, file=sys.stderr)
     assert result.returncode == 0, (
