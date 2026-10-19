@@ -157,6 +157,7 @@ COMPLETION_GUIDANCE_MARKERS = {
         "missing policy leaves the requirement **unknown**",
         "saved per canonical workspace root",
         "stay keyed to the workspace's original path",
+        "does not carry them to the new path and does not delete them",
         "Moving the folder back to its original path restores its order and completion policy",
         "root with no saved names reports unknown",
         "A cancelled or archived item",
