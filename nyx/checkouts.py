@@ -691,6 +691,10 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         return normalize_remote(origin["url"], base) if "url" in origin else None
 
     remote = remote_for(cwd)
+    if not _remote_text_safe(remote):
+        # An origin that cannot be shown safely: the clone joins no group and
+        # reports none of its remote-derived facts.
+        return _CloneOutcome(_unavailable_clone(path, "failed"))
 
     def degraded(status: str) -> _CloneOutcome:
         return _CloneOutcome(_unavailable_clone(path, status), remote)
@@ -709,6 +713,8 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         )
     bare = first.bare
     remote = remote_for(path if not bare else cwd)
+    if not _remote_text_safe(remote):
+        return _CloneOutcome(_unavailable_clone(path, "failed"))
 
     refs = call(
         [
@@ -872,6 +878,10 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
     return _CloneOutcome(clone, remote, diagnostics)
 
 
+def _remote_text_safe(remote: tuple[str, str] | None) -> bool:
+    return remote is None or (_safe_text(remote[0]) and _safe_text(remote[1]))
+
+
 def _all_text_safe(value: Any) -> bool:
     """Check every string a clone would emit against the document's text bound."""
     if isinstance(value, str):
@@ -938,7 +948,7 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
             continue
         seen_paths.add(clone["path"])
         remote = outcome.remote
-        if remote is None or not (_safe_text(remote[0]) and _safe_text(remote[1])):
+        if remote is None:
             repositories.append({"remote": None, "default_branch": None, "clones": [clone]})
             continue
         key, display = remote
