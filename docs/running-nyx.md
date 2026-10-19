@@ -71,11 +71,13 @@ Both commands are Linux service commands; the desktop application does not
 provide them.
 
 `nyx --stop` waits up to five seconds for the running instance to accept the stop
-and finish cleanup. If that time runs out it prints `Nyx shutdown timed out;
-ownership was retained and the outcome is unknown; check with nyx --status` and
-exits 1. The instance kept ownership of the runtime and may still stop, so the
-outcome is unknown rather than failed; `nyx --status` is the authority, and you
-can rerun `nyx --stop` safely.
+and finish cleanup. If that time runs out after Nyx has contacted the instance,
+it prints `Nyx shutdown timed out; ownership was retained and the outcome is
+unknown; check with nyx --status` and exits 1. If it runs out before the
+instance is contacted, it prints the shorter `Nyx shutdown timed out; ownership
+was retained` and exits 1. In both cases the instance kept ownership of the
+runtime and may still stop, so the outcome is unknown rather than failed;
+`nyx --status` is the authority, and you can rerun `nyx --stop` safely.
 
 ### Recover an unreadable runtime record
 
