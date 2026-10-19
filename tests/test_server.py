@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import socket
 import threading
 import time
@@ -2034,3 +2035,87 @@ def test_join_handlers_times_out_while_handler_work_is_blocked():
             running.server.shutdown()
             running.thread.join(timeout=5)
             running.server.server_close()
+
+
+def test_running_board_serves_and_saves_after_a_stored_workspace_is_moved():
+    from test_state import stale_key_scenario
+
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        paths = scenario["paths"]
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            configuration = state.load_configuration(paths)
+            application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+            application.capture_configuration(configuration, paths)
+            application.admit_catalog()
+            try:
+                with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                    status, _, body = request(port, "GET", "/api/settings")
+                    first = json.loads(body)
+                    assert status == 200
+                    assert first["revision"] == state.configuration_revision(paths)
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": first["revision"], "order": ["Queue"], "completed": []}
+                        ),
+                    )
+                    assert status == 200
+                    assert json.loads(body)["outcome"] == "success"
+            finally:
+                assert application.shutdown(time.monotonic() + 2)
+            stored = json.loads(paths.config_file.read_text(encoding="utf-8"))
+            key = str(scenario["a"])
+            assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario[
+                "entries_a"
+            ]
+
+
+def test_deep_stored_record_and_deep_request_body_get_complete_responses():
+    from test_state import DEEP_LEVELS, deep_array
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        specification_root = root / "specifications"
+        specification_root.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            initial = state.setup(specification_root)
+            paths = state.state_paths()
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        deep = deep_array(DEEP_LEVELS)
+        deep_body = '{"revision":"x","order":' + deep + ',"completed":[]}'
+        assert len(deep_body) < 1024 * 1024
+        with pytest.raises(RecursionError):
+            json.loads(deep_body)
+        try:
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                status, _, body = request(port, "PUT", "/api/settings", body=deep_body)
+                assert status == 400
+                assert json.loads(body) == {"error": "invalid_payload"}
+                status, _, body = request(port, "GET", "/api/settings")
+                assert status == 200
+                assert json.loads(body)["revision"] == initial.revision
+
+                paths.config_file.write_text(deep, encoding="utf-8")
+                os.chmod(paths.config_file, 0o600)
+                with patch.object(state, "resolve_account_home", return_value=home):
+                    status, content_type, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps(
+                            {"revision": initial.revision, "order": ["Queue"], "completed": []}
+                        ),
+                    )
+                assert status == 409
+                assert content_type == "application/json"
+                assert json.loads(body)["outcome"] == "reload-needed"
+        finally:
+            assert application.shutdown(time.monotonic() + 2)

@@ -7201,3 +7201,21 @@ def test_public_stop_publishes_unhealthy_before_competing_start_handoff():
                 os.close(lease_fd)
             except OSError:
                 pass
+
+
+def test_setup_of_active_and_moved_workspace_succeeds_after_stored_key_stops_resolving():
+    from test_state import stale_key_scenario
+
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            assert runtime.setup(scenario["b"]).specification_root == scenario["b"]
+            moved = runtime.setup(scenario["moved"])
+            assert moved.specification_root == scenario["moved"]
+            assert moved.stage_order == ()
+            stored = json.loads(scenario["paths"].config_file.read_text(encoding="utf-8"))
+            key = str(scenario["a"])
+            assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario[
+                "entries_a"
+            ]

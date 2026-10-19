@@ -1260,3 +1260,217 @@ def test_malformed_configuration_keeps_exact_configuration_error_type(tmp_path):
             state.load_configuration(paths)
     assert type(error.value) is state.ConfigurationError
     assert str(error.value) == "Nyx configuration cannot be read"
+
+
+DEEP_LEVELS = 200_000
+
+
+def stale_key_scenario(root: Path):
+    """Save A's settings, make B active, then move A and relink its old path."""
+
+    root = root.resolve()
+    home = isolated_home(root)
+    workspace_a = isolated_root(root, "A")
+    workspace_b = isolated_root(root, "B")
+    home_patch, uid_patch = configure_home(home)
+    with home_patch, uid_patch:
+        paths = state.state_paths(create=True)
+        state.save_configuration_owned(
+            workspace_a,
+            paths=paths,
+            stage_order=("Queue", "Done"),
+            completed_stage_names=("Done",),
+        )
+        config_a = state.load_configuration(paths)
+        runtime.setup(workspace_b)
+        config_b = state.load_configuration(paths)
+    stored = json.loads(paths.config_file.read_text(encoding="utf-8"))
+    entries_a = (
+        stored["stage_orders"][str(workspace_a)],
+        stored["completed_stages"][str(workspace_a)],
+    )
+    moved = root / "A-moved"
+    workspace_a.rename(moved)
+    workspace_a.symlink_to(moved, target_is_directory=True)
+    return {
+        "home_patches": (home_patch, uid_patch),
+        "paths": paths,
+        "a": workspace_a,
+        "b": workspace_b,
+        "moved": moved,
+        "config_a": config_a,
+        "config_b": config_b,
+        "entries_a": entries_a,
+    }
+
+
+def assert_entries_a_preserved(scenario) -> None:
+    stored = json.loads(scenario["paths"].config_file.read_text(encoding="utf-8"))
+    key = str(scenario["a"])
+    assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario["entries_a"]
+
+
+def test_moved_and_relinked_keys_load_and_setup_keeps_every_entry():
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        paths = scenario["paths"]
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            loaded = state.load_configuration(paths)
+            assert loaded.specification_root == scenario["b"]
+            assert_entries_a_preserved(scenario)
+            assert runtime.setup(scenario["b"]).specification_root == scenario["b"]
+            assert_entries_a_preserved(scenario)
+            moved_config = runtime.setup(scenario["moved"])
+            assert moved_config.specification_root == scenario["moved"]
+            assert_entries_a_preserved(scenario)
+            assert state.observe_configuration().state == "configured"
+
+
+def test_settings_follow_the_original_path_not_the_moved_workspace():
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            assert runtime.setup(scenario["moved"]).stage_order == ()
+            through_link = runtime.setup(scenario["a"])
+            assert through_link.specification_root == scenario["moved"]
+            assert through_link.stage_order == ()
+            scenario["a"].unlink()
+            scenario["moved"].rename(scenario["a"])
+            restored = runtime.setup(scenario["a"])
+            assert restored.stage_order == ("Queue", "Done")
+            assert restored.completed_stage_names == ("Done",)
+
+
+def test_configuration_revision_is_stable_after_stored_keys_stop_resolving():
+    import hashlib
+
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        paths = scenario["paths"]
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            # The captured objects were built before the move; their revision
+            # must not depend on the live filesystem.
+            captured = {
+                "a": scenario["config_a"].revision,
+                "b": scenario["config_b"].revision,
+            }
+            assert captured["a"] != captured["b"]
+            active = state.load_configuration(paths)
+            assert active.revision == hashlib.sha256(paths.config_file.read_bytes()).hexdigest()
+            assert active.revision == state.configuration_revision(paths)
+            assert active.revision == scenario["config_b"].revision
+
+
+def test_configuration_revision_does_not_touch_the_filesystem(monkeypatch):
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        configuration = scenario["config_a"]
+        expected = configuration.revision
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("revision touched the filesystem")
+
+        monkeypatch.setattr(Path, "resolve", forbidden)
+        monkeypatch.setattr(os.path, "realpath", forbidden)
+        assert configuration.revision == expected
+
+
+def deep_array(levels: int) -> str:
+    return "[" * levels + "]" * levels
+
+
+def test_deep_stored_record_is_a_configuration_error_not_a_recursion_error():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        home = isolated_home(root)
+        workspace = isolated_root(root, "A")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            state.save_configuration_owned(workspace, paths=paths)
+            text = (
+                '{"schema_version":3,"specification_root":'
+                + json.dumps(str(workspace))
+                + ',"stage_orders":{"/x":'
+                + deep_array(DEEP_LEVELS)
+                + "}}"
+            )
+            paths.config_file.write_text(text, encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            with pytest.raises(RecursionError):
+                json.loads(text)
+            before = paths.config_file.read_bytes()
+            with pytest.raises(state.ConfigurationError, match="cannot be read"):
+                state.load_configuration(paths)
+            assert paths.config_file.read_bytes() == before
+            assert state.observe_configuration().state == "unavailable"
+
+
+INVALID_KEYS = (
+    "relative/path",
+    "/a/../b",
+    "/trailing/",
+    "/nul\x00key",
+)
+
+
+def valid_record(workspace: Path, orders: dict, completed: dict) -> str:
+    return json.dumps(
+        {
+            "schema_version": 3,
+            "specification_root": str(workspace),
+            "stage_orders": orders,
+            "completed_stages": completed,
+        },
+        sort_keys=True,
+    )
+
+
+@pytest.mark.parametrize("key", INVALID_KEYS)
+@pytest.mark.parametrize("field", ["stage_orders", "completed_stages"])
+def test_invalid_stored_keys_are_rejected_on_load_with_file_unchanged(key, field):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        home = isolated_home(root)
+        workspace = isolated_root(root, "A")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            state.save_configuration_owned(workspace, paths=paths)
+            orders = {key: ["Queue"]} if field == "stage_orders" else {}
+            completed = {key: ["Done"]} if field == "completed_stages" else {}
+            paths.config_file.write_text(
+                valid_record(workspace, orders, completed), encoding="utf-8"
+            )
+            os.chmod(paths.config_file, 0o600)
+            before = paths.config_file.read_bytes()
+            message = (
+                "stage orders are invalid"
+                if field == "stage_orders"
+                else "completed stages are invalid"
+            )
+            with pytest.raises(state.ConfigurationError, match=message):
+                state.load_configuration(paths)
+            assert paths.config_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("key", INVALID_KEYS + (7, None))
+def test_invalid_keys_are_rejected_by_the_configuration_constructor(key):
+    with pytest.raises(state.StageOrderError):
+        state.Configuration(Path("/workspace"), stage_orders={key: ("Queue",)})
+    with pytest.raises(state.CompletedStageError):
+        state.Configuration(Path("/workspace"), completed_stages={key: ("Done",)})
+
+
+def test_normalized_absolute_key_naming_no_directory_is_accepted_unchanged():
+    key = "/nonexistent/never/created"
+    configuration = state.Configuration(
+        Path("/workspace"),
+        stage_orders={key: ("Queue",)},
+        completed_stages={key: ("Done",)},
+    )
+    assert dict(configuration.stage_orders) == {key: ("Queue",)}
+    assert dict(configuration.completed_stages) == {key: ("Done",)}
