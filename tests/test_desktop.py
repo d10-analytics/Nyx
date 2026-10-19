@@ -915,6 +915,43 @@ def test_replacing_workspace_preserves_saved_order_and_completion():
             session.close()
 
 
+def test_workspace_change_preserves_checkout_settings_for_every_workspace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        first = _workspace(root, "first")
+        second = _workspace(root, "second")
+        with _home_patches(home)[0]:
+            state.setup(first)
+            paths = state.state_paths()
+            settings = {
+                str(first.resolve()): {"folders": ["/one", "/two"], "github_lookup": True},
+                str(second.resolve()): {"folders": ["/three"], "github_lookup": False},
+            }
+            paths.config_file.write_bytes(
+                (
+                    json.dumps(
+                        {
+                            "schema_version": 4,
+                            "specification_root": str(first.resolve()),
+                            "checkout_settings": settings,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            session = desktop.DesktopSession()
+            session.choose_workspace(second)
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["schema_version"] == 4
+            assert stored["specification_root"] == str(second.resolve())
+            assert stored["checkout_settings"] == settings
+            assert state.load_configuration().checkout_folders == ("/three",)
+            session.close()
+
+
 def test_competing_legacy_setup_cannot_mutate_while_desktop_claim_is_held():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
