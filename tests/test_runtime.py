@@ -7452,12 +7452,51 @@ def test_control_status_is_prompt_with_sixteen_stalled_peers(control_daemon, sta
 def test_stalled_peers_never_grow_the_control_threads_past_the_handler_cap(
     control_daemon, stalled_peers
 ):
-    baseline = threading.active_count()
-    stalled_peers(control_daemon.instance, 20)
-    time.sleep(0.3)
-    handlers = threading.active_count() - baseline
-    # The accept thread is already in the baseline; peers hold every slot.
-    assert handlers == runtime.CONTROL_HANDLER_LIMIT
+    def live_handlers() -> int:
+        return sum(
+            1
+            for thread in threading.enumerate()
+            if thread.name == "nyx-control-handler" and thread.is_alive()
+        )
+
+    def refused(peers: list[socket.socket]) -> int:
+        closed = 0
+        for peer in peers:
+            try:
+                if peer.recv(1) == b"":
+                    closed += 1
+            except BlockingIOError:
+                pass
+            except ConnectionError:
+                closed += 1
+        return closed
+
+    total = 20
+    over_cap = total - runtime.CONTROL_HANDLER_LIMIT
+    # Keep the stalled handlers alive for the whole observation window, so a
+    # slow host cannot see them expire before every peer has been accepted.
+    with patch.object(runtime, "RUNTIME_CONTROL_TIMEOUT", 6.0):
+        peers = stalled_peers(control_daemon.instance, total)
+        for peer in peers:
+            peer.setblocking(False)
+        most_handlers = 0
+        closed = 0
+        deadline = time.monotonic() + 4.0
+        # Every connection has been accepted once the over-cap peers see their
+        # connection closed; until then, record the largest handler count.
+        while time.monotonic() < deadline:
+            most_handlers = max(most_handlers, live_handlers())
+            closed = refused(peers)
+            if closed >= over_cap and most_handlers >= runtime.CONTROL_HANDLER_LIMIT:
+                break
+            time.sleep(0.02)
+        settle_until = time.monotonic() + 0.3
+        while time.monotonic() < settle_until:
+            most_handlers = max(most_handlers, live_handlers())
+            time.sleep(0.02)
+        assert most_handlers <= runtime.CONTROL_HANDLER_LIMIT
+        assert live_handlers() == runtime.CONTROL_HANDLER_LIMIT
+        assert closed == over_cap
     assert runtime.CONTROL_HANDLER_LIMIT > runtime.CONTROL_BACKLOG
     assert control_daemon.daemon.control_thread.is_alive()
 
