@@ -455,9 +455,15 @@ def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
                 assert json.loads(body) == expected
                 assert gui.process.poll() is None, gui.diagnostics()
                 gui.close()
-
-    assert not marker.exists(), "the delivered application ran a build-time interpreter"
-    assert not (decoy / "nyx" / "__pycache__").exists(), "the checkout was imported"
+        # Checked while the temporary directory still exists: after it is
+        # removed neither path could ever be found.
+        if marker.exists():
+            pytest.fail(
+                "the delivered application invoked an external interpreter while serving its "
+                f"catalog: the decoy recorded {marker.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+        if (decoy / "nyx" / "__pycache__").exists():
+            pytest.fail("the delivered application imported the decoy checkout's nyx package")
 
 
 def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: ArtifactLayout):
@@ -1011,7 +1017,8 @@ def test_control_is_accepted_only_from_the_samplers_own_records():
         native_ui.REPORTED_HANDLE_RELATION
     }
     # An empty sampler is rejected even though a poll found the window (the
-    # fourth-push shape): the poll evidence is never an input to the decision.
+    # case where only a poll found the window): the poll evidence is never an input to
+    # the decision.
     polled_only = native_ui.observe_console_relations(
         control,
         enumerate_windows=lambda: [native_ui.WindowInfo(control, "", "PseudoConsoleWindow", 0x2000)],
@@ -1485,7 +1492,7 @@ def _locate_card(
 
 
 def test_native_driver_authority_probe_records_the_lane_result(artifact: ArtifactLayout):
-    """First-push probe: record whether this lane grants the driver its authority."""
+    """Record whether this lane grants the driver its authority, printing the result."""
 
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
