@@ -44,7 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("checkouts",),
+        metavar="checkouts",
         help="'checkouts' prints the cached facts of the configured checkout folders",
     )
     parser.add_argument(
@@ -280,6 +280,8 @@ def _status_snapshot() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command not in (None, "checkouts"):
+        parser.error(f"unrecognized arguments: {args.command}")
     if args.command == "checkouts":
         if _retired_arguments(args):
             parser.error("checkouts cannot be combined with --setup, --stop or --status")
