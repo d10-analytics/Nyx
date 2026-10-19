@@ -7221,10 +7221,16 @@ def test_setup_of_active_and_moved_workspace_succeeds_after_stored_key_stops_res
             ]
 
 
+def _checkout_folders(base):
+    # Native, normalized, sorted absolute folders that need not exist.
+    return [str(base / "one"), str(base / "three"), str(base / "two")]
+
+
 def _write_checkout_record(paths, specification_root, other_root):
+    folders = _checkout_folders(other_root.parent)
     settings = {
-        str(specification_root.resolve()): {"folders": ["/one", "/two"], "github_lookup": True},
-        str(other_root.resolve()): {"folders": ["/three"], "github_lookup": False},
+        str(specification_root.resolve()): {"folders": folders[:2], "github_lookup": True},
+        str(other_root.resolve()): {"folders": folders[2:], "github_lookup": False},
     }
     payload = {
         "schema_version": 4,
@@ -7252,7 +7258,7 @@ def test_setup_preserves_checkout_settings_and_revision_tracks_them():
         assert stored["schema_version"] == 4
         assert stored["specification_root"] == str(other.resolve())
         assert stored["checkout_settings"] == payload["checkout_settings"]
-        assert rewritten.checkout_folders == ("/three",)
+        assert rewritten.checkout_folders == (_checkout_folders(root)[2],)
         assert state.configuration_revision(paths) != revision
 
         # Records that differ only in checkout_settings have different revisions.
@@ -7286,7 +7292,7 @@ def test_setup_with_held_lease_and_same_root_leaves_checkout_record_bytes_unchan
         assert lease.acquire(blocking=False)
         try:
             with patch.object(runtime, "_paths", return_value=paths):
-                assert runtime.setup(specification_root).checkout_folders == ("/one", "/two")
+                assert runtime.setup(specification_root).checkout_folders == tuple(_checkout_folders(root)[:2])
         finally:
             lease.close()
         assert paths.config_file.read_bytes() == before

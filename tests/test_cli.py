@@ -288,7 +288,7 @@ def test_active_setup_with_same_root_leaves_checkout_record_unchanged(capsys):
         ):
             state.setup(first)
             paths = state.state_paths()
-        settings = {str(first.resolve()): {"folders": ["/one"], "github_lookup": True}}
+        settings = {str(first.resolve()): {"folders": [str(root / "one")], "github_lookup": True}}
         paths.config_file.write_bytes(
             (
                 json.dumps(

@@ -1535,9 +1535,12 @@ def test_schema_four_checkout_settings_load_per_workspace_and_follow_the_active_
         with home_patch, uid_patch:
             state.state_paths(create=True)
             paths = state.state_paths()
+            # Lexically valid, native folders that do not exist on disk.
+            missing = (str(root / "missing" / "one"), str(root / "missing" / "two"))
+            elsewhere = str(root / "elsewhere")
             settings = {
-                str(active.resolve()): _checkout_entry("/missing/one", "/missing/two", github_lookup=True),
-                str(other.resolve()): _checkout_entry("/elsewhere"),
+                str(active.resolve()): _checkout_entry(*missing, github_lookup=True),
+                str(other.resolve()): _checkout_entry(elsewhere),
             }
             payload = {
                 "schema_version": 4,
@@ -1548,17 +1551,25 @@ def test_schema_four_checkout_settings_load_per_workspace_and_follow_the_active_
             observed = state.observe_configuration()
             assert observed.status == "configured"
             configuration = observed.configuration
-            assert configuration.checkout_folders == ("/missing/one", "/missing/two")
+            assert configuration.checkout_folders == missing
             assert configuration.checkout_settings[str(active.resolve())].github_lookup is True
-            assert configuration.checkout_settings[str(other.resolve())].folders == ("/elsewhere",)
-            assert not Path("/missing/one").exists()
+            assert configuration.checkout_settings[str(other.resolve())].folders == (elsewhere,)
+            assert not Path(missing[0]).exists()
 
             payload["specification_root"] = str(without_entry.resolve())
             _write_record(paths, payload)
             assert state.observe_configuration().configuration.checkout_folders == ()
 
 
-_ROOT = "/tmp/workspace"
+def _abs(*parts):
+    """A native, absolute, normalized path built from the platform anchor."""
+
+    return os.path.normpath(os.path.join(os.path.abspath(os.sep), *parts))
+
+
+_ROOT = _abs("tmp", "workspace")
+_A = _abs("a")
+_B = _abs("b")
 
 
 @pytest.mark.parametrize(
@@ -1567,27 +1578,27 @@ _ROOT = "/tmp/workspace"
         {"schema_version": 1, "checkout_settings": {}},
         {"schema_version": 2, "hidden_stages": [], "checkout_settings": {}},
         {"schema_version": 3, "checkout_settings": {}},
-        {"schema_version": 3, "checkout_settings": {_ROOT: _checkout_entry("/a")}},
+        {"schema_version": 3, "checkout_settings": {_ROOT: _checkout_entry(_A)}},
         {"schema_version": 5},
         {"schema_version": 4, "checkout_settings": []},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {**_checkout_entry("/a"), "extra": 1}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {**_checkout_entry(_A), "extra": 1}}},
         {"schema_version": 4, "checkout_settings": {_ROOT: {"github_lookup": False}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": ["/a"]}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: ["/a"]}},
-        {"schema_version": 4, "checkout_settings": {"relative": _checkout_entry("/a")}},
-        {"schema_version": 4, "checkout_settings": {"/tmp/a/../b": _checkout_entry("/a")}},
-        {"schema_version": 4, "checkout_settings": {"/tmp/a/": _checkout_entry("/a")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A]}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: [_A]}},
+        {"schema_version": 4, "checkout_settings": {"relative": _checkout_entry(_A)}},
+        {"schema_version": 4, "checkout_settings": {_abs("tmp", "a") + os.sep + ".." + os.sep + "b": _checkout_entry(_A)}},
+        {"schema_version": 4, "checkout_settings": {_abs("tmp", "a") + os.sep: _checkout_entry(_A)}},
         {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("relative")}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("/a/./b")}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("/a\x00b")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A + os.sep + "." + os.sep + "b")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A + "\x00b")}},
         {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry()}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("/b", "/a")}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("/a", "/a")}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": "/a", "github_lookup": False}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": {"/a": 1}, "github_lookup": False}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": ["/a"], "github_lookup": 1}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": ["/a"], "github_lookup": "yes"}}},
-        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": ["/a"], "github_lookup": None}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_B, _A)}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A, _A)}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": _A, "github_lookup": False}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": {_A: 1}, "github_lookup": False}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": 1}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": "yes"}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": None}}},
     ],
 )
 def test_invalid_checkout_settings_records_are_unavailable_and_left_unchanged(payload):
@@ -1608,8 +1619,8 @@ def test_save_paths_carry_checkout_settings_and_revision_covers_them():
             state.state_paths(create=True)
             paths = state.state_paths()
             settings = {
-                str(first.resolve()): _checkout_entry("/one", github_lookup=True),
-                str(second.resolve()): _checkout_entry("/two", "/zed"),
+                str(first.resolve()): _checkout_entry(str(root / "one"), github_lookup=True),
+                str(second.resolve()): _checkout_entry(str(root / "two"), str(root / "zed")),
             }
             record = {
                 "schema_version": 4,

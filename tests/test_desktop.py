@@ -925,8 +925,8 @@ def test_workspace_change_preserves_checkout_settings_for_every_workspace():
             state.setup(first)
             paths = state.state_paths()
             settings = {
-                str(first.resolve()): {"folders": ["/one", "/two"], "github_lookup": True},
-                str(second.resolve()): {"folders": ["/three"], "github_lookup": False},
+                str(first.resolve()): {"folders": [str(root / "one"), str(root / "two")], "github_lookup": True},
+                str(second.resolve()): {"folders": [str(root / "three")], "github_lookup": False},
             }
             paths.config_file.write_bytes(
                 (
@@ -948,7 +948,7 @@ def test_workspace_change_preserves_checkout_settings_for_every_workspace():
             assert stored["schema_version"] == 4
             assert stored["specification_root"] == str(second.resolve())
             assert stored["checkout_settings"] == settings
-            assert state.load_configuration().checkout_folders == ("/three",)
+            assert state.load_configuration().checkout_folders == (str(root / "three"),)
             session.close()
 
 

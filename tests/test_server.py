@@ -2169,8 +2169,8 @@ def test_real_settings_http_save_preserves_checkout_settings():
             state.setup(first)
             paths = state.state_paths()
         settings = {
-            str(first.resolve()): {"folders": ["/one", "/two"], "github_lookup": True},
-            str(second.resolve()): {"folders": ["/three"], "github_lookup": False},
+            str(first.resolve()): {"folders": [str(root / "one"), str(root / "two")], "github_lookup": True},
+            str(second.resolve()): {"folders": [str(root / "three")], "github_lookup": False},
         }
         paths.config_file.write_bytes(
             (
