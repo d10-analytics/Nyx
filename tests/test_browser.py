@@ -1395,6 +1395,36 @@ def test_reported_values_and_declared_slots_stay_searchable(open_page, tmp_path)
     assert card.get_attribute("aria-pressed") == "true"
 
 
+def test_resolved_program_title_from_descriptor_is_searchable(open_page, tmp_path):
+    program_id = "123e4567-e89b-42d3-a456-426614174020"
+    program_dir = tmp_path / "Alpha" / "Reference" / "Programs" / program_id
+    program_dir.mkdir(parents=True)
+    program_dir.joinpath("program.md").write_text(
+        f"Program ID: {program_id}\nProgram Title: zqprogram\n", encoding="utf-8"
+    )
+    _write_package(tmp_path, "Alpha", "Queue", "member", STEP_ONE,
+                   f"# Member\nPackage ID: {STEP_ONE}\nProgram Membership: {program_id}\n")
+    _write_package(tmp_path, "Alpha", "Queue", "nonmember", STEP_TWO,
+                   f"# Nonmember\nPackage ID: {STEP_TWO}\n")
+    value = json.loads(scan_catalog(tmp_path))
+    entries = {entry["package_id"]: entry for entry in value["entries"]}
+    assert entries[STEP_ONE]["relationship"]["program"] == {
+        "program_id": program_id, "title": "zqprogram", "resolution": "resolved",
+    }
+    assert entries[STEP_TWO]["relationship"]["program"]["resolution"] == "not_declared"
+    for entry in entries.values():
+        without_title = json.loads(json.dumps(entry))
+        without_title["relationship"]["program"]["title"] = None
+        assert "zqprogram" not in json.dumps(without_title)
+    page = open_page(ScanningClient(tmp_path))
+    member = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    nonmember = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    playwright.expect(nonmember).to_be_visible()
+    page.fill("#filter", "zqprogram")
+    playwright.expect(member).to_be_visible()
+    playwright.expect(nonmember).to_be_hidden()
+
+
 def test_long_unbroken_names_wrap_within_their_column(open_page):
     token = "x" * 300
     value = json.loads(board_payload())

@@ -1265,6 +1265,126 @@ def test_application_settings_save_revalidates_after_post_replace_failure():
         assert application.shutdown(time.monotonic() + 2)
 
 
+def _settings_replaced_record_hook(paths, requested_order, replacement):
+    """Overwrite the just-replaced record, then fail its commit verification once.
+
+    The fired flag is tested before the record is read, so every later
+    verification (including revalidation of an unreadable record) sees the
+    real result.
+    """
+
+    original_verify = state._verify_record
+    fires = []
+
+    def verify(path, *args, **kwargs):
+        details = original_verify(path, *args, **kwargs)
+        if fires or path != paths.config_file:
+            return details
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if list(requested_order) not in payload.get("stage_orders", {}).values():
+            return details
+        fires.append(path)
+        path.write_bytes(replacement)
+        raise OSError("injected post-replacement verification failure")
+
+    return verify, fires
+
+
+def _settings_application(paths):
+    initial = state.load_configuration(paths)
+    application = runtime.ApplicationRuntime(
+        port=runtime.PORT, deadline=time.monotonic() + 5
+    )
+    application.capture_configuration(initial, paths)
+    application.admit_catalog()
+    return initial, application
+
+
+def test_application_settings_save_reports_conflict_for_competing_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        root = str(initial.specification_root)
+        competing = state._configuration_bytes(
+            initial.specification_root,
+            {root: ["Archive", "Review"]},
+            {root: ["Archive"]},
+        )
+        verify, fires = _settings_replaced_record_hook(paths, ["Queue", "Done"], competing)
+        with patch.object(state, "_verify_record", side_effect=verify):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "conflict",
+        }
+        assert paths.config_file.read_bytes() == competing
+        reloaded = state.load_configuration(paths)
+        assert reloaded.stage_order == ("Archive", "Review")
+        assert reloaded.completed_stage_names == ("Archive",)
+        # The runtime adopts the competing record, so its reported revision is current.
+        assert application.get_settings() == {
+            "order": ["Archive", "Review"],
+            "completed": ["Archive"],
+            "revision": result["revision"],
+        }
+        retried = application.save_settings(result["revision"], ["Queue", "Done"], ["Done"])
+        assert retried == {
+            "order": ["Queue", "Done"],
+            "completed": ["Done"],
+            "revision": state.configuration_revision(paths),
+            "outcome": "success",
+        }
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_reload_needed_for_unreadable_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        verify, fires = _settings_replaced_record_hook(paths, ["Queue", "Done"], b"{")
+        with patch.object(state, "_verify_record", side_effect=verify):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": [],
+            "completed": [],
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+        assert application.shutdown(time.monotonic() + 2)
+
+
+def test_application_settings_save_reports_reload_needed_for_unreadable_record_before_replace():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        initial, application = _settings_application(paths)
+        original_replace = state.os.replace
+        fires = []
+
+        def replace(source, destination, *args, **kwargs):
+            if fires or Path(destination) != paths.config_file:
+                return original_replace(source, destination, *args, **kwargs)
+            fires.append(Path(destination))
+            paths.config_file.write_bytes(b"{")
+            raise OSError("injected replacement failure")
+
+        with patch.object(state.os, "replace", side_effect=replace):
+            result = application.save_settings(initial.revision, ["Queue", "Done"], ["Done"])
+        assert fires == [paths.config_file]
+        assert result == {
+            "order": [],
+            "completed": [],
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+        assert application.shutdown(time.monotonic() + 2)
+
+
 def test_application_shutdown_drains_admitted_settings_write_and_rejects_later_admission():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -4018,6 +4138,82 @@ def test_shared_record_read_permits_terminal_unlink():
             os.close(descriptor)
 
 
+def _wait_for_clock_advance(limit: float = 5.0) -> None:
+    """Return only once time.monotonic() has moved past its value on entry.
+
+    Bounded so a coarse clock (about 15.6 ms on Windows) still advances.
+    """
+    entry = time.monotonic()
+    give_up = entry + limit
+    while time.monotonic() <= entry:
+        assert time.monotonic() < give_up, "monotonic clock did not advance"
+        time.sleep(0.001)
+
+
+def test_public_start_hands_one_deadline_to_every_phase():
+    with TemporaryDirectory() as temporary:
+        paths, _, _ = _fixture(Path(temporary))
+        seen: dict[str, float] = {}
+        real_operation_lock = runtime._operation_lock
+        real_lease_lock = runtime._lease_lock
+        real_remove_stale = runtime._remove_stale_instance
+
+        def recording_paths(**kwargs):
+            seen["paths"] = kwargs["deadline"]
+            assert kwargs["deadline_ns"] / 1_000_000_000 == kwargs["deadline"]
+            return paths
+
+        def recording_operation_lock(lock_paths, **kwargs):
+            seen["operation_lock"] = kwargs["deadline"]
+            return real_operation_lock(lock_paths, **kwargs)
+
+        def recording_lease_lock(lock_paths, **kwargs):
+            seen["lease_lock"] = kwargs["deadline"]
+            return real_lease_lock(lock_paths, **kwargs)
+
+        def recording_remove_stale(stale_paths, **kwargs):
+            seen["remove_stale"] = kwargs["deadline"]
+            return real_remove_stale(stale_paths, **kwargs)
+
+        def spawn(lease_fd, deadline_ns, **_kwargs):
+            seen["spawn"] = deadline_ns / 1_000_000_000
+            return SimpleNamespace()
+
+        def acknowledge(_process, _ack_fd, deadline):
+            seen["ack"] = deadline
+            _wait_for_clock_advance()
+            return True
+
+        def ready(_paths, _process, deadline):
+            seen["ready"] = deadline
+            return SimpleNamespace(url=runtime.URL)
+
+        with patch.object(
+            runtime, "_paths", side_effect=recording_paths
+        ), patch.object(
+            runtime, "_operation_lock", side_effect=recording_operation_lock
+        ), patch.object(
+            runtime, "_lease_lock", side_effect=recording_lease_lock
+        ), patch.object(
+            runtime, "_remove_stale_instance", side_effect=recording_remove_stale
+        ), patch.object(
+            runtime, "_spawn_daemon", side_effect=spawn
+        ), patch.object(
+            runtime, "_wait_for_ack", side_effect=acknowledge
+        ), patch.object(runtime, "_wait_ready", side_effect=ready):
+            assert runtime.start() == runtime.URL
+        assert set(seen) == {
+            "paths",
+            "operation_lock",
+            "lease_lock",
+            "remove_stale",
+            "spawn",
+            "ack",
+            "ready",
+        }
+        assert {seen[name] for name in seen} == {seen["spawn"]}
+
+
 def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
@@ -4025,10 +4221,22 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         record = paths.runtime_directory / "instance.json"
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
 
+        control_deadlines: list[float] = []
+        lock_calls: list[tuple[float | None, float]] = []
+        real_operation_lock = runtime._operation_lock
+
+        def recording_operation_lock(lock_paths, **kwargs):
+            lock_calls.append(
+                (kwargs.get("deadline"), kwargs.get("timeout", runtime.LOCK_TIMEOUT))
+            )
+            return real_operation_lock(lock_paths, **kwargs)
+
         def complete_terminal_cleanup(instance, command, **_kwargs):
             nonlocal lease_fd
             assert instance == original
             assert command == "stop"
+            control_deadlines.append(_kwargs["deadline"])
+            _wait_for_clock_advance()
             record.unlink()
             os.close(lease_fd)
             lease_fd = -1
@@ -4041,6 +4249,8 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
         try:
             with patch.object(runtime, "_paths", return_value=paths), patch.object(
                 runtime, "_send_control", side_effect=complete_terminal_cleanup
+            ), patch.object(
+                runtime, "_operation_lock", side_effect=recording_operation_lock
             ):
                 assert runtime.stop() == "stopped"
         finally:
@@ -4048,6 +4258,10 @@ def test_public_stop_accepts_fast_owned_terminal_absence_after_lease_release():
                 os.close(lease_fd)
         assert not record.exists()
         _assert_claim_available(paths.runtime_directory / "lease.lock")
+        assert len(control_deadlines) == 1
+        assert lock_calls
+        assert {deadline for deadline, _ in lock_calls} == set(control_deadlines)
+        assert any(timeout == 0.0 for _, timeout in lock_calls)
 
 
 def test_public_stop_accepts_record_disappearance_during_terminal_snapshot():
