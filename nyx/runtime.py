@@ -63,6 +63,10 @@ LOCK_TIMEOUT = 5.0
 STARTUP_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 5.0
 RUNTIME_CONTROL_TIMEOUT = 1.0
+SHUTDOWN_TIMEOUT_MESSAGE = (
+    "Nyx shutdown timed out; ownership was retained and the outcome is unknown; "
+    "check with nyx --status"
+)
 CONTROL_REQUEST_LIMIT = 8192
 CONTROL_BACKLOG = 16
 # One more slot than the listener backlog, so a full backlog of stalled peers
@@ -1290,8 +1294,16 @@ class _Daemon:
                     response = {"status": status, "instance_id": self.instance.instance_id, "url": URL}
                 elif command == "stop":
                     requested_deadline = request.get("deadline_ns")
-                    if type(requested_deadline) is not int:
-                        requested_deadline = int((time.monotonic() + SHUTDOWN_TIMEOUT) * 1_000_000_000)
+                    now_ns = time.monotonic_ns()
+                    if type(requested_deadline) is not int or not (
+                        now_ns
+                        < requested_deadline
+                        <= now_ns + int(SHUTDOWN_TIMEOUT * 1_000_000_000)
+                    ):
+                        # An invalid or expired stop changes no state: the
+                        # caller has stopped waiting, so it must not execute.
+                        return
+                    shutdown_deadline = requested_deadline / 1_000_000_000
                     # Publish the unhealthy transition before the caller
                     # can observe its acknowledgement and release lifecycle
                     # exclusion.  Cleanup starts after the send attempt so
@@ -1308,7 +1320,7 @@ class _Daemon:
                     finally:
                         threading.Thread(
                             target=self.shutdown,
-                            args=(requested_deadline / 1_000_000_000,),
+                            args=(shutdown_deadline,),
                             daemon=True,
                         ).start()
                     return
@@ -1779,12 +1791,16 @@ def stop() -> str:
         ):
             raise UnhealthyInstanceError("Nyx lifetime lease changed")
         instance, record_snapshot = _read_live_instance(paths)
-        _send_control(
-            instance,
-            "stop",
-            deadline=deadline,
-            deadline_ns=deadline_ns,
-        )
+        try:
+            _send_control(
+                instance,
+                "stop",
+                timeout=SHUTDOWN_TIMEOUT,
+                deadline=deadline,
+                deadline_ns=deadline_ns,
+            )
+        except _ControlTimeoutError as error:
+            raise ShutdownTimeoutError(SHUTDOWN_TIMEOUT_MESSAGE) from error
     # Waiting does not mutate lifecycle state, so release the operation claim.
     # Public status can then authenticate the retained daemon while cleanup is
     # in progress.  Each terminal probe reacquires the claim before inspecting
@@ -1855,7 +1871,7 @@ def stop() -> str:
         time.sleep(0.03)
     if terminal_absence_seen:
         raise UnhealthyInstanceError("Nyx instance record changed")
-    raise ShutdownTimeoutError("Nyx shutdown timed out; ownership was retained")
+    raise ShutdownTimeoutError(SHUTDOWN_TIMEOUT_MESSAGE)
 
 
 def desktop_host() -> bool:
