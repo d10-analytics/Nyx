@@ -545,3 +545,39 @@ def test_module_launch_refuses_retired_options_on_a_desktop_host(tmp_path):
     assert completed.stdout == ""
     assert completed.stderr == f"nyx: {DESKTOP_REFUSAL}\n"
     assert not (home / ".nyx").exists()
+
+
+def test_status_is_configured_after_a_stored_workspace_is_moved_and_relinked(capsys):
+    from test_state import stale_key_scenario
+
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            assert cli.main(["--status"]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "Configuration: configured"
+        assert lines[1] == f"Workspace: {cli._json_literal(str(scenario['b']))}"
+
+
+@pytest.mark.parametrize("kind", ["deep", "not_json"])
+def test_status_reports_unavailable_without_traceback_for_unparseable_record(kind, capsys):
+    from test_state import DEEP_LEVELS, deep_array
+
+    with TemporaryDirectory() as temporary:
+        home = Path(temporary) / "home"
+        home.mkdir()
+        home_patch = patch.object(state, "resolve_account_home", return_value=home)
+        uid_patch = patch.object(state, "_current_uid", return_value=state._current_uid())
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            text = deep_array(DEEP_LEVELS) if kind == "deep" else "not json at all"
+            if kind == "deep":
+                with pytest.raises(RecursionError):
+                    json.loads(text)
+            paths.config_file.write_text(text, encoding="utf-8")
+            os.chmod(paths.config_file, 0o600)
+            assert cli.main(["--status"]) == 1
+        captured = capsys.readouterr()
+        assert "Configuration: unavailable" in captured.out.splitlines()
+        assert "Traceback" not in captured.out + captured.err
