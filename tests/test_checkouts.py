@@ -77,6 +77,33 @@ def commit_file(repo: Path, name: str, content: str, message: str | None = None)
     return git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
+def add_packed_refs(repository: Path, refs: dict[str, str]) -> None:
+    """Add references through ``packed-refs`` so no ref needs its own file.
+
+    A loose ref is a file whose path grows with the ref name, so long or many
+    names hit host path limits; a packed ref costs no path.  The file is
+    written as exact bytes because git rejects a ref line ending in CR.
+    """
+    git(repository, "pack-refs", "--all")
+    packed_file = repository / ".git" / "packed-refs"
+    entries = {
+        line.split(" ", 1)[1]: line.split(" ", 1)[0]
+        for line in packed_file.read_bytes().decode("ascii").split("\n")
+        if line and line[0] not in "#^"
+    }
+    entries.update(refs)
+    # Peel lines are not kept, so the header claims only sorted order and git
+    # peels on demand.
+    packed_file.write_bytes(
+        (
+            "# pack-refs with: sorted \n"
+            + "".join(f"{sha} {name}\n" for name, sha in sorted(entries.items()))
+        ).encode("ascii")
+    )
+    packed = packed_file.read_bytes()
+    assert packed.endswith(b"\n") and b"\r" not in packed
+
+
 def make_remote(root: Path, name: str = "remote.git", branch: str = "trunk") -> Path:
     """A bare remote whose default branch is ``branch`` and that has a commit."""
     bare = root / name
@@ -1349,10 +1376,10 @@ def test_oversized_document_is_refused_with_a_category(tmp_path):
     folder.mkdir()
     repository = clone(remote, folder / "repo")
     head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    updates = "".join(f"create refs/heads/never-pushed-{n:06d} {head}\n" for n in range(10_000))
-    subprocess.run(
-        ["git", "update-ref", "--stdin"], cwd=repository, input=updates, text=True, check=True
+    add_packed_refs(
+        repository, {f"refs/heads/never-pushed-{n:06d}": head for n in range(10_000)}
     )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 10_001
 
     with pytest.raises(checkouts.CheckoutsOutputTooLargeError) as error:
         checkouts.collect_checkouts(
@@ -1686,17 +1713,23 @@ def test_different_objects_naming_the_same_commits_differ_without_counts(repo):
 
 
 def test_text_beyond_the_document_bound_fails_the_clone_not_the_document(tmp_path):
-    if ON_WINDOWS:
-        pytest.skip("the long reference path exceeds Windows path limits")
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
     main = clone(remote, tmp_path / "main")
     sibling = clone(remote, folder / "sibling")
     name = "/".join("x" * 203 for _ in range(5))  # 1019 characters: a safe name
-    git(main, "checkout", "-q", "-b", name)
-    commit_file(main, "long.txt", "long\n")
-    git(main, "push", "-q", "-u", "origin", name)  # "origin/" + name is over the bound
+    # The branch and its remote-tracking ref are packed, so the long name never
+    # becomes a file path; "origin/" + name is over the bound.
+    tip = commit_file(main, "long.txt", "long\n")
+    git(main, "reset", "-q", "--hard", "HEAD~1")
+    add_packed_refs(main, {f"refs/heads/{name}": tip, f"refs/remotes/origin/{name}": tip})
+    git(main, "config", f"branch.{name}.remote", "origin")
+    git(main, "config", f"branch.{name}.merge", f"refs/heads/{name}")
+    upstream = git(
+        main, "for-each-ref", "--format=%(upstream:short)", f"refs/heads/{name}"
+    ).stdout.strip()
+    assert upstream == f"origin/{name}" and len(upstream) > models.MAX_TEXT_UNITS
     linked = folder / "linked"
     git(main, "worktree", "add", "-q", "--detach", str(linked))
 

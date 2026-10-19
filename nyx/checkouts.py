@@ -521,7 +521,10 @@ def _parse_worktrees(data: bytes) -> list[_ListedWorktree]:
             continue
         text = _decode(token)
         if text.startswith("worktree "):
-            entries.append({"path": text[len("worktree ") :]})
+            # Git spells paths with forward slashes on every host; the document
+            # uses the host's native spelling so clone, worktree and folder
+            # paths agree and match the paths callers already hold.
+            entries.append({"path": os.path.normpath(text[len("worktree ") :])})
         elif entries:
             label, _, value = text.partition(" ")
             entries[-1][label] = value
