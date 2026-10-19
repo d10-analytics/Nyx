@@ -2119,3 +2119,38 @@ def test_deep_stored_record_and_deep_request_body_get_complete_responses():
                 assert json.loads(body)["outcome"] == "reload-needed"
         finally:
             assert application.shutdown(time.monotonic() + 2)
+
+
+def test_board_holding_a_configuration_from_before_the_move_still_serves_and_saves():
+    from test_state import stale_key_scenario
+
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        paths = scenario["paths"]
+        home_patch, uid_patch = scenario["home_patches"]
+        with home_patch, uid_patch:
+            application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+            # The board captured B's configuration before A was moved and relinked.
+            application.capture_configuration(scenario["config_b"], paths)
+            application.admit_catalog()
+            try:
+                with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                    status, _, body = request(port, "GET", "/api/settings")
+                    assert status == 200
+                    revision = json.loads(body)["revision"]
+                    assert revision == state.configuration_revision(paths)
+                    status, _, body = request(
+                        port,
+                        "PUT",
+                        "/api/settings",
+                        body=json.dumps({"revision": revision, "order": ["Queue"], "completed": []}),
+                    )
+                    assert status == 200
+                    assert json.loads(body)["outcome"] == "success"
+            finally:
+                assert application.shutdown(time.monotonic() + 2)
+            stored = json.loads(paths.config_file.read_text(encoding="utf-8"))
+            key = str(scenario["a"])
+            assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario[
+                "entries_a"
+            ]

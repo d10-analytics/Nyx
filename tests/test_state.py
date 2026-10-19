@@ -1289,6 +1289,7 @@ def stale_key_scenario(root: Path):
         stored["stage_orders"][str(workspace_a)],
         stored["completed_stages"][str(workspace_a)],
     )
+    revisions_before_move = (config_a.revision, config_b.revision)
     moved = root / "A-moved"
     workspace_a.rename(moved)
     workspace_a.symlink_to(moved, target_is_directory=True)
@@ -1301,6 +1302,7 @@ def stale_key_scenario(root: Path):
         "config_a": config_a,
         "config_b": config_b,
         "entries_a": entries_a,
+        "revisions_before_move": revisions_before_move,
     }
 
 
@@ -1474,3 +1476,10 @@ def test_normalized_absolute_key_naming_no_directory_is_accepted_unchanged():
     )
     assert dict(configuration.stage_orders) == {key: ("Queue",)}
     assert dict(configuration.completed_stages) == {key: ("Done",)}
+
+
+def test_revisions_captured_before_the_move_are_unchanged_after_it():
+    with TemporaryDirectory() as temporary:
+        scenario = stale_key_scenario(Path(temporary))
+        after_move = (scenario["config_a"].revision, scenario["config_b"].revision)
+        assert after_move == scenario["revisions_before_move"]
