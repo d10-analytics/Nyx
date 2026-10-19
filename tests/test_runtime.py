@@ -7390,7 +7390,7 @@ def stalled_peers():
             peer.close()
 
 
-def test_sixteen_stalled_peers_do_not_delay_a_status_request(control_daemon, stalled_peers):
+def test_control_status_is_prompt_with_sixteen_stalled_peers(control_daemon, stalled_peers):
     stalled_peers(control_daemon.instance, 16)
     started = time.monotonic()
     observation = _observe(control_daemon.paths)
@@ -7412,7 +7412,7 @@ def test_stalled_peers_never_grow_the_control_threads_past_the_handler_cap(
     assert control_daemon.daemon.control_thread.is_alive()
 
 
-def test_full_handler_pool_refuses_at_once_and_terminal_close_does_not_wait(
+def test_control_full_handler_pool_refuses_at_once_and_terminal_close_does_not_wait(
     control_daemon, stalled_peers
 ):
     # Lengthen the peers' deadline so shutdown fits well inside their window.
