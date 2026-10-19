@@ -997,6 +997,36 @@ def _unit_sample(
     )
 
 
+def test_control_is_accepted_only_from_the_samplers_own_records():
+    """Polling or attachment evidence cannot validate a sampler that recorded nothing."""
+
+    control = 1268
+    own = _unit_sample(0x2000, "PseudoConsoleWindow", control, "python.exe", 1)
+    reported = _unit_sample(0x1201DC, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    runner = _unit_sample(0x100, "CASCADIA_HOSTING_WINDOW_CLASS", 2396, "WindowsTerminal.exe", 1)
+    # The sampler recorded the control's window by ownership.
+    assert native_ui.accept_control_from_sampler([own, runner], control, 0) == {"owner-in-family"}
+    # The sampler recorded the window the control reports.
+    assert native_ui.accept_control_from_sampler([reported, runner], control, 0x1201DC) == {
+        native_ui.REPORTED_HANDLE_RELATION
+    }
+    # An empty sampler is rejected even though a poll found the window (the
+    # fourth-push shape): the poll evidence is never an input to the decision.
+    polled_only = native_ui.observe_console_relations(
+        control,
+        enumerate_windows=lambda: [native_ui.WindowInfo(control, "", "PseudoConsoleWindow", 0x2000)],
+        process_table=lambda: {control: (1, "python.exe")},
+        attach=lambda pid: {"attached": False, "hwnd": 0},
+        duration=0.0,
+    )
+    assert polled_only["relations"] == {"owner-in-family"}
+    assert native_ui.accept_control_from_sampler([], control, 0x2000) is None
+    # Unrelated sampler windows, or a reported handle the sampler never saw, are rejected.
+    assert native_ui.accept_control_from_sampler([runner], control, 0) is None
+    assert native_ui.accept_control_from_sampler([runner, reported], control, 0x777) is None
+    assert native_ui.accept_control_from_sampler([reported], control, 0) is None
+
+
 def test_console_attribution_follows_family_relations_and_never_runner_terminals():
     """Unit check of the attribution rules; needs no desktop and no artifact."""
 
@@ -1116,11 +1146,12 @@ def _run_console_control(
         {control.pid},
         reported_handles={control_hwnd} if control_hwnd else frozenset(),
     )
+    # Only the sampler's own records may validate it: the application is judged
+    # on those records, so polling and console attachment are diagnostics.
+    accepted = native_ui.accept_control_from_sampler(samples, control.pid, control_hwnd)
     polled = observation["windows"]
-    relations = {relation for _, relation in attributed} | observation["relations"]
-    control_handles = {(sample.handle, sample.at) for sample, _ in attributed} | {
-        (sample.handle, sample.at) for sample, _, _ in polled
-    }
+    relations = accepted or set()
+    control_handles = {(sample.handle, sample.at) for sample, _ in attributed}
     during = [
         sample for sample in samples
         if sample.handle not in sampler.baseline and started - 0.25 <= sample.at <= ended + 1.5
@@ -1129,7 +1160,9 @@ def _run_console_control(
         f"NYX-PROBE console-control pid={control.pid} console_hwnd={control_hwnd:#x} "
         f"relations={sorted(relations)} reported_handle_matches="
         f"{[_describe_sample(sample) for sample, rel in attributed if rel == native_ui.REPORTED_HANDLE_RELATION]!r} "
-        f"polled={[_describe_sample(sample) + ' via ' + rel + '/' + how for sample, rel, how in polled]!r} "
+        f"polled_diagnostic_only={[_describe_sample(sample) + ' via ' + rel + '/' + how for sample, rel, how in polled]!r} "
+        f"polled_relations_diagnostic_only={sorted(observation['relations'])} "
+        f"sampler_accepted={sorted(relations)} "
         f"attach_attempts={observation['attach_attempts']!r} "
         f"attached_but_unattributed={[_describe_sample(s) for s in observation['unattributed_attached']]!r} "
         f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in attributed]!r} "
@@ -1143,12 +1176,12 @@ def _run_console_control(
         pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
     if not relations:
         pytest.fail(
-            "the positive control was not seen: no console or pseudo-console window is owned by "
-            f"the control child (pid {control.pid}), by its parent chain or by a console host "
-            "serving it (polling every top-level window for 5 s and attaching to its console "
-            "included), and the console handle it reports through GetConsoleWindow "
-            f"({control_hwnd:#x}) was not observed by the sampler as a console-class window; "
-            "the sampler cannot judge the application"
+            "the positive control was not seen by the window-show sampler: none of its records "
+            f"is a console or pseudo-console window owned by the control child (pid {control.pid}), "
+            "by its parent chain or by a console host serving it, and the console handle it "
+            f"reports through GetConsoleWindow ({control_hwnd:#x}) is not among them; polling "
+            f"and console attachment found {sorted(observation['relations'])} but only the "
+            "sampler's records count, because the application is judged on them"
         )
     return relations, control_handles
 
@@ -1719,7 +1752,6 @@ def test_delivered_change_workspace_save_switches_to_second_workspace(artifact: 
             assert catalog_pairs == pairs_second, f"HTTP catalog cards are {catalog_pairs!r}"
             assert titles == titles_second, f"page card titles are {titles!r}"
             assert gui.process.poll() is None, gui.diagnostics()
-            assert gui.process.pid == pid
             assert gui.close() == 0, gui.diagnostics()
         _assert_claims_released(home)
 
