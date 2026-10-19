@@ -1,8 +1,11 @@
 import http.client
 import json
 import socket
+import struct
+import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -323,6 +326,219 @@ def test_occupied_numeric_bind_closes_failed_socket_without_reverse_dns():
         assert len(created) == 1
         assert created[0].fileno() == -1
         assert occupant.getsockname() == ("127.0.0.1", port)
+
+
+class U3CoBindDefect(Exception):
+    """create_server bound a port that a default-options listener still holds."""
+
+
+class U8AbortEscapeDefect(Exception):
+    """An injected ConnectionAbortedError escaped _send into handle_error."""
+
+
+@pytest.mark.skipif(
+    sys.platform not in ("win32", "darwin"),
+    reason="co-bind semantics are verified on native Windows and macOS only",
+)
+def test_create_server_does_not_co_bind_a_port_held_by_a_default_listener():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            created = create_server(port=port)
+        except OSError:
+            return
+        try:
+            if created.server_address != ("127.0.0.1", port):
+                pytest.fail(f"returned server address {created.server_address!r} is not the held port {port}")
+            if created.socket.getsockname() != ("127.0.0.1", port):
+                pytest.fail(f"returned server socket is bound to {created.socket.getsockname()!r}")
+            if listener.getsockname() != ("127.0.0.1", port):
+                pytest.fail("the plain listener no longer holds the port")
+            raise U3CoBindDefect(f"create_server co-bound 127.0.0.1:{port}")
+        finally:
+            created.server_close()
+
+
+class _SendObserver:
+    """Wrap the server-side socket write; optionally raise an injected error."""
+
+    def __init__(self, port, error=None):
+        self.port = port
+        self.error = error
+        self.reached = threading.Event()
+        self.outcomes = []
+        self.server_sockets = []
+        self._original = socket.socket.sendall
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        observer = self
+        original = self._original
+
+        def sendall(sock, data, *args):
+            try:
+                is_server_side = sock.getsockname()[1] == observer.port
+            except OSError:
+                is_server_side = False
+            if not is_server_side:
+                return original(sock, data, *args)
+            with observer._lock:
+                if sock not in observer.server_sockets:
+                    observer.server_sockets.append(sock)
+                inject = observer.error is not None and not observer.reached.is_set()
+                if inject:
+                    observer.reached.set()
+            if inject:
+                observer.outcomes.append(type(observer.error).__name__)
+                raise observer.error
+            try:
+                result = original(sock, data, *args)
+            except OSError as error:
+                observer.outcomes.append(
+                    (type(error).__name__, error.errno, getattr(error, "winerror", None))
+                )
+                raise
+            observer.outcomes.append("ok")
+            return result
+
+        socket.socket.sendall = sendall
+        return self
+
+    def __exit__(self, *exc):
+        socket.socket.sendall = self._original
+
+
+def _watch_connection_ends(server):
+    """Record handle_error calls and signal when each connection is shut down."""
+
+    escapes = []
+    finished = []
+    changed = threading.Event()
+    original_shutdown = server.shutdown_request
+
+    def handle_error(request, client_address):
+        escapes.append(sys.exc_info()[1])
+
+    def shutdown_request(request):
+        original_shutdown(request)
+        finished.append(request)
+        changed.set()
+
+    server.handle_error = handle_error
+    server.shutdown_request = shutdown_request
+    return escapes, finished, changed
+
+
+def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers():
+    client = StubClient(catalog=valid_catalog())
+    running = RunningServer(client)
+    try:
+        port = running.server.server_port
+        escapes, finished, changed = _watch_connection_ends(running.server)
+        injected = ConnectionAbortedError(10053, "injected connection abort")
+        with _SendObserver(port, error=injected) as observer:
+            try:
+                request(port, "GET", "/api/catalog")
+            except (http.client.HTTPException, OSError):
+                pass
+            if not observer.reached.is_set():
+                pytest.fail("the injected abort was never reached in the real socket write")
+            first = observer.server_sockets[0]
+            deadline = time.monotonic() + 5
+            while first not in finished and time.monotonic() < deadline:
+                changed.wait(0.05)
+                changed.clear()
+            if first not in finished:
+                pytest.fail("the aborted connection was never shut down by the server")
+            try:
+                status = request(port, "GET", "/api/catalog")[0]
+            except (http.client.HTTPException, OSError) as error:
+                pytest.fail(f"the later request failed after the injected abort: {error!r}")
+            if status != 200:
+                pytest.fail(f"the later request returned {status}, not 200")
+        if escapes:
+            raise U8AbortEscapeDefect(
+                f"injected ConnectionAbortedError escaped _send: {escapes!r}"
+            )
+    finally:
+        running.__exit__(None, None, None)
+
+
+class _HeldCatalog:
+    """Provider that parks the handler after dispatch until released."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def fetch_catalog(self):
+        self.entered.set()
+        self.release.wait(5)
+        return valid_catalog()
+
+
+def _abort_after_dispatch(port):
+    connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+    connection.sendall(
+        b"GET /api/catalog HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % port
+    )
+    return connection
+
+
+def test_probe_real_client_abort_error_mix_is_reported(capsys):
+    """One-off first-push probe: report the real-abort error mix; never fails."""
+
+    repeats = 20
+    mixes = {}
+    for variant in ("rst-linger-zero", "plain-close"):
+        counts = Counter()
+        provider = _HeldCatalog()
+        running = RunningServer(provider)
+        try:
+            port = running.server.server_port
+            escapes, finished, changed = _watch_connection_ends(running.server)
+            for _ in range(repeats):
+                try:
+                    provider.entered.clear()
+                    provider.release.clear()
+                    del escapes[:], finished[:]
+                    changed.clear()
+                    with _SendObserver(port) as observer:
+                        connection = _abort_after_dispatch(port)
+                        try:
+                            provider.entered.wait(5)
+                            if variant == "rst-linger-zero":
+                                connection.setsockopt(
+                                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                                )
+                            connection.close()
+                        finally:
+                            provider.release.set()
+                        deadline = time.monotonic() + 5
+                        while not finished and time.monotonic() < deadline:
+                            changed.wait(0.05)
+                            changed.clear()
+                        counts[
+                            (
+                                tuple(map(str, observer.outcomes)),
+                                tuple(type(error).__name__ for error in escapes),
+                            )
+                        ] += 1
+                except BaseException as error:  # noqa: BLE001 - a probe only reports
+                    counts[("probe-error", type(error).__name__)] += 1
+        finally:
+            provider.release.set()
+            running.__exit__(None, None, None)
+        mixes[variant] = counts
+    with capsys.disabled():
+        for variant, counts in mixes.items():
+            print(
+                f"PROBE real-abort platform={sys.platform} variant={variant} "
+                f"repeats={repeats} mix={dict(counts)}",
+                flush=True,
+            )
 
 
 def test_catalog_route_returns_the_projection_and_uses_one_fetch():
