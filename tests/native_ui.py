@@ -108,18 +108,34 @@ def _windows_describe(user32: Any, wintypes: Any, window: Any) -> WindowInfo:
     return WindowInfo(owner.value, title.value, window_class.value, int(window or 0))
 
 
-def _windows_visible_top_level_windows() -> list[WindowInfo]:
+def _windows_top_level_windows(visible_only: bool) -> list[WindowInfo]:
     user32, _, callback_type, wintypes = _windows_api()
     found: list[WindowInfo] = []
 
     def visit(window, _parameter):
-        if user32.IsWindowVisible(window):
+        if not visible_only or user32.IsWindowVisible(window):
             found.append(_windows_describe(user32, wintypes, window))
         return True
 
     if not user32.EnumWindows(callback_type(visit), 0):
         raise OSError(ctypes.get_last_error(), "EnumWindows failed")
     return found
+
+
+def _windows_visible_top_level_windows() -> list[WindowInfo]:
+    return _windows_top_level_windows(visible_only=True)
+
+
+def all_top_level_windows() -> list[WindowInfo]:
+    """Return every top-level window, hidden ones included (Windows only).
+
+    A console's pseudo-console window is never visible, so the visible-window
+    enumeration cannot see it.
+    """
+
+    if os.name != "nt":
+        raise DriverError("hidden top-level windows are enumerated only on Windows")
+    return _windows_top_level_windows(visible_only=False)
 
 
 def _macos_visible_top_level_windows() -> list[WindowInfo]:
@@ -516,6 +532,124 @@ def attribute_console_windows(
         if relation is not None and (allowed is None or relation in allowed):
             attributed.append((sample, relation))
     return attributed
+
+
+_ATTACH_CONSOLE_SCRIPT = (
+    "import ctypes, json, sys\n"
+    "k = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+    "u = ctypes.WinDLL('user32', use_last_error=True)\n"
+    "k.GetConsoleWindow.restype = ctypes.c_void_p\n"
+    "u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]\n"
+    "u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]\n"
+    "k.FreeConsole()\n"
+    "attached = bool(k.AttachConsole(int(sys.argv[1])))\n"
+    "error = ctypes.get_last_error()\n"
+    "handle = (k.GetConsoleWindow() or 0) if attached else 0\n"
+    "info = {'attached': attached, 'error': error, 'hwnd': handle}\n"
+    "if handle:\n"
+    "    name = ctypes.create_unicode_buffer(256)\n"
+    "    u.GetClassNameW(handle, name, 256)\n"
+    "    owner = ctypes.c_ulong()\n"
+    "    u.GetWindowThreadProcessId(handle, ctypes.byref(owner))\n"
+    "    info['class'] = name.value\n"
+    "    info['owner'] = owner.value\n"
+    "k.FreeConsole()\n"
+    "print(json.dumps(info))\n"
+)
+
+
+def console_window_of(pid: int) -> dict[str, Any]:
+    """Attach to the console of ``pid`` and report its console window, or why not.
+
+    A short-lived helper process does the attaching, so this process keeps its
+    own console.  The window handle returned by ``GetConsoleWindow`` is the
+    strongest evidence of which window belongs to the process.
+    """
+
+    if os.name != "nt":
+        raise DriverError("console attachment exists only on Windows")
+    completed = subprocess.run(
+        [sys.executable, "-c", _ATTACH_CONSOLE_SCRIPT, str(pid)],
+        capture_output=True, text=True, timeout=30, check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        return {"attached": False, "error": f"helper exit {completed.returncode}: "
+                f"{completed.stderr[-300:]!r}", "hwnd": 0}
+    return _json_or_raise(completed.stdout.strip(), "the console attach helper")
+
+
+def _sample_from_info(
+    window: WindowInfo, table: dict[int, tuple[int, str]], source: str
+) -> WindowSample:
+    parent, image = table.get(window.owner, (None, ""))
+    return WindowSample(
+        time.monotonic(), source, window.handle, window.window_class, window.title,
+        window.owner, image, parent, table,
+    )
+
+
+def observe_console_relations(
+    pid: int,
+    *,
+    enumerate_windows: Callable[[], list[WindowInfo]],
+    process_table: Callable[[], dict[int, tuple[int, str]]],
+    attach: Callable[[int], dict[str, Any]],
+    duration: float = 5.0,
+    interval: float = 0.1,
+    attach_interval: float = 0.5,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Look for a console window of ``pid`` by polling, independent of show events.
+
+    Each pass enumerates every top-level window, hidden ones included, and ties
+    console and pseudo-console windows to ``pid`` through concrete process
+    relations.  Until a window is found, the console of ``pid`` is also
+    attached to at intervals and its window handle is looked up the same way;
+    one attach is always made for the evidence record.  The relations found are
+    the ones an application's windows may then be judged by.
+    """
+
+    found: dict[int, tuple[WindowSample, str, str]] = {}
+    unattributed: list[WindowSample] = []
+    attempts: list[dict[str, Any]] = []
+    deadline = clock() + duration
+    next_attach = clock()
+    while True:
+        table = process_table()
+        windows = enumerate_windows()
+        for window in windows:
+            if is_console_evidence_class(window.window_class):
+                sample = _sample_from_info(window, table, "poll-all")
+                relation = attribute_window(sample, {pid})
+                if relation is not None:
+                    found[window.handle] = (sample, relation, "poll-all")
+        if not found and clock() >= next_attach:
+            info = attach(pid)
+            attempts.append(info)
+            next_attach = clock() + attach_interval
+            if info.get("hwnd"):
+                window = WindowInfo(
+                    int(info.get("owner", 0)), "", str(info.get("class", "")), int(info["hwnd"])
+                )
+                sample = _sample_from_info(window, table, "attach")
+                relation = attribute_window(sample, {pid})
+                if relation is not None and is_console_evidence_class(window.window_class):
+                    found[window.handle] = (sample, relation, "attach")
+                else:
+                    unattributed.append(sample)
+        if found or clock() >= deadline:
+            break
+        sleep(interval)
+    if not attempts:
+        attempts.append(attach(pid))  # evidence only; the windows were already found
+    return {
+        "windows": list(found.values()),
+        "relations": {relation for _, relation, _ in found.values()},
+        "attach_attempts": attempts,
+        "unattributed_attached": unattributed,
+    }
 
 
 class WindowShowSampler:
@@ -954,6 +1088,16 @@ class _WindowsBackend:
         ):
             raise DriverError(f"SetWindowPos failed: {ctypes.get_last_error()}")
 
+    def move_window(self, pid: int, left: float, top: float) -> None:
+        """Move the window's top-left corner to ``(left, top)`` without resizing it."""
+
+        swp_nosize, swp_nozorder = 0x0001, 0x0004
+        if not self.user32.SetWindowPos(
+            gui_window(pid).handle, None, int(round(left)), int(round(top)), 0, 0,
+            swp_nosize | swp_nozorder,
+        ):
+            raise DriverError(f"SetWindowPos failed: {ctypes.get_last_error()}")
+
     def screen_bounds(self) -> Rect:
         """Return the virtual desktop rectangle in physical pixels."""
 
@@ -1377,6 +1521,24 @@ class _MacBackend:
                     self.foundation.CFRelease(packed)
             if status != 0:
                 raise DriverError(f"setting {attribute} failed with AXError {status}")
+
+    def move_window(self, pid: int, left: float, top: float) -> None:
+        """Move the window's top-left corner to ``(left, top)`` without resizing it."""
+
+        windows = self._windows(pid)
+        window = next((w for w in windows if self._frame(w) is not None), None)
+        if window is None:
+            raise DriverError(f"no accessible window of pid {pid} reports a frame")
+        packed = self.services.AXValueCreate(1, ctypes.byref(_CGPoint(left, top)))
+        key = self._cfstring("AXPosition")
+        try:
+            status = self.services.AXUIElementSetAttributeValue(window, key, packed)
+        finally:
+            self.foundation.CFRelease(key)
+            if packed:
+                self.foundation.CFRelease(packed)
+        if status != 0:
+            raise DriverError(f"setting AXPosition failed with AXError {status}")
 
     def screen_bounds(self) -> Rect:
         """Return the main display rectangle in points."""
@@ -1877,6 +2039,92 @@ class CdpPage:
         self.close()
 
 
+def settle_measurement(measure: Callable[[], Any], limit: float = 3.0, pause: float = 0.25) -> Any:
+    """Read ``measure`` until two consecutive reads agree or ``limit`` seconds pass."""
+
+    previous = None
+    latest = measure()
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        time.sleep(pause)
+        latest = measure()
+        if latest == previous:
+            break
+        previous = latest
+    return latest
+
+
+def point_is_on_screen(screen: Rect, x: float, y: float, edge: float = 0.0) -> bool:
+    return (
+        screen.left + edge <= x < screen.left + screen.width - edge
+        and screen.top + edge <= y < screen.top + screen.height - edge
+    )
+
+
+def place_click_point_on_screen(
+    driver: Any,
+    pid: int,
+    screen: Rect,
+    calibrate: Callable[[], "PageCalibration"],
+    choose: Callable[[Callable[[float, float], bool] | None], dict[str, Any] | None],
+    settle: Callable[[], Any],
+    *,
+    max_moves: int = 2,
+    edge: float = 20.0,
+) -> dict[str, Any]:
+    """Choose a card point whose screen position is safely on the screen.
+
+    The window is large and may extend past the screen.  When the chosen point
+    maps outside the screen's usable area (or within ``edge`` pixels of its
+    border), the window is moved by OS window management by the delta that
+    brings the point to the screen centre, the page is allowed to settle, the
+    calibration is redone and the point recomputed.  At most ``max_moves``
+    moves are made.  After the last, only points that remain off screen are
+    dropped: a candidate that is on screen is used, otherwise this raises with
+    every measurement.  ``choose(reachable)`` returns the geometry (with the
+    chosen CSS ``point``) or ``None`` when no candidate qualifies.
+    """
+
+    centre = (screen.left + screen.width / 2, screen.top + screen.height / 2)
+    moves: list[dict[str, Any]] = []
+    for attempt in range(max_moves + 1):
+        calibration = calibrate()
+        geometry = choose(None)
+        if geometry is None:
+            raise DriverError(f"no clickable point on the card; moves so far {moves}")
+        screen_point = calibration.to_screen(*geometry["point"])
+        if point_is_on_screen(screen, *screen_point, edge):
+            return {"geometry": geometry, "screen_point": screen_point,
+                    "calibration": calibration, "moves": moves}
+        if attempt == max_moves:
+            break
+        frame = driver.window_frame(pid)
+        delta = (centre[0] - screen_point[0], centre[1] - screen_point[1])
+        target = (frame.left + delta[0], frame.top + delta[1])
+        driver.move_window(pid, *target)
+        settle()
+        moves.append({
+            "from_point": list(screen_point), "delta": list(delta),
+            "frame_before": [frame.left, frame.top, frame.width, frame.height],
+            "window_to": list(target),
+        })
+        print(f"NYX-PROBE window-move {json.dumps(moves[-1])}")
+    def reachable(x: float, y: float) -> bool:
+        return point_is_on_screen(screen, *calibration.to_screen(x, y), edge)
+
+    geometry = choose(reachable)
+    if geometry is not None:
+        screen_point = calibration.to_screen(*geometry["point"])
+        if point_is_on_screen(screen, *screen_point, edge):
+            return {"geometry": geometry, "screen_point": screen_point,
+                    "calibration": calibration, "moves": moves}
+    raise DriverError(
+        f"the card point stays off screen after {len(moves)} window moves: screen {screen}, "
+        f"last point {screen_point}, calibration origin ({calibration.origin_x:.1f},"
+        f"{calibration.origin_y:.1f}) scale {calibration.scale:.3f}, moves {json.dumps(moves)}"
+    )
+
+
 def prepare_board_viewport(
     driver: Any,
     pid: int,
@@ -1906,16 +2154,7 @@ def prepare_board_viewport(
         return state[1] >= minimum_height and state[1] - state[2] >= minimum_band
 
     def settle(limit: float) -> tuple[float, float, float]:
-        previous = None
-        latest = measure()
-        deadline = time.monotonic() + limit
-        while time.monotonic() < deadline:
-            time.sleep(pause)
-            latest = measure()
-            if latest == previous:
-                break
-            previous = latest
-        return latest
+        return settle_measurement(measure, limit, pause)
 
     def record(name: str, state: tuple[float, float, float], **extra: Any) -> None:
         step = {"step": name, "viewport": [state[0], state[1]], "toolbar_bottom": state[2], **extra}
