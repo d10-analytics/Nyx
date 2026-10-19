@@ -84,6 +84,44 @@ the runtime. For an unreadable record, a live owner still refuses both start and
 stop and keeps the record in place. Removal is permanent, because Nyx cannot
 distinguish a genuinely damaged record from a temporarily unreadable one.
 
+## Inspect checkouts
+
+```text
+nyx checkouts
+nyx checkouts --json
+```
+
+`nyx checkouts` lists the git checkouts found in the checkout folders configured
+for the current workspace: one line per clone and one indented line per linked
+worktree, in the same order as the document. `--json` prints the full document
+instead. It works on Linux, Windows and macOS from a Python installation of Nyx;
+the packaged desktop application has no `nyx` command. It never starts, stops or
+inspects the Nyx service, never launches the desktop application, and cannot be
+combined with `--setup`, `--stop` or `--status`.
+
+Each line starts with the checkout's path and then gives its branch (or
+`detached <sha>`), the `staged`, `unstaged`, `untracked` and `conflicted` counts,
+any `operations` in progress such as `merge`, `local-only <n>` (local branches
+with no same-name branch on `origin`, followed by `unknown <n>` when a
+comparison could not be made), and `default <name> <relation> cached <time>`.
+A clone that has never fetched shows `never fetched`; one without an `origin`
+remote shows `no origin remote`. A checkout git refused or could not read shows
+its path and its status instead.
+
+The facts are cached-only labels: every comparison uses the remote-tracking
+branches this clone already has, so the output can be older than the remote
+until you fetch. The command is read-only and makes no network connection: it
+changes no repository, takes no git lock, and never fetches or contacts a
+remote. It exits 0 whenever it can print a document, including when git is
+missing or a folder is unavailable; it exits 1 with one line only when the
+configuration is unavailable or the document exceeds 2 MiB. With no folders
+configured it says `no checkout folders are configured` and exits 0.
+
+Checkout folders are set per workspace, in the account's configuration record;
+see [Your specification workspace](workspaces.md#checkout-folders) for the
+exact edit. A settings editor arrives with the Checkouts view; until then the
+record is edited by hand.
+
 ## Choose board row order
 
 When account settings are available, the toolbar includes a **Board row order**
