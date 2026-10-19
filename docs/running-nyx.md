@@ -237,6 +237,66 @@ execution. Configuration and runtime state still live under `.nyx` in your home
 directory. On Linux the desktop application refuses to start and directs you to
 use the `nyx` console entry instead.
 
+## Maintainer: record cloud-placeholder behavior
+
+Hosted CI cannot provide OneDrive or Dropbox placeholders, so a maintainer runs
+this procedure once on a Windows host with both providers enabled and keeps the
+filled record as the evidence. It changes no Nyx setting and no specification
+content; use a disposable test folder inside each provider's sync folder.
+
+Nyx treats an entry as a link when `os.lstat` reports a symbolic link or the
+`FILE_ATTRIBUTE_REPARSE_POINT` bit (`0x400`) in `st_file_attributes`. A cloud
+placeholder can carry that bit, so the record decides whether Nyx hides or
+refuses placeholder content.
+
+**Setup (once per provider).** Create `<sync folder>\nyx-probe\specs` holding
+one repository folder with a stage folder and one Markdown specification in it,
+and create an empty `<sync folder>\nyx-probe\empty` folder. Wait until the
+provider reports the files as synced.
+
+**States (repeat for each provider, OneDrive then Dropbox).** Set the state on
+the `specs` folder and on the specification file, then record the table before
+each Nyx observation:
+
+| State | How to reach it |
+| --- | --- |
+| Online-only | OneDrive: **Free up space**. Dropbox: **Make online-only** (Smart Sync). |
+| Pinned | OneDrive: **Always keep on this device**. Dropbox: **Make available offline**. |
+| Hydrated | Open the file so the content is downloaded, without pinning (OneDrive **Free up space** and Dropbox **Make online-only** both undone). |
+
+**Fields to record (Python, for each of the workspace root `specs` and one
+entry inside it, per provider and state).** Run `os.lstat(path)` and record
+exactly these values:
+
+| Field | Record |
+| --- | --- |
+| `st_file_attributes` | Value in hexadecimal, plus whether bit `0x400` (reparse point) is set |
+| `st_reparse_tag` | Value in hexadecimal, or `absent` if the attribute does not exist |
+| `stat.S_ISDIR` / `stat.S_ISREG` | `True` or `False` for the root and entry |
+| `stat.S_ISLNK` | `True` or `False` |
+| Other attribute bits | Whether `0x1000` (offline), `0x400000` (recall on data access) and `0x40000` (recall on open) are set |
+
+**Nyx observations (same provider and state).** Save the root as the
+workspace and open the board, then record for each row below what Nyx shows.
+The code expects a root with the reparse bit to be refused and an entry with
+it to be skipped (a linked entry whose name ends in `.md` silently, any other
+linked entry as an incomplete-discovery issue); the record states whether each
+state matches that expectation.
+
+| Observation | Record |
+| --- | --- |
+| Save with `specs` as the workspace root | Accepted, or refused with the message shown (expected for a reparse root: `specification root cannot be read`) |
+| Cards listed | Card count against the number of specifications that exist |
+| Workspace or refresh issues panel | Present or absent, and the issue codes and paths shown |
+| Specification file entry | Listed, skipped silently, or reported as an issue |
+| Reading a card's specification header | Content shown, or the unreadable or non-regular anchor message |
+| Open a card, then refresh | Whether either action downloads the file (provider status changes to hydrated) |
+| Empty `empty` folder as a control | Accepted with zero cards and no issue panel |
+
+Close the record with one line per provider and state naming the observed
+behavior as `matches the code expectation` or `differs`, quoting the differing
+values. A difference is a finding to file, not a documentation change.
+
 ## Read and refresh the board
 
 Use **Search** to search card metadata, including work item titles, projects,
