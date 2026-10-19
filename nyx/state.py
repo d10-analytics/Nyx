@@ -551,15 +551,6 @@ def _validate_stage_order(values: Iterable[str]) -> tuple[str, ...]:
     return names
 
 
-def _is_canonical_root(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and "\x00" not in value
-        and os.path.isabs(value)
-        and os.path.normpath(value) == value
-    )
-
-
 def _canonical_order_root(
     value: str, error: type[ConfigurationError] = StageOrderError
 ) -> str:
@@ -578,6 +569,16 @@ def _canonical_order_root(
     ):
         raise error("stage order root is invalid")
     return value
+
+
+def _is_canonical_root(value: object) -> bool:
+    """Report whether the one shared root validator accepts this text."""
+
+    try:
+        _canonical_order_root(value, ConfigurationError)  # type: ignore[arg-type]
+    except ConfigurationError:
+        return False
+    return True
 
 
 def _validate_stage_orders(values: Mapping[str, Iterable[str]]) -> dict[str, tuple[str, ...]]:
