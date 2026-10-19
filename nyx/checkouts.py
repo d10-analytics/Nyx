@@ -1,0 +1,1054 @@
+"""Read-only collector for the git state of the configured checkout folders.
+
+Every fact comes from a local git command run through one runner, or from a
+direct look at the files git keeps inside a repository's own directories.
+Nothing here fetches, writes, locks or contacts a remote.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote
+
+from .catalog import MAX_OUTPUT_BYTES
+from .models import (
+    CHECKOUTS_DIGEST_OMITTED,
+    CHECKOUTS_SCHEMA_VERSION,
+    OPERATIONS,
+    _safe_text,
+    branch_sort_key,
+    canonical_digest,
+    clone_sort_key,
+    diagnostic_sort_key,
+    folder_sort_key,
+    natural_key,
+    repository_sort_key,
+    worktree_sort_key,
+)
+from .state import _is_reparse_or_link
+
+CALL_CAP_SECONDS = 10.0
+MAX_PARALLEL_CLONES = 8
+GIT_FLOOR = (2, 36)
+
+_ON_WINDOWS = os.name == "nt"
+_GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
+_VERSION_LINE = re.compile(r"git version (?P<version>[0-9]+(?:\.[0-9]+)+\S*)")
+_NUMERIC_PREFIX = re.compile(r"[0-9]+(?:\.[0-9]+)+")
+_CONFIG_PATTERN = (
+    r"^(remote\..*\.(url|promisor)|extensions\.partialclone|url\..*\.insteadof)$"
+)
+_ZERO_OBJECT = re.compile(r"0+")
+_TRUE_VALUES = frozenset({"", "true", "yes", "on", "1"})
+
+# Used only to start the one call that asks git which variables redirect a
+# repository, and when that call cannot answer.
+_FALLBACK_LOCAL_ENVIRONMENT = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NAMESPACE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
+
+
+class CheckoutsOutputTooLargeError(ValueError):
+    """The rendered checkout document would exceed ``MAX_OUTPUT_BYTES``."""
+
+    category = "checkouts_output_too_large"
+
+
+# ---------------------------------------------------------------------------
+# The one git runner
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    code: int | None
+    out: bytes = b""
+    err: bytes = b""
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.code == 0 and not self.timed_out
+
+    def failure(self) -> str:
+        """Return the item status this failed call maps to."""
+        if self.timed_out:
+            return "timed_out"
+        if b"dubious ownership" in self.err:
+            return "unsafe_ownership"
+        return "failed"
+
+
+def _resolve_git() -> str | None:
+    """Find git among the absolute ``PATH`` entries only."""
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        candidate = os.path.join(entry, _GIT_EXECUTABLE)
+        if os.path.isfile(candidate) and (_ON_WINDOWS or os.access(candidate, os.X_OK)):
+            return candidate
+    return None
+
+
+class _GitRunner:
+    """Start every git child with the same isolation, budget and cleanup."""
+
+    def __init__(self, executable: str, deadline_ns: int, call_cap: float) -> None:
+        self._executable = executable
+        self._deadline_ns = deadline_ns
+        self._call_cap = call_cap
+        self._removed = _FALLBACK_LOCAL_ENVIRONMENT
+
+    def learn_local_environment(self) -> None:
+        outcome = self.run(["rev-parse", "--local-env-vars"])
+        if outcome.ok:
+            names = {
+                line.strip()
+                for line in outcome.out.decode("utf-8", "replace").splitlines()
+                if line.strip()
+            }
+            if names:
+                self._removed = frozenset(names)
+
+    def _environment(self, ceiling: str | None) -> dict[str, str]:
+        removed = {name.upper() for name in self._removed} | {
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_NAMESPACE",
+        }
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if (key.upper() if _ON_WINDOWS else key) not in removed
+            and key not in removed
+        }
+        environment.update(
+            {
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": "",
+                "SSH_ASKPASS_REQUIRE": "never",
+                "GCM_INTERACTIVE": "never",
+                "GIT_ALLOW_PROTOCOL": "",
+                "LC_ALL": "C",
+            }
+        )
+        if ceiling is not None:
+            environment["GIT_CEILING_DIRECTORIES"] = ceiling
+        return environment
+
+    def run(
+        self, arguments: Sequence[str], *, path: str | None = None, ceiling: str | None = None
+    ) -> _Outcome:
+        remaining = (self._deadline_ns - time.monotonic_ns()) / 1e9
+        timeout = min(self._call_cap, remaining)
+        if timeout <= 0:
+            return _Outcome(None, timed_out=True)
+        command = [self._executable, "--no-optional-locks", "-c", "core.fsmonitor=false"]
+        if path is not None:
+            command += ["-C", path]
+        command += list(arguments)
+        # Output goes to temporary files, not pipes, so a program git started
+        # and left behind cannot keep this call waiting after git is killed.
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=err,
+                    env=self._environment(ceiling),
+                )
+            except OSError:
+                return _Outcome(None)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                return _Outcome(None, timed_out=True)
+            out.seek(0)
+            err.seek(0)
+            return _Outcome(process.returncode, out.read(), err.read())
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode(data: bytes) -> str:
+    # Explicit on every OS: Windows' default handler would raise on bytes
+    # that are not valid in the filesystem encoding.
+    return data.decode(sys.getfilesystemencoding(), "surrogateescape")
+
+
+def _representable(text: str) -> bool:
+    return _safe_text(text)
+
+
+def _lstat(path: str) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except OSError:
+        return None
+
+
+def _exists(path: str) -> bool:
+    return _lstat(path) is not None
+
+
+def _utc_text(seconds: int) -> str:
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _object_or_none(value: str) -> str | None:
+    return None if not value or _ZERO_OBJECT.fullmatch(value) else value
+
+
+def _parse_version(output: bytes) -> str | None:
+    lines = output.decode("utf-8", "replace").splitlines()
+    match = _VERSION_LINE.match(lines[0].strip()) if lines else None
+    return match.group("version") if match else None
+
+
+def _meets_floor(version: str) -> bool:
+    numeric = _NUMERIC_PREFIX.match(version)
+    if numeric is None:
+        return False
+    parts = tuple(int(part) for part in numeric.group(0).split("."))
+    return parts[: len(GIT_FLOOR)] >= GIT_FLOOR
+
+
+# ---------------------------------------------------------------------------
+# Remote normalization
+# ---------------------------------------------------------------------------
+
+_URL_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*)://(.*)", re.S)
+_WINDOWS_DRIVE = re.compile(r"[A-Za-z]:[\\/]")
+_DEFAULT_PORTS = {"ssh": "22", "git": "9418", "http": "80", "https": "443"}
+_HOME_PREFIX = re.compile(r"~[^/]*/")
+
+
+def _local_remote(path: str, base: str) -> tuple[str, str]:
+    if not os.path.isabs(path):
+        path = os.path.join(base, path)
+    resolved = os.path.realpath(path).removesuffix(".git")
+    return f"file:{resolved}", resolved
+
+
+def _network_remote(scheme: str | None, authority: str, path: str) -> tuple[str, str]:
+    authority = authority.rpartition("@")[2]
+    port = ""
+    if authority.startswith("["):
+        host, _, rest = authority[1:].partition("]")
+        host = f"[{host}]"
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = rest[1:]
+    else:
+        host, separator, tail = authority.rpartition(":")
+        if separator and tail.isdigit():
+            port = tail
+        else:
+            host = authority
+    host = host.lower()
+    if port == _DEFAULT_PORTS.get(scheme or "ssh") and scheme in (None, *_DEFAULT_PORTS):
+        port = ""
+    path = re.split(r"[?#]", path, maxsplit=1)[0].lstrip("/")
+    path = _HOME_PREFIX.sub("", path, count=1)
+    path = path.removesuffix("/").removesuffix(".git")
+    key_host = host + (f":{port}" if port else "")
+    return f"{key_host}/{path}", path or key_host
+
+
+def normalize_remote(url: str, base: str) -> tuple[str, str] | None:
+    """Return the group ``(key, display)`` for a remote URL, never its credentials."""
+    url = url.strip()
+    if not url:
+        return None
+    scheme_match = _URL_SCHEME.fullmatch(url)
+    if scheme_match is not None:
+        scheme = scheme_match.group(1).lower()
+        rest = scheme_match.group(2)
+        authority, _, path = rest.partition("/")
+        if scheme == "file":
+            local = unquote("/" + path)
+            if re.fullmatch(r"/[A-Za-z]:/.*", local):
+                local = local[1:]
+            return _local_remote(local, base)
+        return _network_remote(scheme, authority, path)
+    if _WINDOWS_DRIVE.match(url):
+        return _local_remote(url, base)
+    colon = url.find(":")
+    slash = url.find("/")
+    if colon > 0 and (slash == -1 or colon < slash):
+        host_part = url[:colon]
+        if len(host_part) == 1 and host_part.isalpha():
+            return _local_remote(url, base)
+        return _network_remote(None, host_part, url[colon + 1 :])
+    return _local_remote(url, base)
+
+
+def _rewrite_instead_of(url: str, rules: Iterable[tuple[str, str]]) -> str:
+    best: tuple[str, str] | None = None
+    for prefix, base in rules:
+        if prefix and url.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, base)
+    return url if best is None else best[1] + url[len(best[0]) :]
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    path: str
+    real: str
+    enclosing: str | None
+
+
+@dataclass
+class _Discovery:
+    folders: list[dict[str, Any]] = field(default_factory=list)
+    candidates: list[_Candidate] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _has_git_entry(path: str) -> bool:
+    details = _lstat(os.path.join(path, ".git"))
+    return details is not None and (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode))
+
+
+def _discover(folders: Iterable[str]) -> _Discovery:
+    result = _Discovery()
+    seen_real: set[str] = set()
+
+    def add(path: str, enclosing: str | None) -> None:
+        real = os.path.realpath(path)
+        if real not in seen_real:
+            seen_real.add(real)
+            result.candidates.append(_Candidate(path, real, enclosing))
+
+    for folder in sorted({os.fspath(item) for item in folders}, key=natural_key):
+        if not _representable(folder):
+            result.diagnostics.append({"code": "unrepresentable_path", "path": None})
+            continue
+        try:
+            details = os.stat(folder)
+        except (FileNotFoundError, NotADirectoryError):
+            result.folders.append({"path": folder, "status": "missing"})
+            continue
+        except OSError:
+            result.folders.append({"path": folder, "status": "unreadable"})
+            continue
+        if not stat.S_ISDIR(details.st_mode):
+            result.folders.append({"path": folder, "status": "not_directory"})
+            continue
+        try:
+            with os.scandir(folder) as scan:
+                names = sorted(entry.name for entry in scan)
+        except OSError:
+            result.folders.append({"path": folder, "status": "unreadable"})
+            continue
+        result.folders.append({"path": folder, "status": "ok"})
+        if _has_git_entry(folder):
+            add(folder, None)
+        for name in names:
+            child = os.path.join(folder, name)
+            child_details = _lstat(child)
+            if (
+                child_details is None
+                or _is_reparse_or_link(Path(child), child_details)
+                or not stat.S_ISDIR(child_details.st_mode)
+                or not _has_git_entry(child)
+            ):
+                continue
+            if not _representable(child):
+                result.diagnostics.append({"code": "unrepresentable_path", "path": folder})
+                continue
+            add(child, folder)
+    return result
+
+
+@dataclass(frozen=True)
+class _Identity:
+    candidate: _Candidate
+    status: str  # ok | not_a_repository | unsafe_ownership | failed | timed_out
+    toplevel: str = ""
+    common: str = ""
+    shallow: bool = False
+
+
+def _identify(runner: _GitRunner, candidate: _Candidate) -> _Identity:
+    outcome = runner.run(
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--absolute-git-dir",
+            "--is-bare-repository",
+            "--is-shallow-repository",
+        ],
+        path=candidate.real,
+        ceiling=os.path.dirname(candidate.real),
+    )
+    if not outcome.ok:
+        if not outcome.timed_out and b"not a git repository" in outcome.err:
+            return _Identity(candidate, "not_a_repository")
+        return _Identity(candidate, outcome.failure())
+    lines = _decode(outcome.out).split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if len(lines) != 5:
+        return _Identity(candidate, "failed")
+    toplevel = os.path.realpath(lines[0])
+    if toplevel != candidate.real:
+        return _Identity(candidate, "not_a_repository")
+    return _Identity(
+        candidate,
+        "ok",
+        toplevel=toplevel,
+        common=os.path.realpath(lines[1]),
+        shallow=lines[4] == "true",
+    )
+
+
+# ---------------------------------------------------------------------------
+# One clone
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CloneOutcome:
+    clone: dict[str, Any] | None
+    remote: tuple[str, str] | None = None
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ListedWorktree:
+    path: str
+    head: str | None
+    branch: str | None
+    bare: bool
+    locked: bool
+    prunable: bool
+
+
+def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
+    return {
+        "path": path,
+        "bare": None,
+        "status": status,
+        "partial_clone": None,
+        "shallow": None,
+        "cached_default": None,
+        "local_default": None,
+        "cached_vs_live": None,
+        "stash_count": None,
+        "worktrees": None,
+        "branches": None,
+    }
+
+
+def _comparison(relation: str, ahead: int | None = None, behind: int | None = None) -> dict[str, Any]:
+    return {
+        "basis": "cached",
+        "relation": relation,
+        "ahead": ahead,
+        "behind": behind,
+        "objects_from": None,
+    }
+
+
+def _parse_config(data: bytes) -> tuple[dict[str, str], list[tuple[str, str]], bool]:
+    origin: dict[str, str] = {}
+    rules: list[tuple[str, str]] = []
+    partial = False
+    for record in data.split(b"\0"):
+        if not record:
+            continue
+        key, _, value = _decode(record).partition("\n")
+        if key == "remote.origin.url":
+            origin["url"] = value
+        elif key == "extensions.partialclone":
+            partial = partial or bool(value)
+        elif key.startswith("remote.") and key.endswith(".promisor"):
+            partial = partial or value.strip().lower() in _TRUE_VALUES
+        elif key.startswith("url.") and key.endswith(".insteadof"):
+            rules.append((value, key[len("url.") : -len(".insteadof")]))
+    return origin, rules, partial
+
+
+def _parse_worktrees(data: bytes) -> list[_ListedWorktree]:
+    entries: list[dict[str, Any]] = []
+    for token in data.split(b"\0"):
+        if not token:
+            continue
+        text = _decode(token)
+        if text.startswith("worktree "):
+            entries.append({"path": text[len("worktree ") :]})
+        elif entries:
+            label, _, value = text.partition(" ")
+            entries[-1][label] = value
+    return [
+        _ListedWorktree(
+            path=entry["path"],
+            head=_object_or_none(entry.get("HEAD", "")),
+            branch=entry.get("branch"),
+            bare="bare" in entry,
+            locked="locked" in entry,
+            prunable="prunable" in entry,
+        )
+        for entry in entries
+    ]
+
+
+def _fetch_head_names_origin(path: str, matches: Callable[[str], bool]) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except OSError:
+        return False
+    for raw_line in content.split(b"\n"):
+        fields = _decode(raw_line).split("\t", 2)
+        if len(fields) != 3:
+            continue
+        description = fields[2]
+        source: str | None = description
+        for prefix in ("branch '", "tag '", "remote-tracking branch '", "'"):
+            if description.startswith(prefix):
+                end = description.find("' of ", len(prefix))
+                source = description[end + len("' of ") :] if end >= 0 else None
+                break
+        if source and matches(source):
+            return True
+    return False
+
+
+def _linked_git_directories(common: str) -> dict[str, str]:
+    """Map the real path of each linked worktree to its own git directory."""
+    result: dict[str, str] = {}
+    root = os.path.join(common, "worktrees")
+    try:
+        with os.scandir(root) as scan:
+            names = [entry.name for entry in scan]
+    except OSError:
+        return result
+    for name in names:
+        directory = os.path.join(root, name)
+        try:
+            with open(os.path.join(directory, "gitdir"), "rb") as handle:
+                pointer = _decode(handle.read(4096)).split("\n", 1)[0].strip()
+        except OSError:
+            continue
+        if not pointer:
+            continue
+        if not os.path.isabs(pointer):
+            pointer = os.path.join(directory, pointer)
+        result[os.path.realpath(os.path.dirname(pointer))] = directory
+    return result
+
+
+def _operations(git_directory: str) -> list[str]:
+    found = set()
+    if _exists(os.path.join(git_directory, "MERGE_HEAD")):
+        found.add("merge")
+    if _exists(os.path.join(git_directory, "rebase-merge")):
+        found.add("rebase")
+    if _exists(os.path.join(git_directory, "rebase-apply")):
+        found.add(
+            "am"
+            if _exists(os.path.join(git_directory, "rebase-apply", "applying"))
+            else "rebase"
+        )
+    if _exists(os.path.join(git_directory, "CHERRY_PICK_HEAD")):
+        found.add("cherry_pick")
+    if _exists(os.path.join(git_directory, "REVERT_HEAD")):
+        found.add("revert")
+    if _exists(os.path.join(git_directory, "BISECT_LOG")):
+        found.add("bisect")
+    return [name for name in OPERATIONS if name in found]
+
+
+def _count_status(data: bytes) -> dict[str, int]:
+    staged = unstaged = untracked = conflicted = 0
+    for record in data.split(b"\0"):
+        if record.startswith(b"1 ") and len(record) >= 4:
+            staged += record[2:3] != b"."
+            unstaged += record[3:4] != b"."
+        elif record.startswith(b"u "):
+            conflicted += 1
+        elif record.startswith(b"? "):
+            untracked += 1
+    return {
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "conflicted": conflicted,
+    }
+
+
+def _worktree_document(
+    runner: _GitRunner,
+    listed: _ListedWorktree,
+    *,
+    main: bool,
+    git_directory: str | None,
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "path": listed.path,
+        "main": main,
+        "head": None,
+        "locked": listed.locked,
+        "prunable": listed.prunable,
+        "status": "failed",
+        "changes": None,
+        "operations": None,
+        "index_lock": None,
+    }
+    if listed.prunable:
+        return document
+    real = os.path.realpath(listed.path)
+    outcome = runner.run(
+        ["status", "--porcelain=2", "-z", "--untracked-files=normal", "--no-renames"],
+        path=real,
+        ceiling=os.path.dirname(real),
+    )
+    if not outcome.ok:
+        document["status"] = outcome.failure()
+        return document
+    if git_directory is None or not os.path.isdir(git_directory):
+        return document
+    branch = None
+    if listed.branch is not None and listed.branch.startswith("refs/heads/"):
+        branch = listed.branch[len("refs/heads/") :]
+    if branch is None and listed.head is None:
+        return document
+    document.update(
+        {
+            "status": "ok",
+            "head": {"branch": branch, "sha": listed.head},
+            "changes": _count_status(outcome.out),
+            "operations": _operations(git_directory),
+            "index_lock": _exists(os.path.join(git_directory, "index.lock")),
+        }
+    )
+    return document
+
+
+def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcome:
+    anchor = members[0]
+    cwd = anchor.toplevel
+    ceiling = os.path.dirname(cwd)
+    common = anchor.common
+    path = anchor.candidate.path
+    enclosing = anchor.candidate.enclosing
+
+    def call(arguments: Sequence[str]) -> _Outcome:
+        return runner.run(arguments, path=cwd, ceiling=ceiling)
+
+    configuration = call(["config", "-z", "--get-regexp", _CONFIG_PATTERN])
+    if configuration.timed_out or configuration.code not in (0, 1):
+        return _CloneOutcome(_unavailable_clone(path, configuration.failure()))
+    origin, rules, partial = _parse_config(configuration.out)
+
+    def remote_for(base: str) -> tuple[str, str] | None:
+        return normalize_remote(origin["url"], base) if "url" in origin else None
+
+    remote = remote_for(cwd)
+    if not _remote_text_safe(remote):
+        # An origin that cannot be shown safely: the clone joins no group and
+        # reports none of its remote-derived facts.
+        return _CloneOutcome(_unavailable_clone(path, "failed"))
+
+    def degraded(status: str) -> _CloneOutcome:
+        return _CloneOutcome(_unavailable_clone(path, status), remote)
+
+    listing = call(["worktree", "list", "--porcelain", "-z"])
+    if not listing.ok:
+        return degraded(listing.failure())
+    listed = _parse_worktrees(listing.out)
+    if not listed:
+        return degraded("failed")
+    first = listed[0]
+    path = first.path
+    if not _representable(path):
+        return _CloneOutcome(
+            None, diagnostics=[{"code": "unrepresentable_path", "path": enclosing}]
+        )
+    bare = first.bare
+    remote = remote_for(path if not bare else cwd)
+    if not _remote_text_safe(remote):
+        return _CloneOutcome(_unavailable_clone(path, "failed"))
+
+    refs = call(
+        [
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(symref)%00%(upstream)",
+            "refs/heads",
+            "refs/remotes/origin",
+            "refs/stash",
+        ]
+    )
+    if not refs.ok:
+        return degraded(refs.failure())
+    local: dict[str, tuple[str, str]] = {}
+    cached: dict[str, str] = {}
+    cached_head_target: str | None = None
+    has_stash = False
+    for line in refs.out.split(b"\n"):
+        if not line:
+            continue
+        fields = _decode(line).split("\0")
+        if len(fields) != 4:
+            return degraded("failed")
+        name, sha, symref, upstream = fields
+        if name.startswith("refs/heads/"):
+            local[name[len("refs/heads/") :]] = (sha, upstream)
+        elif name == "refs/remotes/origin/HEAD":
+            if symref.startswith("refs/remotes/origin/"):
+                cached_head_target = symref[len("refs/remotes/origin/") :]
+        elif name.startswith("refs/remotes/origin/"):
+            cached[name[len("refs/remotes/origin/") :]] = sha
+        elif name == "refs/stash":
+            has_stash = True
+    if not all(_safe_text(name) for name in local) or not all(
+        _safe_text(name) for name in cached
+    ):
+        return degraded("failed")
+
+    stash_count = 0
+    if has_stash:
+        stash = call(["rev-list", "--walk-reflogs", "--count", "refs/stash"])
+        if not stash.ok or not stash.out.strip().isdigit():
+            return degraded(stash.failure() if not stash.ok else "failed")
+        stash_count = int(stash.out.strip())
+
+    linked_directories = _linked_git_directories(common)
+    worktrees: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    included: list[_ListedWorktree] = []
+    for index, item in enumerate(listed):
+        if index == 0 and bare:
+            continue
+        if not _representable(item.path):
+            diagnostics.append({"code": "unrepresentable_path", "path": path})
+            continue
+        main = index == 0
+        git_directory = (
+            common if main else linked_directories.get(os.path.realpath(item.path))
+        )
+        worktrees.append(
+            _worktree_document(runner, item, main=main, git_directory=git_directory)
+        )
+        included.append(item)
+    worktrees.sort(key=worktree_sort_key)
+
+    checked_out: dict[str, list[str]] = {}
+    for item in included:
+        if item.branch is not None and item.branch.startswith("refs/heads/"):
+            checked_out.setdefault(item.branch[len("refs/heads/") :], []).append(item.path)
+
+    has_remote = remote is not None
+    memo: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def compare(local_sha: str | None, cached_sha: str | None) -> dict[str, Any]:
+        if local_sha is None or cached_sha is None:
+            return _comparison("absent")
+        if local_sha == cached_sha:
+            return _comparison("equal", 0, 0)
+        if anchor.shallow:
+            return _comparison("differs")
+        key = (local_sha, cached_sha)
+        if key not in memo:
+            counted = call(
+                ["rev-list", "--left-right", "--count", f"{local_sha}...{cached_sha}"]
+            )
+            fields = counted.out.split()
+            if counted.timed_out:
+                memo[key] = _comparison("unknown")
+            elif counted.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
+                ahead, behind = int(fields[0]), int(fields[1])
+                if ahead == 0 and behind == 0:
+                    # Different objects naming the same commits (for example a
+                    # tag object): nothing was counted, so say only that they differ.
+                    memo[key] = _comparison("differs")
+                else:
+                    relation = (
+                        "diverged" if ahead and behind else "ahead" if ahead else "behind"
+                    )
+                    memo[key] = _comparison(relation, ahead, behind)
+            else:
+                memo[key] = _comparison("differs")
+        return memo[key]
+
+    branches: list[dict[str, Any]] = []
+    for name, (sha, upstream) in local.items():
+        shown_upstream: str | None = None
+        if upstream.startswith("refs/remotes/"):
+            shown_upstream = upstream[len("refs/remotes/") :]
+        elif upstream.startswith("refs/heads/"):
+            shown_upstream = "./" + upstream[len("refs/heads/") :]
+        branches.append(
+            {
+                "name": name,
+                "sha": sha,
+                "checked_out_in": sorted(checked_out.get(name, []), key=natural_key),
+                "upstream": shown_upstream,
+                "upstream_mismatch": (
+                    has_remote
+                    and upstream != ""
+                    and upstream != f"refs/remotes/origin/{name}"
+                ),
+                "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
+            }
+        )
+    branches.sort(key=branch_sort_key)
+
+    cached_default = None
+    local_default = None
+    if has_remote:
+        cached_sha = cached.get(cached_head_target) if cached_head_target else None
+        last_fetched = _last_fetched(common, linked_directories, origin, rules, path if not bare else cwd)
+        cached_default = {
+            "name": cached_head_target,
+            "sha": cached_sha,
+            "last_fetched_at": last_fetched,
+            "fetched_since_clone": last_fetched is not None,
+        }
+        if cached_head_target is not None:
+            local_sha = local.get(cached_head_target, (None, ""))[0]
+            local_default = {
+                "name": cached_head_target,
+                "sha": local_sha,
+                "vs_live": None,
+                "vs_cached": compare(local_sha, cached_sha),
+            }
+
+    clone = {
+        "path": path,
+        "bare": bare,
+        "status": "ok",
+        "partial_clone": partial,
+        "shallow": anchor.shallow,
+        "cached_default": cached_default,
+        "local_default": local_default,
+        "cached_vs_live": None,
+        "stash_count": stash_count,
+        "worktrees": worktrees,
+        "branches": branches,
+    }
+    if not _all_text_safe(clone):
+        return degraded("failed")
+    return _CloneOutcome(clone, remote, diagnostics)
+
+
+def _remote_text_safe(remote: tuple[str, str] | None) -> bool:
+    return remote is None or (_safe_text(remote[0]) and _safe_text(remote[1]))
+
+
+def _all_text_safe(value: Any) -> bool:
+    """Check every string a clone would emit against the document's text bound."""
+    if isinstance(value, str):
+        return _safe_text(value)
+    if isinstance(value, dict):
+        return all(_all_text_safe(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_all_text_safe(item) for item in value)
+    return True
+
+
+def _last_fetched(
+    common: str,
+    linked_directories: dict[str, str],
+    origin: dict[str, str],
+    rules: list[tuple[str, str]],
+    base: str,
+) -> str | None:
+    """Return the newest ``FETCH_HEAD`` time that records a fetch of ``origin``."""
+    if "url" not in origin:
+        return None
+    wanted = normalize_remote(_rewrite_instead_of(origin["url"], rules), base)
+    if wanted is None:
+        return None
+
+    def matches(source: str) -> bool:
+        return normalize_remote(source, base) == wanted
+
+    newest: int | None = None
+    for directory in [common, *linked_directories.values()]:
+        candidate = os.path.join(directory, "FETCH_HEAD")
+        details = _lstat(candidate)
+        if details is None or not stat.S_ISREG(details.st_mode):
+            continue
+        if _fetch_head_names_origin(candidate, matches):
+            seconds = details.st_mtime_ns // 1_000_000_000
+            newest = seconds if newest is None else max(newest, seconds)
+    return None if newest is None else _utc_text(newest)
+
+
+# ---------------------------------------------------------------------------
+# The document
+# ---------------------------------------------------------------------------
+
+
+def _group_default_name(clones: list[dict[str, Any]]) -> str | None:
+    names = {
+        clone["cached_default"]["name"]
+        for clone in clones
+        if clone["status"] == "ok"
+        and clone["cached_default"] is not None
+        and clone["cached_default"]["name"] is not None
+    }
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    repositories: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for outcome in outcomes:
+        clone = outcome.clone
+        if clone is None or clone["path"] in seen_paths:
+            continue
+        seen_paths.add(clone["path"])
+        remote = outcome.remote
+        if remote is None:
+            repositories.append({"remote": None, "default_branch": None, "clones": [clone]})
+            continue
+        key, display = remote
+        group = grouped.get(key)
+        if group is None:
+            group = {
+                "remote": {
+                    "key": key,
+                    "display": display,
+                    "check": {"status": "off", "reason": "remote_checks_off"},
+                },
+                "default_branch": {"name": None, "live_sha": None},
+                "clones": [],
+            }
+            grouped[key] = group
+            repositories.append(group)
+        group["clones"].append(clone)
+    for repository in repositories:
+        repository["clones"].sort(key=clone_sort_key)
+        if repository["remote"] is not None:
+            repository["default_branch"]["name"] = _group_default_name(repository["clones"])
+    repositories.sort(key=repository_sort_key)
+    return repositories
+
+
+def _render(document: dict[str, Any]) -> str:
+    rendered = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if len(rendered.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:
+        raise CheckoutsOutputTooLargeError("checkouts output exceeds 2 MiB")
+    return rendered
+
+
+def collect_checkouts(
+    folders: Iterable[str | os.PathLike[str]],
+    *,
+    deadline_ns: int,
+    call_cap_seconds: float = CALL_CAP_SECONDS,
+    max_parallel: int = MAX_PARALLEL_CLONES,
+) -> str:
+    """Collect the checkout facts of ``folders`` as one canonical JSON document.
+
+    ``deadline_ns`` is a ``time.monotonic_ns`` instant; calls that cannot start
+    or finish by then mark their item ``timed_out`` and the document is still
+    produced.
+    """
+    observed_at = _utc_text(int(time.time()))
+    discovery = _discover(os.fspath(folder) for folder in folders)
+    git_state: dict[str, Any] = {"status": "missing", "version": None}
+    repositories: list[dict[str, Any]] = []
+    diagnostics = list(discovery.diagnostics)
+
+    executable = _resolve_git()
+    runner: _GitRunner | None = None
+    if executable is not None:
+        runner = _GitRunner(executable, deadline_ns, call_cap_seconds)
+        version_outcome = runner.run(["--version"])
+        version = _parse_version(version_outcome.out) if version_outcome.ok else None
+        if version is not None and _meets_floor(version):
+            git_state = {"status": "available", "version": version}
+        else:
+            git_state = {"status": "too_old", "version": version}
+
+    if runner is not None and git_state["status"] == "available":
+        runner.learn_local_environment()
+        with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+            identities = list(pool.map(lambda c: _identify(runner, c), discovery.candidates))
+            clones: dict[str, list[_Identity]] = {}
+            outcomes: list[_CloneOutcome] = []
+            for identity in identities:
+                if identity.status == "not_a_repository":
+                    diagnostics.append(
+                        {"code": "not_a_repository", "path": identity.candidate.path}
+                    )
+                elif identity.status != "ok":
+                    outcomes.append(
+                        _CloneOutcome(
+                            _unavailable_clone(identity.candidate.path, identity.status)
+                        )
+                    )
+                else:
+                    clones.setdefault(identity.common, []).append(identity)
+            outcomes.extend(
+                pool.map(lambda members: _collect_clone(runner, members), clones.values())
+            )
+        for outcome in outcomes:
+            diagnostics.extend(outcome.diagnostics)
+        repositories = _assemble_repositories(outcomes)
+
+    unique_diagnostics = {
+        (item["code"], item["path"]): item for item in diagnostics
+    }.values()
+    document: dict[str, Any] = {
+        "schema_version": CHECKOUTS_SCHEMA_VERSION,
+        "checkouts_digest": None,
+        "observed_at": observed_at,
+        "git": git_state,
+        "remote_checks": "off",
+        "folders": sorted(discovery.folders, key=folder_sort_key),
+        "repositories": repositories,
+        "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),
+    }
+    document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
+    return _render(document)
