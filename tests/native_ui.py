@@ -507,21 +507,29 @@ def is_console_evidence_class(window_class: str) -> bool:
     return is_console_window_class(window_class) or window_class == _PSEUDO_CONSOLE_CLASS
 
 
+REPORTED_HANDLE_RELATION = "reported-console-handle"
+FAMILY_OWNS_CONSOLE_RELATION = "owner-in-family"
+
+
 def attribute_console_windows(
     samples: list[WindowSample],
     family: set[int],
     allowed: set[str] | None = None,
+    reported_handles: set[int] | frozenset[int] = frozenset(),
 ) -> list[tuple[WindowSample, str]]:
-    """Return console windows tied to ``family`` by a concrete process relation.
+    """Return console windows tied to ``family`` by a concrete relation.
 
-    Only ownership relations count: the window's owner is in the family, the
-    owner's parent is, or the owner is a console host whose attached client is.
-    A console a process creates for itself exhibits a pseudo-console window
-    owned by that process.  Appearing at about the same time as a family
-    process never attributes a window: a hosted terminal such as the runner's
-    own can open windows while the family runs.  ``allowed`` restricts the
-    relations, so the application is judged only by relations a positive
-    control has shown the sampler can observe.
+    Two forms of relation count.  A process relation: the window's owner is in
+    the family, the owner's parent is, or the owner is a console host whose
+    attached client is.  A reported handle: a family process itself reports the
+    window through ``GetConsoleWindow`` (``reported_handles``) and the sampler
+    observed that handle as a console or pseudo-console window; this is the
+    form a hosted terminal topology produces, where the window is owned by
+    ``OpenConsole.exe`` and not by the child.  Appearing at about the same time
+    as a family process never attributes a window: a hosted terminal such as
+    the runner's own can open windows while the family runs.  ``allowed``
+    restricts the relations, so the application is judged only by relations a
+    positive control has shown the sampler can observe.
     """
 
     attributed: list[tuple[WindowSample, str]] = []
@@ -529,9 +537,25 @@ def attribute_console_windows(
         if not is_console_evidence_class(sample.window_class):
             continue
         relation = attribute_window(sample, family)
+        if relation is None and sample.handle in reported_handles:
+            relation = REPORTED_HANDLE_RELATION
         if relation is not None and (allowed is None or relation in allowed):
             attributed.append((sample, relation))
     return attributed
+
+
+def judging_relations(control_relations: set[str]) -> set[str]:
+    """Return the relations by which the application's family is judged.
+
+    These are the relations the positive control exhibited, plus ownership: a
+    helper that owns a console window is the family process that reports it
+    through ``GetConsoleWindow``, and a short-lived helper cannot be asked for
+    its handle after it exits.  The control's reported-handle form therefore
+    does not narrow the application to windows the helpers could not be asked
+    about.
+    """
+
+    return set(control_relations) | {FAMILY_OWNS_CONSOLE_RELATION}
 
 
 _ATTACH_CONSOLE_SCRIPT = (
