@@ -7436,3 +7436,35 @@ def test_full_handler_pool_refuses_at_once_and_terminal_close_does_not_wait(
             peer.setblocking(False)
             with pytest.raises(BlockingIOError):
                 peer.recv(1)
+
+
+def test_control_handler_start_failure_closes_connection_and_returns_its_slot(
+    control_daemon, stalled_peers
+):
+    # A handler thread that cannot start must not leak its slot: after a full
+    # pool's worth of start failures, every slot is still available.
+    original_start = threading.Thread.start
+    failed: list[threading.Thread] = []
+
+    def failing_start(thread: threading.Thread) -> None:
+        if thread.name == "nyx-control-handler" and len(failed) < runtime.CONTROL_HANDLER_LIMIT:
+            failed.append(thread)
+            raise RuntimeError("can't start new thread")
+        original_start(thread)
+
+    with patch.object(threading.Thread, "start", failing_start):
+        for _ in range(runtime.CONTROL_HANDLER_LIMIT):
+            reply = _control_exchange(
+                control_daemon.instance,
+                (json.dumps(_status_request(control_daemon.instance)) + "\n").encode(),
+                read_for=0.5,
+            )
+            assert reply == b""
+    assert len(failed) == runtime.CONTROL_HANDLER_LIMIT
+    assert control_daemon.daemon.control_thread.is_alive()
+
+    stalled_peers(control_daemon.instance, runtime.CONTROL_BACKLOG)
+    started = time.monotonic()
+    observation = _observe(control_daemon.paths)
+    assert observation.status == "running", observation
+    assert time.monotonic() - started < runtime.RUNTIME_CONTROL_TIMEOUT
