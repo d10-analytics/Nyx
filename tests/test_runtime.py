@@ -7369,3 +7369,70 @@ def test_trickling_sender_is_closed_within_one_control_timeout_of_accept(control
     assert closed_at is not None, "daemon never closed the trickling connection"
     assert closed_at - started < runtime.RUNTIME_CONTROL_TIMEOUT + 0.6
     _assert_control_survives(control_daemon)
+
+
+@pytest.fixture
+def stalled_peers():
+    """Open connections to the control port that never send; closed on exit."""
+
+    peers: list[socket.socket] = []
+
+    def open_peers(instance: runtime.Instance, count: int) -> list[socket.socket]:
+        _, address = runtime._parse_control_endpoint(instance.control)
+        opened = [socket.create_connection(address, timeout=2) for _ in range(count)]
+        peers.extend(opened)
+        return opened
+
+    try:
+        yield open_peers
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+def test_sixteen_stalled_peers_do_not_delay_a_status_request(control_daemon, stalled_peers):
+    stalled_peers(control_daemon.instance, 16)
+    started = time.monotonic()
+    observation = _observe(control_daemon.paths)
+    elapsed = time.monotonic() - started
+    assert observation.status == "running", observation
+    assert elapsed < runtime.RUNTIME_CONTROL_TIMEOUT
+
+
+def test_stalled_peers_never_grow_the_control_threads_past_the_handler_cap(
+    control_daemon, stalled_peers
+):
+    baseline = threading.active_count()
+    stalled_peers(control_daemon.instance, 20)
+    time.sleep(0.3)
+    handlers = threading.active_count() - baseline
+    # The accept thread is already in the baseline; peers hold every slot.
+    assert handlers == runtime.CONTROL_HANDLER_LIMIT
+    assert runtime.CONTROL_HANDLER_LIMIT > runtime.CONTROL_BACKLOG
+    assert control_daemon.daemon.control_thread.is_alive()
+
+
+def test_full_handler_pool_refuses_at_once_and_terminal_close_does_not_wait(
+    control_daemon, stalled_peers
+):
+    # Lengthen the peers' deadline so shutdown fits well inside their window.
+    with patch.object(runtime, "RUNTIME_CONTROL_TIMEOUT", 4.0):
+        peers = stalled_peers(control_daemon.instance, runtime.CONTROL_HANDLER_LIMIT)
+        time.sleep(0.3)
+        extra = stalled_peers(control_daemon.instance, 1)[0]
+        extra.settimeout(0.25)
+        started = time.monotonic()
+        try:
+            assert extra.recv(1) == b""
+        except ConnectionResetError:
+            pass
+        assert time.monotonic() - started < 0.25
+
+        control_thread = control_daemon.daemon.control_thread
+        result = control_daemon.daemon.shutdown(time.monotonic() + 2.0)
+        assert result == "stopped"
+        assert not control_thread.is_alive()
+        for peer in peers:
+            peer.setblocking(False)
+            with pytest.raises(BlockingIOError):
+                peer.recv(1)
