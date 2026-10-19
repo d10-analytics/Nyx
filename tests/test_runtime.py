@@ -7263,10 +7263,29 @@ def _padded_status_line(instance: runtime.Instance, total: int) -> bytes:
     return body + b" " * padding + b"\n"
 
 
-@pytest.fixture
-def control_daemon():
-    """A real in-process daemon on the isolated port, yielding its record and run."""
+_CONTROL_HANDLER_THREAD = "nyx-control-handler"
 
+
+@pytest.fixture
+def control_daemon(monkeypatch):
+    """A real in-process daemon on the isolated port, yielding its record and run.
+
+    Each control connection is served on its own handler thread, so an
+    exception escaping a handler kills only that thread and pytest reports it
+    as a warning, not a failure.  The fixture records every such escape in
+    ``handler_failures`` so the proofs can fail on it, and fails the test at
+    teardown if one was never checked.
+    """
+
+    handler_failures: list[str] = []
+    previous_hook = threading.excepthook
+
+    def record_handler_failure(args: threading.ExceptHookArgs) -> None:
+        if args.thread is not None and args.thread.name == _CONTROL_HANDLER_THREAD:
+            handler_failures.append(f"{args.exc_type.__name__}: {args.exc_value}")
+        previous_hook(args)
+
+    monkeypatch.setattr(threading, "excepthook", record_handler_failure)
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         lease_fd = _transferred_claim_fd(paths.runtime_directory / "lease.lock")
@@ -7275,11 +7294,34 @@ def control_daemon():
             with managed_daemon_run(daemon) as run:
                 instance = _wait_for_record(paths)
                 yield SimpleNamespace(
-                    daemon=daemon, instance=instance, run=run, paths=paths
+                    daemon=daemon,
+                    instance=instance,
+                    run=run,
+                    paths=paths,
+                    handler_failures=handler_failures,
                 )
+    assert handler_failures == [], "an exception escaped a control connection handler"
+
+
+def _assert_no_control_handler_failure(context: SimpleNamespace) -> None:
+    """Fail when any exception escaped a control connection's handler thread.
+
+    The handler closes the connection before an escaping exception reaches
+    the thread hook, so the peer can see end-of-stream first.  Joining the
+    finished handler threads orders their hooks before the assertion.
+    """
+
+    budget = time.monotonic() + 2 * runtime.RUNTIME_CONTROL_TIMEOUT
+    for thread in threading.enumerate():
+        if thread.name == _CONTROL_HANDLER_THREAD:
+            thread.join(timeout=max(0.0, budget - time.monotonic()))
+    assert context.handler_failures == [], (
+        "an exception escaped a control connection handler"
+    )
 
 
 def _assert_control_survives(context: SimpleNamespace) -> None:
+    _assert_no_control_handler_failure(context)
     assert context.daemon.control_thread is not None
     assert context.daemon.control_thread.is_alive()
     assert _observe(context.paths).status == "running"
@@ -7328,7 +7370,7 @@ def test_malformed_control_request_is_dropped_without_ending_the_control_loop(
     assert control_daemon.run.join(timeout=10) == 0
 
 
-def test_status_request_at_exactly_the_read_bound_is_answered(control_daemon):
+def test_control_status_request_at_exactly_the_read_bound_is_answered(control_daemon):
     line = _padded_status_line(control_daemon.instance, runtime.CONTROL_REQUEST_LIMIT)
     assert len(line) == 8192
     reply = _control_exchange(control_daemon.instance, line)
@@ -7336,13 +7378,14 @@ def test_status_request_at_exactly_the_read_bound_is_answered(control_daemon):
     _assert_control_survives(control_daemon)
 
 
-def test_status_request_split_across_two_writes_is_answered(control_daemon):
+def test_control_status_request_split_across_two_writes_is_answered(control_daemon):
     line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
     middle = len(line) // 2
     reply = _control_exchange(
         control_daemon.instance, b"", chunks=[line[:middle], line[middle:]]
     )
     assert json.loads(reply)["status"] == "ready"
+    _assert_no_control_handler_failure(control_daemon)
 
 
 def test_control_request_bytes_after_the_newline_are_ignored(control_daemon):
