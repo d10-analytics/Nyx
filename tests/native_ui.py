@@ -544,6 +544,28 @@ def attribute_console_windows(
     return attributed
 
 
+def accept_control_from_sampler(
+    samples: list[WindowSample], control_pid: int, reported_handle: int
+) -> set[str] | None:
+    """Return the relations by which the sampler's own records show the control, or ``None``.
+
+    The application is judged only on what the sampler recorded, including the
+    hidden pseudo-console windows only its WinEvent hook can see.  The control
+    therefore validates the sampler only when a control-attributed window is in
+    the sampler's own records, by a process relation or by the handle the
+    control reports.  Evidence from any other observer, such as polling or a
+    console attachment, never counts here.
+    """
+
+    attributed = attribute_console_windows(
+        samples,
+        {control_pid},
+        reported_handles={reported_handle} if reported_handle else frozenset(),
+    )
+    relations = {relation for _, relation in attributed}
+    return relations or None
+
+
 def judging_relations(control_relations: set[str]) -> set[str]:
     """Return the relations by which the application's family is judged.
 
