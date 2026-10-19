@@ -259,7 +259,7 @@ def _handler_for(
                 return
             try:
                 payload = json.loads(self.rfile.read(length))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, RecursionError):
                 self._send(HTTPStatus.BAD_REQUEST, _json_bytes({"error": "invalid_payload"}), "application/json")
                 return
             if (
