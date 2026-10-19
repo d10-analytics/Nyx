@@ -501,17 +501,23 @@ def _validate_stage_order(values: Iterable[str]) -> tuple[str, ...]:
     return names
 
 
-def _canonical_order_root(value: str) -> str:
-    if not isinstance(value, str) or not os.path.isabs(value):
-        raise StageOrderError("stage order root is invalid")
-    try:
-        canonical = Path(value).resolve(strict=False)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise StageOrderError("stage order root is invalid") from error
-    if str(canonical) != value:
-        raise StageOrderError("stage order root is not canonical")
-    if any(_is_within(canonical, footprint) for footprint in _installation_footprints()):
-        raise StageOrderError("stage order root is inside the Nyx installation")
+def _canonical_order_root(
+    value: str, error: type[ConfigurationError] = StageOrderError
+) -> str:
+    """Accept a stored root key by its text alone and return it unchanged.
+
+    The key must be an absolute, already-normalized path without NUL. It is never
+    resolved against the live filesystem, so a key whose directory has since
+    moved or become a symlink still loads and keeps its saved settings.
+    """
+
+    if (
+        not isinstance(value, str)
+        or "\x00" in value
+        or not os.path.isabs(value)
+        or os.path.normpath(value) != value
+    ):
+        raise error("stage order root is invalid")
     return value
 
 
@@ -560,7 +566,7 @@ def _validate_completed_stages(
         raise CompletedStageError("completed stages must be a root-keyed map")
     result: dict[str, tuple[str, ...]] = {}
     for root, names in values.items():
-        canonical_root = _canonical_order_root(root)
+        canonical_root = _canonical_order_root(root, CompletedStageError)
         validated = _validate_completed_stage_names(names)
         if validated:
             result[canonical_root] = validated
@@ -648,7 +654,7 @@ def load_configuration(paths: StatePaths | None = None) -> Configuration:
     _verify_record(selected.config_file)
     try:
         payload = json.loads(selected.config_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ConfigurationError("Nyx configuration cannot be read") from error
     return _configuration_from_payload(payload)
 

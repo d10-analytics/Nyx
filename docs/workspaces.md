@@ -226,6 +226,12 @@ Names that are temporarily absent remain retained in the Board
 settings panel so they can be used again when available. **Cancel** leaves the
 saved policy unchanged; **Reset** removes the current root's completion policy.
 
+Saved stage order and completion names stay keyed to the workspace's original
+path. If you move or relink the workspace folder, Nyx does not carry them to the
+new path and does not delete them; the new path starts with no saved settings.
+Moving the folder back to its original path restores its order and completion
+policy.
+
 At the project level, names beginning with `.`, plus `Reference`, are reserved
 and are not project columns. At the stage level, names beginning with `.`, plus
 `Reference` and `.pipeline`, are reserved and are not stage rows. Nyx ignores
