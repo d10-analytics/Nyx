@@ -7672,7 +7672,13 @@ def control_peer():
                 return thread
 
             try:
-                yield SimpleNamespace(paths=paths, serve=serve, state=state_, release=release)
+                yield SimpleNamespace(
+                    paths=paths,
+                    serve=serve,
+                    state=state_,
+                    release=release,
+                    listener=listener,
+                )
             finally:
                 release.set()
                 listener.close()
@@ -7722,6 +7728,44 @@ def test_control_stop_without_an_acknowledgement_reports_the_shared_timeout_mess
     error_output = capsys.readouterr().err
     assert error_output == f"nyx: {runtime.SHUTDOWN_TIMEOUT_MESSAGE}\n"
     assert "control timed out" not in error_output
+
+
+def test_control_stop_dropped_without_a_reply_after_the_deadline_reports_the_shared_timeout_message(
+    control_peer, capsys
+):
+    # The peer receives the stop, finds the caller's published deadline already
+    # passed, and closes without replying.  A controlled clock makes the
+    # deadline pass deterministically between the send and the empty read, so
+    # the client's own socket timer cannot decide the result.
+    offset = [0.0]
+    real_monotonic = time.monotonic
+
+    def drop_after_deadline() -> None:
+        connection, _ = control_peer.listener.accept()
+        with connection:
+            connection.settimeout(5)
+            line = b""
+            while not line.endswith(b"\n"):
+                line += connection.recv(8192)
+            offset[0] = runtime.SHUTDOWN_TIMEOUT + 10.0
+
+    with patch.object(runtime.time, "monotonic", side_effect=lambda: real_monotonic() + offset[0]):
+        peers = [threading.Thread(target=drop_after_deadline, daemon=True) for _ in range(2)]
+        peers[0].start()
+        with pytest.raises(runtime.ShutdownTimeoutError) as caught:
+            runtime.stop()
+        peers[0].join(timeout=5)
+        assert str(caught.value) == runtime.SHUTDOWN_TIMEOUT_MESSAGE
+        offset[0] = 0.0
+        peers[1].start()
+        with patch.object(runtime, "desktop_host", return_value=False):
+            from nyx import cli
+
+            assert cli.main(["--stop"]) == 1
+        peers[1].join(timeout=5)
+    error_output = capsys.readouterr().err
+    assert error_output == f"nyx: {runtime.SHUTDOWN_TIMEOUT_MESSAGE}\n"
+    assert "control did not respond" not in error_output
 
 
 def test_control_stop_acknowledged_but_never_cleaned_up_reports_the_shared_timeout_message(
