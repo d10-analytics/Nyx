@@ -2244,6 +2244,33 @@ def test_anchor_changed_once_after_read_is_retried_and_read_again(tmp_path):
     assert value["discovery_diagnostics"] == []
 
 
+def test_anchor_changed_after_every_read_is_retried_exactly_once(tmp_path):
+    root = tmp_path / "specs"
+    spec = package(root, "Queue", "changing", "# Before\n") / "spec.md"
+    original_open = catalog.Path.open
+    opens: list[Path] = []
+
+    def rewriting_open(target, *args, **kwargs):
+        stream = original_open(target, *args, **kwargs)
+        if Path(target) == spec:
+            opens.append(Path(target))
+            return RewritingReader(stream, spec, b"# Rewrite\n" + b"x" * len(opens))
+        return stream
+
+    with patch.object(catalog.Path, "open", autospec=True, side_effect=rewriting_open):
+        value = json.loads(catalog.scan_catalog(root))
+    assert len(opens) == 2
+    assert value["identity_coverage"] == {
+        "state": "incomplete",
+        "diagnostics": [
+            {
+                "code": "changed_during_read",
+                "message": "changed during read: Fictional/Queue/changing",
+            }
+        ],
+    }
+
+
 def test_completion_policy_and_stage_names_match_case_sensitively(tmp_path):
     source_id = "11111111-1111-4111-8111-111111111111"
     lower_id = "22222222-2222-4222-8222-222222222222"
