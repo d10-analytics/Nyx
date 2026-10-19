@@ -7338,7 +7338,7 @@ def test_status_request_split_across_two_writes_is_answered(control_daemon):
     assert json.loads(reply)["status"] == "ready"
 
 
-def test_bytes_after_the_request_newline_are_ignored(control_daemon):
+def test_control_request_bytes_after_the_newline_are_ignored(control_daemon):
     line = (json.dumps(_status_request(control_daemon.instance)) + "\n").encode()
     reply = _control_exchange(control_daemon.instance, line + b"trailing bytes, not JSON")
     assert json.loads(reply)["status"] == "ready"
