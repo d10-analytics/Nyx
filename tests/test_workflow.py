@@ -15,6 +15,7 @@ rejects it.
 
 from __future__ import annotations
 
+import ast
 import copy
 import re
 from pathlib import Path
@@ -184,9 +185,9 @@ CONTINUE_ON_ERROR_KEY = "continue-on-error"
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
-# Each desktop cap follows the rule above from its measured duration: CI run
-# 39324066360 took 12m37s (757 s) for nyx-desktop-windows and 6m34s (394 s)
-# for nyx-desktop-macos, so twice each rounds up to 30 and 15 minutes.
+# Each desktop cap follows the rule above from its measured duration: 12m37s
+# (757 s) for nyx-desktop-windows and 6m34s (394 s) for nyx-desktop-macos, so
+# twice each rounds up to 30 and 15 minutes.
 JOB_TIMEOUT_MINUTES = {
     "nyx": 30,
     "nyx-windows": 30,
@@ -1916,6 +1917,64 @@ def test_time_limit_check_names_the_offending_job(
     mutated = copy.deepcopy(load_workflow())
     mutate(mutated)
     assert check_job_time_limits(mutated) == expected
+
+
+DOCUMENTED_INSTALL_PATH = Path(__file__).with_name("test_documented_install.py")
+BUILD_BOUND_JOBS = {"powershell": "nyx-desktop-windows", "bash": "nyx-desktop-macos"}
+
+
+def _documented_build_bounds() -> dict[str, int]:
+    """Read the build bounds from the test module without importing it."""
+
+    tree = ast.parse(DOCUMENTED_INSTALL_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_BUILD_TIMEOUT_MINUTES"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise WorkflowContractViolation("_BUILD_TIMEOUT_MINUTES is not defined")
+
+
+def build_bound_violations(
+    bounds: dict[str, int], workflow: dict[str, Any]
+) -> list[str]:
+    problems: list[str] = []
+    for language, job_name in BUILD_BOUND_JOBS.items():
+        bound = bounds.get(language)
+        cap = _job(workflow, job_name).get(TIMEOUT_KEY)
+        if not isinstance(bound, int) or isinstance(bound, bool) or bound <= 0:
+            problems.append(f"{language}: build bound {bound!r} is not a positive integer")
+        elif bound >= cap:
+            problems.append(
+                f"{language}: build bound {bound} min is not below the {job_name} "
+                f"cap of {cap} min"
+            )
+    return problems
+
+
+def test_documented_build_bound_is_below_each_desktop_job_cap() -> None:
+    assert build_bound_violations(_documented_build_bounds(), load_workflow()) == []
+
+
+@pytest.mark.parametrize(
+    ("bounds", "expected"),
+    [
+        (
+            {"powershell": 45, "bash": 10},
+            ["powershell: build bound 45 min is not below the nyx-desktop-windows cap of 30 min"],
+        ),
+        (
+            {"powershell": 20, "bash": 15},
+            ["bash: build bound 15 min is not below the nyx-desktop-macos cap of 15 min"],
+        ),
+        ({"powershell": 20}, ["bash: build bound None is not a positive integer"]),
+    ],
+)
+def test_build_bound_at_or_above_the_job_cap_is_rejected(
+    bounds: dict[str, int], expected: list[str]
+) -> None:
+    assert build_bound_violations(bounds, load_workflow()) == expected
 
 
 def test_installed_wheel_proof_runs_once_after_the_build_in_each_baseline_job() -> None:
