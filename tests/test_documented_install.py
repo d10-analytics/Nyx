@@ -175,18 +175,42 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
+CHECKOUT_RETIRED_WORDING = (
+    "cached-only labels",
+    "makes no network connection:",
+    "never fetches or contacts a remote",
+    "`default <name> <relation> cached <time>`",
+    "`cached <time>`",
+)
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
         "`nyx checkouts`",
         "`--json`",
         "one line per clone and one indented line per linked worktree",
-        "cached-only labels",
+        "nyx checkouts --no-network",
+        "`--no-network` skips every remote check",
+        "`--no-network` is accepted only with `checkouts`",
+        "`remote live`, `remote off` or `remote failed <reason>`",
+        "`unreachable`, `not_found`, `authentication_failed`, `timed_out` or `failed`",
+        "`branches <basis> local-only <n>`",
+        "`default <name> live <relation> cached <relation> tracking live <relation> "
+        "fetched <time>`",
+        "`default <name> cached <relation> fetched <time>`",
         "`never fetched`",
+        "`no live default`",
+        "`no cached default`",
         "`no origin remote`",
         "`local-only <n>`",
-        "`unknown <n>`",
-        "read-only and makes no network connection",
-        "never fetches or contacts a remote",
+        "`unknown <m>`",
+        "`cached` only ever labels a basis",
+        "By default `nyx checkouts` is networked",
+        "it asks each distinct `origin` remote once",
+        "the count may be borrowed read-only from a sibling clone",
+        "Nyx's own SSH runs in batch mode",
+        "unless you configured an SSH command yourself",
+        "`--no-network` makes no network connection at all",
+        "The command is read-only",
+        "writes no alternates file and never fetches",
         "Checkout folders are set per workspace",
         "A settings editor arrives with the Checkouts view",
         "cannot be combined with `--setup`, `--stop` or `--status`",
@@ -433,6 +457,14 @@ def test_documents_publish_the_checkout_contract():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
         for marker in markers:
             assert marker in document, (name, marker)
+
+
+def test_checkout_documentation_drops_the_cached_only_wording():
+    document = re.sub(
+        r"\s+", " ", (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    )
+    for wording in CHECKOUT_RETIRED_WORDING:
+        assert wording not in document, wording
 
 
 def test_documented_header_limits_match_the_catalog():

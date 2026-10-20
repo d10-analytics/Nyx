@@ -45,12 +45,20 @@ def _parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         metavar="checkouts",
-        help="'checkouts' prints the cached facts of the configured checkout folders",
+        help=(
+            "'checkouts' prints the state of the configured checkout folders, "
+            "checking each distinct remote once"
+        ),
     )
     parser.add_argument(
         "--json",
         action="store_true",
         help="with 'checkouts', print the checkout document instead of one line per checkout",
+    )
+    parser.add_argument(
+        "--no-network",
+        action="store_true",
+        help="with 'checkouts', skip every remote check and report cached values only",
     )
     return parser
 
@@ -111,28 +119,46 @@ def _worktree_elements(worktree: dict[str, Any]) -> list[str]:
     return elements
 
 
+def _comparison_text(comparison: dict[str, Any] | None) -> str:
+    return "unknown" if comparison is None else comparison["relation"]
+
+
 def _remote_and_default_elements(
-    clone: dict[str, Any], has_origin: bool
+    clone: dict[str, Any], remote: dict[str, Any]
 ) -> list[str]:
-    if not has_origin:
-        return ["no origin remote"]
+    check = remote["check"]
+    live = check["status"] == "live"
+    if live:
+        elements = ["remote live"]
+    elif check["status"] == "off":
+        elements = ["remote off"]
+    else:
+        elements = [f"remote failed {check['reason']}"]
+    basis = "live" if live else "cached"
     relations = [
         (branch["vs_remote"] or {}).get("relation") for branch in clone["branches"]
     ]
-    remote = f"local-only {relations.count('absent')}"
+    branches = f"branches {basis} local-only {relations.count('absent')}"
     unknown = relations.count("unknown")
     if unknown:
-        remote += f" unknown {unknown}"
-    elements = [remote]
+        branches += f" unknown {unknown}"
+    elements.append(branches)
     local_default = clone["local_default"]
     if local_default is None:
-        elements.append("no cached default")
+        elements.append("no live default" if live else "no cached default")
+        return elements
+    cached = clone["cached_default"]
+    fetched = None if cached is None else cached["last_fetched_at"]
+    fetched_text = "never fetched" if fetched is None else f"fetched {fetched}"
+    vs_cached = _comparison_text(local_default["vs_cached"])
+    if live:
+        elements.append(
+            f"default {local_default['name']} live "
+            f"{_comparison_text(local_default['vs_live'])} cached {vs_cached} "
+            f"tracking live {_comparison_text(clone['cached_vs_live'])} {fetched_text}"
+        )
     else:
-        cached = clone["cached_default"]
-        fetched = None if cached is None else cached["last_fetched_at"]
-        cached_text = "never fetched" if fetched is None else f"cached {fetched}"
-        relation = (local_default["vs_cached"] or {}).get("relation", "unknown")
-        elements.append(f"default {local_default['name']} {relation} {cached_text}")
+        elements.append(f"default {local_default['name']} cached {vs_cached} {fetched_text}")
     return elements
 
 
@@ -151,7 +177,7 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
     for diagnostic in document["diagnostics"]:
         lines.append(f"diagnostic {diagnostic['code']} {_json_literal(diagnostic['path'])}")
     for repository in document["repositories"]:
-        has_origin = repository["remote"] is not None
+        remote = repository["remote"]
         for clone in repository["clones"]:
             path = _json_literal(clone["path"])
             if clone["status"] != "ok":
@@ -164,7 +190,10 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
                     elements.append(f"main {main['status']}")
                 else:
                     elements.extend(_worktree_elements(main))
-            elements.extend(_remote_and_default_elements(clone, has_origin))
+            if remote is None:
+                elements.append("no origin remote")
+            else:
+                elements.extend(_remote_and_default_elements(clone, remote))
             lines.append("  ".join([path, *elements]))
             for worktree in clone["worktrees"]:
                 if worktree["main"]:
@@ -177,8 +206,11 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _checkouts_command(as_json: bool) -> int:
-    """Print the checkout facts of the active workspace without touching runtime."""
+def _checkouts_command(as_json: bool, no_network: bool) -> int:
+    """Print the checkout facts of the active workspace without touching runtime.
+
+    Remote checks run unless ``no_network`` is set.
+    """
 
     try:
         configuration = state.observe_configuration()
@@ -197,7 +229,9 @@ def _checkouts_command(as_json: bool) -> int:
         return 0
     deadline = time.monotonic_ns() + _CHECKOUTS_DEADLINE_SECONDS * 1_000_000_000
     try:
-        rendered = checkouts.collect_checkouts(folders, deadline_ns=deadline)
+        rendered = checkouts.collect_checkouts(
+            folders, deadline_ns=deadline, remote_checks=not no_network
+        )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
         return 1
@@ -285,9 +319,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "checkouts":
         if _retired_arguments(args):
             parser.error("checkouts cannot be combined with --setup, --stop or --status")
-        return _checkouts_command(args.json)
+        return _checkouts_command(args.json, args.no_network)
     if args.json:
         parser.error("--json is only available with checkouts")
+    if args.no_network:
+        parser.error("--no-network is only available with checkouts")
     if runtime.desktop_host():
         if _retired_arguments(args):
             print(f"nyx: {_DESKTOP_LIFECYCLE_REFUSAL}", file=sys.stderr)
