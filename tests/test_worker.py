@@ -215,11 +215,12 @@ def test_inherited_worker_completes_while_parent_liveness_pipe_remains_open() ->
 
 
 class _HandleInheritanceRaceError(Exception):
-    """Defect U5: a concurrent fetch cleared a handle another fetch passes."""
+    """A concurrent fetch cleared a handle another fetch was still passing."""
 
 
 _WINDOWS_ERROR_BAD_PARAMETER = 87
 _RACE_WAIT_SECONDS = 20.0
+_RACE_PARK_SECONDS = 10.0
 
 
 @pytest.mark.skipif(
@@ -230,7 +231,7 @@ _RACE_WAIT_SECONDS = 20.0
     condition=os.name == "nt",
     raises=_HandleInheritanceRaceError,
     strict=True,
-    reason="U5: on Windows a concurrent fetch clears a handle another fetch passes (error 87)",
+    reason="on Windows a concurrent fetch clears a handle another fetch passes (error 87)",
 )
 def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn() -> None:
     with TemporaryDirectory() as temporary:
@@ -302,7 +303,7 @@ def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn()
                 name = threading.current_thread().name
                 if name == "B":
                     b_marked.set()
-                    if not a_cleared.wait(_RACE_WAIT_SECONDS):
+                    if not a_cleared.wait(_RACE_PARK_SECONDS):
                         released_by_timeout.append(True)
                 if name in marks:
                     record(name, "popen")
@@ -352,11 +353,12 @@ def test_overlapping_fetches_keep_inherited_handles_inheritable_for_each_spawn()
                 ("A", "clear"),
                 ("B", "popen"),
             ]
-            if released_by_timeout or collapsed[: len(expected_sequence)] != expected_sequence:
-                pytest.fail(
-                    "forced interleaving did not occur; observed "
-                    f"{collapsed!r}, timed-out release {bool(released_by_timeout)}"
-                )
+            # The overlap is forced only while the product still toggles
+            # inheritability: when A never clears while B is parked (spawns are
+            # serialized, inheritance is counted, or no toggling remains), B was
+            # released by the bounded wait and only the outcome is judged below.
+            if not released_by_timeout and collapsed[: len(expected_sequence)] != expected_sequence:
+                pytest.fail(f"forced interleaving did not occur as designed; observed {collapsed!r}")
 
             if failures:
                 error = failures.get("B")
