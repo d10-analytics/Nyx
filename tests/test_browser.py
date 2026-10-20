@@ -825,7 +825,7 @@ def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_
     assert page.get_by_role("checkbox", name="Counts as finished: Done").is_enabled()
     page.get_by_role("checkbox", name="Counts as finished: Done").uncheck()
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.completed == ["Absent"]
 
 
@@ -909,13 +909,13 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
     page_b.get_by_role("button", name="Save").click()
     page_b.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     page_b.get_by_role("button", name="Reload board settings").click()
-    page_b.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page_b.get_by_text("Current board settings loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
     page_b.get_by_role("button", name="Save").click()
     # The competing save must commit, and its own catalog refresh must consume
     # the next snapshot, before the delayed refresh is released; otherwise the
     # delayed snapshot could be stamped with a revision that is still current.
-    page_b.get_by_text("Board row order saved.", exact=True).wait_for()
+    page_b.get_by_text("Board settings saved.", exact=True).wait_for()
     playwright.expect(
         page_b.locator(f'.card[data-package-id="{GATE}"] .card-title')
     ).to_have_text("Stale gate")
@@ -933,7 +933,7 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
     }""")
     client.release.set()
 
-    page_a.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page_a.get_by_text("Current board settings loaded.", exact=True).wait_for()
     playwright.expect(gate_title).to_have_text("Fresh gate")
     assert page_a.evaluate("window.sawRejectedSnapshot") is False
     assert settings.completed == []
@@ -972,7 +972,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         page.get_by_role("button", name="Save").click()
         assert client.started.wait(timeout=5)
         # The save message only lasts until the blocked post-save refresh resolves.
-        page.get_by_text("Board row order saved.", exact=True).wait_for(timeout=15000)
+        page.get_by_text("Board settings saved.", exact=True).wait_for(timeout=15000)
         gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
         assert gate_title.inner_text() == "Gate step"
         page.evaluate("""() => {
@@ -986,7 +986,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         client.release.set()
         playwright.expect(gate_title).to_have_text("Fresh gate", timeout=15000)
 
-    assert page.locator("#stage-order-status").inner_text() == "Current board row order loaded."
+    assert page.locator("#stage-order-status").inner_text() == "Current board settings loaded."
     assert page.evaluate("window.sawRejectedSnapshot") is False
 
 
@@ -1009,7 +1009,7 @@ def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(
     page.locator(f'.card[data-package-id="{LOOSE}"]').click()
     page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
 
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert "blocks:" in step_two.locator(".card-links").inner_text()
@@ -1042,7 +1042,7 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
     open_stage_editor(page)
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
     # Queue now counts as finished, so the refreshed board hides its row and
     # the arrow from the target while terminal rows are hidden.
     playwright.expect(target).to_have_count(0, timeout=15000)
@@ -1677,11 +1677,11 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page.get_by_role("button", name="Cancel").click()
     assert settings.calls == []
     assert page.locator("#stage-order-status").inner_text() == (
-        "Unsaved board row order changes cancelled."
+        "Unsaved board settings changes cancelled."
     )
     page.get_by_role("button", name="Move Under Development up").press("Enter")
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
     page.wait_for_function(
         "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
@@ -1694,7 +1694,7 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     open_stage_editor(page2)
     assert row_labels(page2) == ["Under Development", "Queue"]
     page2.get_by_role("button", name="Reset").click()
-    page2.get_by_text("Board row order saved.", exact=True).wait_for()
+    page2.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.order == []
     page2.wait_for_function(
         "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
@@ -1786,7 +1786,7 @@ def test_stage_editor_focus_stays_on_used_control_or_successor(open_page):
     assert settings.get_calls == 5
     assert_focus_sampler_clean(page)
     reload.press("Enter")
-    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
     assert settings.get_calls == 6
     assert len(settings.calls) == 4
@@ -1844,7 +1844,7 @@ def test_stage_editor_focus_survives_held_settings_requests(open_page):
         assert_focus_sampler_clean(retry_page)
     finally:
         failed.gate.set()
-    playwright.expect(retry_page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(retry_page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     playwright.expect(retry_page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
     assert failed.get_calls == 2
     assert failed.calls == []
@@ -1874,7 +1874,7 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     open_stage_editor(page)
 
     page.get_by_text(
-        "Could not load board row order: producer_unavailable", exact=True
+        "Could not load board settings: producer_unavailable", exact=True
     ).wait_for()
     assert settings.get_calls == 1
     assert page.get_by_role("button", name="Save").is_disabled()
@@ -1882,12 +1882,12 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     assert retry.is_visible()
 
     retry.click()
-    page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    page.get_by_text("Current board settings loaded.", exact=True).wait_for()
     assert settings.get_calls == 2
     assert stage_editor_order(page) == ["Queue", "Under_Development"]
     page.get_by_role("button", name="Move Under Development up").click()
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
 
 
@@ -1902,24 +1902,27 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
     assert settings.get_calls == 2
 
     winning_page.get_by_role("button", name="Reset").click()
-    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    winning_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", [], [])]
 
     stale_page.get_by_role("button", name="Move Under Development up").click()
     stale_page.get_by_role("button", name="Save").click()
-    stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
+    stale_page.get_by_text(
+        "Save not applied: conflict. Reload board settings to replace this unsaved draft and try again.",
+        exact=True,
+    ).wait_for()
     assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
     assert stale_page.get_by_role("button", name="Save").is_disabled()
     reload = stale_page.get_by_role("button", name="Reload board settings")
     assert reload.is_visible()
 
     reload.click()
-    stale_page.get_by_text("Current board row order loaded.", exact=True).wait_for()
+    stale_page.get_by_text("Current board settings loaded.", exact=True).wait_for()
     assert settings.get_calls == 4
     assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
     stale_page.get_by_role("button", name="Move Under Development up").click()
     stale_page.get_by_role("button", name="Save").click()
-    stale_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    stale_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [
         ("revision-1", [], []),
         ("revision-1", ["Under_Development", "Queue"], []),
@@ -1938,7 +1941,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
 
     winning_page.get_by_role("button", name="Move Under Development up").press("Enter")
     winning_page.get_by_role("button", name="Save").click()
-    winning_page.get_by_text("Board row order saved.", exact=True).wait_for()
+    winning_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
     winning_page.wait_for_function(
         "() => JSON.stringify([...document.querySelectorAll('.row-head')].map(row => row.firstChild.textContent)) === "
@@ -1957,7 +1960,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
     winning_page.get_by_role("button", name="Save").click()
     winning_page.get_by_text(
-        "Save failed: the board row order was not persisted.", exact=True
+        "Save failed: the board settings were not persisted.", exact=True
     ).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
     assert row_labels(winning_page) == ["Under Development", "Queue"]
@@ -2028,10 +2031,10 @@ def test_apply_reloads_settings_saved_on_another_page_without_a_draft(open_page)
     page = open_page(
         StaticClient(three_stage_payload()), settings=settings, init_script=SETTINGS_LOAD_COUNTER,
     )
-    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     other = open_same_board(page)
     try:
-        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
         playwright.expect(other.locator(".row-head")).to_have_text(["Queue", "Under Development", "Review"])
 
         before_save = settings.get_calls
@@ -2040,7 +2043,7 @@ def test_apply_reloads_settings_saved_on_another_page_without_a_draft(open_page)
         # The saving page refreshes through its post-save fetch alone.
         assert settings_loads(page) == page_loads + 1
         assert settings.get_calls == before_save + 1
-        assert page.locator("#stage-order-status").inner_text() == "Board row order saved."
+        assert page.locator("#stage-order-status").inner_text() == "Board settings saved."
 
         before_apply = settings.get_calls
         other_loads = settings_loads(other)
@@ -2057,11 +2060,11 @@ def test_apply_reloads_settings_saved_on_another_page_without_a_draft(open_page)
 def test_apply_keeps_unsaved_draft_when_settings_change_on_another_page(open_page, draft):
     settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
     page = open_page(StaticClient(three_stage_payload()), settings=settings)
-    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     other = open_same_board(page)
     try:
         status = other.locator("#stage-order-status")
-        playwright.expect(status).to_have_text("Current board row order loaded.")
+        playwright.expect(status).to_have_text("Current board settings loaded.")
         open_stage_editor(other)
         queue_finished = other.get_by_role("checkbox", name="Counts as finished: Queue", exact=True)
         if draft == "row-move":
@@ -2087,7 +2090,7 @@ def test_apply_keeps_unsaved_draft_when_settings_change_on_another_page(open_pag
         assert settings.get_calls == before
 
         reload.click()
-        playwright.expect(status).to_have_text("Current board row order loaded.")
+        playwright.expect(status).to_have_text("Current board settings loaded.")
         assert stage_editor_order(other) == ["Queue", "Review", "Under_Development"]
         assert not queue_finished.is_checked()
         assert other.get_by_role("button", name="Save", exact=True).is_disabled()
@@ -2101,12 +2104,12 @@ def test_apply_adds_no_settings_load_while_settings_await_reload(open_page):
     settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
     client = StaticClient(three_stage_payload())
     page = open_page(client, settings=settings)
-    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     settings.fail_next_load = True
     other = open_same_board(page)
     try:
         status = other.locator("#stage-order-status")
-        failure = "Could not load board row order: producer_unavailable"
+        failure = "Could not load board settings: producer_unavailable"
         playwright.expect(status).to_have_text(failure)
 
         save_review_first_elsewhere(page, settings)
@@ -2129,7 +2132,7 @@ def test_apply_adds_no_settings_load_while_settings_await_reload(open_page):
 def test_settings_load_held_across_the_first_apply_is_the_only_load(open_page):
     settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
     page = open_page(StaticClient(three_stage_payload()), settings=settings)
-    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     before = settings.get_calls
     settings.gate = threading.Event()
     other = page.context.new_page()
@@ -2142,7 +2145,7 @@ def test_settings_load_held_across_the_first_apply_is_the_only_load(open_page):
         ).to_have_text("Foundation step", timeout=15000)
         assert settings_loads(other) == 1
         settings.gate.set()
-        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+        playwright.expect(other.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
         assert settings_loads(other) == 1
         assert settings.get_calls == before + 1
     finally:
@@ -2171,7 +2174,7 @@ def test_apply_during_an_in_flight_save_keeps_the_editor_usable(open_page):
     client = StaticClient(three_stage_payload())
     page = open_page(client, settings=settings, init_script=SETTINGS_LOAD_COUNTER)
     status = page.locator("#stage-order-status")
-    playwright.expect(status).to_have_text("Current board row order loaded.")
+    playwright.expect(status).to_have_text("Current board settings loaded.")
     open_stage_editor(page)
     page.get_by_role("button", name="Move Review up", exact=True).click()
     loads = settings_loads(page)
@@ -2186,12 +2189,12 @@ def test_apply_during_an_in_flight_save_keeps_the_editor_usable(open_page):
         playwright.expect(
             page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
         ).to_have_text("Renamed foundation")
-        assert status.text_content() == "Saving board row order…"
+        assert status.text_content() == "Saving board settings…"
         assert settings_loads(page) == loads
     finally:
         settings.hold.set()
     playwright.expect(page.locator(".row-head")).to_have_text(["Queue", "Review", "Under Development"])
-    playwright.expect(status).to_have_text("Board row order saved.")
+    playwright.expect(status).to_have_text("Board settings saved.")
     assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
     assert not page.get_by_role("button", name="Reload board settings", exact=True).is_visible()
     assert page.get_by_role("button", name="Move Queue down", exact=True).is_enabled()
@@ -2230,7 +2233,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
     assert page.locator("#filter").input_value() == "dependent"
     page.get_by_role("button", name="Save").click()
-    page.get_by_text("Board row order saved.", exact=True).wait_for()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
     page.wait_for_function(
@@ -3517,7 +3520,7 @@ def test_stage_editor_busy_focus_indicators_keep_composited_contrast(open_page, 
     if request_kind == "save":
         playwright.expect(page.locator(".row-head")).to_have_text(["Under Development", "Queue"])
     else:
-        playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board row order loaded.")
+        playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     assert_focus_sampler_clean(page)
 
 
