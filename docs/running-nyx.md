@@ -99,14 +99,35 @@ the packaged desktop application has no `nyx` command. It never starts, stops or
 inspects the Nyx service, never launches the desktop application, and cannot be
 combined with `--setup`, `--stop` or `--status`.
 
-Each line starts with the checkout's path and then gives its branch (or
-`detached <sha>`), the `staged`, `unstaged`, `untracked` and `conflicted` counts,
-any `operations` in progress such as `merge`, `local-only <n>` (local branches
-with no same-name branch on `origin`, followed by `unknown <n>` when a
-comparison could not be made), and `default <name> <relation> cached <time>`.
-A clone that has never fetched shows `never fetched`; one without an `origin`
-remote shows `no origin remote`. A checkout git refused or could not read shows
-its path and its status instead.
+Before the checkouts, a few lines report problems with the setup itself.
+`git missing` means no `git` was found on `PATH`, and `git too_old <version>`
+means git is older than 2.36 (without a version when git's answer could not be
+read); either way no checkouts are listed. `folder <path> <status>` names a
+configured folder that is `missing`, `unreadable` or `not_directory`.
+`diagnostic <code> <path>` reports something left out of the list:
+`not_a_repository` for a directory that has a `.git` entry but is not the top of
+its own repository, and `unrepresentable_path` for a checkout whose path cannot
+be shown safely, such as one containing a control character, where the path is
+the folder or clone it belongs under, or `null` for a configured folder itself.
+
+Each clone or worktree line starts with the checkout's path, quoted as a JSON
+string, and then gives, separated by two spaces, its branch as `branch <name>`,
+`detached <sha>`, or `unborn <name>` for a branch with no commits yet; the
+`staged`, `unstaged`, `untracked` and `conflicted` counts; and any `operations`
+in progress such as `merge`. A clone line shows its main worktree's branch and
+counts, or `main <status>` when that worktree could not be read; a bare
+repository's line has neither. Clone lines then add `local-only <n>` (local
+branches with no same-name branch on `origin`, followed by `unknown <n>` when a
+comparison could not be made) and `default <name> <relation> cached <time>`.
+The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
+but not counted, as in a shallow clone), `absent` (one of the two branches does
+not exist) or `unknown`. A clone that has never fetched shows `never fetched`
+in place of `cached <time>`; one whose `origin` default branch is not cached
+shows `no cached default`; one without an `origin` remote shows
+`no origin remote` and no default. A checkout git refused or could not read
+shows its path and its status instead: `unsafe_ownership` when git refuses it
+for ownership, `timed_out` when git did not finish in time, and otherwise
+`failed`.
 
 The facts are cached-only labels: every comparison uses the remote-tracking
 branches this clone already has, so the output can be older than the remote
