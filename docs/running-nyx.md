@@ -153,11 +153,29 @@ run it.
 ### Build the private artifact
 
 From the repository root, install the pinned desktop and build extras and run
-the build driver. Windows PowerShell:
+the build driver.
+
+On Windows the build needs Visual Studio 2022 or later, or its Build Tools, with the MSVC
+C++ x64 build tools (the **Desktop development with C++** workload). The block
+loads that toolchain's environment with `vswhere` and `vcvars64.bat` before the
+build: Nuitka compiles with it, and the deployment tool uses its `dumpbin` to
+discover the Qt modules the application depends on. If the toolchain or
+`dumpbin` is missing, the block stops with an error instead of building.
+Windows PowerShell:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install '.[desktop,build]'
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found; install Visual Studio 2022 or later, or its Build Tools' }
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw 'no Visual Studio installation has the MSVC C++ x64 build tools' }
+$vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+cmd /c "`"$vcvars`" && set" | ForEach-Object {
+  if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+}
+if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit code $LASTEXITCODE" }
+if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) { throw 'dumpbin.exe is not on PATH after loading the build tools' }
 .\.venv\Scripts\python.exe scripts\build_desktop.py
 ```
 
