@@ -483,6 +483,7 @@ class _CloneContext:
     local: dict[str, tuple[str, str]]
     cached: dict[str, str]
     ssh_configured: bool
+    common: str = ""
 
 
 @dataclass
@@ -968,6 +969,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         local=local,
         cached=cached,
         ssh_configured=_has_ssh_command(configuration.out),
+        common=common,
     )
     return _CloneOutcome(clone, remote, diagnostics, context)
 
@@ -1195,11 +1197,24 @@ def _present_objects(
     return result
 
 
+def _lendable(context: _CloneContext) -> bool:
+    """Whether this clone may lend objects: complete history and a path that
+    cannot be split or quoted inside ``GIT_ALTERNATE_OBJECT_DIRECTORIES``."""
+    return (
+        not context.partial
+        and not context.shallow
+        and bool(context.common)
+        and os.pathsep not in context.common
+        and not context.common.startswith('"')
+    )
+
+
 def _apply_live(
     runner: _GitRunner,
     context: _CloneContext,
     clone: dict[str, Any],
     answer: _LiveAnswer,
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
 ) -> None:
     """Replace one clone's cached comparisons with the live ones, in place."""
     name, live_sha = answer.name, answer.sha
@@ -1218,6 +1233,46 @@ def _apply_live(
         _present_objects(runner, context, wanted) if wanted and not guarded else {}
     )
     memo: dict[tuple[str, str], dict[str, Any]] = {}
+    lacking = [item for item in wanted if presence.get(item) == "missing"]
+    candidates = [(c, x) for c, x in siblings if _lendable(x)]
+    sibling_presence: dict[int, dict[str, str]] = {}
+
+    def lender(right: str) -> tuple[dict[str, Any], _CloneContext] | str | None:
+        """The first lendable sibling in natural order holding ``right``, or the
+        state (``unknown`` or ``differs``) of a probe that could not say."""
+        for index, (sibling, sibling_context) in enumerate(candidates):
+            if index not in sibling_presence:
+                sibling_presence[index] = _present_objects(runner, sibling_context, lacking)
+            state = sibling_presence[index].get(right, "missing")
+            if state == "present":
+                return sibling, sibling_context
+            if state != "missing":
+                return state
+        return None
+
+    def borrowed(left: str, right: str) -> dict[str, Any]:
+        source = lender(right)
+        if source is None:
+            return _comparison("differs", basis="live")
+        if isinstance(source, str):
+            return _comparison(source, basis="live")
+        sibling, sibling_context = source
+        result = _counted_comparison(
+            runner.run(
+                ["rev-list", "--left-right", "--count", f"{left}...{right}"],
+                path=context.cwd,
+                ceiling=context.ceiling,
+                overlay={
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.join(
+                        sibling_context.common, "objects"
+                    )
+                },
+            ),
+            "live",
+        )
+        if result["relation"] in ("ahead", "behind", "diverged"):
+            result["objects_from"] = sibling["path"]
+        return result
 
     def live(left: str | None, right: str | None) -> dict[str, Any]:
         if left is None or right is None:
@@ -1227,19 +1282,20 @@ def _apply_live(
         if guarded:
             return _comparison("differs", basis="live")
         state = presence.get(right, "missing")
-        if state == "unknown":
-            return _comparison("unknown", basis="live")
-        if state != "present":
-            return _comparison("differs", basis="live")
+        if state in ("unknown", "differs"):
+            return _comparison("unknown" if state == "unknown" else "differs", basis="live")
         if (left, right) not in memo:
-            memo[(left, right)] = _counted_comparison(
-                runner.run(
-                    ["rev-list", "--left-right", "--count", f"{left}...{right}"],
-                    path=context.cwd,
-                    ceiling=context.ceiling,
-                ),
-                "live",
-            )
+            if state == "present":
+                memo[(left, right)] = _counted_comparison(
+                    runner.run(
+                        ["rev-list", "--left-right", "--count", f"{left}...{right}"],
+                        path=context.cwd,
+                        ceiling=context.ceiling,
+                    ),
+                    "live",
+                )
+            else:
+                memo[(left, right)] = borrowed(left, right)
         return memo[(left, right)]
 
     clone["cached_vs_live"] = live(cached_sha, live_sha)
@@ -1300,7 +1356,7 @@ def _check_remotes(
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         answers = list(pool.map(query, chosen))
-        work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer]] = []
+        work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
         for group, answer in zip(groups, answers):
             if answer.reason is not None:
                 group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
@@ -1309,10 +1365,21 @@ def _check_remotes(
             group["default_branch"] = {"name": answer.name, "live_sha": answer.sha}
             for clone in group["clones"]:
                 if clone["status"] == "ok" and clone["path"] in contexts:
-                    work.append((contexts[clone["path"]], clone, answer))
+                    work.append((contexts[clone["path"]], clone, answer, group))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
-        list(pool.map(lambda item: _apply_live(runner, *item), work))
+        def apply(item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]) -> None:
+            context, clone, answer, group = item
+            siblings = [
+                (other, contexts[other["path"]])
+                for other in group["clones"]
+                if other is not clone
+                and other["status"] == "ok"
+                and other["path"] in contexts
+            ]
+            _apply_live(runner, context, clone, answer, siblings)
+
+        list(pool.map(apply, work))
 
 
 def _render(document: dict[str, Any]) -> str:
