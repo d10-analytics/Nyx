@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import native_ui
 import pytest
@@ -1489,6 +1489,70 @@ def _locate_card(
             for a in attempts
         )
     )
+
+
+class _FakeWindowsInput:
+    """A ``user32`` double whose cursor placement and input injection are separate."""
+
+    def __init__(self, *, injection: str) -> None:
+        self.injection = injection
+        self.cursor = (500, 500)
+        self.send_calls = 0
+        self.mock = MagicMock()
+        self.mock.GetSystemMetrics.side_effect = lambda metric: {
+            76: 0, 77: 0, 78: 1920, 79: 1080}[metric]
+        self.mock.SetCursorPos.side_effect = self._set_cursor
+        self.mock.GetCursorPos.side_effect = self._get_cursor
+        self.mock.SendInput.side_effect = self._send_input
+
+    def _set_cursor(self, x: int, y: int) -> int:
+        self.cursor = (x, y)
+        return 1
+
+    def _get_cursor(self, reference: object) -> int:
+        reference._obj.x, reference._obj.y = self.cursor
+        return 1
+
+    def _send_input(self, count: int, array: object, size: int) -> int:
+        self.send_calls += 1
+        if self.injection == "refused":
+            return 0
+        if self.injection == "delivered":
+            move = array[0].mi
+            self.cursor = (round(move.dx * 1919 / 65535), round(move.dy * 1079 / 65535))
+        return count
+
+
+def _windows_backend_over(fake: _FakeWindowsInput):
+    from ctypes import wintypes
+
+    backend = object.__new__(native_ui._WindowsBackend)
+    backend._wintypes = wintypes
+    backend.user32 = fake.mock
+    backend.kernel32 = MagicMock()
+    backend._declare()
+    return backend
+
+
+@pytest.mark.parametrize("injection", ["refused", "ignored"])
+def test_windows_authority_requires_delivered_input_not_cursor_placement(
+    injection: str, monkeypatch
+):
+    monkeypatch.setattr(native_ui.ctypes, "get_last_error", lambda: 0, raising=False)
+    fake = _FakeWindowsInput(injection=injection)
+    backend = _windows_backend_over(fake)
+    with pytest.raises(native_ui.AuthorityError):
+        backend.check_authority()
+    assert fake.send_calls >= 1
+
+
+def test_windows_authority_passes_when_input_moves_the_cursor(monkeypatch):
+    monkeypatch.setattr(native_ui.ctypes, "get_last_error", lambda: 0, raising=False)
+    fake = _FakeWindowsInput(injection="delivered")
+    backend = _windows_backend_over(fake)
+    assert "SendInput delivery" in backend.check_authority()
+    assert fake.send_calls == 1
+    assert fake.cursor == (60, 60)
 
 
 def test_native_driver_authority_probe_records_the_lane_result(artifact: ArtifactLayout):

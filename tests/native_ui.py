@@ -1097,8 +1097,15 @@ class _WindowsBackend:
                 f"the input desktop is not accessible (error {ctypes.get_last_error()})"
             )
         self.user32.CloseDesktop(desktop)
+        # Park the cursor elsewhere with a non-input call, then require SendInput
+        # alone to bring it to the target, so a refused or ignored injection
+        # cannot pass on the strength of cursor placement.
         target = (60, 60)
-        self.move(*target)
+        self.move(200, 200)
+        try:
+            self._send_absolute_move(*target)
+        except DriverError as error:
+            raise AuthorityError(f"input was not accepted: {error}") from error
         point = wintypes.POINT()
         if not self.user32.GetCursorPos(ctypes.byref(point)):
             raise AuthorityError("GetCursorPos failed")
@@ -1220,6 +1227,20 @@ class _WindowsBackend:
         event.ki.wScan = scan
         event.ki.dwFlags = flags
         return event
+
+    def _send_absolute_move(self, x: float, y: float) -> None:
+        """Deliver an absolute virtual-desktop mouse move through ``SendInput``."""
+
+        left, top, width, height = (
+            self.user32.GetSystemMetrics(metric) for metric in (76, 77, 78, 79)
+        )
+        if width <= 0 or height <= 0:
+            raise DriverError(f"the virtual desktop has no extent: {width}x{height}")
+        event = self._mouse(0x0001 | 0x4000 | 0x8000)  # MOVE | VIRTUALDESK | ABSOLUTE
+        event.mi.dx = int(round((x - left) * 65535 / max(width - 1, 1)))
+        event.mi.dy = int(round((y - top) * 65535 / max(height - 1, 1)))
+        self._send(event)
+        time.sleep(0.1)
 
     def move(self, x: float, y: float) -> None:
         if not self.user32.SetCursorPos(int(round(x)), int(round(y))):
