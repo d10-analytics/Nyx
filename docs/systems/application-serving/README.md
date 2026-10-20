@@ -5,9 +5,8 @@ README is narrative only.
 
 ## Responsibilities
 
-- `ApplicationRuntime`: shared HTTP, catalog admission, and worker lifecycle.
-- The loopback-only server, the catalog worker, and the packaged desktop
-  worker entry.
+- `ApplicationRuntime`: shared HTTP, catalog admission, and worker lifecycle;
+  the loopback-only server, the catalog worker, and the desktop worker entry.
 - Board settings are read and saved through `save_configuration_owned` after
   the revision check; `/api/workspace` is read-only.
 
