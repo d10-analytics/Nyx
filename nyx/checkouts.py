@@ -587,6 +587,30 @@ def _linked_git_directories(common: str) -> dict[str, str]:
     return result
 
 
+def _claimed_elsewhere(path: str, git_directory: str) -> bool:
+    """Whether the worktree's current `.git` names a different git directory.
+
+    A missing or unreadable `.git` is not a claim by anyone else: the worktree
+    stays listed and its status simply fails.
+    """
+    marker = os.path.join(path, ".git")
+    if os.path.isdir(marker):
+        return True
+    try:
+        with open(marker, "rb") as handle:
+            first = _decode(handle.read(4096)).split("\n", 1)[0].strip()
+    except OSError:
+        return False
+    if not first.startswith("gitdir:"):
+        return True
+    pointer = first[len("gitdir:") :].strip()
+    if not pointer:
+        return True
+    if not os.path.isabs(pointer):
+        pointer = os.path.join(path, pointer)
+    return os.path.realpath(pointer) != os.path.realpath(git_directory)
+
+
 def _operations(git_directory: str) -> list[str]:
     found = set()
     if _exists(os.path.join(git_directory, "MERGE_HEAD")):
@@ -776,6 +800,13 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         git_directory = (
             common if main else linked_directories.get(os.path.realpath(item.path))
         )
+        if (
+            not main
+            and git_directory is not None
+            and not item.prunable
+            and _claimed_elsewhere(item.path, git_directory)
+        ):
+            continue
         worktrees.append(
             _worktree_document(runner, item, main=main, git_directory=git_directory)
         )
