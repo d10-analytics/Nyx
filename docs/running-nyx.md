@@ -176,9 +176,16 @@ could not ask or finish asking falls back to cached values and shows
 the count may be borrowed read-only from a sibling clone of the same remote
 that has the commit; the JSON document names that sibling. Nyx's own SSH runs
 in batch mode, so it never stops to ask for a password or passphrase, unless you
-configured an SSH command yourself. `--no-network` makes no network connection
-at all: `remote off`, and every value comes from the remote-tracking branches
-the clone already has, so it can be older than the remote until you fetch.
+configured an SSH command yourself. An SSH command or credential helper that you
+configured runs exactly as configured, so whether it asks for input depends on
+that configuration. When a remote check runs out of time, Nyx stops git itself
+but not the programs git started to reach the remote, such as your SSH command,
+a credential helper or git's HTTP helper. Such a program can keep running after
+`nyx checkouts` has printed its result and exited, and a prompt it opened can
+stay on the terminal until that program ends or you stop it. `--no-network`
+makes no network connection at all: `remote off`, and every value comes from
+the remote-tracking branches the clone already has, so it can be older than the
+remote until you fetch.
 
 The command is read-only: it changes no repository, takes no git lock, writes
 no alternates file and never fetches, so asking a remote leaves every clone as
