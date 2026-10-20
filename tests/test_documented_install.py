@@ -9,12 +9,14 @@ than a detached console daemon.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -486,17 +488,67 @@ def _session_arguments(block: str) -> list[str]:
     return ["bash", "-euo", "pipefail", "-c", block]
 
 
+_TIMEOUT_REPORT_GRACE_SECONDS = 10.0
+
+
+def _kill_session_tree(process: subprocess.Popen) -> None:
+    """Kill the session shell and every descendant that holds its output pipes."""
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True, check=False,
+        )
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        process.kill()
+
+
 def _run_session(
     block: str, *, root: Path, environment: dict[str, str] | None = None,
     timeout: float,
 ) -> subprocess.CompletedProcess:
+    """Run ``block`` as one shell session, killing its whole process tree on timeout.
+
+    ``subprocess.run`` kills only the shell, and the build children that keep the
+    output pipes open then keep the read blocked.  The session therefore leads
+    its own process group (or is killed with ``taskkill /T`` on Windows), and the
+    partial output is collected with a bounded read before the timeout is raised.
+    """
+
     arguments = _session_arguments(block)
     if shutil.which(arguments[0]) is None:
         pytest.fail(f"the lane's shell {arguments[0]!r} is not available")
-    return subprocess.run(
-        arguments, cwd=root, env=environment, capture_output=True, text=True,
-        check=False, timeout=timeout,
-    )
+    options: dict[str, object] = {}
+    if os.name != "nt":
+        options["start_new_session"] = True
+    with subprocess.Popen(
+        arguments, cwd=root, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, **options,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as expired:
+            _kill_session_tree(process)
+            try:
+                stdout, stderr = process.communicate(timeout=_TIMEOUT_REPORT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired as lingering:
+                stdout, stderr = lingering.stdout, lingering.stderr
+            raise subprocess.TimeoutExpired(
+                arguments, timeout, output=_as_text(stdout), stderr=_as_text(stderr)
+            ) from expired
+        except BaseException:
+            _kill_session_tree(process)
+            raise
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
+
+def _as_text(output: str | bytes | None) -> str:
+    if output is None:
+        return ""
+    return output.decode(errors="replace") if isinstance(output, bytes) else output
 
 
 def test_session_fails_hard_when_the_lane_shell_is_missing(tmp_path, monkeypatch):
@@ -504,6 +556,36 @@ def test_session_fails_hard_when_the_lane_shell_is_missing(tmp_path, monkeypatch
     monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(pytest.fail.Exception, match=rf"the lane's shell '{shell}' is not available"):
         _run_session("unused", root=tmp_path, timeout=120)
+
+
+def test_session_timeout_kills_the_tree_and_reports_partial_output(tmp_path):
+    heartbeat = tmp_path / "heartbeat"
+    child = (
+        "import time\n"
+        "print('session-started', flush=True)\n"
+        f"path = {str(heartbeat)!r}\n"
+        "end = time.monotonic() + 120\n"
+        "while time.monotonic() < end:\n"
+        "    open(path, 'a').write('x')\n"
+        "    time.sleep(0.1)\n"
+    )
+    script = tmp_path / "outlives.py"
+    script.write_text(child, encoding="utf-8")
+    if os.name == "nt":
+        block = f"& '{sys.executable}' '{script}'\necho after-child"
+    else:
+        block = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}\necho after-child"
+    timeout = 3.0
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        _run_session(block, root=tmp_path, timeout=timeout)
+    elapsed = time.monotonic() - started
+    assert elapsed < timeout + _TIMEOUT_REPORT_GRACE_SECONDS, elapsed
+    assert "session-started" in _as_text(raised.value.stdout)
+    size = heartbeat.stat().st_size
+    assert size > 0
+    time.sleep(1.0)
+    assert heartbeat.stat().st_size == size, "the foreground child survived the timeout"
 
 
 def _native_exit(code: int) -> str:
