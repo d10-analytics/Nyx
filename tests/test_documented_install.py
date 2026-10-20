@@ -553,10 +553,10 @@ def test_dependency_and_completion_policy_text_matches_the_board():
     assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
     assert "actionable configuration explanation" not in _normalized(
         "docs/specification-reference.md")
-    for name in ("docs/workspaces.md", "docs/specification-reference.md"):
-        document = _normalized(name)
-        assert "**Board settings**" in document, name
-        assert "**unknown**" in document, name
+    assert "The policy is set in **Board settings**; a missing policy" in _normalized(
+        "docs/workspaces.md")
+    assert ("The completion policy is configured in the collapsed **Board settings** "
+            "panel") in _normalized("docs/specification-reference.md")
     assert ("a missing policy leaves the requirement **unknown**, with no prompt "
             "or explanation") in _normalized("docs/workspaces.md")
     assert ("a completion dependency is **unknown**; the board shows no prompt "
