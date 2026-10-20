@@ -1,0 +1,7 @@
+schema_version = 1
+name = "lifecycle-control"
+files = [
+    "nyx/_native_claim.py",
+    "nyx/cli.py",
+    "nyx/runtime.py",
+]

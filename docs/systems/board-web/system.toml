@@ -1,0 +1,11 @@
+schema_version = 1
+name = "board-web"
+files = [
+    "nyx/static/Anta-OFL.txt",
+    "nyx/static/Anta-Regular.ttf",
+    "nyx/static/app.js",
+    "nyx/static/d10-diamond.svg",
+    "nyx/static/index.html",
+    "nyx/static/style.css",
+    "nyx/static/theme.js",
+]
