@@ -2638,3 +2638,178 @@ def test_a_user_ssh_command_runs_unmodified(ssh_world, monkeypatch, how):
     assert_fell_back_to_cached(group_of(document, repository), "authentication_failed")
     assert not fake_log.exists()
     assert user_log.exists() and "BatchMode" not in user_log.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Sibling borrowing: counts for objects a clone lacks, without writing to it
+# ---------------------------------------------------------------------------
+
+
+def object_files(repository: Path) -> list[tuple[str, int]]:
+    root = repository / ".git" / "objects"
+    return sorted(
+        (item.relative_to(root).as_posix(), item.stat().st_size)
+        for item in root.rglob("*")
+        if item.is_file()
+    )
+
+
+def borrowed_world(tmp_path: Path, holders: tuple[str, ...] = ("holder",)):
+    """A lagging clone and clones that pushed two commits the lagging one lacks."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    lagging = clone(remote, folder / "a lagging")
+    held = []
+    for name in holders:
+        held.append(clone(remote, folder / name))
+    first = held[0]
+    commit_file(first, "one.txt", "1\n")
+    head = commit_file(first, "two.txt", "2\n")
+    push_by_url(first, remote, "trunk")
+    for repository in held[1:]:
+        git(repository, "fetch", "-q", "origin")
+        git(repository, "reset", "-q", "--hard", "origin/trunk")
+    return folder, remote, lagging, held, head
+
+
+def test_lagging_clone_counts_with_objects_borrowed_from_a_sibling(tmp_path):
+    folder, _remote, lagging, (holder,), head = borrowed_world(tmp_path)
+    before = (object_files(lagging), git(lagging, "count-objects", "-v").stdout)
+    assert git(lagging, "cat-file", "-e", head, check=False).returncode != 0
+
+    document = live([folder])
+
+    item = find_clone(document, lagging)
+    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
+    assert item["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
+        "objects_from": real(holder),
+    }
+    assert item["cached_vs_live"]["objects_from"] == real(holder)
+    assert (object_files(lagging), git(lagging, "count-objects", "-v").stdout) == before
+    assert not (lagging / ".git" / "objects" / "info" / "alternates").exists()
+    assert git(lagging, "cat-file", "-e", head, check=False).returncode != 0
+
+
+def test_first_sibling_in_natural_order_that_holds_the_head_lends(tmp_path):
+    folder, _remote, lagging, holders, head = borrowed_world(
+        tmp_path, ("holder 10", "holder 2")
+    )
+
+    item = find_clone(live([folder]), lagging)
+
+    assert item["local_default"]["vs_live"]["objects_from"] == real(folder / "holder 2")
+    assert item["local_default"]["vs_live"]["behind"] == 2
+
+
+def test_removed_holder_leaves_the_lagging_clone_with_differs(tmp_path):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    remove_tree(holder)
+
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+
+    assert comparison == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
+def test_inherited_alternates_value_never_makes_an_unborrowed_count(tmp_path, monkeypatch):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    kept = tmp_path / "kept"
+    shutil.move(str(holder), str(kept))
+    monkeypatch.setenv(
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", str(kept / ".git" / "objects")
+    )
+
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+
+    assert comparison["relation"] == "differs"
+    assert comparison["behind"] is None and comparison["objects_from"] is None
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the slow git stand-in is a shell script")
+def test_sibling_probe_cut_by_the_budget_is_unknown(tmp_path, monkeypatch):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    real_git = shutil.which("git")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    script = shim / "git"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'case "$*" in *"-C {real(holder)} rev-list --no-walk"*) sleep 5;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    comparison = find_clone(
+        live([folder], call_cap_seconds=1.0), lagging
+    )["local_default"]["vs_live"]
+
+    assert comparison == {
+        "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
+def test_partial_and_shallow_holders_never_lend_and_gain_no_pack(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    lagging = clone(remote.as_uri(), folder / "a lagging")
+    partial = clone(remote.as_uri(), folder / "b partial", "--filter=blob:none")
+    shallow = clone(remote.as_uri(), folder / "c shallow", "--depth", "1")
+    head = push_commit(remote, "trunk", tmp_path)
+    git(partial, "fetch", "-q", "origin")
+    git(shallow, "fetch", "-q", "--depth", "1")
+    for holder in (partial, shallow):
+        assert git(holder, "cat-file", "-e", head, check=False).returncode == 0
+    packs = pack_listing(partial)
+
+    document = live([folder])
+
+    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
+    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+    assert pack_listing(partial) == packs
+
+
+def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
+    folder, remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    gone = clone(make_remote(tmp_path / "served", "gone.git"), folder / "gone clone")
+    remove_tree(tmp_path / "served" / "gone.git")
+
+    first_text, first, _ = collect_text([folder], remote_checks=True)
+    time.sleep(1.1)
+    second_text, second, _ = collect_text([folder], remote_checks=True)
+    off = collect_text([folder])[1]
+
+    assert first["schema_version"] == 1
+    borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
+    assert borrowed["objects_from"] == real(holder)
+    assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
+    assert off["remote_checks"] == "off"
+    assert first["observed_at"] != second["observed_at"]
+    assert first["checkouts_digest"] == second["checkouts_digest"]
+    assert {k: v for k, v in first.items() if k != "observed_at"} == {
+        k: v for k, v in second.items() if k != "observed_at"
+    }
+    for document in (first, second, off):
+        for group in document["repositories"]:
+            for item in group["clones"]:
+                assert set(item) == set(models._CLONE_KEYS)
+                for comparison in comparisons_of(item):
+                    assert set(comparison) == set(models._COMPARISON_KEYS)
+
+    push_commit(remote, "trunk", tmp_path)
+    advanced = live([folder])
+    assert advanced["checkouts_digest"] != first["checkouts_digest"]
