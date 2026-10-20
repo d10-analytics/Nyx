@@ -107,15 +107,17 @@ distinguish a genuinely damaged record from a temporarily unreadable one.
 ```text
 nyx checkouts
 nyx checkouts --json
+nyx checkouts --no-network
 ```
 
 `nyx checkouts` lists the git checkouts found in the checkout folders configured
 for the current workspace: one line per clone and one indented line per linked
 worktree, in the same order as the document. `--json` prints the full document
-instead. It works on Linux, Windows and macOS from a Python installation of Nyx;
+instead, and `--no-network` skips every remote check (see below). It works on Linux, Windows and macOS from a Python installation of Nyx;
 the packaged desktop application has no `nyx` command. It never starts, stops or
 inspects the Nyx service, never launches the desktop application, and cannot be
-combined with `--setup`, `--stop` or `--status`.
+combined with `--setup`, `--stop` or `--status`; `--no-network` is accepted only
+with `checkouts`.
 
 Before the checkouts, a few lines report problems with the setup itself.
 `git missing` means no `git` was found on `PATH`, and `git too_old <version>`
@@ -134,27 +136,57 @@ string, and then gives, separated by two spaces, its branch as `branch <name>`,
 `staged`, `unstaged`, `untracked` and `conflicted` counts; and any `operations`
 in progress such as `merge`. A clone line shows its main worktree's branch and
 counts, or `main <status>` when that worktree could not be read; a bare
-repository's line has neither. Clone lines then add `local-only <n>` (local
-branches with no same-name branch on `origin`, followed by `unknown <n>` when a
-comparison could not be made) and `default <name> <relation> cached <time>`.
+repository's line has neither. A clone line with an `origin` remote then adds,
+separated by two spaces and in this order, three more elements.
+
+- `remote live`, `remote off` or `remote failed <reason>`. `live` means Nyx
+  asked `origin` and got an answer; `off` means `--no-network` was given;
+  `failed` means the check did not succeed, and the reason is one of
+  `unreachable`, `not_found`, `authentication_failed`, `timed_out` or `failed`.
+  The reason is only a category: no URL, user name, password or error text is
+  ever printed.
+- `branches <basis> local-only <n>`, followed by `unknown <m>` when a
+  comparison could not be made. `<basis>` is `live` when the remote check was
+  live and `cached` otherwise, including for a clone with no local branches.
+  `local-only <n>` counts local branches with no same-name branch on `origin`.
+- The default branch, in one of three forms. With a live check:
+  `default <name> live <relation> cached <relation> tracking live <relation>
+  fetched <time>`, comparing the local default branch with the remote's, then
+  with this clone's remote-tracking copy, and that copy with the remote's. Without
+  one: `default <name> cached <relation> fetched <time>`. A clone that has never
+  fetched shows `never fetched` in place of `fetched <time>`. A clone whose
+  remote has no default branch (an empty remote, or one with a detached `HEAD`)
+  shows `no live default`, and one whose default is not known without asking the
+  remote shows `no cached default`.
+
 The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
 but not counted, as in a shallow clone), `absent` (one of the two branches does
-not exist) or `unknown`. A clone that has never fetched shows `never fetched`
-in place of `cached <time>`; one whose `origin` default branch is not cached
-shows `no cached default`; one without an `origin` remote shows
-`no origin remote` and no default. A checkout git refused or could not read
-shows its path and its status instead: `unsafe_ownership` when git refuses it
-for ownership, `timed_out` when git did not finish in time, and otherwise
-`failed`.
+not exist) or `unknown`. `cached` only ever labels a basis; the time a clone
+last fetched is always `fetched <time>`. A clone without an `origin` remote shows
+`no origin remote` and no branch or default elements. A checkout git refused or
+could not read shows its path and its status instead: `unsafe_ownership` when
+git refuses it for ownership, `timed_out` when git did not finish in time, and
+otherwise `failed`.
 
-The facts are cached-only labels: every comparison uses the remote-tracking
-branches this clone already has, so the output can be older than the remote
-until you fetch. The command is read-only and makes no network connection: it
-changes no repository, takes no git lock, and never fetches or contacts a
-remote. It exits 0 whenever it can print a document, including when git is
-missing or a folder is unavailable; it exits 1 with one line only when the
-configuration is unavailable or the document exceeds 2 MiB. With no folders
-configured it says `no checkout folders are configured` and exits 0.
+By default `nyx checkouts` is networked: it asks each distinct `origin` remote
+once, so clones that share a remote share one answer, and compares against what
+the remote has now. It stops waiting after 60 seconds in total; a remote it
+could not ask or finish asking falls back to cached values and shows
+`remote failed <reason>`. When a clone lacks a commit that it needs for a count,
+the count may be borrowed read-only from a sibling clone of the same remote
+that has the commit; the JSON document names that sibling. Nyx's own SSH runs
+in batch mode, so it never stops to ask for a password or passphrase, unless you
+configured an SSH command yourself. `--no-network` makes no network connection
+at all: `remote off`, and every value comes from the remote-tracking branches
+the clone already has, so it can be older than the remote until you fetch.
+
+The command is read-only: it changes no repository, takes no git lock, writes
+no alternates file and never fetches, so asking a remote leaves every clone as
+it was. It exits 0 whenever it can print a document, including when git is
+missing, a folder is unavailable or a remote check failed; it exits 1 with one
+line only when the configuration is unavailable or the document exceeds 2 MiB.
+With no folders configured it says `no checkout folders are configured` and
+exits 0.
 
 Checkout folders are set per workspace, in the account's configuration record;
 see [Your specification workspace](workspaces.md#checkout-folders) for the
