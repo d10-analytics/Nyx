@@ -978,12 +978,12 @@ def _assert_claims_released(home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Windows console-window observation (U1)
+# Windows console-window observation
 # ---------------------------------------------------------------------------
 
 
 class ConsoleWindowDefect(Exception):
-    """A console-class window attributed to the application or a descendant (U1)."""
+    """A console-class window attributed to the application or a descendant."""
 
 
 _CONSOLE_CONTROL_SOURCE = (
@@ -1039,8 +1039,8 @@ def test_console_attribution_follows_family_relations_and_never_runner_terminals
 
     helper, gui = 5001, 4000
     family = {gui, helper}
-    # The recorded U1 shape: a pseudo-console window owned by a helper process.
-    u1 = _unit_sample(0x30220, "PseudoConsoleWindow", helper, "NyxWorker.exe", gui)
+    # A pseudo-console window owned by a helper process.
+    pseudo = _unit_sample(0x30220, "PseudoConsoleWindow", helper, "NyxWorker.exe", gui)
     visible = _unit_sample(0x30221, "ConsoleWindowClass", helper, "NyxWorker.exe", gui)
     # A console window owned by a console host whose parent is the family process.
     hosted = _unit_sample(0x30222, "ConsoleWindowClass", 7000, "conhost.exe", helper)
@@ -1052,7 +1052,7 @@ def test_console_attribution_follows_family_relations_and_never_runner_terminals
     ]
     other = _unit_sample(0x40000, "Qt6QWindowIcon", helper, "NyxWorker.exe", gui)
     attributed = native_ui.attribute_console_windows(
-        [u1, visible, hosted, other, *runner], family
+        [pseudo, visible, hosted, other, *runner], family
     )
     assert {(sample.handle, relation) for sample, relation in attributed} == {
         (0x30220, "owner-in-family"),
@@ -1060,7 +1060,7 @@ def test_console_attribution_follows_family_relations_and_never_runner_terminals
         (0x30222, "owner-parent-in-family"),
     }
     # Removing the family relation stops the attribution (the check is failing-capable).
-    assert native_ui.attribute_console_windows([u1, visible, hosted], {99999}) == []
+    assert native_ui.attribute_console_windows([pseudo, visible, hosted], {99999}) == []
     # The control's own console window, owned by OpenConsole.exe, is attributed
     # only through the handle the control reports, and only when it matches.
     control_window = _unit_sample(0x1201DC, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
@@ -1082,13 +1082,13 @@ def test_console_attribution_follows_family_relations_and_never_runner_terminals
     ) == []
     # The application is judged by the control's relations plus ownership, so a
     # control seen only through its reported handle still lets a helper-owned
-    # console window raise U1, and still never admits a runner terminal.
+    # console window raise the defect, and still never admits a runner terminal.
     judged = native_ui.judging_relations({native_ui.REPORTED_HANDLE_RELATION})
     assert native_ui.REPORTED_HANDLE_RELATION in judged and "owner-in-family" in judged
     assert [
         sample.handle
         for sample, _ in native_ui.attribute_console_windows(
-            [u1, *runner], family, allowed=judged
+            [pseudo, *runner], family, allowed=judged
         )
     ] == [0x30220]
 
@@ -1202,10 +1202,10 @@ def _run_console_control(
     raises=ConsoleWindowDefect,
     strict=True,
     reason=(
-        "U1 on Windows: the delivered worker helper (NyxWorker.exe, built with "
+        "on Windows the delivered worker helper (NyxWorker.exe, built with "
         "--windows-console-mode=force and spawned without creation flags) creates a console "
-        "of its own; the windows-2025 observation attributed five console-class "
-        "(PseudoConsoleWindow) windows owned by NyxWorker.exe whose parent is the GUI"
+        "of its own, so console-class (PseudoConsoleWindow) windows owned by NyxWorker.exe "
+        "whose parent is the GUI appear"
     ),
 )
 def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayout):
@@ -1576,20 +1576,16 @@ def test_native_driver_authority_probe_records_the_lane_result(artifact: Artifac
 
 
 class NativeClipboardWriteDefect(Exception):
-    """A correctly delivered right-click whose write never reached the native clipboard (S2-N2)."""
+    """A correctly delivered right-click whose write never reached the native clipboard."""
 
 
 @pytest.mark.skipif(
     sys.platform == "darwin" and os.environ.get("NYX_EXPECTED_NATIVE_HOST") == "macos-15",
     reason=(
-        "R-06 on the hosted macos-15 lane is recorded unverifiable (D-16, D-17): the 1024x768 "
-        "runner screen leaves the delivered window's frame at [0,25,1024,683] and the board web "
-        "view at 985x173 CSS px while the page's sticky toolbar ends at 181.5 CSS px, so the "
-        "toolbar covers the board and no card is ever visible, and Cmd-minus x3 and Cmd+wheel x3 "
-        "changed the viewport by 0 px; the driver authority check passed, so this is a display "
-        "limitation. Owner native driver run: python -m pytest tests/test_desktop_artifact.py "
-        "-v -s -k \"native_clipboard or switches_to_second_workspace\" with "
-        "NYX_EXPECTED_NATIVE_HOST unset on a larger macOS display. A SKIP result is not evidence."
+        "the hosted macos-15 lane's 1024x768 screen leaves the board's sticky toolbar "
+        "covering every card and ignores zoom changes, so no card can be clicked there. "
+        "Run this test with NYX_EXPECTED_NATIVE_HOST unset on a larger macOS display; "
+        "a skip is not evidence."
     ),
 )
 def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: ArtifactLayout):

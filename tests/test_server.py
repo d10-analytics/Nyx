@@ -326,11 +326,11 @@ def test_occupied_numeric_bind_closes_failed_socket_without_reverse_dns():
         assert occupant.getsockname() == ("127.0.0.1", port)
 
 
-class U3CoBindDefect(Exception):
+class PortCoBindDefect(Exception):
     """create_server bound a port that a default-options listener still holds."""
 
 
-class U8AbortEscapeDefect(Exception):
+class ConnectionAbortEscapeDefect(Exception):
     """An injected ConnectionAbortedError escaped _send into handle_error."""
 
 
@@ -354,7 +354,7 @@ def test_create_server_does_not_co_bind_a_port_held_by_a_default_listener():
                 pytest.fail(f"returned server socket is bound to {created.socket.getsockname()!r}")
             if listener.getsockname() != ("127.0.0.1", port):
                 pytest.fail("the plain listener no longer holds the port")
-            raise U3CoBindDefect(f"create_server co-bound 127.0.0.1:{port}")
+            raise PortCoBindDefect(f"create_server co-bound 127.0.0.1:{port}")
         finally:
             created.server_close()
 
@@ -460,8 +460,8 @@ def _require_later_request_ok(port):
 @pytest.mark.xfail(
     condition=sys.platform.startswith("linux") or sys.platform in ("win32", "darwin"),
     strict=True,
-    raises=U8AbortEscapeDefect,
-    reason="U8: _send does not absorb ConnectionAbortedError (linux, win32, darwin)",
+    raises=ConnectionAbortEscapeDefect,
+    reason="_send does not absorb ConnectionAbortedError (linux, win32, darwin)",
 )
 def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers():
     client = StubClient(catalog=valid_catalog())
@@ -482,7 +482,7 @@ def test_injected_connection_abort_in_send_does_not_escape_and_server_recovers()
         if escapes:
             if not _only_escaped(escapes, lambda error: error is injected):
                 pytest.fail(f"an unexpected exception reached handle_error: {escapes!r}")
-            raise U8AbortEscapeDefect(
+            raise ConnectionAbortEscapeDefect(
                 f"injected ConnectionAbortedError escaped _send: {escapes!r}"
             )
     finally:
@@ -509,8 +509,8 @@ class _HeldCatalog:
 @pytest.mark.xfail(
     condition=sys.platform == "win32",
     strict=True,
-    raises=U8AbortEscapeDefect,
-    reason="U8: _send does not absorb ConnectionAbortedError (win32)",
+    raises=ConnectionAbortEscapeDefect,
+    reason="_send does not absorb ConnectionAbortedError (win32)",
 )
 def test_real_client_abort_after_dispatch_does_not_escape_and_server_recovers():
     provider = _HeldCatalog()
@@ -546,7 +546,7 @@ def test_real_client_abort_after_dispatch_does_not_escape_and_server_recovers():
         if escapes:
             if not _only_escaped(escapes, _is_winerror_10053):
                 pytest.fail(f"an unexpected exception reached handle_error: {escapes!r}")
-            raise U8AbortEscapeDefect(f"real client abort escaped _send: {escapes!r}")
+            raise ConnectionAbortEscapeDefect(f"real client abort escaped _send: {escapes!r}")
     finally:
         provider.release.set()
         running.__exit__(None, None, None)

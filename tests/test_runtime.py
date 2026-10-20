@@ -3212,15 +3212,15 @@ def _occupied_port_scenario():
             occupant.close()
 
 
-class U3FixedPortCoBindDefect(Exception):
+class FixedPortCoBindDefect(Exception):
     """The daemon bound the fixed port while another listener still held it."""
 
 
 @pytest.mark.xfail(
     condition=sys.platform == "win32",
     strict=True,
-    raises=U3FixedPortCoBindDefect,
-    reason="U3: the reusable daemon listener co-binds a held port on win32 (exit 25)",
+    raises=FixedPortCoBindDefect,
+    reason="the reusable daemon listener co-binds a held port on win32 (exit 25)",
 )
 def test_fixed_port_occupant_causes_startup_failure_without_fallback():
     code, bound, held, record_exists, leftovers = _occupied_port_scenario()
@@ -3231,7 +3231,7 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
     if code == 30:
         return
     if code == 25 and bound == ("127.0.0.1", runtime.PORT) and held:
-        raise U3FixedPortCoBindDefect(
+        raise FixedPortCoBindDefect(
             f"daemon bound {bound!r} while the occupant held it; exit {code}"
         )
     pytest.fail(f"unexpected exit {code!r} (bound={bound!r}, occupant held={held})")
