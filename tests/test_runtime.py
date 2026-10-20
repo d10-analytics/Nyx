@@ -1168,7 +1168,7 @@ def test_schema_two_owner_settings_rewrite_only_on_setup_with_equal_revision():
         with patch.object(runtime, "_paths", return_value=paths):
             rewritten = runtime.setup(specification_root)
         expected.pop("hidden_stages")
-        expected["schema_version"] = 3
+        expected["schema_version"] = 4
         assert json.loads(paths.config_file.read_bytes()) == expected
         assert rewritten.stage_orders == loaded.stage_orders
         assert rewritten.completed_stages == loaded.completed_stages
@@ -1192,7 +1192,7 @@ def test_application_settings_save_conflict_and_restart_persistence():
         assert saved["order"] == ["Done", "Queue"]
         assert saved["completed"] == ["Done"]
         expected.pop("hidden_stages")
-        expected["schema_version"] = 3
+        expected["schema_version"] = 4
         expected["stage_orders"][str(specification_root.resolve())] = ["Done", "Queue"]
         expected["completed_stages"][str(specification_root.resolve())] = ["Done"]
         assert json.loads(paths.config_file.read_bytes()) == expected
@@ -7812,3 +7812,80 @@ def test_setup_of_active_and_moved_workspace_succeeds_after_stored_key_stops_res
             assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario[
                 "entries_a"
             ]
+
+
+def _checkout_folders(base):
+    # Native, normalized, sorted absolute folders that need not exist.
+    return [str(base / "one"), str(base / "three"), str(base / "two")]
+
+
+def _write_checkout_record(paths, specification_root, other_root):
+    folders = _checkout_folders(other_root.parent)
+    settings = {
+        str(specification_root.resolve()): {"folders": folders[:2], "github_lookup": True},
+        str(other_root.resolve()): {"folders": folders[2:], "github_lookup": False},
+    }
+    payload = {
+        "schema_version": 4,
+        "specification_root": str(specification_root.resolve()),
+        "checkout_settings": settings,
+    }
+    paths.config_file.write_bytes(
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    )
+    return payload
+
+
+def test_setup_preserves_checkout_settings_and_revision_tracks_them():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, home, specification_root = _fixture(root)
+        other = root / "other"
+        other.mkdir()
+        payload = _write_checkout_record(paths, specification_root, other)
+        before = paths.config_file.read_bytes()
+        revision = state.configuration_revision(paths)
+        with patch.object(runtime, "_paths", return_value=paths):
+            rewritten = runtime.setup(other)
+        stored = json.loads(paths.config_file.read_bytes())
+        assert stored["schema_version"] == 4
+        assert stored["specification_root"] == str(other.resolve())
+        assert stored["checkout_settings"] == payload["checkout_settings"]
+        assert rewritten.checkout_folders == (_checkout_folders(root)[2],)
+        assert state.configuration_revision(paths) != revision
+
+        # Records that differ only in checkout_settings have different revisions.
+        paths.config_file.write_bytes(before)
+        changed = json.loads(before)
+        changed["checkout_settings"][str(other.resolve())]["github_lookup"] = True
+        paths.config_file.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+        assert state.configuration_revision(paths) != revision
+
+        # Rewriting an unchanged schema 3 record as schema 4 keeps its revision.
+        paths.config_file.write_text(
+            json.dumps({"schema_version": 3, "specification_root": str(other.resolve())}) + "\n",
+            encoding="utf-8",
+        )
+        legacy_revision = state.configuration_revision(paths)
+        with patch.object(runtime, "_paths", return_value=paths):
+            runtime.setup(other)
+        assert json.loads(paths.config_file.read_bytes())["schema_version"] == 4
+        assert state.configuration_revision(paths) == legacy_revision
+
+
+def test_setup_with_held_lease_and_same_root_leaves_checkout_record_bytes_unchanged():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        paths, home, specification_root = _fixture(root)
+        other = root / "other"
+        other.mkdir()
+        _write_checkout_record(paths, specification_root, other)
+        before = paths.config_file.read_bytes()
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                assert runtime.setup(specification_root).checkout_folders == tuple(_checkout_folders(root)[:2])
+        finally:
+            lease.close()
+        assert paths.config_file.read_bytes() == before

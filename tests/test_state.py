@@ -73,7 +73,7 @@ def test_setup_uses_controlled_home_and_persists_canonical_empty_symlink_root():
         assert loaded == result
         payload = json.loads(paths.config_file.read_text(encoding="utf-8"))
         assert payload == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(actual.resolve()),
         }
         assert paths.config_file.is_relative_to(home)
@@ -205,7 +205,7 @@ def test_schema_one_loads_defaults_without_writing_and_explicit_setup_migrates()
 
         assert migrated == state.Configuration(second.resolve())
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(second.resolve()),
         }
 
@@ -519,7 +519,7 @@ def test_post_replace_verification_failure_keeps_new_record_without_claiming_rol
                 state.setup(second)
 
         assert json.loads(paths.config_file.read_text(encoding="utf-8")) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(second.resolve()),
         }
 
@@ -853,7 +853,7 @@ def test_configuration_observation_returns_valid_schema_data_only_when_configure
         {"schema_version": 2, "hidden_stages": {}, "specification_root": "/tmp/root"},
         {"schema_version": 3, "hidden_stages": [], "specification_root": "/tmp/root"},
         {"schema_version": 3, "hidden_stages": ["Done"], "specification_root": "/tmp/root"},
-        {"schema_version": 4, "specification_root": "/tmp/root"},
+        {"schema_version": 5, "specification_root": "/tmp/root"},
         *[{"schema_version": version, "specification_root": "/tmp/root"}
           for version in (0, -1, None, True, 2.0, "3")],
     ],
@@ -1486,3 +1486,168 @@ def test_revisions_captured_before_the_move_are_unchanged_after_it():
         scenario = stale_key_scenario(Path(temporary))
         after_move = (scenario["config_a"].revision, scenario["config_b"].revision)
         assert after_move == scenario["revisions_before_move"]
+
+
+def _write_record(paths, payload) -> bytes:
+    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    paths.config_file.write_bytes(data)
+    return data
+
+
+def _checkout_entry(*folders, github_lookup=False):
+    return {"folders": list(folders), "github_lookup": github_lookup}
+
+
+def _observe_record(payload):
+    """Write a record into a fresh isolated home and observe it as the CLI does."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        spec_root = isolated_root(root, "spec-root")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            record = {"specification_root": str(spec_root.resolve()), **payload}
+            before = _write_record(paths, record)
+            observed = state.observe_configuration()
+            assert paths.config_file.read_bytes() == before
+        return observed, spec_root.resolve()
+
+
+@pytest.mark.parametrize("schema_version", [3, 4])
+def test_record_without_checkout_settings_loads_with_an_empty_map(schema_version):
+    observed, spec_root = _observe_record({"schema_version": schema_version})
+    assert observed.status == "configured"
+    assert dict(observed.checkout_settings) == {}
+    assert observed.configuration.checkout_folders == ()
+
+
+def test_schema_four_checkout_settings_load_per_workspace_and_follow_the_active_root():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        active = isolated_root(root, "active")
+        other = isolated_root(root, "other")
+        without_entry = isolated_root(root, "without-entry")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            # Lexically valid, native folders that do not exist on disk.
+            missing = (str(root / "missing" / "one"), str(root / "missing" / "two"))
+            elsewhere = str(root / "elsewhere")
+            settings = {
+                str(active.resolve()): _checkout_entry(*missing, github_lookup=True),
+                str(other.resolve()): _checkout_entry(elsewhere),
+            }
+            payload = {
+                "schema_version": 4,
+                "specification_root": str(active.resolve()),
+                "checkout_settings": settings,
+            }
+            _write_record(paths, payload)
+            observed = state.observe_configuration()
+            assert observed.status == "configured"
+            configuration = observed.configuration
+            assert configuration.checkout_folders == missing
+            assert configuration.checkout_settings[str(active.resolve())].github_lookup is True
+            assert configuration.checkout_settings[str(other.resolve())].folders == (elsewhere,)
+            assert not Path(missing[0]).exists()
+
+            payload["specification_root"] = str(without_entry.resolve())
+            _write_record(paths, payload)
+            assert state.observe_configuration().configuration.checkout_folders == ()
+
+
+def _abs(*parts):
+    """A native, absolute, normalized path built from the platform anchor."""
+
+    return os.path.normpath(os.path.join(os.path.abspath(os.sep), *parts))
+
+
+_ROOT = _abs("tmp", "workspace")
+_A = _abs("a")
+_B = _abs("b")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 1, "checkout_settings": {}},
+        {"schema_version": 2, "hidden_stages": [], "checkout_settings": {}},
+        {"schema_version": 3, "checkout_settings": {}},
+        {"schema_version": 3, "checkout_settings": {_ROOT: _checkout_entry(_A)}},
+        {"schema_version": 5},
+        {"schema_version": 4, "checkout_settings": []},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {**_checkout_entry(_A), "extra": 1}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"github_lookup": False}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A]}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: [_A]}},
+        {"schema_version": 4, "checkout_settings": {"relative": _checkout_entry(_A)}},
+        {"schema_version": 4, "checkout_settings": {_abs("tmp", "a") + os.sep + ".." + os.sep + "b": _checkout_entry(_A)}},
+        {"schema_version": 4, "checkout_settings": {_abs("tmp", "a") + os.sep: _checkout_entry(_A)}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry("relative")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A + os.sep + "." + os.sep + "b")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A + "\x00b")}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry()}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_B, _A)}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: _checkout_entry(_A, _A)}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": _A, "github_lookup": False}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": {_A: 1}, "github_lookup": False}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": 1}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": "yes"}}},
+        {"schema_version": 4, "checkout_settings": {_ROOT: {"folders": [_A], "github_lookup": None}}},
+    ],
+)
+def test_invalid_checkout_settings_records_are_unavailable_and_left_unchanged(payload):
+    # _observe_record asserts the file bytes are unchanged after observation.
+    observed, _ = _observe_record(payload)
+    assert observed.status == "unavailable"
+    assert observed.configuration is None
+
+
+def test_save_paths_carry_checkout_settings_and_revision_covers_them():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            settings = {
+                str(first.resolve()): _checkout_entry(str(root / "one"), github_lookup=True),
+                str(second.resolve()): _checkout_entry(str(root / "two"), str(root / "zed")),
+            }
+            record = {
+                "schema_version": 4,
+                "specification_root": str(first.resolve()),
+                "checkout_settings": settings,
+            }
+            _write_record(paths, record)
+            revision = state.configuration_revision(paths)
+
+            # The owned save seam carries the stored map from the record on disk.
+            state.save_configuration_owned(second, paths=paths, stage_order=["A"])
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["checkout_settings"] == settings
+            assert stored["specification_root"] == str(second.resolve())
+
+            # The revision covers the map: records differing only in it differ.
+            changed = json.loads(paths.config_file.read_bytes())
+            changed["checkout_settings"][str(first.resolve())]["github_lookup"] = False
+            before = state.configuration_revision(paths)
+            _write_record(paths, changed)
+            assert state.configuration_revision(paths) != before
+            assert revision != state.configuration_revision(paths)
+
+            # An unchanged schema 3 record rewritten as schema 4 keeps its revision.
+            legacy = {"schema_version": 3, "specification_root": str(first.resolve())}
+            _write_record(paths, legacy)
+            legacy_revision = state.configuration_revision(paths)
+            state._save_configuration(paths, first.resolve())
+            assert json.loads(paths.config_file.read_bytes())["schema_version"] == 4
+            assert state.configuration_revision(paths) == legacy_revision

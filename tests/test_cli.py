@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -155,7 +157,7 @@ def test_real_setup_cli_uses_portable_state_layout(capsys):
         )
         assert paths.config_file.is_file()
         assert json.loads(paths.config_file.read_bytes()) == {
-            "schema_version": 3,
+            "schema_version": 4,
             "specification_root": str(specification.resolve()),
         }
         assert paths.runtime_directory.is_dir()
@@ -274,6 +276,44 @@ def test_active_setup_rejects_changed_root_without_cli_mutation(capsys):
             lease.close()
         assert paths.config_file.read_bytes() == before
         assert "stop Nyx" in capsys.readouterr().err
+
+
+def test_active_setup_with_same_root_leaves_checkout_record_unchanged(capsys):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        first = root / "first"
+        first.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home), patch.object(
+            state, "_current_uid", return_value=state._current_uid()
+        ):
+            state.setup(first)
+            paths = state.state_paths()
+        settings = {str(first.resolve()): {"folders": [str(root / "one")], "github_lookup": True}}
+        paths.config_file.write_bytes(
+            (
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "specification_root": str(first.resolve()),
+                        "checkout_settings": settings,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        lease = runtime._lease_lock(paths, timeout=0.0)
+        assert lease.acquire(blocking=False)
+        before = paths.config_file.read_bytes()
+        try:
+            with patch.object(runtime, "_paths", return_value=paths):
+                assert cli.main(["--setup", str(first)]) == 0
+        finally:
+            lease.close()
+        assert paths.config_file.read_bytes() == before
 
 
 def test_status_renders_configured_stopped_snapshot_with_ascii_json_and_no_lifecycle(
@@ -581,3 +621,532 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
         captured = capsys.readouterr()
         assert "Configuration: unavailable" in captured.out.splitlines()
         assert "Traceback" not in captured.out + captured.err
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts
+# ---------------------------------------------------------------------------
+
+from test_checkouts import (  # noqa: E402
+    GLOBAL_CONFIG,
+    allow_filters,
+    clone,
+    commit_file,
+    git,
+    make_remote,
+    real,
+    trust_only,
+)
+
+from nyx import checkouts, models  # noqa: E402
+
+NO_FOLDERS = "no checkout folders are configured"
+UNAVAILABLE = "nyx: Nyx configuration is unavailable\n"
+
+
+@pytest.fixture
+def account(tmp_path, monkeypatch):
+    """An isolated account home that is also the only git configuration."""
+
+    home = tmp_path / "account"
+    home.mkdir(mode=0o755)
+    (home / ".gitconfig").write_text(GLOBAL_CONFIG)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in list(os.environ):
+        if name.startswith("GIT_") and name != "GIT_CONFIG_NOSYSTEM":
+            monkeypatch.delenv(name)
+    return home
+
+
+def _write_record(tmp_path: Path, payload: dict | bytes) -> Path:
+    paths = state.state_paths(create=True)
+    if isinstance(payload, bytes):
+        paths.config_file.write_bytes(payload)
+    else:
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        paths.config_file.write_bytes(data.encode("utf-8"))
+    return paths.config_file
+
+
+def _configure(tmp_path: Path, folders: list[Path | str]) -> Path:
+    """Write a schema 4 record for a workspace whose settings name ``folders``."""
+
+    specification = tmp_path / "spec"
+    specification.mkdir(exist_ok=True)
+    key = str(specification.resolve())
+    entry = {"folders": sorted(str(folder) for folder in folders), "github_lookup": False}
+    return _write_record(
+        tmp_path,
+        {
+            "schema_version": 4,
+            "specification_root": key,
+            "checkout_settings": {key: entry},
+        },
+    )
+
+
+def _run_checkouts(capsys, *arguments: str) -> tuple[int, str, str]:
+    code = cli.main(["checkouts", *arguments])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _plain_lines(capsys) -> list[str]:
+    code, out, err = _run_checkouts(capsys)
+    assert (code, err) == (0, "")
+    return out.splitlines()
+
+
+def _line_for(lines: list[str], path: Path | str, indent: str = "") -> str:
+    literal = indent + cli._json_literal(real(path))
+    [line] = [
+        candidate
+        for candidate in lines
+        if candidate == literal or candidate.startswith(literal + "  ")
+    ]
+    return line
+
+
+def _file_listing(root: Path) -> list[str]:
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+
+def test_module_launch_prints_a_valid_document_on_every_host_without_touching_state(
+    tmp_path, account, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "listed")
+    record = _configure(tmp_path, [folder])
+    before = record.read_bytes()
+    listing = _file_listing(account / ".nyx")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(account),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    [item] = [c for r in document["repositories"] for c in r["clones"]]
+    assert item["path"] == real(repository)
+    assert record.read_bytes() == before
+    assert _file_listing(account / ".nyx") == listing
+    assert not any(name.endswith(("instance.json", ".lock")) for name in listing)
+
+
+def test_module_launch_with_an_empty_home_exits_zero_and_creates_no_state(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    completed = subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(home),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert NO_FOLDERS in completed.stdout
+    assert not (home / ".nyx").exists()
+
+
+def test_checkouts_runs_on_a_desktop_host_without_launching_the_application(
+    tmp_path, account, monkeypatch, capsys
+):
+    monkeypatch.setattr(runtime, "desktop_host", lambda: True)
+    with patch.object(cli, "_launch_desktop") as launch, patch.object(
+        runtime, "observe_runtime"
+    ) as observe_runtime:
+        code, out, _ = _run_checkouts(capsys)
+    assert code == 0
+    assert NO_FOLDERS in out
+    launch.assert_not_called()
+    observe_runtime.assert_not_called()
+
+
+def test_without_configuration_one_line_is_printed_and_nothing_is_created(
+    account, capsys
+):
+    code, out, err = _run_checkouts(capsys)
+    assert (code, err) == (0, "")
+    assert len(out.splitlines()) == 1
+    assert NO_FOLDERS in out
+    assert not (account / ".nyx").exists()
+
+
+def test_configuration_without_folders_for_the_active_workspace_is_said_so(
+    tmp_path, account, capsys
+):
+    specification = tmp_path / "spec"
+    specification.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    _write_record(
+        tmp_path,
+        {
+            "schema_version": 4,
+            "specification_root": str(specification.resolve()),
+            "checkout_settings": {
+                str(other.resolve()): {"folders": [str(tmp_path)], "github_lookup": False}
+            },
+        },
+    )
+    code, out, err = _run_checkouts(capsys)
+    assert (code, err) == (0, "")
+    assert len(out.splitlines()) == 1
+    assert NO_FOLDERS in out
+
+
+def test_unreadable_record_prints_only_the_unavailable_line_and_exits_one(
+    tmp_path, account, capsys
+):
+    record = _configure(tmp_path, [tmp_path])
+    record.write_bytes(b"{ not json")
+    code, out, err = _run_checkouts(capsys, "--json")
+    assert (code, out, err) == (1, "", UNAVAILABLE)
+
+
+def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "many")
+    head = git(repository, "rev-parse", "HEAD").stdout.strip()
+    # Packed references need no file per branch, so no host path limit applies.
+    git(repository, "pack-refs", "--all")
+    packed_file = repository / ".git" / "packed-refs"
+    entries = {
+        line.split(" ", 1)[1]: line.split(" ", 1)[0]
+        for line in packed_file.read_bytes().decode("ascii").split("\n")
+        if line and line[0] not in "#^"
+    }
+    for index in range(7000):
+        entries[f"refs/heads/{index:05d}-{'x' * 180}"] = head
+    # Peel lines are not kept, so the header claims only sorted order and git
+    # peels on demand.  Bytes are written exactly: git rejects a CRLF ref line.
+    packed_file.write_bytes(
+        (
+            "# pack-refs with: sorted \n"
+            + "".join(f"{sha} {name}\n" for name, sha in sorted(entries.items()))
+        ).encode("ascii")
+    )
+    packed = packed_file.read_bytes()
+    assert packed.endswith(b"\n") and b"\r" not in packed
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 7001
+    _configure(tmp_path, [folder])
+
+    for arguments in ((), ("--json",)):
+        code, out, err = _run_checkouts(capsys, *arguments)
+        assert code == 1
+        assert out == ""
+        assert err.startswith("nyx: ")
+        assert "checkouts_output_too_large" in err
+        assert len(err.splitlines()) == 1
+
+
+def test_missing_git_exits_zero_in_both_modes(tmp_path, account, monkeypatch, capsys):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    _configure(tmp_path, [folder])
+    empty = tmp_path / "no-git"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+    code, out, err = _run_checkouts(capsys, "--json")
+    assert (code, err) == (0, "")
+    assert models.parse_checkouts(out)["git"] == {"status": "missing", "version": None}
+
+    code, out, err = _run_checkouts(capsys)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[0] == "git missing"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["checkouts", "--status"],
+        ["checkouts", "--stop"],
+        ["--setup", "/some/root", "checkouts"],
+        ["checkouts", "--setup", "/some/root"],
+        ["--json"],
+        ["checkouts", "extra"],
+    ],
+)
+def test_checkouts_combinations_are_usage_errors_that_never_read_state(
+    arguments, capsys
+):
+    with patch.object(state, "observe_configuration") as observe_config, patch.object(
+        runtime, "observe_runtime"
+    ) as observe_runtime, patch.object(runtime, "setup") as setup, patch.object(
+        runtime, "start"
+    ) as start, patch.object(runtime, "stop") as stop:
+        with pytest.raises(SystemExit) as error:
+            cli.main(arguments)
+    assert error.value.code == 2
+    for operation in (observe_config, observe_runtime, setup, start, stop):
+        operation.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("usage: nyx ")
+
+
+def test_folder_and_diagnostic_lines_precede_the_clones(tmp_path, account, capsys):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "real")
+    (folder / "fake" / ".git" / "info").mkdir(parents=True)
+    absent = tmp_path / "absent"
+    _configure(tmp_path, [folder, absent])
+
+    lines = _plain_lines(capsys)
+
+    assert lines[0] == f"folder {cli._json_literal(str(absent))} missing"
+    assert lines[1] == f"diagnostic not_a_repository {cli._json_literal(str(folder / 'fake'))}"
+    assert lines[2].startswith(cli._json_literal(real(repository)) + "  ")
+    assert len(lines) == 3
+
+
+def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account, capsys):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    commit_file(repository, "tracked.txt", "one\n")
+    commit_file(repository, "other.txt", "one\n")
+    git(repository, "checkout", "-q", "-b", "feature")
+    (repository / "tracked.txt").write_text("two\n")
+    git(repository, "add", "tracked.txt")
+    (repository / "other.txt").write_text("two\n")
+    (repository / "new-a.txt").write_text("a\n")
+    (repository / "new-b.txt").write_text("b\n")
+    _configure(tmp_path, [folder])
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    elements = line.split("  ")[1:]
+    assert elements[0] == "branch feature"
+    assert elements[1] == "staged 1 unstaged 1 untracked 2 conflicted 0"
+    assert elements[2] == "local-only 1"
+    assert elements[3] == "default trunk ahead never fetched"
+    assert not any(element.startswith("operations") for element in elements)
+
+
+def test_cached_default_shows_the_fetch_time_once_the_clone_has_fetched(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    git(repository, "fetch", "-q", "origin")
+    _configure(tmp_path, [folder])
+
+    element = _line_for(_plain_lines(capsys), repository).split("  ")[-1]
+
+    assert re.fullmatch(
+        r"default trunk equal cached [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z", element
+    )
+
+
+def test_conflicted_merge_prints_its_operation_and_conflicted_count(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    git(repository, "checkout", "-q", "-b", "other")
+    commit_file(repository, "file.txt", "other\n")
+    git(repository, "checkout", "-q", "trunk")
+    commit_file(repository, "file.txt", "mine\n")
+    git(repository, "merge", "other", check=False)
+    _configure(tmp_path, [folder])
+
+    elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
+
+    assert elements[:3] == [
+        "branch trunk",
+        "staged 0 unstaged 0 untracked 0 conflicted 1",
+        "operations merge",
+    ]
+
+
+def test_linked_worktrees_are_indented_lines_under_their_clone(tmp_path, account, capsys):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    outside = tmp_path / "outside" / "linked"
+    git(repository, "worktree", "add", "-q", "-b", "side", str(outside))
+    detached = tmp_path / "outside" / "detached"
+    git(repository, "worktree", "add", "-q", "--detach", str(detached))
+    sha = git(repository, "rev-parse", "HEAD").stdout.strip()
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys)
+
+    clone_index = lines.index(_line_for(lines, repository))
+    linked = _line_for(lines, outside, "  ")
+    assert linked == (
+        f"  {cli._json_literal(real(outside))}  branch side  "
+        "staged 0 unstaged 0 untracked 0 conflicted 0"
+    )
+    assert _line_for(lines, detached, "  ").split("  ")[2] == f"detached {sha}"
+    assert lines.index(linked) > clone_index
+
+
+def test_bare_repository_clone_line_has_no_head_or_counts_but_its_worktree_has(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    linked = folder / "bare-linked"
+    git(remote, "worktree", "add", "-q", str(linked), "trunk")
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys)
+
+    assert _line_for(lines, remote) == f"{cli._json_literal(real(remote))}  no origin remote"
+    assert _line_for(lines, linked, "  ").split("  ")[2] == "branch trunk"
+
+
+def test_refused_clone_prints_its_status_instead_of_the_facts(
+    tmp_path, account, monkeypatch, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    trusted = clone(remote, folder / "trusted")
+    refused = clone(remote, folder / "refused")
+    trust_only(account, [trusted])
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys)
+
+    assert _line_for(lines, refused) == f"{cli._json_literal(real(refused))}  unsafe_ownership"
+    assert "no origin remote" not in _line_for(lines, refused)
+    assert "branch trunk" in _line_for(lines, trusted)
+
+
+def test_tree_filtered_clone_prints_main_failed_and_keeps_remote_and_default(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    allow_filters(remote)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote.as_uri(), folder / "trees", "--filter=tree:0", "--no-checkout")
+    _configure(tmp_path, [folder])
+
+    elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
+
+    assert elements[0] == "main failed"
+    assert elements[1] == "local-only 0"
+    assert elements[2].startswith("default trunk ")
+    assert not any(element.startswith(("branch ", "staged ")) for element in elements)
+
+
+def test_clone_without_origin_prints_no_origin_remote_and_no_remote_counts(
+    tmp_path, account, capsys
+):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = folder / "local"
+    git(folder, "init", "-q", "-b", "main", str(repository))
+    commit_file(repository, "file.txt", "one\n")
+    git(repository, "branch", "wip")
+    _configure(tmp_path, [folder])
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert line.split("  ")[2:] == [
+        "staged 0 unstaged 0 untracked 0 conflicted 0",
+        "no origin remote",
+    ]
+    assert "local-only" not in line
+    assert "default" not in line
+
+
+def test_clone_of_an_empty_remote_prints_local_only_and_no_cached_default(
+    tmp_path, account, capsys
+):
+    empty = tmp_path / "empty.git"
+    git(tmp_path, "init", "-q", "--bare", str(empty))
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(empty, folder / "fresh")
+    commit_file(repository, "file.txt", "one\n")
+    _configure(tmp_path, [folder])
+
+    elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
+
+    assert elements[-2:] == ["local-only 1", "no cached default"]
+
+
+def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "slow")
+    git(repository, "checkout", "-q", "-b", "feature")
+    git(repository, "push", "-q", "origin", "feature")
+    make_slow_clone_in_place(repository)
+
+    text = checkouts.collect_checkouts(
+        [str(folder)], deadline_ns=time.monotonic_ns() + 1_000_000_000
+    )
+    lines = cli.format_checkouts(models.parse_checkouts(text))
+
+    elements = _line_for(lines, repository).split("  ")[1:]
+    assert elements[0] == "main timed_out"
+    assert elements[1] == "local-only 0 unknown 1"
+    assert elements[2].startswith("default trunk equal ")
+
+
+def make_slow_clone_in_place(repository: Path) -> None:
+    """One more commit on ``feature`` and a stat-dirty file under a slow clean filter."""
+
+    commit_file(repository, "slow.txt", "slow\n", "one unpushed commit")
+    (repository / ".git" / "info" / "attributes").write_text("slow.txt filter=slow\n")
+    git(repository, "config", "filter.slow.clean", "sleep 5; cat")
+    later = time.time_ns() + 5_000_000_000
+    os.utime(repository / "slow.txt", ns=(later, later))
+
+
+@pytest.mark.parametrize("arguments", [(), ("--json",)])
+def test_origin_credentials_never_reach_either_output(tmp_path, account, capsys, arguments):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    git(
+        repository,
+        "remote",
+        "set-url",
+        "origin",
+        "https://someuser:s3cr3tpass@example.invalid/owner/repo.git",
+    )
+    _configure(tmp_path, [folder])
+
+    code, out, err = _run_checkouts(capsys, *arguments)
+
+    assert (code, err) == (0, "")
+    assert cli._json_literal(real(repository)) in out
+    assert "s3cr3tpass" not in out
+    assert "someuser" not in out

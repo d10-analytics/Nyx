@@ -242,6 +242,52 @@ Names are compared literally. Case-distinct siblings are representable only on
 host filesystems that support them; Nyx does not normalize case or claim that
 every host can store both spellings.
 
+## Checkout folders
+
+Nyx records, per workspace, the folders whose git checkouts `nyx checkouts`
+lists. Until the settings editor exists, set them by editing the account's
+configuration record by hand: `~/.nyx/config/config.json` on Linux and macOS,
+`%USERPROFILE%\.nyx\config\config.json` on Windows. A record with checkout
+folders uses schema 4:
+
+```json
+{
+  "schema_version": 4,
+  "specification_root": "/home/me/specs",
+  "checkout_settings": {
+    "/home/me/specs": {
+      "folders": ["/home/me/code", "/home/me/more-code"],
+      "github_lookup": false
+    }
+  }
+}
+```
+
+- The key under `checkout_settings` is the record's own `specification_root`
+  value, copied exactly. On Linux `nyx --status` prints the same path after
+  `Workspace:`; desktop hosts refuse `--status`, so copy the value from the
+  record itself.
+- Each entry in `folders` must be an absolute path, and the list must be sorted
+  by character code, with no duplicates and at least one entry. Write each path
+  already normalized in the host's own separators, with no trailing separator
+  and no `.` or `..` parts: `/home/me/code`, not `/home/me/code/`, and on
+  Windows `C:\\Users\\me\\code`, not `C:/Users/me/code`. Character-code order
+  puts capital letters before lowercase ones and `-` before `/`. To stop
+  listing checkouts for a workspace, remove its entry rather than leaving an
+  empty list.
+- On Windows, write each backslash as `\\` in JSON, for example
+  `"C:\\Users\\me\\code"`.
+- Stop Nyx first (`nyx --stop` on Linux, or quit the desktop application),
+  because a running board keeps the settings it captured in memory and would
+  overwrite or ignore the edit.
+- On Windows and macOS, rebuild the desktop application at this version before
+  editing: an older application refuses a schema 4 record.
+- If an edit is malformed, the configuration becomes unavailable and
+  `nyx checkouts` reports `nyx: Nyx configuration is unavailable`. Undoing the
+  edit restores it.
+
+Other keys the record already holds, such as `stage_orders`, stay as they are.
+
 ## Move files yourself
 
 Nyx does not provide lifecycle buttons. Move a work item directory with your

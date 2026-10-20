@@ -102,6 +102,65 @@ the runtime. For an unreadable record, a live owner still refuses both start and
 stop and keeps the record in place. Removal is permanent, because Nyx cannot
 distinguish a genuinely damaged record from a temporarily unreadable one.
 
+## Inspect checkouts
+
+```text
+nyx checkouts
+nyx checkouts --json
+```
+
+`nyx checkouts` lists the git checkouts found in the checkout folders configured
+for the current workspace: one line per clone and one indented line per linked
+worktree, in the same order as the document. `--json` prints the full document
+instead. It works on Linux, Windows and macOS from a Python installation of Nyx;
+the packaged desktop application has no `nyx` command. It never starts, stops or
+inspects the Nyx service, never launches the desktop application, and cannot be
+combined with `--setup`, `--stop` or `--status`.
+
+Before the checkouts, a few lines report problems with the setup itself.
+`git missing` means no `git` was found on `PATH`, and `git too_old <version>`
+means git is older than 2.36 (without a version when git's answer could not be
+read); either way no checkouts are listed. `folder <path> <status>` names a
+configured folder that is `missing`, `unreadable` or `not_directory`.
+`diagnostic <code> <path>` reports something left out of the list:
+`not_a_repository` for a directory that has a `.git` entry but is not the top of
+its own repository, and `unrepresentable_path` for a checkout whose path cannot
+be shown safely, such as one containing a control character, where the path is
+the folder or clone it belongs under, or `null` for a configured folder itself.
+
+Each clone or worktree line starts with the checkout's path, quoted as a JSON
+string, and then gives, separated by two spaces, its branch as `branch <name>`,
+`detached <sha>`, or `unborn <name>` for a branch with no commits yet; the
+`staged`, `unstaged`, `untracked` and `conflicted` counts; and any `operations`
+in progress such as `merge`. A clone line shows its main worktree's branch and
+counts, or `main <status>` when that worktree could not be read; a bare
+repository's line has neither. Clone lines then add `local-only <n>` (local
+branches with no same-name branch on `origin`, followed by `unknown <n>` when a
+comparison could not be made) and `default <name> <relation> cached <time>`.
+The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
+but not counted, as in a shallow clone), `absent` (one of the two branches does
+not exist) or `unknown`. A clone that has never fetched shows `never fetched`
+in place of `cached <time>`; one whose `origin` default branch is not cached
+shows `no cached default`; one without an `origin` remote shows
+`no origin remote` and no default. A checkout git refused or could not read
+shows its path and its status instead: `unsafe_ownership` when git refuses it
+for ownership, `timed_out` when git did not finish in time, and otherwise
+`failed`.
+
+The facts are cached-only labels: every comparison uses the remote-tracking
+branches this clone already has, so the output can be older than the remote
+until you fetch. The command is read-only and makes no network connection: it
+changes no repository, takes no git lock, and never fetches or contacts a
+remote. It exits 0 whenever it can print a document, including when git is
+missing or a folder is unavailable; it exits 1 with one line only when the
+configuration is unavailable or the document exceeds 2 MiB. With no folders
+configured it says `no checkout folders are configured` and exits 0.
+
+Checkout folders are set per workspace, in the account's configuration record;
+see [Your specification workspace](workspaces.md#checkout-folders) for the
+exact edit. A settings editor arrives with the Checkouts view; until then the
+record is edited by hand.
+
 ## Choose board row order
 
 When account settings are available, the toolbar includes a **Board row order**

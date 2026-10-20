@@ -173,6 +173,40 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
+CHECKOUT_GUIDANCE_MARKERS = {
+    "docs/running-nyx.md": (
+        "`nyx checkouts`",
+        "`--json`",
+        "one line per clone and one indented line per linked worktree",
+        "cached-only labels",
+        "`never fetched`",
+        "`no origin remote`",
+        "`local-only <n>`",
+        "`unknown <n>`",
+        "read-only and makes no network connection",
+        "never fetches or contacts a remote",
+        "Checkout folders are set per workspace",
+        "A settings editor arrives with the Checkouts view",
+        "cannot be combined with `--setup`, `--stop` or `--status`",
+        "exits 1 with one line only when the configuration is unavailable "
+        "or the document exceeds 2 MiB",
+        "`no checkout folders are configured`",
+    ),
+    "docs/workspaces.md": (
+        '"schema_version": 4',
+        '"checkout_settings"',
+        '"github_lookup": false',
+        "The key under `checkout_settings` is the record's own `specification_root` value",
+        "Each entry in `folders` must be an absolute path, and the list must be sorted",
+        "write each backslash as `\\\\` in JSON",
+        "Stop Nyx first",
+        "`nyx --stop` on Linux, or quit the desktop application",
+        "rebuild the desktop application at this version",
+        "an older application refuses a schema 4 record",
+        "the configuration becomes unavailable",
+        "Undoing the edit restores it",
+    ),
+}
 PORT_CONFLICT_GUIDANCE_MARKERS = (
     "**Nyx says port 8765 is already in use:**",
     "Linux", "`ss -ltnp 'sport = :8765'`",
@@ -290,6 +324,13 @@ def test_documents_publish_the_saved_stage_order_contract():
 
 def test_documents_publish_the_explicit_completion_contract():
     for name, markers in COMPLETION_GUIDANCE_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert marker in document, (name, marker)
+
+
+def test_documents_publish_the_checkout_contract():
+    for name, markers in CHECKOUT_GUIDANCE_MARKERS.items():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
         for marker in markers:
             assert marker in document, (name, marker)
@@ -429,7 +470,7 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
     assert setup.stdout.strip() == f"configured {sample}"
     configuration = json.loads((home / ".nyx/config/config.json").read_text(encoding="utf-8"))
     assert configuration["specification_root"] == str(sample)
-    assert configuration == {"schema_version": 3, "specification_root": str(sample)}
+    assert configuration == {"schema_version": 4, "specification_root": str(sample)}
     locator = home / ".nyx/runtime/instance.json"
     claim = home / ".nyx/runtime/lease.lock"
     try:

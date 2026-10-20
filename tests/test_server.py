@@ -2154,3 +2154,54 @@ def test_board_holding_a_configuration_from_before_the_move_still_serves_and_sav
             assert (stored["stage_orders"][key], stored["completed_stages"][key]) == scenario[
                 "entries_a"
             ]
+
+
+def test_real_settings_http_save_preserves_checkout_settings():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        first = root / "first"
+        first.mkdir()
+        second = root / "second"
+        second.mkdir()
+        with patch.object(state, "resolve_account_home", return_value=home):
+            state.setup(first)
+            paths = state.state_paths()
+        settings = {
+            str(first.resolve()): {"folders": [str(root / "one"), str(root / "two")], "github_lookup": True},
+            str(second.resolve()): {"folders": [str(root / "three")], "github_lookup": False},
+        }
+        paths.config_file.write_bytes(
+            (
+                json.dumps(
+                    {
+                        "schema_version": 4,
+                        "specification_root": str(first.resolve()),
+                        "checkout_settings": settings,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        initial = state.load_configuration(paths)
+        application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+        application.capture_configuration(initial, paths)
+        application.admit_catalog()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = request(
+                port,
+                "PUT",
+                "/api/settings",
+                body=json.dumps(
+                    {"revision": initial.revision, "order": ["Queue"], "completed": ["Queue"]}
+                ),
+            )
+        assert status == 200
+        assert json.loads(body)["outcome"] == "success"
+        stored = json.loads(paths.config_file.read_bytes())
+        assert stored["schema_version"] == 4
+        assert stored["stage_orders"] == {str(first.resolve()): ["Queue"]}
+        assert stored["checkout_settings"] == settings
