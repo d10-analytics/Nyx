@@ -3188,7 +3188,14 @@ def test_held_lease_retains_valid_stale_record_without_control_or_signal():
         assert record.exists()
 
 
-def test_fixed_port_occupant_causes_startup_failure_without_fallback():
+def _occupied_port_scenario():
+    """Run the real daemon against a held fixed port; return its observations.
+
+    Returns ``(exit_code, bound_address, held, record_exists, temporary_files)``
+    where ``bound_address`` is the daemon server's address if it ever bound one
+    and ``held`` is whether the occupant still held the fixed port address.
+    """
+
     with TemporaryDirectory() as temporary:
         paths, _, _ = _fixture(Path(temporary))
         occupant = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3200,13 +3207,39 @@ def test_fixed_port_occupant_causes_startup_failure_without_fallback():
             with patch.object(runtime, "_paths", return_value=paths):
                 daemon = runtime._Daemon(lease_fd, int((time.monotonic() + 5) * 1_000_000_000))
                 with managed_daemon_run(daemon) as run:
-                    assert run.join(timeout=8) in (25, 30)
-            if daemon.server is not None:
-                assert daemon.server.server_address == ("127.0.0.1", runtime.PORT)
-            assert not paths.runtime_directory.joinpath("instance.json").exists()
-            assert not list(paths.runtime_directory.glob(".instance.json.*"))
+                    code = run.join(timeout=8)
+            bound = None if daemon.server is None else daemon.server.server_address
+            held = occupant.getsockname() == ("127.0.0.1", runtime.PORT)
+            record_exists = paths.runtime_directory.joinpath("instance.json").exists()
+            leftovers = list(paths.runtime_directory.glob(".instance.json.*"))
+            return code, bound, held, record_exists, leftovers
         finally:
             occupant.close()
+
+
+class FixedPortCoBindDefect(Exception):
+    """The daemon bound the fixed port while another listener still held it."""
+
+
+@pytest.mark.xfail(
+    condition=sys.platform == "win32",
+    strict=True,
+    raises=FixedPortCoBindDefect,
+    reason="the reusable daemon listener co-binds a held port on win32 (exit 25)",
+)
+def test_fixed_port_occupant_causes_startup_failure_without_fallback():
+    code, bound, held, record_exists, leftovers = _occupied_port_scenario()
+    if record_exists:
+        pytest.fail("instance.json exists after the failed startup")
+    if leftovers:
+        pytest.fail(f"temporary record files remain: {leftovers!r}")
+    if code == 30:
+        return
+    if code == 25 and bound == ("127.0.0.1", runtime.PORT) and held:
+        raise FixedPortCoBindDefect(
+            f"daemon bound {bound!r} while the occupant held it; exit {code}"
+        )
+    pytest.fail(f"unexpected exit {code!r} (bound={bound!r}, occupant held={held})")
 
 
 def _write_runtime_record(

@@ -9,12 +9,14 @@ than a detached console daemon.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -58,12 +60,12 @@ EXPECTED = {
         ".venv/bin/nyx --status",
         ".venv/bin/nyx --stop",
     ),
-    "powershell": (
-        "py -3.12 -m venv .venv",
-        r".\.venv\Scripts\python.exe -m pip install '.[desktop,build]'",
-        r".\.venv\Scripts\python.exe scripts\build_desktop.py",
-    ),
 }
+BUILD_HEADING = "### Build the private artifact"
+# The desktop build is bounded for a native compile, not for one command.  Each
+# bound stays below its desktop job's time limit so a hung build fails here with
+# its captured output instead of being cut off by the job limit.
+_BUILD_TIMEOUT_MINUTES = {"powershell": 20, "bash": 10}
 # The documented private artifacts and the application actions the guide
 # promises.  The desktop lane consumes these paths against the staged build.
 DESKTOP_ARTIFACT_PATHS = {
@@ -245,12 +247,43 @@ EVENT_COMPLETION_EXAMPLE = (
 _START_TIMEOUT = 90.0
 
 
+def _fenced_blocks(text: str, language: str) -> list[str]:
+    return re.findall(rf"^```{language}\n(.*?)^```", text, re.MULTILINE | re.DOTALL)
+
+
 def _documented_commands(document: str, language: str) -> tuple[str, ...]:
-    blocks = re.findall(rf"^```{language}\n(.*?)^```", document, re.MULTILINE | re.DOTALL)
+    blocks = _fenced_blocks(document, language)
     assert blocks, f"missing {language} installation block"
     commands = tuple(blocks[0].splitlines())
     assert commands == EXPECTED[language], f"changed {language} installation commands"
     return commands
+
+
+def _published_build_block(document: str, language: str) -> str:
+    """Return the one ``language`` block published under the build heading."""
+
+    assert document.count(BUILD_HEADING + "\n") == 1, "missing build heading"
+    kept: list[str] = []
+    fenced = False
+    for line in document.split(BUILD_HEADING + "\n", 1)[1].splitlines(keepends=True):
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and re.match(r"#{1,3} ", line):
+            break
+        kept.append(line)
+    section = "".join(kept)
+    blocks = _fenced_blocks(section, language)
+    assert len(blocks) == 1, f"expected one {language} build block, found {len(blocks)}"
+    assert blocks[0].strip(), f"empty {language} build block"
+    return blocks[0]
+
+
+def _lane_build_language() -> str | None:
+    if os.name == "nt":
+        return "powershell"
+    if sys.platform == "darwin":
+        return "bash"
+    return None
 
 
 @pytest.mark.parametrize("language", EXPECTED)
@@ -278,6 +311,72 @@ def test_document_contract_rejects_changed_or_deleted_commands(language, index):
         document = f"```{language}\n" + "\n".join(changed) + "\n```\n"
         with pytest.raises(AssertionError, match="changed"):
             _documented_commands(document, language)
+
+
+def test_readme_and_guide_publish_the_same_powershell_build_block():
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    readme_blocks = _fenced_blocks(readme, "powershell")
+    assert len(readme_blocks) == 1, "README must publish exactly one PowerShell block"
+    selected = _published_build_block(guide, "powershell")
+    assert readme_blocks[0] == selected
+    assert "scripts" in selected and "build_desktop.py" in selected
+
+
+SYNTHETIC_GUIDE = (
+    "# Running Nyx\n\n"
+    "## Linux\n\n```bash\nlinux-first\n```\n\n"
+    "{heading}\n\n"
+    "```powershell\n{powershell}\n```\n\n"
+    "```bash\n{macos}\n```\n\n"
+    "### Open\n\n```bash\nafter-section\n```\n"
+)
+
+
+def _synthetic_guide(powershell="ps-build", macos="mac-build", heading=BUILD_HEADING):
+    return SYNTHETIC_GUIDE.format(heading=heading, powershell=powershell, macos=macos)
+
+
+def test_build_block_is_selected_by_heading_and_language_not_position():
+    guide = _synthetic_guide()
+    assert _published_build_block(guide, "bash") == "mac-build\n"
+    assert _published_build_block(guide, "powershell") == "ps-build\n"
+    # The first and last bash blocks of the document are never the build block.
+    assert _published_build_block(guide, "bash") not in ("linux-first\n", "after-section\n")
+
+
+def test_changing_a_command_under_the_heading_changes_the_selected_block():
+    before = _published_build_block(_synthetic_guide(), "bash")
+    after = _published_build_block(_synthetic_guide(macos="mac-build\nextra"), "bash")
+    assert after != before
+    assert after == "mac-build\nextra\n"
+    # A change outside the heading leaves the selection alone.
+    other = _synthetic_guide().replace("linux-first", "linux-changed")
+    assert _published_build_block(other, "bash") == before
+
+
+def test_build_selection_rejects_missing_heading_or_missing_language_block():
+    with pytest.raises(AssertionError, match="missing build heading"):
+        _published_build_block(_synthetic_guide(heading="### Something else"), "bash")
+    with pytest.raises(AssertionError, match="expected one"):
+        _published_build_block(_synthetic_guide().replace("```powershell", "```text"), "powershell")
+
+
+def test_build_selection_keeps_comment_lines_inside_the_selected_block():
+    # A shell comment inside the block looks like a heading; it must neither end
+    # the section nor drop the commands after it.
+    macos = "mac-venv\n# then build\nmac-build"
+    guide = _synthetic_guide(macos=macos)
+    assert _published_build_block(guide, "bash") == macos + "\n"
+
+
+def test_real_guide_selects_the_macos_build_block_not_the_linux_one():
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    selected = _published_build_block(guide, "bash")
+    linux = "\n".join(EXPECTED["bash"]) + "\n"
+    assert selected != linux
+    assert "build_desktop.py" in selected
+    assert "venv" in selected
 
 
 def test_documents_publish_the_private_desktop_guidance():
@@ -394,37 +493,231 @@ def test_documents_publish_the_invalid_record_recovery_guidance():
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
-    if os.name == "nt":
-        arguments = [
-            "pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference = 'Stop'\n" + command
-            + "\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-        ]
-    else:
-        arguments = ["bash", "-euo", "pipefail", "-c", command]
+    """Run one published Linux installation command in its own bash."""
+
     result = subprocess.run(
-        arguments, cwd=root, env=environment, capture_output=True, text=True,
-        check=False, timeout=180,
+        ["bash", "-euo", "pipefail", "-c", command], cwd=root, env=environment,
+        capture_output=True, text=True, check=False, timeout=180,
     )
     assert result.returncode == 0, (command, result.returncode, result.stdout, result.stderr)
     return result
 
 
+@pytest.mark.skipif(os.name == "nt", reason="per-line commands run only on the Linux installation path")
 def test_native_shell_propagates_failed_command(tmp_path):
-    if os.name == "nt":
-        command = "& '" + sys.executable.replace("'", "''") + "' -c 'import sys; sys.exit(17)'"
-    else:
-        command = shlex.quote(sys.executable) + " -c 'import sys; sys.exit(17)'"
     with pytest.raises(AssertionError, match=r"\b17\b"):
-        _run_command(command, root=tmp_path, environment=_installed_environment(tmp_path))
+        _run_command(_native_exit(17), root=tmp_path, environment=_installed_environment(tmp_path))
+
+
+_PWSH_SESSION_PREFIX = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "$PSNativeCommandUseErrorActionPreference = $true\n"
+    "trap {\n"
+    "  [Console]::Error.WriteLine(($_ | Out-String))\n"
+    "  if ($_.Exception -is [System.Management.Automation.NativeCommandExitException] "
+    "-and $LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n"
+    "  exit 1\n"
+    "}\n"
+)
+
+
+def _session_arguments(block: str) -> list[str]:
+    """Return the argument vector running ``block`` as one shell session."""
+
+    if os.name == "nt":
+        return [
+            "pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+            _PWSH_SESSION_PREFIX + block,
+        ]
+    return ["bash", "-euo", "pipefail", "-c", block]
+
+
+_TIMEOUT_REPORT_GRACE_SECONDS = 10.0
+
+
+def _kill_session_tree(process: subprocess.Popen) -> None:
+    """Kill the session shell and every descendant that holds its output pipes."""
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True, check=False,
+        )
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        process.kill()
+
+
+def _run_session(
+    block: str, *, root: Path, environment: dict[str, str] | None = None,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """Run ``block`` as one shell session, killing its whole process tree on timeout.
+
+    ``subprocess.run`` kills only the shell, and the build children that keep the
+    output pipes open then keep the read blocked.  The session therefore leads
+    its own process group (or is killed with ``taskkill /T`` on Windows), and the
+    partial output is collected with a bounded read before the timeout is raised.
+    """
+
+    arguments = _session_arguments(block)
+    if shutil.which(arguments[0]) is None:
+        pytest.fail(f"the lane's shell {arguments[0]!r} is not available")
+    options: dict[str, object] = {}
+    if os.name != "nt":
+        options["start_new_session"] = True
+    with subprocess.Popen(
+        arguments, cwd=root, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, **options,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as expired:
+            _kill_session_tree(process)
+            try:
+                stdout, stderr = process.communicate(timeout=_TIMEOUT_REPORT_GRACE_SECONDS)
+            except subprocess.TimeoutExpired as lingering:
+                stdout, stderr = lingering.stdout, lingering.stderr
+            raise subprocess.TimeoutExpired(
+                arguments, timeout, output=_as_text(stdout), stderr=_as_text(stderr)
+            ) from expired
+        except BaseException:
+            _kill_session_tree(process)
+            raise
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+
+
+def _as_text(output: str | bytes | None) -> str:
+    if output is None:
+        return ""
+    return output.decode(errors="replace") if isinstance(output, bytes) else output
+
+
+def test_session_fails_hard_when_the_lane_shell_is_missing(tmp_path, monkeypatch):
+    shell = _session_arguments("unused")[0]
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(pytest.fail.Exception, match=rf"the lane's shell '{shell}' is not available"):
+        _run_session("unused", root=tmp_path, timeout=120)
+
+
+def test_session_timeout_kills_the_tree_and_reports_partial_output(tmp_path):
+    heartbeat = tmp_path / "heartbeat"
+    child = (
+        "import time\n"
+        "print('session-started', flush=True)\n"
+        f"path = {str(heartbeat)!r}\n"
+        "end = time.monotonic() + 120\n"
+        "while time.monotonic() < end:\n"
+        "    open(path, 'a').write('x')\n"
+        "    time.sleep(0.1)\n"
+    )
+    script = tmp_path / "outlives.py"
+    script.write_text(child, encoding="utf-8")
+    if os.name == "nt":
+        block = f"& '{sys.executable}' '{script}'\necho after-child"
+    else:
+        block = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}\necho after-child"
+    timeout = 3.0
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        _run_session(block, root=tmp_path, timeout=timeout)
+    elapsed = time.monotonic() - started
+    assert elapsed < timeout + _TIMEOUT_REPORT_GRACE_SECONDS, elapsed
+    assert "session-started" in _as_text(raised.value.stdout)
+    size = heartbeat.stat().st_size
+    assert size > 0
+    time.sleep(1.0)
+    assert heartbeat.stat().st_size == size, "the foreground child survived the timeout"
+
+
+def _native_exit(code: int) -> str:
+    interpreter = sys.executable
+    if os.name == "nt":
+        return f"& '{interpreter.replace(chr(39), chr(39) * 2)}' -c 'import sys; sys.exit({code})'"
+    return f"{shlex.quote(interpreter)} -c 'import sys; sys.exit({code})'"
+
+
+def test_session_keeps_state_between_lines(tmp_path):
+    if os.name == "nt":
+        block = "$env:NYX_SESSION_PROBE = 'kept'\nWrite-Output \"seen=$env:NYX_SESSION_PROBE\""
+    else:
+        block = 'export NYX_SESSION_PROBE=kept\necho "seen=$NYX_SESSION_PROBE"'
+    result = _run_session(block, root=tmp_path, timeout=120)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == "seen=kept"
+
+
+def test_session_runs_from_the_given_root(tmp_path):
+    block = "Write-Output (Get-Location).Path" if os.name == "nt" else "pwd"
+    result = _run_session(block, root=tmp_path, timeout=120)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
+
+
+def test_session_failing_native_command_stops_the_block_with_its_own_exit_code(tmp_path):
+    block = _native_exit(17) + "\necho after-failure"
+    result = _run_session(block, root=tmp_path, timeout=120)
+    assert result.returncode == 17, (result.returncode, result.stdout, result.stderr)
+    assert "after-failure" not in result.stdout
+
+
+def test_session_without_errors_exits_zero(tmp_path):
+    block = _native_exit(0) + "\necho finished"
+    result = _run_session(block, root=tmp_path, timeout=120)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "finished" in result.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the PowerShell trap exists only on Windows lanes")
+def test_session_non_native_terminating_error_exits_non_zero_with_record(tmp_path):
+    # A native command exiting 0 leaves LASTEXITCODE 0, so a ``throw`` must
+    # still end the session non-zero.
+    block = _native_exit(0) + "\nthrow 'nyx-session-boom'\nWrite-Output after-throw"
+    result = _run_session(block, root=tmp_path, timeout=120)
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    assert "nyx-session-boom" in result.stderr
+    assert "after-throw" not in result.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the PowerShell trap exists only on Windows lanes")
+def test_session_native_failure_record_reaches_stderr(tmp_path):
+    result = _run_session(_native_exit(23), root=tmp_path, timeout=120)
+    assert result.returncode == 23, (result.returncode, result.stdout, result.stderr)
+    assert result.stderr.strip()
+
+
+@pytest.mark.skipif(
+    os.environ.get("NYX_VERIFY_DOCUMENTED_BUILD") != "1",
+    reason="the documented build runs only in the desktop documented-build step",
+)
+def test_documented_desktop_build_blocks_run_literally():
+    language = _lane_build_language()
+    if language is None:
+        pytest.skip("the documented build runs only on the Windows and macOS desktop lanes")
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    block = _published_build_block(guide, language)
+    bound = _BUILD_TIMEOUT_MINUTES[language] * 60
+    try:
+        result = _run_session(
+            block, root=REPOSITORY_ROOT, environment=dict(os.environ), timeout=bound
+        )
+    except subprocess.TimeoutExpired as expired:
+        pytest.fail(f"the documented {language} build exceeded {bound} s: {expired.stdout!r}")
+    print(result.stdout)
+    print(result.stderr, file=sys.stderr)
+    assert result.returncode == 0, (
+        f"documented {language} build exited {result.returncode}",
+        result.stdout[-4000:], result.stderr[-4000:],
+    )
 
 
 def _exercise_documented_linux_installation(tmp_path: Path) -> None:
     """Run the published Linux commands exactly as written."""
 
-    language = "powershell" if os.name == "nt" else "bash"
     blocks = [
-        _documented_commands((REPOSITORY_ROOT / name).read_text(encoding="utf-8"), language)
+        _documented_commands((REPOSITORY_ROOT / name).read_text(encoding="utf-8"), "bash")
         for name in DOCUMENTS
     ]
     assert blocks[0] == blocks[1]

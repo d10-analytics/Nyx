@@ -126,17 +126,31 @@ operating system may ask you to trust or open the build the first time you run
 it.
 
 Build the private artifact from the repository root with the pinned desktop and
-build extras:
+build extras. On Windows the build needs Visual Studio 2022 or later, or its Build Tools,
+with the MSVC C++ x64 build tools; the block loads that environment so Nuitka can
+compile and the deployment tool's `dumpbin` can discover the Qt modules, and it
+stops with an error if either is missing:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install '.[desktop,build]'
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found; install Visual Studio 2022 or later, or its Build Tools' }
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw 'no Visual Studio installation has the MSVC C++ x64 build tools' }
+$vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+cmd /c "`"$vcvars`" && set" | ForEach-Object {
+  if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+}
+if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit code $LASTEXITCODE" }
+if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) { throw 'dumpbin.exe is not on PATH after loading the build tools' }
 .\.venv\Scripts\python.exe scripts\build_desktop.py
 ```
 
 The build stages `dist\desktop\Nyx\Nyx.exe` on Windows and
-`dist/desktop/Nyx.app` on macOS; macOS uses the same three commands with
-`python3.12` and `.venv/bin/python`. Opening the staged application does not
+`dist/desktop/Nyx.app` on macOS; macOS needs no Visual Studio step and runs the
+same virtual environment, install and build commands with `python3.12` and
+`.venv/bin/python`. Opening the staged application does not
 need a separate Python installation or virtual environment, and there is no
 offline-install guarantee.
 

@@ -10,7 +10,6 @@ source imports inside the application.
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import http.client
 import json
 import os
@@ -18,10 +17,13 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import native_ui
 import pytest
 
 from nyx import state
@@ -37,10 +39,10 @@ if _ARTIFACT_REQUIRED and not _ARTIFACT_ENV:
         "NYX_DESKTOP_ARTIFACT must identify the staged application in a required native lane"
     )
 
-pytestmark = pytest.mark.skipif(
-    not _ARTIFACT_ENV,
-    reason="the delivered desktop artifact is not staged on this host",
-)
+_ARTIFACT_ABSENT_REASON = "the delivered desktop artifact is not staged on this host"
+# The `artifact` fixture skips when nothing is staged, so the pure unit checks
+# in this module still run on a host without a desktop.
+_requires_artifact = pytest.mark.skipif(not _ARTIFACT_ENV, reason=_ARTIFACT_ABSENT_REASON)
 
 PORT = 8765
 _HOST = f"127.0.0.1:{PORT}"
@@ -83,6 +85,8 @@ def _bundle_executable(bundle: Path) -> str:
 
 @pytest.fixture(scope="module")
 def artifact() -> ArtifactLayout:
+    if not _ARTIFACT_ENV:
+        pytest.skip(_ARTIFACT_ABSENT_REASON)
     layout = ArtifactLayout(Path(_ARTIFACT_ENV).resolve())
     assert layout.executable.is_file(), f"staged application executable is missing: {layout.executable}"
     assert layout.helper.is_file(), f"bundled worker helper is missing: {layout.helper}"
@@ -250,108 +254,9 @@ class _RunningGui:
             return self.process.wait(timeout=timeout)
 
 
-def _windows_visible_top_level_windows() -> list[tuple[int, str]]:
-    from ctypes import wintypes
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
-    user32.EnumWindows.restype = wintypes.BOOL
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.IsWindowVisible.restype = wintypes.BOOL
-    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetWindowTextW.restype = ctypes.c_int
-    found: list[tuple[int, str]] = []
-
-    def visit(window, _parameter):
-        if user32.IsWindowVisible(window):
-            owner = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
-            title = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(window, title, len(title))
-            found.append((owner.value, title.value))
-        return True
-
-    if not user32.EnumWindows(callback_type(visit), 0):
-        raise OSError(ctypes.get_last_error(), "EnumWindows failed")
-    return found
-
-
-def _macos_visible_top_level_windows() -> list[tuple[int, str]]:
-    graphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-    foundation = ctypes.CDLL(
-        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-    )
-    graphics.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
-    graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
-    foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
-    foundation.CFArrayGetCount.restype = ctypes.c_long
-    foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
-    foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
-    foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
-    foundation.CFNumberGetValue.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int32),
-    ]
-    foundation.CFNumberGetValue.restype = ctypes.c_bool
-    foundation.CFStringGetCString.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
-    ]
-    foundation.CFStringGetCString.restype = ctypes.c_bool
-    foundation.CFRelease.argtypes = [ctypes.c_void_p]
-    foundation.CFRelease.restype = None
-    on_screen_only = 1 << 0
-    exclude_desktop_elements = 1 << 4
-    number_sint32 = 3
-    utf8 = 0x08000100
-    owner_pid_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerPID").value
-    owner_name_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowOwnerName").value
-    layer_key = ctypes.c_void_p.in_dll(graphics, "kCGWindowLayer").value
-
-    def integer(info, key) -> int | None:
-        value = foundation.CFDictionaryGetValue(info, key)
-        number = ctypes.c_int32()
-        if not value or not foundation.CFNumberGetValue(value, number_sint32, ctypes.byref(number)):
-            return None
-        return number.value
-
-    def text(info, key) -> str:
-        value = foundation.CFDictionaryGetValue(info, key)
-        buffer = ctypes.create_string_buffer(512)
-        if not value or not foundation.CFStringGetCString(value, buffer, len(buffer), utf8):
-            return ""
-        return buffer.value.decode("utf-8", errors="replace")
-
-    windows = graphics.CGWindowListCopyWindowInfo(
-        on_screen_only | exclude_desktop_elements, 0
-    )
-    if not windows:
-        raise OSError("CGWindowListCopyWindowInfo returned no window list")
-    found: list[tuple[int, str]] = []
-    try:
-        for index in range(foundation.CFArrayGetCount(windows)):
-            info = foundation.CFArrayGetValueAtIndex(windows, index)
-            owner = integer(info, owner_pid_key)
-            # Layer 0 is the normal application window level; menu bar, dock
-            # and overlay surfaces sit on other layers.
-            if owner is None or integer(info, layer_key) != 0:
-                continue
-            found.append((owner, text(info, owner_name_key)))
-    finally:
-        foundation.CFRelease(windows)
-    return found
-
-
-def _visible_top_level_windows() -> list[tuple[int, str]]:
-    """Return the owner process id and a label for each visible top-level window."""
-
-    if os.name == "nt":
-        return _windows_visible_top_level_windows()
-    if sys.platform == "darwin":
-        return _macos_visible_top_level_windows()
-    raise AssertionError("window readiness is observable only on Windows and macOS")
+# The window enumerators and their dispatcher live in the shared native driver
+# module so one owner answers "which windows does process X show".
+_visible_top_level_windows = native_ui.visible_top_level_windows
 
 
 def _wait_for_window(gui: _RunningGui, timeout: float = _WINDOW_TIMEOUT) -> None:
@@ -363,7 +268,7 @@ def _wait_for_window(gui: _RunningGui, timeout: float = _WINDOW_TIMEOUT) -> None
     """
 
     deadline = time.monotonic() + timeout
-    owners: list[tuple[int, str]] = []
+    owners: list[native_ui.WindowInfo] = []
     while True:
         exit_code = gui.process.poll()
         if exit_code is not None:
@@ -372,12 +277,15 @@ def _wait_for_window(gui: _RunningGui, timeout: float = _WINDOW_TIMEOUT) -> None
                 f"application log:\n{gui.diagnostics()[-2000:]}"
             )
         owners = _visible_top_level_windows()
-        if any(owner == gui.process.pid for owner, _ in owners):
+        if any(window.owner == gui.process.pid for window in owners):
             return
         if time.monotonic() >= deadline:
             break
         time.sleep(0.25)
-    observed = ", ".join(f"{owner}:{label!r}" for owner, label in sorted(set(owners)))
+    observed = ", ".join(
+        f"{owner}:{label!r}"
+        for owner, label in sorted({(window.owner, window.title) for window in owners})
+    )
     raise AssertionError(
         f"no visible top-level window owned by pid {gui.process.pid} within {timeout:g}s; "
         f"observed window owners: [{observed}]; "
@@ -386,18 +294,37 @@ def _wait_for_window(gui: _RunningGui, timeout: float = _WINDOW_TIMEOUT) -> None
 
 
 @contextlib.contextmanager
-def _running_gui(artifact: ArtifactLayout, root: Path, environment: dict[str, str]):
+def _running_gui(
+    artifact: ArtifactLayout,
+    root: Path,
+    environment: dict[str, str],
+    extra_environment: dict[str, str] | None = None,
+    job_observer: native_ui.JobObserver | None = None,
+):
+    """Launch the staged application and yield it.
+
+    ``extra_environment`` adds variables to this launch only.  A
+    ``job_observer`` places the process in its job object immediately after
+    launch, before the caller can issue a first request.
+    """
+
     log = root / "application.log"
     handle = log.open("wb")
+    launch_environment = {**environment, **(extra_environment or {})}
     process = subprocess.Popen(
         [str(artifact.executable)],
         cwd=str(root),
-        env=environment,
+        env=launch_environment,
         stdout=handle,
         stderr=subprocess.STDOUT,
     )
     running = _RunningGui(process, handle, log)
     try:
+        if job_observer is not None:
+            try:
+                job_observer.attach(process)
+            except native_ui.DriverError as error:
+                pytest.fail(f"the application could not be placed in a job object: {error}")
         yield running
     finally:
         if process.poll() is None:
@@ -416,6 +343,82 @@ def test_delivered_artifact_carries_application_worker_and_resources(artifact: A
     assert artifact.application_root.is_dir()
     assert artifact.helper.parent.name == "NyxWorker"
     assert artifact.resource.read_bytes() == (_SOURCE_ROOT / "nyx" / "static" / "app.js").read_bytes()
+
+
+def _find_dotnet_compiler() -> Path:
+    """Locate the C# compiler shipped with Windows, so no download is needed."""
+
+    windows = Path(os.environ.get("WINDIR", r"C:\Windows"))
+    for framework in ("Framework64", "Framework"):
+        candidate = windows / "Microsoft.NET" / framework / "v4.0.30319" / "csc.exe"
+        if candidate.is_file():
+            return candidate
+    pytest.fail("the .NET Framework C# compiler that ships with Windows was not found")
+
+
+def _install_interpreter_decoys(decoy_bin: Path, marker: Path, scratch: Path) -> None:
+    """Install decoy interpreters that record an invocation and exit nonzero.
+
+    On Windows each decoy is a native executable image, because
+    ``CreateProcess`` does not run a shebang script as ``python.exe``.
+    """
+
+    if os.name == "nt":
+        source = scratch / "interpreter-decoy.cs"
+        literal = str(marker).replace('"', '""')
+        source.write_text(
+            "using System.IO;\n"
+            "public static class NyxInterpreterDecoy {\n"
+            "    public static int Main(string[] arguments) {\n"
+            f'        File.AppendAllText(@"{literal}", "invoked\\n");\n'
+            "        return 9;\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        python = decoy_bin / "python.exe"
+        compiled = subprocess.run(
+            [str(_find_dotnet_compiler()), "/nologo", "/target:exe", f"/out:{python}", str(source)],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if compiled.returncode != 0 or not python.is_file():
+            pytest.fail(
+                f"the native interpreter decoy did not compile ({compiled.returncode}): "
+                f"{compiled.stdout[-1500:]!r} {compiled.stderr[-1500:]!r}"
+            )
+        shutil.copyfile(python, decoy_bin / "python3.exe")
+        return
+    for name in ("python", "python3"):
+        interpreter = decoy_bin / name
+        interpreter.write_text(f"#!/bin/sh\ntouch {marker}\nexit 127\n", encoding="utf-8")
+        interpreter.chmod(0o755)
+
+
+def _prove_decoys_fire(environment: dict[str, str], marker: Path, root: Path) -> None:
+    """Run each interpreter name through the sanitized PATH and require the marker.
+
+    The control uses the platform shell, which resolves the name through the
+    environment's own ``PATH`` the way the application's lookup would.
+    """
+
+    shell = (
+        [os.environ.get("COMSPEC", "cmd.exe"), "/c"]
+        if os.name == "nt"
+        else ["/bin/sh", "-c"]
+    )
+    for name in ("python", "python3"):
+        command = shell + ([name, "-c", "pass"] if os.name == "nt" else [f"{name} -c pass"])
+        control = subprocess.run(
+            command, env=environment, cwd=str(root), capture_output=True, timeout=60, check=False
+        )
+        if not marker.exists():
+            pytest.fail(
+                f"the interpreter decoy never fired for {name!r} through the sanitized PATH "
+                f"(exit {control.returncode}): {control.stdout!r} {control.stderr!r}"
+            )
+        if control.returncode == 0:
+            pytest.fail(f"the interpreter decoy for {name!r} did not exit nonzero")
+        marker.unlink()
 
 
 def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
@@ -439,14 +442,10 @@ def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
         decoy_bin = root / "decoy-bin"
         decoy_bin.mkdir()
         marker = root / "decoy-interpreter-ran"
-        for name in ("python", "python3"):
-            interpreter = decoy_bin / name
-            interpreter.write_text(
-                f"#!/bin/sh\ntouch {marker}\nexit 127\n", encoding="utf-8"
-            )
-            interpreter.chmod(0o755)
+        _install_interpreter_decoys(decoy_bin, marker, root)
         environment = _sanitized_environment(home, decoy)
         environment["PATH"] = os.pathsep.join([str(decoy_bin), environment["PATH"]])
+        _prove_decoys_fire(environment, marker, root)
         with _workspace(root) as workspace:
             _, configuration = _write_configuration(home, workspace)
             expected = json.loads(_expected_catalog(configuration))
@@ -456,9 +455,15 @@ def test_delivered_application_ignores_a_decoy_checkout_and_build_interpreter(
                 assert json.loads(body) == expected
                 assert gui.process.poll() is None, gui.diagnostics()
                 gui.close()
-
-    assert not marker.exists(), "the delivered application ran a build-time interpreter"
-    assert not (decoy / "nyx" / "__pycache__").exists(), "the checkout was imported"
+        # Checked while the temporary directory still exists: after it is
+        # removed neither path could ever be found.
+        if marker.exists():
+            pytest.fail(
+                "the delivered application invoked an external interpreter while serving its "
+                f"catalog: the decoy recorded {marker.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+        if (decoy / "nyx" / "__pycache__").exists():
+            pytest.fail("the delivered application imported the decoy checkout's nyx package")
 
 
 def test_delivered_board_serves_exact_catalog_and_bundled_resources(artifact: ArtifactLayout):
@@ -580,9 +585,9 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
                         _wait_for_window(second)
                         if os.name == "nt":
                             titles = [
-                                title
-                                for owner, title in _visible_top_level_windows()
-                                if owner == second.process.pid
+                                window.title
+                                for window in _visible_top_level_windows()
+                                if window.owner == second.process.pid
                             ]
                             assert "Nyx" in titles, (
                                 f"second launch windows {titles!r}; "
@@ -794,6 +799,7 @@ def test_delivered_chooser_state_starts_no_runtime_or_workers(artifact: Artifact
         _assert_claims_released(home)
 
 
+@_requires_artifact
 def test_window_readiness_fails_at_its_bound_for_a_process_without_a_window():
     """A launched process that never shows a window fails the readiness wait."""
 
@@ -969,3 +975,969 @@ def _assert_claims_released(home: Path) -> None:
         claim = NativeClaim(path)
         assert claim.acquire(blocking=False), f"claim still held after exit: {path}"
         claim.close()
+
+
+# ---------------------------------------------------------------------------
+# Windows console-window observation
+# ---------------------------------------------------------------------------
+
+
+class ConsoleWindowDefect(Exception):
+    """A console-class window attributed to the application or a descendant."""
+
+
+_CONSOLE_CONTROL_SOURCE = (
+    "import ctypes, sys, time\n"
+    "kernel32 = ctypes.windll.kernel32\n"
+    "kernel32.GetConsoleWindow.restype = ctypes.c_void_p\n"
+    "open(sys.argv[1], 'w').write(str(kernel32.GetConsoleWindow() or 0))\n"
+    "time.sleep(7.0)\n"
+)
+
+
+def _unit_sample(
+    handle: int, window_class: str, owner: int, image: str = "", parent: int | None = None
+) -> native_ui.WindowSample:
+    return native_ui.WindowSample(
+        1.0, "synthetic", handle, window_class, "", owner, image, parent, {}
+    )
+
+
+def test_control_is_accepted_only_from_the_samplers_own_records():
+    """Polling or attachment evidence cannot validate a sampler that recorded nothing."""
+
+    control = 1268
+    own = _unit_sample(0x2000, "PseudoConsoleWindow", control, "python.exe", 1)
+    reported = _unit_sample(0x1201DC, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    runner = _unit_sample(0x100, "CASCADIA_HOSTING_WINDOW_CLASS", 2396, "WindowsTerminal.exe", 1)
+    # The sampler recorded the control's window by ownership.
+    assert native_ui.accept_control_from_sampler([own, runner], control, 0) == {"owner-in-family"}
+    # The sampler recorded the window the control reports.
+    assert native_ui.accept_control_from_sampler([reported, runner], control, 0x1201DC) == {
+        native_ui.REPORTED_HANDLE_RELATION
+    }
+    # An empty sampler is rejected even though a poll found the window (the
+    # case where only a poll found the window): the poll evidence is never an input to
+    # the decision.
+    polled_only = native_ui.observe_console_relations(
+        control,
+        enumerate_windows=lambda: [native_ui.WindowInfo(control, "", "PseudoConsoleWindow", 0x2000)],
+        process_table=lambda: {control: (1, "python.exe")},
+        attach=lambda pid: {"attached": False, "hwnd": 0},
+        duration=0.0,
+    )
+    assert polled_only["relations"] == {"owner-in-family"}
+    assert native_ui.accept_control_from_sampler([], control, 0x2000) is None
+    # Unrelated sampler windows, or a reported handle the sampler never saw, are rejected.
+    assert native_ui.accept_control_from_sampler([runner], control, 0) is None
+    assert native_ui.accept_control_from_sampler([runner, reported], control, 0x777) is None
+    assert native_ui.accept_control_from_sampler([reported], control, 0) is None
+
+
+def test_console_attribution_follows_family_relations_and_never_runner_terminals():
+    """Unit check of the attribution rules; needs no desktop and no artifact."""
+
+    helper, gui = 5001, 4000
+    family = {gui, helper}
+    # A pseudo-console window owned by a helper process.
+    pseudo = _unit_sample(0x30220, "PseudoConsoleWindow", helper, "NyxWorker.exe", gui)
+    visible = _unit_sample(0x30221, "ConsoleWindowClass", helper, "NyxWorker.exe", gui)
+    # A console window owned by a console host whose parent is the family process.
+    hosted = _unit_sample(0x30222, "ConsoleWindowClass", 7000, "conhost.exe", helper)
+    # The runner's own terminal windows, owned by an unrelated process tree.
+    runner = [
+        _unit_sample(0x100 + index, "CASCADIA_HOSTING_WINDOW_CLASS", 2396,
+                     "WindowsTerminal.exe", 1)
+        for index in range(8)
+    ]
+    other = _unit_sample(0x40000, "Qt6QWindowIcon", helper, "NyxWorker.exe", gui)
+    attributed = native_ui.attribute_console_windows(
+        [pseudo, visible, hosted, other, *runner], family
+    )
+    assert {(sample.handle, relation) for sample, relation in attributed} == {
+        (0x30220, "owner-in-family"),
+        (0x30221, "owner-in-family"),
+        (0x30222, "owner-parent-in-family"),
+    }
+    # Removing the family relation stops the attribution (the check is failing-capable).
+    assert native_ui.attribute_console_windows([pseudo, visible, hosted], {99999}) == []
+    # The control's own console window, owned by OpenConsole.exe, is attributed
+    # only through the handle the control reports, and only when it matches.
+    control_window = _unit_sample(0x1201DC, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    unrelated_pseudo = _unit_sample(0x1201DD, "PseudoConsoleWindow", 9124, "OpenConsole.exe", 696)
+    samples = [control_window, unrelated_pseudo, *runner]
+    assert native_ui.attribute_console_windows(samples, {1268}) == []
+    matched = native_ui.attribute_console_windows(
+        samples, {1268}, reported_handles={0x1201DC}
+    )
+    assert [(sample.handle, relation) for sample, relation in matched] == [
+        (0x1201DC, native_ui.REPORTED_HANDLE_RELATION)
+    ]
+    assert native_ui.attribute_console_windows(
+        samples, {1268}, reported_handles={0x999999}
+    ) == []
+    # A reported handle never attributes a window that is not console-class.
+    assert native_ui.attribute_console_windows(
+        [_unit_sample(0x1201DC, "Qt6QWindowIcon", 9124)], {1268}, reported_handles={0x1201DC}
+    ) == []
+    # The application is judged by the control's relations plus ownership, so a
+    # control seen only through its reported handle still lets a helper-owned
+    # console window raise the defect, and still never admits a runner terminal.
+    judged = native_ui.judging_relations({native_ui.REPORTED_HANDLE_RELATION})
+    assert native_ui.REPORTED_HANDLE_RELATION in judged and "owner-in-family" in judged
+    assert [
+        sample.handle
+        for sample, _ in native_ui.attribute_console_windows(
+            [pseudo, *runner], family, allowed=judged
+        )
+    ] == [0x30220]
+
+
+def _describe_sample(sample: native_ui.WindowSample) -> str:
+    return (
+        f"class={sample.window_class!r} hwnd={sample.handle:#x} owner_pid={sample.owner_pid} "
+        f"owner_image={sample.owner_image!r} owner_parent={sample.owner_parent} "
+        f"title={sample.title!r} source={sample.source}"
+    )
+
+
+def _run_console_control(
+    sampler: native_ui.WindowShowSampler, root: Path
+) -> tuple[set[str], set[tuple[int, float]]]:
+    """Start a console-subsystem child in a new console and require the sampler to see it.
+
+    The runner's console topology varies.  The child's console window is either
+    tied to it by a process relation (window owner, owner's parent, a console
+    host's attached clients) or is owned by a console host such as
+    ``OpenConsole.exe``, in which case the handle the child itself reports
+    through ``GetConsoleWindow`` identifies it once the sampler observed that
+    handle.  Timing never attributes.  Return the relations the control
+    exhibited, so the application is judged by the same relations, and the
+    (handle, time) identities of the windows it caused.
+    """
+
+    hwnd_file = root / "control-console-window"
+    started = time.monotonic()
+    control = subprocess.Popen(
+        [sys.executable, "-c", _CONSOLE_CONTROL_SOURCE, str(hwnd_file)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+    # Detect by polling every top-level window (hidden pseudo-console windows
+    # included) and by attaching to the control's console, rather than relying on
+    # a show event arriving while the control is alive.
+    observation = native_ui.observe_console_relations(
+        control.pid,
+        enumerate_windows=native_ui.all_top_level_windows,
+        process_table=native_ui.windows_process_table,
+        attach=native_ui.console_window_of,
+    )
+    try:
+        control.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        control.kill()
+        control.wait(timeout=30)
+        pytest.fail("the console control child did not finish")
+    ended = time.monotonic()
+    time.sleep(1.0)
+    try:
+        control_hwnd = int(hwnd_file.read_text(encoding="utf-8") or "0")
+    except (OSError, ValueError):
+        control_hwnd = 0
+    samples = sampler.snapshot()
+    shown_at = dict(sampler.shown_at)
+    attributed = native_ui.attribute_console_windows(
+        samples,
+        {control.pid},
+        reported_handles={control_hwnd} if control_hwnd else frozenset(),
+    )
+    # Only the sampler's own records may validate it: the application is judged
+    # on those records, so polling and console attachment are diagnostics.
+    accepted = native_ui.accept_control_from_sampler(samples, control.pid, control_hwnd)
+    polled = observation["windows"]
+    relations = accepted or set()
+    control_handles = {(sample.handle, sample.at) for sample, _ in attributed}
+    during = [
+        sample for sample in samples
+        if sample.handle not in sampler.baseline and started - 0.25 <= sample.at <= ended + 1.5
+    ]
+    print(
+        f"NYX-PROBE console-control pid={control.pid} console_hwnd={control_hwnd:#x} "
+        f"relations={sorted(relations)} reported_handle_matches="
+        f"{[_describe_sample(sample) for sample, rel in attributed if rel == native_ui.REPORTED_HANDLE_RELATION]!r} "
+        f"polled_diagnostic_only={[_describe_sample(sample) + ' via ' + rel + '/' + how for sample, rel, how in polled]!r} "
+        f"polled_relations_diagnostic_only={sorted(observation['relations'])} "
+        f"sampler_accepted={sorted(relations)} "
+        f"attach_attempts={observation['attach_attempts']!r} "
+        f"attached_but_unattributed={[_describe_sample(s) for s in observation['unattributed_attached']]!r} "
+        f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in attributed]!r} "
+        f"observed_by_handle={[_describe_sample(sample) for sample in samples if sample.handle == control_hwnd]!r} "
+        f"new_windows_during_control={[_describe_sample(sample) for sample in during]!r} "
+        f"baseline_count={len(sampler.baseline)} "
+        f"shown_console_class={[_describe_sample(sample) for sample in samples if native_ui.is_console_window_class(sample.window_class) and sample.handle in shown_at]!r} "
+        "(new_windows_during_control is context only and never attributes a window)"
+    )
+    if sampler.errors:
+        pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
+    if not relations:
+        pytest.fail(
+            "the positive control was not seen by the window-show sampler: none of its records "
+            f"is a console or pseudo-console window owned by the control child (pid {control.pid}), "
+            "by its parent chain or by a console host serving it, and the console handle it "
+            f"reports through GetConsoleWindow ({control_hwnd:#x}) is not among them; polling "
+            f"and console attachment found {sorted(observation['relations'])} but only the "
+            "sampler's records count, because the application is judged on them"
+        )
+    return relations, control_handles
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="console-subsystem helper windows are a Windows-only observation",
+)
+@pytest.mark.xfail(
+    condition=sys.platform == "win32",
+    raises=ConsoleWindowDefect,
+    strict=True,
+    reason=(
+        "on Windows the delivered worker helper (NyxWorker.exe, built with "
+        "--windows-console-mode=force and spawned without creation flags) creates a console "
+        "of its own, so console-class (PseudoConsoleWindow) windows owned by NyxWorker.exe "
+        "whose parent is the GUI appear"
+    ),
+)
+def test_delivered_gui_and_helper_show_no_console_window(artifact: ArtifactLayout):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        environment = _sanitized_environment(home, decoy)
+        with _workspace(root) as workspace:
+            _, configuration = _write_configuration(home, workspace)
+            expected = json.loads(_expected_catalog(configuration))
+            observer = native_ui.JobObserver()
+            try:
+                with native_ui.WindowShowSampler() as sampler:
+                    time.sleep(1.0)
+                    sampler.mark_baseline()
+                    relations, control_handles = _run_console_control(sampler, root)
+                    with _running_gui(artifact, root, environment, job_observer=observer) as gui:
+                        _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                        if json.loads(body) != expected:
+                            pytest.fail("the delivered board did not serve the exact catalog")
+                        statuses: list[int] = []
+                        begin = time.monotonic()
+                        for _ in range(6):
+                            status, _, _ = _request("/api/catalog")
+                            statuses.append(status)
+                            time.sleep(0.3)
+                        end = time.monotonic()
+                        helpers = observer.started_between(begin, end + 0.5)
+                        pid = gui.process.pid
+                        exit_code = gui.close()
+                        time.sleep(0.5)
+                    samples = sampler.snapshot()
+            finally:
+                observer.close()
+            family = {pid} | observer.descendant_pids()
+            if sampler.errors:
+                pytest.fail(f"the window-show sampler reported errors: {sampler.errors!r}")
+            if statuses.count(200) < 3:
+                pytest.fail(f"fewer than three catalog requests succeeded: {statuses!r}")
+            if not helpers:
+                pytest.fail(
+                    "the job object reported no helper process during the catalog requests; "
+                    f"job events: {observer.events!r}"
+                )
+            if exit_code != 0:
+                pytest.fail(f"the application exited {exit_code!r} after the observation")
+            console_samples = [
+                sample for sample in samples
+                if native_ui.is_console_window_class(sample.window_class)
+            ]
+            judged = [
+                (sample, relation)
+                for sample, relation in native_ui.attribute_console_windows(
+                    samples, family, allowed=native_ui.judging_relations(relations)
+                )
+                if (sample.handle, sample.at) not in control_handles
+            ]
+            newly_appearing = [
+                sample for sample in console_samples if sample.handle not in sampler.baseline
+            ]
+            attributed = [sample for sample, _ in judged]
+            print(
+                f"NYX-PROBE console-observation gui_pid={pid} helper_pids={sorted(helpers)} "
+                f"control_relations={sorted(relations)} "
+                f"judged_by={sorted(native_ui.judging_relations(relations))} requests={statuses} "
+                f"attributed={[_describe_sample(sample) + ' via ' + rel for sample, rel in judged]!r} "
+                f"newly_appearing_context_only={[_describe_sample(s) for s in newly_appearing]!r} "
+                f"all_console_class_samples={[_describe_sample(s) for s in console_samples]!r}"
+            )
+            if attributed:
+                raise ConsoleWindowDefect(
+                    "console-class windows were attributed to the application or a descendant: "
+                    + "; ".join(_describe_sample(sample) for sample in attributed)
+                )
+        _assert_claims_released(home)
+
+
+# ---------------------------------------------------------------------------
+# Shared OS-level driver consumers
+# ---------------------------------------------------------------------------
+
+_CDP_PAGE_PREFIX = f"http://{_HOST}/"
+_HOST_LABEL = os.environ.get("NYX_EXPECTED_NATIVE_HOST", "unrecorded-host")
+
+_CARD_PATHS_EXPRESSION = (
+    "Array.from(document.querySelectorAll('.card[data-package-path]'))"
+    ".map((card) => card.dataset.packagePath)"
+)
+_CARD_TITLES_EXPRESSION = (
+    "Array.from(document.querySelectorAll('.card .card-title'))"
+    ".map((title) => title.textContent)"
+)
+
+
+@contextlib.contextmanager
+def _driver_step(what: str):
+    """Report a driver or precondition failure as a hard failure."""
+
+    try:
+        yield
+    except native_ui.DriverError as error:
+        pytest.fail(f"{what}: {error}", pytrace=False)
+
+
+def _authorized_driver(gui: _RunningGui):
+    """Return the lane's driver after its authority check, failing hard otherwise."""
+
+    with _driver_step("the native driver could not start"):
+        driver = native_ui.create_driver()
+    try:
+        detail = driver.check_authority(gui.process.pid)
+    except native_ui.DriverError as error:
+        print(f"NYX-PROBE driver-authority host={_HOST_LABEL} backend={driver.name} "
+              f"result=FAIL detail={error}")
+        pytest.fail(
+            f"the native driver was not granted its authority on {_HOST_LABEL}: {error}",
+            pytrace=False,
+        )
+    print(f"NYX-PROBE driver-authority host={_HOST_LABEL} backend={driver.name} "
+          f"result=PASS detail={detail}")
+    return driver
+
+
+def _cdp_environment() -> tuple[int, dict[str, str]]:
+    port = native_ui.free_loopback_port(avoid=PORT)
+    return port, {"QTWEBENGINE_REMOTE_DEBUGGING": str(port)}
+
+
+def _saved_root(config_file: Path) -> str:
+    return json.loads(config_file.read_text(encoding="utf-8"))["specification_root"]
+
+
+def _catalog_pairs(catalog: dict) -> list[tuple[str, str]]:
+    """Return sorted ``(package path, card title)`` pairs for a catalog payload."""
+
+    return sorted(
+        (entry["package_path"], entry["declared"]["title"] or entry["package_path"])
+        for entry in catalog["entries"]
+    )
+
+
+def _wait_for_cards(page: native_ui.CdpPage, expected: int, timeout: float = 30.0) -> list[str]:
+    deadline = time.monotonic() + timeout
+    paths: list[str] = []
+    while time.monotonic() < deadline:
+        paths = page.evaluate(_CARD_PATHS_EXPRESSION) or []
+        if len(paths) >= expected:
+            return paths
+        time.sleep(0.25)
+    pytest.fail(f"the board rendered {len(paths)} cards, expected {expected}: {paths!r}")
+
+
+# Statements that compute the viewport size and the bands that fixed or sticky
+# page elements cover at the top and bottom of the viewport.
+_COVER_SCRIPT = (
+    " const root = document.documentElement;"
+    " const vw = root.clientWidth, vh = root.clientHeight;"
+    " const describe = (e) => e ? e.tagName + (e.id ? '#' + e.id : '') +"
+    "   (typeof e.className === 'string' && e.className.trim()"
+    "     ? '.' + e.className.trim().split(/\\s+/).join('.') : '') : null;"
+    " const covering = (e) => { for (let n = e; n && n !== document.body && n !== root;"
+    "   n = n.parentElement) { const p = getComputedStyle(n).position;"
+    "   if (p === 'fixed' || p === 'sticky') return n; } return null; };"
+    " const topElement = document.elementFromPoint(vw / 2, 2);"
+    " const bottomElement = document.elementFromPoint(vw / 2, vh - 2);"
+    " const topCover = topElement ? covering(topElement) : null;"
+    " const bottomCover = bottomElement ? covering(bottomElement) : null;"
+    " let toolbarBottom = 0;"
+    " for (const n of [topCover, document.querySelector('header.toolbar')]) {"
+    "   if (!n) continue; const b = n.getBoundingClientRect();"
+    "   if (b.top <= 2 && b.bottom > toolbarBottom) toolbarBottom = b.bottom; }"
+    " let bottomLimit = vh;"
+    " if (bottomCover && bottomCover !== topCover) {"
+    "   const b = bottomCover.getBoundingClientRect();"
+    "   if (b.bottom >= vh - 2 && b.top < bottomLimit) bottomLimit = b.top; }"
+)
+
+_MEASURE_CARD_EXPRESSION = (
+    "(function (target, mode) {"
+    " const card = Array.from(document.querySelectorAll('.card[data-package-path]'))"
+    "   .find((c) => c.dataset.packagePath === target);"
+    " if (!card) return {error: 'the target card is not rendered'};"
+    + _COVER_SCRIPT +
+    " if (mode === 'center') {"
+    "   card.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});"
+    " } else {"
+    "   card.scrollIntoView({block: 'start', inline: 'center', behavior: 'instant'});"
+    "   window.scrollBy(0, -(toolbarBottom + 12));"
+    " }"
+    " const r = card.getBoundingClientRect();"
+    " const vv = window.visualViewport;"
+    " const style = getComputedStyle(card);"
+    " return {mode: mode, rect: [r.left, r.top, r.width, r.height],"
+    "   inner: [window.innerWidth, window.innerHeight], client: [vw, vh],"
+    "   visual: vv ? [vv.offsetLeft, vv.offsetTop, vv.pageLeft, vv.pageTop, vv.scale] : null,"
+    "   scroll: [window.scrollX, window.scrollY], ratio: window.devicePixelRatio,"
+    "   style: [style.display, style.visibility, style.pointerEvents],"
+    "   toolbarBottom: toolbarBottom, bottomLimit: bottomLimit,"
+    "   covers: [describe(topCover), describe(bottomCover)]}; })"
+)
+
+_BOARD_STATE_EXPRESSION = (
+    "(function () {" + _COVER_SCRIPT + " return [vw, vh, toolbarBottom]; })()"
+)
+
+_HIT_POINTS_EXPRESSION = (
+    "(function (points) { return points.map(([x, y]) => {"
+    " const e = document.elementFromPoint(x, y);"
+    " const c = e && e.closest('.card[data-package-path]');"
+    " return c ? c.dataset.packagePath : null; }); })"
+)
+
+
+def _try_locate_card(
+    page: native_ui.CdpPage,
+    target: str,
+    window: dict | None,
+    reachable: Callable[[float, float], bool] | None,
+) -> dict | None:
+    """Locate ``target`` or return ``None`` when no point qualifies (a measuring error still fails)."""
+
+    try:
+        return _locate_card(page, target, window, reachable)
+    except pytest.fail.Exception as failure:
+        if "is clickable below the toolbar" in str(failure):
+            return None
+        raise
+
+
+def _locate_card(
+    page: native_ui.CdpPage,
+    target: str,
+    window: dict | None = None,
+    reachable: Callable[[float, float], bool] | None = None,
+) -> dict:
+    """Bring ``target`` into the usable viewport band and pick a point that really hits it.
+
+    The usable band is the viewport below the page's sticky toolbar and above
+    any bottom cover.  The card is first centred; when its intersection with the
+    band is too small the document is scrolled once so the card starts just
+    below the toolbar.  ``reachable`` drops points the OS pointer cannot reach,
+    such as page areas of a window that extends past the screen.  Each
+    candidate point is verified with
+    ``elementFromPoint`` and ``closest`` before it is returned; a card that no
+    candidate hits is a hard failure.
+    """
+
+    attempts: list[dict] = []
+    for mode in ("center", "start"):
+        geometry = page.evaluate(
+            f"({_MEASURE_CARD_EXPRESSION})({json.dumps(target)}, {json.dumps(mode)})"
+        )
+        if not isinstance(geometry, dict) or "error" in geometry:
+            pytest.fail(f"the target card could not be measured: {geometry!r}")
+        geometry["window"] = window
+        candidates = native_ui.card_click_candidates(geometry)
+        geometry["unreachable"] = [
+            point for point in candidates if reachable is not None and not reachable(*point)
+        ]
+        candidates = [point for point in candidates if point not in geometry["unreachable"]]
+        hits = (
+            page.evaluate(f"({_HIT_POINTS_EXPRESSION})({json.dumps(candidates)})")
+            if candidates else []
+        )
+        geometry["candidates"] = candidates
+        geometry["candidate_hits"] = hits
+        print(f"NYX-PROBE card-geometry target={target!r} geometry={json.dumps(geometry)}")
+        attempts.append(geometry)
+        for point, hit in zip(candidates, hits):
+            if hit == target:
+                geometry["point"] = point
+                return geometry
+    pytest.fail(
+        f"no point of card {target!r} is clickable below the toolbar: "
+        + "; ".join(
+            f"{a['mode']}: rectangle {a['rect']}, viewport {a['client']}, scroll {a['scroll']}, "
+            f"toolbar bottom {a['toolbarBottom']}, bottom limit {a['bottomLimit']}, "
+            f"candidates {a['candidates']}, hits {a['candidate_hits']}"
+            for a in attempts
+        )
+    )
+
+
+class _FakeWindowsInput:
+    """A ``user32`` double whose cursor placement and input injection are separate."""
+
+    def __init__(self, *, injection: str) -> None:
+        self.injection = injection
+        self.cursor = (500, 500)
+        self.send_calls = 0
+        self.mock = MagicMock()
+        self.mock.GetSystemMetrics.side_effect = lambda metric: {
+            76: 0, 77: 0, 78: 1920, 79: 1080}[metric]
+        self.mock.SetCursorPos.side_effect = self._set_cursor
+        self.mock.GetCursorPos.side_effect = self._get_cursor
+        self.mock.SendInput.side_effect = self._send_input
+
+    def _set_cursor(self, x: int, y: int) -> int:
+        self.cursor = (x, y)
+        return 1
+
+    def _get_cursor(self, reference: object) -> int:
+        reference._obj.x, reference._obj.y = self.cursor
+        return 1
+
+    def _send_input(self, count: int, array: object, size: int) -> int:
+        self.send_calls += 1
+        if self.injection == "refused":
+            return 0
+        if self.injection == "delivered":
+            move = array[0].mi
+            self.cursor = (round(move.dx * 1919 / 65535), round(move.dy * 1079 / 65535))
+        return count
+
+
+def _windows_backend_over(fake: _FakeWindowsInput):
+    from ctypes import wintypes
+
+    backend = object.__new__(native_ui._WindowsBackend)
+    backend._wintypes = wintypes
+    backend.user32 = fake.mock
+    backend.kernel32 = MagicMock()
+    backend._declare()
+    return backend
+
+
+@pytest.mark.parametrize("injection", ["refused", "ignored"])
+def test_windows_authority_requires_delivered_input_not_cursor_placement(
+    injection: str, monkeypatch
+):
+    monkeypatch.setattr(native_ui.ctypes, "get_last_error", lambda: 0, raising=False)
+    fake = _FakeWindowsInput(injection=injection)
+    backend = _windows_backend_over(fake)
+    with pytest.raises(native_ui.AuthorityError):
+        backend.check_authority()
+    assert fake.send_calls >= 1
+
+
+def test_windows_authority_passes_when_input_moves_the_cursor(monkeypatch):
+    monkeypatch.setattr(native_ui.ctypes, "get_last_error", lambda: 0, raising=False)
+    fake = _FakeWindowsInput(injection="delivered")
+    backend = _windows_backend_over(fake)
+    assert "SendInput delivery" in backend.check_authority()
+    assert fake.send_calls == 1
+    assert fake.cursor == (60, 60)
+
+
+def test_native_driver_authority_probe_records_the_lane_result(artifact: ArtifactLayout):
+    """Record whether this lane grants the driver its authority, printing the result."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        with _workspace(root) as workspace:
+            _write_configuration(home, workspace)
+            with _running_gui(
+                artifact, root, _sanitized_environment(home, decoy)
+            ) as gui:
+                _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                _wait_for_window(gui)
+                _authorized_driver(gui)
+                assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+
+
+class NativeClipboardWriteDefect(Exception):
+    """A correctly delivered right-click whose write never reached the native clipboard."""
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and os.environ.get("NYX_EXPECTED_NATIVE_HOST") == "macos-15",
+    reason=(
+        "the hosted macos-15 lane's 1024x768 screen leaves the board's sticky toolbar "
+        "covering every card and ignores zoom changes, so no card can be clicked there. "
+        "Run this test with NYX_EXPECTED_NATIVE_HOST unset on a larger macOS display; "
+        "a skip is not evidence."
+    ),
+)
+def test_delivered_card_right_click_copies_path_to_native_clipboard(artifact: ArtifactLayout):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        cdp_port, cdp_environment = _cdp_environment()
+        with _workspace(root) as workspace:
+            config_file, configuration = _write_configuration(home, workspace)
+            expected_catalog = json.loads(_expected_catalog(configuration))
+            catalog_paths = {entry["package_path"] for entry in expected_catalog["entries"]}
+            environment = _sanitized_environment(home, decoy)
+            with _running_gui(
+                artifact, root, environment, extra_environment=cdp_environment
+            ) as gui:
+                _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                if json.loads(body) != expected_catalog:
+                    pytest.fail("the delivered board did not serve the exact catalog")
+                _wait_for_window(gui)
+                driver = _authorized_driver(gui)
+                pid = gui.process.pid
+                with _driver_step("the page could not be located or read"):
+                    page = native_ui.CdpPage(cdp_port, _CDP_PAGE_PREFIX)
+                try:
+                    with _driver_step("the window or page could not be prepared"):
+                        _wait_for_cards(page, len(catalog_paths))
+                        driver.bring_forward(pid)
+                        # The delivered window gives the board only part of its height
+                        # and the page's sticky toolbar can fill that part, so prepare
+                        # the viewport by window management and, if needed, OS zoom.
+                        screen = driver.screen_bounds()
+                        window_size = native_ui.prepare_board_viewport(
+                            driver,
+                            pid,
+                            lambda: tuple(page.evaluate(_BOARD_STATE_EXPRESSION)),
+                            lambda: native_ui.find_pointer_base(
+                                driver, page, driver.window_frame(pid), screen
+                            )[:2],
+                        )
+                        window_size["screen"] = [
+                            screen.left, screen.top, screen.width, screen.height
+                        ]
+                        shown = [p for p in page.evaluate(_CARD_PATHS_EXPRESSION)
+                                 if p in catalog_paths]
+                        if not shown:
+                            pytest.fail("no rendered card matches a catalog package path")
+                        target = sorted(shown)[0]
+                        page.evaluate(
+                            "(() => { window.__nyxContext = [];"
+                            " document.addEventListener('contextmenu', (event) => {"
+                            "   const card = event.target.closest('.card[data-package-path]');"
+                            "   window.__nyxContext.push(card ? card.dataset.packagePath : null);"
+                            " }, true); return true; })()"
+                        )
+                        sentinel = f"NYX-SENTINEL-{uuid.uuid4().hex}"
+                        driver.set_clipboard(sentinel)
+                        if driver.get_clipboard() != sentinel:
+                            pytest.fail("the native clipboard did not accept the sentinel")
+                        driver.bring_forward(pid)
+                        # Measure last, immediately before the click, so nothing
+                        # that happened while the window came forward can move the card.
+                        # The window may extend past the screen, so the point is moved
+                        # on screen by window management before the click.
+                        placement = native_ui.place_click_point_on_screen(
+                            driver,
+                            pid,
+                            screen,
+                            calibrate=lambda: native_ui.calibrate_page(
+                                driver, page, driver.window_frame(pid), screen
+                            ),
+                            choose=lambda reachable: _try_locate_card(
+                                page, target, window_size, reachable
+                            ),
+                            settle=lambda: native_ui.settle_measurement(
+                                lambda: tuple(page.evaluate(_BOARD_STATE_EXPRESSION))
+                            ),
+                        )
+                        geometry = placement["geometry"]
+                        calibration = placement["calibration"]
+                        css_x, css_y = geometry["point"]
+                        screen_x, screen_y = placement["screen_point"]
+                        print(
+                            f"NYX-PROBE click-point css=({css_x:.1f},{css_y:.1f}) "
+                            f"screen=({screen_x:.1f},{screen_y:.1f}) "
+                            f"scale={calibration.scale:.3f} origin=({calibration.origin_x:.1f},"
+                            f"{calibration.origin_y:.1f}) moves={json.dumps(placement['moves'])} "
+                            f"calibration_moves={calibration.moves!r}"
+                        )
+                        driver.click(screen_x, screen_y, "right")
+                    with _driver_step("the click could not be confirmed"):
+                        deadline = time.monotonic() + 10
+                        reached: list = []
+                        while time.monotonic() < deadline:
+                            reached = page.evaluate("window.__nyxContext") or []
+                            if reached:
+                                break
+                            time.sleep(0.2)
+                        if reached != [target]:
+                            pytest.fail(
+                                f"the right-click did not reach the target card {target!r}; "
+                                f"context-menu events reached {reached!r}"
+                            )
+                    expected_path = os.path.join(_saved_root(config_file), *target.split("/"))
+                    with _driver_step("the native clipboard could not be read"):
+                        deadline = time.monotonic() + 10
+                        copied = sentinel
+                        while time.monotonic() < deadline:
+                            copied = driver.get_clipboard()
+                            if copied != sentinel:
+                                break
+                            time.sleep(0.25)
+                        status_text = page.evaluate(
+                            "(() => { const s = document.querySelector('.copy-status');"
+                            " return s ? s.textContent : null; })()"
+                        )
+                    if copied == sentinel:
+                        raise NativeClipboardWriteDefect(
+                            f"the context-menu event reached card {target!r} but the native "
+                            f"clipboard still holds the sentinel; page copy status: {status_text!r}"
+                        )
+                    assert copied == expected_path
+                finally:
+                    page.close()
+                assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+
+
+def test_delivered_change_workspace_save_switches_to_second_workspace(artifact: ArtifactLayout):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        first = root / "first"
+        second = root / "second"
+        shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", first)
+        shutil.copytree(_SOURCE_ROOT / "examples" / "sample-specifications", second)
+        shutil.rmtree(second / "Trail_API")
+        cdp_port, cdp_environment = _cdp_environment()
+        config_file, first_configuration = _write_configuration(home, first)
+        second_root = str(second.resolve())
+        expected_first = json.loads(_expected_catalog(first_configuration))
+        expected_second = json.loads(
+            _expected_catalog(state.Configuration(second.resolve()))
+        )
+        pairs_first, pairs_second = _catalog_pairs(expected_first), _catalog_pairs(expected_second)
+        if pairs_first == pairs_second:
+            pytest.fail("the two workspaces must present different cards")
+        titles_first = sorted(title for _, title in pairs_first)
+        titles_second = sorted(title for _, title in pairs_second)
+        environment = _sanitized_environment(home, decoy)
+
+        def page_titles() -> list[str] | None:
+            try:
+                with native_ui.CdpPage(cdp_port, _CDP_PAGE_PREFIX, timeout=5) as page:
+                    return sorted(page.evaluate(_CARD_TITLES_EXPRESSION) or [])
+            except (native_ui.CdpError, OSError):
+                return None
+
+        with _running_gui(
+            artifact, root, environment, extra_environment=cdp_environment
+        ) as gui:
+            _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+            if _catalog_pairs(json.loads(body)) != pairs_first:
+                pytest.fail("the delivered board did not start on the first workspace")
+            _wait_for_window(gui)
+            driver = _authorized_driver(gui)
+            pid = gui.process.pid
+            with _driver_step("the first workspace's cards could not be read"):
+                with native_ui.CdpPage(cdp_port, _CDP_PAGE_PREFIX) as page:
+                    _wait_for_cards(page, len(pairs_first))
+                    if sorted(page.evaluate(_CARD_TITLES_EXPRESSION)) != titles_first:
+                        pytest.fail("the page's card titles do not match the first catalog")
+            with _driver_step("the Change workspace flow could not be driven"):
+                driver.bring_forward(pid)
+                change = driver.find_widget(pid, "button", "Change workspace")
+                if not change.enabled:
+                    pytest.fail("Change workspace is disabled")
+                driver.click(*change.rect.center)
+                deadline = time.monotonic() + 15
+                field = None
+                while time.monotonic() < deadline:
+                    try:
+                        candidate = driver.find_widget(pid, "edit", "Workspace root")
+                    except native_ui.DriverError:
+                        candidate = None
+                    if candidate is not None and candidate.enabled:
+                        field = candidate
+                        break
+                    time.sleep(0.25)
+                if field is None:
+                    pytest.fail("the Workspace root field never became available")
+                driver.replace_text(pid, "Workspace root", second_root)
+                deadline = time.monotonic() + 10
+                read_back = None
+                while time.monotonic() < deadline:
+                    read_back = driver.find_widget(pid, "edit", "Workspace root").value
+                    if read_back == second_root:
+                        break
+                    time.sleep(0.25)
+                if read_back != second_root:
+                    pytest.fail(
+                        f"the Workspace root field reads {read_back!r}, expected {second_root!r}"
+                    )
+                save = driver.find_widget(pid, "button", "Save workspace")
+                if not save.enabled:
+                    pytest.fail("Save workspace is disabled")
+                driver.click(*save.rect.center)
+            deadline = time.monotonic() + 60
+            catalog_pairs: object = None
+            titles: object = None
+            saved: object = None
+            while time.monotonic() < deadline:
+                try:
+                    status, served, _ = _request("/api/catalog")
+                    catalog_pairs = _catalog_pairs(json.loads(served)) if status == 200 else None
+                except OSError:
+                    catalog_pairs = None
+                titles = page_titles()
+                saved = _saved_root(config_file)
+                if (
+                    catalog_pairs == pairs_second
+                    and titles == titles_second
+                    and saved == second_root
+                ):
+                    break
+                time.sleep(0.5)
+            assert saved == second_root, f"saved configuration root is {saved!r}"
+            assert catalog_pairs == pairs_second, f"HTTP catalog cards are {catalog_pairs!r}"
+            assert titles == titles_second, f"page card titles are {titles!r}"
+            assert gui.process.poll() is None, gui.diagnostics()
+            assert gui.close() == 0, gui.diagnostics()
+        _assert_claims_released(home)
+
+
+# ---------------------------------------------------------------------------
+# Relocated delivered copy
+# ---------------------------------------------------------------------------
+
+
+def _symlinks(root: Path) -> set[str]:
+    found: set[str] = set()
+    for directory, names, files in os.walk(root, followlinks=False):
+        for name in names + files:
+            path = Path(directory) / name
+            if path.is_symlink():
+                found.add(str(path.relative_to(root)))
+    return found
+
+
+@contextlib.contextmanager
+def _moved_aside(paths: list[Path]):
+    """Move each existing tree aside by rename and restore them all afterwards."""
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for path in paths:
+            if not (path.exists() or path.is_symlink()):
+                continue
+            aside = path.with_name(f"{path.name}.nyx-aside-{uuid.uuid4().hex[:8]}")
+            path.rename(aside)
+            moved.append((path, aside))
+        yield [path for path, _ in moved]
+    finally:
+        failures: list[str] = []
+        for path, aside in reversed(moved):
+            try:
+                aside.rename(path)
+            except OSError as error:
+                failures.append(f"{aside} -> {path}: {error}")
+        if failures:
+            raise RuntimeError("a moved-aside tree could not be restored: " + "; ".join(failures))
+
+
+_LSREGISTER = (
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
+
+
+def test_delivered_relocated_copy_runs_without_the_build_tree(artifact: ArtifactLayout):
+    build_trees = [
+        _SOURCE_ROOT / "dist" / "desktop",
+        _SOURCE_ROOT / "build" / "desktop",
+        _SOURCE_ROOT / ".venv",
+    ]
+    if not build_trees[2].exists() and _ARTIFACT_REQUIRED:
+        pytest.fail(
+            f"the documented build environment {build_trees[2]} is absent in the artifact lane"
+        )
+    bundle = artifact.artifact.suffix == ".app" or artifact.artifact.is_dir()
+    staged = artifact.artifact if bundle else artifact.application_root
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        decoy = _inert_path(root)
+        copy_root = root / "relocated"
+        copy_root.mkdir()
+        copied = copy_root / staged.name
+        shutil.copytree(staged, copied, symlinks=True)
+        if _symlinks(copied) != _symlinks(staged):
+            pytest.fail("the copy did not preserve the staged bundle's symlinks")
+        relocated = ArtifactLayout(copied if bundle else copied / artifact.executable.name)
+        for required in (relocated.executable, relocated.helper, relocated.resource):
+            if not required.is_file():
+                pytest.fail(f"the copy lacks {required}")
+        process_id: int | None = None
+        try:
+            with _moved_aside(build_trees):
+                with _workspace(root) as workspace:
+                    _, configuration = _write_configuration(home, workspace)
+                    expected = json.loads(_expected_catalog(configuration))
+                    environment = _sanitized_environment(home, decoy)
+                    with _running_gui(relocated, root, environment) as gui:
+                        process_id = gui.process.pid
+                        try:
+                            _, body, _ = _wait_for_board(time.monotonic() + _START_TIMEOUT, gui)
+                            with _driver_step("the running image path could not be read"):
+                                image = native_ui.process_image_path(gui.process.pid)
+                            if os.path.normcase(os.path.realpath(image)) != os.path.normcase(
+                                os.path.realpath(relocated.executable)
+                            ):
+                                pytest.fail(
+                                    f"the application runs from {image!r}, "
+                                    f"not from the copy {relocated.executable}"
+                                )
+                            assert json.loads(body) == expected
+                            assert gui.process.poll() is None, gui.diagnostics()
+                        finally:
+                            if gui.process.poll() is None:
+                                _request_close_by_pid(gui.process.pid)
+                                try:
+                                    code = gui.process.wait(timeout=30)
+                                except subprocess.TimeoutExpired:
+                                    gui.process.kill()
+                                    code = gui.process.wait(timeout=30)
+                            else:
+                                code = gui.process.returncode
+                        assert code == 0, gui.diagnostics()
+                    _wait_port_free(time.monotonic() + 15)
+                    _assert_claims_released(home)
+        finally:
+            if sys.platform == "darwin":
+                unregister = subprocess.run(
+                    [_LSREGISTER, "-u", str(copied)],
+                    capture_output=True, text=True, timeout=60, check=False,
+                )
+                if unregister.returncode != 0:
+                    raise RuntimeError(
+                        f"lsregister -u {copied} failed ({unregister.returncode}): "
+                        f"{unregister.stderr!r}; relocated pid {process_id}"
+                    )

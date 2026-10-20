@@ -720,8 +720,34 @@ def dependency_state_payload(state, *, titles=None):
     return value
 
 
-def test_card_right_click_copies_full_directory_without_changing_selection(open_page, tmp_path):
-    root = tmp_path / "spec workspace"
+# Literal expectations for Windows-style roots: the root is preserved and every
+# separator after it is a backslash. The None case is the pytest tmp_path root,
+# which is POSIX on Linux and macOS and drive-letter on nyx-windows.
+COPY_ROOT_CASES = [
+    pytest.param(None, None, id="tmp_path"),
+    pytest.param(
+        "C:\\work\\board",
+        "C:\\work\\board\\Alpha\\Under_Development\\step-one",
+        id="drive-letter",
+    ),
+    pytest.param(
+        "\\\\server\\share\\board",
+        "\\\\server\\share\\board\\Alpha\\Under_Development\\step-one",
+        id="unc",
+    ),
+    pytest.param(
+        "\\\\server\\share\\teams\\spec workspace\\board",
+        "\\\\server\\share\\teams\\spec workspace\\board\\Alpha\\Under_Development\\step-one",
+        id="unc-deep",
+    ),
+]
+
+
+@pytest.mark.parametrize(("windows_root", "expected_path"), COPY_ROOT_CASES)
+def test_card_right_click_copies_full_directory_without_changing_selection(
+    open_page, tmp_path, windows_root, expected_path
+):
+    root = tmp_path / "spec workspace" if windows_root is None else windows_root
     settings = BrowserSettings(root=root)
     page = open_page(StaticClient(board_payload()), settings=settings)
     page.context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -738,7 +764,13 @@ def test_card_right_click_copies_full_directory_without_changing_selection(open_
     assert 8 <= popup_box["x"] - (card_box["x"] + card_box["width"]) <= 12
     assert popup_box["x"] + popup_box["width"] <= page.viewport_size["width"]
     assert popup_box["y"] + popup_box["height"] <= page.viewport_size["height"]
-    assert page.evaluate("navigator.clipboard.readText()") == str(root / relative)
+    assert relative == "Alpha/Under_Development/step-one"
+    copied = page.evaluate("navigator.clipboard.readText()")
+    if windows_root is None:
+        assert copied == str(root / relative)
+    else:
+        assert copied == expected_path
+        assert "/" not in copied
     assert card.get_attribute("aria-pressed") == "false"
     playwright.expect(page.locator("#copy-status")).to_be_hidden(timeout=3500)
     page.set_viewport_size({"width": 480, "height": 320})

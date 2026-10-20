@@ -230,11 +230,29 @@ run it.
 ### Build the private artifact
 
 From the repository root, install the pinned desktop and build extras and run
-the build driver. Windows PowerShell:
+the build driver.
+
+On Windows the build needs Visual Studio 2022 or later, or its Build Tools, with the MSVC
+C++ x64 build tools (the **Desktop development with C++** workload). The block
+loads that toolchain's environment with `vswhere` and `vcvars64.bat` before the
+build: Nuitka compiles with it, and the deployment tool uses its `dumpbin` to
+discover the Qt modules the application depends on. If the toolchain or
+`dumpbin` is missing, the block stops with an error instead of building.
+Windows PowerShell:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install '.[desktop,build]'
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found; install Visual Studio 2022 or later, or its Build Tools' }
+$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw 'no Visual Studio installation has the MSVC C++ x64 build tools' }
+$vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+cmd /c "`"$vcvars`" && set" | ForEach-Object {
+  if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+}
+if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit code $LASTEXITCODE" }
+if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) { throw 'dumpbin.exe is not on PATH after loading the build tools' }
 .\.venv\Scripts\python.exe scripts\build_desktop.py
 ```
 
@@ -313,6 +331,72 @@ or shared hosting, cross-host configuration synchronization, or agent
 execution. Configuration and runtime state still live under `.nyx` in your home
 directory. On Linux the desktop application refuses to start and directs you to
 use the `nyx` console entry instead.
+
+## Maintainer: record cloud-placeholder behavior
+
+Hosted CI cannot provide OneDrive or Dropbox placeholders, so a maintainer runs
+this procedure once on a Windows host with both providers enabled and keeps the
+filled record as the evidence. It changes no Nyx setting and no specification
+content; use a disposable test folder inside each provider's sync folder.
+
+Nyx treats an entry as a link when `os.lstat` reports a symbolic link or the
+`FILE_ATTRIBUTE_REPARSE_POINT` bit (`0x400`) in `st_file_attributes`. A cloud
+placeholder can carry that bit, so the record decides whether Nyx hides or
+refuses placeholder content.
+
+**Setup (once per provider).** Create `<sync folder>\nyx-probe\specs` holding
+one repository folder, one stage folder inside it, and one package folder
+inside that containing a file named exactly `spec.md`
+(`specs\<repository>\<stage>\<package>\spec.md`; a card exists only for such
+a file). Also create an empty `<sync folder>\nyx-probe\empty` folder. Wait until the
+provider reports the files as synced.
+
+**States (repeat for each provider, OneDrive then Dropbox).** Set the state on
+the `specs` folder, the repository folder and `spec.md`, then record the table before
+each Nyx observation:
+
+| State | How to reach it |
+| --- | --- |
+| Online-only | OneDrive: **Free up space**. Dropbox: **Make online-only** (Smart Sync). |
+| Pinned | OneDrive: **Always keep on this device**. Dropbox: **Make available offline**. |
+| Hydrated | Open the file so the content is downloaded, without pinning (OneDrive **Free up space** and Dropbox **Make online-only** both undone). |
+
+**Fields to record (Python, for each of the workspace root `specs`, the
+repository folder and `spec.md` itself, per provider and state).** Run `os.lstat(path)` and record
+exactly these values:
+
+| Field | Record |
+| --- | --- |
+| `st_file_attributes` | Value in hexadecimal, plus whether bit `0x400` (reparse point) is set |
+| `st_reparse_tag` | Value in hexadecimal, or `absent` if the attribute does not exist |
+| `stat.S_ISDIR` / `stat.S_ISREG` | `True` or `False` for the root and entry |
+| `stat.S_ISLNK` | `True` or `False` |
+| Other attribute bits | Whether `0x1000` (offline), `0x400000` (recall on data access) and `0x40000` (recall on open) are set |
+
+**Nyx observations (same provider and state).** Save the root as the
+workspace and open the board, then record for each row below what Nyx shows.
+The code expects the following when the reparse bit is set. Save accepts the
+root, but the catalog scan refuses it, so the board shows `producer_failed`
+instead of cards. A reparse repository or stage folder is skipped silently if
+its name ends in `.md`; any other one is reported as an incomplete-discovery
+issue. A reparse `spec.md` still produces a card, carrying a nonregular-anchor
+diagnostic. The record states whether each state matches those expectations.
+
+| Observation | Record |
+| --- | --- |
+| Save with `specs` as the workspace root | Accepted or refused, and any message shown (expected: accepted, even for a reparse root) |
+| Board after Save | Cards listed, or the `producer_failed` state (expected for a reparse root) |
+| Cards listed | Card count against the number of specifications that exist |
+| Workspace or refresh issues panel | Present or absent, and the issue codes and paths shown |
+| Repository folder entry | Listed, skipped silently, or reported as an issue |
+| `spec.md` entry | Card present or absent, and the diagnostic shown (expected for a reparse file: card with a nonregular anchor) |
+| Reading a card's specification header | Content shown, or the unreadable or nonregular anchor message |
+| Open a card, then refresh | Whether either action downloads the file (provider status changes to hydrated) |
+| Empty `empty` folder as a control | Accepted with zero cards and no issue panel |
+
+Close the record with one line per provider and state naming the observed
+behavior as `matches the code expectation` or `differs`, quoting the differing
+values. A difference is a finding to file, not a documentation change.
 
 ## Read and refresh the board
 

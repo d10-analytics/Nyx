@@ -15,6 +15,7 @@ rejects it.
 
 from __future__ import annotations
 
+import ast
 import copy
 import re
 from pathlib import Path
@@ -60,8 +61,10 @@ REQUIRED_NATIVE_ENV = "NYX_REQUIRE_NATIVE_DESKTOP"
 EXPECTED_NATIVE_HOST_ENV = "NYX_EXPECTED_NATIVE_HOST"
 DESKTOP_ARTIFACT_ENV = "NYX_DESKTOP_ARTIFACT"
 DOCUMENTED_INSTALL_ENV = "NYX_VERIFY_DOCUMENTED_INSTALL"
+DOCUMENTED_BUILD_ENV = "NYX_VERIFY_DOCUMENTED_BUILD"
 
 SOURCE_SESSION_STEP = "Verify native desktop source and session"
+DOCUMENTED_BUILD_STEP = "Build the documented desktop artifact"
 BUILD_ARTIFACT_STEP = "Build and verify the native desktop artifact"
 PREFLIGHT_STEP = "Record native host and session preflight"
 
@@ -72,7 +75,17 @@ INSTALLED_WHEEL_COMMAND = "{python} -m pytest tests/test_wheel_install.py -v"
 DOCUMENTED_INSTALL_COMMAND = "python -m pytest tests/test_documented_install.py -v"
 DESKTOP_SOURCE_COMMAND = "python -m pytest tests/test_desktop.py -v -s"
 DESKTOP_ARTIFACT_COMMAND = "python -m pytest tests/test_desktop_artifact.py -v -s"
-DESKTOP_BUILD_COMMAND = "python scripts/build_desktop.py"
+DOCUMENTED_BUILD_COMMAND = "python -m pytest tests/test_documented_install.py -v -s"
+# The published build commands live only in the guide.  The workflow holds no
+# copy and no other build command, so any of these tokens in a desktop job is a
+# copied or direct build (the guide's blocks all create or use ``.venv``).
+FORBIDDEN_BUILD_MARKERS = (
+    "build_desktop",
+    ".venv",
+    "-m venv",
+    "vswhere",
+    "vcvars",
+)
 DESKTOP_EXTRA_INSTALL = "python -m pip install -e '.[test,desktop,build]'"
 PWSH_FAILURE_GUARD = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
 POSIX_FAILURE_GUARD = "set -euo pipefail"
@@ -172,11 +185,14 @@ CONTINUE_ON_ERROR_KEY = "continue-on-error"
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
+# Each desktop cap follows the rule above from its longest recent successful
+# duration: 15m26s (926 s) for nyx-desktop-windows and 6m34s (394 s) for
+# nyx-desktop-macos, so twice each rounds up to 35 and 15 minutes.
 JOB_TIMEOUT_MINUTES = {
     "nyx": 30,
     "nyx-windows": 30,
     "nyx-macos": 30,
-    "nyx-desktop-windows": 40,
+    "nyx-desktop-windows": 35,
     "nyx-desktop-macos": 15,
 }
 # A cancelled run is not evidence for the commit it ran on, so the workflow
@@ -699,6 +715,75 @@ def check_native_environment(workflow: dict[str, Any]) -> list[str]:
                     f"{name}: {step_name!r} expected native host is "
                     f"{env.get(EXPECTED_NATIVE_HOST_ENV)!r}, expected {spec['host']!r}"
                 )
+        build = _step_named(job, DOCUMENTED_BUILD_STEP)
+        if build is not None and REQUIRED_NATIVE_ENV in _step_env(build):
+            problems.append(
+                f"{name}: {DOCUMENTED_BUILD_STEP!r} sets {REQUIRED_NATIVE_ENV}, "
+                "which arms the pre-artifact import guard"
+            )
+    return problems
+
+
+def check_documented_build_step(workflow: dict[str, Any]) -> list[str]:
+    """Require the pre-artifact documented build step in both desktop jobs.
+
+    The step runs the gated build test only: its env is exactly the build gate
+    (so the import guard stays armed for the artifact step), it sits between
+    the source step and the artifact step, and no other desktop step carries
+    the gate, a copied published command, or a direct build.
+    """
+
+    problems: list[str] = []
+    for name in DESKTOP_JOBS:
+        job = _job(workflow, name)
+        if job is None:
+            problems.append(f"{name}: job is missing")
+            continue
+        steps = _steps(job)
+        names = [step.get("name") for step in steps]
+        step = _step_named(job, DOCUMENTED_BUILD_STEP)
+        if step is None:
+            problems.append(f"{name}: {DOCUMENTED_BUILD_STEP!r} step is missing")
+        else:
+            if _step_env(step) != {DOCUMENTED_BUILD_ENV: "1"}:
+                problems.append(
+                    f"{name}: {DOCUMENTED_BUILD_STEP!r} env is {_step_env(step)!r}, "
+                    f"expected only {DOCUMENTED_BUILD_ENV}='1'"
+                )
+            problems.extend(
+                _gate_violations(
+                    f"{name}: documented build command",
+                    [_effective_lines(step)],
+                    (DOCUMENTED_BUILD_COMMAND,),
+                )
+            )
+            if names.count(DOCUMENTED_BUILD_STEP) != 1:
+                problems.append(f"{name}: {DOCUMENTED_BUILD_STEP!r} step is duplicated")
+            if SOURCE_SESSION_STEP in names and BUILD_ARTIFACT_STEP in names:
+                if not (
+                    names.index(SOURCE_SESSION_STEP)
+                    < names.index(DOCUMENTED_BUILD_STEP)
+                    < names.index(BUILD_ARTIFACT_STEP)
+                ):
+                    problems.append(
+                        f"{name}: {DOCUMENTED_BUILD_STEP!r} must run after the "
+                        "source step and before the artifact step"
+                    )
+        for other in steps:
+            if other.get("name") == DOCUMENTED_BUILD_STEP:
+                continue
+            if DOCUMENTED_BUILD_ENV in _step_env(other):
+                problems.append(
+                    f"{name}: step {other.get('name')!r} sets {DOCUMENTED_BUILD_ENV}"
+                )
+        for other in steps:
+            for line in _effective_lines(other):
+                for marker in FORBIDDEN_BUILD_MARKERS:
+                    if marker in line:
+                        problems.append(
+                            f"{name}: step {other.get('name')!r} holds build command "
+                            f"text {marker!r}: {line!r}"
+                        )
     return problems
 
 
@@ -764,11 +849,6 @@ def check_native_artifact_lane(workflow: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: {BUILD_ARTIFACT_STEP!r} step is missing")
             continue
         segments = [_effective_lines(step)]
-        problems.extend(
-            _gate_violations(
-                f"{name}: artifact build command", segments, (DESKTOP_BUILD_COMMAND,)
-            )
-        )
         if not _contains_marker(segments, spec["artifact"]):
             problems.append(f"{name}: artifact path {spec['artifact']!r} is missing")
         problems.extend(
@@ -823,9 +903,15 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
             problems.append(
                 f"{name}: artifact build stage runs before the native source/session stage"
             )
+        if DOCUMENTED_BUILD_STEP in names and not (
+            source_index < names.index(DOCUMENTED_BUILD_STEP) < build_index
+        ):
+            problems.append(
+                f"{name}: documented build stage must run between the native "
+                "source/session stage and the artifact stage"
+            )
         lines = _effective_lines(steps[build_index])
         stages = (
-            lambda line: line == DESKTOP_BUILD_COMMAND,
             lambda line: spec["artifact_export"] in line,
             lambda line: line == DESKTOP_ARTIFACT_COMMAND,
             lambda line: line == DESKTOP_SOURCE_COMMAND,
@@ -838,7 +924,7 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
             continue
         if positions != sorted(positions) or len(set(positions)) != len(positions):
             problems.append(
-                f"{name}: artifact stage order must be build, artifact input, "
+                f"{name}: artifact stage order must be artifact input, "
                 "artifact tests, then artifact-mode desktop scenarios"
             )
     return problems
@@ -878,6 +964,7 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "job_time_limits": check_job_time_limits,
     "no_concurrency_cancellation": check_no_concurrency_cancellation,
     "native_environment": check_native_environment,
+    "documented_build_step": check_documented_build_step,
     "native_dependencies": check_native_dependencies,
     "native_source_lane": check_native_source_lane,
     "native_session_preflight": check_native_session_preflight,
@@ -1060,12 +1147,75 @@ def _mutate_override_artifact_input(workflow: dict[str, Any]) -> None:
     )
 
 
-def _mutate_move_build_after_artifact_tests(workflow: dict[str, Any]) -> None:
+def _mutate_move_documented_build_after_artifact_step(workflow: dict[str, Any]) -> None:
+    job = _job(workflow, "nyx-desktop-windows")
+    steps = _steps(job)
+    documented = next(step for step in steps if step.get("name") == DOCUMENTED_BUILD_STEP)
+    steps.remove(documented)
+    steps.append(documented)
+    job["steps"] = steps
+
+
+def _mutate_drop_documented_build_step(workflow: dict[str, Any]) -> None:
+    job = _job(workflow, "nyx-desktop-macos")
+    job["steps"] = [step for step in _steps(job) if step.get("name") != DOCUMENTED_BUILD_STEP]
+
+
+def _mutate_require_native_on_documented_build(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)
+    step["env"] = {**_step_env(step), REQUIRED_NATIVE_ENV: "1"}
+
+
+def _mutate_drop_documented_build_gate(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-macos", DOCUMENTED_BUILD_STEP)
+    step["env"] = {}
+
+
+def _mutate_gate_the_artifact_step_as_documented_build(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
-    text = _run_text(step)
-    build_line = f"{DESKTOP_BUILD_COMMAND}\n"
-    assert build_line in text
-    step["run"] = text.replace(build_line, "", 1) + build_line
+    step["env"] = {**_step_env(step), DOCUMENTED_BUILD_ENV: "1"}
+
+
+def _mutate_re_add_direct_build(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-windows",
+        BUILD_ARTIFACT_STEP,
+        "$env:NYX_DESKTOP_ARTIFACT = $artifact",
+        _insert_before("python scripts/build_desktop.py"),
+    )
+
+
+def _mutate_copy_published_command_into_documented_step(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-windows",
+        DOCUMENTED_BUILD_STEP,
+        DOCUMENTED_BUILD_COMMAND,
+        _insert_before(r".\.venv\Scripts\python.exe -m pip install '.[desktop,build]'"),
+    )
+
+
+def _mutate_copy_published_command_into_macos_artifact_step(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        BUILD_ARTIFACT_STEP,
+        DESKTOP_ARTIFACT_COMMAND,
+        _insert_before(".venv/bin/python scripts/build_desktop.py"),
+    )
+
+
+def _mutate_reload_visual_studio_loader(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-windows",
+        BUILD_ARTIFACT_STEP,
+        "$env:NYX_DESKTOP_ARTIFACT = $artifact",
+        _insert_before(
+            '$vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"'
+        ),
+    )
 
 
 def _mutate_move_build_step_before_source_step(workflow: dict[str, Any]) -> None:
@@ -1247,9 +1397,13 @@ def _mutate_ignore_artifact_test_failure(workflow: dict[str, Any]) -> None:
     )
 
 
-def _mutate_comment_out_desktop_build(workflow: dict[str, Any]) -> None:
+def _mutate_comment_out_documented_build(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
-        workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP, DESKTOP_BUILD_COMMAND, _comment_out
+        workflow,
+        "nyx-desktop-windows",
+        DOCUMENTED_BUILD_STEP,
+        DOCUMENTED_BUILD_COMMAND,
+        _comment_out,
     )
 
 
@@ -1321,9 +1475,9 @@ def _mutate_reassign_powershell_error_preference(workflow: dict[str, Any]) -> No
 def _mutate_comment_out_powershell_exit_guard(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
     physical = _run_text(step).splitlines()
-    build = physical.index(DESKTOP_BUILD_COMMAND)
-    assert physical[build + 1] == PWSH_FAILURE_GUARD
-    physical[build + 1] = _comment_out(physical[build + 1])
+    tests = physical.index(DESKTOP_ARTIFACT_COMMAND)
+    assert physical[tests + 1] == PWSH_FAILURE_GUARD
+    physical[tests + 1] = _comment_out(physical[tests + 1])
     step["run"] = "\n".join(physical) + "\n"
 
 
@@ -1368,6 +1522,10 @@ def _mutate_quote_job_time_limit(workflow: dict[str, Any]) -> None:
 
 def _mutate_change_job_time_limit_within_range(workflow: dict[str, Any]) -> None:
     _job(workflow, "nyx-desktop-macos")[TIMEOUT_KEY] = 30
+
+
+def _mutate_change_desktop_windows_time_limit_within_range(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-windows")[TIMEOUT_KEY] = 40
 
 
 def _mutate_add_job_without_time_limit(workflow: dict[str, Any]) -> None:
@@ -1481,9 +1639,49 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_native_artifact_input,
         _mutate_override_artifact_input,
     ),
-    "move build after artifact tests": (
+    "move documented build step after artifact step": (
+        check_documented_build_step,
+        _mutate_move_documented_build_after_artifact_step,
+    ),
+    "move documented build step after artifact step (ordering)": (
         check_native_stage_ordering,
-        _mutate_move_build_after_artifact_tests,
+        _mutate_move_documented_build_after_artifact_step,
+    ),
+    "drop documented build step": (
+        check_documented_build_step,
+        _mutate_drop_documented_build_step,
+    ),
+    "require native desktop on documented build step": (
+        check_documented_build_step,
+        _mutate_require_native_on_documented_build,
+    ),
+    "require native desktop on documented build step (environment)": (
+        check_native_environment,
+        _mutate_require_native_on_documented_build,
+    ),
+    "drop documented build gate": (
+        check_documented_build_step,
+        _mutate_drop_documented_build_gate,
+    ),
+    "set documented build gate on artifact step": (
+        check_documented_build_step,
+        _mutate_gate_the_artifact_step_as_documented_build,
+    ),
+    "re-add direct desktop build": (
+        check_documented_build_step,
+        _mutate_re_add_direct_build,
+    ),
+    "copy published command into documented build step": (
+        check_documented_build_step,
+        _mutate_copy_published_command_into_documented_step,
+    ),
+    "copy published command into macOS artifact step": (
+        check_documented_build_step,
+        _mutate_copy_published_command_into_macos_artifact_step,
+    ),
+    "reload Visual Studio loader": (
+        check_documented_build_step,
+        _mutate_reload_visual_studio_loader,
     ),
     "move build step before source step": (
         check_native_stage_ordering,
@@ -1541,9 +1739,9 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_native_artifact_lane,
         _mutate_ignore_artifact_test_failure,
     ),
-    "comment out desktop build command": (
-        check_native_artifact_lane,
-        _mutate_comment_out_desktop_build,
+    "comment out documented build command": (
+        check_documented_build_step,
+        _mutate_comment_out_documented_build,
     ),
     "comment out desktop extras install": (
         check_native_dependencies,
@@ -1600,6 +1798,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "change job time limit within range": (
         check_job_time_limits,
         _mutate_change_job_time_limit_within_range,
+    ),
+    "change windows desktop job time limit within range": (
+        check_job_time_limits,
+        _mutate_change_desktop_windows_time_limit_within_range,
     ),
     "add job without time limit": (
         check_job_time_limits,
@@ -1687,7 +1889,7 @@ def test_every_job_declares_its_measured_time_limit() -> None:
         "nyx": 30,
         "nyx-windows": 30,
         "nyx-macos": 30,
-        "nyx-desktop-windows": 40,
+        "nyx-desktop-windows": 35,
         "nyx-desktop-macos": 15,
     }
 
@@ -1702,6 +1904,10 @@ def test_every_job_declares_its_measured_time_limit() -> None:
             _mutate_change_job_time_limit_within_range,
             ["nyx-desktop-macos: timeout-minutes is 30, expected 15"],
         ),
+        (
+            _mutate_change_desktop_windows_time_limit_within_range,
+            ["nyx-desktop-windows: timeout-minutes is 40, expected 35"],
+        ),
         (_mutate_add_job_without_time_limit, ["nyx-extra: job does not declare timeout-minutes"]),
     ],
 )
@@ -1711,6 +1917,64 @@ def test_time_limit_check_names_the_offending_job(
     mutated = copy.deepcopy(load_workflow())
     mutate(mutated)
     assert check_job_time_limits(mutated) == expected
+
+
+DOCUMENTED_INSTALL_PATH = Path(__file__).with_name("test_documented_install.py")
+BUILD_BOUND_JOBS = {"powershell": "nyx-desktop-windows", "bash": "nyx-desktop-macos"}
+
+
+def _documented_build_bounds() -> dict[str, int]:
+    """Read the build bounds from the test module without importing it."""
+
+    tree = ast.parse(DOCUMENTED_INSTALL_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_BUILD_TIMEOUT_MINUTES"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise WorkflowContractViolation("_BUILD_TIMEOUT_MINUTES is not defined")
+
+
+def build_bound_violations(
+    bounds: dict[str, int], workflow: dict[str, Any]
+) -> list[str]:
+    problems: list[str] = []
+    for language, job_name in BUILD_BOUND_JOBS.items():
+        bound = bounds.get(language)
+        cap = _job(workflow, job_name).get(TIMEOUT_KEY)
+        if not isinstance(bound, int) or isinstance(bound, bool) or bound <= 0:
+            problems.append(f"{language}: build bound {bound!r} is not a positive integer")
+        elif bound >= cap:
+            problems.append(
+                f"{language}: build bound {bound} min is not below the {job_name} "
+                f"cap of {cap} min"
+            )
+    return problems
+
+
+def test_documented_build_bound_is_below_each_desktop_job_cap() -> None:
+    assert build_bound_violations(_documented_build_bounds(), load_workflow()) == []
+
+
+@pytest.mark.parametrize(
+    ("bounds", "expected"),
+    [
+        (
+            {"powershell": 45, "bash": 10},
+            ["powershell: build bound 45 min is not below the nyx-desktop-windows cap of 35 min"],
+        ),
+        (
+            {"powershell": 20, "bash": 15},
+            ["bash: build bound 15 min is not below the nyx-desktop-macos cap of 15 min"],
+        ),
+        ({"powershell": 20}, ["bash: build bound None is not a positive integer"]),
+    ],
+)
+def test_build_bound_at_or_above_the_job_cap_is_rejected(
+    bounds: dict[str, int], expected: list[str]
+) -> None:
+    assert build_bound_violations(bounds, load_workflow()) == expected
 
 
 def test_installed_wheel_proof_runs_once_after_the_build_in_each_baseline_job() -> None:
