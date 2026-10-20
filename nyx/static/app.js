@@ -1147,7 +1147,7 @@
         settingsRevision = payload.revision;
         editorStageOrder = editorNames();
         editorCompletedStages = [...savedCompletedStages];
-        settingsStatus("Current board row order loaded.");
+        settingsStatus("Current board settings loaded.");
         renderStageOrderEditor();
         if (displayed) renderBoard();
         if (refreshCatalog) request("manual");
@@ -1157,7 +1157,7 @@
         settingsAvailable = false;
         settingsReloadAvailable = true;
         settingsRevision = null;
-        settingsStatus(`Could not load board row order: ${settingsErrorMessage(error)}`, true);
+        settingsStatus(`Could not load board settings: ${settingsErrorMessage(error)}`, true);
         renderStageOrderEditor();
       }).finally(() => {
         if (serial !== settingsRequestSerial) return;
@@ -1169,7 +1169,7 @@
   function saveStageOrder(order, completed) {
     if (!settingsAvailable || !settingsRevision || settingsBusy) return;
     settingsBusy = true;
-    settingsStatus("Saving board row order…");
+    settingsStatus("Saving board settings…");
     renderStageOrderEditor();
     fetch(SETTINGS_ROUTE, {
       method: "PUT",
@@ -1190,8 +1190,8 @@
     }).then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
-          ? `Save not applied: ${payload.outcome}. Reload the current board row order to replace this unsaved draft and try again.`
-          : "Save failed: the board row order was not persisted.";
+          ? `Save not applied: ${payload.outcome}. Reload board settings to replace this unsaved draft and try again.`
+          : "Save failed: the board settings were not persisted.";
         if (payload.outcome === "conflict" || payload.outcome === "reload-needed") {
           settingsAvailable = false;
           settingsReloadAvailable = true;
@@ -1205,7 +1205,7 @@
       settingsRevision = payload.revision;
       editorStageOrder = editorNames();
       editorCompletedStages = [...savedCompletedStages];
-      settingsStatus("Board row order saved.");
+      settingsStatus("Board settings saved.");
       renderStageOrderEditor();
       request("settings", payload.revision);
     }).catch((error) => {
@@ -1522,7 +1522,7 @@
     if (settingsBusy) return;
     editorStageOrder = editorNames();
     editorCompletedStages = [...savedCompletedStages];
-    settingsStatus("Unsaved board row order changes cancelled.");
+    settingsStatus("Unsaved board settings changes cancelled.");
     renderStageOrderEditor();
   });
   stageOrderReset.addEventListener("click", () => saveStageOrder([], []));
