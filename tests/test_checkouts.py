@@ -2236,6 +2236,40 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
     assert nothing["default_branch"]["live_sha"] is None
 
 
+def test_presence_probe_reads_a_present_id_beside_a_missing_one(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served, "r.git", "trunk")
+    holder = clone(remote, folder / "holder")
+    outside = clone(remote, tmp_path / "outside")
+    git(holder, "checkout", "-q", "-b", "feature")
+    feature_tip = pushed_then_reset(holder, remote, "feature")
+    git(holder, "checkout", "-q", "trunk")
+    # The live trunk head, which the holder lacks, sorts before the feature
+    # tip it holds, so reading the probe's answer by argument position would
+    # misplace the present ID.
+    attempt = 0
+    while True:
+        live_head = commit_file(outside, "o.txt", f"outside {attempt}\n")
+        if live_head < feature_tip:
+            break
+        git(outside, "reset", "-q", "--hard", "HEAD~1")
+        attempt += 1
+    push_by_url(outside, remote, "trunk")
+
+    item = find_clone(live([folder]), holder)
+
+    assert branch_of(item, "feature")["vs_remote"] == {
+        "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
+    }
+    assert item["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
 def test_failed_remotes_fall_back_to_cached_without_leaking_anything(tmp_path, recorders):
     recorder = recorders()
     served = tmp_path / "served"
