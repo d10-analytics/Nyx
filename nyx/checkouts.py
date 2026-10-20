@@ -1,8 +1,12 @@
 """Read-only collector for the git state of the configured checkout folders.
 
-Every fact comes from a local git command run through one runner, or from a
-direct look at the files git keeps inside a repository's own directories.
-Nothing here fetches, writes, locks or contacts a remote.
+Every fact comes from a git command run through one runner, or from a direct
+look at the files git keeps inside a repository's own directories. Nothing here
+fetches, writes or locks anything. Local commands run with every transport
+denied. The one exception is the optional remote check: a single
+``git ls-remote`` per distinct remote, the only call that lifts the transport
+denial (so git applies the user's own transport policy and credentials), and it
+transfers no objects.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,8 +53,11 @@ _GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
 _VERSION_LINE = re.compile(r"git version (?P<version>[0-9]+(?:\.[0-9]+)+\S*)")
 _NUMERIC_PREFIX = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 _CONFIG_PATTERN = (
-    r"^(remote\..*\.(url|promisor)|extensions\.partialclone|url\..*\.insteadof)$"
+    r"^(remote\..*\.(url|promisor)|extensions\.partialclone|url\..*\.insteadof"
+    r"|core\.sshcommand)$"
 )
+_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_PROBE_CHUNK = 200
 _ZERO_OBJECT = re.compile(r"0+")
 _TRUE_VALUES = frozenset({"", "true", "yes", "on", "1"})
 
@@ -169,12 +176,25 @@ class _GitRunner:
         return environment
 
     def run(
-        self, arguments: Sequence[str], *, path: str | None = None, ceiling: str | None = None
+        self,
+        arguments: Sequence[str],
+        *,
+        path: str | None = None,
+        ceiling: str | None = None,
+        overlay: Mapping[str, str | None] | None = None,
     ) -> _Outcome:
+        """Run one git command; ``overlay`` is applied after the scrub and fixed
+        variables of this call only, and a ``None`` value removes a variable."""
         remaining = (self._deadline_ns - time.monotonic_ns()) / 1e9
         timeout = min(self._call_cap, remaining)
         if timeout <= 0:
             return _Outcome(None, timed_out=True)
+        environment = self._environment(ceiling)
+        for name, value in (overlay or {}).items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = value
         command = [self._executable, "--no-optional-locks", "-c", "core.fsmonitor=false"]
         if path is not None:
             command += ["-C", path]
@@ -188,7 +208,7 @@ class _GitRunner:
                     stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=err,
-                    env=self._environment(ceiling),
+                    env=environment,
                 )
             except OSError:
                 return _Outcome(None)
@@ -452,11 +472,25 @@ def _identify(runner: _GitRunner, candidate: _Candidate) -> _Identity:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _CloneContext:
+    """What a live comparison needs from one clone's local collection."""
+
+    cwd: str
+    ceiling: str
+    partial: bool
+    shallow: bool
+    local: dict[str, tuple[str, str]]
+    cached: dict[str, str]
+    ssh_configured: bool
+
+
 @dataclass
 class _CloneOutcome:
     clone: dict[str, Any] | None
     remote: tuple[str, str] | None = None
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    context: _CloneContext | None = None
 
 
 @dataclass(frozen=True)
@@ -485,14 +519,43 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
     }
 
 
-def _comparison(relation: str, ahead: int | None = None, behind: int | None = None) -> dict[str, Any]:
+def _comparison(
+    relation: str,
+    ahead: int | None = None,
+    behind: int | None = None,
+    basis: str = "cached",
+) -> dict[str, Any]:
     return {
-        "basis": "cached",
+        "basis": basis,
         "relation": relation,
         "ahead": ahead,
         "behind": behind,
         "objects_from": None,
     }
+
+
+def _counted_comparison(outcome: _Outcome, basis: str) -> dict[str, Any]:
+    """Read a ``rev-list --left-right --count`` outcome as a comparison."""
+    fields = outcome.out.split()
+    if outcome.timed_out or (basis == "live" and outcome.code is None):
+        return _comparison("unknown", basis=basis)
+    if outcome.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
+        ahead, behind = int(fields[0]), int(fields[1])
+        if ahead == 0 and behind == 0:
+            # Different objects naming the same commits (for example a tag
+            # object): nothing was counted, so say only that they differ.
+            return _comparison("differs", basis=basis)
+        relation = "diverged" if ahead and behind else "ahead" if ahead else "behind"
+        return _comparison(relation, ahead, behind, basis)
+    return _comparison("differs", basis=basis)
+
+
+def _has_ssh_command(data: bytes) -> bool:
+    return any(
+        _decode(record).partition("\n")[0] == "core.sshcommand"
+        for record in data.split(b"\0")
+        if record
+    )
 
 
 def _parse_config(data: bytes) -> tuple[dict[str, str], list[tuple[str, str]], bool]:
@@ -833,25 +896,10 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
             return _comparison("differs")
         key = (local_sha, cached_sha)
         if key not in memo:
-            counted = call(
-                ["rev-list", "--left-right", "--count", f"{local_sha}...{cached_sha}"]
+            memo[key] = _counted_comparison(
+                call(["rev-list", "--left-right", "--count", f"{local_sha}...{cached_sha}"]),
+                "cached",
             )
-            fields = counted.out.split()
-            if counted.timed_out:
-                memo[key] = _comparison("unknown")
-            elif counted.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
-                ahead, behind = int(fields[0]), int(fields[1])
-                if ahead == 0 and behind == 0:
-                    # Different objects naming the same commits (for example a
-                    # tag object): nothing was counted, so say only that they differ.
-                    memo[key] = _comparison("differs")
-                else:
-                    relation = (
-                        "diverged" if ahead and behind else "ahead" if ahead else "behind"
-                    )
-                    memo[key] = _comparison(relation, ahead, behind)
-            else:
-                memo[key] = _comparison("differs")
         return memo[key]
 
     branches: list[dict[str, Any]] = []
@@ -912,7 +960,16 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
     }
     if not _all_text_safe(clone):
         return degraded("failed")
-    return _CloneOutcome(clone, remote, diagnostics)
+    context = _CloneContext(
+        cwd=cwd,
+        ceiling=ceiling,
+        partial=partial,
+        shallow=anchor.shallow,
+        local=local,
+        cached=cached,
+        ssh_configured=_has_ssh_command(configuration.out),
+    )
+    return _CloneOutcome(clone, remote, diagnostics, context)
 
 
 def _remote_text_safe(remote: tuple[str, str] | None) -> bool:
@@ -1011,6 +1068,253 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
     return repositories
 
 
+# ---------------------------------------------------------------------------
+# Remote checks and live comparisons
+# ---------------------------------------------------------------------------
+
+_AUTH_PHRASES = (
+    "authentication failed",
+    "permission denied",
+    "could not read username",
+    "could not read password",
+)
+_UNREACHABLE_PHRASES = (
+    "could not resolve host",
+    "failed to connect",
+    "couldn't connect to server",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "operation timed out",
+    "no route to host",
+    "network is unreachable",
+)
+_NOT_FOUND_PHRASES = ("not found", "does not appear to be a git repository")
+
+
+@dataclass(frozen=True)
+class _LiveAnswer:
+    """One remote's answer, or the category of its failure; never raw text."""
+
+    reason: str | None = None
+    name: str | None = None
+    sha: str | None = None
+    branches: Mapping[str, str] = field(default_factory=dict)
+
+
+def _failure_reason(outcome: _Outcome) -> str:
+    """Name a failed ``ls-remote`` by category, from stderr read under ``LC_ALL=C``."""
+    if outcome.timed_out:
+        return "timed_out"
+    text = outcome.err.decode("utf-8", "replace").lower()
+    for reason, phrases in (
+        ("authentication_failed", _AUTH_PHRASES),
+        ("unreachable", _UNREACHABLE_PHRASES),
+        ("not_found", _NOT_FOUND_PHRASES),
+    ):
+        if any(phrase in text for phrase in phrases):
+            return reason
+    return "failed"
+
+
+def _parse_listing(data: bytes) -> _LiveAnswer | None:
+    """Read ``ls-remote --symref`` output; ``None`` when it is not that shape."""
+    name: str | None = None
+    head: str | None = None
+    branches: dict[str, str] = {}
+    for line in _decode(data).split("\n"):
+        if not line:
+            continue
+        left, tab, right = line.partition("\t")
+        if not tab:
+            return None
+        if left.startswith("ref: "):
+            target = left[len("ref: ") :]
+            if right == "HEAD" and name is None and target.startswith("refs/heads/"):
+                candidate = target[len("refs/heads/") :]
+                name = candidate if _safe_text(candidate) else None
+        elif _OBJECT_ID.fullmatch(left) and left.strip("0"):
+            if right == "HEAD":
+                head = left
+            elif right.startswith("refs/heads/"):
+                branch = right[len("refs/heads/") :]
+                if _safe_text(branch):
+                    branches[branch] = left
+        else:
+            return None
+    return _LiveAnswer(name=name, sha=head, branches=branches)
+
+
+def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
+    """The group's one ``ls-remote``, run from its chosen clone and never retried."""
+    # Lifting the base denial gives git back its own transport policy: the
+    # caller's inherited value stands, and an unset one stays unset.
+    overlay: dict[str, str | None] = {"GIT_ALLOW_PROTOCOL": os.environ.get("GIT_ALLOW_PROTOCOL")}
+    if (
+        "GIT_SSH_COMMAND" not in os.environ
+        and "GIT_SSH" not in os.environ
+        and not context.ssh_configured
+    ):
+        overlay["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    outcome = runner.run(
+        ["ls-remote", "--symref", "origin", "HEAD", "refs/heads/*"],
+        path=context.cwd,
+        ceiling=context.ceiling,
+        overlay=overlay,
+    )
+    if not outcome.ok:
+        return _LiveAnswer(_failure_reason(outcome))
+    answer = _parse_listing(outcome.out)
+    return answer if answer is not None else _LiveAnswer("failed")
+
+
+def _present_objects(
+    runner: _GitRunner, context: _CloneContext, wanted: Sequence[str]
+) -> dict[str, str]:
+    """Classify each wanted ID as ``present``, ``missing``, ``unknown`` or ``differs``.
+
+    The IDs are arguments because the runner closes stdin; git prints the
+    present ones, in no promised order, and exits 0 when some are missing.
+    """
+    result: dict[str, str] = {}
+    for start in range(0, len(wanted), _PROBE_CHUNK):
+        chunk = list(wanted[start : start + _PROBE_CHUNK])
+        outcome = runner.run(
+            ["rev-list", "--no-walk", "--ignore-missing", *chunk],
+            path=context.cwd,
+            ceiling=context.ceiling,
+        )
+        if outcome.timed_out or outcome.code is None:
+            state = dict.fromkeys(chunk, "unknown")
+        elif not outcome.ok:
+            state = dict.fromkeys(chunk, "differs")
+        else:
+            found = set(outcome.out.decode("ascii", "replace").split())
+            state = {item: "present" if item in found else "missing" for item in chunk}
+        result.update(state)
+    return result
+
+
+def _apply_live(
+    runner: _GitRunner,
+    context: _CloneContext,
+    clone: dict[str, Any],
+    answer: _LiveAnswer,
+) -> None:
+    """Replace one clone's cached comparisons with the live ones, in place."""
+    name, live_sha = answer.name, answer.sha
+    cached_sha = context.cached.get(name) if name is not None else None
+    local_sha = context.local.get(name, (None, ""))[0] if name is not None else None
+    pairs = [(cached_sha, live_sha)]
+    if name is not None:
+        pairs.append((local_sha, live_sha))
+    for branch in clone["branches"]:
+        pairs.append((branch["sha"], answer.branches.get(branch["name"])))
+    guarded = context.partial or context.shallow
+    wanted = sorted(
+        {right for left, right in pairs if left and right and left != right}
+    )
+    presence = (
+        _present_objects(runner, context, wanted) if wanted and not guarded else {}
+    )
+    memo: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def live(left: str | None, right: str | None) -> dict[str, Any]:
+        if left is None or right is None:
+            return _comparison("absent", basis="live")
+        if left == right:
+            return _comparison("equal", 0, 0, "live")
+        if guarded:
+            return _comparison("differs", basis="live")
+        state = presence.get(right, "missing")
+        if state == "unknown":
+            return _comparison("unknown", basis="live")
+        if state != "present":
+            return _comparison("differs", basis="live")
+        if (left, right) not in memo:
+            memo[(left, right)] = _counted_comparison(
+                runner.run(
+                    ["rev-list", "--left-right", "--count", f"{left}...{right}"],
+                    path=context.cwd,
+                    ceiling=context.ceiling,
+                ),
+                "live",
+            )
+        return memo[(left, right)]
+
+    clone["cached_vs_live"] = live(cached_sha, live_sha)
+    if name is None:
+        clone["local_default"] = None
+    else:
+        previous = clone["local_default"]
+        if previous is not None and previous["name"] == name:
+            vs_cached = previous["vs_cached"]
+        elif local_sha is None or cached_sha is None:
+            vs_cached = _comparison("absent")
+        elif local_sha == cached_sha:
+            vs_cached = _comparison("equal", 0, 0)
+        elif context.shallow:
+            vs_cached = _comparison("differs")
+        else:
+            vs_cached = _counted_comparison(
+                runner.run(
+                    ["rev-list", "--left-right", "--count", f"{local_sha}...{cached_sha}"],
+                    path=context.cwd,
+                    ceiling=context.ceiling,
+                ),
+                "cached",
+            )
+        clone["local_default"] = {
+            "name": name,
+            "sha": local_sha,
+            "vs_live": live(local_sha, live_sha),
+            "vs_cached": vs_cached,
+        }
+    for branch in clone["branches"]:
+        branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
+
+
+def _check_remotes(
+    runner: _GitRunner,
+    repositories: list[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    max_parallel: int,
+) -> None:
+    """Phase 2 (one query per remote) then phase 3 (live comparisons per clone)."""
+    groups = [item for item in repositories if item["remote"] is not None]
+    chosen: list[_CloneContext | None] = []
+    for group in groups:
+        first = next(
+            (
+                contexts[clone["path"]]
+                for clone in group["clones"]
+                if clone["status"] == "ok" and clone["path"] in contexts
+            ),
+            None,
+        )
+        chosen.append(first)
+
+    def query(context: _CloneContext | None) -> _LiveAnswer:
+        # A group with no usable clone makes no call.
+        return _query_remote(runner, context) if context is not None else _LiveAnswer("failed")
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+        answers = list(pool.map(query, chosen))
+        work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer]] = []
+        for group, answer in zip(groups, answers):
+            if answer.reason is not None:
+                group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
+                continue
+            group["remote"]["check"] = {"status": "live", "reason": None}
+            group["default_branch"] = {"name": answer.name, "live_sha": answer.sha}
+            for clone in group["clones"]:
+                if clone["status"] == "ok" and clone["path"] in contexts:
+                    work.append((contexts[clone["path"]], clone, answer))
+        # The pool is drained between the phases, so a blocked query keeps a
+        # later comparison from starting.
+        list(pool.map(lambda item: _apply_live(runner, *item), work))
+
+
 def _render(document: dict[str, Any]) -> str:
     rendered = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     if len(rendered.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:
@@ -1024,12 +1328,14 @@ def collect_checkouts(
     deadline_ns: int,
     call_cap_seconds: float = CALL_CAP_SECONDS,
     max_parallel: int = MAX_PARALLEL_CLONES,
+    remote_checks: bool = False,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
     ``deadline_ns`` is a ``time.monotonic_ns`` instant; calls that cannot start
     or finish by then mark their item ``timed_out`` and the document is still
-    produced.
+    produced. ``remote_checks`` adds one ``ls-remote`` per distinct remote and
+    the live comparisons built on it; left off, nothing contacts a remote.
     """
     observed_at = _utc_text(int(time.time()))
     discovery = _discover(os.fspath(folder) for folder in folders)
@@ -1073,6 +1379,13 @@ def collect_checkouts(
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
         repositories = _assemble_repositories(outcomes)
+        if remote_checks:
+            contexts = {
+                outcome.clone["path"]: outcome.context
+                for outcome in outcomes
+                if outcome.clone is not None and outcome.context is not None
+            }
+            _check_remotes(runner, repositories, contexts, max_parallel)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
@@ -1082,7 +1395,7 @@ def collect_checkouts(
         "checkouts_digest": None,
         "observed_at": observed_at,
         "git": git_state,
-        "remote_checks": "off",
+        "remote_checks": "on" if remote_checks else "off",
         "folders": sorted(discovery.folders, key=folder_sort_key),
         "repositories": repositories,
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),
