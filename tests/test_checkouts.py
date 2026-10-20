@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from nyx import checkouts, models
+from nyx import checkouts, cli, models
 
 ON_WINDOWS = os.name == "nt"
 TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -514,6 +514,35 @@ def test_checked_out_in_branch_order_and_main_first(repo, tmp_path):
     assert branch_of(item, "topic")["checked_out_in"] == [real(linked)]
     assert branch_of(item, "b2")["checked_out_in"] == []
     assert [wt["path"] for wt in item["worktrees"]] == [real(repo), real(linked)]
+
+
+def test_stale_worktree_path_reused_by_another_clone_belongs_only_to_that_clone(tmp_path):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "code"
+    first = clone(remote, folder / "c1")
+    second = clone(remote, folder / "c2")
+    shared = folder / "wt"
+    git(first, "worktree", "add", "-q", str(shared), "-b", "f1")
+    shutil.rmtree(shared)
+    git(second, "worktree", "add", "-q", str(shared), "-b", "f2")
+
+    document = collect([folder])
+
+    owner = find_clone(document, second)
+    assert [item["path"] for item in owner["worktrees"]].count(real(shared)) == 1
+    taken = find_worktree(owner, shared)
+    assert taken["head"]["branch"] == "f2"
+    assert taken["status"] == "ok"
+    assert branch_of(owner, "f2")["checked_out_in"] == [real(shared)]
+    stale = find_clone(document, first)
+    assert [item["path"] for item in stale["worktrees"]] == [real(first)]
+    assert branch_of(stale, "f1")["checked_out_in"] == []
+    assert sum(
+        item["path"] == real(shared)
+        for entry in all_clones(document)
+        for item in entry["worktrees"]
+    ) == 1
+    assert cli.format_checkouts(document)
 
 
 def test_locked_worktree_inside_a_dirty_clone_does_not_report_the_clone(repo):
