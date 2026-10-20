@@ -588,10 +588,12 @@ def _linked_git_directories(common: str) -> dict[str, str]:
 
 
 def _claimed_elsewhere(path: str, git_directory: str) -> bool:
-    """Whether the worktree's current `.git` names a different git directory.
+    """Whether another repository now owns the worktree path.
 
-    A missing or unreadable `.git` is not a claim by anyone else: the worktree
-    stays listed and its status simply fails.
+    Only a `.git` directory, or a `gitdir:` pointer to an existing git
+    directory other than this clone's own, is such a claim. A missing,
+    unreadable or malformed `.git`, an empty pointer, or a pointer to a
+    directory that is gone leaves the worktree listed so its status fails.
     """
     marker = os.path.join(path, ".git")
     if os.path.isdir(marker):
@@ -602,13 +604,14 @@ def _claimed_elsewhere(path: str, git_directory: str) -> bool:
     except OSError:
         return False
     if not first.startswith("gitdir:"):
-        return True
+        return False
     pointer = first[len("gitdir:") :].strip()
     if not pointer:
-        return True
+        return False
     if not os.path.isabs(pointer):
         pointer = os.path.join(path, pointer)
-    return os.path.realpath(pointer) != os.path.realpath(git_directory)
+    target = os.path.realpath(pointer)
+    return os.path.isdir(target) and target != os.path.realpath(git_directory)
 
 
 def _operations(git_directory: str) -> list[str]:
