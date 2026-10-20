@@ -80,7 +80,7 @@ when no update is waiting. Use the stop command above when you are finished.
 Setup saves the workspace location for your account on this host. This setup
 choice is separate from the browser's personal
 **Hide empty rows and columns** and **Hide terminal rows** preferences, which are
-stored only in that browser. The **Board row order** editor saves its order in the same account-local
+stored only in that browser. The **Board settings** panel saves the board row order in the same account-local
 configuration, shared by that account's browser and desktop views. The saved order
 survives browser reload and a supported Nyx restart, and is keyed by workspace root:
 switching from workspace A to workspace B does not apply A's order, while returning
@@ -174,10 +174,10 @@ The [workspace guide](docs/workspaces.md) walks through your first specification
 moving work between stages, and adding dependencies when you need them.
 
 Progress and dependency information comes from your specification files. A card
-with declared direct prerequisites identifies them as satisfied, waiting, unknown,
-or unavailable; a card with none has no dependency marker. These labels report
-only recorded prerequisites and do not imply implementation approval or
-completion.
+shows links to its resolved prerequisite and dependent items, and shows
+**unresolved target** only when a relationship cannot be resolved; a card with
+no relationships has no dependency marker. These links report only recorded
+relationships and do not imply implementation approval or completion.
 
 ## Working with coding agents
 
@@ -197,5 +197,7 @@ Nyx itself does not launch agents or execute the work described by a specificati
 - [Running Nyx](docs/running-nyx.md): start, stop, check status, and configure board settings.
 - [Specification reference](docs/specification-reference.md): metadata, programs, and dependencies.
 
-Nyx serves one local account on the fixed loopback address. The browser
-is read-only; shared or remote hosting is not supported.
+Nyx serves the board on the fixed loopback address without caller
+authentication, so other local accounts on the same host can read the catalog
+and workspace path and change board settings. The browser never edits
+specification files; shared or remote hosting is not supported.

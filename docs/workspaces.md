@@ -123,10 +123,33 @@ specifications/
 Each work item has its own directory containing `spec.md`. You can add grouping
 directories between a stage and its work item directories as the project grows.
 
-Generate a unique `Package ID` value:
+Every UUID field (`Package ID`, `Program ID`, `Program Membership`,
+`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a
+lowercase version 4 UUID only; an uppercase or otherwise invalid value is not
+accepted. An invalid `Package ID` makes the item lose its identity, so
+dependents that name it show **unresolved target** and **Workspace issues**
+lists nothing. An invalid `Prerequisite` or `Completion Prerequisite` shows
+**unresolved target**. An invalid `Program Membership` or `Superseded By` leaves
+the item's identity intact and leaves only that relationship unresolved. An
+invalid `Program ID` invalidates its program descriptor without affecting any
+item's identity.
+
+Generate a unique lowercase `Package ID` value. On Linux:
 
 ```bash
 python3 -c 'import uuid; print(uuid.uuid4())'
+```
+
+On macOS, which prints uppercase by default:
+
+```bash
+uuidgen | tr '[:upper:]' '[:lower:]'
+```
+
+In Windows PowerShell:
+
+```powershell
+[guid]::NewGuid().ToString()
 ```
 
 Write the following structure in `spec.md`, replacing the example ID with the
@@ -168,7 +191,7 @@ For example, move `route-preview` from `Under_Development` to `Queue` when it
 is ready to be scheduled. Keep its `Package ID` unchanged so dependency references
 continue to identify the same work.
 
-These familiar stage directory names are used by the bundled examples:
+These familiar stage directory names are common choices, not a required set:
 
 | Directory | Board label | Typical use |
 | --- | --- | --- |
@@ -205,8 +228,9 @@ Completion Prerequisite: 55555555-5555-4555-8555-555555555555
 ```
 
 When the target moves into a selected stage, this whole-item requirement becomes
-satisfied; moving it out reopens the requirement. A missing policy leaves the
-requirement **unknown** and asks you to configure completed stages. Hiding a
+satisfied; moving it out reopens the requirement. The policy is set in **Board
+settings**; a missing policy leaves the requirement **unknown**, with no prompt
+or explanation. Hiding a
 finished row does not change its dependency results. This assertion records
 workflow completion; it does not verify evidence, approve work, or satisfy a
 named outcome.
@@ -303,18 +327,18 @@ columns without changing the workspace or configuration. It does not override
 **Hide terminal rows**: uncheck that control to show finished rows and their
 cards and dependency connections.
 
-The **Board row order** editor is another presentation control. It saves a
+The **Board settings** panel's row-order editor is another presentation control. It saves a
 root-keyed order map in the current account's configuration, so browser and
 desktop views for that account share the order and a supported restart restores
 it. Switching between workspace roots does not carry one root's order into
 another. **Move up** and **Move down** change the draft; **Save** persists it,
-**Cancel** performs no write, and **Reset** clears only the current root's saved
-order. Unlisted eligible stages are appended in canonical inventory order until
+**Cancel** performs no write, and **Reset** clears the current root's saved row
+order and completed-stage set. Unlisted eligible stages are appended in canonical inventory order until
 you save them. Saved names remain literal even when their stage is absent;
 they retain their place for a later return but do not produce a row while
 absent. If loading account settings fails, no saved order is available,
 so the board uses canonical inventory order and reports the problem for retry.
-Choose **Reload board row order** to retry. A conflict or reload-needed Save
+Choose **Reload board settings** to retry. A conflict or reload-needed Save
 requires that reload, which replaces the stale unsaved draft with the current
 saved order. For other Save failures: If Save fails, the board keeps displaying
 the prior saved order and retains the unsaved editor draft so you can retry.

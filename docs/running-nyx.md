@@ -163,21 +163,21 @@ record is edited by hand.
 
 ## Choose board row order
 
-When account settings are available, the toolbar includes a **Board row order**
-editor. It lists the literal stage names known to the current workspace. Use
+When account settings are available, the toolbar includes a collapsed **Board settings**
+panel with a row-order editor. It lists the literal stage names known to the current workspace. Use
 **Move up** and **Move down** to arrange them, then choose **Save**. Save writes
 the order to this account's configuration and the board applies it without moving
 any folders or changing work item state. The saved order is shared by this
 account's browser and desktop views, survives browser reload and a supported Nyx
 restart, and is kept separately for each workspace root.
 
-**Cancel** discards the editor's unsaved moves and performs no write. **Reset**
-clears the saved order for the current workspace only; the board then follows the
-canonical inventory order. An absent saved stage name stays in the editor
+**Cancel** discards the unsaved moves and unsaved completion choices and performs
+no write. **Reset** clears the current root's row order and completed-stage set;
+the board then follows the canonical inventory order. An absent saved stage name stays in the editor
 as a retained literal, marked as unavailable, but it produces no board row. A new
 eligible stage that is not yet saved follows the saved names and is appended in
 canonical inventory order. If the settings service cannot load, the board remains
-usable in canonical inventory order and shows **Reload board row order** so you
+usable in canonical inventory order and shows **Reload board settings** so you
 can retry. A conflict or reload-needed Save requires that reload, which replaces
 the unsaved draft with the current saved order. Any other failed Save leaves the
 prior saved order and unsaved draft in place so you can retry.
@@ -325,8 +325,9 @@ report that the desktop application has no lifecycle commands.
 
 ### Desktop limits
 
-The application serves one local account through the fixed loopback address and
-does not edit specifications. It has no automatic startup, auto-update, remote
+The application serves the board on the fixed loopback address without caller
+authentication, so other local accounts on the same host can read the catalog and
+workspace path and change board settings. It does not edit specifications. It has no automatic startup, auto-update, remote
 or shared hosting, cross-host configuration synchronization, or agent
 execution. Configuration and runtime state still live under `.nyx` in your home
 directory. On Linux the desktop application refuses to start and directs you to
@@ -468,7 +469,7 @@ is unchanged.
 
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
 fresh browser context so the compact preference starts checked. Before saving the
-first image, open **Board settings**, use **Board row order** to move **Queue**
+first image, open **Board settings**, use the row-order editor to move **Queue**
 above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
 **Hide terminal rows** checked for all three images.
@@ -531,12 +532,19 @@ repeatable browser session; it does not add a permanent screenshot framework.
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that
   a directory is empty.
-- A dependency shows **unresolved target**, or a work item looks wrong: inspect
-  the involved `spec.md` headers for a missing or duplicated `Package ID`, a
-  malformed field, or a prerequisite naming a nonexistent item. The board does
-  not list problems inside individual specifications. **Workspace issues**
-  reports only directories, specification files, and program descriptors that
-  could not be read or identified.
+- A dependency shows **unresolved target**, or a work item looks wrong: check
+  **Workspace issues** first for an unreadable directory or specification file
+  that made identity coverage incomplete. If it is empty, check that the
+  prerequisite UUID and the target's `Package ID` are lowercase version 4 and
+  unique, because an invalid or duplicate ID produces no Workspace-issues entry,
+  then inspect the involved `spec.md` headers for a malformed field or a
+  prerequisite naming a nonexistent item. Nyx keeps its conservative
+  all-or-nothing resolution, so one unreadable entry makes every resolved
+  relationship show **unresolved target**. Descriptor problems affect programs
+  only and do not make identity coverage incomplete. The board does not list
+  problems inside individual specifications; **Workspace issues** reports only
+  directories, specification files, and program descriptors that could not be
+  read or identified.
   The [reference](specification-reference.md) explains the expected format.
 - **An edit has not appeared:** request a refresh and apply any pending update.
   If the catalog cannot be refreshed, the browser reports the problem; do not
@@ -548,6 +556,12 @@ repeatable browser session; it does not add a permanent screenshot framework.
   appears when the catalog worker writes too much diagnostic output or, on
   Windows, aborts, so if a small workspace keeps reporting it, the cause is a
   worker failure rather than the workspace's size.
+- **`nyx --status` prints `Configuration: unavailable`:** Nyx cannot read the
+  account configuration, and `nyx --setup` does not repair an existing
+  unreadable record. Run `nyx --stop`, then either restore
+  `~/.nyx/config/config.json` from a backup or move it aside and run
+  `nyx --setup <workspace>`, which discards the saved board settings and
+  checkout folders.
 - **Setup rejects a change:** on Linux, stop the running instance, repeat setup,
   then start it. In the desktop application, choose **Change workspace**, then
   **Retry** if the stop is incomplete.
@@ -558,4 +572,6 @@ repeatable browser session; it does not add a permanent screenshot framework.
 
 Nyx reads specification files without modifying them. Setup and runtime commands
 do write account-local configuration and runtime state. The service is intended
-for one local account through its fixed loopback interface, not shared or remote hosting.
+for use on a fixed loopback interface without caller authentication, so other local
+accounts on the same host can read the catalog and workspace path and change
+board settings; shared or remote hosting is not supported.
