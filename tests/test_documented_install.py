@@ -91,7 +91,8 @@ DESKTOP_GUIDANCE_MARKERS = (
 )
 STAGE_ORDER_GUIDANCE_MARKERS = {
     "README.md": (
-        "Board row order",
+        "The **Board settings** panel saves the board row order in the same "
+        "account-local configuration",
         "account-local",
         "browser and desktop views",
         "workspace root",
@@ -99,7 +100,8 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "does not rename or move",
     ),
     "docs/running-nyx.md": (
-        "Board row order",
+        "the toolbar includes a collapsed **Board settings** panel with a "
+        "row-order editor",
         "Move up",
         "Move down",
         "Cancel",
@@ -490,6 +492,196 @@ def test_documents_publish_the_invalid_record_recovery_guidance():
     for marker in RECOVERY_GUIDANCE_MARKERS:
         assert marker in normalized, marker
     assert "```" not in section
+
+
+_ALL_DOCUMENTS = (
+    "README.md", "docs/running-nyx.md", "docs/workspaces.md",
+    "docs/specification-reference.md",
+)
+UUID_COMMANDS = (
+    "python3 -c 'import uuid; print(uuid.uuid4())'",
+    "uuidgen | tr '[:upper:]' '[:lower:]'",
+    "[guid]::NewGuid().ToString()",
+)
+UUID_RULE_MARKERS = (
+    "Every UUID field (`Package ID`, `Program ID`, `Program Membership`, "
+    "`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a "
+    "lowercase version 4 UUID only",
+    "An invalid `Package ID` makes the item lose its identity, so ",
+    "An invalid `Prerequisite` or `Completion Prerequisite` shows "
+    "**unresolved target**",
+    "An invalid `Program Membership` or `Superseded By` leaves the item's "
+    "identity intact",
+)
+PROGRAM_GRAMMAR_MARKERS = (
+    "holds exactly one `Program ID` line and one `Program Title` line and no "
+    "other non-empty content",
+    "The ID must equal the program directory name",
+    "the title must be 1–120 characters",
+    "inside a canonical UUID program directory makes every program membership "
+    "in the workspace **unknown**",
+    "program-title search finds nothing, while **Workspace issues** names that "
+    "descriptor",
+    "A program directory whose name is not a lowercase version 4 UUID is "
+    "skipped without a diagnostic",
+)
+UNRESOLVED_CHECK_FIRST = "check **Workspace issues** first for an unreadable directory or specification file that made identity coverage incomplete"
+UNRESOLVED_MARKERS = (
+    UNRESOLVED_CHECK_FIRST,
+    "Descriptor problems affect programs only and do not make identity "
+    "coverage incomplete",
+    "conservative all-or-nothing resolution",
+)
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+
+
+def _section(name: str, heading: str) -> str:
+    text = (REPOSITORY_ROOT / name).read_text(encoding="utf-8")
+    assert heading in text, (name, heading)
+    section = text.split(heading, 1)[1].split("\n## ", 1)[0]
+    return re.sub(r"\s+", " ", section)
+
+
+def test_dependency_and_completion_policy_text_matches_the_board():
+    readme = _normalized("README.md")
+    assert "satisfied, waiting, unknown, or unavailable" not in readme
+    assert "shows links to its resolved prerequisite and dependent items" in readme
+    assert "**unresolved target** only when a relationship cannot be resolved" in readme
+    assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
+    assert "actionable configuration explanation" not in _normalized(
+        "docs/specification-reference.md")
+    for name in ("docs/workspaces.md", "docs/specification-reference.md"):
+        document = _normalized(name)
+        assert "**Board settings**" in document, name
+        assert "**unknown**" in document, name
+    assert ("a missing policy leaves the requirement **unknown**, with no prompt "
+            "or explanation") in _normalized("docs/workspaces.md")
+    assert ("a completion dependency is **unknown**; the board shows no prompt "
+            "or explanation") in _normalized("docs/specification-reference.md")
+
+
+def test_configuration_unavailable_recovery_is_one_fence_free_bullet():
+    document = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    heading = "## If something looks wrong\n"
+    assert heading in document
+    raw = document.split(heading, 1)[1].split("\n## ", 1)[0]
+    bullets = [
+        re.sub(r"\s+", " ", bullet)
+        for bullet in re.split(r"\n(?=- )", raw)
+        if "Configuration: unavailable" in bullet
+    ]
+    assert len(bullets) == 1
+    bullet = bullets[0]
+    for marker in (
+        "`nyx --status` prints `Configuration: unavailable`",
+        "`nyx --setup` does not repair an existing unreadable record",
+        "Run `nyx --stop`",
+        "restore `~/.nyx/config/config.json` from a backup",
+        "move it aside",
+        "`nyx --setup <workspace>`",
+        "discards the saved board settings and checkout folders",
+    ):
+        assert marker in bullet, marker
+    assert "```" not in raw
+    for forbidden in ("pkill", "killall", "taskkill", "kill -9"):
+        assert forbidden not in bullet, forbidden
+
+
+@pytest.mark.parametrize("name", ["docs/specification-reference.md", "docs/workspaces.md"])
+def test_documents_state_the_uuid_rule_effects_and_commands(name):
+    document = _normalized(name)
+    for marker in UUID_RULE_MARKERS + UUID_COMMANDS:
+        assert marker in document, (name, marker)
+    assert "**Workspace issues** lists nothing" in document, name
+    assert "invalid `Program ID`" in document, name
+
+
+def test_reference_states_program_id_invalidates_the_descriptor():
+    document = _normalized("docs/specification-reference.md")
+    assert ("An invalid `Program ID` makes its program descriptor invalid, as "
+            "described under Programs, without affecting any item's identity") in document
+
+
+def test_readme_publishes_no_uuid_generation_command():
+    readme = _normalized("README.md")
+    for command in UUID_COMMANDS:
+        assert command not in readme, command
+
+
+def test_reference_programs_section_documents_the_descriptor_grammar():
+    section = _section("docs/specification-reference.md", "## Programs")
+    for marker in PROGRAM_GRAMMAR_MARKERS:
+        assert marker in section, marker
+
+
+def test_reference_scopes_bold_names_to_reported_text_and_core_labels_are_plain():
+    reference = _normalized("docs/specification-reference.md")
+    assert ("Bold names are documented for reported-text fields only. The core "
+            "field labels in the table above are written plain") in reference
+    core_bold = re.compile(
+        r"\*\*(Package ID|Status|Target repo|Program ID|Program Title|"
+        r"Program Membership|Claim|Prerequisite|Completion Prerequisite|"
+        r"Superseded By)\*{0,2}:"
+    )
+    for name in _ALL_DOCUMENTS:
+        assert not core_bold.search(_normalized(name)), name
+
+
+@pytest.mark.parametrize("name,section_heading,old_phrase", [
+    ("docs/running-nyx.md", "## If something looks wrong\n",
+     "inspect the involved `spec.md` headers"),
+    ("docs/specification-reference.md", "## Diagnostics",
+     "inspect the affected specification headers"),
+])
+def test_unresolved_target_guidance_checks_workspace_issues_first(
+        name, section_heading, old_phrase):
+    section = _section(name, section_heading)
+    for marker in UNRESOLVED_MARKERS:
+        assert marker in section, (name, marker)
+    if old_phrase in section:
+        assert section.index(old_phrase) > section.index(UNRESOLVED_CHECK_FIRST), name
+
+
+def test_documents_name_board_settings_and_reset_clears_both_settings():
+    for name in _ALL_DOCUMENTS:
+        document = _normalized(name)
+        assert "**Board row order**" not in document, name
+        assert "Reload board row order" not in document, name
+    assert "used by the bundled examples" not in _normalized("docs/workspaces.md")
+    for name, phrase in (
+        ("docs/workspaces.md", "clears only the current root's saved order"),
+        ("docs/running-nyx.md", "clears the saved order for the current workspace only"),
+        ("docs/running-nyx.md", "discards the editor's unsaved moves"),
+    ):
+        assert phrase not in _normalized(name), (name, phrase)
+    assert ("**Reset** clears the current root's saved row order and "
+            "completed-stage set") in _normalized("docs/workspaces.md")
+    guide = _normalized("docs/running-nyx.md")
+    assert ("**Cancel** discards the unsaved moves and unsaved completion "
+            "choices") in guide
+    assert ("**Reset** clears the current root's row order and completed-stage "
+            "set; the board then follows the canonical inventory order") in guide
+    assert "use the row-order editor to move **Queue**" in guide
+    assert "**Reload board settings**" in guide
+    assert "**Reload board settings**" in _normalized("docs/workspaces.md")
+
+
+def test_documents_state_the_loopback_exposure_without_caller_authentication():
+    for name in ("README.md", "docs/running-nyx.md"):
+        document = _normalized(name)
+        assert "serves one local account" not in document, name
+        assert "intended for one local account" not in document, name
+    readme = _normalized("README.md")
+    assert "The browser is read-only;" not in readme
+    assert "without caller authentication, so other local accounts on the same host" in readme
+    assert "The browser never edits specification files" in readme
+    for heading in ("### Desktop limits", "## If something looks wrong\n"):
+        section = _section("docs/running-nyx.md", heading)
+        assert "without caller authentication, so other local accounts on the same host" in section, heading
+        assert "change board settings" in section, heading
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):
