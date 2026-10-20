@@ -545,6 +545,43 @@ def test_stale_worktree_path_reused_by_another_clone_belongs_only_to_that_clone(
     assert cli.format_checkouts(document)
 
 
+def test_worktree_of_a_moved_clone_stays_listed_as_failed(tmp_path):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "m"
+    original = clone(remote, folder / "c")
+    outside = tmp_path / "outside_mv"
+    git(original, "worktree", "add", "-q", str(outside), "-b", "mv")
+    moved = folder / "c-moved"
+    original.rename(moved)
+
+    document = collect([folder])
+
+    owner = find_clone(document, moved)
+    worktree = find_worktree(owner, outside)
+    assert worktree["status"] == "failed" and worktree["changes"] is None
+    assert worktree["head"] is None
+    assert branch_of(owner, "mv")["checked_out_in"] == [real(outside)]
+    assert sum(
+        item["path"] == real(outside)
+        for entry in all_clones(document)
+        for item in entry["worktrees"]
+    ) == 1
+
+
+@pytest.mark.parametrize("content", ["garbage\n", "gitdir:\n", "gitdir:   \n"])
+def test_worktree_with_a_malformed_git_file_stays_listed_as_failed(repo, tmp_path, content):
+    linked = tmp_path / "broken-wt"
+    git(repo, "worktree", "add", "-q", str(linked), "-b", "broken")
+    (linked / ".git").write_text(content)
+
+    item = state_of(repo)
+
+    worktree = find_worktree(item, linked)
+    assert worktree["status"] == "failed" and worktree["changes"] is None
+    assert_unreadable(worktree)
+    assert branch_of(item, "broken")["checked_out_in"] == [real(linked)]
+
+
 def test_locked_worktree_inside_a_dirty_clone_does_not_report_the_clone(repo):
     (repo / "dirty.txt").write_text("dirty\n")
     inside = repo / "inside"
