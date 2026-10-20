@@ -185,14 +185,14 @@ CONTINUE_ON_ERROR_KEY = "continue-on-error"
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
-# Each desktop cap follows the rule above from its measured duration: 12m37s
-# (757 s) for nyx-desktop-windows and 6m34s (394 s) for nyx-desktop-macos, so
-# twice each rounds up to 30 and 15 minutes.
+# Each desktop cap follows the rule above from its longest recent successful
+# duration: 15m26s (926 s) for nyx-desktop-windows and 6m34s (394 s) for
+# nyx-desktop-macos, so twice each rounds up to 35 and 15 minutes.
 JOB_TIMEOUT_MINUTES = {
     "nyx": 30,
     "nyx-windows": 30,
     "nyx-macos": 30,
-    "nyx-desktop-windows": 30,
+    "nyx-desktop-windows": 35,
     "nyx-desktop-macos": 15,
 }
 # A cancelled run is not evidence for the commit it ran on, so the workflow
@@ -1889,7 +1889,7 @@ def test_every_job_declares_its_measured_time_limit() -> None:
         "nyx": 30,
         "nyx-windows": 30,
         "nyx-macos": 30,
-        "nyx-desktop-windows": 30,
+        "nyx-desktop-windows": 35,
         "nyx-desktop-macos": 15,
     }
 
@@ -1906,7 +1906,7 @@ def test_every_job_declares_its_measured_time_limit() -> None:
         ),
         (
             _mutate_change_desktop_windows_time_limit_within_range,
-            ["nyx-desktop-windows: timeout-minutes is 40, expected 30"],
+            ["nyx-desktop-windows: timeout-minutes is 40, expected 35"],
         ),
         (_mutate_add_job_without_time_limit, ["nyx-extra: job does not declare timeout-minutes"]),
     ],
@@ -1962,7 +1962,7 @@ def test_documented_build_bound_is_below_each_desktop_job_cap() -> None:
     [
         (
             {"powershell": 45, "bash": 10},
-            ["powershell: build bound 45 min is not below the nyx-desktop-windows cap of 30 min"],
+            ["powershell: build bound 45 min is not below the nyx-desktop-windows cap of 35 min"],
         ),
         (
             {"powershell": 20, "bash": 15},

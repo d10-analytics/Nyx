@@ -150,7 +150,7 @@ jobs:
 
   nyx-desktop-windows:
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
