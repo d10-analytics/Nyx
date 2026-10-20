@@ -99,7 +99,23 @@ path-substitution containment. Case is preserved literally; case-distinct
 siblings exist only where the host filesystem supports them, and Nyx does not
 normalize or alias their names.
 
-Generate fresh IDs with `python3 -c 'import uuid; print(uuid.uuid4())'`. Use each
+Bold names are documented for reported-text fields only. The core field labels
+in the table above are written plain, exactly as shown.
+
+Every UUID field (`Package ID`, `Program ID`, `Program Membership`,
+`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a
+lowercase version 4 UUID only; an uppercase or otherwise invalid value is not
+accepted. The effect depends on the field. An invalid `Package ID` makes the item
+lose its identity, so its dependents show **unresolved target** and **Workspace
+issues** lists nothing. An invalid `Prerequisite` or `Completion Prerequisite`
+shows **unresolved target**. An invalid `Program Membership` or `Superseded By`
+leaves the item's identity intact and leaves only that relationship unresolved.
+An invalid `Program ID` makes its program descriptor invalid, as described under
+Programs, without affecting any item's identity.
+
+Generate fresh lowercase IDs with `python3 -c 'import uuid; print(uuid.uuid4())'`
+on Linux, `uuidgen | tr '[:upper:]' '[:lower:]'` on macOS (`uuidgen` prints
+uppercase), or `[guid]::NewGuid().ToString()` in Windows PowerShell. Use each
 `Package ID` once in a workspace and retain it when moving the work item. Repeat
 `Claim` and `Prerequisite` rows for distinct outcomes and requirements; do not
 repeat scalar fields such as `Package ID` or `Program Membership`.
@@ -159,8 +175,8 @@ does not satisfy its claims automatically.
 The completion policy is configured in the collapsed **Board settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
 canonical workspace root and can include temporarily absent names.
-Without a configured policy, a completion dependency is **unknown** with an
-actionable configuration explanation. Row order, stage spelling,
+Without a configured policy, a completion dependency is **unknown**; the board
+shows no prompt or explanation. Row order, stage spelling,
 `Cancelled`, and `Archive` do not infer completion. A completed stage is a
 recorded workflow assertion rather than evidence verification.
 
@@ -194,7 +210,16 @@ Program Membership: 99999999-9999-4999-8999-999999999999
 
 Use a fresh UUID for your own program and match it in the directory name,
 descriptor, and membership fields. Membership comes from the work items; a separate
-member list is not needed. A whole `program.md` descriptor obeys the same
+member list is not needed.
+
+A `program.md` descriptor holds exactly one `Program ID` line and one `Program
+Title` line and no other non-empty content. The ID must equal the program
+directory name, and the title must be 1–120 characters. One invalid descriptor
+inside a canonical UUID program directory makes every program membership in the
+workspace **unknown**, so program-title search finds nothing, while **Workspace
+issues** names that descriptor. A program directory whose name is not a lowercase
+version 4 UUID is skipped without a diagnostic, and its memberships stay
+**unknown**. A whole `program.md` descriptor obeys the same
 65,536-byte limit as a `spec.md` header, counted from the first byte of the
 file, and a larger descriptor is reported as an invalid package. The browser
 includes the resolved program title in search. Board columns remain projects.
@@ -204,10 +229,17 @@ includes the resolved program title in search. Board columns remain projects.
 **Workspace issues** lists unreadable directories, unreadable or invalid
 `spec.md` files, and invalid or duplicate program descriptors. A prerequisite
 that cannot be resolved to exactly one work item shows on the dependent card as
-**unresolved target**. Duplicate or malformed Package IDs and invalid claims or
-fields are otherwise not listed; inspect the affected specification headers
-rather than inferring completion from an incomplete view. Uncheck **Hide terminal
-rows** to show providers in finished rows and their connections to dependent cards.
+**unresolved target**. When one appears, check **Workspace issues** first for an
+unreadable directory or specification file that made identity coverage
+incomplete; if it is empty, check that the prerequisite UUID and the target's
+`Package ID` are lowercase version 4 and unique, because an invalid or duplicate
+ID produces no Workspace-issues entry, then inspect the affected specification
+headers rather than inferring completion from an incomplete view. Nyx keeps its
+conservative all-or-nothing resolution: while identity coverage is incomplete,
+every resolved relationship shows **unresolved target**. Descriptor problems
+affect programs only and do not make identity coverage incomplete. Uncheck **Hide
+terminal rows** to show providers in finished rows and their connections to
+dependent cards.
 
 Discovery diagnostics also distinguish a safely identified but incomplete
 project or stage from a confirmed empty one. Inspect the affected directory and
