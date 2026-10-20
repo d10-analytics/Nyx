@@ -267,7 +267,14 @@ folders uses schema 4:
   value, copied exactly. On Linux `nyx --status` prints the same path after
   `Workspace:`; desktop hosts refuse `--status`, so copy the value from the
   record itself.
-- Each entry in `folders` must be an absolute path, and the list must be sorted.
+- Each entry in `folders` must be an absolute path, and the list must be sorted
+  by character code, with no duplicates and at least one entry. Write each path
+  already normalized in the host's own separators, with no trailing separator
+  and no `.` or `..` parts: `/home/me/code`, not `/home/me/code/`, and on
+  Windows `C:\\Users\\me\\code`, not `C:/Users/me/code`. Character-code order
+  puts capital letters before lowercase ones and `-` before `/`. To stop
+  listing checkouts for a workspace, remove its entry rather than leaving an
+  empty list.
 - On Windows, write each backslash as `\\` in JSON, for example
   `"C:\\Users\\me\\code"`.
 - Stop Nyx first (`nyx --stop` on Linux, or quit the desktop application),
