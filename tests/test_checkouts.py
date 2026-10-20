@@ -2813,3 +2813,66 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     push_commit(remote, "trunk", tmp_path)
     advanced = live([folder])
     assert advanced["checkouts_digest"] != first["checkouts_digest"]
+
+
+def git_stand_in(tmp_path: Path, body: str) -> Path:
+    """A ``git`` stand-in on PATH that runs ``body`` before the real git."""
+    real_git = shutil.which("git")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    script = shim / "git"
+    script.write_text(f'#!/bin/sh\n{body}\nexec "{real_git}" "$@"\n')
+    script.chmod(0o755)
+    return shim
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+def test_sibling_probe_that_fails_gives_differs_not_unknown(tmp_path, monkeypatch):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    shim = git_stand_in(
+        tmp_path,
+        f'case "$*" in *"-C {real(holder)} rev-list --no-walk"*) exit 1;; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+
+    assert comparison == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
+def test_a_holder_of_another_remote_never_lends(tmp_path):
+    folder, _remote, lagging, (holder,), head = borrowed_world(tmp_path)
+    other = make_remote(tmp_path / "served", "other.git")
+    git(holder, "remote", "set-url", "origin", str(other))
+    assert git(holder, "cat-file", "-e", head, check=False).returncode == 0
+
+    document = live([folder])
+
+    assert group_of(document, holder) is not group_of(document, lagging)
+    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the logging git stand-in is a shell script")
+def test_no_sibling_is_probed_when_the_clone_holds_the_head(tmp_path, monkeypatch):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    git(holder, "fetch", "-q", "origin")
+    git(lagging, "fetch", "-q", "origin")
+    log = tmp_path / "calls.log"
+    shim = git_stand_in(tmp_path, f'printf "%s\\n" "$*" >> "{log}"')
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+
+    assert comparison == {
+        "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
+        "objects_from": None,
+    }
+    calls = log.read_text().splitlines()
+    assert any(f"-C {real(lagging)} rev-list --no-walk" in call for call in calls)
+    assert not any(f"-C {real(holder)} rev-list --no-walk" in call for call in calls)
