@@ -568,11 +568,38 @@ def test_worktree_of_a_moved_clone_stays_listed_as_failed(tmp_path):
     ) == 1
 
 
+def replace_git_marker(worktree: Path, content: str) -> None:
+    """Make ``<worktree>/.git`` a plain file holding ``content``.
+
+    Some hosts leave the marker read-only or otherwise not directly writable
+    after ``git worktree add``, so remove it first instead of writing over it.
+    """
+    marker = worktree / ".git"
+    try:
+        if marker.is_dir() and not marker.is_symlink():
+            shutil.rmtree(marker)
+        elif marker.exists() or marker.is_symlink():
+            try:
+                os.chmod(marker, stat.S_IWRITE)
+            except OSError:
+                pass
+            marker.unlink()
+        marker.write_text(content)
+    except OSError as error:
+        try:
+            state = os.stat(marker)
+        except OSError as stat_error:
+            state = f"unavailable ({stat_error})"
+        raise AssertionError(
+            f"cannot replace {marker}: {error!r}; is_dir={marker.is_dir()}; stat={state}"
+        ) from error
+
+
 @pytest.mark.parametrize("content", ["garbage\n", "gitdir:\n", "gitdir:   \n"])
 def test_worktree_with_a_malformed_git_file_stays_listed_as_failed(repo, tmp_path, content):
     linked = tmp_path / "broken-wt"
     git(repo, "worktree", "add", "-q", str(linked), "-b", "broken")
-    (linked / ".git").write_text(content)
+    replace_git_marker(linked, content)
 
     item = state_of(repo)
 
