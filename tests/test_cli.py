@@ -627,18 +627,23 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
 # nyx checkouts
 # ---------------------------------------------------------------------------
 
+import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
     GLOBAL_CONFIG,
     allow_filters,
     clone,
+    closed_port,
     commit_file,
     git,
     make_remote,
     real,
     trust_only,
+    web_clone,
 )
 
 from nyx import checkouts, models  # noqa: E402
+
+recorders = test_checkouts.recorders
 
 NO_FOLDERS = "no checkout folders are configured"
 UNAVAILABLE = "nyx: Nyx configuration is unavailable\n"
@@ -694,8 +699,8 @@ def _run_checkouts(capsys, *arguments: str) -> tuple[int, str, str]:
     return code, captured.out, captured.err
 
 
-def _plain_lines(capsys) -> list[str]:
-    code, out, err = _run_checkouts(capsys)
+def _plain_lines(capsys, *arguments: str) -> list[str]:
+    code, out, err = _run_checkouts(capsys, *arguments)
     assert (code, err) == (0, "")
     return out.splitlines()
 
@@ -882,6 +887,10 @@ def test_missing_git_exits_zero_in_both_modes(tmp_path, account, monkeypatch, ca
         ["--setup", "/some/root", "checkouts"],
         ["checkouts", "--setup", "/some/root"],
         ["--json"],
+        ["--no-network"],
+        ["--json", "--no-network"],
+        ["--setup", "/some/root", "--no-network"],
+        ["checkouts", "--status", "--no-network"],
         ["checkouts", "extra"],
     ],
 )
@@ -935,13 +944,14 @@ def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account
     (repository / "new-b.txt").write_text("b\n")
     _configure(tmp_path, [folder])
 
-    line = _line_for(_plain_lines(capsys), repository)
+    line = _line_for(_plain_lines(capsys, "--no-network"), repository)
 
     elements = line.split("  ")[1:]
     assert elements[0] == "branch feature"
     assert elements[1] == "staged 1 unstaged 1 untracked 2 conflicted 0"
-    assert elements[2] == "local-only 1"
-    assert elements[3] == "default trunk ahead never fetched"
+    assert elements[2] == "remote off"
+    assert elements[3] == "branches cached local-only 1"
+    assert elements[4] == "default trunk cached ahead never fetched"
     assert not any(element.startswith("operations") for element in elements)
 
 
@@ -955,11 +965,13 @@ def test_cached_default_shows_the_fetch_time_once_the_clone_has_fetched(
     git(repository, "fetch", "-q", "origin")
     _configure(tmp_path, [folder])
 
-    element = _line_for(_plain_lines(capsys), repository).split("  ")[-1]
+    line = _line_for(_plain_lines(capsys, "--no-network"), repository)
 
     assert re.fullmatch(
-        r"default trunk equal cached [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z", element
+        r"default trunk cached equal fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
+        line.split("  ")[-1],
     )
+    assert re.search(r"cached [0-9]{4}-", line) is None
 
 
 def test_conflicted_merge_prints_its_operation_and_conflicted_count(
@@ -1054,11 +1066,12 @@ def test_tree_filtered_clone_prints_main_failed_and_keeps_remote_and_default(
     repository = clone(remote.as_uri(), folder / "trees", "--filter=tree:0", "--no-checkout")
     _configure(tmp_path, [folder])
 
-    elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
+    elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
     assert elements[0] == "main failed"
-    assert elements[1] == "local-only 0"
-    assert elements[2].startswith("default trunk ")
+    assert elements[1] == "remote off"
+    assert elements[2] == "branches cached local-only 0"
+    assert elements[3].startswith("default trunk cached ")
     assert not any(element.startswith(("branch ", "staged ")) for element in elements)
 
 
@@ -1083,7 +1096,7 @@ def test_clone_without_origin_prints_no_origin_remote_and_no_remote_counts(
     assert "default" not in line
 
 
-def test_clone_of_an_empty_remote_prints_local_only_and_no_cached_default(
+def test_clone_of_an_empty_remote_under_no_network_prints_no_cached_default(
     tmp_path, account, capsys
 ):
     empty = tmp_path / "empty.git"
@@ -1094,9 +1107,9 @@ def test_clone_of_an_empty_remote_prints_local_only_and_no_cached_default(
     commit_file(repository, "file.txt", "one\n")
     _configure(tmp_path, [folder])
 
-    elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
+    elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
-    assert elements[-2:] == ["local-only 1", "no cached default"]
+    assert elements[-3:] == ["remote off", "branches cached local-only 1", "no cached default"]
 
 
 def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
@@ -1115,8 +1128,9 @@ def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
 
     elements = _line_for(lines, repository).split("  ")[1:]
     assert elements[0] == "main timed_out"
-    assert elements[1] == "local-only 0 unknown 1"
-    assert elements[2].startswith("default trunk equal ")
+    assert elements[1] == "remote off"
+    assert elements[2] == "branches cached local-only 0 unknown 1"
+    assert elements[3].startswith("default trunk cached equal ")
 
 
 def make_slow_clone_in_place(repository: Path) -> None:
@@ -1129,7 +1143,9 @@ def make_slow_clone_in_place(repository: Path) -> None:
     os.utime(repository / "slow.txt", ns=(later, later))
 
 
-@pytest.mark.parametrize("arguments", [(), ("--json",)])
+@pytest.mark.parametrize(
+    "arguments", [(), ("--json",), ("--no-network",), ("--json", "--no-network")]
+)
 def test_origin_credentials_never_reach_either_output(tmp_path, account, capsys, arguments):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
@@ -1150,3 +1166,325 @@ def test_origin_credentials_never_reach_either_output(tmp_path, account, capsys,
     assert cli._json_literal(real(repository)) in out
     assert "s3cr3tpass" not in out
     assert "someuser" not in out
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts: networked default, --no-network and the plain-output grammar
+# ---------------------------------------------------------------------------
+
+REMOTE_ELEMENT = re.compile(
+    r"remote (?P<state>live|off|failed (?P<reason>unreachable|not_found|"
+    r"authentication_failed|timed_out|failed))"
+)
+BRANCHES_ELEMENT = re.compile(
+    r"branches (?P<basis>live|cached) local-only (?P<local_only>[0-9]+)"
+    r"(?: unknown (?P<unknown>[0-9]+))?"
+)
+FRESHNESS = r"(?:never fetched|fetched (?P<fetched>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z))"
+LIVE_DEFAULT = re.compile(
+    r"default (?P<name>\S+) live (?P<live>[a-z]+) cached (?P<cached>[a-z]+) "
+    r"tracking live (?P<tracking>[a-z]+) " + FRESHNESS
+)
+CACHED_DEFAULT = re.compile(
+    r"default (?P<name>\S+) cached (?P<cached>[a-z]+) " + FRESHNESS
+)
+NO_DEFAULT = re.compile(r"no (?P<basis>live|cached) default")
+
+
+def _module_run(account: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "nyx.cli", *arguments],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(account),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _relation(comparison: dict | None) -> str:
+    return "unknown" if comparison is None else comparison["relation"]
+
+
+def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
+    """Parse the three trailing elements and compare each captured field to the document."""
+
+    remote, branches, default = line.split("  ")[-3:]
+    check = group["remote"]["check"]
+    parsed = REMOTE_ELEMENT.fullmatch(remote)
+    assert parsed, remote
+    assert parsed["state"].split()[0] == {"live": "live", "off": "off", "failed": "failed"}[
+        check["status"]
+    ]
+    assert parsed["reason"] == (check["reason"] if check["status"] == "failed" else None)
+
+    basis = "live" if check["status"] == "live" else "cached"
+    counted = BRANCHES_ELEMENT.fullmatch(branches)
+    assert counted, branches
+    relations = [_relation(branch["vs_remote"]) for branch in item["branches"]]
+    assert counted["basis"] == basis
+    assert int(counted["local_only"]) == relations.count("absent")
+    assert counted["unknown"] == (
+        str(relations.count("unknown")) if "unknown" in relations else None
+    )
+    assert {b["vs_remote"]["basis"] for b in item["branches"]} <= {basis}
+
+    local = item["local_default"]
+    fetched = item["cached_default"]["last_fetched_at"]
+    if local is None:
+        found = NO_DEFAULT.fullmatch(default)
+        assert found and found["basis"] == basis
+        return {"default": None}
+    if basis == "live":
+        found = LIVE_DEFAULT.fullmatch(default)
+        assert found, default
+        assert found["live"] == _relation(local["vs_live"])
+        assert found["tracking"] == _relation(item["cached_vs_live"])
+    else:
+        found = CACHED_DEFAULT.fullmatch(default)
+        assert found, default
+    assert found["name"] == local["name"]
+    assert found["cached"] == _relation(local["vs_cached"])
+    assert found["fetched"] == fetched
+    return {"default": default}
+
+
+def _origin_lines(lines: list[str], document: dict) -> dict[str, tuple[str, dict, dict]]:
+    found = {}
+    for group in document["repositories"]:
+        if group["remote"] is None:
+            continue
+        for item in group["clones"]:
+            if item["status"] == "ok":
+                found[item["path"]] = (_line_for(lines, item["path"]), group, item)
+    return found
+
+
+@pytest.fixture
+def grammar_scenario(tmp_path, account, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+
+    alpha = make_remote(served, "alpha.git")
+    fetched = web_clone(recorder, "alpha", alpha, folder / "a-fetched", "a-fetched")
+    git(fetched, "fetch", "-q", "origin")
+    never = web_clone(recorder, "alpha", alpha, folder / "b-never", "b-never")
+    git(never, "checkout", "-q", "-b", "feature")
+    bare_branches = web_clone(recorder, "alpha", alpha, folder / "c-no-branches", "c-none")
+    git(bare_branches, "checkout", "-q", "--detach")
+    git(bare_branches, "update-ref", "-d", "refs/heads/trunk")
+    git(bare_branches, "update-ref", "-d", "refs/heads/feature", check=False)
+
+    detached_remote = make_remote(served, "detached.git")
+    detached = web_clone(recorder, "detached", detached_remote, folder / "d-detached", "d")
+    sha = git(detached_remote, "rev-parse", "trunk").stdout.strip()
+    git(detached_remote, "update-ref", "--no-deref", "HEAD", sha)
+
+    refused = clone(make_remote(served, "refused.git"), folder / "e-refused")
+    git(
+        refused,
+        "remote",
+        "set-url",
+        "origin",
+        f"http://someuser:s3cr3tpass@127.0.0.1:{closed_port()}/refused.git",
+    )
+
+    empty_remote = served / "empty.git"
+    git(served, "init", "-q", "--bare", str(empty_remote))
+    empty = clone(empty_remote, folder / "f-empty")
+
+    _configure(tmp_path, [folder])
+    return {
+        "recorder": recorder,
+        "paths": {
+            "fetched": fetched,
+            "never": never,
+            "no_branches": bare_branches,
+            "detached": detached,
+            "refused": refused,
+            "empty": empty,
+        },
+    }
+
+
+def _both_outputs(account: Path, *flags: str) -> tuple[list[str], dict, str]:
+    plain = _module_run(account, "checkouts", *flags)
+    document_run = _module_run(account, "checkouts", "--json", *flags)
+    assert (plain.returncode, plain.stderr) == (0, "")
+    assert (document_run.returncode, document_run.stderr) == (0, "")
+    return (
+        plain.stdout.splitlines(),
+        models.parse_checkouts(document_run.stdout),
+        plain.stdout + document_run.stdout,
+    )
+
+
+def test_live_plain_lines_follow_the_grammar_and_agree_with_the_document(
+    grammar_scenario, account
+):
+    paths = grammar_scenario["paths"]
+    lines, document, text = _both_outputs(account)
+
+    assert document["remote_checks"] == "on"
+    by_path = _origin_lines(lines, document)
+    parsed = {
+        name: _assert_line_matches_document(*by_path[real(path)])
+        for name, path in paths.items()
+    }
+
+    def tail(name: str) -> list[str]:
+        return by_path[real(paths[name])][0].split("  ")[-3:]
+
+    assert tail("fetched")[:2] == ["remote live", "branches live local-only 0"]
+    assert re.fullmatch(
+        r"default trunk live equal cached equal tracking live equal fetched "
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
+        tail("fetched")[2],
+    )
+    assert tail("never")[:2] == ["remote live", "branches live local-only 1"]
+    assert tail("never")[2].endswith(" never fetched")
+    assert tail("no_branches")[:2] == ["remote live", "branches live local-only 0"]
+    assert tail("detached") == ["remote live", "branches live local-only 0", "no live default"]
+    assert tail("refused") == [
+        "remote failed unreachable",
+        "branches cached local-only 0",
+        tail("refused")[2],
+    ]
+    assert CACHED_DEFAULT.fullmatch(tail("refused")[2])
+    assert tail("empty") == ["remote live", "branches live local-only 0", "no live default"]
+    assert parsed["detached"] == {"default": None}
+    assert re.search(r"cached [0-9]{4}-", text) is None
+    assert "s3cr3tpass" not in text and "someuser" not in text
+    assert "http://" not in text
+    assert "127.0.0.1" not in "\n".join(lines)
+
+
+def test_no_network_plain_lines_follow_the_cached_grammar(grammar_scenario, account):
+    paths = grammar_scenario["paths"]
+    recorder = grammar_scenario["recorder"]
+    before = len(recorder.discoveries())
+    lines, document, text = _both_outputs(account, "--no-network")
+
+    assert len(recorder.discoveries()) == before
+    assert document["remote_checks"] == "off"
+    by_path = _origin_lines(lines, document)
+    for path in paths.values():
+        line, group, item = by_path[real(path)]
+        assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
+        _assert_line_matches_document(line, group, item)
+        remote, branches, default = line.split("  ")[-3:]
+        assert remote == "remote off"
+        assert branches.startswith("branches cached local-only ")
+        assert default.startswith(("default ", "no cached default"))
+        assert " live " not in default
+    assert by_path[real(paths["empty"])][0].split("  ")[-1] == "no cached default"
+    assert by_path[real(paths["never"])][0].endswith(" never fetched")
+    assert re.search(r"cached [0-9]{4}-", text) is None
+    assert "s3cr3tpass" not in text and "someuser" not in text
+
+
+def test_a_failed_group_line_matches_a_document_that_fell_back_to_cached(
+    grammar_scenario, account
+):
+    lines, document, _ = _both_outputs(account)
+    group = next(
+        g
+        for g in document["repositories"]
+        if g["remote"] is not None and g["remote"]["check"]["status"] == "failed"
+    )
+    [item] = group["clones"]
+    assert group["remote"]["check"] == {"status": "failed", "reason": "unreachable"}
+    assert {b["vs_remote"]["basis"] for b in item["branches"]} == {"cached"}
+    assert "remote failed unreachable" in _line_for(lines, item["path"]).split("  ")
+
+
+def _single_clone(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    web_clone(recorder, "solo", make_remote(served, "solo.git"), folder / "solo", "solo")
+    _configure(tmp_path, [folder])
+    return recorder
+
+
+def test_no_network_makes_no_request_and_the_default_makes_exactly_one(
+    tmp_path, account, recorders
+):
+    recorder = _single_clone(tmp_path, recorders)
+
+    off = _module_run(account, "checkouts", "--no-network", "--json")
+    assert (off.returncode, off.stderr) == (0, "")
+    assert recorder.requests == []
+    document = models.parse_checkouts(off.stdout)
+    assert document["remote_checks"] == "off"
+    [group] = document["repositories"]
+    assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
+    assert {c["basis"] for item in group["clones"] for c in _every_comparison(item)} == {
+        "cached"
+    }
+
+    on = _module_run(account, "checkouts", "--json")
+    assert (on.returncode, on.stderr) == (0, "")
+    assert len(recorder.discoveries()) == 1
+    live = models.parse_checkouts(on.stdout)
+    assert live["remote_checks"] == "on"
+    assert live["repositories"][0]["remote"]["check"] == {"status": "live", "reason": None}
+
+
+def _every_comparison(item: dict) -> list[dict]:
+    found = [branch["vs_remote"] for branch in item["branches"]]
+    found.append(item["cached_vs_live"])
+    if item["local_default"] is not None:
+        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+    return [comparison for comparison in found if comparison is not None]
+
+
+def test_help_lists_no_network_and_no_longer_claims_cached_only_output():
+    completed = subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "checkouts", "--help"],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0
+    flattened = " ".join(completed.stdout.split())
+    assert "--no-network" in flattened
+    assert "skip every remote check" in flattened
+    assert "prints the cached facts" not in flattened
+
+
+def test_no_network_without_checkouts_is_a_usage_error(account):
+    for arguments in (["--no-network"], ["--no-network", "--json"]):
+        completed = _module_run(account, *arguments)
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr.startswith("usage: nyx ")
+    assert not (account / ".nyx").exists()
+
+
+@pytest.mark.parametrize("flags", [(), ("--no-network",)])
+def test_exit_codes_do_not_depend_on_the_switch(tmp_path, account, monkeypatch, capsys, flags):
+    code, out, err = _run_checkouts(capsys, *flags)
+    assert (code, err) == (0, "") and NO_FOLDERS in out
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    record = _configure(tmp_path, [folder])
+    empty = tmp_path / "no-git"
+    empty.mkdir()
+    with monkeypatch.context() as scoped:
+        scoped.setenv("PATH", str(empty))
+        code, out, err = _run_checkouts(capsys, "--json", *flags)
+    assert (code, err) == (0, "")
+    assert models.parse_checkouts(out)["git"]["status"] == "missing"
+
+    record.write_bytes(b"{ not json")
+    assert _run_checkouts(capsys, "--json", *flags) == (1, "", UNAVAILABLE)
