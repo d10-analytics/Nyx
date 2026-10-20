@@ -853,7 +853,7 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
     assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 7001
     _configure(tmp_path, [folder])
 
-    for arguments in ((), ("--json",)):
+    for arguments in ((), ("--json",), ("--no-network",), ("--json", "--no-network")):
         code, out, err = _run_checkouts(capsys, *arguments)
         assert code == 1
         assert out == ""
