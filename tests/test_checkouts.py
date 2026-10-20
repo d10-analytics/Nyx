@@ -11,12 +11,16 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1887,3 +1891,716 @@ def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tm
         branch["vs_remote"] is None and branch["upstream_mismatch"] is False
         for branch in kept["branches"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Remote checks: an in-test loopback smart-HTTP server and live comparisons
+# ---------------------------------------------------------------------------
+
+ADVERTISEMENT = "application/x-git-upload-pack-advertisement"
+STDERR_PHRASES = (
+    "does not appear to be a git repository",
+    "Failed to connect",
+    "Couldn't connect",
+    "protocol error",
+    "bad line length",
+    "not allowed",
+    "terminal prompts",
+    "Permission denied",
+    "fatal",
+)
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *arguments):
+        pass
+
+    def do_GET(self):
+        recorder = self.server.recorder
+        parts = urlsplit(self.path)
+        with recorder.lock:
+            recorder.requests.append((parts.path, parts.query, self.headers.get("X-Clone")))
+            recorder.in_flight += 1
+            recorder.max_in_flight = max(recorder.max_in_flight, recorder.in_flight)
+        try:
+            self._answer(recorder, parts)
+        finally:
+            with recorder.lock:
+                recorder.in_flight -= 1
+
+    def _send(self, status, body=b"", content_type=None, headers=()):
+        self.send_response(status)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _answer(self, recorder, parts):
+        base = parts.path.removesuffix("/info/refs")
+        bare = recorder.remotes.get(base)
+        if bare is None or not parts.path.endswith("/info/refs"):
+            self._send(404)
+            return
+        behavior = recorder.behaviors.get(base, "serve")
+        if behavior == "block":
+            recorder.release.wait(120)
+            return
+        if behavior == "401":
+            self._send(401, headers=[("WWW-Authenticate", 'Basic realm="nyx"')])
+            return
+        if behavior == "junk":
+            self._send(200, b"this is not a git advertisement\n", ADVERTISEMENT)
+            return
+        if isinstance(behavior, tuple) and behavior[0] == "delay":
+            recorder.release.wait(behavior[1])
+        elif isinstance(behavior, tuple) and behavior[0] == "hook":
+            behavior[1]()
+        advertised = subprocess.run(
+            ["git", "upload-pack", "--stateless-rpc", "--advertise-refs", str(bare)],
+            capture_output=True,
+            check=True,
+        ).stdout
+        self._send(200, b"001e# service=git-upload-pack\n0000" + advertised, ADVERTISEMENT)
+
+
+class _QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+class Recorder:
+    """Serve real upload-pack advertisements for bare remotes and log each request."""
+
+    def __init__(self) -> None:
+        self.remotes: dict[str, Path] = {}
+        self.behaviors: dict[str, Any] = {}
+        self.requests: list[tuple[str, str, str | None]] = []
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.release = threading.Event()
+        self.server = _QuietServer(("127.0.0.1", 0), _Handler)
+        self.server.recorder = self
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def add(self, name: str, bare: Path, behavior: Any = "serve") -> str:
+        self.remotes[f"/{name}.git"] = bare
+        self.behaviors[f"/{name}.git"] = behavior
+        return self.url(name)
+
+    def url(self, name: str) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/{name}.git"
+
+    def discoveries(self, name: str | None = None) -> list[tuple[str, str, str | None]]:
+        return [
+            item
+            for item in self.requests
+            if item[0].endswith("/info/refs")
+            and "service=git-upload-pack" in item[1]
+            and (name is None or item[0] == f"/{name}.git/info/refs")
+        ]
+
+    def stop(self) -> None:
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def recorders(monkeypatch):
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    made: list[Recorder] = []
+
+    def make() -> Recorder:
+        made.append(Recorder())
+        return made[-1]
+
+    yield make
+    for recorder in made:
+        recorder.stop()
+
+
+def web_clone(recorder: Recorder, name: str, bare: Path, destination: Path, label: str,
+              *options: str) -> Path:
+    """Clone ``bare`` and point ``origin`` at its recorder path, naming the clone in a header."""
+    if f"/{name}.git" not in recorder.remotes:
+        recorder.add(name, bare)
+    source = bare.as_uri() if options else bare
+    clone(source, destination, *options)
+    git(destination, "remote", "set-url", "origin", recorder.url(name))
+    git(destination, "config", "http.extraHeader", f"X-Clone: {label}")
+    return destination
+
+
+def collect_text(folders: list[Path | str], *, seconds: float = 60.0, **options: Any):
+    started = time.monotonic()
+    text = checkouts.collect_checkouts(
+        [str(folder) for folder in folders],
+        deadline_ns=time.monotonic_ns() + int(seconds * 1e9),
+        **options,
+    )
+    return text, models.parse_checkouts(text), time.monotonic() - started
+
+
+def live(folders: list[Path | str], **options: Any) -> dict[str, Any]:
+    return collect_text(folders, remote_checks=True, **options)[1]
+
+
+def group_of(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
+    wanted = real(path)
+    for group in document["repositories"]:
+        if any(item["path"] == wanted for item in group["clones"]):
+            return group
+    raise AssertionError(f"no group holds {wanted}")
+
+
+def comparisons_of(item: dict[str, Any]) -> list[dict[str, Any]]:
+    found = [branch["vs_remote"] for branch in item["branches"]]
+    found.append(item["cached_vs_live"])
+    if item["local_default"] is not None:
+        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+    return [comparison for comparison in found if comparison is not None]
+
+
+def assert_fell_back_to_cached(group: dict[str, Any], reason: str) -> None:
+    assert group["remote"]["check"] == {"status": "failed", "reason": reason}
+    assert group["default_branch"]["live_sha"] is None
+    for item in group["clones"]:
+        if item["status"] != "ok":
+            continue
+        assert item["cached_vs_live"] is None
+        if item["local_default"] is not None:
+            assert item["local_default"]["vs_live"] is None
+        assert {c["basis"] for c in comparisons_of(item)} <= {"cached"}
+
+
+def push_by_url(repository: Path, remote: Path, branch: str) -> None:
+    git(repository, "push", "-q", remote.as_uri(), branch)
+
+
+def pushed_then_reset(repository: Path, remote: Path, branch: str = "trunk") -> str:
+    """Commit, push by URL and reset back, so origin/<branch> stays one commit behind."""
+    pushed = commit_file(repository, f"{branch}-pushed.txt", "pushed\n")
+    push_by_url(repository, remote, branch)
+    git(repository, "reset", "-q", "--hard", "HEAD~1")
+    return pushed
+
+
+def remove_tree(path: Path) -> None:
+    def retry(function, target, _error):
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+
+    shutil.rmtree(path, onerror=retry)
+
+
+def fingerprint(repository: Path) -> dict[str, Any]:
+    state = repository_fingerprint(repository)
+    state["fetch_head"] = (repository / ".git" / "FETCH_HEAD").exists()
+    return state
+
+
+def pack_listing(repository: Path) -> list[tuple[str, bytes]]:
+    directory = repository / ".git" / "objects" / "pack"
+    return sorted((item.name, item.read_bytes()) for item in directory.iterdir())
+
+
+def closed_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_one_discovery_per_remote_in_natural_order_and_off_makes_none(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    one = make_remote(served, "one.git", "trunk")
+    two = make_remote(served, "two.git", "main")
+    three = make_remote(served, "three.git", "main")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for label in ("Repo Clone 10", "Repo Clone 2", "Repo Clone 3"):
+        web_clone(recorder, "one", one, folder / label, label)
+    web_clone(recorder, "two", two, folder / "Other Clone", "Other Clone")
+    broken = web_clone(recorder, "three", three, folder / "Broken Clone", "Broken Clone")
+    name = "/".join("x" * 203 for _ in range(5))
+    tip = commit_file(broken, "long.txt", "long\n")
+    git(broken, "reset", "-q", "--hard", "HEAD~1")
+    add_packed_refs(broken, {f"refs/heads/{name}": tip, f"refs/remotes/origin/{name}": tip})
+    git(broken, "config", f"branch.{name}.remote", "origin")
+    git(broken, "config", f"branch.{name}.merge", f"refs/heads/{name}")
+
+    off = collect([folder])
+    assert recorder.requests == []
+    assert_cached_everywhere(off)
+
+    document = live([folder])
+
+    assert document["remote_checks"] == "on"
+    assert [item[0] for item in recorder.discoveries()].count("/three.git/info/refs") == 0
+    assert sorted(item[0] for item in recorder.discoveries()) == [
+        "/one.git/info/refs", "/two.git/info/refs"
+    ]
+    assert recorder.discoveries("one")[0][2] == "Repo Clone 2"
+    assert group_of(document, folder / "Repo Clone 2")["remote"]["check"] == {
+        "status": "live", "reason": None
+    }
+    assert group_of(document, folder / "Repo Clone 2")["default_branch"]["name"] == "trunk"
+    assert group_of(document, folder / "Other Clone")["remote"]["check"]["status"] == "live"
+    assert find_clone(document, broken)["status"] == "failed"
+    assert group_of(document, broken)["remote"]["check"] == {
+        "status": "failed", "reason": "failed"
+    }
+    assert recorder.requests and all(
+        item[0] != "/three.git/info/refs" for item in recorder.requests
+    )
+
+
+def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served, "r.git", "trunk")
+    main = clone(remote, folder / "main")
+    git(main, "checkout", "-q", "-b", "pushed")
+    commit_file(main, "p.txt", "p\n")
+    push_by_url(main, remote, "pushed")
+    git(main, "checkout", "-q", "-b", "private")
+    commit_file(main, "q.txt", "q\n")
+    git(main, "checkout", "-q", "trunk")
+    pushed = pushed_then_reset(main, remote)
+
+    other = make_remote(served, "other.git", "trunk")
+    lagging = clone(other, folder / "lagging")
+    outside = clone(other, tmp_path / "outside")
+    outside_head = commit_file(outside, "o.txt", "o\n")
+    push_by_url(outside, other, "trunk")
+
+    detached = make_remote(served, "detached.git", "trunk")
+    detached_clone = clone(detached, folder / "detached clone")
+    head = git(detached, "rev-parse", "HEAD").stdout.strip()
+    git(detached, "update-ref", "--no-deref", "HEAD", head)
+    empty = served / "empty.git"
+    git(served, "init", "-q", "--bare", "-b", "trunk", str(empty))
+    empty_clone = clone(empty, folder / "empty clone")
+
+    clones = [main, lagging, detached_clone, empty_clone]
+    before = {path: fingerprint(path) for path in clones}
+
+    document = live([folder])
+
+    assert {path: fingerprint(path) for path in clones} == before
+    group = group_of(document, main)
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    assert group["default_branch"] == {"name": "trunk", "live_sha": pushed}
+    item = find_clone(document, main)
+    default = item["local_default"]
+    assert default["name"] == "trunk"
+    assert default["vs_live"] == {
+        "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
+    }
+    assert default["vs_cached"]["basis"] == "cached"
+    assert default["vs_cached"]["relation"] == "equal"
+    assert item["cached_vs_live"]["relation"] == "behind"
+    assert (item["cached_vs_live"]["behind"], item["cached_vs_live"]["basis"]) == (1, "live")
+    assert branch_of(item, "pushed")["vs_remote"]["relation"] == "equal"
+    assert branch_of(item, "pushed")["vs_remote"]["basis"] == "live"
+    assert branch_of(item, "private")["vs_remote"]["relation"] == "absent"
+    assert branch_of(item, "private")["vs_remote"]["basis"] == "live"
+
+    stale = find_clone(document, lagging)["local_default"]["vs_live"]
+    assert group_of(document, lagging)["default_branch"]["live_sha"] == outside_head
+    assert stale == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+    no_name = group_of(document, detached_clone)
+    assert no_name["default_branch"] == {"name": None, "live_sha": head}
+    assert find_clone(document, detached_clone)["local_default"] is None
+    nothing = group_of(document, empty_clone)
+    assert nothing["remote"]["check"] == {"status": "live", "reason": None}
+    assert nothing["default_branch"]["live_sha"] is None
+
+
+def test_failed_remotes_fall_back_to_cached_without_leaking_anything(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    gone = make_remote(served, "gone.git")
+    gone_clone = clone(gone, folder / "gone clone")
+    remove_tree(gone)
+    refused = clone(make_remote(served, "refused.git"), folder / "refused clone")
+    port = closed_port()
+    git(refused, "remote", "set-url", "origin", f"http://u:s3cret@127.0.0.1:{port}/r.git")
+    junk = make_remote(served, "junk.git")
+    recorder.add("junk", junk, "junk")
+    junk_clone = web_clone(recorder, "junk", junk, folder / "junk clone", "junk clone")
+    fine = make_remote(served, "fine.git")
+    fine_clone = web_clone(recorder, "fine", fine, folder / "fine clone", "fine clone")
+
+    text, document, _ = collect_text([folder], remote_checks=True)
+
+    assert_fell_back_to_cached(group_of(document, gone_clone), "not_found")
+    assert_fell_back_to_cached(group_of(document, refused), "unreachable")
+    assert_fell_back_to_cached(group_of(document, junk_clone), "failed")
+    assert group_of(document, fine_clone)["remote"]["check"]["status"] == "live"
+    assert "s3cret" not in text
+    assert f"http://127.0.0.1:{port}" not in text and "r.git" not in text
+    assert not any(phrase in text for phrase in STDERR_PHRASES)
+
+
+def test_inherited_protocol_policy_governs_the_remote_call(tmp_path, recorders, monkeypatch):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    local = clone(make_remote(served, "local.git"), folder / "file clone")
+    web = web_clone(recorder, "web", make_remote(served, "web.git"), folder / "web clone", "web")
+
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "http")
+    inherited = live([folder])
+    assert_fell_back_to_cached(group_of(inherited, local), "failed")
+    assert group_of(inherited, web)["remote"]["check"]["status"] == "live"
+
+    monkeypatch.delenv("GIT_ALLOW_PROTOCOL")
+    assert group_of(live([folder]), local)["remote"]["check"]["status"] == "live"
+
+    git(local, "config", "protocol.file.allow", "never")
+    configured = live([folder])
+    assert_fell_back_to_cached(group_of(configured, local), "failed")
+    assert group_of(configured, web)["remote"]["check"]["status"] == "live"
+
+
+def test_partial_clone_that_fetched_the_live_head_still_differs_without_counts(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    partial = clone(remote.as_uri(), folder / "partial", "--filter=blob:none")
+    pushed = push_commit(remote, "trunk", tmp_path)
+    git(partial, "fetch", "-q", "origin")
+    packs = pack_count(partial)
+
+    document = live([folder])
+
+    item = find_clone(document, partial)
+    assert item["partial_clone"] is True
+    assert group_of(document, partial)["default_branch"]["live_sha"] == pushed
+    assert item["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "differs", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+    assert pack_count(partial) == packs
+
+
+def test_query_runs_in_the_first_partial_clone_and_adds_no_pack(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    partial = web_clone(
+        recorder, "shared", remote, folder / "A Partial", "A Partial", "--filter=blob:none"
+    )
+    pushed = push_commit(remote, "trunk", tmp_path)
+    full = web_clone(recorder, "shared", remote, folder / "B Full", "B Full")
+    packs = pack_listing(partial)
+
+    document = live([folder])
+
+    assert [item[2] for item in recorder.discoveries()] == ["A Partial"]
+    assert pack_listing(partial) == packs
+    group = group_of(document, partial)
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    assert group["default_branch"]["live_sha"] == pushed
+    assert find_clone(document, partial)["local_default"]["vs_live"]["relation"] == "differs"
+    assert find_clone(document, partial)["local_default"]["vs_live"]["ahead"] is None
+    assert find_clone(document, full)["local_default"]["vs_live"]["relation"] == "equal"
+
+
+def test_shallow_clone_never_counts_a_live_comparison(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    shallow = clone(remote.as_uri(), folder / "shallow", "--depth", "1")
+    push_commit(remote, "trunk", tmp_path)
+    git(shallow, "fetch", "-q", "--depth", "1")
+    counted = git(shallow, "rev-list", "--left-right", "--count", "trunk...origin/trunk")
+    assert counted.stdout.split() == ["1", "1"], "control: counting would claim a divergence"
+
+    item = find_clone(live([folder]), shallow)
+
+    assert item["shallow"] is True
+    assert item["local_default"]["vs_live"]["relation"] == "differs"
+    assert {c["relation"] for c in comparisons_of(item) if c["basis"] == "live"} <= {
+        "equal", "differs"
+    }
+
+
+def test_blocked_remote_times_out_while_another_group_stays_live(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    stuck = make_remote(served, "stuck.git")
+    recorder.add("stuck", stuck, "block")
+    stuck_clone = web_clone(recorder, "stuck", stuck, folder / "stuck clone", "stuck")
+    fine = web_clone(recorder, "fine", make_remote(served, "fine.git"), folder / "fine", "fine")
+
+    _, document, elapsed = collect_text(
+        [folder], remote_checks=True, seconds=8.0, call_cap_seconds=2.0
+    )
+
+    assert_fell_back_to_cached(group_of(document, stuck_clone), "timed_out")
+    assert group_of(document, fine)["remote"]["check"]["status"] == "live"
+    assert elapsed < 8.0
+
+
+def test_remote_queries_run_at_most_max_parallel_at_once(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    paths = []
+    for number in range(4):
+        bare = make_remote(served, f"slow{number}.git")
+        recorder.add(f"slow{number}", bare, ("delay", 0.5))
+        paths.append(web_clone(recorder, f"slow{number}", bare, folder / f"c{number}", "c"))
+
+    _, document, _ = collect_text(
+        [folder], remote_checks=True, seconds=8.0, call_cap_seconds=2.0, max_parallel=2
+    )
+
+    assert all(group_of(document, path)["remote"]["check"]["status"] == "live" for path in paths)
+    assert len(recorder.discoveries()) == 4
+    assert recorder.max_in_flight <= 2
+
+
+def test_deadline_cuts_an_unstarted_query_and_the_collection_returns(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    paths = []
+    for number in range(2):
+        bare = make_remote(served, f"stuck{number}.git")
+        recorder.add(f"stuck{number}", bare, "block")
+        paths.append(web_clone(recorder, f"stuck{number}", bare, folder / f"c{number}", "c"))
+
+    _, document, elapsed = collect_text(
+        [folder], remote_checks=True, seconds=8.0, max_parallel=1
+    )
+
+    assert len(recorder.discoveries()) == 1
+    for path in paths:
+        assert_fell_back_to_cached(group_of(document, path), "timed_out")
+    assert elapsed < 10.0
+
+
+def test_blocked_query_keeps_a_later_comparison_from_starting(tmp_path, recorders):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served, "quick.git")
+    lagging = web_clone(recorder, "quick", remote, folder / "lagging", "lagging")
+    pushed = pushed_then_reset(lagging, remote)
+    stuck = make_remote(served, "stuck.git")
+    recorder.add("stuck", stuck, "block")
+    web_clone(recorder, "stuck", stuck, folder / "stuck clone", "stuck")
+
+    _, document, _ = collect_text(
+        [folder], remote_checks=True, seconds=8.0, max_parallel=2
+    )
+
+    group = group_of(document, lagging)
+    assert group["remote"]["check"]["status"] == "live"
+    assert group["default_branch"]["live_sha"] == pushed
+    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+        "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
+        "objects_from": None,
+    }
+
+
+def test_refused_credentials_fail_once_from_the_first_clone_without_prompting(
+    tmp_path, recorders
+):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    bare = make_remote(served, "auth.git")
+    recorder.add("auth", bare, "401")
+    first = web_clone(recorder, "auth", bare, folder / "Auth Clone 10", "Auth Clone 10")
+    second = web_clone(recorder, "auth", bare, folder / "Auth Clone 2", "Auth Clone 2")
+
+    _, document, _ = collect_text([folder], remote_checks=True, call_cap_seconds=2.0)
+
+    assert_fell_back_to_cached(group_of(document, first), "authentication_failed")
+    assert group_of(document, second) is group_of(document, first)
+    assert [item[2] for item in recorder.discoveries()] == ["Auth Clone 2"]
+
+
+@posix_only
+def test_no_askpass_program_runs_for_a_refused_remote(tmp_path, recorders, monkeypatch):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    bare = make_remote(served, "auth.git")
+    recorder.add("auth", bare, "401")
+    repository = web_clone(recorder, "auth", bare, folder / "Auth Clone 2", "Auth Clone 2")
+    markers = {name: tmp_path / f"marker-{name}" for name in ("git", "ssh", "core")}
+    scripts = tmp_path / "scripts"
+    git_script = marker_script(scripts, "git-askpass", markers["git"], "echo secret")
+    ssh_script = marker_script(scripts, "ssh-askpass", markers["ssh"], "echo secret")
+    core_script = marker_script(scripts, "core-askpass", markers["core"], "echo secret")
+    git(repository, "config", "core.askPass", str(core_script))
+    monkeypatch.setenv("GIT_ASKPASS", str(git_script))
+    monkeypatch.setenv("SSH_ASKPASS", str(ssh_script))
+
+    document = live([folder], call_cap_seconds=2.0)
+
+    assert group_of(document, repository)["remote"]["check"]["reason"] == "authentication_failed"
+    assert not any(marker.exists() for marker in markers.values())
+
+
+def test_branch_deleted_during_the_remote_query_is_never_a_counted_comparison(
+    tmp_path, recorders
+):
+    recorder = recorders()
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    bare = make_remote(served, "shared.git")
+    scratch = clone(bare, tmp_path / "scratch")
+    git(scratch, "checkout", "-q", "-b", "feature")
+    commit_file(scratch, "f.txt", "f\n")
+    git(scratch, "push", "-q", "origin", "feature")
+    web_clone(recorder, "shared", bare, folder / "A", "A")
+    other = folder / "B"
+    web_clone(recorder, "shared", bare, other, "B")
+    git(other, "checkout", "-q", "-b", "feature", "origin/feature")
+    commit_file(other, "unpushed.txt", "u\n")
+    git(other, "checkout", "-q", "trunk")
+
+    control = live([folder])
+    assert branch_of(find_clone(control, other), "feature")["vs_remote"] == {
+        "basis": "live", "relation": "ahead", "ahead": 1, "behind": 0, "objects_from": None
+    }
+
+    def delete_and_prune():
+        git(other, "branch", "-q", "-D", "feature")
+        git(other, "reflog", "expire", "--expire=now", "--all")
+        git(other, "prune", "--expire=now")
+
+    recorder.behaviors["/shared.git"] = ("hook", delete_and_prune)
+    changed = live([folder])
+
+    assert git(other, "rev-parse", "--verify", "-q", "refs/heads/feature",
+               check=False).returncode != 0
+
+    def without_feature(document):
+        stripped = json.loads(json.dumps(document))
+        for item in all_clones(stripped):
+            if item["branches"] is not None:
+                item["branches"] = [b for b in item["branches"] if b["name"] != "feature"
+                                    or item["path"] != real(other)]
+        stripped.pop("observed_at")
+        stripped.pop("checkouts_digest")
+        return stripped
+
+    listed = [b for b in find_clone(changed, other)["branches"] if b["name"] == "feature"]
+    for branch in listed:
+        assert branch["vs_remote"]["relation"] in {"differs", "unknown"}
+        assert branch["vs_remote"]["basis"] == "live"
+        assert branch["vs_remote"]["ahead"] is None
+    assert without_feature(changed) == without_feature(control)
+
+
+# ---------------------------------------------------------------------------
+# SSH in batch mode unless the user configured their own command (POSIX only)
+# ---------------------------------------------------------------------------
+
+
+def argv_logger(directory: Path, name: str, log: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    script.write_text(
+        f'#!/bin/sh\necho "$@" >> "{log}"\n'
+        "echo 'git@example.invalid: Permission denied (publickey).' >&2\nexit 255\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+@pytest.fixture
+def ssh_world(tmp_path, monkeypatch):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(make_remote(served), folder / "ssh clone")
+    git(repository, "remote", "set-url", "origin", "ssh://git@example.invalid/r.git")
+    fake_log = tmp_path / "fake.log"
+    argv_logger(tmp_path / "bin", "ssh", fake_log)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    user_log = tmp_path / "user.log"
+    user = argv_logger(tmp_path / "user", "user-ssh", user_log)
+    return folder, repository, fake_log, user, user_log
+
+
+@posix_only
+def test_ssh_runs_in_batch_mode_when_the_user_has_no_ssh_command(ssh_world):
+    folder, repository, fake_log, _, _ = ssh_world
+
+    document = live([folder])
+
+    assert_fell_back_to_cached(group_of(document, repository), "authentication_failed")
+    assert "-o BatchMode=yes" in fake_log.read_text()
+
+
+@posix_only
+@pytest.mark.parametrize("how", ["core.sshCommand", "GIT_SSH", "GIT_SSH_COMMAND"])
+def test_a_user_ssh_command_runs_unmodified(ssh_world, monkeypatch, how):
+    folder, repository, fake_log, user, user_log = ssh_world
+    if how == "core.sshCommand":
+        git(repository, "config", "core.sshCommand", str(user))
+    else:
+        monkeypatch.setenv(how, str(user))
+
+    document = live([folder])
+
+    assert_fell_back_to_cached(group_of(document, repository), "authentication_failed")
+    assert not fake_log.exists()
+    assert user_log.exists() and "BatchMode" not in user_log.read_text()
