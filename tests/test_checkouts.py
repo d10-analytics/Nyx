@@ -573,26 +573,34 @@ def replace_git_marker(worktree: Path, content: str) -> None:
 
     Some hosts leave the marker read-only or otherwise not directly writable
     after ``git worktree add``, so remove it first instead of writing over it.
+    Another process can briefly hold a fresh file open, so a permission error
+    is retried a few times; any other error is raised at once.
     """
     marker = worktree / ".git"
-    try:
-        if marker.is_dir() and not marker.is_symlink():
-            shutil.rmtree(marker)
-        elif marker.exists() or marker.is_symlink():
-            try:
-                os.chmod(marker, stat.S_IWRITE)
-            except OSError:
-                pass
-            marker.unlink()
-        marker.write_text(content)
-    except OSError as error:
+    attempts = 3
+    for attempt in range(attempts):
         try:
-            state = os.stat(marker)
-        except OSError as stat_error:
-            state = f"unavailable ({stat_error})"
-        raise AssertionError(
-            f"cannot replace {marker}: {error!r}; is_dir={marker.is_dir()}; stat={state}"
-        ) from error
+            if marker.is_dir() and not marker.is_symlink():
+                shutil.rmtree(marker)
+            elif marker.exists() or marker.is_symlink():
+                try:
+                    os.chmod(marker, stat.S_IWRITE)
+                except OSError:
+                    pass
+                marker.unlink()
+            marker.write_text(content)
+            return
+        except PermissionError as error:
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
+                continue
+            try:
+                state = os.stat(marker)
+            except OSError as stat_error:
+                state = f"unavailable ({stat_error})"
+            raise AssertionError(
+                f"cannot replace {marker}: {error!r}; is_dir={marker.is_dir()}; stat={state}"
+            ) from error
 
 
 @pytest.mark.parametrize("content", ["garbage\n", "gitdir:\n", "gitdir:   \n"])
