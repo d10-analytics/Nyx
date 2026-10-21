@@ -193,22 +193,35 @@ has no merge commits and every one of its own commits has a counterpart in the
 base with the same change (the same patch identity, whitespace included), as
 after a rebase or a cherry-pick. `squash_equivalent`: the branch's whole change
 since it left the base has the same patch identity as one commit on the base, as
-after a squash merge. Both patch rungs also require that merging the branch into
-the base would change nothing, so a change that only looks the same, indented
-differently or made at another place in a repeated block, never reads as merged.
-Nyx runs that merge in a scratch repository that borrows the clone's objects and
-changes nothing in the clone. A branch whose lines the base rewrote after
-landing them, or one sharing no history with the base, fails that check and
-reads as `not_merged`. `tree_equal`: the branch's file contents are identical to the content of
+after a squash merge. Both patch rungs also require that the base commit with the
+matching change made it where the branch made it. A patch identity ignores where a
+change lands, so Nyx finds the base commit with the same identity (for a squash,
+the one with the identity of the branch's whole change) and compares that commit's
+change with the branch's, file by file: the commit left the file as the branch's
+change leaves it, or, for a text file, merging the branch's change into the file
+the commit started from gives the file the commit left. A change that only looks
+the same, indented differently or made at another place in a repeated block,
+never reads as merged. What the base did to those lines after landing them does
+not matter, and a branch with its own root commit, sharing no history with the
+base, is judged the same way. Nyx reads objects and merges copies of files in a
+temporary directory of its own: it writes to no repository and does not even
+touch the modification time of an object file. A branch can still read
+`not_merged` when the landing commit left a binary file, a symbolic link or a
+submodule differently from the branch, so no content merge applies, or when the
+content merge of a text file does not reproduce the file the commit left (a
+conflict, a landing resolved by hand, or one made with another diff algorithm
+than the default). More than eight base commits with one identity, a file over
+1 MiB, a change touching more than 5,000 files or needing more than 16 content
+merges make the verdict `unknown` with the reason `history_limit`, never
+`merged`. `tree_equal`: the branch's file contents are identical to the content of
 some commit on the base. `not_merged` has the rung `none`: every rung that could
 run found nothing. An `unknown` verdict has no rung and one of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
 partial, so only the `ancestor` rung runs and the others are skipped rather
 than fetching missing files. `git_too_old` means git is older than 2.39: the two
 patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact patch
-identities, the merge check and telling two different changes to the same binary
-file apart, so they are skipped, and
-`ancestor` and `tree_equal` still run. `history_limit` means the branch or the
+identities and telling two different changes to the same binary file apart, so they
+are skipped, and `ancestor` and `tree_equal` still run. `history_limit` means the branch or the
 comparison was too large to check within the fixed bounds. `deadline` means one
 git call reached its 10-second cap or the 60 seconds, less the half second kept
 for the cache write, ran out, and `failed` means a git call failed. A shallow or
