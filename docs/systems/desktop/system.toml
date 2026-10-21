@@ -1,0 +1,7 @@
+schema_version = 1
+name = "desktop"
+files = [
+    "nyx/desktop.py",
+    "pysidedeploy.spec",
+    "scripts/build_desktop.py",
+]

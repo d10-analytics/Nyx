@@ -1,0 +1,8 @@
+schema_version = 1
+name = "application-serving"
+files = [
+    "nyx/app_runtime.py",
+    "nyx/desktop_worker.py",
+    "nyx/server.py",
+    "nyx/worker.py",
+]
