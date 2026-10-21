@@ -3123,7 +3123,6 @@ def run_sh(body: str) -> str:
     return f"#!/bin/sh\n{body}\n"
 
 
-@pytest.mark.skipif(ON_WINDOWS, reason="the trap programs are shell scripts")
 def sign_trunk(work: Path) -> str:
     """Put a commit carrying a ``gpgsig`` header on top of ``trunk`` and push it."""
     git(work, "checkout", "-q", "trunk")
@@ -3148,6 +3147,7 @@ def sign_trunk(work: Path) -> str:
     return signed
 
 
+@pytest.mark.skipif(ON_WINDOWS, reason="the trap programs are shell scripts")
 def test_configured_programs_never_run_and_do_not_change_verdicts(tmp_path):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     signed = sign_trunk(work)
