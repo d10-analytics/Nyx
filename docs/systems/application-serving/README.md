@@ -7,8 +7,8 @@ README is narrative only.
 
 - `ApplicationRuntime`: shared HTTP, catalog admission, and worker lifecycle;
   the loopback-only server, the catalog worker, and the desktop worker entry.
-- Board settings are read and saved through `save_configuration_owned` after
-  the revision check; `/api/workspace` is read-only.
+- Board settings are read from the held configuration, saved through
+  `save_configuration_owned` after the revision check; `/api/workspace` is read-only.
 
 ## Outside this boundary
 
