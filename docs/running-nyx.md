@@ -207,8 +207,8 @@ comparison was too large to check within the fixed bounds. `deadline` means the
 partial clone shows `incomplete_clone` in preference to `git_too_old`.
 
 Verdicts that took git a long time to compute are remembered in
-`~/.nyx/cache/checkouts.json`, so a later run that cannot decide a branch can
-still answer from them. The cache is used only when `~/.nyx` already exists; Nyx never creates that
+`~/.nyx/cache/checkouts.json`, so a later run that cannot decide a branch in
+time can still answer from them. The cache is used only when `~/.nyx` already exists; Nyx never creates that
 directory for it, and it is created inside `~/.nyx` as `cache/` when first
 needed. It stores only verdicts decided in full by git 2.39 or later in a clone
 that is neither shallow nor partial, and only for the rungs other than
@@ -220,9 +220,15 @@ warm run may give the remembered verdict instead, whatever the reason
 (`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
 `history_limit` depends on the other branches in the clone, which is why a
 remembered answer may stand in for it. A warm run therefore does the same git
-work as a cold run: it checks every branch it can before it looks anything up,
-and only a shallow or partial clone, where no check beyond `ancestor` can run,
-looks up first. Under git older than 2.39, the lookup comes after the size
+work as a cold run, spending the time it has left re-checking: it works the
+branches with no remembered answer first, then those with the oldest remembered
+answer, then the newest, and a remembered answer stands in only where that
+re-check does not finish. A branch whose re-check finishes is remembered again
+with the time of that check, so the oldest answers are always re-checked first
+and a clone too large to check within the 60 seconds is covered a few branches
+at a time over successive runs. A run that re-checks nothing leaves the file
+untouched. Only a shallow or partial clone, where no check beyond `ancestor` can
+run, looks up first. Under git older than 2.39, the lookup comes after the size
 check and the `tree_equal` rung, so a remembered answer never replaces a
 `tree_equal` verdict that the cold run decides. A repository's diff attributes
 (`.gitattributes` in the tree and `info/attributes`) can make Nyx compare a

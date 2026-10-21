@@ -240,6 +240,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "has no branches, no worktrees and no base, so it has no verdicts at all",
         "It never replaces a verdict the run decides itself",
         "a warm run differs from a cold run only where the cold run says `unknown`",
+        "it works the branches with no remembered answer first, then those with the oldest "
+        "remembered answer, then the newest, and a remembered answer stands in only where "
+        "that re-check does not finish",
+        "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",
         "so once the attributes are gone a run that decides the branch reports its own verdict",
