@@ -233,11 +233,10 @@ class _GitRunner:
         path: str | None = None,
         ceiling: str | None = None,
         overlay: Mapping[str, str | None] | None = None,
-        stdin_bytes: bytes | None = None,
     ) -> _Outcome:
         """Run one git command; ``overlay`` is applied after the scrub and fixed
         variables of this call only, and a ``None`` value removes a variable.
-        Standard input is closed unless ``stdin_bytes`` supplies it."""
+        Standard input is closed."""
         timeout = self._timeout()
         if timeout <= 0:
             return _Outcome(None, timed_out=True)
@@ -247,17 +246,11 @@ class _GitRunner:
         with (
             tempfile.TemporaryFile() as out,
             tempfile.TemporaryFile() as err,
-            tempfile.TemporaryFile() as supplied,
         ):
-            stdin: Any = subprocess.DEVNULL
-            if stdin_bytes is not None:
-                supplied.write(stdin_bytes)
-                supplied.seek(0)
-                stdin = supplied
             try:
                 process = subprocess.Popen(
                     command,
-                    stdin=stdin,
+                    stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=err,
                     env=environment,
@@ -1714,25 +1707,29 @@ class _Ladder:
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
 
-    def _git(self, arguments: Sequence[str], stdin_bytes: bytes | None = None) -> _Outcome:
+    def _git(self, arguments: Sequence[str]) -> _Outcome:
         return self._runner.run(
             self._args(arguments),
             path=self._context.cwd,
             ceiling=self._context.ceiling,
             overlay=self._overlay,
-            stdin_bytes=stdin_bytes,
+        )
+
+    def _stream(self, producer: Sequence[str], consumer: Sequence[str]) -> _Outcome:
+        """Run ``producer | consumer`` in the clone, keeping only the consumer's output."""
+        return self._runner.pipeline(
+            self._args(producer),
+            self._args(consumer),
+            path=self._context.cwd,
+            ceiling=self._context.ceiling,
+            overlay=self._overlay,
         )
 
     def _patch_ids(self, revisions: Sequence[str]) -> dict[str, str] | _Outcome:
         """Map each non-merge commit of ``revisions`` to its stable patch ID."""
-        outcome = self._runner.pipeline(
-            self._args(
-                ["log", "--no-merges", "-p", "--format=commit %H", *_PATCH_FLAGS, *revisions, "--"]
-            ),
-            self._args(["patch-id", "--stable"]),
-            path=self._context.cwd,
-            ceiling=self._context.ceiling,
-            overlay=self._overlay,
+        outcome = self._stream(
+            ["log", "--no-merges", "-p", "--format=commit %H", *_PATCH_FLAGS, *revisions, "--"],
+            ["patch-id", "--stable"],
         )
         if not outcome.ok:
             return outcome
@@ -2012,12 +2009,9 @@ class _Ladder:
                 tip.verdict = _merged("patch_equivalent")
                 return
         if tip.bases is not None and len(tip.bases) == 1:
-            diff = self._git(["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"])
-            if not diff.ok:
-                tip.fail(_call_failure(diff))
-                return
-            header = b"commit " + b"1" * len(base) + b"\n"
-            identified = self._git(["patch-id", "--stable"], stdin_bytes=header + diff.out)
+            identified = self._stream(
+                ["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"], ["patch-id", "--stable"]
+            )
             fields = identified.out.split() if identified.ok else []
             if not identified.ok:
                 tip.fail(_call_failure(identified))
