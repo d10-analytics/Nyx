@@ -60,6 +60,8 @@ MAX_PARALLEL_CLONES = 8
 GIT_FLOOR = (2, 36)
 # Git before this release hashes a binary change in ``patch-id`` without its
 # object IDs, so two different changes to one binary file get the same patch ID.
+# It also has ``patch-id --verbatim`` and ``merge-tree --write-tree``, which the
+# patch rungs need to tell changes apart exactly and to confirm where they apply.
 PATCH_FLOOR = (2, 39)
 OWN_COMMIT_CAP = 2000
 COMPARISON_CAP = 5000
@@ -1605,6 +1607,7 @@ class _VerdictSettings:
     pinned: tuple[str, ...]
     overlay: dict[str, str | None]
     patch_rungs: bool
+    scratch: str
 
 
 def _verdict_settings(scratch: str, version: str | None) -> _VerdictSettings:
@@ -1627,6 +1630,7 @@ def _verdict_settings(scratch: str, version: str | None) -> _VerdictSettings:
             "GIT_NO_LAZY_FETCH": "1",
         },
         patch_rungs=_at_least(version, PATCH_FLOOR),
+        scratch=scratch,
     )
 
 
@@ -1726,10 +1730,10 @@ class _Ladder:
         )
 
     def _patch_ids(self, revisions: Sequence[str]) -> dict[str, str] | _Outcome:
-        """Map each non-merge commit of ``revisions`` to its stable patch ID."""
+        """Map each non-merge commit of ``revisions`` to its verbatim patch ID."""
         outcome = self._stream(
             ["log", "--no-merges", "-p", "--format=commit %H", *_PATCH_FLAGS, *revisions, "--"],
-            ["patch-id", "--stable"],
+            ["patch-id", "--verbatim"],
         )
         if not outcome.ok:
             return outcome
@@ -2006,17 +2010,120 @@ class _Ladder:
                 tip.fail(_call_failure(own))
                 return
             if len(own) == tip.own and all(item in comparison for item in own.values()):
-                tip.verdict = _merged("patch_equivalent")
-                return
+                applied = self._applied(tip)
+                if applied is None:
+                    return
+                if applied:
+                    tip.verdict = _merged("patch_equivalent")
+                    return
         if tip.bases is not None and len(tip.bases) == 1:
             identified = self._stream(
-                ["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"], ["patch-id", "--stable"]
+                ["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"], ["patch-id", "--verbatim"]
             )
             fields = identified.out.split() if identified.ok else []
             if not identified.ok:
                 tip.fail(_call_failure(identified))
             elif fields and fields[0].decode("ascii", "replace") in comparison:
-                tip.verdict = _merged("squash_equivalent")
+                applied = self._applied(tip)
+                if applied:
+                    tip.verdict = _merged("squash_equivalent")
+
+    # -- where a matching change applies ---------------------------------
+
+    def _applied(self, tip: _Tip) -> bool | None:
+        """Whether merging the tip into the base changes nothing, once per tip.
+
+        A patch identity ignores where a change lands, so a match proves the
+        change only when the merge finds it already in the base.  ``None``
+        means a step failed and the tip carries its error.
+        """
+        known = self._confirmed.get(tip.sha)
+        if known is None:
+            known = self._merge_changes_nothing(tip)
+            if known is not None:
+                self._confirmed[tip.sha] = known
+        return known
+
+    def _merge_scratch(self) -> str | _Outcome:
+        """A scratch repository sharing the clone's objects, made on first use.
+
+        The merge writes the objects of its result, so it runs in an empty bare
+        repository that borrows the clone's object directory (and the lender's)
+        and the clone itself stays untouched.  Its own configuration and
+        attributes are empty, so no merge driver of the clone can run.
+        """
+        if self._merge_repository is not None:
+            return self._merge_repository
+        source = self._git(["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+        lines = source.out.splitlines() if source.ok else []
+        if len(lines) != 1:
+            self._merge_repository = source if not source.ok else _Outcome(1)
+            return self._merge_repository
+        try:
+            target = tempfile.mkdtemp(prefix="merge-", dir=self._settings.scratch)
+        except OSError:
+            self._merge_repository = _Outcome(1)
+            return self._merge_repository
+        digest = "sha256" if len(self._base.sha) == 64 else "sha1"
+        made = self._runner.run(
+            self._args(
+                ["init", "--bare", "--quiet", "--template=", f"--object-format={digest}", target]
+            ),
+            path=self._settings.scratch,
+            overlay=self._settings.overlay,
+        )
+        if not made.ok:
+            self._merge_repository = made
+            return made
+        quoted = lines[0].replace(b"\\", b"\\\\").replace(b'"', b'\\"').replace(b"\n", b"\\n")
+        try:
+            with open(os.path.join(target, "objects", "info", "alternates"), "wb") as handle:
+                handle.write(b'"' + quoted + b'"\n')
+        except OSError:
+            self._merge_repository = _Outcome(1)
+            return self._merge_repository
+        self._merge_repository = target
+        return target
+
+    def _merge_changes_nothing(self, tip: _Tip) -> bool | None:
+        if not tip.bases:
+            # Histories sharing no commit cannot be merged without an option
+            # newer than the patch floor, so nothing confirms the match.
+            return False
+        repository = self._merge_scratch()
+        if isinstance(repository, _Outcome):
+            tip.fail(_call_failure(repository))
+            return None
+        if self._base_tree is None:
+            tree = self._git(["rev-parse", f"{self._base.sha}^{{tree}}"])
+            fields = tree.out.split() if tree.ok else []
+            if len(fields) != 1:
+                tip.fail(_call_failure(tree))
+                return None
+            self._base_tree = fields[0]
+        merged = self._runner.run(
+            self._args(
+                [
+                    "--git-dir=" + repository,
+                    "merge-tree",
+                    "--write-tree",
+                    "--no-messages",
+                    self._base.sha,
+                    tip.sha,
+                ]
+            ),
+            path=self._settings.scratch,
+            ceiling=self._settings.scratch,
+            overlay=self._overlay,
+        )
+        # Exit 1 is a conflict: the tip's change is not already in the base.
+        if merged.code == 1 and not merged.timed_out:
+            return False
+        fields = merged.out.split() if merged.ok else []
+        if len(fields) != 1:
+            tip.fail(_call_failure(merged))
+            return None
+        return fields[0] == self._base_tree
 
     # -- tree rung ------------------------------------------------------
 
@@ -2129,6 +2236,10 @@ def _assign_verdicts(
 
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
 _CACHE_KEYS = frozenset({"schema_version", "verdicts"})
+# Version 1 stored patch rungs decided by a patch identity that ignored
+# whitespace and line numbers; its entries are never served.
+_CACHE_SCHEMA = 2
+_RETIRED_CACHE_SCHEMA = 1
 _CACHE_ENTRY_KEYS = frozenset({"rung", "at"})
 
 
@@ -2137,7 +2248,7 @@ def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
     document = _object(load_strict_json(data, "checkout cache"), "checkout cache")
     _keys(document, _CACHE_KEYS, "checkout cache")
     version = document["schema_version"]
-    if type(version) is not int or version != 1:
+    if type(version) is not int or version not in (_RETIRED_CACHE_SCHEMA, _CACHE_SCHEMA):
         raise ProtocolError("checkout cache schema_version is unsupported")
     verdicts = _object(document["verdicts"], "checkout cache verdicts")
     if len(verdicts) > CACHE_ENTRY_CAP:
@@ -2154,12 +2265,14 @@ def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
         if type(at) is not int or at < 0:
             raise ProtocolError("checkout cache time is invalid")
         entries[key] = (rung, at)
-    return entries
+    # A retired file is well formed but holds nothing to trust; the next write
+    # replaces it.
+    return entries if version == _CACHE_SCHEMA else {}
 
 
 def _cache_bytes(entries: Mapping[str, tuple[str, int]]) -> bytes:
     document = {
-        "schema_version": 1,
+        "schema_version": _CACHE_SCHEMA,
         "verdicts": {key: {"rung": rung, "at": at} for key, (rung, at) in entries.items()},
     }
     return (
