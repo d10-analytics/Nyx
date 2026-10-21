@@ -716,7 +716,8 @@ def _line_for(lines: list[str], path: Path | str, indent: str = "") -> str:
 
 
 def _file_listing(root: Path) -> list[str]:
-    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+    """Every path under ``root``, relative and with ``/`` separators on every platform."""
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
 
 
 def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
