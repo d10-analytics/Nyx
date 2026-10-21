@@ -7,6 +7,7 @@ changes any outcome.  Timeouts are lowered only through collector parameters.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -3689,3 +3690,635 @@ def test_branches_of_unrelated_histories_share_the_whole_base_range(tmp_path, mo
     monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 3)
     limited = verdicts_of(find_clone(collect([folder]), work))
     assert limited == {"trunk": None, "x": MERGED_PATCH, "y": unknown("history_limit")}
+
+
+# ---------------------------------------------------------------------------
+# The verdict cache and the verdict deadline
+# ---------------------------------------------------------------------------
+
+REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
+NOT_ROOT = ON_WINDOWS or os.geteuid() != 0
+
+
+def nyx_home(home: Path) -> Path:
+    """Create ``~/.nyx`` in the isolated home and return the cache file path."""
+    (home / ".nyx").mkdir(exist_ok=True)
+    return home / ".nyx" / "cache" / "checkouts.json"
+
+
+def cache_entries(cache: Path) -> dict[str, str]:
+    document = json.loads(cache.read_text())
+    assert document["schema_version"] == 1
+    return {key: entry["rung"] for key, entry in document["verdicts"].items()}
+
+
+def stable(document: dict[str, Any]) -> dict[str, Any]:
+    """The document without what a cache diagnostic or the clock may change."""
+    return {
+        key: value
+        for key, value in document.items()
+        if key not in {"observed_at", "checkouts_digest", "diagnostics"}
+    }
+
+
+def stand_in(tmp_path: Path, name: str, body: str) -> Path:
+    shim = tmp_path / name
+    shim.mkdir()
+    script = shim / "git"
+    script.write_text(f'#!/bin/sh\n{body}\nexec "{shutil.which("git")}" "$@"\n')
+    script.chmod(0o755)
+    return shim
+
+
+@contextlib.contextmanager
+def path_with(monkeypatch, shim: Path):
+    original = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{original}")
+    try:
+        yield
+    finally:
+        monkeypatch.setenv("PATH", original)
+
+
+def recording(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    log = tmp_path / f"{name}.log"
+    return stand_in(tmp_path, name, f'printf "%s\\n" "$*" >> "{log}"'), log
+
+
+def patch_work(log: Path) -> list[str]:
+    calls = [line.split() for line in log.read_text().splitlines()] if log.exists() else []
+    return [
+        " ".join(call)
+        for call in calls
+        if "diff" in call or "patch-id" in call or ("log" in call and "-p" in call)
+    ]
+
+
+def cache_world(tmp_path: Path, tag: str = ""):
+    """One clone with a branch per cached outcome, all judged against ``trunk``."""
+    tmp_path.mkdir(exist_ok=True)
+    folder, _remote, work = small_world(tmp_path)
+
+    def branch(name: str) -> None:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+
+    branch("both")
+    commit_file(work, "both.txt", "both\n", "add both")
+    branch("noff")
+    commit_file(work, "noff.txt", "n\n")
+    branch("picked")
+    commit_file(work, "p1.txt", "p1\n")
+    commit_file(work, "p2.txt", "p2\n")
+    branch("unmerged")
+    commit_file(work, f"u{tag}.txt", f"u{tag}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "both.txt", "both\n", "land both by hand")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked~1", "picked")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge noff", "noff")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+CACHE_WORLD_VERDICTS = {
+    "both": MERGED_PATCH,
+    "noff": MERGED_ANCESTOR,
+    "picked": MERGED_PATCH,
+    "unmerged": NOT_MERGED,
+    "trunk": None,
+}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_warm_collection_rewrites_nothing_and_runs_no_patch_work(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work)) == CACHE_WORLD_VERDICTS
+    base = rev(work, "origin/trunk")
+    # Only complete, non-ancestor verdicts are stored.
+    assert cache_entries(cache) == {
+        f"{rev(work, 'both')}.{base}": "patch_equivalent",
+        f"{rev(work, 'picked')}.{base}": "patch_equivalent",
+        f"{rev(work, 'unmerged')}.{base}": "none",
+    }
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    shim, log = recording(tmp_path, "warm")
+
+    with path_with(monkeypatch, shim):
+        second = collect([folder])
+
+    assert second["checkouts_digest"] == first["checkouts_digest"]
+    assert verdicts_of(find_clone(second, work)) == CACHE_WORLD_VERDICTS
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
+    assert patch_work(log) == []
+    assert log.read_text()  # the recorder really saw this run's git calls
+
+
+def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
+    document = json.loads(valid)
+    good_key = next(iter(document["verdicts"]))
+    return {
+        "garbage": b"not json {",
+        "extra_key": json.dumps({**document, "extra": 1}).encode(),
+        "foreign_schema": json.dumps({**document, "schema_version": 2}).encode(),
+        "ancestor_rung": json.dumps(
+            {"schema_version": 1, "verdicts": {good_key: {"rung": "ancestor", "at": 1}}}
+        ).encode(),
+        "key_lengths": json.dumps(
+            {
+                "schema_version": 1,
+                "verdicts": {"a" * 40 + "." + "b" * 64: {"rung": "none", "at": 1}},
+            }
+        ).encode(),
+        "oversized": b" " * (5 * 1024 * 1024),
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["garbage", "extra_key", "foreign_schema", "ancestor_rung", "key_lengths", "oversized", "symlink"],
+)
+def test_an_unreadable_cache_changes_only_a_diagnostic_and_is_repaired(
+    tmp_path, isolated_git, kind
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    valid = cache.read_bytes()
+    cache.unlink()
+    if kind == "symlink":
+        target = tmp_path / "elsewhere.json"
+        target.write_bytes(valid)
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            cache.symlink_to(target)
+        except OSError:
+            pytest.skip("this lane does not grant the symbolic-link privilege")
+    else:
+        cache.write_bytes(invalid_cache_payloads(valid)[kind])
+
+    document = collect([folder])
+
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_unreadable", "path": str(cache)},
+    ]
+    assert not cache.is_symlink()
+    assert cache_entries(cache) == cache_entries_of(valid)
+    if kind == "symlink":
+        assert target.read_bytes() == valid
+
+
+def cache_entries_of(data: bytes) -> dict[str, str]:
+    return {key: entry["rung"] for key, entry in json.loads(data)["verdicts"].items()}
+
+
+@pytest.mark.skipif(not NOT_ROOT or ON_WINDOWS, reason="needs a read-only directory that binds")
+def test_a_read_only_cache_directory_gives_a_write_diagnostic(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    cache.unlink()
+    cache.parent.chmod(0o500)
+    try:
+        document = collect([folder])
+    finally:
+        cache.parent.chmod(0o700)
+
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_write_failed", "path": str(cache)},
+    ]
+    assert not cache.exists()
+
+
+def test_without_a_state_directory_nothing_is_read_written_or_reported(tmp_path, isolated_git):
+    folder, work = cache_world(tmp_path)
+    assert not (isolated_git / ".nyx").exists()
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert not (isolated_git / ".nyx").exists()
+
+
+def test_a_run_with_nothing_to_store_creates_neither_cache_directory_nor_file(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "merged", "trunk")
+    commit_file(work, "m.txt", "m\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge it", "merged")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work)) == {"merged": MERGED_ANCESTOR, "trunk": None}
+    assert document["diagnostics"] == []
+    assert list((isolated_git / ".nyx").iterdir()) == []
+    assert not cache.parent.exists()
+
+
+def incomplete_world(tmp_path: Path, option: str):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    push_commit(remote, "trunk", tmp_path / "s1")
+    incomplete = clone(f"file://{remote}", folder / "incomplete", option)
+    git(incomplete, "checkout", "-q", "-b", "other", "origin/trunk")
+    commit_file(incomplete, "other.txt", "other\n")
+    return folder, incomplete
+
+
+@pytest.mark.parametrize("option", ["--depth=1", "--filter=blob:none"])
+def test_incomplete_clones_leave_an_existing_cache_file_untouched(tmp_path, isolated_git, option):
+    cache = nyx_home(isolated_git)
+    cache.parent.mkdir()
+    stored = json.dumps(
+        {"schema_version": 1, "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}}}
+    ).encode()
+    cache.write_bytes(stored)
+    folder, incomplete = incomplete_world(tmp_path, option)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, incomplete))["other"] == unknown("incomplete_clone")
+    assert document["diagnostics"] == []
+    assert cache.read_bytes() == stored
+
+
+def test_a_cache_hit_gives_a_shallow_clone_the_full_clones_verdict(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    full_folder = tmp_path / "full"
+    shallow_folder = tmp_path / "shallow"
+    full_folder.mkdir()
+    shallow_folder.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, full_folder / "work")
+    git(work, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(work, "picked.txt", "picked\n")
+    git(work, "push", "-q", "origin", "picked")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked")
+    git(work, "push", "-q", "origin", "trunk")
+    shallow = clone(f"file://{remote}", shallow_folder / "shallow", "--depth=1", "--no-single-branch")
+    git(shallow, "checkout", "-q", "-b", "picked", "origin/picked")
+
+    full = verdicts_of(find_clone(collect([full_folder]), work))
+    assert full["picked"] == MERGED_PATCH
+    stored = cache.read_bytes()
+    cache.unlink()
+    cold = find_clone(collect([shallow_folder]), shallow)
+    assert cold["shallow"] is True
+    assert verdicts_of(cold)["picked"] == unknown("incomplete_clone")
+    cache.write_bytes(stored)
+
+    warm = find_clone(collect([shallow_folder]), shallow)
+
+    assert verdicts_of(warm)["picked"] == MERGED_PATCH
+    assert cache.read_bytes() == stored
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_git_before_the_patch_fix_stores_nothing_and_serves_cached_verdicts(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    with path_with(monkeypatch, old):
+        cold = collect([folder])
+    assert not cache.parent.exists()  # not even the tree_equal verdict is stored
+    assert verdicts_of(find_clone(cold, work)) == {
+        "both": MERGED_TREE,
+        "noff": MERGED_ANCESTOR,
+        "picked": unknown("git_too_old"),
+        "unmerged": unknown("git_too_old"),
+        "trunk": None,
+    }
+    collect([folder])
+    assert cache_entries(cache)
+
+    with path_with(monkeypatch, old):
+        warm = collect([folder])
+
+    # A hit stands in for git_too_old, but never replaces a rung the cold run decides.
+    assert verdicts_of(find_clone(warm, work)) == {
+        "both": MERGED_TREE,
+        "noff": MERGED_ANCESTOR,
+        "picked": MERGED_PATCH,
+        "unmerged": NOT_MERGED,
+        "trunk": None,
+    }
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_a_stronger_cached_rung_never_changes_what_old_git_reports(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "both", "trunk")
+    commit_file(work, "both.txt", "both\n", "add both")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "both.txt", "both\n", "land both by hand")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "push", "-q", "origin", "trunk")
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    with path_with(monkeypatch, old):
+        cold_old = collect([folder])
+    assert verdicts_of(find_clone(cold_old, work))["both"] == MERGED_TREE
+    assert not cache.parent.exists()
+
+    real_cold = collect([folder])
+    real_warm = collect([folder])
+    assert verdicts_of(find_clone(real_cold, work))["both"] == MERGED_PATCH
+    assert real_warm["checkouts_digest"] == real_cold["checkouts_digest"]
+    assert list(cache_entries(cache).values()) == ["patch_equivalent"]
+
+    with path_with(monkeypatch, old):
+        warm_old = collect([folder])
+
+    assert verdicts_of(find_clone(warm_old, work))["both"] == MERGED_TREE
+    assert warm_old["checkouts_digest"] == cold_old["checkouts_digest"]
+
+
+COLLECT_PROCESS = (
+    "import sys, time\n"
+    "from nyx import checkouts\n"
+    "print(checkouts.collect_checkouts([sys.argv[1]], deadline_ns=time.monotonic_ns() + 60_000_000_000))\n"
+)
+
+
+def test_two_collector_processes_over_different_clones_both_complete(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folders = []
+    for name in ("one", "two"):
+        folder, _work = cache_world(tmp_path / name, tag=name)
+        folders.append(folder)
+    environment = dict(os.environ)
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", COLLECT_PROCESS, str(folder)],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for folder in folders
+    ]
+    outputs = [process.communicate(timeout=120)[0] for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0]
+    for output in outputs:
+        document = models.parse_checkouts(output)
+        codes = [item["code"] for item in document["diagnostics"]]
+        # A replace over a file the other process holds open may fail on Windows only.
+        assert codes == [] or (
+            ON_WINDOWS and codes in (["checkout_cache_unreadable"], ["checkout_cache_write_failed"])
+        )
+        assert all(
+            branch["verdict"] is not None or branch["name"] == "trunk"
+            for item in all_clones(document)
+            for branch in item["branches"]
+        )
+    assert cache_entries(cache)  # the file parses afterwards
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the lane's os.replace count is proven on POSIX")
+def test_one_collection_replaces_the_cache_file_exactly_once(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    worlds = [cache_world(tmp_path / name, tag=name) for name in ("one", "two")]
+    folders = [folder for folder, _work in worlds]
+    real_replace = os.replace
+    destinations: list[str] = []
+
+    def counting(source, destination, *args, **kwargs):
+        destinations.append(os.fspath(destination))
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", counting)
+
+    collect(folders)
+
+    assert destinations == [str(cache)]
+    stored = cache_entries(cache)
+    for _folder, work in worlds:  # each clone's newly decided verdict is in the one write
+        assert f"{rev(work, 'unmerged')}.{rev(work, 'origin/trunk')}" in stored
+
+
+def test_stale_temporaries_are_removed_by_the_next_write_and_recent_ones_stay(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    cache.parent.mkdir()
+    old = cache.parent / ".checkouts.json.stale1"
+    recent = cache.parent / ".checkouts.json.fresh1"
+    other = cache.parent / ".other.json.stale1"
+    for item, age in ((old, 660), (recent, 60), (other, 660)):
+        item.write_text("x")
+        stamp = time.time() - age
+        os.utime(item, (stamp, stamp))
+    folder, _work = cache_world(tmp_path)
+
+    collect([folder])
+
+    assert not old.exists()
+    assert recent.exists() and other.exists()
+    assert cache.is_file()
+
+
+def branch_cache_world(tmp_path: Path, names: list[str]):
+    folder, _remote, work = small_world(tmp_path)
+    for name in names:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    base = rev(work, "origin/trunk")
+    return folder, work, {name: f"{rev(work, name)}.{base}" for name in names}
+
+
+def write_cache(cache: Path, entries: dict[str, int]) -> None:
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "verdicts": {key: {"rung": "none", "at": at} for key, at in entries.items()},
+            }
+        )
+    )
+
+
+def test_eviction_keeps_the_used_entries_and_drops_the_oldest(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, _work, keys = branch_cache_world(tmp_path, [f"b{n}" for n in range(1, 7)])
+    write_cache(cache, {keys["b1"]: 10, keys["b2"]: 20, keys["b3"]: 30, keys["b4"]: 40})
+    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 4)
+
+    collect([folder])
+
+    assert set(cache_entries(cache)) == {keys["b5"], keys["b6"], keys["b4"], keys["b3"]}
+
+
+def test_eviction_drops_unused_newer_entries_and_breaks_ties_by_key(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _work, keys = branch_cache_world(tmp_path, ["b1", "b2", "b3", "b4"])
+    stale = "c" * 40 + "." + keys["b1"].split(".")[1]
+    write_cache(cache, {stale: 4_000_000_000, keys["b1"]: 10, keys["b2"]: 10})
+    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 3)
+
+    collect([folder])
+
+    assert set(cache_entries(cache)) == {keys["b3"], keys["b4"], min(keys["b1"], keys["b2"])}
+    assert stale not in cache_entries(cache)
+
+
+def deadline_world(tmp_path: Path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("a-fast", "z-slow"):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "a-fast", "z-slow")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+DELAYED_PATCH_WORK = 'case "$*" in *" log "*|*" diff "*|*" patch-id"*) exec sleep 30;; esac'
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_patch_work_past_the_deadline_is_unknown_then_decided_then_cached(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = deadline_world(tmp_path)
+    slow = stand_in(tmp_path, "slow", DELAYED_PATCH_WORK)
+
+    with path_with(monkeypatch, slow):
+        limited = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(limited, work)) == {
+        "a-fast": unknown("deadline"),
+        "z-slow": unknown("deadline"),
+        "trunk": None,
+    }
+    assert not cache.exists()
+
+    decided = collect([folder])
+    assert verdicts_of(find_clone(decided, work)) == {
+        "a-fast": MERGED_PATCH,
+        "z-slow": MERGED_PATCH,
+        "trunk": None,
+    }
+
+    with path_with(monkeypatch, slow):
+        again = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(again, work)) == verdicts_of(find_clone(decided, work))
+    assert again["diagnostics"] == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_the_verdict_reserve_leaves_time_to_cache_the_branch_that_finished(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = deadline_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    fast, slow_tip = rev(work, "a-fast"), rev(work, "z-slow")
+    slow = stand_in(
+        tmp_path, "slow", f'case "$*" in *" log "*"{slow_tip}"*) exec sleep 30;; esac'
+    )
+
+    with path_with(monkeypatch, slow):
+        document = collect([folder], seconds=3.0)
+
+    assert verdicts_of(find_clone(document, work)) == {
+        "a-fast": MERGED_PATCH,
+        "z-slow": unknown("deadline"),
+        "trunk": None,
+    }
+    assert document["diagnostics"] == []
+    assert cache_entries(cache) == {f"{fast}.{base}": "patch_equivalent"}
+
+    # The control: without the reserve the slow call runs to the real deadline
+    # and the write has no time left, so nothing is cached.
+    cache.unlink()
+    monkeypatch.setattr(checkouts, "VERDICT_RESERVE_NS", 0)
+    with path_with(monkeypatch, slow):
+        unreserved = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(unreserved, work))["z-slow"] == unknown("deadline")
+    assert unreserved["diagnostics"] == [
+        {"code": "checkout_cache_write_failed", "path": str(cache)}
+    ]
+    assert not cache.exists()
+
+
+def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "side", "trunk")
+    for number in range(1, 6):
+        commit_file(work, f"s{number}.txt", "x\n")
+    side_tip = rev(work, "side")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c1.txt", "x\n")
+    commit_file(work, "c2.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "bee", "trunk")
+    commit_file(work, "bee.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "side")
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 5)
+
+    alone = collect([folder])
+    assert verdicts_of(find_clone(alone, work)) == {"bee": NOT_MERGED, "trunk": None}
+    stored = cache.read_bytes()
+    git(work, "checkout", "-q", "-b", "aye", side_tip)
+    commit_file(work, "aye.txt", "x\n")
+    bee_tip = rev(work, "bee")
+    cache.unlink()
+
+    def run(name: str):
+        if ON_WINDOWS:
+            return collect([folder]), None
+        shim, log = recording(tmp_path, name)
+        with path_with(monkeypatch, shim):
+            return collect([folder]), log
+
+    cold, cold_log = run("cold")
+    assert verdicts_of(find_clone(cold, work)) == {
+        "aye": NOT_MERGED, "bee": unknown("history_limit"), "trunk": None,
+    }
+    cache.write_bytes(stored)
+    warm, warm_log = run("warm")
+    assert verdicts_of(find_clone(warm, work)) == {
+        "aye": NOT_MERGED, "bee": NOT_MERGED, "trunk": None,
+    }
+    if cold_log is not None:
+        assert f"...{bee_tip}" in cold_log.read_text()
+        assert f"...{bee_tip}" not in warm_log.read_text()

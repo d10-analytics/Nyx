@@ -719,16 +719,25 @@ def _file_listing(root: Path) -> list[str]:
     return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
 
 
-def test_module_launch_prints_a_valid_document_on_every_host_without_touching_state(
+def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     tmp_path, account, monkeypatch
 ):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
     repository = clone(remote, folder / "listed")
+    git(repository, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(repository, "picked.txt", "picked\n")
+    git(repository, "checkout", "-q", "trunk")
+    commit_file(repository, "diverged.txt", "diverged\n")
+    git(repository, "cherry-pick", "picked")
+    git(repository, "push", "-q", "origin", "trunk")
+    tip = git(repository, "rev-parse", "picked").stdout.strip()
+    base = git(repository, "rev-parse", "origin/trunk").stdout.strip()
     record = _configure(tmp_path, [folder])
     before = record.read_bytes()
     listing = _file_listing(account / ".nyx")
+    runtime_before = state.observe_runtime()
 
     completed = subprocess.run(
         [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
@@ -744,9 +753,24 @@ def test_module_launch_prints_a_valid_document_on_every_host_without_touching_st
     document = models.parse_checkouts(completed.stdout)
     [item] = [c for r in document["repositories"] for c in r["clones"]]
     assert item["path"] == real(repository)
+    assert document["diagnostics"] == []
+    [picked] = [b for b in item["branches"] if b["name"] == "picked"]
+    assert picked["verdict"] == {
+        "state": "merged", "rung": "patch_equivalent", "reason": None,
+    }
     assert record.read_bytes() == before
-    assert _file_listing(account / ".nyx") == listing
-    assert not any(name.endswith(("instance.json", ".lock")) for name in listing)
+    after = _file_listing(account / ".nyx")
+    assert sorted(set(after) - set(listing)) == ["cache", "cache/checkouts.json"]
+    assert set(listing) <= set(after)
+    stored = json.loads((account / ".nyx" / "cache" / "checkouts.json").read_text())
+    assert set(stored) == {"schema_version", "verdicts"}
+    assert stored["schema_version"] == 1
+    assert {key: entry["rung"] for key, entry in stored["verdicts"].items()} == {
+        f"{tip}.{base}": "patch_equivalent"
+    }
+    assert not any(name.endswith(("instance.json", ".lock")) for name in after)
+    assert "runtime" not in {name.split("/")[0] for name in set(after) - set(listing)}
+    assert state.observe_runtime() == runtime_before
 
 
 def test_module_launch_with_an_empty_home_exits_zero_and_creates_no_state(tmp_path):

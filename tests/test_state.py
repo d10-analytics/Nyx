@@ -1651,3 +1651,172 @@ def test_save_paths_carry_checkout_settings_and_revision_covers_them():
             state._save_configuration(paths, first.resolve())
             assert json.loads(paths.config_file.read_bytes())["schema_version"] == 4
             assert state.configuration_revision(paths) == legacy_revision
+
+
+# -- the shared atomic replacement and the checkout verdict cache ------------
+
+
+def test_atomic_replace_replaces_the_target_and_leaves_no_temporary():
+    with TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        target = directory / "record.json"
+        target.write_bytes(b"old")
+
+        state._atomic_replace(directory, target, b"new", prefix=".record.json.")
+
+        assert target.read_bytes() == b"new"
+        assert sorted(item.name for item in directory.iterdir()) == ["record.json"]
+
+
+def test_atomic_replace_failure_keeps_the_target_and_removes_the_temporary():
+    with TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        target = directory / "record.json"
+        target.write_bytes(b"old")
+
+        with patch.object(state.os, "replace", side_effect=OSError("injected")), pytest.raises(OSError):
+            state._atomic_replace(directory, target, b"new", prefix=".record.json.")
+
+        assert target.read_bytes() == b"old"
+        assert sorted(item.name for item in directory.iterdir()) == ["record.json"]
+
+
+def test_atomic_replace_reports_a_failure_after_the_replacement_as_replaced():
+    with TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        target = directory / "record.json"
+
+        with patch.object(state, "_sync_directory", side_effect=OSError("injected")), pytest.raises(
+            state._ReplaceVerificationError
+        ) as raised:
+            state._atomic_replace(directory, target, b"new", prefix=".record.json.")
+
+        assert raised.value.replaced is True
+        assert target.read_bytes() == b"new"
+
+
+def test_atomic_replace_rejects_an_expired_deadline_as_an_os_error():
+    with TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        target = directory / "record.json"
+
+        with pytest.raises(OSError) as raised:
+            state._atomic_replace(
+                directory, target, b"new", prefix=".record.json.", deadline_ns=time.monotonic_ns() - 1
+            )
+
+        assert isinstance(raised.value, state.OperationDeadlineError)
+        assert not target.exists()
+        assert list(directory.iterdir()) == []
+
+
+def test_configuration_admission_errors_still_propagate_unchanged():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        workspace = isolated_root(root, "workspace")
+        external = root / "external"
+        external.mkdir()
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            paths = state.state_paths(create=True)
+            paths.config_directory.rmdir()
+            paths.config_directory.symlink_to(external, target_is_directory=True)
+            with pytest.raises(state.AccountHomeError):
+                state.save_configuration_owned(workspace, paths=paths)
+        assert list(external.iterdir()) == []
+
+
+def cache_directory(home: Path) -> Path:
+    return home / ".nyx" / "cache"
+
+
+def test_cache_reads_report_nothing_stored_for_every_missing_level():
+    with TemporaryDirectory() as temporary:
+        home = isolated_home(Path(temporary))
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            assert state.read_checkout_cache() is None
+            (home / ".nyx").mkdir()
+            assert state.read_checkout_cache() is None
+            cache_directory(home).mkdir()
+            assert state.read_checkout_cache() is None
+            (cache_directory(home) / "checkouts.json").write_bytes(b"{}")
+            assert state.read_checkout_cache() == b"{}"
+            assert state.checkout_cache_path() == cache_directory(home) / "checkouts.json"
+
+
+def test_cache_reads_refuse_links_non_files_and_oversized_files():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            cache = cache_directory(home)
+            cache.mkdir(parents=True)
+            target = cache / "checkouts.json"
+            target.mkdir()
+            with pytest.raises(state.CheckoutCacheError):
+                state.read_checkout_cache()
+            target.rmdir()
+            target.write_bytes(b" " * state.CHECKOUT_CACHE_MAX_BYTES)
+            assert len(state.read_checkout_cache() or b"") == state.CHECKOUT_CACHE_MAX_BYTES
+            target.write_bytes(b" " * (state.CHECKOUT_CACHE_MAX_BYTES + 1))
+            with pytest.raises(state.CheckoutCacheError):
+                state.read_checkout_cache()
+            target.unlink()
+            valid = root / "valid.json"
+            valid.write_bytes(b"{}")
+            try:
+                target.symlink_to(valid)
+            except OSError:
+                pytest.skip("this lane does not grant the symbolic-link privilege")
+            with pytest.raises(state.CheckoutCacheError):
+                state.read_checkout_cache()
+
+
+def test_cache_directory_that_is_a_link_is_refused_for_reads_and_writes():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        external = root / "external"
+        external.mkdir()
+        (external / "checkouts.json").write_bytes(b"{}")
+        (home / ".nyx").mkdir()
+        try:
+            cache_directory(home).symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("this lane does not grant the symbolic-link privilege")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            with pytest.raises(state.CheckoutCacheError):
+                state.read_checkout_cache()
+            with pytest.raises(state.CheckoutCacheError):
+                state.write_checkout_cache(b"{}", deadline_ns=time.monotonic_ns() + 10**10)
+        assert (external / "checkouts.json").read_bytes() == b"{}"
+        assert sorted(item.name for item in external.iterdir()) == ["checkouts.json"]
+
+
+def test_cache_write_never_creates_the_state_directory_but_creates_cache():
+    with TemporaryDirectory() as temporary:
+        home = isolated_home(Path(temporary))
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            deadline = time.monotonic_ns() + 10**10
+            assert state.write_checkout_cache(b"{}", deadline_ns=deadline) is False
+            assert list(home.iterdir()) == []
+            (home / ".nyx").mkdir()
+            assert state.write_checkout_cache(b"{}", deadline_ns=deadline) is True
+            assert sorted(item.name for item in (home / ".nyx").iterdir()) == ["cache"]
+            assert sorted(item.name for item in cache_directory(home).iterdir()) == ["checkouts.json"]
+            assert state.read_checkout_cache() == b"{}"
+
+
+def test_cache_write_after_the_deadline_creates_nothing():
+    with TemporaryDirectory() as temporary:
+        home = isolated_home(Path(temporary))
+        (home / ".nyx").mkdir()
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch, pytest.raises(state.OperationDeadlineError):
+            state.write_checkout_cache(b"{}", deadline_ns=time.monotonic_ns() - 1)
+        assert list((home / ".nyx").iterdir()) == []
