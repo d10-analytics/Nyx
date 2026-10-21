@@ -1675,7 +1675,6 @@ class _Tip:
     own: int = 0
     merges: int = 0
     bases: list[str] | None = None
-    limited: bool = False
     cached: bool = False
     order: int = 0
 
@@ -1707,8 +1706,10 @@ class _Ladder:
         self._overlay: dict[str, str | None] = dict(settings.overlay)
         if base.alternate is not None:
             self._overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = base.alternate
-        # Own non-merge commits that yielded a patch ID, by tip.
-        self.own_commits: dict[str, frozenset[str]] = {}
+        # The scratch repository the merge checks run in, made on first use.
+        self._merge_repository: str | _Outcome | None = None
+        self._base_tree: bytes | None = None
+        self._confirmed: dict[str, bool] = {}
 
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
@@ -1903,7 +1904,6 @@ class _Ladder:
                 tip.verdict = _merged("ancestor")
                 continue
             if tip.own > OWN_COMMIT_CAP or tip.left > COMPARISON_CAP:
-                tip.limited = True
                 tip.verdict = _unknown("history_limit")
                 continue
             merges = self._git(["rev-list", "--merges", "--count", f"{base}..{tip.sha}"])
@@ -1981,7 +1981,6 @@ class _Ladder:
                 shared = ceiling_commit
                 break
             victim = victims.pop()
-            victim.limited = True
             victim.verdict = _unknown("history_limit")
             del active[victim]
         if not active:
@@ -2009,7 +2008,6 @@ class _Ladder:
             if isinstance(own, _Outcome):
                 tip.fail(_call_failure(own))
                 return
-            self.own_commits[tip.sha] = frozenset(own)
             if len(own) == tip.own and all(item in comparison for item in own.values()):
                 tip.verdict = _merged("patch_equivalent")
                 return
@@ -2048,7 +2046,6 @@ def _cached_base(context: _CloneContext, name: str | None) -> _Base | None:
 class _CloneVerdicts:
     """What one clone's verdict work leaves for the rest of the collection."""
 
-    own_commits: Mapping[str, frozenset[str]] = field(default_factory=dict)
     used: frozenset[str] = frozenset()
     fresh: Mapping[str, str] = field(default_factory=dict)
 
@@ -2063,7 +2060,7 @@ def _assign_clone_verdicts(
 ) -> _CloneVerdicts:
     """Write one clone's ``verdict_base`` and every verdict.
 
-    Returns its own-commit sets and the cache keys the verdicts used or decided.
+    Returns the cache keys the verdicts used or decided.
     """
     detached = [
         worktree
@@ -2090,7 +2087,7 @@ def _assign_clone_verdicts(
         branch["verdict"] = dict(decided[branch["sha"]])
     for worktree in detached:
         worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
-    return _CloneVerdicts(ladder.own_commits, frozenset(ladder.used), dict(ladder.fresh))
+    return _CloneVerdicts(frozenset(ladder.used), dict(ladder.fresh))
 
 
 def _assign_verdicts(
@@ -2106,8 +2103,8 @@ def _assign_verdicts(
 
     A clone the live comparisons did not reach takes its base from its cached
     ``origin/HEAD`` target, or the name its group's clones agree on.
-    Returns each clone's own-commit sets and cache keys for reuse inside the
-    module.  ``cache`` is only read here; the caller writes it afterwards.
+    Returns each clone's cache keys for the caller's cache write.  ``cache`` is
+    only read here; the caller writes it afterwards.
     """
     jobs: list[tuple[dict[str, Any], _CloneContext, _Base | None]] = []
     for repository in repositories:
