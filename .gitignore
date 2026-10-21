@@ -14,4 +14,3 @@ venv/
 env/
 .env
 .claude/
-AGENTS.md
