@@ -2270,10 +2270,16 @@ def collect_checkouts(
         bases: dict[str, _Base | None] = {}
         if remote_checks:
             bases = _check_remotes(runner, repositories, contexts, max_parallel)
-        cache_path = str(checkout_cache_path())
-        # A path the document cannot carry makes the cache unavailable.
-        use_cache = _representable(cache_path)
-        cache = _load_cache(cache_path, diagnostics) if use_cache else {}
+        # An account home that cannot be resolved, or a path the document
+        # cannot carry, makes the cache unavailable: no read, no write and no
+        # diagnostic, since there is no path to report.
+        try:
+            cache_path: str | None = str(checkout_cache_path())
+        except (StateError, OSError):
+            cache_path = None
+        if cache_path is not None and not _representable(cache_path):
+            cache_path = None
+        cache = _load_cache(cache_path, diagnostics) if cache_path is not None else {}
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
@@ -2286,7 +2292,7 @@ def collect_checkouts(
                 max_parallel,
                 cache,
             )
-        if use_cache:
+        if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, deadline_ns, diagnostics)
 
     unique_diagnostics = {
