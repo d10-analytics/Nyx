@@ -3535,3 +3535,73 @@ def test_a_merged_ref_moved_to_an_unmerged_commit_keeps_its_recorded_tip(tmp_pat
     assert done.exists()
     assert moved["sha"] == tip
     assert verdict_tuple(moved["verdict"]) == MERGED_ANCESTOR
+
+
+def test_the_shared_range_cap_evicts_the_largest_branch_even_when_it_comes_first(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "line-a", "trunk")
+    commit_file(work, "a1.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "a-fork")
+    commit_file(work, "a-fork.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "line-b", "trunk")
+    for number in (1, 2, 3, 4):
+        commit_file(work, f"b{number}.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "b-fork")
+    commit_file(work, "b-fork.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge a", "line-a")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge b", "line-b")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "line-a", "line-b")
+    larger = git(work, "rev-list", "--count", "a-fork..origin/trunk").stdout.strip()
+    smaller = git(work, "rev-list", "--count", "b-fork..origin/trunk").stdout.strip()
+    assert (int(larger), int(smaller)) == (6, 3)
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 4)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["a-fork"] == unknown("history_limit")
+    assert verdicts["b-fork"] == NOT_MERGED
+
+
+def test_the_comparison_cap_limits_a_branch_far_behind_the_base(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "far", "trunk")
+    commit_file(work, "far.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c1.txt", "x\n")
+    commit_file(work, "c2.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "near")
+    commit_file(work, "near.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c3.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    monkeypatch.setattr(checkouts, "COMPARISON_CAP", 2)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["far"] == unknown("history_limit")
+    assert verdicts["near"] == NOT_MERGED
+
+
+def test_a_partial_clone_proves_a_strict_ancestor_without_fetching(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    push_commit(remote, "trunk", tmp_path / "s1")
+    push_commit(remote, "trunk", tmp_path / "s2")
+    partial = clone(f"file://{remote}", folder / "partial", "--filter=blob:none")
+    git(partial, "branch", "older", "origin/trunk~1")
+    assert rev(partial, "older") != rev(partial, "origin/trunk")
+    before = (object_files(partial), pack_listing(partial))
+
+    item = find_clone(collect([folder]), partial)
+
+    assert item["partial_clone"] is True
+    assert verdicts_of(item)["older"] == MERGED_ANCESTOR
+    assert (object_files(partial), pack_listing(partial)) == before
