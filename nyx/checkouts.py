@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -60,12 +61,19 @@ MAX_PARALLEL_CLONES = 8
 GIT_FLOOR = (2, 36)
 # Git before this release hashes a binary change in ``patch-id`` without its
 # object IDs, so two different changes to one binary file get the same patch ID.
-# It also has ``patch-id --verbatim`` and ``merge-tree --write-tree``, which the
-# patch rungs need to tell changes apart exactly and to confirm where they apply.
+# It also has ``patch-id --verbatim``, which the patch rungs need to tell
+# changes apart exactly.
 PATCH_FLOOR = (2, 39)
 OWN_COMMIT_CAP = 2000
 COMPARISON_CAP = 5000
 SHARED_RANGE_CAP = 5000
+# Bounds of the check that a matching change landed where the branch made it:
+# base commits tried per patch identity, paths in one change, paths whose
+# contents must be merged, and bytes of one file read for that merge.
+LANDING_CAP = 8
+CONFIRM_PATH_CAP = 5000
+MERGE_PATH_CAP = 16
+MERGE_FILE_CAP = 1 << 20
 # The verdict cache keeps at most this many entries; the file stays
 # far below the reader's byte bound because an entry is at most about 190 bytes.
 CACHE_ENTRY_CAP = 8192
@@ -1578,6 +1586,13 @@ _PATCH_FLAGS = (
     "--dst-prefix=b/",
 )
 _PATCH_ID = re.compile(r"([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64})")
+# One raw ``diff-tree -z`` record: old and new mode, old and new object, status.
+_RAW_CHANGE = re.compile(
+    rb":([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [A-Z][0-9]*"
+)
+_ZERO_MODE = re.compile(rb"0+")
+# A path's mode and object before and after a change; ``None`` where it is absent.
+_PathChange = tuple[tuple[bytes, bytes] | None, tuple[bytes, bytes] | None]
 _OCTOPUS_CHUNK = 200
 
 
@@ -1658,6 +1673,14 @@ def _integers(data: bytes, count: int) -> list[int] | None:
     return [int(item) for item in fields]
 
 
+class _Unconfirmed(Exception):
+    """A step of the landing check failed or exceeded a bound; ``reason`` names it."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass(eq=False)
 class _Tip:
     """One distinct commit awaiting a verdict, with what the ladder learns of it.
@@ -1703,10 +1726,9 @@ class _Ladder:
         self._overlay: dict[str, str | None] = dict(settings.overlay)
         if base.alternate is not None:
             self._overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = base.alternate
-        # The scratch repository the merge checks run in, made on first use.
-        self._merge_repository: str | _Outcome | None = None
-        self._base_tree: bytes | None = None
-        self._confirmed: dict[str, bool] = {}
+        # What the landing check read, kept so a commit or blob is read once.
+        self._change_sets: dict[tuple[str, ...], dict[bytes, _PathChange]] = {}
+        self._blobs: dict[str, bytes] = {}
 
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
@@ -1999,131 +2021,185 @@ class _Ladder:
         if not listing.ok:
             tip.fail(_call_failure(listing))
             return
-        comparison = {
-            mapped[item]
-            for item in listing.out.decode("ascii", "replace").split()
-            if item in mapped
-        }
-        if tip.merges == 0:
-            own = self._patch_ids([f"{base}..{tip.sha}"])
-            if isinstance(own, _Outcome):
-                tip.fail(_call_failure(own))
-                return
-            if len(own) == tip.own and all(item in comparison for item in own.values()):
-                applied = self._applied(tip)
-                if applied is None:
+        # The base commits (newest first) behind each patch identity.
+        landings: dict[str, list[str]] = {}
+        for item in listing.out.decode("ascii", "replace").split():
+            if item in mapped:
+                landings.setdefault(mapped[item], []).append(item)
+        try:
+            if tip.merges == 0:
+                own = self._patch_ids([f"{base}..{tip.sha}"])
+                if isinstance(own, _Outcome):
+                    tip.fail(_call_failure(own))
                     return
-                if applied:
+                if (
+                    len(own) == tip.own
+                    and all(item in landings for item in own.values())
+                    and all(
+                        self._landed(lambda commit=commit: self._commit_changes(commit), identity, landings)
+                        for commit, identity in own.items()
+                    )
+                ):
                     tip.verdict = _merged("patch_equivalent")
                     return
-        if tip.bases is not None and len(tip.bases) == 1:
-            identified = self._stream(
-                ["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"], ["patch-id", "--verbatim"]
-            )
-            fields = identified.out.split() if identified.ok else []
-            if not identified.ok:
-                tip.fail(_call_failure(identified))
-            elif fields and fields[0].decode("ascii", "replace") in comparison:
-                applied = self._applied(tip)
-                if applied:
+            if tip.bases is not None and len(tip.bases) == 1:
+                identified = self._stream(
+                    ["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"],
+                    ["patch-id", "--verbatim"],
+                )
+                fields = identified.out.split() if identified.ok else []
+                if not identified.ok:
+                    tip.fail(_call_failure(identified))
+                    return
+                identity = fields[0].decode("ascii", "replace") if fields else ""
+                if identity in landings and self._landed(
+                    lambda: self._range_changes(tip.bases[0], tip.sha), identity, landings
+                ):
                     tip.verdict = _merged("squash_equivalent")
+        except _Unconfirmed as failure:
+            tip.fail(failure.reason)
 
-    # -- where a matching change applies ---------------------------------
+    # -- where a matching change landed ------------------------------------
 
-    def _applied(self, tip: _Tip) -> bool | None:
-        """Whether merging the tip into the base changes nothing, once per tip.
+    def _landed(
+        self,
+        branch: Callable[[], dict[bytes, _PathChange]],
+        identity: str,
+        landings: Mapping[str, list[str]],
+    ) -> bool:
+        """Whether one base commit with this patch identity made the branch's change.
 
         A patch identity ignores where a change lands, so a match proves the
-        change only when the merge finds it already in the base.  ``None``
-        means a step failed and the tip carries its error.
+        change only when a commit with that identity made exactly the branch's
+        change: its parent-to-commit change is the branch's change, or merging
+        the branch's change into the commit's parent gives the commit.  Nothing
+        is written anywhere; only objects are read and plain temporary files made.
         """
-        known = self._confirmed.get(tip.sha)
-        if known is None:
-            known = self._merge_changes_nothing(tip)
-            if known is not None:
-                self._confirmed[tip.sha] = known
-        return known
+        candidates = landings[identity]
+        changes = branch()
+        for commit in candidates[:LANDING_CAP]:
+            if self._same_change(changes, self._commit_changes(commit)):
+                return True
+        if len(candidates) > LANDING_CAP:
+            raise _Unconfirmed("history_limit")
+        return False
 
-    def _merge_scratch(self) -> str | _Outcome:
-        """A scratch repository sharing the clone's objects, made on first use.
+    def _commit_changes(self, commit: str) -> dict[bytes, _PathChange]:
+        """The paths a non-merge commit changes, against its parent or the empty tree."""
+        return self._changes(("commit", commit), ["--root", commit])
 
-        The merge writes the objects of its result, so it runs in an empty bare
-        repository that borrows the clone's object directory (and the lender's)
-        and the clone itself stays untouched.  Its own configuration and
-        attributes are empty, so no merge driver of the clone can run.
+    def _range_changes(self, old: str, new: str) -> dict[bytes, _PathChange]:
+        return self._changes(("range", old, new), [old, new])
+
+    def _changes(
+        self, key: tuple[str, ...], revisions: Sequence[str]
+    ) -> dict[bytes, _PathChange]:
+        known = self._change_sets.get(key)
+        if known is not None:
+            return known
+        outcome = self._git(
+            [
+                "diff-tree", "-r", "-z", "--raw", "--no-abbrev", "--no-renames",
+                "--no-commit-id", "--no-ext-diff", "--ignore-submodules=none",
+                *revisions, "--",
+            ]
+        )  # fmt: skip
+        if not outcome.ok:
+            raise _Unconfirmed(_call_failure(outcome))
+        fields = outcome.out.split(b"\0")
+        if fields and not fields[-1]:
+            fields.pop()
+        if len(fields) % 2 or len(fields) // 2 > CONFIRM_PATH_CAP:
+            raise _Unconfirmed("failed" if len(fields) % 2 else "history_limit")
+        result: dict[bytes, _PathChange] = {}
+        for index in range(0, len(fields), 2):
+            matched = _RAW_CHANGE.fullmatch(fields[index])
+            if matched is None:
+                raise _Unconfirmed("failed")
+            result[fields[index + 1]] = tuple(  # type: ignore[assignment]
+                None if _ZERO_MODE.fullmatch(mode) else (mode, oid)
+                for mode, oid in (matched.group(1, 3), matched.group(2, 4))
+            )
+        self._change_sets[key] = result
+        return result
+
+    def _blob(self, oid: bytes) -> bytes:
+        name = oid.decode("ascii")
+        known = self._blobs.get(name)
+        if known is not None:
+            return known
+        size = self._git(["cat-file", "-s", name])
+        counted = _integers(size.out, 1) if size.ok else None
+        if counted is None:
+            raise _Unconfirmed(_call_failure(size))
+        if counted[0] > MERGE_FILE_CAP:
+            raise _Unconfirmed("history_limit")
+        content = self._git(["cat-file", "blob", name])
+        if not content.ok:
+            raise _Unconfirmed(_call_failure(content))
+        self._blobs[name] = content.out
+        return content.out
+
+    def _same_change(
+        self, branch: Mapping[bytes, _PathChange], landed: Mapping[bytes, _PathChange]
+    ) -> bool:
+        """Whether the landed commit's change is the branch's, path by path.
+
+        A path agrees when the commit left the file as the branch's change does,
+        or, for text files, when merging the branch's change into the file the
+        commit started from gives the file the commit left.
         """
-        if self._merge_repository is not None:
-            return self._merge_repository
-        source = self._git(["rev-parse", "--path-format=absolute", "--git-path", "objects"])
-        lines = source.out.splitlines() if source.ok else []
-        if len(lines) != 1:
-            self._merge_repository = source if not source.ok else _Outcome(1)
-            return self._merge_repository
-        try:
-            target = tempfile.mkdtemp(prefix="merge-", dir=self._settings.scratch)
-        except OSError:
-            self._merge_repository = _Outcome(1)
-            return self._merge_repository
-        digest = "sha256" if len(self._base.sha) == 64 else "sha1"
-        made = self._runner.run(
-            self._args(
-                ["init", "--bare", "--quiet", "--template=", f"--object-format={digest}", target]
-            ),
-            path=self._settings.scratch,
-            overlay=self._settings.overlay,
-        )
-        if not made.ok:
-            self._merge_repository = made
-            return made
-        quoted = lines[0].replace(b"\\", b"\\\\").replace(b'"', b'\\"').replace(b"\n", b"\\n")
-        try:
-            with open(os.path.join(target, "objects", "info", "alternates"), "wb") as handle:
-                handle.write(b'"' + quoted + b'"\n')
-        except OSError:
-            self._merge_repository = _Outcome(1)
-            return self._merge_repository
-        self._merge_repository = target
-        return target
+        if branch.keys() != landed.keys():
+            return False
+        merges: list[tuple[bytes, bytes, bytes, bytes]] = []
+        for path, (before, after) in branch.items():
+            start, end = landed[path]
+            if after == end:
+                continue
+            regular = {b"100644", b"100755"}
+            entries = (before, start, after, end)
+            if any(entry is None for entry in entries):
+                return False
+            modes = {entry[0] for entry in entries}  # type: ignore[index]
+            if len(modes) != 1 or not modes <= regular:
+                return False
+            # Merging onto an unchanged or already-final file cannot give the end.
+            if start == before or start == after:
+                return False
+            merges.append(tuple(entry[1] for entry in entries))  # type: ignore[index,arg-type]
+        if len(merges) > MERGE_PATH_CAP:
+            raise _Unconfirmed("history_limit")
+        return all(self._merges_to(*group) for group in merges)
 
-    def _merge_changes_nothing(self, tip: _Tip) -> bool | None:
-        if not tip.bases:
-            # Histories sharing no commit cannot be merged without an option
-            # newer than the patch floor, so nothing confirms the match.
+    def _merges_to(self, before: bytes, start: bytes, after: bytes, end: bytes) -> bool:
+        """Whether ``git merge-file`` of ``after`` onto ``start`` (base ``before``) is ``end``."""
+        contents = [self._blob(oid) for oid in (start, before, after, end)]
+        if any(b"\0" in item for item in contents[:3]):
             return False
-        repository = self._merge_scratch()
-        if isinstance(repository, _Outcome):
-            tip.fail(_call_failure(repository))
-            return None
-        if self._base_tree is None:
-            tree = self._git(["rev-parse", f"{self._base.sha}^{{tree}}"])
-            fields = tree.out.split() if tree.ok else []
-            if len(fields) != 1:
-                tip.fail(_call_failure(tree))
-                return None
-            self._base_tree = fields[0]
-        merged = self._runner.run(
-            self._args(
-                [
-                    "--git-dir=" + repository,
-                    "merge-tree",
-                    "--write-tree",
-                    "--no-messages",
-                    self._base.sha,
-                    tip.sha,
-                ]
-            ),
-            path=self._settings.scratch,
-            ceiling=self._settings.scratch,
-            overlay=self._overlay,
-        )
-        # Exit 1 is a conflict: the tip's change is not already in the base.
-        if merged.code == 1 and not merged.timed_out:
-            return False
-        fields = merged.out.split() if merged.ok else []
-        if len(fields) != 1:
-            tip.fail(_call_failure(merged))
-            return None
-        return fields[0] == self._base_tree
+        try:
+            folder = tempfile.mkdtemp(prefix="merge-", dir=self._settings.scratch)
+        except OSError as error:
+            raise _Unconfirmed("failed") from error
+        try:
+            names = ["ours", "base", "theirs"]
+            try:
+                for name, item in zip(names, contents):
+                    with open(os.path.join(folder, name), "wb") as handle:
+                        handle.write(item)
+            except OSError as error:
+                raise _Unconfirmed("failed") from error
+            merged = self._runner.run(
+                self._args(["merge-file", "-p", "--no-diff3", *names]),
+                path=folder,
+                ceiling=self._settings.scratch,
+                overlay=self._settings.overlay,
+            )
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        if merged.timed_out or merged.code is None or merged.code < 0 or merged.code >= 128:
+            raise _Unconfirmed(_call_failure(merged))
+        # A positive count is the conflicts of the merge: the change is not there.
+        return merged.code == 0 and merged.out == contents[3]
 
     # -- tree rung ------------------------------------------------------
 
