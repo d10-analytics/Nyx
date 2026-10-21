@@ -32,17 +32,27 @@ from .models import (
     CHECKOUTS_DIGEST_OMITTED,
     CHECKOUTS_SCHEMA_VERSION,
     OPERATIONS,
+    ProtocolError,
+    _keys,
+    _object,
     _safe_text,
     branch_sort_key,
     canonical_digest,
     clone_sort_key,
     diagnostic_sort_key,
     folder_sort_key,
+    load_strict_json,
     natural_key,
     repository_sort_key,
     worktree_sort_key,
 )
-from .state import _is_reparse_or_link
+from .state import (
+    StateError,
+    _is_reparse_or_link,
+    checkout_cache_path,
+    read_checkout_cache,
+    write_checkout_cache,
+)
 
 CALL_CAP_SECONDS = 10.0
 MAX_PARALLEL_CLONES = 8
@@ -53,6 +63,11 @@ PATCH_FLOOR = (2, 39)
 OWN_COMMIT_CAP = 2000
 COMPARISON_CAP = 5000
 SHARED_RANGE_CAP = 5000
+# The verdict cache keeps at most this many entries (``D-05``); the file stays
+# far below the reader's byte bound because an entry is at most about 190 bytes.
+CACHE_ENTRY_CAP = 8192
+# Verdict git calls stop this long before the deadline so the cache write has time.
+VERDICT_RESERVE_NS = 500_000_000
 
 _ON_WINDOWS = os.name == "nt"
 _GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
@@ -143,6 +158,12 @@ class _GitRunner:
         self._deadline_ns = deadline_ns
         self._call_cap = call_cap
         self._removed = _FALLBACK_LOCAL_ENVIRONMENT
+
+    def with_deadline(self, deadline_ns: int) -> _GitRunner:
+        """A runner with the same isolation and learned environment but another deadline."""
+        other = _GitRunner(self._executable, deadline_ns, self._call_cap)
+        other._removed = self._removed
+        return other
 
     def learn_local_environment(self) -> None:
         outcome = self.run(["rev-parse", "--local-env-vars"])
@@ -1621,6 +1642,8 @@ def _unknown(reason: str) -> dict[str, Any]:
 
 
 _NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None}
+# The rungs a cache entry may hold; ``ancestor`` and every ``unknown`` never.
+CACHE_RUNGS = frozenset({"patch_equivalent", "squash_equivalent", "tree_equal", "none"})
 
 
 def _call_failure(outcome: _Outcome) -> str:
@@ -1646,6 +1669,7 @@ class _Tip:
     merges: int = 0
     bases: list[str] | None = None
     limited: bool = False
+    cached: bool = False
 
     def fail(self, reason: str) -> None:
         if self.error is None:
@@ -1661,11 +1685,17 @@ class _Ladder:
         context: _CloneContext,
         base: _Base,
         settings: _VerdictSettings,
+        cache: Mapping[str, tuple[str, int]] | None = None,
     ) -> None:
         self._runner = runner
         self._context = context
         self._base = base
         self._settings = settings
+        self._cache = cache or {}
+        # Cache keys that stood in for a verdict, and entries decided by a
+        # complete computation in this collection (key -> rung).
+        self.used: set[str] = set()
+        self.fresh: dict[str, str] = {}
         self._overlay: dict[str, str | None] = dict(settings.overlay)
         if base.alternate is not None:
             self._overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = base.alternate
@@ -1713,8 +1743,15 @@ class _Ladder:
         for sha in [sha for _, sha in branches] + list(detached):
             tips.setdefault(sha, _Tip(sha))
         self._ancestors(tips, branches, detached)
+        incomplete = self._context.shallow or self._context.partial
+        # With the patch rungs available, or no rung beyond ``ancestor`` able to
+        # run, a cached verdict cannot replace one the cold run decides, so the
+        # lookup precedes the size checks.  Otherwise it follows ``tree_equal``.
+        early = self._settings.patch_rungs or incomplete
+        if early:
+            self._lookup(tips)
         pending = [tip for tip in tips.values() if tip.verdict is None and tip.error is None]
-        if pending and (self._context.shallow or self._context.partial):
+        if pending and incomplete:
             for tip in pending:
                 tip.verdict = _unknown("incomplete_clone")
             pending = []
@@ -1725,6 +1762,10 @@ class _Ladder:
             # A tip whose earlier step failed stays unproven: no later rung decides it.
             if tip.verdict is None and tip.error is None and self._tree_equal(tip):
                 tip.verdict = _merged("tree_equal")
+        if not early:
+            self._lookup(tips)
+        complete = self._settings.patch_rungs and not incomplete
+        base_sha = self._base.sha
         result: dict[str, dict[str, Any]] = {}
         for sha, tip in tips.items():
             if tip.verdict is None:
@@ -1734,8 +1775,28 @@ class _Ladder:
                     tip.verdict = _unknown("git_too_old")
                 else:
                     tip.verdict = dict(_NOT_MERGED)
+            if (
+                complete
+                and not tip.cached
+                and tip.verdict["rung"] in CACHE_RUNGS
+                and len(sha) == len(base_sha)
+            ):
+                self.fresh[f"{sha}.{base_sha}"] = tip.verdict["rung"]
             result[sha] = tip.verdict
         return result
+
+    def _lookup(self, tips: Mapping[str, _Tip]) -> None:
+        """Let a cached verdict stand in for a tip left undecided or ``unknown``."""
+        for sha, tip in tips.items():
+            if tip.verdict is not None and tip.verdict["state"] != "unknown":
+                continue
+            key = f"{sha}.{self._base.sha}"
+            entry = self._cache.get(key)
+            if entry is None:
+                continue
+            tip.verdict = dict(_NOT_MERGED) if entry[0] == "none" else _merged(entry[0])
+            tip.cached = True
+            self.used.add(key)
 
     # -- step 1 ---------------------------------------------------------
 
@@ -1950,14 +2011,27 @@ def _cached_base(context: _CloneContext, name: str | None) -> _Base | None:
     return _Base(name, sha, "cached", None, None) if name is not None and sha else None
 
 
+@dataclass(frozen=True)
+class _CloneVerdicts:
+    """What one clone's verdict work leaves for the rest of the collection."""
+
+    own_commits: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    used: frozenset[str] = frozenset()
+    fresh: Mapping[str, str] = field(default_factory=dict)
+
+
 def _assign_clone_verdicts(
     runner: _GitRunner,
     clone: dict[str, Any],
     context: _CloneContext,
     base: _Base | None,
     settings: _VerdictSettings,
-) -> dict[str, frozenset[str]]:
-    """Write one clone's ``verdict_base`` and every verdict; return its own-commit sets."""
+    cache: Mapping[str, tuple[str, int]],
+) -> _CloneVerdicts:
+    """Write one clone's ``verdict_base`` and every verdict.
+
+    Returns its own-commit sets and the cache keys the verdicts used or decided.
+    """
     detached = [
         worktree
         for worktree in clone["worktrees"]
@@ -1969,12 +2043,12 @@ def _assign_clone_verdicts(
             branch["verdict"] = _unknown("no_base")
         for worktree in detached:
             worktree["verdict"] = _unknown("no_base")
-        return {}
+        return _CloneVerdicts()
     clone["verdict_base"] = base.document()
     subjects = [branch for branch in clone["branches"] if branch["name"] != base.name]
     if not subjects and not detached:
-        return {}
-    ladder = _Ladder(runner, context, base, settings)
+        return _CloneVerdicts()
+    ladder = _Ladder(runner, context, base, settings, cache)
     decided = ladder.decide(
         [(branch["name"], branch["sha"]) for branch in subjects],
         [worktree["head"]["sha"] for worktree in detached],
@@ -1983,7 +2057,7 @@ def _assign_clone_verdicts(
         branch["verdict"] = dict(decided[branch["sha"]])
     for worktree in detached:
         worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
-    return ladder.own_commits
+    return _CloneVerdicts(ladder.own_commits, frozenset(ladder.used), dict(ladder.fresh))
 
 
 def _assign_verdicts(
@@ -1993,12 +2067,14 @@ def _assign_verdicts(
     bases: Mapping[str, _Base | None],
     settings: _VerdictSettings,
     max_parallel: int,
-) -> dict[str, dict[str, frozenset[str]]]:
+    cache: Mapping[str, tuple[str, int]],
+) -> dict[str, _CloneVerdicts]:
     """Give every usable clone its verdict base and verdicts, one clone per task.
 
     A clone the live comparisons did not reach takes its base from its cached
     ``origin/HEAD`` target, or the name its group's clones agree on.
-    Returns each clone's own-commit sets for reuse inside the module.
+    Returns each clone's own-commit sets and cache keys for reuse inside the
+    module.  ``cache`` is only read here; the caller writes it afterwards.
     """
     jobs: list[tuple[dict[str, Any], _CloneContext, _Base | None]] = []
     for repository in repositories:
@@ -2019,12 +2095,107 @@ def _assign_verdicts(
                 base = _cached_base(context, name)
             jobs.append((clone, context, base))
 
-    def decide(job: tuple[dict[str, Any], _CloneContext, _Base | None]) -> tuple[str, dict[str, frozenset[str]]]:
+    def decide(job: tuple[dict[str, Any], _CloneContext, _Base | None]) -> tuple[str, _CloneVerdicts]:
         clone, context, base = job
-        return clone["path"], _assign_clone_verdicts(runner, clone, context, base, settings)
+        return clone["path"], _assign_clone_verdicts(runner, clone, context, base, settings, cache)
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         return dict(pool.map(decide, jobs))
+
+
+_CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
+_CACHE_KEYS = frozenset({"schema_version", "verdicts"})
+_CACHE_ENTRY_KEYS = frozenset({"rung", "at"})
+
+
+def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
+    """Validate the cache file strictly; any deviation raises ``ProtocolError``."""
+    document = _object(load_strict_json(data, "checkout cache"), "checkout cache")
+    _keys(document, _CACHE_KEYS, "checkout cache")
+    version = document["schema_version"]
+    if type(version) is not int or version != 1:
+        raise ProtocolError("checkout cache schema_version is unsupported")
+    verdicts = _object(document["verdicts"], "checkout cache verdicts")
+    if len(verdicts) > CACHE_ENTRY_CAP:
+        raise ProtocolError("checkout cache has too many entries")
+    entries: dict[str, tuple[str, int]] = {}
+    for key, raw in verdicts.items():
+        if _CACHE_KEY.fullmatch(key) is None:
+            raise ProtocolError("checkout cache key is invalid")
+        entry = _object(raw, "checkout cache entry")
+        _keys(entry, _CACHE_ENTRY_KEYS, "checkout cache entry")
+        rung, at = entry["rung"], entry["at"]
+        if type(rung) is not str or rung not in CACHE_RUNGS:
+            raise ProtocolError("checkout cache rung is invalid")
+        if type(at) is not int or at < 0:
+            raise ProtocolError("checkout cache time is invalid")
+        entries[key] = (rung, at)
+    return entries
+
+
+def _cache_bytes(entries: Mapping[str, tuple[str, int]]) -> bytes:
+    document = {
+        "schema_version": 1,
+        "verdicts": {key: {"rung": rung, "at": at} for key, (rung, at) in entries.items()},
+    }
+    return (
+        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _load_cache(path: str, diagnostics: list[dict[str, Any]]) -> dict[str, tuple[str, int]]:
+    """Read the cache once; a missing ``~/.nyx`` or file is empty, a bad file is a diagnostic."""
+    try:
+        data = read_checkout_cache()
+        return {} if data is None else _parse_cache(data)
+    except (StateError, ProtocolError, OSError):
+        diagnostics.append({"code": "checkout_cache_unreadable", "path": path})
+        return {}
+
+
+def _store_cache(
+    path: str,
+    results: Iterable[_CloneVerdicts],
+    loaded: Mapping[str, tuple[str, int]],
+    deadline_ns: int,
+    diagnostics: list[dict[str, Any]],
+) -> None:
+    """Merge this collection's new verdicts into the file with one atomic write.
+
+    Nothing new, nothing written. The file is read again so entries another
+    process stored meanwhile survive; a lost race only loses entries, which are
+    recomputed.
+    """
+    fresh: dict[str, str] = {}
+    used: set[str] = set()
+    for result in results:
+        fresh.update(result.fresh)
+        used |= result.used
+    if not fresh:
+        return
+    try:
+        try:
+            existing = read_checkout_cache()
+            current = {} if existing is None else _parse_cache(existing)
+        except (StateError, ProtocolError, OSError):
+            existing, current = None, {}
+        now = int(time.time())
+        merged = dict(current)
+        for key in used:
+            if key not in merged and key in loaded:
+                merged[key] = loaded[key]
+        for key, rung in fresh.items():
+            if key not in current or current[key][0] != rung:
+                merged[key] = (rung, now)
+        kept = sorted(
+            merged.items(),
+            key=lambda item: (item[0] not in used and item[0] not in fresh, -item[1][1], item[0]),
+        )[:CACHE_ENTRY_CAP]
+        payload = _cache_bytes(dict(kept))
+        if payload != existing:
+            write_checkout_cache(payload, deadline_ns=deadline_ns)
+    except (StateError, ValueError, OSError):
+        diagnostics.append({"code": "checkout_cache_write_failed", "path": path})
 
 
 def _render(document: dict[str, Any]) -> str:
@@ -2099,15 +2270,24 @@ def collect_checkouts(
         bases: dict[str, _Base | None] = {}
         if remote_checks:
             bases = _check_remotes(runner, repositories, contexts, max_parallel)
+        cache_path = str(checkout_cache_path())
+        # A path the document cannot carry makes the cache unavailable.
+        use_cache = _representable(cache_path)
+        cache = _load_cache(cache_path, diagnostics) if use_cache else {}
+        # Verdict calls stop early so the cache write still fits before the deadline.
+        verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
-            _assign_verdicts(
-                runner,
+            verdicts = _assign_verdicts(
+                verdict_runner,
                 repositories,
                 contexts,
                 bases,
                 _verdict_settings(scratch, git_state["version"]),
                 max_parallel,
+                cache,
             )
+        if use_cache:
+            _store_cache(cache_path, verdicts.values(), cache, deadline_ns, diagnostics)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics

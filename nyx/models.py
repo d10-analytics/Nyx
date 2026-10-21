@@ -810,7 +810,14 @@ _REMOTE_CHECKS = frozenset({"on", "off"})
 _FOLDER_KEYS = frozenset({"path", "status"})
 _FOLDER_STATUSES = frozenset({"ok", "missing", "unreadable", "not_directory"})
 _CHECKOUTS_DIAGNOSTIC_KEYS = frozenset({"code", "path"})
-CHECKOUTS_DIAGNOSTIC_CODES = frozenset({"not_a_repository", "unrepresentable_path"})
+CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
+    {
+        "not_a_repository",
+        "unrepresentable_path",
+        "checkout_cache_unreadable",
+        "checkout_cache_write_failed",
+    }
+)
 _REPOSITORY_KEYS = frozenset({"remote", "default_branch", "clones"})
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
