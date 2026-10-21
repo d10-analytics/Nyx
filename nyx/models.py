@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 1)
+# Checkout facts document (schema 2)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 1
+CHECKOUTS_SCHEMA_VERSION = 2
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 
 _NUMBER_RUN = re.compile(r"([0-9]+)")
@@ -832,22 +832,43 @@ _CLONE_KEYS = frozenset(
         "stash_count",
         "worktrees",
         "branches",
+        "verdict_base",
     }
 )
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
 _LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_live", "vs_cached"})
 _WORKTREE_KEYS = frozenset(
-    {"path", "main", "head", "locked", "prunable", "status", "changes", "operations", "index_lock"}
+    {
+        "path",
+        "main",
+        "head",
+        "locked",
+        "prunable",
+        "status",
+        "changes",
+        "operations",
+        "index_lock",
+        "verdict",
+    }
 )
 _HEAD_KEYS = frozenset({"branch", "sha"})
 _CHANGE_KEYS = frozenset({"staged", "unstaged", "untracked", "conflicted"})
 OPERATIONS = ("am", "bisect", "cherry_pick", "merge", "rebase", "revert")
 _BRANCH_KEYS = frozenset(
-    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote"}
+    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote", "verdict"}
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
+_VERDICT_BASE_KEYS = frozenset({"name", "sha", "basis", "objects_from"})
+_VERDICT_KEYS = frozenset({"state", "rung", "reason"})
+_VERDICT_STATES = frozenset({"merged", "not_merged", "unknown"})
+_VERDICT_MERGED_RUNGS = frozenset(
+    {"ancestor", "patch_equivalent", "squash_equivalent", "tree_equal"}
+)
+_VERDICT_UNKNOWN_REASONS = frozenset(
+    {"no_base", "incomplete_clone", "git_too_old", "history_limit", "deadline", "failed"}
+)
 _COMPARISON_RELATIONS = frozenset(
     {"equal", "ahead", "behind", "diverged", "differs", "absent", "unknown"}
 )
@@ -981,6 +1002,38 @@ def _comparison(value: Any, name: str, *, nullable: bool = False) -> None:
         raise ProtocolError(f"{name} counts contradict {relation}")
 
 
+def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
+    item = _object(value, name)
+    _keys(item, _VERDICT_KEYS, name)
+    state = _choice(item["state"], _VERDICT_STATES, f"{name}.state")
+    rung, reason = item["rung"], item["reason"]
+    if state == "merged":
+        _choice(rung, _VERDICT_MERGED_RUNGS, f"{name}.rung")
+        valid = reason is None
+    elif state == "not_merged":
+        valid = rung == "none" and reason is None
+    else:
+        _choice(reason, _VERDICT_UNKNOWN_REASONS, f"{name}.reason")
+        valid = rung is None
+    if not valid:
+        raise ProtocolError(f"{name} carries a rung or reason its state does not allow")
+
+
+def _verdict_base(value: Any, name: str) -> None:
+    if value is None:
+        return
+    item = _object(value, name)
+    _keys(item, _VERDICT_BASE_KEYS, name)
+    _text(item["name"], f"{name}.name")
+    _object_id(item["sha"], f"{name}.sha")
+    basis = _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
+    lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
+    if lender is not None and basis != "live":
+        raise ProtocolError(f"{name}.objects_from requires the live basis")
+
+
 def _head(value: Any, name: str) -> None:
     item = _object(value, name)
     _keys(item, _HEAD_KEYS, name)
@@ -998,7 +1051,7 @@ def _worktree(value: Any, name: str) -> dict[str, Any]:
     _bool(item["locked"], f"{name}.locked")
     prunable = _bool(item["prunable"], f"{name}.prunable")
     status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
-    nullable_fields = ("head", "changes", "operations", "index_lock")
+    nullable_fields = ("head", "changes", "operations", "index_lock", "verdict")
     if status != "ok":
         if any(item[field] is not None for field in nullable_fields):
             raise ProtocolError(f"{name} must leave its facts null when status is {status}")
@@ -1017,6 +1070,7 @@ def _worktree(value: Any, name: str) -> dict[str, Any]:
     ):
         raise ProtocolError(f"{name}.operations is invalid")
     _bool(item["index_lock"], f"{name}.index_lock")
+    _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     return item
 
 
@@ -1036,6 +1090,7 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
         raise ProtocolError(f"{name} compares with a remote the clone does not have")
     if has_remote and item["vs_remote"] is None:
         raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
+    _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     return item
 
 
@@ -1054,6 +1109,7 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
         "stash_count",
         "worktrees",
         "branches",
+        "verdict_base",
     )
     if status != "ok":
         if any(item[field] is not None for field in facts):
@@ -1064,6 +1120,7 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
     _bool(item["shallow"], f"{name}.shallow")
     _count(item["stash_count"], f"{name}.stash_count")
     _comparison(item["cached_vs_live"], f"{name}.cached_vs_live", nullable=True)
+    _verdict_base(item["verdict_base"], f"{name}.verdict_base")
 
     cached = item["cached_default"]
     local = item["local_default"]

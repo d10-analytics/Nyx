@@ -47,6 +47,12 @@ from .state import _is_reparse_or_link
 CALL_CAP_SECONDS = 10.0
 MAX_PARALLEL_CLONES = 8
 GIT_FLOOR = (2, 36)
+# Git before this release hashes a binary change in ``patch-id`` without its
+# object IDs, so two different changes to one binary file get the same patch ID.
+PATCH_FLOOR = (2, 39)
+OWN_COMMIT_CAP = 2000
+COMPARISON_CAP = 5000
+SHARED_RANGE_CAP = 5000
 
 _ON_WINDOWS = os.name == "nt"
 _GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
@@ -175,20 +181,17 @@ class _GitRunner:
             environment["GIT_CEILING_DIRECTORIES"] = ceiling
         return environment
 
-    def run(
+    def _timeout(self) -> float:
+        remaining = (self._deadline_ns - time.monotonic_ns()) / 1e9
+        return min(self._call_cap, remaining)
+
+    def _prepare(
         self,
         arguments: Sequence[str],
-        *,
-        path: str | None = None,
-        ceiling: str | None = None,
-        overlay: Mapping[str, str | None] | None = None,
-    ) -> _Outcome:
-        """Run one git command; ``overlay`` is applied after the scrub and fixed
-        variables of this call only, and a ``None`` value removes a variable."""
-        remaining = (self._deadline_ns - time.monotonic_ns()) / 1e9
-        timeout = min(self._call_cap, remaining)
-        if timeout <= 0:
-            return _Outcome(None, timed_out=True)
+        path: str | None,
+        ceiling: str | None,
+        overlay: Mapping[str, str | None] | None,
+    ) -> tuple[list[str], dict[str, str]]:
         environment = self._environment(ceiling)
         for name, value in (overlay or {}).items():
             if value is None:
@@ -199,13 +202,40 @@ class _GitRunner:
         if path is not None:
             command += ["-C", path]
         command += list(arguments)
+        return command, environment
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        path: str | None = None,
+        ceiling: str | None = None,
+        overlay: Mapping[str, str | None] | None = None,
+        stdin_bytes: bytes | None = None,
+    ) -> _Outcome:
+        """Run one git command; ``overlay`` is applied after the scrub and fixed
+        variables of this call only, and a ``None`` value removes a variable.
+        Standard input is closed unless ``stdin_bytes`` supplies it."""
+        timeout = self._timeout()
+        if timeout <= 0:
+            return _Outcome(None, timed_out=True)
+        command, environment = self._prepare(arguments, path, ceiling, overlay)
         # Output goes to temporary files, not pipes, so a program git started
         # and left behind cannot keep this call waiting after git is killed.
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        with (
+            tempfile.TemporaryFile() as out,
+            tempfile.TemporaryFile() as err,
+            tempfile.TemporaryFile() as supplied,
+        ):
+            stdin: Any = subprocess.DEVNULL
+            if stdin_bytes is not None:
+                supplied.write(stdin_bytes)
+                supplied.seek(0)
+                stdin = supplied
             try:
                 process = subprocess.Popen(
                     command,
-                    stdin=subprocess.DEVNULL,
+                    stdin=stdin,
                     stdout=out,
                     stderr=err,
                     env=environment,
@@ -221,6 +251,73 @@ class _GitRunner:
             out.seek(0)
             err.seek(0)
             return _Outcome(process.returncode, out.read(), err.read())
+
+    def pipeline(
+        self,
+        producer: Sequence[str],
+        consumer: Sequence[str],
+        *,
+        path: str,
+        ceiling: str,
+        overlay: Mapping[str, str | None] | None = None,
+    ) -> _Outcome:
+        """Run ``producer | consumer`` as two git processes started like ``run``.
+
+        Only the consumer's output is kept, in a temporary file; the producer
+        has closed standard input. Both processes are killed on timeout, and the
+        outcome succeeds only when both exit 0.
+        """
+        timeout = self._timeout()
+        if timeout <= 0:
+            return _Outcome(None, timed_out=True)
+        first_command, environment = self._prepare(producer, path, ceiling, overlay)
+        second_command, _ = self._prepare(consumer, path, ceiling, overlay)
+        with (
+            tempfile.TemporaryFile() as out,
+            tempfile.TemporaryFile() as first_err,
+            tempfile.TemporaryFile() as second_err,
+        ):
+            try:
+                first = subprocess.Popen(
+                    first_command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=first_err,
+                    env=environment,
+                )
+            except OSError:
+                return _Outcome(None)
+            assert first.stdout is not None
+            try:
+                second = subprocess.Popen(
+                    second_command,
+                    stdin=first.stdout,
+                    stdout=out,
+                    stderr=second_err,
+                    env=environment,
+                )
+            except OSError:
+                first.stdout.close()
+                first.kill()
+                first.wait()
+                return _Outcome(None)
+            first.stdout.close()
+            started = time.monotonic()
+            try:
+                second.wait(timeout=timeout)
+                first.wait(timeout=max(0.0, timeout - (time.monotonic() - started)))
+            except subprocess.TimeoutExpired:
+                for process in (first, second):
+                    process.kill()
+                    process.wait()
+                return _Outcome(None, timed_out=True)
+            if first.returncode != 0 or second.returncode != 0:
+                failing = first if first.returncode != 0 else second
+                stream = first_err if failing is first else second_err
+                stream.seek(0)
+                return _Outcome(failing.returncode, err=stream.read())
+            out.seek(0)
+            return _Outcome(0, out.read())
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +360,16 @@ def _parse_version(output: bytes) -> str | None:
     return match.group("version") if match else None
 
 
-def _meets_floor(version: str) -> bool:
-    numeric = _NUMERIC_PREFIX.match(version)
+def _at_least(version: str | None, floor: tuple[int, ...]) -> bool:
+    numeric = _NUMERIC_PREFIX.match(version) if version is not None else None
     if numeric is None:
         return False
     parts = tuple(int(part) for part in numeric.group(0).split("."))
-    return parts[: len(GIT_FLOOR)] >= GIT_FLOOR
+    return parts[: len(floor)] >= floor
+
+
+def _meets_floor(version: str) -> bool:
+    return _at_least(version, GIT_FLOOR)
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +618,7 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
         "stash_count": None,
         "worktrees": None,
         "branches": None,
+        "verdict_base": None,
     }
 
 
@@ -734,6 +836,7 @@ def _worktree_document(
         "changes": None,
         "operations": None,
         "index_lock": None,
+        "verdict": None,
     }
     if listed.prunable:
         return document
@@ -922,6 +1025,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                     and upstream != f"refs/remotes/origin/{name}"
                 ),
                 "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
+                "verdict": None,
             }
         )
     branches.sort(key=branch_sort_key)
@@ -958,6 +1062,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "stash_count": stash_count,
         "worktrees": worktrees,
         "branches": branches,
+        "verdict_base": None,
     }
     if not _all_text_safe(clone):
         return degraded("failed")
@@ -1215,8 +1320,13 @@ def _apply_live(
     clone: dict[str, Any],
     answer: _LiveAnswer,
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
-) -> None:
-    """Replace one clone's cached comparisons with the live ones, in place."""
+    base_name: str | None = None,
+) -> _Base | None:
+    """Replace one clone's cached comparisons with the live ones, in place.
+
+    Returns the clone's verdict base for ``base_name``, chosen from the same
+    presence pass and lender as the comparisons.
+    """
     name, live_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
     local_sha = context.local.get(name, (None, ""))[0] if name is not None else None
@@ -1226,9 +1336,14 @@ def _apply_live(
     for branch in clone["branches"]:
         pairs.append((branch["sha"], answer.branches.get(branch["name"])))
     guarded = context.partial or context.shallow
-    wanted = sorted(
-        {right for left, right in pairs if left and right and left != right}
-    )
+    base_head = answer.branches.get(base_name) if base_name is not None else None
+    if base_head is None and base_name is not None and base_name == name:
+        base_head = live_sha
+    held = set(context.cached.values()) | {sha for sha, _ in context.local.values()}
+    probed = {right for left, right in pairs if left and right and left != right}
+    if base_head is not None and base_head not in held:
+        probed.add(base_head)
+    wanted = sorted(probed)
     presence = (
         _present_objects(runner, context, wanted) if wanted and not guarded else {}
     )
@@ -1329,14 +1444,41 @@ def _apply_live(
     for branch in clone["branches"]:
         branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
 
+    if base_name is None:
+        return None
+    cached_base = context.cached.get(base_name)
+    fallback = (
+        _Base(base_name, cached_base, "cached", None, None) if cached_base is not None else None
+    )
+    if base_head is None:
+        return fallback
+    if guarded:
+        return _Base(base_name, base_head, "live", None, None) if base_head == cached_base else fallback
+    if base_head in held or presence.get(base_head) == "present":
+        return _Base(base_name, base_head, "live", None, None)
+    if presence.get(base_head) == "missing":
+        source = lender(base_head)
+        if isinstance(source, tuple):
+            sibling, sibling_context = source
+            return _Base(
+                base_name,
+                base_head,
+                "live",
+                sibling["path"],
+                os.path.join(sibling_context.common, "objects"),
+            )
+    return fallback
+
 
 def _check_remotes(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
-) -> None:
-    """Phase 2 (one query per remote) then phase 3 (live comparisons per clone)."""
+) -> dict[str, _Base | None]:
+    """Phase 2 (one query per remote) then phase 3 (live comparisons per clone).
+
+    Returns the verdict base of each clone the live comparisons reached."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -1357,6 +1499,7 @@ def _check_remotes(
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         answers = list(pool.map(query, chosen))
         work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
+        bases: dict[str, _Base | None] = {}
         for group, answer in zip(groups, answers):
             if answer.reason is not None:
                 group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
@@ -1368,7 +1511,9 @@ def _check_remotes(
                     work.append((contexts[clone["path"]], clone, answer, group))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
-        def apply(item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]) -> None:
+        def apply(
+            item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]],
+        ) -> tuple[str, _Base | None]:
             context, clone, answer, group = item
             siblings = [
                 (other, contexts[other["path"]])
@@ -1377,9 +1522,501 @@ def _check_remotes(
                 and other["status"] == "ok"
                 and other["path"] in contexts
             ]
-            _apply_live(runner, context, clone, answer, siblings)
+            cached_default = clone["cached_default"]
+            base_name = (
+                answer.name
+                or (cached_default["name"] if cached_default is not None else None)
+                or _group_default_name(group["clones"])
+            )
+            return clone["path"], _apply_live(
+                runner, context, clone, answer, siblings, base_name
+            )
 
-        list(pool.map(apply, work))
+        bases.update(pool.map(apply, work))
+    return bases
+
+
+# ---------------------------------------------------------------------------
+# Merge verdicts
+# ---------------------------------------------------------------------------
+
+_PATCH_FLAGS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--no-show-signature",
+    "--no-renames",
+    "--no-relative",
+    "--diff-algorithm=myers",
+    "--indent-heuristic",
+    "--unified=3",
+    "--inter-hunk-context=0",
+    "--submodule=short",
+    "--ignore-submodules=none",
+    "--root",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
+_PATCH_ID = re.compile(r"([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64})")
+_OCTOPUS_CHUNK = 200
+
+
+@dataclass(frozen=True)
+class _Base:
+    """The commit a clone's branches are judged against."""
+
+    name: str
+    sha: str
+    basis: str
+    objects_from: str | None
+    alternate: str | None
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "sha": self.sha,
+            "basis": self.basis,
+            "objects_from": self.objects_from,
+        }
+
+
+@dataclass(frozen=True)
+class _VerdictSettings:
+    """What every verdict command of one collection shares."""
+
+    pinned: tuple[str, ...]
+    overlay: dict[str, str | None]
+    patch_rungs: bool
+
+
+def _verdict_settings(scratch: str, version: str | None) -> _VerdictSettings:
+    """The pinned options, the overlay and the git-version gate of the patch rungs.
+
+    The paths name files that never exist, inside the collection's scratch
+    directory, so no attributes or grafts file can be read.
+    """
+    return _VerdictSettings(
+        pinned=(
+            "--no-replace-objects",
+            "-c",
+            "core.quotePath=true",
+            "-c",
+            "core.attributesFile=" + os.path.join(scratch, "no-attributes"),
+        ),
+        overlay={
+            "GIT_GRAFT_FILE": os.path.join(scratch, "no-grafts"),
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+        },
+        patch_rungs=_at_least(version, PATCH_FLOOR),
+    )
+
+
+def _merged(rung: str) -> dict[str, Any]:
+    return {"state": "merged", "rung": rung, "reason": None}
+
+
+def _unknown(reason: str) -> dict[str, Any]:
+    return {"state": "unknown", "rung": None, "reason": reason}
+
+
+_NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None}
+
+
+def _call_failure(outcome: _Outcome) -> str:
+    return "deadline" if outcome.timed_out else "failed"
+
+
+def _integers(data: bytes, count: int) -> list[int] | None:
+    fields = data.split()
+    if len(fields) != count or not all(item.isdigit() for item in fields):
+        return None
+    return [int(item) for item in fields]
+
+
+@dataclass
+class _Tip:
+    """One distinct commit awaiting a verdict, with what the ladder learns of it."""
+
+    sha: str
+    verdict: dict[str, Any] | None = None
+    error: str | None = None
+    left: int = 0
+    own: int = 0
+    merges: int = 0
+    bases: list[str] | None = None
+    limited: bool = False
+
+    def fail(self, reason: str) -> None:
+        if self.error is None:
+            self.error = reason
+
+
+class _Ladder:
+    """Decide the merge verdict of tips against one clone's base, read-only."""
+
+    def __init__(
+        self,
+        runner: _GitRunner,
+        context: _CloneContext,
+        base: _Base,
+        settings: _VerdictSettings,
+    ) -> None:
+        self._runner = runner
+        self._context = context
+        self._base = base
+        self._settings = settings
+        self._overlay: dict[str, str | None] = dict(settings.overlay)
+        if base.alternate is not None:
+            self._overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = base.alternate
+        # Own non-merge commits that yielded a patch ID, by tip.
+        self.own_commits: dict[str, frozenset[str]] = {}
+
+    def _args(self, arguments: Sequence[str]) -> list[str]:
+        return [*self._settings.pinned, *arguments]
+
+    def _git(self, arguments: Sequence[str], stdin_bytes: bytes | None = None) -> _Outcome:
+        return self._runner.run(
+            self._args(arguments),
+            path=self._context.cwd,
+            ceiling=self._context.ceiling,
+            overlay=self._overlay,
+            stdin_bytes=stdin_bytes,
+        )
+
+    def _patch_ids(self, revisions: Sequence[str]) -> dict[str, str] | _Outcome:
+        """Map each non-merge commit of ``revisions`` to its stable patch ID."""
+        outcome = self._runner.pipeline(
+            self._args(
+                ["log", "--no-merges", "-p", "--format=commit %H", *_PATCH_FLAGS, *revisions, "--"]
+            ),
+            self._args(["patch-id", "--stable"]),
+            path=self._context.cwd,
+            ceiling=self._context.ceiling,
+            overlay=self._overlay,
+        )
+        if not outcome.ok:
+            return outcome
+        result: dict[str, str] = {}
+        for line in outcome.out.decode("ascii", "replace").splitlines():
+            matched = _PATCH_ID.fullmatch(line.strip())
+            if matched is None:
+                return _Outcome(1)
+            result[matched.group(2)] = matched.group(1)
+        return result
+
+    def decide(
+        self, branches: Sequence[tuple[str, str]], detached: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return the verdict of every tip in ``branches`` (name, tip) and ``detached``."""
+        tips: dict[str, _Tip] = {}
+        for sha in [sha for _, sha in branches] + list(detached):
+            tips.setdefault(sha, _Tip(sha))
+        self._ancestors(tips, branches, detached)
+        pending = [tip for tip in tips.values() if tip.verdict is None and tip.error is None]
+        if pending and (self._context.shallow or self._context.partial):
+            for tip in pending:
+                tip.verdict = _unknown("incomplete_clone")
+            pending = []
+        pending = self._sizes(pending)
+        if self._settings.patch_rungs:
+            self._patches(pending)
+        for tip in pending:
+            if tip.verdict is None and self._tree_equal(tip):
+                tip.verdict = _merged("tree_equal")
+        result: dict[str, dict[str, Any]] = {}
+        for sha, tip in tips.items():
+            if tip.verdict is None:
+                if tip.error is not None:
+                    tip.verdict = _unknown(tip.error)
+                elif not self._settings.patch_rungs:
+                    tip.verdict = _unknown("git_too_old")
+                else:
+                    tip.verdict = dict(_NOT_MERGED)
+            result[sha] = tip.verdict
+        return result
+
+    # -- step 1 ---------------------------------------------------------
+
+    def _ancestors(
+        self,
+        tips: dict[str, _Tip],
+        branches: Sequence[tuple[str, str]],
+        detached: Sequence[str],
+    ) -> None:
+        base = self._base.sha
+        listing = self._git(
+            ["for-each-ref", f"--merged={base}", "--format=%(objectname) %(refname)", "refs/heads"]
+        )
+        if not listing.ok:
+            for tip in tips.values():
+                tip.fail(_call_failure(listing))
+            return
+        merged: dict[str, str] = {}
+        for line in _decode(listing.out).split("\n"):
+            if not line:
+                continue
+            sha, _, ref = line.partition(" ")
+            if ref.startswith("refs/heads/"):
+                merged[ref[len("refs/heads/") :]] = sha
+        checked: dict[str, bool | str] = {}
+
+        def is_ancestor(tip: _Tip) -> None:
+            if tip.sha not in checked:
+                outcome = self._git(["merge-base", "--is-ancestor", tip.sha, base])
+                if outcome.code == 0 and not outcome.timed_out:
+                    checked[tip.sha] = True
+                elif outcome.code == 1 and not outcome.timed_out:
+                    checked[tip.sha] = False
+                else:
+                    checked[tip.sha] = _call_failure(outcome)
+            state = checked[tip.sha]
+            if state is True:
+                tip.verdict = _merged("ancestor")
+            elif isinstance(state, str):
+                tip.fail(state)
+
+        for name, sha in branches:
+            tip = tips[sha]
+            if tip.verdict is not None:
+                continue
+            if sha == base or merged.get(name) == sha:
+                tip.verdict = _merged("ancestor")
+            elif name in merged:
+                is_ancestor(tip)
+        for sha in detached:
+            tip = tips[sha]
+            if tip.verdict is None:
+                if sha == base:
+                    tip.verdict = _merged("ancestor")
+                else:
+                    is_ancestor(tip)
+
+    # -- step 2 ---------------------------------------------------------
+
+    def _sizes(self, pending: list[_Tip]) -> list[_Tip]:
+        base = self._base.sha
+        remaining: list[_Tip] = []
+        for tip in pending:
+            counts = self._git(["rev-list", "--left-right", "--count", f"{base}...{tip.sha}"])
+            parsed = _integers(counts.out, 2) if counts.ok else None
+            if parsed is None:
+                tip.fail(_call_failure(counts))
+                tip.verdict = _unknown(tip.error or "failed")
+                continue
+            tip.left, tip.own = parsed
+            if tip.own == 0:
+                tip.verdict = _merged("ancestor")
+                continue
+            if tip.own > OWN_COMMIT_CAP or tip.left > COMPARISON_CAP:
+                tip.limited = True
+                tip.verdict = _unknown("history_limit")
+                continue
+            merges = self._git(["rev-list", "--merges", "--count", f"{base}..{tip.sha}"])
+            parsed = _integers(merges.out, 1) if merges.ok else None
+            if parsed is None:
+                tip.fail(_call_failure(merges))
+                tip.verdict = _unknown(tip.error or "failed")
+                continue
+            tip.merges = parsed[0]
+            remaining.append(tip)
+        return remaining
+
+    # -- steps 3 and 4 --------------------------------------------------
+
+    def _merge_bases(self, tip: _Tip) -> None:
+        outcome = self._git(["merge-base", "--all", self._base.sha, tip.sha])
+        if outcome.ok:
+            tip.bases = outcome.out.decode("ascii", "replace").split()
+        elif outcome.code == 1 and not outcome.timed_out and not outcome.out.strip():
+            tip.bases = []
+        else:
+            tip.fail(_call_failure(outcome))
+
+    def _octopus(self, commits: list[str]) -> str | _Outcome:
+        current = commits
+        while True:
+            groups = [
+                current[start : start + _OCTOPUS_CHUNK]
+                for start in range(0, len(current), _OCTOPUS_CHUNK)
+            ]
+            reduced: list[str] = []
+            for group in groups:
+                outcome = self._git(["merge-base", "--octopus", *group])
+                fields = outcome.out.split() if outcome.ok else []
+                if len(fields) != 1:
+                    return outcome if not outcome.ok else _Outcome(1)
+                reduced.append(fields[0].decode("ascii", "replace"))
+            if len(reduced) == 1:
+                return reduced[0]
+            current = reduced
+
+    def _patches(self, pending: list[_Tip]) -> None:
+        base = self._base.sha
+        for tip in pending:
+            self._merge_bases(tip)
+        active = [tip for tip in pending if tip.error is None]
+        shared: str | None = None
+        while active:
+            known = sorted({item for tip in active for item in tip.bases or []})
+            ceiling_commit: str | None = None
+            if known and all(tip.bases for tip in active):
+                found = self._octopus(known)
+                if isinstance(found, _Outcome):
+                    for tip in active:
+                        tip.fail(_call_failure(found))
+                    return
+                ceiling_commit = found
+            revisions = [base] if ceiling_commit is None else [base, "--not", ceiling_commit]
+            counted = self._git(["rev-list", "--no-merges", "--count", *revisions, "--"])
+            parsed = _integers(counted.out, 1) if counted.ok else None
+            if parsed is None:
+                for tip in active:
+                    tip.fail(_call_failure(counted))
+                return
+            if parsed[0] <= SHARED_RANGE_CAP:
+                shared = ceiling_commit
+                break
+            victim = max(
+                enumerate(active), key=lambda item: (item[1].left, item[0])
+            )[1]
+            victim.limited = True
+            victim.verdict = _unknown("history_limit")
+            active.remove(victim)
+        if not active:
+            return
+        mapped = self._patch_ids([base] if shared is None else [base, "--not", shared])
+        if isinstance(mapped, _Outcome):
+            for tip in active:
+                tip.fail(_call_failure(mapped))
+            return
+        for tip in active:
+            self._patch_rungs(tip, mapped)
+
+    def _patch_rungs(self, tip: _Tip, mapped: dict[str, str]) -> None:
+        base = self._base.sha
+        listing = self._git(["rev-list", "--no-merges", f"{tip.sha}..{base}"])
+        if not listing.ok:
+            tip.fail(_call_failure(listing))
+            return
+        comparison = {
+            mapped[item]
+            for item in listing.out.decode("ascii", "replace").split()
+            if item in mapped
+        }
+        if tip.merges == 0:
+            own = self._patch_ids([f"{base}..{tip.sha}"])
+            if isinstance(own, _Outcome):
+                tip.fail(_call_failure(own))
+            else:
+                self.own_commits[tip.sha] = frozenset(own)
+                if len(own) == tip.own and all(item in comparison for item in own.values()):
+                    tip.verdict = _merged("patch_equivalent")
+                    return
+        if tip.bases is not None and len(tip.bases) == 1:
+            diff = self._git(["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"])
+            if not diff.ok:
+                tip.fail(_call_failure(diff))
+                return
+            header = b"commit " + b"1" * len(base) + b"\n"
+            identified = self._git(["patch-id", "--stable"], stdin_bytes=header + diff.out)
+            fields = identified.out.split() if identified.ok else []
+            if not identified.ok:
+                tip.fail(_call_failure(identified))
+            elif fields and fields[0].decode("ascii", "replace") in comparison:
+                tip.verdict = _merged("squash_equivalent")
+
+    # -- tree rung ------------------------------------------------------
+
+    def _tree_equal(self, tip: _Tip) -> bool:
+        tree = self._git(["rev-parse", f"{tip.sha}^{{tree}}"])
+        trees = self._git(["log", "--format=%T", f"{tip.sha}..{self._base.sha}", "--"])
+        if not tree.ok or not trees.ok:
+            tip.fail(_call_failure(tree if not tree.ok else trees))
+            return False
+        return tree.out.strip() in set(trees.out.split())
+
+
+def _cached_base(context: _CloneContext, name: str | None) -> _Base | None:
+    sha = context.cached.get(name) if name is not None else None
+    return _Base(name, sha, "cached", None, None) if name is not None and sha else None
+
+
+def _assign_clone_verdicts(
+    runner: _GitRunner,
+    clone: dict[str, Any],
+    context: _CloneContext,
+    base: _Base | None,
+    settings: _VerdictSettings,
+) -> dict[str, frozenset[str]]:
+    """Write one clone's ``verdict_base`` and every verdict; return its own-commit sets."""
+    detached = [
+        worktree
+        for worktree in clone["worktrees"]
+        if worktree["status"] == "ok" and worktree["head"]["branch"] is None
+    ]
+    if base is None:
+        clone["verdict_base"] = None
+        for branch in clone["branches"]:
+            branch["verdict"] = _unknown("no_base")
+        for worktree in detached:
+            worktree["verdict"] = _unknown("no_base")
+        return {}
+    clone["verdict_base"] = base.document()
+    subjects = [branch for branch in clone["branches"] if branch["name"] != base.name]
+    if not subjects and not detached:
+        return {}
+    ladder = _Ladder(runner, context, base, settings)
+    decided = ladder.decide(
+        [(branch["name"], branch["sha"]) for branch in subjects],
+        [worktree["head"]["sha"] for worktree in detached],
+    )
+    for branch in subjects:
+        branch["verdict"] = dict(decided[branch["sha"]])
+    for worktree in detached:
+        worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
+    return ladder.own_commits
+
+
+def _assign_verdicts(
+    runner: _GitRunner,
+    repositories: list[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    bases: Mapping[str, _Base | None],
+    settings: _VerdictSettings,
+    max_parallel: int,
+) -> dict[str, dict[str, frozenset[str]]]:
+    """Give every usable clone its verdict base and verdicts, one clone per task.
+
+    A clone the live comparisons did not reach takes its base from its cached
+    ``origin/HEAD`` target, or the name its group's clones agree on.
+    Returns each clone's own-commit sets for reuse inside the module.
+    """
+    jobs: list[tuple[dict[str, Any], _CloneContext, _Base | None]] = []
+    for repository in repositories:
+        agreed = (
+            _group_default_name(repository["clones"])
+            if repository["remote"] is not None
+            else None
+        )
+        for clone in repository["clones"]:
+            context = contexts.get(clone["path"])
+            if clone["status"] != "ok" or context is None:
+                continue
+            if clone["path"] in bases:
+                base = bases[clone["path"]]
+            else:
+                cached_default = clone["cached_default"]
+                name = (cached_default["name"] if cached_default is not None else None) or agreed
+                base = _cached_base(context, name)
+            jobs.append((clone, context, base))
+
+    def decide(job: tuple[dict[str, Any], _CloneContext, _Base | None]) -> tuple[str, dict[str, frozenset[str]]]:
+        clone, context, base = job
+        return clone["path"], _assign_clone_verdicts(runner, clone, context, base, settings)
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+        return dict(pool.map(decide, jobs))
 
 
 def _render(document: dict[str, Any]) -> str:
@@ -1446,13 +2083,23 @@ def collect_checkouts(
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
         repositories = _assemble_repositories(outcomes)
+        contexts = {
+            outcome.clone["path"]: outcome.context
+            for outcome in outcomes
+            if outcome.clone is not None and outcome.context is not None
+        }
+        bases: dict[str, _Base | None] = {}
         if remote_checks:
-            contexts = {
-                outcome.clone["path"]: outcome.context
-                for outcome in outcomes
-                if outcome.clone is not None and outcome.context is not None
-            }
-            _check_remotes(runner, repositories, contexts, max_parallel)
+            bases = _check_remotes(runner, repositories, contexts, max_parallel)
+        with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
+            _assign_verdicts(
+                runner,
+                repositories,
+                contexts,
+                bases,
+                _verdict_settings(scratch, git_state["version"]),
+                max_parallel,
+            )
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
