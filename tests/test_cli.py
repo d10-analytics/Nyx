@@ -630,6 +630,7 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
 import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
     GLOBAL_CONFIG,
+    add_packed_refs,
     allow_filters,
     clone,
     closed_port,
@@ -1156,6 +1157,26 @@ def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
     assert elements[1] == "remote off"
     assert elements[2] == "branches cached local-only 0 unknown 1"
     assert elements[3].startswith("default trunk cached equal ")
+
+
+def test_a_clone_over_the_branch_cap_prints_only_its_status(tmp_path, account, capsys):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "crowded")
+    head = git(repository, "rev-parse", "HEAD").stdout.strip()
+    add_packed_refs(
+        repository, {f"refs/heads/extra-{n:03d}": head for n in range(models.CHECKOUT_BRANCH_CAP)}
+    )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+    sibling = clone(remote, folder / "ordinary")
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys, "--no-network")
+
+    assert _line_for(lines, repository) == f"{cli._json_literal(real(repository))}  too_many_branches"
+    # The sibling clone of the same remote keeps its ordinary line.
+    assert "too_many_branches" not in _line_for(lines, sibling)
 
 
 def make_slow_clone_in_place(repository: Path) -> None:

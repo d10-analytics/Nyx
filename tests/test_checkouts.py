@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1763,6 +1764,62 @@ def test_parser_accepts_non_ok_items_with_null_facts(sample):
     assert models.parse_checkouts(redigest(broken))
 
 
+def with_branch_count(document: dict[str, Any], count: int) -> dict[str, Any]:
+    """Give the first clone exactly ``count`` branches, each extra one a copy of a decided one."""
+    clone_document = first_clone(document)
+    template = other_branches(clone_document)[0]
+    kept = clone_document["branches"]
+    extras = [
+        {**template, "name": f"zz-extra-{n:03d}", "checked_out_in": []}
+        for n in range(count - len(kept))
+    ]
+    clone_document["branches"] = sorted([*kept, *extras], key=models.branch_sort_key)
+    assert len(clone_document["branches"]) == count
+    return clone_document
+
+
+def test_parser_limits_an_ok_clone_to_the_branch_cap(sample):
+    document, _folder = sample
+    at_cap = doc_copy(document)
+    with_branch_count(at_cap, models.CHECKOUT_BRANCH_CAP)
+    assert models.parse_checkouts(redigest(at_cap))
+
+    over = doc_copy(document)
+    with_branch_count(over, models.CHECKOUT_BRANCH_CAP + 1)
+    with pytest.raises(models.ProtocolError, match="more than 100 branches"):
+        models.parse_checkouts(redigest(over))
+
+
+def test_parser_accepts_a_clone_over_the_branch_cap_with_null_facts(sample):
+    document, _folder = sample
+    crowded = doc_copy(document)
+    refused_clone(crowded)["status"] = "too_many_branches"
+    assert models.parse_checkouts(redigest(crowded))
+
+
+def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
+    document, _folder = sample
+    broken = doc_copy(document)
+    main_worktree(first_clone(broken)).update(
+        status="too_many_branches", head=None, changes=None, operations=None,
+        index_lock=None, verdict=None,
+    )
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
+@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base"])
+def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
+    document, _folder = sample
+    ok_clone = first_clone(doc_copy(document))
+    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base")}
+    broken = doc_copy(document)
+    refused_clone(broken)["status"] = "too_many_branches"
+    first_clone(broken)[fact] = facts[fact]
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
 @pytest.mark.parametrize(
     ("fact", "empty"),
     [(fact, empty) for fact, forms in NULLABLE_CLONE_FACTS.items() for empty in forms],
@@ -1803,12 +1860,16 @@ def test_oversized_document_is_refused_with_a_category(tmp_path):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
-    repository = clone(remote, folder / "repo")
-    head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    add_packed_refs(
-        repository, {f"refs/heads/never-pushed-{n:06d}": head for n in range(10_000)}
-    )
-    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 10_001
+    # Each clone holds the most branches one clone may (the default and 99
+    # more), all at the default's tip, and long names fill the document.
+    for index in range(48):
+        repository = clone(remote, folder / f"repo-{index:03d}")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/{index:03d}-{n:03d}-" + "x" * 230: head for n in range(99)},
+        )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
 
     with pytest.raises(checkouts.CheckoutsOutputTooLargeError) as error:
         checkouts.collect_checkouts(
@@ -4973,3 +5034,254 @@ def test_an_unusable_account_home_leaves_the_cache_unavailable_without_a_diagnos
     assert document["diagnostics"] == []
     assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
     assert not (tmp_path / "relative-home").exists()
+
+
+# ---------------------------------------------------------------------------
+# Supported clone size and the work a clone costs
+# ---------------------------------------------------------------------------
+
+
+def import_branches(repository: Path, count: int, tag: str = "b") -> list[str]:
+    """Add ``count`` one-commit branches, each unmerged, in one ``git fast-import`` run.
+
+    Every branch changes its own file, so none is an ancestor of the default
+    branch, patch-equivalent to a commit on it or tree-equal to one.
+    """
+    root = git(repository, "rev-parse", "HEAD").stdout.strip()
+    names = [f"{tag}{number:05d}" for number in range(count)]
+    stream = b"".join(
+        (
+            f"commit refs/heads/{name}\ncommitter T <t@example.com> 1700000000 +0000\n"
+            f"data {len(name) + 1}\n{name}\nfrom {root}\n"
+            f"M 100644 inline {name}.txt\ndata 2\nx\n\n"
+        ).encode("ascii")
+        for name in names
+    )
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repository,
+        input=stream,
+        capture_output=True,
+        check=True,
+    )
+    return names
+
+
+def git_subcommand(arguments: Any) -> str:
+    """The git subcommand of a runner call, past global options and ``-c`` pairs."""
+    pending = iter(arguments)
+    for argument in pending:
+        if argument == "-c":
+            next(pending, None)
+        elif not argument.startswith("-"):
+            return argument
+    return arguments[0] if arguments else ""
+
+
+@contextlib.contextmanager
+def counted_git_calls(monkeypatch):
+    """Record the subcommand of every ``_GitRunner.run`` and ``pipeline`` call."""
+    calls: list[str] = []
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+
+    def counting_run(self, arguments, **options):
+        calls.append(git_subcommand(arguments))
+        return run(self, arguments, **options)
+
+    def counting_pipeline(self, producer, consumer, **options):
+        calls.append(git_subcommand(producer))
+        return pipeline(self, producer, consumer, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(checkouts._GitRunner, "run", counting_run)
+        patched.setattr(checkouts._GitRunner, "pipeline", counting_pipeline)
+        yield calls
+
+
+def count_tip_equality(monkeypatch) -> list[int]:
+    """Count every ``_Tip.__eq__`` call; a list search over tips makes one per element."""
+    calls = [0]
+    compare = checkouts._Tip.__eq__
+
+    def counting_eq(self, other):
+        calls[0] += 1
+        return compare(self, other)
+
+    monkeypatch.setattr(checkouts._Tip, "__eq__", counting_eq)
+    return calls
+
+
+CLONE_FACTS = (
+    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
+    "stash_count", "worktrees", "branches", "verdict_base",
+)
+
+
+def test_a_clone_over_the_branch_cap_is_refused_and_its_neighbours_are_unaffected(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served, "one.git")
+    other_remote = make_remote(served, "two.git")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    exact = clone(remote, folder / "exact")
+    import_branches(exact, models.CHECKOUT_BRANCH_CAP - 1)
+    crowded = clone(remote, folder / "crowded")
+    import_branches(crowded, models.CHECKOUT_BRANCH_CAP)
+    sibling = clone(remote, folder / "sibling")
+    apart = clone(other_remote, folder / "apart")
+    assert len(git(exact, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
+    assert len(git(crowded, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+
+    document = collect([folder])
+
+    at_cap = find_clone(document, exact)
+    assert at_cap["status"] == "ok"
+    assert len(at_cap["branches"]) == 100
+    assert {
+        name: verdict for name, verdict in verdicts_of(at_cap).items() if name != "trunk"
+    } == {name: NOT_MERGED for name in verdicts_of(at_cap) if name != "trunk"}
+    over = find_clone(document, crowded)
+    assert over["status"] == "too_many_branches"
+    assert [over[fact] for fact in CLONE_FACTS] == [None] * len(CLONE_FACTS)
+    # The refused clone stays in its remote's group beside the sibling clone.
+    [group] = [
+        repository
+        for repository in document["repositories"]
+        if real(crowded) in [item["path"] for item in repository["clones"]]
+    ]
+    assert {item["path"] for item in group["clones"]} == {
+        real(path) for path in (exact, crowded, sibling)
+    }
+    assert find_clone(document, sibling)["status"] == "ok"
+    alone = collect([folder / "apart"])
+    assert find_clone(document, apart) == find_clone(alone, apart)
+
+
+def test_clones_over_the_branch_cap_cost_the_same_git_calls_whatever_their_branch_count(
+    tmp_path, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    counts: dict[int, list[str]] = {}
+    for extra in (100, 10_000):
+        folder = tmp_path / f"folder-{extra}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository, {f"refs/heads/never-pushed-{n:06d}": head for n in range(extra)}
+        )
+        assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == extra + 1
+        with counted_git_calls(monkeypatch) as calls:
+            document = collect([folder])
+        assert find_clone(document, repository)["status"] == "too_many_branches"
+        counts[extra] = list(calls)
+
+    assert sorted(counts[100]) == sorted(counts[10_000])
+    assert counts[100]
+    assert not {"rev-list", "merge-base", "log", "diff", "patch-id", "status"} & set(counts[100])
+
+
+def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    remote = make_remote(tmp_path)
+    calls_by_size: dict[int, Counter] = {}
+    for size in (100, 50, 25):
+        folder = tmp_path / f"folder-{size}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        tips = [
+            rev(repository, name) for name in import_branches(repository, size - 1, f"s{size}-")
+        ]
+        with monkeypatch.context() as patched:
+            equality = count_tip_equality(patched)
+            with counted_git_calls(patched) as calls:
+                document = collect([folder], seconds=600.0)
+        calls_by_size[size] = Counter(calls)
+        item = find_clone(document, repository)
+        assert item["status"] == "ok"
+        assert len(item["branches"]) == size
+        if size == 100:
+            assert verdicts_of(item) == {
+                "trunk": None,
+                **{branch["name"]: NOT_MERGED for branch in other_branches(item)},
+            }
+            assert len(other_branches(item)) == 99
+            assert document["diagnostics"] == []
+            base = item["verdict_base"]["sha"]
+            assert cache_entries(cache) == {f"{tip}.{base}": "none" for tip in tips}
+            # A list search over the tips compared each pair (4,851 calls); a
+            # lookup by identity compares none.
+            assert equality[0] <= len(tips)
+
+    sizes = set().union(*calls_by_size.values())
+    for subcommand in sizes:
+        growth_small = calls_by_size[50][subcommand] - calls_by_size[25][subcommand]
+        growth_large = calls_by_size[100][subcommand] - calls_by_size[50][subcommand]
+        assert growth_large == 2 * growth_small, subcommand
+    assert calls_by_size[100]["rev-list"] > calls_by_size[50]["rev-list"]
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_no_git_process_starts_after_the_verdict_deadline_and_the_cache_write_lands(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, fast = cache_world(tmp_path)
+    slow = clone(tmp_path / "served" / "remote.git", folder / "slow")
+    import_branches(slow, 12)
+    log = tmp_path / "calls.log"
+    shim = stand_in(
+        tmp_path,
+        "slow-sizes",
+        f'case "$*" in *"{real(slow)}"*--left-right*) printf "size\\n" >> "{log}"; sleep 2;; esac',
+    )
+    starts: list[int] = []
+    start_process = subprocess.Popen
+
+    def recording_start(*arguments, **options):
+        starts.append(time.monotonic_ns())
+        return start_process(*arguments, **options)
+
+    # A call that returns timed out without starting a process; by then every
+    # other clone has finished, so only the slow clone's ladder is running.
+    idle: list[int] = []
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+
+    def watching(call):
+        def watched(self, *arguments, **options):
+            before = len(starts)
+            outcome = call(self, *arguments, **options)
+            if outcome.timed_out and len(starts) == before:
+                idle.append(time.monotonic_ns())
+            return outcome
+
+        return watched
+
+    deadline_ns = time.monotonic_ns() + 5 * 10**9
+    with path_with(monkeypatch, shim), monkeypatch.context() as patched:
+        patched.setattr(subprocess, "Popen", recording_start)
+        patched.setattr(checkouts._GitRunner, "run", watching(run))
+        patched.setattr(checkouts._GitRunner, "pipeline", watching(pipeline))
+        text = checkouts.collect_checkouts([str(folder)], deadline_ns=deadline_ns)
+    finished = time.monotonic_ns()
+
+    verdict_deadline = deadline_ns - checkouts.VERDICT_RESERVE_NS
+    sizes_started = len(log.read_text().splitlines()) if log.exists() else 0
+    # The ladder began and was cut short by the deadline, not finished.
+    assert 1 <= sizes_started < 12
+    assert max(starts) <= verdict_deadline + 100_000_000
+    # Once the runner has refused a call for lack of time, no later call starts one.
+    assert idle
+    assert [moment for moment in starts if moment > min(idle)] == []
+    assert finished < deadline_ns
+    document = models.parse_checkouts(text)
+    reached = verdicts_of(find_clone(document, slow))
+    assert {name: reached[name] for name in reached if name != "trunk"} == {
+        name: unknown("deadline") for name in reached if name != "trunk"
+    }
+    assert verdicts_of(find_clone(document, fast)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert set(cache_entries(cache).values()) == {"patch_equivalent", "none"}

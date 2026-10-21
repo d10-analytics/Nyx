@@ -187,6 +187,12 @@ CHECKOUT_RETIRED_WORDING = (
     "an unreadable clone, or one with no default branch name",
     "so the document is the same warm or cold",
     "it checks every branch it can before it looks anything up",
+    "`deadline` means the 60 seconds ran out first",
+    "finishing every check of one branch (including the `tree_equal` rung and the "
+    "`not_merged` decision) before it starts the next",
+    "A branch whose re-check finishes is remembered again with the time of that check",
+    "so the oldest answers are always re-checked first",
+    "a clone too large to check within the 60 seconds is covered a few branches at a time",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -241,10 +247,25 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "has no branches, no worktrees and no base, so it has no verdicts at all",
         "It never replaces a verdict the run decides itself",
         "a warm run differs from a cold run only where the cold run says `unknown`",
-        "it works the branches with no remembered answer first, then those with the oldest "
-        "remembered answer, then the newest, finishing every check of one branch (including "
-        "the `tree_equal` rung and the `not_merged` decision) before it starts the next, and "
-        "a remembered answer stands in only where that re-check does not finish",
+        "It runs the size checks, the merge bases and the shared comparison for every "
+        "remaining branch first, then each branch's own checks, its `tree_equal` rung and the "
+        "`not_merged` decision finish before the next branch starts",
+        "those with no remembered answer first, then those with the oldest remembered answer, "
+        "then the newest",
+        "A verdict the run decides always wins over a remembered one, and a remembered answer "
+        "stands in only where that re-check does not finish",
+        "is remembered again with the time of this run",
+        "a clone is covered a few branches at a time over successive runs, but only within "
+        "these limits",
+        "A budget that ends inside the shared steps (the size checks, merge bases and shared "
+        "comparison) decides no new branch",
+        "Branches that can never be remembered, because one of their steps fails or reaches "
+        "the 10-second cap or because they are `history_limit`, are worked first on every run",
+        "The 8,192 remembered answers are shared by all clones",
+        "`too_many_branches` when the clone has more than 100 local branches (the default "
+        "branch included)",
+        "so it shows no facts and no verdicts",
+        "The plain lines are otherwise unchanged",
         "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",
@@ -253,7 +274,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`git_too_old` means git is older than 2.39",
         "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39",
         "`history_limit` means the branch or the comparison was too large",
-        "`deadline` means the 60 seconds ran out first",
+        "`deadline` means one git call reached its 10-second cap or the 60 seconds, less the "
+        "half second kept for the cache write, ran out",
         "`failed` means a git call failed",
         "`~/.nyx/cache/checkouts.json`",
         "The cache is used only when `~/.nyx` already exists",
