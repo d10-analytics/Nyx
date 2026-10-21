@@ -1744,11 +1744,10 @@ class _Ladder:
             tips.setdefault(sha, _Tip(sha))
         self._ancestors(tips, branches, detached)
         incomplete = self._context.shallow or self._context.partial
-        # With the patch rungs available, or no rung beyond ``ancestor`` able to
-        # run, a cached verdict cannot replace one the cold run decides, so the
-        # lookup precedes the size checks.  Otherwise it follows ``tree_equal``.
-        early = self._settings.patch_rungs or incomplete
-        if early:
+        # A shallow or partial clone runs no rung beyond ``ancestor``, so its
+        # lookup precedes the size checks.  Otherwise the rungs run first and a
+        # cached verdict only stands in for a tip they leave ``unknown``.
+        if incomplete:
             self._lookup(tips)
         pending = [tip for tip in tips.values() if tip.verdict is None and tip.error is None]
         if pending and incomplete:
@@ -1762,7 +1761,13 @@ class _Ladder:
             # A tip whose earlier step failed stays unproven: no later rung decides it.
             if tip.verdict is None and tip.error is None and self._tree_equal(tip):
                 tip.verdict = _merged("tree_equal")
-        if not early:
+        if self._settings.patch_rungs:
+            # With every rung run, a tip that proved nothing is decided
+            # ``not_merged`` by this run and no cached verdict replaces it.
+            for tip in tips.values():
+                if tip.verdict is None and tip.error is None:
+                    tip.verdict = dict(_NOT_MERGED)
+        if not incomplete:
             self._lookup(tips)
         complete = self._settings.patch_rungs and not incomplete
         base_sha = self._base.sha
