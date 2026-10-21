@@ -180,9 +180,9 @@ past. A clone with no `origin` remote or no default branch name has no base. So
 does a clone that has a default branch name but neither the remote's current
 commit for it (in the clone or borrowed from a sibling) nor its own
 remote-tracking copy of that branch. Every verdict in a clone with no base is
-`unknown` with the reason `no_base`. A clone git could not read, described
-below, has no branches, no worktrees and no base, so it has no verdicts at
-all. In every other clone, every local branch except the base branch
+`unknown` with the reason `no_base`. A clone git could not read or that has too
+many branches, described below, has no branches, no worktrees and no base, so it
+has no verdicts at all. In every other clone, every local branch except the base branch
 itself, and every worktree on a detached `HEAD`, gets a verdict: `state` is
 `merged`, `not_merged` or `unknown`.
 
@@ -202,8 +202,9 @@ than fetching missing files. `git_too_old` means git is older than 2.39: the two
 patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 to tell two
 different changes to the same binary file apart, so they are skipped, and
 `ancestor` and `tree_equal` still run. `history_limit` means the branch or the
-comparison was too large to check within the fixed bounds. `deadline` means the
-60 seconds ran out first, and `failed` means a git call failed. A shallow or
+comparison was too large to check within the fixed bounds. `deadline` means one
+git call reached its 10-second cap or the 60 seconds, less the half second kept
+for the cache write, ran out, and `failed` means a git call failed. A shallow or
 partial clone shows `incomplete_clone` in preference to `git_too_old`.
 
 Verdicts that took git a long time to compute are remembered in
@@ -220,14 +221,23 @@ warm run may give the remembered verdict instead, whatever the reason
 (`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
 `history_limit` depends on the other branches in the clone, which is why a
 remembered answer may stand in for it. A warm run therefore does the same git
-work as a cold run, spending the time it has left re-checking: it works the
-branches with no remembered answer first, then those with the oldest remembered
-answer, then the newest, finishing every check of one branch (including the
-`tree_equal` rung and the `not_merged` decision) before it starts the next, and
-a remembered answer stands in only where that re-check does not finish. A branch whose re-check finishes is remembered again
-with the time of that check, so the oldest answers are always re-checked first
-and a clone too large to check within the 60 seconds is covered a few branches
-at a time over successive runs. A run that re-checks nothing leaves the file
+work as a cold run, spending the time it has left re-checking. It runs the size checks, the merge bases and the shared
+comparison for every remaining branch first, then each branch's own checks, its
+`tree_equal` rung and the `not_merged` decision finish before the next branch
+starts. Both steps take the branches in one order: those with no remembered
+answer first, then those with the oldest remembered answer, then the newest. A
+verdict the run decides always wins over a remembered one, and a remembered
+answer stands in only where that re-check does not finish. Every branch whose
+check the run finishes, `ancestor` aside, is remembered again with the time of
+this run, so the oldest answers are re-checked first next time and a clone is
+covered a few branches at a time over successive runs, but only within these
+limits. A budget that ends inside the shared steps (the size checks, merge
+bases and shared comparison) decides no new branch, although remembered answers
+still stand in. Branches that can never be remembered, because one of their
+steps fails or reaches the 10-second cap or because they are `history_limit`,
+are worked first on every run. The 8,192 remembered answers are shared by all
+clones, and any beyond them are dropped and recomputed. A run that re-checks
+nothing leaves the file
 untouched. Only a shallow or partial clone, where no check beyond `ancestor` can
 run, looks up first. Under git older than 2.39, the lookup comes after the size
 check and the `tree_equal` rung, so a remembered answer never replaces a
@@ -246,8 +256,12 @@ not exist) or `unknown`. `cached` only ever labels a basis; the time a clone
 last fetched is always `fetched <time>`. A clone without an `origin` remote shows
 `no origin remote` and no branch or default elements. A checkout git refused or
 could not read shows its path and its status instead: `unsafe_ownership` when
-git refuses it for ownership, `timed_out` when git did not finish in time, and
-otherwise `failed`.
+git refuses it for ownership, `timed_out` when git did not finish in time,
+`too_many_branches` when the clone has more than 100 local branches (the default
+branch included), and otherwise `failed`. A `too_many_branches` clone is not
+examined, so it shows no facts and no verdicts; it stays listed with the other
+clones of its remote but lends them no objects and takes no part in choosing
+their default branch name. The plain lines are otherwise unchanged.
 
 By default `nyx checkouts` is networked: it asks each distinct `origin` remote
 once, so clones that share a remote share one answer, and compares against what
