@@ -14,7 +14,7 @@ README is narrative only.
 
 ## Collaborators
 
-- Depends on `protocols` (field limits and document validation) and
+- Depends on `protocols` (schema constants, field limits, and text helpers) and
   `account-state` (completed-stage validation).
 - Used by `checkouts` and `application-serving`.
 
