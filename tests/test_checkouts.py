@@ -5182,6 +5182,38 @@ def test_clones_over_the_branch_cap_cost_the_same_git_calls_whatever_their_branc
     assert not {"rev-list", "merge-base", "log", "diff", "patch-id", "status"} & set(counts[100])
 
 
+def test_a_clone_over_the_branch_cap_is_refused_before_its_stash_is_counted(
+    tmp_path, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    counts: dict[bool, list[str]] = {}
+    for stashed in (False, True):
+        folder = tmp_path / f"folder-{stashed}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        if stashed:
+            (repository / "file.txt").write_text("changed\n")
+            git(repository, "stash", "-q")
+            # Within the cap the collector counts this stash with a git call.
+            within = find_clone(collect([folder]), repository)
+            assert (within["status"], within["stash_count"]) == ("ok", 1)
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/extra-{n:03d}": head for n in range(models.CHECKOUT_BRANCH_CAP)},
+        )
+        assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+        assert bool(git(repository, "for-each-ref", "refs/stash").stdout.strip()) == stashed
+        with counted_git_calls(monkeypatch) as calls:
+            document = collect([folder])
+        assert find_clone(document, repository)["status"] == "too_many_branches"
+        counts[stashed] = sorted(calls)
+
+    # A stash costs the over-cap clone nothing: the cap is checked first.
+    assert counts[True] == counts[False]
+    assert "rev-list" not in counts[True]
+
+
 def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
     tmp_path, monkeypatch, isolated_git
 ):
