@@ -66,7 +66,8 @@ def system_problems(root: Path, listing: set[str]) -> list[str]:
             continue
         for field in sorted(set(data) - ALLOWED_FIELDS):
             problems.append(f"{name}: unknown field {field}")
-        if data.get("schema_version") != SCHEMA_VERSION:
+        version = data.get("schema_version")
+        if type(version) is not int or version != SCHEMA_VERSION:
             problems.append(f"{name}: schema_version must be {SCHEMA_VERSION}")
         if data.get("name") != name:
             problems.append(f"{name}: name {data.get('name')!r} differs from folder")
@@ -190,8 +191,9 @@ def test_folder_without_system_toml(layout: Path) -> None:
     ]
 
 
-def test_wrong_schema_version(layout: Path) -> None:
-    write_system(layout, "alpha", ["nyx/a.py", "nyx/b.py"], schema_version=2)
+@pytest.mark.parametrize("version", ["2", "true", "1.0", '"1"'])
+def test_wrong_schema_version(layout: Path, version: str) -> None:
+    write_system(layout, "alpha", ["nyx/a.py", "nyx/b.py"], schema_version=version)
     assert system_problems(layout, LISTING) == ["alpha: schema_version must be 1"]
 
 
