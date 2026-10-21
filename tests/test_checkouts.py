@@ -4141,8 +4141,12 @@ CACHE_WORLD_VERDICTS = {
 }
 
 
+def cache_times(cache: Path) -> dict[str, int]:
+    return {key: entry["at"] for key, entry in json.loads(cache.read_text())["verdicts"].items()}
+
+
 @pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
-def test_a_warm_collection_decides_again_and_rewrites_nothing(
+def test_a_warm_collection_decides_again_and_stamps_what_it_verified(
     tmp_path, monkeypatch, isolated_git
 ):
     cache = nyx_home(isolated_git)
@@ -4151,12 +4155,13 @@ def test_a_warm_collection_decides_again_and_rewrites_nothing(
     assert verdicts_of(find_clone(first, work)) == CACHE_WORLD_VERDICTS
     base = rev(work, "origin/trunk")
     # Only complete, non-ancestor verdicts are stored.
-    assert cache_entries(cache) == {
+    stored = {
         f"{rev(work, 'both')}.{base}": "patch_equivalent",
         f"{rev(work, 'picked')}.{base}": "patch_equivalent",
         f"{rev(work, 'unmerged')}.{base}": "none",
     }
-    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    assert cache_entries(cache) == stored
+    write_cache(cache, {key: 10 for key in stored}, rungs=stored)
     shim, log = recording(tmp_path, "warm")
 
     with path_with(monkeypatch, shim):
@@ -4164,9 +4169,28 @@ def test_a_warm_collection_decides_again_and_rewrites_nothing(
 
     assert second["checkouts_digest"] == first["checkouts_digest"]
     assert verdicts_of(find_clone(second, work)) == CACHE_WORLD_VERDICTS
-    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
-    # The cache fills only what the run leaves unknown, so the rungs run again.
+    # The cache fills only what the run leaves unknown, so the rungs run again,
+    # and every verdict the run decided again is stamped as verified now.
     assert patch_work(log) != []
+    assert cache_entries(cache) == stored
+    assert all(at > 10 for at in cache_times(cache).values())
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_collection_that_verifies_nothing_rewrites_nothing(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    collect([folder])
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    slow = stand_in(tmp_path, "slow", DELAYED_PATCH_WORK)
+
+    with path_with(monkeypatch, slow):
+        document = collect([folder], seconds=3.0)
+
+    # Every re-check ran out of time, so saved answers stood in and were not re-stamped.
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
 
 
 def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
@@ -4508,13 +4532,18 @@ def branch_cache_world(tmp_path: Path, names: list[str]):
     return folder, work, {name: f"{rev(work, name)}.{base}" for name in names}
 
 
-def write_cache(cache: Path, entries: dict[str, int]) -> None:
+def write_cache(
+    cache: Path, entries: dict[str, int], rungs: dict[str, str] | None = None
+) -> None:
     cache.parent.mkdir(exist_ok=True)
     cache.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "verdicts": {key: {"rung": "none", "at": at} for key, at in entries.items()},
+                "verdicts": {
+                    key: {"rung": (rungs or {}).get(key, "none"), "at": at}
+                    for key, at in entries.items()
+                },
             }
         )
     )
@@ -4523,24 +4552,38 @@ def write_cache(cache: Path, entries: dict[str, int]) -> None:
 def test_eviction_keeps_the_used_entries_and_drops_the_oldest(tmp_path, monkeypatch, isolated_git):
     cache = nyx_home(isolated_git)
     folder, _work, keys = branch_cache_world(tmp_path, [f"b{n}" for n in range(1, 7)])
-    write_cache(cache, {keys["b1"]: 10, keys["b2"]: 20, keys["b3"]: 30, keys["b4"]: 40})
-    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 4)
+    base = keys["b1"].split(".")[1]
+    gone = {f"{letter * 40}.{base}": at for letter, at in zip("cdef", (10, 20, 30, 40))}
+    write_cache(cache, gone)
+    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 8)
 
     collect([folder])
 
-    assert set(cache_entries(cache)) == {keys["b5"], keys["b6"], keys["b4"], keys["b3"]}
+    # The six verified entries are kept; of the four no branch uses, the newest two.
+    newest = {key for key, at in gone.items() if at >= 30}
+    assert set(cache_entries(cache)) == set(keys.values()) | newest
 
 
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
 def test_eviction_drops_unused_newer_entries_and_breaks_ties_by_key(
     tmp_path, monkeypatch, isolated_git
 ):
     cache = nyx_home(isolated_git)
-    folder, _work, keys = branch_cache_world(tmp_path, ["b1", "b2", "b3", "b4"])
-    stale = "c" * 40 + "." + keys["b1"].split(".")[1]
+    folder, work, keys = branch_cache_world(tmp_path, ["b1", "b2", "b3", "b4"])
+    base = keys["b1"].split(".")[1]
+    stale = "c" * 40 + "." + base
     write_cache(cache, {stale: 4_000_000_000, keys["b1"]: 10, keys["b2"]: 10})
+    # b1 and b2 cannot be re-checked, so their saved answers stand in (used);
+    # b3 and b4 are verified by the run.
+    broken = stand_in(
+        tmp_path,
+        "broken",
+        f'case "$*" in *"...{rev(work, "b1")}"*|*"...{rev(work, "b2")}"*) exit 1;; esac',
+    )
     monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 3)
 
-    collect([folder])
+    with path_with(monkeypatch, broken):
+        collect([folder])
 
     assert set(cache_entries(cache)) == {keys["b3"], keys["b4"], min(keys["b1"], keys["b2"])}
     assert stale not in cache_entries(cache)
@@ -4734,6 +4777,92 @@ def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
     assert verdicts_of(find_clone(warm, work)) == {
         "aye": NOT_MERGED, "bee": NOT_MERGED, "trunk": None,
     }
+
+
+def cherry_picked_world(tmp_path: Path, names: list[str]):
+    """Every branch is cherry-picked onto a diverged ``trunk``, so each is patch-equivalent."""
+    folder, _remote, work = small_world(tmp_path)
+    for name in names:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "diverged\n")
+    git(work, "cherry-pick", *names)
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_clone_over_budget_converges_across_short_collections(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    base = rev(work, "origin/trunk")
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in names)
+    slow = stand_in(tmp_path, "slow", f'case "$*" in {cases}) sleep 1;; esac')
+
+    with path_with(monkeypatch, slow):
+        first = collect([folder], seconds=4.0)
+        second = collect([folder], seconds=4.0)
+
+    first_verdicts = verdicts_of(find_clone(first, work))
+    assert unknown("deadline") in first_verdicts.values()
+    # The tips the first run could not reach are worked before the ones it cached.
+    second_verdicts = verdicts_of(find_clone(second, work))
+    for name in ("b4", "b5"):
+        assert second_verdicts[name] == MERGED_PATCH
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_uncached_tips_are_worked_first_then_the_oldest_saved_answer(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work, keys = branch_cache_world(tmp_path, ["n1", "n2", "n3", "n4"])
+    write_cache(cache, {keys["n1"]: 200, keys["n2"]: 100})
+    shim, log = recording(tmp_path, "order")
+
+    with path_with(monkeypatch, shim):
+        collect([folder])
+
+    tips = {rev(work, name): name for name in ("n1", "n2", "n3", "n4")}
+    sized = [
+        tips[token.split("...")[1]]
+        for line in log.read_text().splitlines()
+        if "--left-right" in line
+        for token in line.split()
+        if "..." in token
+    ]
+    assert sized == ["n3", "n4", "n2", "n1"]
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+def test_a_saved_answer_stands_in_only_where_the_recheck_does_not_finish(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    cold = collect([folder])
+    assert verdicts_of(find_clone(cold, work)) == OWN_STEP_VERDICTS
+    stored = {f"{one}.{base}": "patch_equivalent", f"{other}.{base}": "none"}
+    assert cache_entries(cache) == stored
+    write_cache(cache, {key: 10 for key in stored}, rungs=stored)
+    # The re-check of ``one`` fails; ``other`` is re-checked and finishes.
+    fault = stand_in(
+        tmp_path, "fault", f'case "$*" in *" log "*"{base}..{one} --"*) exit 1;; esac'
+    )
+
+    with path_with(monkeypatch, fault):
+        warm = collect([folder])
+
+    assert verdicts_of(find_clone(warm, work)) == OWN_STEP_VERDICTS
+    assert warm["checkouts_digest"] == cold["checkouts_digest"]
+    times = cache_times(cache)
+    assert times[f"{one}.{base}"] == 10
+    assert times[f"{other}.{base}"] > 10
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the account home comes from HOME on POSIX only")
