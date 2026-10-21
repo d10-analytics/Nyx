@@ -867,6 +867,8 @@ _BRANCH_KEYS = frozenset(
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
+_VERDICT_PATCH_FLOOR = (2, 39)
+_NUMERIC_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 _VERDICT_BASE_KEYS = frozenset({"name", "sha", "basis", "objects_from"})
 _VERDICT_KEYS = frozenset({"state", "rung", "reason"})
 _VERDICT_STATES = frozenset({"merged", "not_merged", "unknown"})
@@ -1101,7 +1103,70 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
     return item
 
 
-def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str]) -> dict[str, Any]:
+def _verdict_state(verdict: Mapping[str, Any]) -> tuple[str, Any]:
+    return verdict["state"], verdict["reason"]
+
+
+def _git_below_patch_floor(version: str | None) -> bool:
+    numeric = _NUMERIC_VERSION.match(version) if version is not None else None
+    if numeric is None:
+        return False
+    parts = tuple(int(part) for part in numeric.group(0).split("."))
+    return parts[: len(_VERDICT_PATCH_FLOOR)] < _VERDICT_PATCH_FLOOR
+
+
+def _clone_verdicts(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    has_remote: bool,
+    git_version: str | None,
+    branches: list[dict[str, Any]],
+    worktrees: list[dict[str, Any]],
+) -> None:
+    """Check the verdicts of one ``ok`` clone against its base and its own limits."""
+    base = item["verdict_base"]
+    if base is not None and not has_remote:
+        raise ProtocolError(f"{name}.verdict_base requires a remote")
+    verdicts: list[tuple[str, Mapping[str, Any]]] = []
+    for index, branch in enumerate(branches):
+        label = f"{name}.branches[{index}].verdict"
+        verdict = branch["verdict"]
+        names_base = base is not None and branch["name"] == base["name"]
+        if names_base != (verdict is None):
+            raise ProtocolError(f"{label} must be null exactly for the verdict base branch")
+        if verdict is not None:
+            verdicts.append((label, verdict))
+    for index, worktree in enumerate(worktrees):
+        label = f"{name}.worktrees[{index}].verdict"
+        detached = (
+            worktree["status"] == "ok"
+            and worktree["head"]["branch"] is None
+        )
+        if detached != (worktree["verdict"] is not None):
+            raise ProtocolError(f"{label} must be present exactly for a detached checkout")
+        if worktree["verdict"] is not None:
+            verdicts.append((label, worktree["verdict"]))
+    limited = item["shallow"] or item["partial_clone"]
+    for label, verdict in verdicts:
+        no_base = _verdict_state(verdict) == ("unknown", "no_base")
+        if no_base != (base is None):
+            raise ProtocolError(f"{label} contradicts the verdict base of the clone")
+        reason = verdict["reason"]
+        if reason == "incomplete_clone" and not limited:
+            raise ProtocolError(f"{label} names an incomplete clone that is complete")
+        if reason == "git_too_old" and not _git_below_patch_floor(git_version):
+            raise ProtocolError(f"{label} names an old git that is not old")
+
+
+def _clone(
+    value: Any,
+    name: str,
+    *,
+    has_remote: bool,
+    worktree_paths: set[str],
+    git_version: str | None,
+) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _CLONE_KEYS, name)
     path = _text(item["path"], f"{name}.path")
@@ -1181,10 +1246,24 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
     for branch in parsed_branches:
         if not set(branch["checked_out_in"]) <= local_paths:
             raise ProtocolError(f"{name} has a branch checked out in an unlisted worktree")
+    _clone_verdicts(
+        item,
+        name,
+        has_remote=has_remote,
+        git_version=git_version,
+        branches=parsed_branches,
+        worktrees=parsed,
+    )
     return item
 
 
-def _repository(value: Any, index: int, clone_paths: set[str], worktree_paths: set[str]) -> dict[str, Any]:
+def _repository(
+    value: Any,
+    index: int,
+    clone_paths: set[str],
+    worktree_paths: set[str],
+    git_version: str | None,
+) -> dict[str, Any]:
     name = f"repositories[{index}]"
     item = _object(value, name)
     _keys(item, _REPOSITORY_KEYS, name)
@@ -1223,6 +1302,7 @@ def _repository(value: Any, index: int, clone_paths: set[str], worktree_paths: s
             f"{name}.clones[{clone_index}]",
             has_remote=remote is not None,
             worktree_paths=worktree_paths,
+            git_version=git_version,
         )
         for clone_index, raw in enumerate(clones)
     ]
@@ -1292,7 +1372,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     worktree_paths: set[str] = set()
     remote_keys: set[str] = set()
     parsed = [
-        _repository(raw_repository, index, clone_paths, worktree_paths)
+        _repository(raw_repository, index, clone_paths, worktree_paths, version)
         for index, raw_repository in enumerate(repositories)
     ]
     for repository in parsed:
