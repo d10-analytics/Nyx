@@ -63,7 +63,7 @@ PATCH_FLOOR = (2, 39)
 OWN_COMMIT_CAP = 2000
 COMPARISON_CAP = 5000
 SHARED_RANGE_CAP = 5000
-# The verdict cache keeps at most this many entries (``D-05``); the file stays
+# The verdict cache keeps at most this many entries; the file stays
 # far below the reader's byte bound because an entry is at most about 190 bytes.
 CACHE_ENTRY_CAP = 8192
 # Verdict git calls stop this long before the deadline so the cache write has time.
@@ -1775,9 +1775,11 @@ class _Ladder:
                     tip.verdict = _unknown("git_too_old")
                 else:
                     tip.verdict = dict(_NOT_MERGED)
+            # A tip that recorded a failed or timed-out step never stores a verdict.
             if (
                 complete
                 and not tip.cached
+                and tip.error is None
                 and tip.verdict["rung"] in CACHE_RUNGS
                 and len(sha) == len(base_sha)
             ):
@@ -1975,11 +1977,11 @@ class _Ladder:
             own = self._patch_ids([f"{base}..{tip.sha}"])
             if isinstance(own, _Outcome):
                 tip.fail(_call_failure(own))
-            else:
-                self.own_commits[tip.sha] = frozenset(own)
-                if len(own) == tip.own and all(item in comparison for item in own.values()):
-                    tip.verdict = _merged("patch_equivalent")
-                    return
+                return
+            self.own_commits[tip.sha] = frozenset(own)
+            if len(own) == tip.own and all(item in comparison for item in own.values()):
+                tip.verdict = _merged("patch_equivalent")
+                return
         if tip.bases is not None and len(tip.bases) == 1:
             diff = self._git(["diff", *_PATCH_FLAGS, tip.bases[0], tip.sha, "--"])
             if not diff.ok:
