@@ -1722,7 +1722,8 @@ class _Ladder:
         if self._settings.patch_rungs:
             self._patches(pending)
         for tip in pending:
-            if tip.verdict is None and self._tree_equal(tip):
+            # A tip whose earlier step failed stays unproven: no later rung decides it.
+            if tip.verdict is None and tip.error is None and self._tree_equal(tip):
                 tip.verdict = _merged("tree_equal")
         result: dict[str, dict[str, Any]] = {}
         for sha, tip in tips.items():
@@ -1833,7 +1834,8 @@ class _Ladder:
         else:
             tip.fail(_call_failure(outcome))
 
-    def _octopus(self, commits: list[str]) -> str | _Outcome:
+    def _octopus(self, commits: list[str]) -> str | None | _Outcome:
+        """The one merge base of ``commits``; ``None`` when they share none."""
         current = commits
         while True:
             groups = [
@@ -1843,6 +1845,8 @@ class _Ladder:
             reduced: list[str] = []
             for group in groups:
                 outcome = self._git(["merge-base", "--octopus", *group])
+                if outcome.code == 1 and not outcome.timed_out and not outcome.out.strip():
+                    return None
                 fields = outcome.out.split() if outcome.ok else []
                 if len(fields) != 1:
                     return outcome if not outcome.ok else _Outcome(1)
@@ -1860,6 +1864,8 @@ class _Ladder:
         while active:
             known = sorted({item for tip in active for item in tip.bases or []})
             ceiling_commit: str | None = None
+            # Without one common merge base the shared range is the whole base
+            # history, still bounded by the count below.
             if known and all(tip.bases for tip in active):
                 found = self._octopus(known)
                 if isinstance(found, _Outcome):
@@ -1930,7 +1936,9 @@ class _Ladder:
 
     def _tree_equal(self, tip: _Tip) -> bool:
         tree = self._git(["rev-parse", f"{tip.sha}^{{tree}}"])
-        trees = self._git(["log", "--format=%T", f"{tip.sha}..{self._base.sha}", "--"])
+        trees = self._git(
+            ["log", "--no-show-signature", "--format=%T", f"{tip.sha}..{self._base.sha}", "--"]
+        )
         if not tree.ok or not trees.ok:
             tip.fail(_call_failure(tree if not tree.ok else trees))
             return False
