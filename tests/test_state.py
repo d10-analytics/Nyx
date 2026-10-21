@@ -1820,3 +1820,25 @@ def test_cache_write_after_the_deadline_creates_nothing():
         with home_patch, uid_patch, pytest.raises(state.OperationDeadlineError):
             state.write_checkout_cache(b"{}", deadline_ns=time.monotonic_ns() - 1)
         assert list((home / ".nyx").iterdir()) == []
+
+
+def test_configuration_failure_after_the_shared_replacement_stays_a_commit_verification_error():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = isolated_home(root)
+        first = isolated_root(root, "first")
+        second = isolated_root(root, "second")
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.setup(first)
+            paths = state.state_paths()
+
+            with patch.object(state, "_sync_directory", side_effect=OSError("injected")), pytest.raises(
+                state.ConfigurationCommitVerificationError, match="replaced but could not be verified"
+            ):
+                state.setup(second)
+
+        assert json.loads(paths.config_file.read_text(encoding="utf-8"))["specification_root"] == str(
+            second.resolve()
+        )
+        assert sorted(item.name for item in paths.config_directory.iterdir()) == ["config.json"]
