@@ -1759,18 +1759,22 @@ class _Ladder:
         # out leaves the tips with the freshest saved answer unrecomputed.
         pending.sort(key=self._priority)
         pending = self._sizes(pending)
+        mapped: dict[str, str] | None = None
+        eligible: list[_Tip] = []
         if self._settings.patch_rungs:
-            self._patches(pending)
+            eligible, mapped = self._shared(pending)
+        # Each tip finishes its whole ladder before the next starts, so a budget
+        # that runs out leaves only the tips with the freshest saved answers.
         for tip in pending:
+            if mapped is not None and tip in eligible:
+                self._patch_rungs(tip, mapped)
             # A tip whose earlier step failed stays unproven: no later rung decides it.
             if tip.verdict is None and tip.error is None and self._tree_equal(tip):
                 tip.verdict = _merged("tree_equal")
-        if self._settings.patch_rungs:
-            # With every rung run, a tip that proved nothing is decided
-            # ``not_merged`` by this run and no cached verdict replaces it.
-            for tip in tips.values():
-                if tip.verdict is None and tip.error is None:
-                    tip.verdict = dict(_NOT_MERGED)
+            if self._settings.patch_rungs and tip.verdict is None and tip.error is None:
+                # With every rung run, a tip that proved nothing is decided
+                # ``not_merged`` by this run and no cached verdict replaces it.
+                tip.verdict = dict(_NOT_MERGED)
         if not incomplete:
             self._lookup(tips)
         complete = self._settings.patch_rungs and not incomplete
@@ -1937,7 +1941,8 @@ class _Ladder:
                 return reduced[0]
             current = reduced
 
-    def _patches(self, pending: list[_Tip]) -> None:
+    def _shared(self, pending: list[_Tip]) -> tuple[list[_Tip], dict[str, str] | None]:
+        """The ladder-wide patch steps; return the tips left for their own patch rungs."""
         base = self._base.sha
         for tip in pending:
             self._merge_bases(tip)
@@ -1953,7 +1958,7 @@ class _Ladder:
                 if isinstance(found, _Outcome):
                     for tip in active:
                         tip.fail(_call_failure(found))
-                    return
+                    return [], None
                 ceiling_commit = found
             revisions = [base] if ceiling_commit is None else [base, "--not", ceiling_commit]
             counted = self._git(["rev-list", "--no-merges", "--count", *revisions, "--"])
@@ -1961,7 +1966,7 @@ class _Ladder:
             if parsed is None:
                 for tip in active:
                     tip.fail(_call_failure(counted))
-                return
+                return [], None
             if parsed[0] <= SHARED_RANGE_CAP:
                 shared = ceiling_commit
                 break
@@ -1970,14 +1975,13 @@ class _Ladder:
             victim.verdict = _unknown("history_limit")
             active.remove(victim)
         if not active:
-            return
+            return [], None
         mapped = self._patch_ids([base] if shared is None else [base, "--not", shared])
         if isinstance(mapped, _Outcome):
             for tip in active:
                 tip.fail(_call_failure(mapped))
-            return
-        for tip in active:
-            self._patch_rungs(tip, mapped)
+            return [], None
+        return active, mapped
 
     def _patch_rungs(self, tip: _Tip, mapped: dict[str, str]) -> None:
         base = self._base.sha
