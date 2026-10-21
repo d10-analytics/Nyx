@@ -3527,6 +3527,16 @@ def test_a_lookalike_change_elsewhere_in_the_base_is_not_merged(
         assert patch_identity(work, tip, "--stable") == patch_identity(work, landed, "--stable")
         same = patch_identity(work, tip, "--verbatim") == patch_identity(work, landed, "--verbatim")
         assert same != verbatim_differs
+    else:
+        # The squashed branch's whole change has the same identity as the base's commit.
+        fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
+        whole = subprocess.run(
+            ["git", "diff", "--no-ext-diff", fork, tip], cwd=work, capture_output=True, check=True
+        ).stdout
+        identity = subprocess.run(
+            ["git", "patch-id", "--stable"], input=whole, cwd=work, capture_output=True, check=True
+        ).stdout.split()[0].decode()
+        assert identity == patch_identity(work, landed, "--stable")
 
     document = collect([folder])
 
@@ -3537,7 +3547,7 @@ def test_a_lookalike_change_elsewhere_in_the_base_is_not_merged(
     assert cache_entries(cache)[key] == "none"
 
 
-def test_a_change_the_base_later_rewrote_is_not_confirmed_as_merged(tmp_path):
+def test_a_change_the_base_later_rewrote_still_reads_merged_where_it_landed(tmp_path):
     folder, _remote, work = small_world(tmp_path)
     commit_file(work, "f.txt", "a\nb\nc\n", "add f")
     git(work, "push", "-q", "origin", "trunk")
@@ -3551,9 +3561,214 @@ def test_a_change_the_base_later_rewrote_is_not_confirmed_as_merged(tmp_path):
 
     document = collect([tmp_path / "folder"])
 
-    # The merge of the branch into the base conflicts, so the match is not
-    # confirmed: the verdict errs toward keeping the branch.
-    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    # The base commit that landed the change made exactly the branch's change,
+    # so the branch is merged whatever the base did to those lines afterwards.
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+CHANGELOG = "# Changes\n\n- old\n"
+LIST_LINES = "a\nb\nc\nd\n"
+
+
+def landed_then_changed_world(tmp_path: Path, shape: str):
+    """A branch whose change landed on the base, which then changed around it.
+
+    Merging the branch into the base's current tip conflicts (or changes the
+    tree) in each of these worlds, yet the base commit that landed the change
+    made exactly the branch's change.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    name, original = (
+        ("CHANGELOG.md", CHANGELOG) if shape == "squash-above" else ("list.txt", LIST_LINES)
+    )
+    commit_file(work, name, original, f"add {name}")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash-above":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+        commit_file(work, name, CHANGELOG + "- feature A\n", "log feature A")
+    else:
+        commit_file(work, name, original.replace("b\n", "B\n"), "capitalise b")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    if shape == "squash-above":
+        git(work, "merge", "--squash", "feature")
+        git(work, "commit", "-q", "-m", "squash feature")
+        commit_file(work, name, CHANGELOG + "- feature B\n- feature A\n", "log feature B above")
+    else:
+        git(work, "cherry-pick", "feature")
+        if shape == "pick-adjacent":
+            commit_file(work, name, "a\nB\nC\nd\n", "edit the next line")
+        elif shape == "pick-before":
+            commit_file(work, name, "a\nx\nB\nc\nd\n", "insert a line before it")
+        else:
+            git(work, "revert", "--no-edit", "HEAD")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize(
+    ("shape", "verdict"),
+    [
+        ("squash-above", MERGED_SQUASH),
+        ("pick-adjacent", MERGED_PATCH),
+        ("pick-before", MERGED_PATCH),
+        ("pick-revert", MERGED_PATCH),
+    ],
+)
+def test_a_change_that_landed_reads_merged_however_the_base_changed_around_it_later(
+    tmp_path, shape, verdict
+):
+    folder, work = landed_then_changed_world(tmp_path, shape)
+    # The trap is real: merging the branch into the base now does not give the base.
+    attempt = git(work, "merge-tree", "--write-tree", "origin/trunk", "feature", check=False)
+    assert attempt.returncode == 1 or attempt.stdout.strip() != rev(work, "origin/trunk^{tree}")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == verdict
+
+
+def test_a_branch_with_its_own_root_commit_cherry_picked_into_the_base_reads_merged(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "--orphan", "feature")
+    git(work, "rm", "-rfq", ".")
+    commit_file(work, "orphan.txt", "one\n", "root of the unrelated branch")
+    commit_file(work, "orphan.txt", "one\ntwo\n", "extend it")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature~1", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    assert git(work, "merge-base", "feature", "trunk", check=False).returncode == 1
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+@pytest.mark.parametrize("shape", ["patch", "squash"])
+def test_a_lookalike_change_landed_on_a_shifted_file_is_not_merged_either(tmp_path, shape):
+    """The base's file differs from the branch's, so the landing check merges contents."""
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "ci.yml", "# head\n" + JOBS_ORIGINAL, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+    commit_file(work, "ci.yml", "# head\n" + JOBS_BRANCH, "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "ci.yml", "# HEAD\n" + JOBS_ORIGINAL, "retitle")
+    if shape == "squash":
+        write_bytes(work, "notes.txt", b"notes\n")
+    commit_file(work, "ci.yml", "# HEAD\n" + JOBS_BASE, "timeout on job 2")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    landed = rev(work, "trunk~1")
+    fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
+    whole = subprocess.run(
+        ["git", "diff", "--no-ext-diff", fork, "feature"], cwd=work, capture_output=True, check=True
+    ).stdout
+    wanted = patch_identity(work, landed, "--verbatim")
+    identities = {"patch": patch_identity(work, rev(work, "feature"), "--verbatim"), "squash": subprocess.run(
+        ["git", "patch-id", "--verbatim"], input=whole, cwd=work, capture_output=True, check=True
+    ).stdout.split()[0].decode()}
+    # The trap is real: the identities agree, so only the landing check refuses.
+    assert identities[shape] == wanted
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["feature"] == NOT_MERGED
+
+
+def shifted_world(tmp_path: Path):
+    """A cherry-pick whose base file differs from the branch's, so its change
+    lands at a shifted place and the landing check must merge file contents."""
+    folder, _remote, work = small_world(tmp_path)
+    lines = "".join(f"line {number}\n" for number in range(1, 13))
+    commit_file(work, "f.txt", lines, "add f")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "f.txt", lines.replace("line 10\n", "line ten\n"), "edit line 10")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "f.txt", lines.replace("line 2\n", "two\nextra\n"), "grow the top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+def test_a_cherry_pick_that_landed_at_a_shifted_place_reads_merged_through_a_content_merge(
+    tmp_path, monkeypatch
+):
+    folder, work = shifted_world(tmp_path)
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+    assert "merge-file" in calls
+    assert not {"merge-tree", "init"} & set(calls)
+
+
+def file_times(repository: Path) -> dict[str, int]:
+    """Every file under the repository's git directory with its modification time."""
+    git_dir = repository / ".git" if (repository / ".git").exists() else repository
+    return {
+        item.relative_to(git_dir).as_posix(): item.stat().st_mtime_ns
+        for item in git_dir.rglob("*")
+        if item.is_file()
+    }
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
+def test_the_landing_check_touches_no_object_store_not_even_a_timestamp(tmp_path, packed):
+    folder, remote, work, _worktree = build_verdict_world(tmp_path)
+    git(work, "push", "-q", "origin", "picked", "squashed", "bin-picked")
+    first = clone(remote, tmp_path / "chain" / "first", "--shared")
+    second = clone(first, folder / "second", "--shared")
+    for name in ("picked", "squashed", "bin-picked"):
+        git(second, "branch", name, rev(work, name))
+    if packed:
+        git(work, "gc", "-q")
+        git(remote, "gc", "-q")
+    stores = [work, remote, first, second]
+    before = [file_times(store) for store in stores]
+    assert any(path.startswith("objects/pack/") for path in before[0]) == packed
+    time.sleep(0.05)
+
+    document = collect([folder])
+
+    verdicts = verdicts_of(find_clone(document, second))
+    assert (verdicts["picked"], verdicts["squashed"]) == (MERGED_PATCH, MERGED_SQUASH)
+    assert [file_times(store) for store in stores] == before
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
+def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path, packed):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    holder = clone(remote, folder / "holder A")
+    other = clone(remote, folder / "other B")
+    git(other, "checkout", "-q", "-b", "feat")
+    commit_file(other, "feat.txt", "feat\n")
+    commit_file(holder, "held.txt", "held\n")
+    git(holder, "fetch", "-q", str(other), "feat")
+    git(holder, "cherry-pick", "FETCH_HEAD")
+    git(holder, "push", "-q", "origin", "trunk")
+    if packed:
+        git(holder, "gc", "-q")
+    stores = [holder, other, remote]
+    before = [file_times(store) for store in stores]
+    time.sleep(0.05)
+
+    document = live([folder])
+
+    item = find_clone(document, other)
+    assert item["verdict_base"]["objects_from"] == real(holder)
+    assert verdicts_of(item)["feat"] == MERGED_PATCH
+    assert [file_times(store) for store in stores] == before
 
 
 def test_a_cached_verdict_from_the_retired_schema_is_never_served(
@@ -3667,18 +3882,17 @@ def test_a_commit_that_differs_from_a_base_commit_only_in_whitespace_is_not_its_
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ('case "$*" in *" init --bare "*) exit 3;; esac', "failed"),
-        ('case "$*" in *" merge-tree "*) exit 2;; esac', "failed"),
-        ('case "$*" in *" merge-tree "*) sleep 3;; esac', "deadline"),
+        ('case "$*" in *" diff-tree "*) exit 2;; esac', "failed"),
+        ('case "$*" in *" diff-tree "*) sleep 3;; esac', "deadline"),
     ],
-    ids=["scratch-repository", "merge", "merge-call-cap"],
+    ids=["landing-diff", "landing-diff-call-cap"],
 )
-def test_a_merge_check_that_fails_leaves_the_match_unknown_and_stores_nothing(
+def test_a_landing_check_that_fails_leaves_the_match_unknown_and_stores_nothing(
     tmp_path, monkeypatch, isolated_git, body, reason
 ):
     cache = nyx_home(isolated_git)
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
-    shim = stand_in(tmp_path, "failing-merge-check", body)
+    shim = stand_in(tmp_path, "failing-landing-check", body)
 
     with path_with(monkeypatch, shim):
         document = collect([folder], call_cap_seconds=1.0)
@@ -3689,19 +3903,43 @@ def test_a_merge_check_that_fails_leaves_the_match_unknown_and_stores_nothing(
     for name in ("picked", "squashed", "bin-picked", "blobdiff"):
         assert verdicts[name] == unknown(reason), name
         assert f"{rev(work, name)}.{base}" not in stored, name
-    # Tips that never reach the merge check are decided and stored as usual.
+    # Tips that never reach the landing check are decided and stored as usual.
     assert verdicts["unmerged"] == NOT_MERGED
     assert verdicts["split"] == MERGED_TREE
     assert stored[f"{rev(work, 'unmerged')}.{base}"] == "none"
 
 
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ('case "$*" in *" cat-file "*) exit 2;; esac', "failed"),
+        ('case "$*" in *" cat-file "*) sleep 3;; esac', "deadline"),
+        ('case "$*" in *" merge-file "*) exit 255;; esac', "failed"),
+        ('case "$*" in *" merge-file "*) sleep 3;; esac', "deadline"),
+    ],
+    ids=["read-blob", "read-blob-call-cap", "merge-file", "merge-file-call-cap"],
+)
+def test_a_content_merge_step_that_fails_leaves_the_match_unknown_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, body, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, work = shifted_world(tmp_path)
+    shim = stand_in(tmp_path, "failing-content-merge", body)
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=1.0)
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown(reason)
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
 @posix_only
-def test_the_merge_check_runs_no_clone_merge_driver_and_adds_no_object_to_the_clone(
+def test_the_landing_check_runs_no_clone_merge_driver_and_touches_nothing_in_the_clone(
     tmp_path, isolated_git
 ):
-    folder, work = lookalike_world(
-        tmp_path, "ci.yml", JOBS_ORIGINAL, JOBS_BRANCH, JOBS_BASE, "patch"
-    )
+    folder, work = shifted_world(tmp_path)
     marker = tmp_path / "driver-marker"
     driver = marker_script(tmp_path / "scripts", "driver", marker, "exit 1")
     git(work, "config", "merge.probe.driver", f"{driver} %O %A %B")
@@ -3710,13 +3948,14 @@ def test_the_merge_check_runs_no_clone_merge_driver_and_adds_no_object_to_the_cl
     git(work, "merge-tree", "--write-tree", "origin/trunk", "feature", check=False)
     assert marker.exists(), "control: a merge inside the clone runs its configured driver"
     marker.unlink()
-    before = snapshot(work)
+    before = (snapshot(work), file_times(work))
+    time.sleep(0.05)
 
     document = collect([folder])
 
-    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
     assert not marker.exists()
-    assert snapshot(work) == before
+    assert (snapshot(work), file_times(work)) == before
 
 
 def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
