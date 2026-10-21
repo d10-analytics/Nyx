@@ -4322,3 +4322,35 @@ def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
     if cold_log is not None:
         assert f"...{bee_tip}" in cold_log.read_text()
         assert f"...{bee_tip}" not in warm_log.read_text()
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the account home comes from HOME on POSIX only")
+def test_an_unusable_account_home_leaves_the_cache_unavailable_without_a_diagnostic(
+    tmp_path, isolated_git
+):
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    environment = dict(os.environ)
+    environment["HOME"] = "relative-home"
+    environment.pop("USERPROFILE", None)
+    # Git still needs its isolated global configuration.
+    environment["GIT_CONFIG_GLOBAL"] = str(isolated_git / ".gitconfig")
+    environment["XDG_CONFIG_HOME"] = str(isolated_git)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", COLLECT_PROCESS, str(folder)],
+        cwd=tmp_path,
+        env={**environment, "PYTHONPATH": str(REPOSITORY_ROOT)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    document = models.parse_checkouts(completed.stdout)
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == []
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert not (tmp_path / "relative-home").exists()
