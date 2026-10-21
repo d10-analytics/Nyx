@@ -129,6 +129,11 @@ configured folder that is `missing`, `unreadable` or `not_directory`.
 its own repository, and `unrepresentable_path` for a checkout whose path cannot
 be shown safely, such as one containing a control character, where the path is
 the folder or clone it belongs under, or `null` for a configured folder itself.
+`checkout_cache_unreadable` and `checkout_cache_write_failed` report the verdict
+cache described below, with the cache file's path: the first means the file was
+present but could not be used and was treated as empty, the second means it
+could not be updated. Neither changes any verdict or any other part of the
+document.
 
 Each clone or worktree line starts with the checkout's path, quoted as a JSON
 string, and then gives, separated by two spaces, its branch as `branch <name>`,
@@ -158,6 +163,57 @@ separated by two spaces and in this order, three more elements.
   remote has no default branch (an empty remote, or one with a detached `HEAD`)
   shows `no live default`, and one whose default is not known without asking the
   remote shows `no cached default`.
+
+Whether each local branch is already merged into the remote's default branch
+is a verdict, and appears only in the `--json` document: the plain lines above
+are unchanged and show no verdicts. In each clone, `verdict_base` names the
+default branch the verdicts are judged against, its commit, and its `basis`.
+The branch is the remote's default branch, or, when the remote did not answer,
+the name the clone's own remote-tracking copy points to, or the name every clone
+of the remote agrees on. The `live` basis is the remote's current commit for
+that name, taken from the clone itself or borrowed read-only from a sibling
+clone that has it (named in `objects_from`). The `cached` basis, "base stale",
+is the clone's own remote-tracking copy of that branch, which can be older than
+the remote until you fetch; a branch shown as merged against a stale base was
+merged into what the clone last saw, which the remote may since have moved
+past. A clone with no `origin` remote, an unreadable clone, or one with no
+default branch name has no base, and every verdict in it is
+`unknown` with the reason `no_base`. Every local branch except the base branch
+itself, and every worktree on a detached `HEAD`, gets a verdict: `state` is
+`merged`, `not_merged` or `unknown`.
+
+A `merged` verdict names the first rung of this ladder that proved it, tried in
+this order. `ancestor`: the branch's commit is already in the base's history, so
+nothing on the branch is missing from the base. `patch_equivalent`: the branch
+has no merge commits and every one of its own commits has a counterpart in the
+base with the same change (the same patch identity), as after a rebase or a
+cherry-pick. `squash_equivalent`: the branch's whole change since it left the
+base has the same patch identity as one commit on the base, as after a squash
+merge. `tree_equal`: the branch's file contents are identical to the content of
+some commit on the base. `not_merged` has the rung `none`: every rung that could
+run found nothing. An `unknown` verdict has no rung and one of six reasons.
+`no_base` is described above. `incomplete_clone` means the clone is shallow or
+partial, so only the `ancestor` rung runs and the others are skipped rather
+than fetching missing files. `git_too_old` means git is older than 2.39: the two
+patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 to tell two
+different changes to the same binary file apart, so they are skipped, and
+`ancestor` and `tree_equal` still run. `history_limit` means the branch or the
+comparison was too large to check within the fixed bounds. `deadline` means the
+60 seconds ran out first, and `failed` means a git call failed. A shallow or
+partial clone shows `incomplete_clone` in preference to `git_too_old`.
+
+Verdicts that took git a long time to compute are remembered in
+`~/.nyx/cache/checkouts.json`, so a later run can answer without repeating the
+work. The cache is used only when `~/.nyx` already exists; Nyx never creates that
+directory for it, and it is created inside `~/.nyx` as `cache/` when first
+needed. It stores only verdicts decided in full by git 2.39 or later in a clone
+that is neither shallow nor partial, and only for the rungs other than
+`ancestor`, together with the `not_merged` answer. A remembered answer is used
+only in place of an `unknown` verdict that this run could not decide for lack of
+time, a failed call, a size bound or a clone limit. It never replaces an answer
+the run reaches itself, so the document is the same warm or cold. A file that is
+missing, damaged, too large or from another version is ignored. Deleting it only
+costs time, because the verdicts are recomputed.
 
 The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
 but not counted, as in a shallow clone), `absent` (one of the two branches does
@@ -189,7 +245,7 @@ remote until you fetch.
 
 The command is read-only: it changes no repository, takes no git lock, writes
 no alternates file and never fetches, so asking a remote leaves every clone as
-it was. It exits 0 whenever it can print a document, including when git is
+it was. Its only write is the verdict cache file, which changes no repository. It exits 0 whenever it can print a document, including when git is
 missing, a folder is unavailable or a remote check failed; it exits 1 with one
 line only when the configuration is unavailable or the document exceeds 2 MiB.
 With no folders configured it says `no checkout folders are configured` and
