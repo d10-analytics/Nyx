@@ -3639,6 +3639,86 @@ def test_the_squash_rung_streams_its_diff_and_no_run_call_carries_diff_bytes(
     assert buffered == []
 
 
+def test_a_commit_that_differs_from_a_base_commit_only_in_whitespace_is_not_its_counterpart(
+    tmp_path,
+):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "w.txt", "keep\nx\nkeep\n", "add w")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "w.txt", "keep\ny \nkeep\n", "y with a trailing space")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    commit_file(work, "w.txt", "keep\ny\nkeep\n", "y")
+    commit_file(work, "w.txt", "keep\ny \nkeep\n", "add the trailing space")
+    git(work, "push", "-q", "origin", "trunk")
+    tip, landed = rev(work, "feature"), rev(work, "trunk~1")
+    # Only whitespace tells the two commits apart, and merging the branch into
+    # the base would change nothing, so only an exact identity keeps them apart.
+    assert patch_identity(work, tip, "--stable") == patch_identity(work, landed, "--stable")
+    assert patch_identity(work, tip, "--verbatim") != patch_identity(work, landed, "--verbatim")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ('case "$*" in *" init --bare "*) exit 3;; esac', "failed"),
+        ('case "$*" in *" merge-tree "*) exit 2;; esac', "failed"),
+        ('case "$*" in *" merge-tree "*) sleep 3;; esac', "deadline"),
+    ],
+    ids=["scratch-repository", "merge", "merge-call-cap"],
+)
+def test_a_merge_check_that_fails_leaves_the_match_unknown_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, body, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    shim = stand_in(tmp_path, "failing-merge-check", body)
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=1.0)
+
+    verdicts = verdicts_of(find_clone(document, work))
+    stored = cache_entries(cache)
+    base = rev(work, "origin/trunk")
+    for name in ("picked", "squashed", "bin-picked", "blobdiff"):
+        assert verdicts[name] == unknown(reason), name
+        assert f"{rev(work, name)}.{base}" not in stored, name
+    # Tips that never reach the merge check are decided and stored as usual.
+    assert verdicts["unmerged"] == NOT_MERGED
+    assert verdicts["split"] == MERGED_TREE
+    assert stored[f"{rev(work, 'unmerged')}.{base}"] == "none"
+
+
+@posix_only
+def test_the_merge_check_runs_no_clone_merge_driver_and_adds_no_object_to_the_clone(
+    tmp_path, isolated_git
+):
+    folder, work = lookalike_world(
+        tmp_path, "ci.yml", JOBS_ORIGINAL, JOBS_BRANCH, JOBS_BASE, "patch"
+    )
+    marker = tmp_path / "driver-marker"
+    driver = marker_script(tmp_path / "scripts", "driver", marker, "exit 1")
+    git(work, "config", "merge.probe.driver", f"{driver} %O %A %B")
+    (work / ".git" / "info").mkdir(exist_ok=True)
+    (work / ".git" / "info" / "attributes").write_text("* merge=probe\n")
+    git(work, "merge-tree", "--write-tree", "origin/trunk", "feature", check=False)
+    assert marker.exists(), "control: a merge inside the clone runs its configured driver"
+    marker.unlink()
+    before = snapshot(work)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert not marker.exists()
+    assert snapshot(work) == before
+
+
 def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     cold = verdicts_of(find_clone(collect([folder]), work))
