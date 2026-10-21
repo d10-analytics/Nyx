@@ -7,7 +7,8 @@ README is narrative only.
 
 - Typed validation of catalog and checkout documents.
 - The canonical digest helper and the sort keys.
-- The schema constants and field limits that `catalog` and `checkouts` import.
+- The schema constants that `catalog` and `checkouts` import, and the field
+  limits `catalog` imports.
 - Imports nothing internal.
 
 ## Outside this boundary
