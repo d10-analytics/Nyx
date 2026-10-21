@@ -3936,6 +3936,195 @@ def test_a_content_merge_step_that_fails_leaves_the_match_unknown_and_stores_not
 
 
 @posix_only
+def test_a_symbolic_link_retargeted_where_the_base_edited_a_file_is_not_merged(
+    tmp_path, isolated_git
+):
+    """The base's file at that path is a regular file, the branch's a symbolic link."""
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "link", "a", "add link as a file")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for target, message in (("a", "make link a symbolic link"), ("b", "retarget link")):
+        (work / "link").unlink()
+        (work / "link").symlink_to(target)
+        git(work, "add", "link")
+        git(work, "commit", "-q", "-m", message)
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature~1")
+    (work / "link").unlink()
+    write_bytes(work, "link", b"a")
+    git(work, "commit", "-q", "-m", "make link a file again")
+    commit_file(work, "link", "b", "edit the file")
+    git(work, "push", "-q", "origin", "trunk")
+    # The trap is real: the retarget and the file edit share their exact identity.
+    assert patch_identity(work, rev(work, "feature"), "--verbatim") == patch_identity(
+        work, rev(work, "trunk"), "--verbatim"
+    )
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert cache_entries(cache)[f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"] == "none"
+
+
+def repeated_block_landings(work: Path, blocks: int, landed: list[int]) -> None:
+    """``ci.yml`` with ``blocks`` identical jobs; the base times out ``landed`` jobs
+    (0-based) one commit each, in that order, all with one patch identity."""
+    state = [JOB_BLOCK] * blocks
+    for index in landed:
+        state[index] = JOB_TIMEOUT
+        commit_file(work, "ci.yml", "".join(state), f"timeout on job {index + 1}")
+
+
+def test_a_landing_behind_a_newer_lookalike_with_its_identity_still_reads_merged(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "ci.yml", JOB_BLOCK * 3, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "ci.yml", JOB_TIMEOUT + JOB_BLOCK * 2, "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    commit_file(work, "ci.yml", JOB_TIMEOUT * 2 + JOB_BLOCK, "timeout on job 2")
+    git(work, "push", "-q", "origin", "trunk")
+    # The newest base commit with the branch's identity is the lookalike on job 2.
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    assert patch_identity(work, rev(work, "trunk"), "--verbatim") == identity
+    assert patch_identity(work, rev(work, "trunk~1"), "--verbatim") == identity
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+def test_more_base_commits_with_the_identity_than_the_bound_leave_the_branch_unknown(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.LANDING_CAP + 3
+    commit_file(work, "ci.yml", JOB_BLOCK * blocks, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "ci.yml", JOB_TIMEOUT + JOB_BLOCK * (blocks - 1), "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    # One lookalike more than the bound, none of them on job 1.
+    repeated_block_landings(work, blocks, list(range(1, checkouts.LANDING_CAP + 2)))
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown("history_limit")
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
+def content_merges_world(tmp_path: Path, files: int):
+    """A cherry-pick of one commit editing ``files`` files, each of which the base
+    edited elsewhere first, so each file needs its own content merge."""
+    folder, _remote, work = small_world(tmp_path)
+    lines = "".join(f"line {number}\n" for number in range(1, 13))
+    names = [f"m{number:02d}.txt" for number in range(files)]
+    for name in names:
+        write_bytes(work, name, lines.encode())
+    git(work, "commit", "-q", "-m", "add files")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for name in names:
+        write_bytes(work, name, lines.replace("line 10\n", "ten\n").encode())
+    git(work, "commit", "-q", "-m", "edit line 10 everywhere")
+    git(work, "checkout", "-q", "trunk")
+    for name in names:
+        write_bytes(work, name, lines.replace("line 2\n", "two\nextra\n").encode())
+    git(work, "commit", "-q", "-m", "grow every top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize("over", [False, True], ids=["at-bound", "over-bound"])
+def test_more_content_merges_than_the_bound_leave_the_branch_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git, over
+):
+    cache = nyx_home(isolated_git)
+    folder, work = content_merges_world(tmp_path, checkouts.MERGE_PATH_CAP + over)
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    verdict = verdicts_of(find_clone(document, work))["feature"]
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    stored = cache_entries(cache) if cache.exists() else {}
+    if over:
+        assert verdict == unknown("history_limit")
+        assert key not in stored
+        assert "merge-file" not in calls
+    else:
+        assert verdict == MERGED_PATCH
+        assert stored[key] == "patch_equivalent"
+        assert calls.count("merge-file") == checkouts.MERGE_PATH_CAP
+
+
+def test_a_content_merge_of_a_file_over_the_bound_is_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    rows = [
+        f"row {number:06d} {'x' * 40}\n" for number in range(checkouts.MERGE_FILE_CAP // 48 + 10)
+    ]
+    original = "".join(rows)
+    assert len(original) > checkouts.MERGE_FILE_CAP
+    commit_file(work, "big.txt", original, "add big")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "big.txt", original.replace(rows[-5], rows[-5].upper()), "edit near the end")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "big.txt", original.replace(rows[3], rows[3].upper()), "edit near the top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown("history_limit")
+    assert "merge-file" not in calls
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
+@pytest.mark.parametrize("over", [False, True], ids=["at-bound", "over-bound"])
+def test_a_change_touching_more_paths_than_the_bound_is_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git, over
+):
+    cache = nyx_home(isolated_git)
+    monkeypatch.setattr(checkouts, "CONFIRM_PATH_CAP", 3)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for number in range(3 + over):
+        write_bytes(work, f"p{number}.txt", b"p\n")
+    git(work, "commit", "-q", "-m", "add files")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    verdict = verdicts_of(find_clone(document, work))["feature"]
+    stored = cache_entries(cache) if cache.exists() else {}
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    if over:
+        assert verdict == unknown("history_limit")
+        assert key not in stored
+    else:
+        assert verdict == MERGED_PATCH
+        assert stored[key] == "patch_equivalent"
+
+
+@posix_only
 def test_the_landing_check_runs_no_clone_merge_driver_and_touches_nothing_in_the_clone(
     tmp_path, isolated_git
 ):
