@@ -766,7 +766,7 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     assert set(listing) <= set(after)
     stored = json.loads((account / ".nyx" / "cache" / "checkouts.json").read_text())
     assert set(stored) == {"schema_version", "verdicts"}
-    assert stored["schema_version"] == 1
+    assert stored["schema_version"] == 2
     assert {key: entry["rung"] for key, entry in stored["verdicts"].items()} == {
         f"{tip}.{base}": "patch_equivalent"
     }
