@@ -3553,6 +3553,23 @@ def test_a_repository_attribute_no_longer_present_does_not_keep_a_cached_unmerge
     assert verdicts_of(find_clone(document, work))["blobdiff"] == MERGED_PATCH
 
 
+def test_a_cached_merged_never_replaces_an_unmerged_the_run_decides(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    base, blobdiff = rev(work, "origin/trunk"), rev(work, "blobdiff")
+
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work))["blobdiff"] == MERGED_PATCH
+    assert cache_entries(cache)[f"{blobdiff}.{base}"] == "patch_equivalent"
+    (work / ".git" / "info").mkdir(exist_ok=True)
+    (work / ".git" / "info" / "attributes").write_text("shared.txt -diff\n")
+
+    document = collect([folder])
+
+    # Every rung ran and proved nothing, so the run's own answer stands.
+    assert verdicts_of(find_clone(document, work))["blobdiff"] == NOT_MERGED
+
+
 def test_inherited_repository_variables_are_ignored(tmp_path, monkeypatch):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     baseline = verdicts_of(find_clone(collect([folder]), work))
