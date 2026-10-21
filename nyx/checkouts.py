@@ -29,6 +29,7 @@ from urllib.parse import unquote
 
 from .catalog import MAX_OUTPUT_BYTES
 from .models import (
+    CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
     CHECKOUTS_SCHEMA_VERSION,
     OPERATIONS,
@@ -965,6 +966,9 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
             cached[name[len("refs/remotes/origin/") :]] = sha
         elif name == "refs/stash":
             has_stash = True
+    # A clone beyond the supported size costs this listing and nothing more.
+    if len(local) > CHECKOUT_BRANCH_CAP:
+        return degraded("too_many_branches")
     if not all(_safe_text(name) for name in local) or not all(
         _safe_text(name) for name in cached
     ):
@@ -1657,9 +1661,12 @@ def _integers(data: bytes, count: int) -> list[int] | None:
     return [int(item) for item in fields]
 
 
-@dataclass
+@dataclass(eq=False)
 class _Tip:
-    """One distinct commit awaiting a verdict, with what the ladder learns of it."""
+    """One distinct commit awaiting a verdict, with what the ladder learns of it.
+
+    Tips compare and hash by identity, so sets and mappings of tips cost a hash.
+    """
 
     sha: str
     verdict: dict[str, Any] | None = None
@@ -1760,7 +1767,7 @@ class _Ladder:
         pending.sort(key=self._priority)
         pending = self._sizes(pending)
         mapped: dict[str, str] | None = None
-        eligible: list[_Tip] = []
+        eligible: set[_Tip] = set()
         if self._settings.patch_rungs:
             eligible, mapped = self._shared(pending)
         # Each tip finishes its whole ladder before the next starts, so a budget
@@ -1784,10 +1791,10 @@ class _Ladder:
             if tip.verdict is None:
                 if tip.error is not None:
                     tip.verdict = _unknown(tip.error)
-                elif not self._settings.patch_rungs:
-                    tip.verdict = _unknown("git_too_old")
                 else:
-                    tip.verdict = dict(_NOT_MERGED)
+                    # Only a git below the patch floor reaches here without an
+                    # error: with the rungs available every tip was decided above.
+                    tip.verdict = _unknown("git_too_old")
             # A tip that recorded a failed or timed-out step never stores a verdict.
             if (
                 complete
@@ -1941,12 +1948,15 @@ class _Ladder:
                 return reduced[0]
             current = reduced
 
-    def _shared(self, pending: list[_Tip]) -> tuple[list[_Tip], dict[str, str] | None]:
+    def _shared(self, pending: list[_Tip]) -> tuple[set[_Tip], dict[str, str] | None]:
         """The ladder-wide patch steps; return the tips left for their own patch rungs."""
         base = self._base.sha
         for tip in pending:
             self._merge_bases(tip)
-        active = [tip for tip in pending if tip.error is None]
+        active = {tip: None for tip in pending if tip.error is None}
+        # Each round limits the active tip with the largest comparison (ties:
+        # the later one), so one sort fixes the whole victim order.
+        victims = sorted(active, key=lambda item: (item.left, item.order))
         shared: str | None = None
         while active:
             known = sorted({item for tip in active for item in tip.bases or []})
@@ -1958,7 +1968,7 @@ class _Ladder:
                 if isinstance(found, _Outcome):
                     for tip in active:
                         tip.fail(_call_failure(found))
-                    return [], None
+                    return set(), None
                 ceiling_commit = found
             revisions = [base] if ceiling_commit is None else [base, "--not", ceiling_commit]
             counted = self._git(["rev-list", "--no-merges", "--count", *revisions, "--"])
@@ -1966,22 +1976,22 @@ class _Ladder:
             if parsed is None:
                 for tip in active:
                     tip.fail(_call_failure(counted))
-                return [], None
+                return set(), None
             if parsed[0] <= SHARED_RANGE_CAP:
                 shared = ceiling_commit
                 break
-            victim = max(active, key=lambda item: (item.left, item.order))
+            victim = victims.pop()
             victim.limited = True
             victim.verdict = _unknown("history_limit")
-            active.remove(victim)
+            del active[victim]
         if not active:
-            return [], None
+            return set(), None
         mapped = self._patch_ids([base] if shared is None else [base, "--not", shared])
         if isinstance(mapped, _Outcome):
             for tip in active:
                 tip.fail(_call_failure(mapped))
-            return [], None
-        return active, mapped
+            return set(), None
+        return set(active), mapped
 
     def _patch_rungs(self, tip: _Tip, mapped: dict[str, str]) -> None:
         base = self._base.sha

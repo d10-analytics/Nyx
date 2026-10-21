@@ -785,6 +785,9 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 CHECKOUTS_SCHEMA_VERSION = 2
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
+# A clone lists at most this many local branches; beyond it the clone is
+# reported as ``too_many_branches`` and none of its branches is examined.
+CHECKOUT_BRANCH_CAP = 100
 
 _NUMBER_RUN = re.compile(r"([0-9]+)")
 _TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -843,6 +846,7 @@ _CLONE_KEYS = frozenset(
     }
 )
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
+_CLONE_STATUSES = _ITEM_STATUSES | {"too_many_branches"}
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
 _LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_live", "vs_cached"})
 _WORKTREE_KEYS = frozenset(
@@ -1170,7 +1174,7 @@ def _clone(
     item = _object(value, name)
     _keys(item, _CLONE_KEYS, name)
     path = _text(item["path"], f"{name}.path")
-    status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
+    status = _choice(item["status"], _CLONE_STATUSES, f"{name}.status")
     facts = (
         "bare",
         "partial_clone",
@@ -1238,6 +1242,8 @@ def _clone(
 
     local_paths = {worktree["path"] for worktree in parsed}
     branches = _list(item["branches"], f"{name}.branches")
+    if len(branches) > CHECKOUT_BRANCH_CAP:
+        raise ProtocolError(f"{name} lists more than {CHECKOUT_BRANCH_CAP} branches")
     parsed_branches = [
         _branch(raw, f"{name}.branches[{index}]", has_remote=has_remote)
         for index, raw in enumerate(branches)
