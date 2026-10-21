@@ -207,8 +207,8 @@ comparison was too large to check within the fixed bounds. `deadline` means the
 partial clone shows `incomplete_clone` in preference to `git_too_old`.
 
 Verdicts that took git a long time to compute are remembered in
-`~/.nyx/cache/checkouts.json`, so a later run can answer without repeating the
-work. The cache is used only when `~/.nyx` already exists; Nyx never creates that
+`~/.nyx/cache/checkouts.json`, so a later run that cannot decide a branch can
+still answer from them. The cache is used only when `~/.nyx` already exists; Nyx never creates that
 directory for it, and it is created inside `~/.nyx` as `cache/` when first
 needed. It stores only verdicts decided in full by git 2.39 or later in a clone
 that is neither shallow nor partial, and only for the rungs other than
@@ -219,12 +219,17 @@ run differs from a cold run only where the cold run says `unknown`: the
 warm run may give the remembered verdict instead, whatever the reason
 (`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
 `history_limit` depends on the other branches in the clone, which is why a
-remembered answer may stand in for it. Under git older than 2.39, the lookup
-comes after the size check and the `tree_equal` rung, so a remembered answer
-never replaces a `tree_equal` verdict that the cold run decides. One residual:
-a repository's diff attributes (`.gitattributes` in the tree and
-`info/attributes`) can make Nyx compare a file by its blob identity instead of
-by hunks, which can only make matching stricter. A file that is
+remembered answer may stand in for it. A warm run therefore does the same git
+work as a cold run: it checks every branch it can before it looks anything up,
+and only a shallow or partial clone, where no check beyond `ancestor` can run,
+looks up first. Under git older than 2.39, the lookup comes after the size
+check and the `tree_equal` rung, so a remembered answer never replaces a
+`tree_equal` verdict that the cold run decides. A repository's diff attributes
+(`.gitattributes` in the tree and `info/attributes`) can make Nyx compare a
+file by its blob identity instead of by hunks, which can only make matching
+stricter. A `not_merged` they caused is remembered like any other, but it
+stands in only for a later `unknown`, so once the attributes are gone a run
+that decides the branch reports its own verdict. A file that is
 missing, damaged, too large or from another version is ignored. Deleting it only
 costs time, because the verdicts are recomputed.
 

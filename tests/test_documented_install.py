@@ -242,6 +242,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "a warm run differs from a cold run only where the cold run says `unknown`",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",
+        "so once the attributes are gone a run that decides the branch reports its own verdict",
         "`incomplete_clone` means the clone is shallow or partial",
         "`git_too_old` means git is older than 2.39",
         "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39",
