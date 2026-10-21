@@ -183,6 +183,9 @@ CHECKOUT_RETIRED_WORDING = (
     "never fetches or contacts a remote",
     "`default <name> <relation> cached <time>`",
     "`cached <time>`",
+    "every verdict in it is `unknown` with the reason `no_base`. Every",
+    "an unreadable clone, or one with no default branch name",
+    "so the document is the same warm or cold",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -230,7 +233,15 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`tree_equal`: the branch's file contents are identical",
         "`not_merged` has the rung `none`",
         "`no_base`",
-        "has no base, and every verdict in it is `unknown` with the reason `no_base`",
+        "A clone with no `origin` remote or no default branch name has no base",
+        "neither the remote's current commit for it (in the clone or borrowed from a sibling) "
+        "nor its own remote-tracking copy of that branch",
+        "Every verdict in a clone with no base is `unknown` with the reason `no_base`",
+        "has no branches, no worktrees and no base, so it has no verdicts at all",
+        "It never replaces a verdict the run decides itself",
+        "a warm run differs from a cold run only where the cold run says `unknown`",
+        "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
+        "which can only make matching stricter",
         "`incomplete_clone` means the clone is shallow or partial",
         "`git_too_old` means git is older than 2.39",
         "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39",

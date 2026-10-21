@@ -176,9 +176,13 @@ clone that has it (named in `objects_from`). The `cached` basis, "base stale",
 is the clone's own remote-tracking copy of that branch, which can be older than
 the remote until you fetch; a branch shown as merged against a stale base was
 merged into what the clone last saw, which the remote may since have moved
-past. A clone with no `origin` remote, an unreadable clone, or one with no
-default branch name has no base, and every verdict in it is
-`unknown` with the reason `no_base`. Every local branch except the base branch
+past. A clone with no `origin` remote or no default branch name has no base. So
+does a clone that has a default branch name but neither the remote's current
+commit for it (in the clone or borrowed from a sibling) nor its own
+remote-tracking copy of that branch. Every verdict in a clone with no base is
+`unknown` with the reason `no_base`. A clone git could not read, described
+below, has no branches, no worktrees and no base, so it has no verdicts at
+all. In every other clone, every local branch except the base branch
 itself, and every worktree on a detached `HEAD`, gets a verdict: `state` is
 `merged`, `not_merged` or `unknown`.
 
@@ -210,8 +214,17 @@ needed. It stores only verdicts decided in full by git 2.39 or later in a clone
 that is neither shallow nor partial, and only for the rungs other than
 `ancestor`, together with the `not_merged` answer. A remembered answer is used
 only in place of an `unknown` verdict that this run could not decide for lack of
-time, a failed call, a size bound or a clone limit. It never replaces an answer
-the run reaches itself, so the document is the same warm or cold. A file that is
+time, a failed call, a size bound or a clone limit. It never replaces a verdict the run decides itself, so a warm
+run differs from a cold run only where the cold run says `unknown`: the
+warm run may give the remembered verdict instead, whatever the reason
+(`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
+`history_limit` depends on the other branches in the clone, which is why a
+remembered answer may stand in for it. Under git older than 2.39, the lookup
+comes after the size check and the `tree_equal` rung, so a remembered answer
+never replaces a `tree_equal` verdict that the cold run decides. One residual:
+a repository's diff attributes (`.gitattributes` in the tree and
+`info/attributes`) can make Nyx compare a file by its blob identity instead of
+by hunks, which can only make matching stricter. A file that is
 missing, damaged, too large or from another version is ignored. Deleting it only
 costs time, because the verdicts are recomputed.
 
