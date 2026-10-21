@@ -3457,6 +3457,188 @@ def test_each_rung_proves_exactly_its_case(tmp_path):
     assert len(git(work, "merge-base", "--all", base, "cross").stdout.split()) == 2
 
 
+INDENT_ORIGINAL = "def main():\n    setup()\n    work()\n    cleanup()\n    finish()\n"
+INDENT_BRANCH = "def main():\n    setup()\n    work()\n        cleanup()\n    finish()\n"
+INDENT_BASE = "def main():\n    setup()\n    work()\ncleanup()\n    finish()\n"
+JOB_BLOCK = (
+    "job:\n  image: base\n  cache: none\n  retry: 1\n  script: make\n  after: done\n"
+    "  notify: no\n"
+)
+JOB_TIMEOUT = JOB_BLOCK.replace("  script: make\n", "  script: make\n  timeout: 30\n")
+JOBS_ORIGINAL = JOB_BLOCK * 3
+JOBS_BRANCH = JOB_TIMEOUT + JOB_BLOCK * 2
+JOBS_BASE = JOB_BLOCK + JOB_TIMEOUT + JOB_BLOCK
+
+
+def patch_identity(repo: Path, commit: str, mode: str) -> str:
+    shown = subprocess.run(
+        ["git", "show", "--format=", "--no-ext-diff", commit],
+        cwd=repo, capture_output=True, check=True,
+    ).stdout
+    result = subprocess.run(
+        ["git", "patch-id", mode], input=shown, cwd=repo, capture_output=True, check=True
+    )
+    return result.stdout.split()[0].decode()
+
+
+def lookalike_world(tmp_path: Path, name: str, original: str, branch: str, base: str, shape: str):
+    """A branch and the base each change ``name`` in a way that is the same patch
+    once whitespace and line numbers are ignored, yet is a different change.
+
+    ``shape`` ``patch`` lands the base's change as its own commit, so the
+    branch could only match commit by commit; ``squash`` gives the branch two
+    commits and lands them on the base as one, so only the whole branch matches.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, name, original, f"add {name}")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+    commit_file(work, name, branch, f"change {name} on the branch")
+    git(work, "checkout", "-q", "trunk")
+    if shape == "squash":
+        write_bytes(work, "notes.txt", b"notes\n")
+    commit_file(work, name, base, f"change {name} on the base")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize("shape", ["patch", "squash"])
+@pytest.mark.parametrize(
+    ("name", "original", "branch", "base", "verbatim_differs"),
+    [
+        ("app.py", INDENT_ORIGINAL, INDENT_BRANCH, INDENT_BASE, True),
+        ("ci.yml", JOBS_ORIGINAL, JOBS_BRANCH, JOBS_BASE, False),
+    ],
+    ids=["indentation", "repeated-block"],
+)
+def test_a_lookalike_change_elsewhere_in_the_base_is_not_merged(
+    tmp_path, isolated_git, name, original, branch, base, verbatim_differs, shape
+):
+    cache = nyx_home(isolated_git)
+    folder, work = lookalike_world(tmp_path, name, original, branch, base, shape)
+    tip, landed = rev(work, "feature"), rev(work, "trunk~1")
+    if shape == "patch":
+        # The trap is real: the stable identities agree.  Where only whitespace
+        # differs the verbatim ones do not; where only the location differs no
+        # identity can tell, and the merge check alone refuses the match.
+        assert patch_identity(work, tip, "--stable") == patch_identity(work, landed, "--stable")
+        same = patch_identity(work, tip, "--verbatim") == patch_identity(work, landed, "--verbatim")
+        assert same != verbatim_differs
+
+    document = collect([folder])
+
+    item = find_clone(document, work)
+    assert verdicts_of(item)["feature"] == NOT_MERGED
+    key = f"{tip}.{rev(work, 'origin/trunk')}"
+    # What is stored under the pair is the decided ``none``, never a patch rung.
+    assert cache_entries(cache)[key] == "none"
+
+
+def test_a_change_the_base_later_rewrote_is_not_confirmed_as_merged(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "f.txt", "a\nb\nc\n", "add f")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "f.txt", "A\nb\nc\n", "capitalise a")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "feature")
+    commit_file(work, "f.txt", "Z\nb\nc\n", "rewrite the same line later")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([tmp_path / "folder"])
+
+    # The merge of the branch into the base conflicts, so the match is not
+    # confirmed: the verdict errs toward keeping the branch.
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+
+
+def test_a_cached_verdict_from_the_retired_schema_is_never_served(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = lookalike_world(
+        tmp_path, "app.py", INDENT_ORIGINAL, INDENT_BRANCH, INDENT_BASE, "patch"
+    )
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    document = {"schema_version": 1, "verdicts": {key: {"rung": "patch_equivalent", "at": 5}}}
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(json.dumps(document))
+
+    with path_with(monkeypatch, old):
+        retired = collect([folder])
+    assert verdicts_of(find_clone(retired, work))["feature"] == unknown("git_too_old")
+    assert retired["diagnostics"] == []
+
+    cache.write_text(json.dumps({**document, "schema_version": 2}))
+    with path_with(monkeypatch, old):
+        current = collect([folder])
+    assert verdicts_of(find_clone(current, work))["feature"] == MERGED_PATCH
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="needs a SHA-256 repository the lane may lack")
+def test_the_patch_rungs_confirm_a_cherry_pick_in_a_sha256_repository(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = served / "remote.git"
+    made = git(served, "init", "-q", "--bare", "--object-format=sha256", "-b", "trunk", str(remote),
+               check=False)
+    if made.returncode != 0:
+        pytest.skip("this git cannot make a SHA-256 repository")
+    seed = served / "seed"
+    git(served, "init", "-q", "--object-format=sha256", "-b", "trunk", str(seed))
+    commit_file(seed, "file.txt", "one\n", "seed")
+    git(seed, "remote", "add", "origin", str(remote))
+    git(seed, "push", "-q", "origin", "trunk")
+    work = clone(remote, folder / "work")
+    git(work, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(work, "p1.txt", "p1\n")
+    commit_file(work, "p2.txt", "p2\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked~1", "picked")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["picked"] == MERGED_PATCH
+
+
+def test_the_squash_rung_streams_its_diff_and_no_run_call_carries_diff_bytes(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+    streamed: list[str] = []
+    buffered: list[str] = []
+
+    def recording_run(self, arguments, **options):
+        if git_subcommand(arguments) in ("diff", "patch-id") or "stdin_bytes" in options:
+            buffered.append(git_subcommand(arguments))
+        return run(self, arguments, **options)
+
+    def recording_pipeline(self, producer, consumer, **options):
+        streamed.append(git_subcommand(producer))
+        return pipeline(self, producer, consumer, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(checkouts._GitRunner, "run", recording_run)
+        patched.setattr(checkouts._GitRunner, "pipeline", recording_pipeline)
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["squashed"] == MERGED_SQUASH
+    assert "diff" in streamed
+    assert buffered == []
+
+
 def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     cold = verdicts_of(find_clone(collect([folder]), work))
@@ -4121,7 +4303,7 @@ def nyx_home(home: Path) -> Path:
 
 def cache_entries(cache: Path) -> dict[str, str]:
     document = json.loads(cache.read_text())
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     return {key: entry["rung"] for key, entry in document["verdicts"].items()}
 
 
@@ -4260,13 +4442,13 @@ def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
     return {
         "garbage": b"not json {",
         "extra_key": json.dumps({**document, "extra": 1}).encode(),
-        "foreign_schema": json.dumps({**document, "schema_version": 2}).encode(),
+        "foreign_schema": json.dumps({**document, "schema_version": 3}).encode(),
         "ancestor_rung": json.dumps(
-            {"schema_version": 1, "verdicts": {good_key: {"rung": "ancestor", "at": 1}}}
+            {"schema_version": 2, "verdicts": {good_key: {"rung": "ancestor", "at": 1}}}
         ).encode(),
         "key_lengths": json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "verdicts": {"a" * 40 + "." + "b" * 64: {"rung": "none", "at": 1}},
             }
         ).encode(),
@@ -4383,7 +4565,7 @@ def test_incomplete_clones_leave_an_existing_cache_file_untouched(tmp_path, isol
     cache = nyx_home(isolated_git)
     cache.parent.mkdir()
     stored = json.dumps(
-        {"schema_version": 1, "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}}}
+        {"schema_version": 2, "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}}}
     ).encode()
     cache.write_bytes(stored)
     folder, incomplete = incomplete_world(tmp_path, option)
@@ -4600,7 +4782,7 @@ def write_cache(
     cache.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "verdicts": {
                     key: {"rung": (rungs or {}).get(key, "none"), "at": at}
                     for key, at in entries.items()
