@@ -1404,6 +1404,323 @@ def test_unchanged_state_gives_a_new_observation_time_and_the_same_digest(repo):
     assert first["checkouts_digest"] == second["checkouts_digest"]
 
 
+def verdict_of(state, rung=None, reason=None):
+    return {"state": state, "rung": rung, "reason": reason}
+
+
+def merged_verdict():
+    return verdict_of("merged", "ancestor")
+
+
+def other_branches(clone_document):
+    base = clone_document["verdict_base"]["name"]
+    return [item for item in clone_document["branches"] if item["name"] != base]
+
+
+def detach(document, verdict):
+    """Detach the outside worktree of the first clone and give it ``verdict``."""
+    clone_document = first_clone(document)
+    worktree = next(item for item in clone_document["worktrees"] if not item["main"])
+    worktree["head"] = {"branch": None, "sha": worktree["head"]["sha"]}
+    worktree["verdict"] = verdict
+    return worktree
+
+
+def undecided_without_a_base(document):
+    """Drop the first clone's base, as for a group that agrees on no default name."""
+    clone_document = first_clone(document)
+    clone_document["verdict_base"] = None
+    for branch in clone_document["branches"]:
+        branch["verdict"] = verdict_of("unknown", reason="no_base")
+
+
+def without_remote(document):
+    """Reduce the first clone to a repository with no remote and so no base."""
+    clone_document = first_clone(document)
+    document["repositories"] = [
+        {"remote": None, "default_branch": None, "clones": [clone_document]}
+    ]
+    clone_document.update(cached_default=None, local_default=None, cached_vs_live=None)
+    for branch in clone_document["branches"]:
+        branch.update(vs_remote=None, upstream_mismatch=False)
+    undecided_without_a_base(document)
+    return clone_document
+
+
+def mutate_verdict(state, rung, reason):
+    def mutate(document):
+        other_branches(first_clone(document))[0]["verdict"] = verdict_of(state, rung, reason)
+
+    return mutate
+
+
+def mutate_verdict_extra_key(document):
+    other_branches(first_clone(document))[0]["verdict"]["extra"] = 1
+
+
+def mutate_base_extra_key(document):
+    first_clone(document)["verdict_base"]["extra"] = 1
+
+
+def mutate_base_basis(value):
+    def mutate(document):
+        first_clone(document)["verdict_base"]["basis"] = value
+
+    return mutate
+
+
+def mutate_base_lender_with_cached_basis(document):
+    base = first_clone(document)["verdict_base"]
+    assert base["basis"] == "cached"
+    base["objects_from"] = first_clone(document)["path"]
+
+
+def mutate_verdict_on_the_base_branch(document):
+    base = first_clone(document)["verdict_base"]["name"]
+    branch_of(first_clone(document), base)["verdict"] = merged_verdict()
+
+
+def mutate_null_verdict_on_another_branch(document):
+    other_branches(first_clone(document))[0]["verdict"] = None
+
+
+def mutate_verdict_on_a_worktree_on_a_branch(document):
+    worktree = next(item for item in first_clone(document)["worktrees"] if not item["main"])
+    assert worktree["head"]["branch"] is not None
+    worktree["verdict"] = merged_verdict()
+
+
+def mutate_verdict_on_a_non_ok_worktree(document):
+    worktree = next(item for item in first_clone(document)["worktrees"] if not item["main"])
+    worktree.update(
+        status="failed", head=None, changes=None, operations=None, index_lock=None,
+        verdict=merged_verdict(),
+    )
+
+
+def mutate_null_verdict_on_a_detached_worktree(document):
+    detach(document, None)
+
+
+def mutate_incomplete_clone_on_a_full_clone(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+
+
+def mutate_incomplete_clone_on_a_detached_worktree(document):
+    detach(document, verdict_of("unknown", reason="incomplete_clone"))
+
+
+def mutate_git_too_old_on_a_new_git(document):
+    assert document["git"]["version"] == "2.43.0"
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
+        "unknown", reason="git_too_old"
+    )
+
+
+def mutate_git_too_old_on_the_floor_version(document):
+    document["git"]["version"] = "2.39.0"
+    mutate_git_too_old_on_a_new_git_verdict(document)
+
+
+def mutate_git_too_old_on_a_newer_vendor_version(document):
+    document["git"]["version"] = "2.39.1.windows.1"
+    mutate_git_too_old_on_a_new_git_verdict(document)
+
+
+def mutate_git_too_old_on_a_detached_worktree(document):
+    detach(document, verdict_of("unknown", reason="git_too_old"))
+
+
+def mutate_git_too_old_on_a_new_git_verdict(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
+        "unknown", reason="git_too_old"
+    )
+
+
+def mutate_base_null_with_a_decided_branch(document):
+    undecided_without_a_base(document)
+    other_branches_target = next(
+        item for item in first_clone(document)["branches"] if item["name"] != "trunk"
+    )
+    other_branches_target["verdict"] = merged_verdict()
+
+
+def mutate_base_null_with_a_decided_worktree(document):
+    undecided_without_a_base(document)
+    detach(document, merged_verdict())
+
+
+def mutate_no_base_with_a_base(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of("unknown", reason="no_base")
+
+
+def mutate_no_base_on_a_detached_worktree_with_a_base(document):
+    detach(document, verdict_of("unknown", reason="no_base"))
+
+
+def mutate_base_on_a_clone_without_a_remote(document):
+    clone_document = without_remote(document)
+    clone_document["verdict_base"] = {
+        "name": "trunk", "sha": "1" * 40, "basis": "live", "objects_from": None
+    }
+    for branch in clone_document["branches"]:
+        branch["verdict"] = None if branch["name"] == "trunk" else merged_verdict()
+
+
+def mutate_base_on_a_clone_that_is_not_ok(document):
+    clone_document = first_clone(document)
+    base = clone_document["verdict_base"]
+    refused_clone(document)
+    clone_document["verdict_base"] = base
+
+
+def mutate_missing_verdict_key(document):
+    del other_branches(first_clone(document))[0]["verdict"]["reason"]
+
+
+REJECTED_VERDICT_DOCUMENTS = {
+    "merged_without_rung": mutate_verdict("merged", None, None),
+    "merged_with_rung_none": mutate_verdict("merged", "none", None),
+    "merged_with_foreign_rung": mutate_verdict("merged", "pull_request", None),
+    "not_merged_with_rung_ancestor": mutate_verdict("not_merged", "ancestor", None),
+    "not_merged_without_rung": mutate_verdict("not_merged", None, None),
+    "unknown_with_rung": mutate_verdict("unknown", "ancestor", "failed"),
+    "unknown_with_rung_none": mutate_verdict("unknown", "none", "failed"),
+    "unknown_without_reason": mutate_verdict("unknown", None, None),
+    "reason_on_merged": mutate_verdict("merged", "ancestor", "failed"),
+    "reason_on_not_merged": mutate_verdict("not_merged", "none", "failed"),
+    "foreign_state": mutate_verdict("pending", None, None),
+    "foreign_reason": mutate_verdict("unknown", None, "objects_missing"),
+    "extra_verdict_key": mutate_verdict_extra_key,
+    "missing_verdict_key": mutate_missing_verdict_key,
+    "extra_base_key": mutate_base_extra_key,
+    "foreign_base_basis": mutate_base_basis("remote"),
+    "null_base_basis": mutate_base_basis(None),
+    "lender_under_the_cached_basis": mutate_base_lender_with_cached_basis,
+    "verdict_on_the_base_branch": mutate_verdict_on_the_base_branch,
+    "null_verdict_on_another_branch": mutate_null_verdict_on_another_branch,
+    "verdict_on_a_worktree_on_a_branch": mutate_verdict_on_a_worktree_on_a_branch,
+    "verdict_on_a_non_ok_worktree": mutate_verdict_on_a_non_ok_worktree,
+    "null_verdict_on_a_detached_worktree": mutate_null_verdict_on_a_detached_worktree,
+    "incomplete_clone_on_a_full_clone": mutate_incomplete_clone_on_a_full_clone,
+    "incomplete_clone_on_a_detached_worktree": mutate_incomplete_clone_on_a_detached_worktree,
+    "git_too_old_on_a_new_git": mutate_git_too_old_on_a_new_git,
+    "git_too_old_on_the_floor_version": mutate_git_too_old_on_the_floor_version,
+    "git_too_old_on_a_vendor_version": mutate_git_too_old_on_a_newer_vendor_version,
+    "git_too_old_on_a_detached_worktree": mutate_git_too_old_on_a_detached_worktree,
+    "null_base_with_a_decided_branch": mutate_base_null_with_a_decided_branch,
+    "null_base_with_a_decided_worktree": mutate_base_null_with_a_decided_worktree,
+    "no_base_with_a_base": mutate_no_base_with_a_base,
+    "no_base_worktree_with_a_base": mutate_no_base_on_a_detached_worktree_with_a_base,
+    "base_without_a_remote": mutate_base_on_a_clone_without_a_remote,
+    "base_on_a_clone_that_is_not_ok": mutate_base_on_a_clone_that_is_not_ok,
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_VERDICT_DOCUMENTS), ids=str)
+def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_VERDICT_DOCUMENTS[mutation](broken)
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
+def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
+    document, _folder = sample
+    shapes = [
+        verdict_of("merged", rung)
+        for rung in ("ancestor", "patch_equivalent", "squash_equivalent", "tree_equal")
+    ] + [verdict_of("not_merged", "none")] + [
+        verdict_of("unknown", reason=reason)
+        for reason in ("history_limit", "deadline", "failed")
+    ]
+    for shape in shapes:
+        accepted = doc_copy(document)
+        other_branches(first_clone(accepted))[0]["verdict"] = shape
+        assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    clone_document = first_clone(accepted)
+    clone_document["verdict_base"].update(basis="live", objects_from=clone_document["path"])
+    clone_document["branches"] = [
+        item for item in clone_document["branches"] if item["name"] != "trunk"
+    ]
+    assert all(item["verdict"] is not None for item in clone_document["branches"])
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_detached_checkout_with_a_verdict(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    detach(accepted, verdict_of("merged", "tree_equal"))
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_clone_with_a_base_and_no_other_branch(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    clone_document = first_clone(accepted)
+    clone_document["branches"] = [
+        item for item in clone_document["branches"] if item["name"] == "trunk"
+    ]
+    assert clone_document["verdict_base"] is not None
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_documents_without_a_base(sample):
+    document, _folder = sample
+    undecided = doc_copy(document)
+    undecided_without_a_base(undecided)
+    detach(undecided, verdict_of("unknown", reason="no_base"))
+    assert models.parse_checkouts(redigest(undecided))
+    assert all(
+        item["verdict"] == verdict_of("unknown", reason="no_base")
+        for item in first_clone(undecided)["branches"]
+    )
+
+    remoteless = doc_copy(document)
+    without_remote(remoteless)
+    assert first_clone(remoteless)["verdict_base"] is None
+    assert models.parse_checkouts(redigest(remoteless))
+
+
+def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
+    document, _folder = sample
+    limited = doc_copy(document)
+    clone_document = first_clone(limited)
+    clone_document["shallow"] = True
+    other_branches(clone_document)[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+    assert models.parse_checkouts(redigest(limited))
+    clone_document["shallow"] = False
+    clone_document["partial_clone"] = True
+    detach(limited, verdict_of("unknown", reason="incomplete_clone"))
+    assert models.parse_checkouts(redigest(limited))
+
+    old = doc_copy(document)
+    old["git"]["version"] = "2.38.1"
+    other_branches(first_clone(old))[0]["verdict"] = verdict_of("unknown", reason="git_too_old")
+    assert models.parse_checkouts(redigest(old))
+    old["git"]["version"] = "2.9.5"
+    assert models.parse_checkouts(redigest(old))
+
+
+def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
+    document, _folder = sample
+    retired = doc_copy(document)
+    retired["schema_version"] = 1
+    with pytest.raises(models.ProtocolError, match="schema"):
+        models.parse_checkouts(redigest(retired))
+
+
 NULLABLE_CLONE_FACTS = {
     "bare": (False, 0, "", []),
     "partial_clone": (False, 0, "", []),
