@@ -186,6 +186,7 @@ CHECKOUT_RETIRED_WORDING = (
     "every verdict in it is `unknown` with the reason `no_base`. Every",
     "an unreadable clone, or one with no default branch name",
     "so the document is the same warm or cold",
+    "it checks every branch it can before it looks anything up",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -241,8 +242,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "It never replaces a verdict the run decides itself",
         "a warm run differs from a cold run only where the cold run says `unknown`",
         "it works the branches with no remembered answer first, then those with the oldest "
-        "remembered answer, then the newest, and a remembered answer stands in only where "
-        "that re-check does not finish",
+        "remembered answer, then the newest, finishing every check of one branch (including "
+        "the `tree_equal` rung and the `not_merged` decision) before it starts the next, and "
+        "a remembered answer stands in only where that re-check does not finish",
         "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",

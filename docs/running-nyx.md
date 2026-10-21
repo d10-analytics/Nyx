@@ -222,8 +222,9 @@ warm run may give the remembered verdict instead, whatever the reason
 remembered answer may stand in for it. A warm run therefore does the same git
 work as a cold run, spending the time it has left re-checking: it works the
 branches with no remembered answer first, then those with the oldest remembered
-answer, then the newest, and a remembered answer stands in only where that
-re-check does not finish. A branch whose re-check finishes is remembered again
+answer, then the newest, finishing every check of one branch (including the
+`tree_equal` rung and the `not_merged` decision) before it starts the next, and
+a remembered answer stands in only where that re-check does not finish. A branch whose re-check finishes is remembered again
 with the time of that check, so the oldest answers are always re-checked first
 and a clone too large to check within the 60 seconds is covered a few branches
 at a time over successive runs. A run that re-checks nothing leaves the file
