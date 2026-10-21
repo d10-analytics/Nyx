@@ -3124,8 +3124,34 @@ def run_sh(body: str) -> str:
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the trap programs are shell scripts")
+def sign_trunk(work: Path) -> str:
+    """Put a commit carrying a ``gpgsig`` header on top of ``trunk`` and push it."""
+    git(work, "checkout", "-q", "trunk")
+    plain = git(
+        work, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "signed"
+    ).stdout.strip()
+    header, _, message = git(work, "cat-file", "commit", plain).stdout.partition("\n\n")
+    signature = (
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+        " \n"
+        " iQEzBAABCAAdFiEEnotarealsignatureAAAAAAAAAAAAAAAAAAAA=\n"
+        " =AAAA\n"
+        " -----END PGP SIGNATURE-----\n"
+    )
+    raw = f"{header}\n{signature}\n{message}".encode()
+    signed = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+        cwd=work, input=raw, capture_output=True, check=True,
+    ).stdout.decode().strip()
+    git(work, "update-ref", "refs/heads/trunk", signed)
+    git(work, "push", "-q", "origin", "trunk")
+    return signed
+
+
 def test_configured_programs_never_run_and_do_not_change_verdicts(tmp_path):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    signed = sign_trunk(work)
+    assert "gpgsig " in git(work, "cat-file", "commit", signed).stdout
     baseline = verdicts_of(find_clone(collect([folder]), work))
     markers = tmp_path / "markers"
     markers.mkdir()
@@ -3145,7 +3171,8 @@ def test_configured_programs_never_run_and_do_not_change_verdicts(tmp_path):
     # The configuration really changes unpinned git: it runs a program.
     git(work, "log", "-p", "--ext-diff", "-2", "picked", check=False)
     git(work, "log", "-p", "-2", "picked", check=False)
-    assert {item.name for item in markers.iterdir()} >= {"external", "textconv"}
+    git(work, "log", "-1", "--format=%T", "trunk", check=False)
+    assert {item.name for item in markers.iterdir()} >= {"external", "textconv", "gpg"}
     for item in markers.iterdir():
         item.unlink()
 
@@ -3605,3 +3632,60 @@ def test_a_partial_clone_proves_a_strict_ancestor_without_fetching(tmp_path):
     assert item["partial_clone"] is True
     assert verdicts_of(item)["older"] == MERGED_ANCESTOR
     assert (object_files(partial), pack_listing(partial)) == before
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "options", "reason"),
+    [
+        ("exit 1", {}, "failed"),
+        ("sleep 3", {"call_cap_seconds": 1.0}, "deadline"),
+    ],
+    ids=["failed", "timed_out"],
+)
+def test_a_tip_whose_patch_step_failed_is_never_decided_by_a_later_rung(
+    tmp_path, monkeypatch, body, options, reason
+):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    split = rev(work, "split")
+    assert verdicts_of(find_clone(collect([folder]), work))["split"] == MERGED_TREE
+    shim = git_stand_in(
+        tmp_path, f'case "$*" in *"rev-list --no-merges {split}.."*) {body};; esac'
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder], **options)
+
+    verdicts = verdicts_of(find_clone(document, work))
+    assert verdicts["split"] == unknown(reason)
+    assert verdicts["picked"] == MERGED_PATCH
+
+
+def test_branches_of_unrelated_histories_share_the_whole_base_range(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    seed = rev(work, "trunk")
+    git(work, "checkout", "-q", "--orphan", "second-root")
+    git(work, "rm", "-q", "-rf", ".")
+    second = commit_file(work, "root.txt", "second root\n")
+    git(work, "checkout", "-q", "-b", "y", "second-root")
+    commit_file(work, "y.txt", "y\n")
+    git(work, "checkout", "-q", "-b", "x", "trunk")
+    commit_file(work, "x.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(
+        work, "merge", "-q", "--no-ff", "--allow-unrelated-histories", "-m", "join", "second-root"
+    )
+    git(work, "cherry-pick", "x", "y")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "second-root")
+    assert git(work, "merge-base", "--octopus", seed, second, check=False).returncode == 1
+    assert rev(work, "x~1") == seed and rev(work, "y~1") == second
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts == {"trunk": None, "x": MERGED_PATCH, "y": MERGED_PATCH}
+    # The whole base history holds four non-merge commits; with room for three
+    # the later of the two equally far branches is evicted and the other decided.
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 3)
+    limited = verdicts_of(find_clone(collect([folder]), work))
+    assert limited == {"trunk": None, "x": MERGED_PATCH, "y": unknown("history_limit")}
