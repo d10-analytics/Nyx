@@ -4593,6 +4593,77 @@ def test_the_verdict_reserve_leaves_time_to_cache_the_branch_that_finished(
     assert not cache.exists()
 
 
+def own_step_world(tmp_path: Path):
+    """``one`` is cherry-picked onto a diverged trunk; ``other`` is unmerged."""
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("one", "other"):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "diverged\n")
+    git(work, "cherry-pick", "one")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+OWN_STEP_VERDICTS = {"one": MERGED_PATCH, "other": NOT_MERGED, "trunk": None}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "options", "reason"),
+    [
+        ("exit 1", {}, "failed"),
+        ("sleep 3", {"call_cap_seconds": 1.0}, "deadline"),
+    ],
+    ids=["failed", "timed_out"],
+)
+def test_a_failed_own_commit_step_is_unknown_and_never_cached(
+    tmp_path, monkeypatch, isolated_git, body, options, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    cold = collect([folder])
+    assert verdicts_of(find_clone(cold, work)) == OWN_STEP_VERDICTS
+    cache.unlink()
+    # Only the patch IDs of ``one``'s own commits fail; its single merge base
+    # would still let the squash rung decide it.
+    fault = stand_in(
+        tmp_path, "fault", f'case "$*" in *" log "*"{base}..{one} --"*) {body};; esac'
+    )
+
+    with path_with(monkeypatch, fault):
+        faulted = collect([folder], **options)
+
+    assert verdicts_of(find_clone(faulted, work)) == {**OWN_STEP_VERDICTS, "one": unknown(reason)}
+    assert cache_entries(cache) == {f"{other}.{base}": "none"}
+    warm = collect([folder])
+    assert stable(warm) == stable(cold)
+    assert warm["checkouts_digest"] == cold["checkouts_digest"]
+
+
+def test_a_tip_that_recorded_a_failure_stores_no_verdict(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    original = checkouts._Ladder._patch_rungs
+
+    # A rung that decides a tip after one of its steps failed must not reach the cache.
+    def decided_after_a_failure(self, tip, mapped):
+        original(self, tip, mapped)
+        if tip.sha == one:
+            tip.fail("failed")
+            tip.verdict = checkouts._merged("squash_equivalent")
+
+    monkeypatch.setattr(checkouts._Ladder, "_patch_rungs", decided_after_a_failure)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["one"] == MERGED_SQUASH
+    assert cache_entries(cache) == {f"{other}.{base}": "none"}
+
+
 def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
     tmp_path, monkeypatch, isolated_git
 ):
