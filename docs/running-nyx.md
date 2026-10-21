@@ -190,17 +190,24 @@ A `merged` verdict names the first rung of this ladder that proved it, tried in
 this order. `ancestor`: the branch's commit is already in the base's history, so
 nothing on the branch is missing from the base. `patch_equivalent`: the branch
 has no merge commits and every one of its own commits has a counterpart in the
-base with the same change (the same patch identity), as after a rebase or a
-cherry-pick. `squash_equivalent`: the branch's whole change since it left the
-base has the same patch identity as one commit on the base, as after a squash
-merge. `tree_equal`: the branch's file contents are identical to the content of
+base with the same change (the same patch identity, whitespace included), as
+after a rebase or a cherry-pick. `squash_equivalent`: the branch's whole change
+since it left the base has the same patch identity as one commit on the base, as
+after a squash merge. Both patch rungs also require that merging the branch into
+the base would change nothing, so a change that only looks the same, indented
+differently or made at another place in a repeated block, never reads as merged.
+Nyx runs that merge in a scratch repository that borrows the clone's objects and
+changes nothing in the clone. A branch whose lines the base rewrote after
+landing them, or one sharing no history with the base, fails that check and
+reads as `not_merged`. `tree_equal`: the branch's file contents are identical to the content of
 some commit on the base. `not_merged` has the rung `none`: every rung that could
 run found nothing. An `unknown` verdict has no rung and one of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
 partial, so only the `ancestor` rung runs and the others are skipped rather
 than fetching missing files. `git_too_old` means git is older than 2.39: the two
-patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 to tell two
-different changes to the same binary file apart, so they are skipped, and
+patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact patch
+identities, the merge check and telling two different changes to the same binary
+file apart, so they are skipped, and
 `ancestor` and `tree_equal` still run. `history_limit` means the branch or the
 comparison was too large to check within the fixed bounds. `deadline` means one
 git call reached its 10-second cap or the 60 seconds, less the half second kept

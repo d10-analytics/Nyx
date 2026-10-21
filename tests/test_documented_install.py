@@ -237,6 +237,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`ancestor`: the branch's commit is already in the base's history",
         "`patch_equivalent`: the branch has no merge commits",
         "`squash_equivalent`: the branch's whole change",
+        "the same patch identity, whitespace included",
+        "Both patch rungs also require that merging the branch into the base would change nothing",
+        "indented differently or made at another place in a repeated block, never reads as merged",
+        "or one sharing no history with the base, fails that check and reads as `not_merged`",
         "`tree_equal`: the branch's file contents are identical",
         "`not_merged` has the rung `none`",
         "`no_base`",
@@ -273,7 +277,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "so once the attributes are gone a run that decides the branch reports its own verdict",
         "`incomplete_clone` means the clone is shallow or partial",
         "`git_too_old` means git is older than 2.39",
-        "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39",
+        "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact "
+        "patch identities, the merge check and telling two different changes to the same binary "
+        "file apart",
         "`history_limit` means the branch or the comparison was too large",
         "`deadline` means one git call reached its 10-second cap or the 60 seconds, less the "
         "half second kept for the cache write, ran out",
