@@ -854,29 +854,16 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
-    repository = clone(remote, folder / "many")
-    head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    # Packed references need no file per branch, so no host path limit applies.
-    git(repository, "pack-refs", "--all")
-    packed_file = repository / ".git" / "packed-refs"
-    entries = {
-        line.split(" ", 1)[1]: line.split(" ", 1)[0]
-        for line in packed_file.read_bytes().decode("ascii").split("\n")
-        if line and line[0] not in "#^"
-    }
-    for index in range(7000):
-        entries[f"refs/heads/{index:05d}-{'x' * 180}"] = head
-    # Peel lines are not kept, so the header claims only sorted order and git
-    # peels on demand.  Bytes are written exactly: git rejects a CRLF ref line.
-    packed_file.write_bytes(
-        (
-            "# pack-refs with: sorted \n"
-            + "".join(f"{sha} {name}\n" for name, sha in sorted(entries.items()))
-        ).encode("ascii")
-    )
-    packed = packed_file.read_bytes()
-    assert packed.endswith(b"\n") and b"\r" not in packed
-    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 7001
+    # Each clone holds the most branches one clone may (the default and 99
+    # more), all at the default's tip, and long names fill the document.
+    for index in range(48):
+        repository = clone(remote, folder / f"many-{index:03d}")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/{index:03d}-{n:03d}-" + "x" * 230: head for n in range(99)},
+        )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
     _configure(tmp_path, [folder])
 
     for arguments in ((), ("--json",), ("--no-network",), ("--json", "--no-network")):

@@ -265,6 +265,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`too_many_branches` when the clone has more than 100 local branches (the default "
         "branch included)",
         "so it shows no facts and no verdicts",
+        "lends them no objects and takes no part in choosing their default branch name",
         "The plain lines are otherwise unchanged",
         "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",

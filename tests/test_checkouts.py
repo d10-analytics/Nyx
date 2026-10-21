@@ -5244,8 +5244,7 @@ def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_bran
             assert document["diagnostics"] == []
             base = item["verdict_base"]["sha"]
             assert cache_entries(cache) == {f"{tip}.{base}": "none" for tip in tips}
-            # A list search over the tips compared each pair (4,851 calls); a
-            # lookup by identity compares none.
+            # Looking a tip up must not compare tips pairwise.
             assert equality[0] <= len(tips)
 
     sizes = set().union(*calls_by_size.values())
