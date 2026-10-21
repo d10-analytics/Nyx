@@ -1670,6 +1670,7 @@ class _Tip:
     bases: list[str] | None = None
     limited: bool = False
     cached: bool = False
+    order: int = 0
 
     def fail(self, reason: str) -> None:
         if self.error is None:
@@ -1741,7 +1742,7 @@ class _Ladder:
         """Return the verdict of every tip in ``branches`` (name, tip) and ``detached``."""
         tips: dict[str, _Tip] = {}
         for sha in [sha for _, sha in branches] + list(detached):
-            tips.setdefault(sha, _Tip(sha))
+            tips.setdefault(sha, _Tip(sha, order=len(tips)))
         self._ancestors(tips, branches, detached)
         incomplete = self._context.shallow or self._context.partial
         # A shallow or partial clone runs no rung beyond ``ancestor``, so its
@@ -1754,6 +1755,9 @@ class _Ladder:
             for tip in pending:
                 tip.verdict = _unknown("incomplete_clone")
             pending = []
+        # Every later step walks the tips in this order, so a budget that runs
+        # out leaves the tips with the freshest saved answer unrecomputed.
+        pending.sort(key=self._priority)
         pending = self._sizes(pending)
         if self._settings.patch_rungs:
             self._patches(pending)
@@ -1791,6 +1795,16 @@ class _Ladder:
                 self.fresh[f"{sha}.{base_sha}"] = tip.verdict["rung"]
             result[sha] = tip.verdict
         return result
+
+    def _priority(self, tip: _Tip) -> tuple[int, int, int]:
+        """Tips with no saved answer first, then the oldest saved answer, then the newest.
+
+        Ties keep the document order, so the work order is deterministic.
+        """
+        entry = self._cache.get(f"{tip.sha}.{self._base.sha}")
+        if entry is None:
+            return (0, 0, tip.order)
+        return (1, entry[1], tip.order)
 
     def _lookup(self, tips: Mapping[str, _Tip]) -> None:
         """Let a cached verdict stand in for a tip left undecided or ``unknown``."""
@@ -1951,9 +1965,7 @@ class _Ladder:
             if parsed[0] <= SHARED_RANGE_CAP:
                 shared = ceiling_commit
                 break
-            victim = max(
-                enumerate(active), key=lambda item: (item[1].left, item[0])
-            )[1]
+            victim = max(active, key=lambda item: (item.left, item.order))
             victim.limited = True
             victim.verdict = _unknown("history_limit")
             active.remove(victim)
@@ -2169,7 +2181,9 @@ def _store_cache(
 ) -> None:
     """Merge this collection's new verdicts into the file with one atomic write.
 
-    Nothing new, nothing written. The file is read again so entries another
+    Nothing decided by this run, nothing written; a verdict the run decided
+    again gets a fresh time so the oldest saved answers are re-checked first
+    next time. The file is read again so entries another
     process stored meanwhile survive; a lost race only loses entries, which are
     recomputed.
     """
@@ -2191,9 +2205,10 @@ def _store_cache(
         for key in used:
             if key not in merged and key in loaded:
                 merged[key] = loaded[key]
+        # A verdict this run decided is verified now, so its entry rotates to
+        # the back of the next collection's re-check order.
         for key, rung in fresh.items():
-            if key not in current or current[key][0] != rung:
-                merged[key] = (rung, now)
+            merged[key] = (rung, now)
         kept = sorted(
             merged.items(),
             key=lambda item: (item[0] not in used and item[0] not in fresh, -item[1][1], item[0]),
