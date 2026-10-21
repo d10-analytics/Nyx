@@ -3325,8 +3325,10 @@ def build_verdict_world(tmp_path: Path):
     )
 
     git(work, "checkout", "-q", "trunk")
-    commit_file(work, "t1.txt", "t1\n", "land t1 on trunk")
-    commit_file(work, "t2.txt", "t2\n", "land t2 on trunk")
+    # Exact bytes, like the branch's copies: a text-mode write would end the
+    # lines in CRLF on Windows and the two trees would genuinely differ.
+    commit_bytes(work, "t1.txt", b"t1\n", "land t1 on trunk")
+    commit_bytes(work, "t2.txt", b"t2\n", "land t2 on trunk")
     commit_file(work, "d1.txt", "diverged\n")
     commit_bytes(work, "bin.dat", b"\0trunk\n", "binary on trunk")
     commit_file(
