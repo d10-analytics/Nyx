@@ -3536,6 +3536,23 @@ def test_user_global_attributes_do_not_change_a_patch_equivalent(tmp_path, isola
     assert verdicts_of(find_clone(document, work))["blobdiff"] == MERGED_PATCH
 
 
+def test_a_repository_attribute_no_longer_present_does_not_keep_a_cached_unmerged(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    attributes = work / ".gitattributes"
+    attributes.write_text("shared.txt -diff\n")
+
+    stricter = collect([folder])
+    assert verdicts_of(find_clone(stricter, work))["blobdiff"] == NOT_MERGED
+
+    attributes.unlink()
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["blobdiff"] == MERGED_PATCH
+
+
 def test_inherited_repository_variables_are_ignored(tmp_path, monkeypatch):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     baseline = verdicts_of(find_clone(collect([folder]), work))
@@ -4108,7 +4125,7 @@ CACHE_WORLD_VERDICTS = {
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
-def test_a_warm_collection_rewrites_nothing_and_runs_no_patch_work(
+def test_a_warm_collection_decides_again_and_rewrites_nothing(
     tmp_path, monkeypatch, isolated_git
 ):
     cache = nyx_home(isolated_git)
@@ -4131,8 +4148,8 @@ def test_a_warm_collection_rewrites_nothing_and_runs_no_patch_work(
     assert second["checkouts_digest"] == first["checkouts_digest"]
     assert verdicts_of(find_clone(second, work)) == CACHE_WORLD_VERDICTS
     assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
-    assert patch_work(log) == []
-    assert log.read_text()  # the recorder really saw this run's git calls
+    # The cache fills only what the run leaves unknown, so the rungs run again.
+    assert patch_work(log) != []
 
 
 def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
@@ -4689,28 +4706,17 @@ def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
     stored = cache.read_bytes()
     git(work, "checkout", "-q", "-b", "aye", side_tip)
     commit_file(work, "aye.txt", "x\n")
-    bee_tip = rev(work, "bee")
     cache.unlink()
 
-    def run(name: str):
-        if ON_WINDOWS:
-            return collect([folder]), None
-        shim, log = recording(tmp_path, name)
-        with path_with(monkeypatch, shim):
-            return collect([folder]), log
-
-    cold, cold_log = run("cold")
+    cold = collect([folder])
     assert verdicts_of(find_clone(cold, work)) == {
         "aye": NOT_MERGED, "bee": unknown("history_limit"), "trunk": None,
     }
     cache.write_bytes(stored)
-    warm, warm_log = run("warm")
+    warm = collect([folder])
     assert verdicts_of(find_clone(warm, work)) == {
         "aye": NOT_MERGED, "bee": NOT_MERGED, "trunk": None,
     }
-    if cold_log is not None:
-        assert f"...{bee_tip}" in cold_log.read_text()
-        assert f"...{bee_tip}" not in warm_log.read_text()
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the account home comes from HOME on POSIX only")
