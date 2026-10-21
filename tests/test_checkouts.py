@@ -4815,6 +4815,84 @@ def test_a_clone_over_budget_converges_across_short_collections(
         assert second_verdicts[name] == MERGED_PATCH
 
 
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_an_uncached_tip_is_decided_whole_before_cached_tips_use_the_budget(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    base = rev(work, "origin/trunk")
+    collect([folder])
+    assert len(cache_entries(cache)) == 5
+    # ``u`` proves nothing; ``t`` is a commit and its revert, decided by no rung.
+    git(work, "checkout", "-q", "-b", "u", "trunk")
+    commit_file(work, "u.txt", "u\n")
+    git(work, "checkout", "-q", "-b", "t", "trunk")
+    commit_file(work, "t.txt", "t\n")
+    git(work, "revert", "--no-edit", "HEAD")
+    git(work, "checkout", "-q", "trunk")
+    log = tmp_path / "order.log"
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in [*names, "u", "t"])
+    slow = stand_in(
+        tmp_path, "slow", f'case "$*" in {cases}) printf "%s\\n" "$*" >> "{log}"; sleep 1;; esac'
+    )
+
+    with path_with(monkeypatch, slow):
+        collect([folder], seconds=4.0)
+        second = collect([folder], seconds=4.0)
+
+    verdicts = verdicts_of(find_clone(second, work))
+    assert verdicts["u"] == NOT_MERGED
+    assert verdicts["t"] == NOT_MERGED
+    assert all(verdicts[name] == MERGED_PATCH for name in names)
+    first_calls = log.read_text().splitlines()
+    tips = {rev(work, name): name for name in [*names, "u", "t"]}
+    worked = [
+        tips[token.split("..")[1]]
+        for line in first_calls
+        for token in line.split()
+        if ".." in token
+    ]
+    # Across both runs the uncached tips are worked before any cached one.
+    assert set(worked[:2]) == {"u", "t"}
+    assert f"{rev(work, 'u')}.{base}" in cache_entries(cache)
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_an_uncached_tree_equal_tip_is_decided_before_cached_tips_use_the_budget(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    # ``te`` adds two files in one commit; trunk gets them as two separate commits.
+    git(work, "checkout", "-q", "-b", "te", "trunk")
+    (work / "te1.txt").write_text("1\n")
+    (work / "te2.txt").write_text("2\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", "te")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "te1.txt", "1\n")
+    commit_file(work, "te2.txt", "2\n")
+    git(work, "push", "-q", "origin", "trunk")
+    base, te = rev(work, "origin/trunk"), rev(work, "te")
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work))["te"] == ("merged", "tree_equal", None)
+    document = json.loads(cache.read_text())
+    assert document["verdicts"].pop(f"{te}.{base}")["rung"] == "tree_equal"
+    cache.write_text(json.dumps(document))
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in [*names, "te"])
+    slow = stand_in(tmp_path, "slow", f'case "$*" in {cases}) sleep 1;; esac')
+
+    with path_with(monkeypatch, slow):
+        collect([folder], seconds=4.0)
+        second = collect([folder], seconds=4.0)
+
+    assert verdicts_of(find_clone(second, work))["te"] == ("merged", "tree_equal", None)
+    assert cache_entries(cache)[f"{te}.{base}"] == "tree_equal"
+
+
 @pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
 def test_uncached_tips_are_worked_first_then_the_oldest_saved_answer(
     tmp_path, monkeypatch, isolated_git
