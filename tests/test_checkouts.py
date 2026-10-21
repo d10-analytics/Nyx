@@ -1513,10 +1513,9 @@ def mutate_incomplete_clone_on_a_detached_worktree(document):
 
 
 def mutate_git_too_old_on_a_new_git(document):
-    assert document["git"]["version"] == "2.43.0"
-    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
-        "unknown", reason="git_too_old"
-    )
+    # Set rather than read: the collecting git differs from host to host.
+    document["git"]["version"] = "2.43.0"
+    mutate_git_too_old_on_a_new_git_verdict(document)
 
 
 def mutate_git_too_old_on_the_floor_version(document):
