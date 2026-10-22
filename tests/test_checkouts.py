@@ -3760,20 +3760,14 @@ def file_times(repository: Path) -> dict[str, int]:
     return times
 
 
-def assert_no_object_leftovers(repository: Path) -> None:
-    """No temporary or half-written object or pack file is left in the object store.
-
-    Which object files exist and when they were written is the storage layout,
-    which git's own housekeeping rewrites; the objects themselves are compared
-    by ``snapshot``.
-    """
+def store_times(repository: Path) -> dict[str, int]:
+    """Every file of the object store, loose or packed, with its modification time."""
     objects = git_dir_of(repository) / "objects"
-    leftovers = sorted(
-        item.relative_to(objects).as_posix()
+    return {
+        item.relative_to(objects).as_posix(): item.stat().st_mtime_ns
         for item in objects.rglob("*")
-        if item.is_file() and "tmp" in item.name
-    )
-    assert leftovers == [], f"temporary object files left in {repository}"
+        if item.is_file()
+    }
 
 
 def pack_names(repository: Path) -> list[str]:
@@ -3818,17 +3812,18 @@ def test_the_landing_check_touches_no_object_store_not_even_a_timestamp(tmp_path
     # Each variant states its own layout: nothing packs on its own.
     assert bool(pack_names(work)) == packed
     assert bool(loose_objects(work)) == (not packed)
-    before = [(snapshot(store), file_times(store)) for store in stores]
+    before = [(snapshot(store), file_times(store), store_times(store)) for store in stores]
     time.sleep(0.05)
 
     document = collect([folder])
 
     verdicts = verdicts_of(find_clone(document, second))
     assert (verdicts["picked"], verdicts["squashed"]) == (MERGED_PATCH, MERGED_SQUASH)
-    for store, (content, times) in zip(stores, before, strict=True):
+    for store, (content, times, objects) in zip(stores, before, strict=True):
         assert snapshot(store) == content
         assert file_times(store) == times
-        assert_no_object_leftovers(store)
+        # Housekeeping is pinned off, so any new, removed or touched object file is the run's.
+        assert store_times(store) == objects
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
@@ -3850,7 +3845,7 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
         pack_everything(holder)
     stores = [holder, other, remote]
     assert bool(pack_names(holder)) == packed
-    before = [(snapshot(store), file_times(store)) for store in stores]
+    before = [(snapshot(store), file_times(store), store_times(store)) for store in stores]
     time.sleep(0.05)
 
     document = live([folder])
@@ -3858,10 +3853,11 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
     item = find_clone(document, other)
     assert item["verdict_base"]["objects_from"] == real(holder)
     assert verdicts_of(item)["feat"] == MERGED_PATCH
-    for store, (content, times) in zip(stores, before, strict=True):
+    for store, (content, times, objects) in zip(stores, before, strict=True):
         assert snapshot(store) == content
         assert file_times(store) == times
-        assert_no_object_leftovers(store)
+        # Housekeeping is pinned off, so any new, removed or touched object file is the run's.
+        assert store_times(store) == objects
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
@@ -4415,12 +4411,44 @@ def snapshot(repository: Path) -> tuple[Any, ...]:
 def test_verdicts_change_nothing_in_any_repository(tmp_path):
     folder, remote, work, _worktree = build_verdict_world(tmp_path)
     repositories = [work, remote]
-    before = [snapshot(repository) for repository in repositories]
+    before = [(snapshot(repository), store_times(repository)) for repository in repositories]
 
     collect([folder])
 
-    assert [snapshot(repository) for repository in repositories] == before
+    assert [
+        (snapshot(repository), store_times(repository)) for repository in repositories
+    ] == before
     assert not (work / ".git" / "index.lock").exists()
+
+
+def test_the_content_of_every_repository_survives_git_housekeeping_during_a_run(
+    tmp_path, monkeypatch
+):
+    """Tolerates housekeeping: only content is compared, never object files or their times."""
+    folder, remote, work, _worktree = build_verdict_world(tmp_path)
+    repositories = [work, remote]
+    expected = verdicts_of(find_clone(collect([folder]), work))
+    before = [snapshot(repository) for repository in repositories]
+    original = checkouts._GitRunner.run
+    housekeeping: list[str] = []
+
+    def run_with_housekeeping(self, arguments, **options):
+        if not housekeeping:
+            housekeeping.append("done")
+            for repository in repositories:
+                git(repository, "gc", "-q")
+                git(repository, "repack", "-A", "-d", "-q", "-f")
+                git(repository, "pack-refs", "--all")
+                git(repository, "commit-graph", "write")
+        return original(self, arguments, **options)
+
+    monkeypatch.setattr(checkouts._GitRunner, "run", run_with_housekeeping)
+
+    document = collect([folder])
+
+    assert housekeeping
+    assert verdicts_of(find_clone(document, work)) == expected
+    assert [snapshot(repository) for repository in repositories] == before
 
 
 def run_sh(body: str) -> str:
