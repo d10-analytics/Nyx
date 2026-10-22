@@ -43,6 +43,10 @@ GLOBAL_CONFIG = """\
 \tallow = always
 [advice]
 \tdetachedHead = false
+[gc]
+\tauto = 0
+[maintenance]
+\tauto = false
 """
 
 
@@ -59,6 +63,16 @@ def isolated_git(tmp_path_factory, monkeypatch):
         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
             monkeypatch.delenv(name)
     return home
+
+
+def test_automatic_housekeeping_is_off_in_every_repository_a_test_builds(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, tmp_path / "work")
+    for repository in (remote, work):
+        assert git(repository, "config", "--get", "gc.auto").stdout.strip() == "0"
+        assert git(repository, "config", "--get", "maintenance.auto").stdout.strip() == "false"
 
 
 def git(cwd: Path | str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -3713,14 +3727,80 @@ def test_a_cherry_pick_that_landed_at_a_shifted_place_reads_merged_through_a_con
     assert not {"merge-tree", "init"} & set(calls)
 
 
+def git_dir_of(repository: Path) -> Path:
+    return repository / ".git" if (repository / ".git").exists() else repository
+
+
+# Paths git itself rewrites during housekeeping without changing any ref or
+# object; no verdict can be proved or disproved by their timestamps.
+HOUSEKEEPING_DIRECTORIES = {"objects", "refs", "logs"}
+HOUSEKEEPING_FILES = {"packed-refs", "maintenance.lock", "info/refs"}
+
+
 def file_times(repository: Path) -> dict[str, int]:
-    """Every file under the repository's git directory with its modification time."""
-    git_dir = repository / ".git" if (repository / ".git").exists() else repository
-    return {
-        item.relative_to(git_dir).as_posix(): item.stat().st_mtime_ns
-        for item in git_dir.rglob("*")
-        if item.is_file()
-    }
+    """Modification times of what a verdict run could touch outside git's own housekeeping.
+
+    The git directory without the object store, the references and their logs,
+    ``packed-refs``, ``info/refs`` and ``gc.*`` files, plus the working tree.
+    """
+    git_dir = git_dir_of(repository)
+    times: dict[str, int] = {}
+    for item in git_dir.rglob("*"):
+        relative = item.relative_to(git_dir).as_posix()
+        if not item.is_file() or HOUSEKEEPING_DIRECTORIES & set(relative.split("/")):
+            continue
+        if relative in HOUSEKEEPING_FILES or relative.startswith("gc."):
+            continue
+        times[f".git/{relative}"] = item.stat().st_mtime_ns
+    if git_dir != repository:
+        for item in repository.rglob("*"):
+            relative = item.relative_to(repository).as_posix()
+            if item.is_file() and relative.split("/")[0] != ".git":
+                times[relative] = item.stat().st_mtime_ns
+    return times
+
+
+def assert_no_object_leftovers(repository: Path) -> None:
+    """No temporary or half-written object or pack file is left in the object store.
+
+    Which object files exist and when they were written is the storage layout,
+    which git's own housekeeping rewrites; the objects themselves are compared
+    by ``snapshot``.
+    """
+    objects = git_dir_of(repository) / "objects"
+    leftovers = sorted(
+        item.relative_to(objects).as_posix()
+        for item in objects.rglob("*")
+        if item.is_file() and "tmp" in item.name
+    )
+    assert leftovers == [], f"temporary object files left in {repository}"
+
+
+def pack_names(repository: Path) -> list[str]:
+    return sorted(
+        item.name for item in (git_dir_of(repository) / "objects" / "pack").glob("*.pack")
+    )
+
+
+def loose_objects(repository: Path) -> list[str]:
+    objects = git_dir_of(repository) / "objects"
+    return sorted(
+        item.name for item in objects.glob("[0-9a-f][0-9a-f]/*") if item.is_file()
+    )
+
+
+def pack_everything(repository: Path) -> None:
+    """Put every object, reachable or not, in one pack and drop the loose copies."""
+    names = git(
+        repository, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"
+    ).stdout
+    destination = git_dir_of(repository) / "objects" / "pack" / "pack"
+    subprocess.run(
+        ["git", "pack-objects", "-q", str(destination)],
+        cwd=repository, input=names, text=True, capture_output=True, check=True,
+    )
+    git(repository, "prune-packed")
+    assert pack_names(repository) and loose_objects(repository) == []
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
@@ -3732,18 +3812,23 @@ def test_the_landing_check_touches_no_object_store_not_even_a_timestamp(tmp_path
     for name in ("picked", "squashed", "bin-picked"):
         git(second, "branch", name, rev(work, name))
     if packed:
-        git(work, "gc", "-q")
-        git(remote, "gc", "-q")
+        pack_everything(work)
+        pack_everything(remote)
     stores = [work, remote, first, second]
-    before = [file_times(store) for store in stores]
-    assert any(path.startswith("objects/pack/") for path in before[0]) == packed
+    # Each variant states its own layout: nothing packs on its own.
+    assert bool(pack_names(work)) == packed
+    assert bool(loose_objects(work)) == (not packed)
+    before = [(snapshot(store), file_times(store)) for store in stores]
     time.sleep(0.05)
 
     document = collect([folder])
 
     verdicts = verdicts_of(find_clone(document, second))
     assert (verdicts["picked"], verdicts["squashed"]) == (MERGED_PATCH, MERGED_SQUASH)
-    assert [file_times(store) for store in stores] == before
+    for store, (content, times) in zip(stores, before, strict=True):
+        assert snapshot(store) == content
+        assert file_times(store) == times
+        assert_no_object_leftovers(store)
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
@@ -3762,9 +3847,10 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
     git(holder, "cherry-pick", "FETCH_HEAD")
     git(holder, "push", "-q", "origin", "trunk")
     if packed:
-        git(holder, "gc", "-q")
+        pack_everything(holder)
     stores = [holder, other, remote]
-    before = [file_times(store) for store in stores]
+    assert bool(pack_names(holder)) == packed
+    before = [(snapshot(store), file_times(store)) for store in stores]
     time.sleep(0.05)
 
     document = live([folder])
@@ -3772,7 +3858,10 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
     item = find_clone(document, other)
     assert item["verdict_base"]["objects_from"] == real(holder)
     assert verdicts_of(item)["feat"] == MERGED_PATCH
-    assert [file_times(store) for store in stores] == before
+    for store, (content, times) in zip(stores, before, strict=True):
+        assert snapshot(store) == content
+        assert file_times(store) == times
+        assert_no_object_leftovers(store)
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
@@ -4291,15 +4380,35 @@ def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
 
 
 def snapshot(repository: Path) -> tuple[Any, ...]:
-    git_dir = repository / ".git" if (repository / ".git").exists() else repository
+    """What a repository holds, independent of how git lays it out on disk.
+
+    The references, the set of objects (loose or packed), the index file, every
+    lock file, the configuration, and the working tree.
+    """
+    git_dir = git_dir_of(repository)
+    objects = sorted(
+        git(repository, "cat-file", "--batch-all-objects", "--batch-check").stdout.splitlines()
+    )
+    index = git_dir / "index"
+    locks = sorted(
+        item.relative_to(git_dir).as_posix()
+        for item in git_dir.rglob("*.lock")
+        if item.name != "maintenance.lock"
+    )
+    tree = {}
+    if git_dir != repository:
+        tree = {
+            item.relative_to(repository).as_posix(): item.read_bytes()
+            for item in repository.rglob("*")
+            if item.is_file() and item.relative_to(repository).parts[0] != ".git"
+        }
     return (
         git(repository, "for-each-ref").stdout,
+        objects,
+        (index.read_bytes(), index.stat().st_mtime_ns) if index.exists() else None,
+        locks,
         (git_dir / "config").read_bytes(),
-        sorted(
-            item.relative_to(git_dir / "objects").as_posix()
-            for item in (git_dir / "objects").rglob("*")
-            if item.is_file()
-        ),
+        tree,
     )
 
 
