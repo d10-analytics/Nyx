@@ -4021,6 +4021,71 @@ def test_more_base_commits_with_the_identity_than_the_bound_leave_the_branch_unk
     assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
 
 
+def test_a_newer_candidate_over_a_bound_does_not_hide_an_older_exact_landing(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.MERGE_FILE_CAP // len(JOB_BLOCK) + 100
+    state = [JOB_BLOCK] * blocks
+    commit_file(work, "ci.yml", "".join(state), "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    state[5] = JOB_TIMEOUT
+    commit_file(work, "ci.yml", "".join(state), "timeout on job 6")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    # The newest candidate looks the same on another copy of the block, and,
+    # starting from a file the branch never saw, confirming it needs a content
+    # merge of a file over the bound.
+    state.append("tail: 1\n")
+    commit_file(work, "ci.yml", "".join(state), "add a tail")
+    state[6] = JOB_TIMEOUT
+    commit_file(work, "ci.yml", "".join(state), "timeout on job 7")
+    git(work, "push", "-q", "origin", "trunk")
+    assert len(JOB_BLOCK) * blocks > checkouts.MERGE_FILE_CAP
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    assert patch_identity(work, rev(work, "trunk"), "--verbatim") == identity
+    assert patch_identity(work, rev(work, "trunk~2"), "--verbatim") == identity
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+def test_landing_content_merges_keep_only_a_bounded_amount_in_memory(tmp_path):
+    import tracemalloc
+
+    folder, _remote, work = small_world(tmp_path)
+    rows = [f"row {number:06d} {'x' * 40}\n" for number in range(18000)]
+    size = sum(len(row) for row in rows)
+    assert 0.8 * checkouts.MERGE_FILE_CAP < size < checkouts.MERGE_FILE_CAP
+    commit_file(work, "big.txt", "".join(rows), "add big")
+    git(work, "push", "-q", "origin", "trunk")
+    names = [f"f{number}" for number in range(8)]
+    for number, name in enumerate(names):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        edited = list(rows)
+        edited[9000 + number] = edited[9000 + number].upper()
+        commit_file(work, "big.txt", "".join(edited), f"edit row {number}")
+    git(work, "checkout", "-q", "trunk")
+    base = list(rows)
+    for number, name in enumerate(names):
+        base[number] = base[number].upper()
+        commit_file(work, "big.txt", "".join(base), f"base edit {number}")
+        git(work, "cherry-pick", name)
+    git(work, "push", "-q", "origin", "trunk")
+
+    tracemalloc.start()
+    try:
+        document = collect([folder])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    verdicts = verdicts_of(find_clone(document, work))
+    assert all(verdicts[name] == MERGED_PATCH for name in names)
+    assert peak < 6 * checkouts.MERGE_FILE_CAP, peak
+
+
 def content_merges_world(tmp_path: Path, files: int):
     """A cherry-pick of one commit editing ``files`` files, each of which the base
     edited elsewhere first, so each file needs its own content merge."""
@@ -4150,11 +4215,12 @@ def test_the_landing_check_runs_no_clone_merge_driver_and_touches_nothing_in_the
 def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
     folder, _remote, work, _worktree = build_verdict_world(tmp_path)
     cold = verdicts_of(find_clone(collect([folder]), work))
-    tip = rev(work, "unmerged")
-    loose = work / ".git" / "objects" / tip[:2] / tip[2:]
-    assert loose.is_file()
-    loose.chmod(0o600)
-    loose.unlink()
+    # A ref to an object no store of the clone holds, however it would be packed.
+    absent = "1234567890abcdef1234567890abcdef12345678"
+    assert git(work, "cat-file", "-e", absent, check=False).returncode != 0
+    ref = work / ".git" / "refs" / "heads" / "unmerged"
+    assert ref.is_file() and rev(work, "unmerged") != absent
+    ref.write_text(absent + "\n")
 
     document = collect([folder])
 
@@ -5554,16 +5620,31 @@ def test_a_clone_over_budget_converges_across_short_collections(
     cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in names)
     slow = stand_in(tmp_path, "slow", f'case "$*" in {cases}) sleep 1;; esac')
 
+    runs = []
     with path_with(monkeypatch, slow):
-        first = collect([folder], seconds=4.0)
-        second = collect([folder], seconds=4.0)
+        for _ in range(MOST_SHORT_COLLECTIONS):
+            runs.append(verdicts_of(find_clone(collect([folder], seconds=4.0), work)))
+            if unknown("deadline") not in runs[-1].values():
+                break
 
-    first_verdicts = verdicts_of(find_clone(first, work))
-    assert unknown("deadline") in first_verdicts.values()
-    # The tips the first run could not reach are worked before the ones it cached.
-    second_verdicts = verdicts_of(find_clone(second, work))
-    for name in ("b4", "b5"):
-        assert second_verdicts[name] == MERGED_PATCH
+    # The deadline path is exercised: the first collection leaves work undecided.
+    assert unknown("deadline") in runs[0].values()
+    # Progress is monotone: a decided tip never returns to unknown, and no
+    # collection decides fewer tips than the one before it.
+    for earlier, later in zip(runs, runs[1:]):
+        for name, verdict in earlier.items():
+            if verdict is not None and verdict[0] != "unknown":
+                assert later[name] == verdict
+        assert decided(later) >= decided(earlier)
+    # Short collections add up to a verdict for every branch.
+    assert all(runs[-1][name] == MERGED_PATCH for name in names)
+
+
+MOST_SHORT_COLLECTIONS = 6
+
+
+def decided(verdicts: dict[str, Any]) -> int:
+    return sum(1 for verdict in verdicts.values() if verdict is not None and verdict[0] != "unknown")
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
