@@ -105,15 +105,47 @@ def test_a_push_of_more_than_the_default_unpack_limit_leaves_the_remote_loose(tm
     assert len(loose_objects(remote)) > 150
     assert pack_names(remote) == []
     before = store_times(remote)
-    git(remote, "gc", "--auto")
-    git(remote, "maintenance", "run", "--auto")
-    assert store_times(remote) == before
     # A second push runs receive-pack again: nothing is packed or removed.  Modification
     # times are not compared here because git freshens a loose object it receives again.
     push_many_objects(work, 150)
     after = store_times(remote)
     assert pack_names(remote) == []
     assert set(before) < set(after)
+
+
+def commit_with_eager_loose_objects_task(tmp_path: Path, *options: str) -> Path:
+    """Commit, in a repository whose loose-objects task is due as soon as object directory 17 is used."""
+    work = tmp_path / "work"
+    git(tmp_path, "init", "-q", "-b", "trunk", str(work))
+    git(work, "config", "maintenance.loose-objects.enabled", "true")
+    git(work, "config", "maintenance.loose-objects.auto", "1")
+    # The task's due check only looks at object directory 17, so make a blob land there.
+    for number in range(100_000):
+        content = f"blob {number}\n"
+        identity = subprocess.run(
+            ["git", "hash-object", "--stdin"], cwd=work, input=content, text=True,
+            capture_output=True, check=True,
+        ).stdout.strip()
+        if identity.startswith("17"):
+            break
+    (work / "blob.txt").write_text(content)
+    git(work, *options, "add", "blob.txt")
+    git(work, *options, "commit", "-q", "-m", "one blob")
+    return work
+
+
+def test_maintenance_auto_false_stops_the_commit_route_to_packing(tmp_path):
+    held = commit_with_eager_loose_objects_task(tmp_path)
+
+    assert pack_names(held) == []
+    assert loose_objects(held)
+
+
+def test_the_commit_route_packs_when_maintenance_auto_is_on(tmp_path):
+    """Control: the same repository packs on commit once the pin is lifted, so the probe works."""
+    packed = commit_with_eager_loose_objects_task(tmp_path, "-c", "maintenance.auto=true")
+
+    assert pack_names(packed) != []
 
 
 def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
@@ -3785,25 +3817,17 @@ def git_dir_of(repository: Path) -> Path:
     return repository / ".git" if (repository / ".git").exists() else repository
 
 
-# Paths git itself rewrites during housekeeping without changing any ref or
-# object; no verdict can be proved or disproved by their timestamps.
-HOUSEKEEPING_DIRECTORIES = {"objects", "refs", "logs"}
-HOUSEKEEPING_FILES = {"packed-refs", "maintenance.lock", "info/refs"}
-
-
 def file_times(repository: Path) -> dict[str, int]:
-    """Modification times of what a verdict run could touch outside git's own housekeeping.
+    """Modification times of every file a verdict run could touch.
 
-    The git directory without the object store, the references and their logs,
-    ``packed-refs``, ``info/refs`` and ``gc.*`` files, plus the working tree.
+    The git directory except the object store, which ``store_times`` compares
+    strictly, plus the working tree.
     """
     git_dir = git_dir_of(repository)
     times: dict[str, int] = {}
     for item in git_dir.rglob("*"):
         relative = item.relative_to(git_dir).as_posix()
-        if not item.is_file() or HOUSEKEEPING_DIRECTORIES & set(relative.split("/")):
-            continue
-        if relative in HOUSEKEEPING_FILES or relative.startswith("gc."):
+        if not item.is_file() or relative.split("/")[0] == "objects":
             continue
         times[f".git/{relative}"] = item.stat().st_mtime_ns
     if git_dir != repository:
@@ -4481,8 +4505,9 @@ def test_the_content_of_every_repository_survives_git_housekeeping_during_a_run(
     """Tolerates housekeeping: only content is compared, never object files or their times."""
     folder, remote, work, _worktree = build_verdict_world(tmp_path)
     repositories = [work, remote]
-    expected = verdicts_of(find_clone(collect([folder]), work))
     before = [snapshot(repository) for repository in repositories]
+    expected = verdicts_of(find_clone(collect([folder]), work))
+    assert [snapshot(repository) for repository in repositories] == before
     original = checkouts._GitRunner.run
     housekeeping: list[str] = []
 
