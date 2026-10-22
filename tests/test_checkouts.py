@@ -77,7 +77,9 @@ def real(path: Path | str) -> str:
 def commit_file(repo: Path, name: str, content: str, message: str | None = None) -> str:
     target = repo / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
+    # Exact bytes: text mode would write CRLF on Windows and make identical
+    # changes differ from those made with ``write_bytes``.
+    target.write_bytes(content.encode())
     git(repo, "add", name)
     git(repo, "commit", "-q", "-m", message or f"edit {name}")
     return git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -3472,7 +3474,7 @@ JOBS_BASE = JOB_BLOCK + JOB_TIMEOUT + JOB_BLOCK
 
 def patch_identity(repo: Path, commit: str, mode: str) -> str:
     shown = subprocess.run(
-        ["git", "show", "--format=", "--no-ext-diff", commit],
+        ["git", "show", "--format=", *checkouts._PATCH_FLAGS, commit],
         cwd=repo, capture_output=True, check=True,
     ).stdout
     result = subprocess.run(
@@ -3531,7 +3533,8 @@ def test_a_lookalike_change_elsewhere_in_the_base_is_not_merged(
         # The squashed branch's whole change has the same identity as the base's commit.
         fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
         whole = subprocess.run(
-            ["git", "diff", "--no-ext-diff", fork, tip], cwd=work, capture_output=True, check=True
+            ["git", "diff", *checkouts._PATCH_FLAGS, fork, tip, "--"],
+            cwd=work, capture_output=True, check=True
         ).stdout
         identity = subprocess.run(
             ["git", "patch-id", "--stable"], input=whole, cwd=work, capture_output=True, check=True
@@ -3666,7 +3669,8 @@ def test_a_lookalike_change_landed_on_a_shifted_file_is_not_merged_either(tmp_pa
     landed = rev(work, "trunk~1")
     fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
     whole = subprocess.run(
-        ["git", "diff", "--no-ext-diff", fork, "feature"], cwd=work, capture_output=True, check=True
+        ["git", "diff", *checkouts._PATCH_FLAGS, fork, "feature", "--"],
+        cwd=work, capture_output=True, check=True
     ).stdout
     wanted = patch_identity(work, landed, "--verbatim")
     identities = {"patch": patch_identity(work, rev(work, "feature"), "--verbatim"), "squash": subprocess.run(
@@ -3771,6 +3775,7 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
     assert [file_times(store) for store in stores] == before
 
 
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
 def test_a_cached_verdict_from_the_retired_schema_is_never_served(
     tmp_path, monkeypatch, isolated_git
 ):
@@ -4098,7 +4103,7 @@ def test_one_landing_confirmation_keeps_a_bounded_amount_however_much_it_reads(t
 
     def commit_states(message: str) -> None:
         for name in names:
-            (work / name).write_text("".join(states[name]))
+            (work / name).write_bytes("".join(states[name]).encode())
         git(work, "add", *names)
         git(work, "commit", "-q", "-m", message)
 
