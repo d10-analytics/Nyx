@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -873,6 +874,29 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
         assert err.startswith("nyx: ")
         assert "checkouts_output_too_large" in err
         assert len(err.splitlines()) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the scratch location is made unusable with a file")
+@pytest.mark.parametrize("arguments", [(), ("--json",)], ids=["human", "json"])
+def test_an_unusable_temporary_directory_is_one_error_line_not_a_traceback(
+    tmp_path, account, monkeypatch, capsys, arguments
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    clone(remote, folder / "work")
+    _configure(tmp_path, [folder])
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("a file cannot host the scratch directory")
+    monkeypatch.setattr(tempfile, "tempdir", str(blocker))
+
+    code, out, err = _run_checkouts(capsys, *arguments)
+
+    assert code == 1
+    assert out == ""
+    assert err.startswith("nyx: checkouts: ")
+    assert len(err.splitlines()) == 1
+    assert "Traceback" not in err
 
 
 def test_missing_git_exits_zero_in_both_modes(tmp_path, account, monkeypatch, capsys):
