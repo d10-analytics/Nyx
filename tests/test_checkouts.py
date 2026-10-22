@@ -4086,6 +4086,60 @@ def test_landing_content_merges_keep_only_a_bounded_amount_in_memory(tmp_path):
     assert peak < 6 * checkouts.MERGE_FILE_CAP, peak
 
 
+def test_one_landing_confirmation_keeps_a_bounded_amount_however_much_it_reads(tmp_path):
+    import tracemalloc
+
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.MERGE_FILE_CAP // len(JOB_BLOCK) - 200
+    size = len(JOB_BLOCK) * blocks
+    assert 0.9 * checkouts.MERGE_FILE_CAP < size < checkouts.MERGE_FILE_CAP
+    names = ("one.yml", "two.yml")
+    states = {name: [JOB_BLOCK] * blocks for name in names}
+
+    def commit_states(message: str) -> None:
+        for name in names:
+            (work / name).write_text("".join(states[name]))
+        git(work, "add", *names)
+        git(work, "commit", "-q", "-m", message)
+
+    commit_states("add jobs")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for name in names:
+        states[name][5] = JOB_TIMEOUT
+    commit_states("timeout on job 6 of both files")
+    git(work, "checkout", "-q", "trunk")
+    states = {name: [JOB_BLOCK] * blocks for name in names}
+    # Each of the eight landings makes the branch's change to ``one.yml`` but a
+    # lookalike change to ``two.yml``, each from a file the branch never saw, so
+    # every one needs a content merge of both files: one confirmation reads far
+    # more distinct file contents than it may keep.
+    for number in range(checkouts.LANDING_CAP):
+        states["one.yml"][5] = JOB_BLOCK
+        for name in names:
+            states[name][100 + number] = JOB_BLOCK.replace("image: base", "image: next")
+        commit_states(f"move the image of job {101 + number}")
+        states["one.yml"][5] = JOB_TIMEOUT
+        states["two.yml"][20 + number] = JOB_TIMEOUT
+        commit_states(f"timeout on jobs 6 and {21 + number}")
+    git(work, "push", "-q", "origin", "trunk")
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    for number in range(checkouts.LANDING_CAP):
+        assert patch_identity(work, rev(work, f"trunk~{2 * number}"), "--verbatim") == identity
+    distinct = 2 * len(names) + 2 * len(names) * checkouts.LANDING_CAP
+    assert distinct * size > 4 * checkouts.MERGE_RETAIN_CAP
+
+    tracemalloc.start()
+    try:
+        document = collect([folder])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert peak < checkouts.MERGE_RETAIN_CAP + 8 * checkouts.MERGE_FILE_CAP, peak
+
+
 def content_merges_world(tmp_path: Path, files: int):
     """A cherry-pick of one commit editing ``files`` files, each of which the base
     edited elsewhere first, so each file needs its own content merge."""
