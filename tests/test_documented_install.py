@@ -183,6 +183,25 @@ CHECKOUT_RETIRED_WORDING = (
     "never fetches or contacts a remote",
     "`default <name> <relation> cached <time>`",
     "`cached <time>`",
+    "every verdict in it is `unknown` with the reason `no_base`. Every",
+    "an unreadable clone, or one with no default branch name",
+    "so the document is the same warm or cold",
+    "it checks every branch it can before it looks anything up",
+    "`deadline` means the 60 seconds ran out first",
+    "finishing every check of one branch (including the `tree_equal` rung and the "
+    "`not_merged` decision) before it starts the next",
+    "A branch whose re-check finishes is remembered again with the time of that check",
+    "so the oldest answers are always re-checked first",
+    "a clone too large to check within the 60 seconds is covered a few branches at a time",
+    "More than eight base commits with one identity, a file over 1 MiB, a change touching "
+    "more than 5,000 files or needing more than 16 content merges make the verdict "
+    "`unknown` with the reason `history_limit`, never `merged`.",
+    "a landing that touched more than 5,000 paths or needed more than 16 content merges",
+    "`history_limit` depends on the other branches in the clone",
+    "Its only write is the verdict cache file",
+    "line only when the configuration is unavailable or the document exceeds 2 MiB",
+    "or, when the remote did not answer, the name the clone's own remote-tracking copy",
+    "a failed call, a size bound or a clone limit",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -193,6 +212,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`--no-network` skips every remote check",
         "`--no-network` is accepted only with `checkouts`",
         "`remote live`, `remote off` or `remote failed <reason>`",
+        "Nyx tries the eight newest base commits with the identity, and a match among "
+        "them proves `merged`",
+        "a file over 1 MiB that landed unchanged needs no content merge",
+        "only when no commit Nyx tried matched and the check could not finish",
         "`unreachable`, `not_found`, `authentication_failed`, `timed_out` or `failed`",
         "`branches <basis> local-only <n>`",
         "`default <name> live <relation> cached <relation> tracking live <relation> "
@@ -216,9 +239,80 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "Checkout folders are set per workspace",
         "A settings editor arrives with the Checkouts view",
         "cannot be combined with `--setup`, `--stop` or `--status`",
-        "exits 1 with one line only when the configuration is unavailable "
-        "or the document exceeds 2 MiB",
+        "exits 1 with one line only when the configuration is unavailable, the document "
+        "exceeds 2 MiB, or a temporary file or directory it needs cannot be made",
+        "`nyx: checkouts: unable to collect (<reason>)`",
         "`no checkout folders are configured`",
+        "`checkout_cache_unreadable` and `checkout_cache_write_failed`",
+        "appears only in the `--json` document: the plain lines above are unchanged",
+        "`verdict_base` names the default branch the verdicts are judged against",
+        '"base stale"',
+        "which can be older than the remote until you fetch",
+        "`ancestor`: the branch's commit is already in the base's history",
+        "`patch_equivalent`: the branch has no merge commits",
+        "`squash_equivalent`: the branch's whole change",
+        "the same patch identity, whitespace included",
+        "Both patch rungs also require that the base commit with the matching change made it "
+        "where the branch made it",
+        "indented differently or made at another place in a repeated block, never reads as merged",
+        "a branch with its own root commit, sharing no history with the base, is judged the same way",
+        "it writes to no repository and does not even touch the modification time of an object file",
+        "can still read `not_merged` when the landing commit left a binary file",
+        "`unknown` with the reason `history_limit`, never `merged`, only when no commit",
+        "more than 16 content merges, or more than eight base commits with the identity",
+        "a branch change or a landing that touched more than 5,000 paths",
+        "`history_limit` is a cost bound, not a fact about the branch, and the bound on the "
+        "shared comparison depends on the other branches in the clone",
+        "`tree_equal`: the branch's file contents are identical",
+        "`not_merged` has the rung `none`",
+        "`no_base`",
+        "A clone with no `origin` remote or no default branch name has no base",
+        "neither the remote's current commit for it (in the clone or borrowed from a sibling) "
+        "nor its own remote-tracking copy of that branch",
+        "Every verdict in a clone with no base is `unknown` with the reason `no_base`",
+        "has no branches, no worktrees and no base, so it has no verdicts at all",
+        "It never replaces a verdict the run decides itself",
+        "a warm run differs from a cold run only where the cold run says `unknown`",
+        "It runs the size checks, the merge bases and the shared comparison for every "
+        "remaining branch first, then each branch's own checks, its `tree_equal` rung and the "
+        "`not_merged` decision finish before the next branch starts",
+        "those with no remembered answer first, then those with the oldest remembered answer, "
+        "then the newest",
+        "A verdict the run decides always wins over a remembered one, and a remembered answer "
+        "stands in only where that re-check does not finish",
+        "is remembered again with the time of this run",
+        "a clone is covered a few branches at a time over successive runs, but only within "
+        "these limits",
+        "A budget that ends inside the shared steps (the size checks, merge bases and shared "
+        "comparison) decides no new branch",
+        "Branches that can never be remembered, because one of their steps fails or reaches "
+        "the 10-second cap or because they are `history_limit`, are worked first on every run",
+        "The 8,192 remembered answers are shared by all clones",
+        "`too_many_branches` when the clone has more than 100 local branches (the default "
+        "branch included)",
+        "so it shows no facts and no verdicts",
+        "lends them no objects and takes no part in choosing their default branch name",
+        "The plain lines are otherwise unchanged",
+        "A run that re-checks nothing leaves the file untouched",
+        "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
+        "which can only make matching stricter",
+        "so once the attributes are gone a run that decides the branch reports its own verdict",
+        "`incomplete_clone` means the clone is shallow or partial",
+        "`git_too_old` means git is older than 2.39",
+        "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact "
+        "patch identities and telling two different changes to the same binary file apart",
+        "`history_limit` means the branch or the comparison was too large",
+        "`deadline` means one git call reached its 10-second cap or the 60 seconds, less the "
+        "half second kept for the cache write, ran out",
+        "`failed` means a git call failed",
+        "`~/.nyx/cache/checkouts.json`",
+        "The cache is used only when `~/.nyx` already exists",
+        "Deleting it only costs time",
+        "Its only lasting write is the verdict cache file, which changes no repository",
+        "are made in the system's temporary directory and removed before it exits",
+        "when the remote did not answer or has no default branch (an empty remote, or one "
+        "with a detached `HEAD`)",
+        "a size bound, a shallow or partial clone or a git older than 2.39",
     ),
     "docs/workspaces.md": (
         '"schema_version": 4',

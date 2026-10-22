@@ -780,11 +780,14 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 1)
+# Checkout facts document (schema 2)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 1
+CHECKOUTS_SCHEMA_VERSION = 2
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
+# A clone lists at most this many local branches; beyond it the clone is
+# reported as ``too_many_branches`` and none of its branches is examined.
+CHECKOUT_BRANCH_CAP = 100
 
 _NUMBER_RUN = re.compile(r"([0-9]+)")
 _TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -810,7 +813,14 @@ _REMOTE_CHECKS = frozenset({"on", "off"})
 _FOLDER_KEYS = frozenset({"path", "status"})
 _FOLDER_STATUSES = frozenset({"ok", "missing", "unreadable", "not_directory"})
 _CHECKOUTS_DIAGNOSTIC_KEYS = frozenset({"code", "path"})
-CHECKOUTS_DIAGNOSTIC_CODES = frozenset({"not_a_repository", "unrepresentable_path"})
+CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
+    {
+        "not_a_repository",
+        "unrepresentable_path",
+        "checkout_cache_unreadable",
+        "checkout_cache_write_failed",
+    }
+)
 _REPOSITORY_KEYS = frozenset({"remote", "default_branch", "clones"})
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
@@ -832,22 +842,46 @@ _CLONE_KEYS = frozenset(
         "stash_count",
         "worktrees",
         "branches",
+        "verdict_base",
     }
 )
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
+_CLONE_STATUSES = _ITEM_STATUSES | {"too_many_branches"}
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
 _LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_live", "vs_cached"})
 _WORKTREE_KEYS = frozenset(
-    {"path", "main", "head", "locked", "prunable", "status", "changes", "operations", "index_lock"}
+    {
+        "path",
+        "main",
+        "head",
+        "locked",
+        "prunable",
+        "status",
+        "changes",
+        "operations",
+        "index_lock",
+        "verdict",
+    }
 )
 _HEAD_KEYS = frozenset({"branch", "sha"})
 _CHANGE_KEYS = frozenset({"staged", "unstaged", "untracked", "conflicted"})
 OPERATIONS = ("am", "bisect", "cherry_pick", "merge", "rebase", "revert")
 _BRANCH_KEYS = frozenset(
-    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote"}
+    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote", "verdict"}
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
+_VERDICT_PATCH_FLOOR = (2, 39)
+_NUMERIC_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+_VERDICT_BASE_KEYS = frozenset({"name", "sha", "basis", "objects_from"})
+_VERDICT_KEYS = frozenset({"state", "rung", "reason"})
+_VERDICT_STATES = frozenset({"merged", "not_merged", "unknown"})
+_VERDICT_MERGED_RUNGS = frozenset(
+    {"ancestor", "patch_equivalent", "squash_equivalent", "tree_equal"}
+)
+_VERDICT_UNKNOWN_REASONS = frozenset(
+    {"no_base", "incomplete_clone", "git_too_old", "history_limit", "deadline", "failed"}
+)
 _COMPARISON_RELATIONS = frozenset(
     {"equal", "ahead", "behind", "diverged", "differs", "absent", "unknown"}
 )
@@ -981,6 +1015,38 @@ def _comparison(value: Any, name: str, *, nullable: bool = False) -> None:
         raise ProtocolError(f"{name} counts contradict {relation}")
 
 
+def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
+    item = _object(value, name)
+    _keys(item, _VERDICT_KEYS, name)
+    state = _choice(item["state"], _VERDICT_STATES, f"{name}.state")
+    rung, reason = item["rung"], item["reason"]
+    if state == "merged":
+        _choice(rung, _VERDICT_MERGED_RUNGS, f"{name}.rung")
+        valid = reason is None
+    elif state == "not_merged":
+        valid = rung == "none" and reason is None
+    else:
+        _choice(reason, _VERDICT_UNKNOWN_REASONS, f"{name}.reason")
+        valid = rung is None
+    if not valid:
+        raise ProtocolError(f"{name} carries a rung or reason its state does not allow")
+
+
+def _verdict_base(value: Any, name: str) -> None:
+    if value is None:
+        return
+    item = _object(value, name)
+    _keys(item, _VERDICT_BASE_KEYS, name)
+    _text(item["name"], f"{name}.name")
+    _object_id(item["sha"], f"{name}.sha")
+    basis = _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
+    lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
+    if lender is not None and basis != "live":
+        raise ProtocolError(f"{name}.objects_from requires the live basis")
+
+
 def _head(value: Any, name: str) -> None:
     item = _object(value, name)
     _keys(item, _HEAD_KEYS, name)
@@ -998,7 +1064,7 @@ def _worktree(value: Any, name: str) -> dict[str, Any]:
     _bool(item["locked"], f"{name}.locked")
     prunable = _bool(item["prunable"], f"{name}.prunable")
     status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
-    nullable_fields = ("head", "changes", "operations", "index_lock")
+    nullable_fields = ("head", "changes", "operations", "index_lock", "verdict")
     if status != "ok":
         if any(item[field] is not None for field in nullable_fields):
             raise ProtocolError(f"{name} must leave its facts null when status is {status}")
@@ -1017,6 +1083,7 @@ def _worktree(value: Any, name: str) -> dict[str, Any]:
     ):
         raise ProtocolError(f"{name}.operations is invalid")
     _bool(item["index_lock"], f"{name}.index_lock")
+    _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     return item
 
 
@@ -1036,14 +1103,78 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
         raise ProtocolError(f"{name} compares with a remote the clone does not have")
     if has_remote and item["vs_remote"] is None:
         raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
+    _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     return item
 
 
-def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str]) -> dict[str, Any]:
+def _verdict_state(verdict: Mapping[str, Any]) -> tuple[str, Any]:
+    return verdict["state"], verdict["reason"]
+
+
+def _git_below_patch_floor(version: str | None) -> bool:
+    numeric = _NUMERIC_VERSION.match(version) if version is not None else None
+    if numeric is None:
+        return False
+    parts = tuple(int(part) for part in numeric.group(0).split("."))
+    return parts[: len(_VERDICT_PATCH_FLOOR)] < _VERDICT_PATCH_FLOOR
+
+
+def _clone_verdicts(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    has_remote: bool,
+    git_version: str | None,
+    branches: list[dict[str, Any]],
+    worktrees: list[dict[str, Any]],
+) -> None:
+    """Check the verdicts of one ``ok`` clone against its base and its own limits."""
+    base = item["verdict_base"]
+    if base is not None and not has_remote:
+        raise ProtocolError(f"{name}.verdict_base requires a remote")
+    verdicts: list[tuple[str, Mapping[str, Any]]] = []
+    for index, branch in enumerate(branches):
+        label = f"{name}.branches[{index}].verdict"
+        verdict = branch["verdict"]
+        names_base = base is not None and branch["name"] == base["name"]
+        if names_base != (verdict is None):
+            raise ProtocolError(f"{label} must be null exactly for the verdict base branch")
+        if verdict is not None:
+            verdicts.append((label, verdict))
+    for index, worktree in enumerate(worktrees):
+        label = f"{name}.worktrees[{index}].verdict"
+        detached = (
+            worktree["status"] == "ok"
+            and worktree["head"]["branch"] is None
+        )
+        if detached != (worktree["verdict"] is not None):
+            raise ProtocolError(f"{label} must be present exactly for a detached checkout")
+        if worktree["verdict"] is not None:
+            verdicts.append((label, worktree["verdict"]))
+    limited = item["shallow"] or item["partial_clone"]
+    for label, verdict in verdicts:
+        no_base = _verdict_state(verdict) == ("unknown", "no_base")
+        if no_base != (base is None):
+            raise ProtocolError(f"{label} contradicts the verdict base of the clone")
+        reason = verdict["reason"]
+        if reason == "incomplete_clone" and not limited:
+            raise ProtocolError(f"{label} names an incomplete clone that is complete")
+        if reason == "git_too_old" and not _git_below_patch_floor(git_version):
+            raise ProtocolError(f"{label} names an old git that is not old")
+
+
+def _clone(
+    value: Any,
+    name: str,
+    *,
+    has_remote: bool,
+    worktree_paths: set[str],
+    git_version: str | None,
+) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _CLONE_KEYS, name)
     path = _text(item["path"], f"{name}.path")
-    status = _choice(item["status"], _ITEM_STATUSES, f"{name}.status")
+    status = _choice(item["status"], _CLONE_STATUSES, f"{name}.status")
     facts = (
         "bare",
         "partial_clone",
@@ -1054,6 +1185,7 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
         "stash_count",
         "worktrees",
         "branches",
+        "verdict_base",
     )
     if status != "ok":
         if any(item[field] is not None for field in facts):
@@ -1064,6 +1196,7 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
     _bool(item["shallow"], f"{name}.shallow")
     _count(item["stash_count"], f"{name}.stash_count")
     _comparison(item["cached_vs_live"], f"{name}.cached_vs_live", nullable=True)
+    _verdict_base(item["verdict_base"], f"{name}.verdict_base")
 
     cached = item["cached_default"]
     local = item["local_default"]
@@ -1109,6 +1242,8 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
 
     local_paths = {worktree["path"] for worktree in parsed}
     branches = _list(item["branches"], f"{name}.branches")
+    if len(branches) > CHECKOUT_BRANCH_CAP:
+        raise ProtocolError(f"{name} lists more than {CHECKOUT_BRANCH_CAP} branches")
     parsed_branches = [
         _branch(raw, f"{name}.branches[{index}]", has_remote=has_remote)
         for index, raw in enumerate(branches)
@@ -1117,10 +1252,24 @@ def _clone(value: Any, name: str, *, has_remote: bool, worktree_paths: set[str])
     for branch in parsed_branches:
         if not set(branch["checked_out_in"]) <= local_paths:
             raise ProtocolError(f"{name} has a branch checked out in an unlisted worktree")
+    _clone_verdicts(
+        item,
+        name,
+        has_remote=has_remote,
+        git_version=git_version,
+        branches=parsed_branches,
+        worktrees=parsed,
+    )
     return item
 
 
-def _repository(value: Any, index: int, clone_paths: set[str], worktree_paths: set[str]) -> dict[str, Any]:
+def _repository(
+    value: Any,
+    index: int,
+    clone_paths: set[str],
+    worktree_paths: set[str],
+    git_version: str | None,
+) -> dict[str, Any]:
     name = f"repositories[{index}]"
     item = _object(value, name)
     _keys(item, _REPOSITORY_KEYS, name)
@@ -1159,6 +1308,7 @@ def _repository(value: Any, index: int, clone_paths: set[str], worktree_paths: s
             f"{name}.clones[{clone_index}]",
             has_remote=remote is not None,
             worktree_paths=worktree_paths,
+            git_version=git_version,
         )
         for clone_index, raw in enumerate(clones)
     ]
@@ -1228,7 +1378,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     worktree_paths: set[str] = set()
     remote_keys: set[str] = set()
     parsed = [
-        _repository(raw_repository, index, clone_paths, worktree_paths)
+        _repository(raw_repository, index, clone_paths, worktree_paths, version)
         for index, raw_repository in enumerate(repositories)
     ]
     for repository in parsed:

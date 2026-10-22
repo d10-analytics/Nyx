@@ -7,6 +7,7 @@ changes any outcome.  Timeouts are lowered only through collector parameters.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,13 @@ GLOBAL_CONFIG = """\
 \tallow = always
 [advice]
 \tdetachedHead = false
+[gc]
+\tauto = 0
+[maintenance]
+\tauto = false
+[receive]
+\tautogc = false
+\tunpackLimit = 10000
 """
 
 
@@ -59,6 +68,64 @@ def isolated_git(tmp_path_factory, monkeypatch):
     return home
 
 
+PINNED_HOUSEKEEPING = {
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    "receive.autogc": "false",
+    "receive.unpackLimit": "10000",
+}
+
+
+def test_automatic_housekeeping_is_off_in_every_repository_a_test_builds(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, tmp_path / "work")
+    for repository in (remote, work):
+        for key, value in PINNED_HOUSEKEEPING.items():
+            assert git(repository, "config", "--get", key).stdout.strip() == value, key
+
+
+def push_many_objects(work: Path, count: int) -> None:
+    for number in range(count):
+        (work / f"bulk-{number}.txt").write_bytes(f"bulk {number} {time.time_ns()}\n".encode())
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "bulk")
+    git(work, "push", "-q", "origin", "trunk")
+
+
+def test_a_push_of_more_than_the_default_unpack_limit_leaves_the_remote_loose(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, tmp_path / "work")
+
+    push_many_objects(work, 150)
+
+    assert len(loose_objects(remote)) > 150
+    assert pack_names(remote) == []
+    before = store_times(remote)
+    # A second push runs receive-pack again: nothing is packed or removed.  Modification
+    # times are not compared here because git freshens a loose object it receives again.
+    push_many_objects(work, 150)
+    after = store_times(remote)
+    assert pack_names(remote) == []
+    assert set(before) < set(after)
+
+
+def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
+    """Control: the loose result above is the pin's doing, and the probe can see a pack."""
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "receive.unpackLimit", "100")
+    work = clone(remote, tmp_path / "work")
+
+    push_many_objects(work, 150)
+
+    assert pack_names(remote) != []
+
+
 def git(cwd: Path | str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["git", *arguments], cwd=cwd, capture_output=True, text=True, check=False
@@ -75,7 +142,9 @@ def real(path: Path | str) -> str:
 def commit_file(repo: Path, name: str, content: str, message: str | None = None) -> str:
     target = repo / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content)
+    # Exact bytes: text mode would write CRLF on Windows and make identical
+    # changes differ from those made with ``write_bytes``.
+    target.write_bytes(content.encode())
     git(repo, "add", name)
     git(repo, "commit", "-q", "-m", message or f"edit {name}")
     return git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -1251,6 +1320,7 @@ def mutate_clone_repeated(document):
     duplicate.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
         local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        verdict_base=None,
     )
     document["repositories"].append(
         {"remote": None, "default_branch": None, "clones": [duplicate]}
@@ -1334,7 +1404,8 @@ def mutate_prunable_ok(document):
         mutate_comparison_counts("absent"),
         mutate_comparison_counts("unknown"),
         mutate_counts_contradict,
-        mutate_schema(2),
+        mutate_schema(1),
+        mutate_schema(3),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1401,6 +1472,322 @@ def test_unchanged_state_gives_a_new_observation_time_and_the_same_digest(repo):
     assert first["checkouts_digest"] == second["checkouts_digest"]
 
 
+def verdict_of(state, rung=None, reason=None):
+    return {"state": state, "rung": rung, "reason": reason}
+
+
+def merged_verdict():
+    return verdict_of("merged", "ancestor")
+
+
+def other_branches(clone_document):
+    base = clone_document["verdict_base"]["name"]
+    return [item for item in clone_document["branches"] if item["name"] != base]
+
+
+def detach(document, verdict):
+    """Detach the outside worktree of the first clone and give it ``verdict``."""
+    clone_document = first_clone(document)
+    worktree = next(item for item in clone_document["worktrees"] if not item["main"])
+    worktree["head"] = {"branch": None, "sha": worktree["head"]["sha"]}
+    worktree["verdict"] = verdict
+    return worktree
+
+
+def undecided_without_a_base(document):
+    """Drop the first clone's base, as for a group that agrees on no default name."""
+    clone_document = first_clone(document)
+    clone_document["verdict_base"] = None
+    for branch in clone_document["branches"]:
+        branch["verdict"] = verdict_of("unknown", reason="no_base")
+
+
+def without_remote(document):
+    """Reduce the first clone to a repository with no remote and so no base."""
+    clone_document = first_clone(document)
+    document["repositories"] = [
+        {"remote": None, "default_branch": None, "clones": [clone_document]}
+    ]
+    clone_document.update(cached_default=None, local_default=None, cached_vs_live=None)
+    for branch in clone_document["branches"]:
+        branch.update(vs_remote=None, upstream_mismatch=False)
+    undecided_without_a_base(document)
+    return clone_document
+
+
+def mutate_verdict(state, rung, reason):
+    def mutate(document):
+        other_branches(first_clone(document))[0]["verdict"] = verdict_of(state, rung, reason)
+
+    return mutate
+
+
+def mutate_verdict_extra_key(document):
+    other_branches(first_clone(document))[0]["verdict"]["extra"] = 1
+
+
+def mutate_base_extra_key(document):
+    first_clone(document)["verdict_base"]["extra"] = 1
+
+
+def mutate_base_basis(value):
+    def mutate(document):
+        first_clone(document)["verdict_base"]["basis"] = value
+
+    return mutate
+
+
+def mutate_base_lender_with_cached_basis(document):
+    base = first_clone(document)["verdict_base"]
+    assert base["basis"] == "cached"
+    base["objects_from"] = first_clone(document)["path"]
+
+
+def mutate_verdict_on_the_base_branch(document):
+    base = first_clone(document)["verdict_base"]["name"]
+    branch_of(first_clone(document), base)["verdict"] = merged_verdict()
+
+
+def mutate_null_verdict_on_another_branch(document):
+    other_branches(first_clone(document))[0]["verdict"] = None
+
+
+def mutate_verdict_on_a_worktree_on_a_branch(document):
+    worktree = next(item for item in first_clone(document)["worktrees"] if not item["main"])
+    assert worktree["head"]["branch"] is not None
+    worktree["verdict"] = merged_verdict()
+
+
+def mutate_verdict_on_a_non_ok_worktree(document):
+    worktree = next(item for item in first_clone(document)["worktrees"] if not item["main"])
+    worktree.update(
+        status="failed", head=None, changes=None, operations=None, index_lock=None,
+        verdict=merged_verdict(),
+    )
+
+
+def mutate_null_verdict_on_a_detached_worktree(document):
+    detach(document, None)
+
+
+def mutate_incomplete_clone_on_a_full_clone(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+
+
+def mutate_incomplete_clone_on_a_detached_worktree(document):
+    detach(document, verdict_of("unknown", reason="incomplete_clone"))
+
+
+def mutate_git_too_old_on_a_new_git(document):
+    # Set rather than read: the collecting git differs from host to host.
+    document["git"]["version"] = "2.43.0"
+    mutate_git_too_old_on_a_new_git_verdict(document)
+
+
+def mutate_git_too_old_on_the_floor_version(document):
+    document["git"]["version"] = "2.39.0"
+    mutate_git_too_old_on_a_new_git_verdict(document)
+
+
+def mutate_git_too_old_on_a_newer_vendor_version(document):
+    document["git"]["version"] = "2.39.1.windows.1"
+    mutate_git_too_old_on_a_new_git_verdict(document)
+
+
+def mutate_git_too_old_on_a_detached_worktree(document):
+    detach(document, verdict_of("unknown", reason="git_too_old"))
+
+
+def mutate_git_too_old_on_a_new_git_verdict(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of(
+        "unknown", reason="git_too_old"
+    )
+
+
+def mutate_base_null_with_a_decided_branch(document):
+    undecided_without_a_base(document)
+    other_branches_target = next(
+        item for item in first_clone(document)["branches"] if item["name"] != "trunk"
+    )
+    other_branches_target["verdict"] = merged_verdict()
+
+
+def mutate_base_null_with_a_decided_worktree(document):
+    undecided_without_a_base(document)
+    detach(document, merged_verdict())
+
+
+def mutate_no_base_with_a_base(document):
+    other_branches(first_clone(document))[0]["verdict"] = verdict_of("unknown", reason="no_base")
+
+
+def mutate_no_base_on_a_detached_worktree_with_a_base(document):
+    detach(document, verdict_of("unknown", reason="no_base"))
+
+
+def mutate_base_on_a_clone_without_a_remote(document):
+    clone_document = without_remote(document)
+    clone_document["verdict_base"] = {
+        "name": "trunk", "sha": "1" * 40, "basis": "live", "objects_from": None
+    }
+    for branch in clone_document["branches"]:
+        branch["verdict"] = None if branch["name"] == "trunk" else merged_verdict()
+
+
+def mutate_base_on_a_clone_that_is_not_ok(document):
+    clone_document = first_clone(document)
+    base = clone_document["verdict_base"]
+    refused_clone(document)
+    clone_document["verdict_base"] = base
+
+
+def mutate_missing_verdict_key(document):
+    del other_branches(first_clone(document))[0]["verdict"]["reason"]
+
+
+REJECTED_VERDICT_DOCUMENTS = {
+    "merged_without_rung": mutate_verdict("merged", None, None),
+    "merged_with_rung_none": mutate_verdict("merged", "none", None),
+    "merged_with_foreign_rung": mutate_verdict("merged", "pull_request", None),
+    "not_merged_with_rung_ancestor": mutate_verdict("not_merged", "ancestor", None),
+    "not_merged_without_rung": mutate_verdict("not_merged", None, None),
+    "unknown_with_rung": mutate_verdict("unknown", "ancestor", "failed"),
+    "unknown_with_rung_none": mutate_verdict("unknown", "none", "failed"),
+    "unknown_without_reason": mutate_verdict("unknown", None, None),
+    "reason_on_merged": mutate_verdict("merged", "ancestor", "failed"),
+    "reason_on_not_merged": mutate_verdict("not_merged", "none", "failed"),
+    "foreign_state": mutate_verdict("pending", None, None),
+    "foreign_reason": mutate_verdict("unknown", None, "objects_missing"),
+    "extra_verdict_key": mutate_verdict_extra_key,
+    "missing_verdict_key": mutate_missing_verdict_key,
+    "extra_base_key": mutate_base_extra_key,
+    "foreign_base_basis": mutate_base_basis("remote"),
+    "null_base_basis": mutate_base_basis(None),
+    "lender_under_the_cached_basis": mutate_base_lender_with_cached_basis,
+    "verdict_on_the_base_branch": mutate_verdict_on_the_base_branch,
+    "null_verdict_on_another_branch": mutate_null_verdict_on_another_branch,
+    "verdict_on_a_worktree_on_a_branch": mutate_verdict_on_a_worktree_on_a_branch,
+    "verdict_on_a_non_ok_worktree": mutate_verdict_on_a_non_ok_worktree,
+    "null_verdict_on_a_detached_worktree": mutate_null_verdict_on_a_detached_worktree,
+    "incomplete_clone_on_a_full_clone": mutate_incomplete_clone_on_a_full_clone,
+    "incomplete_clone_on_a_detached_worktree": mutate_incomplete_clone_on_a_detached_worktree,
+    "git_too_old_on_a_new_git": mutate_git_too_old_on_a_new_git,
+    "git_too_old_on_the_floor_version": mutate_git_too_old_on_the_floor_version,
+    "git_too_old_on_a_vendor_version": mutate_git_too_old_on_a_newer_vendor_version,
+    "git_too_old_on_a_detached_worktree": mutate_git_too_old_on_a_detached_worktree,
+    "null_base_with_a_decided_branch": mutate_base_null_with_a_decided_branch,
+    "null_base_with_a_decided_worktree": mutate_base_null_with_a_decided_worktree,
+    "no_base_with_a_base": mutate_no_base_with_a_base,
+    "no_base_worktree_with_a_base": mutate_no_base_on_a_detached_worktree_with_a_base,
+    "base_without_a_remote": mutate_base_on_a_clone_without_a_remote,
+    "base_on_a_clone_that_is_not_ok": mutate_base_on_a_clone_that_is_not_ok,
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_VERDICT_DOCUMENTS), ids=str)
+def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_VERDICT_DOCUMENTS[mutation](broken)
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
+def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
+    document, _folder = sample
+    shapes = [
+        verdict_of("merged", rung)
+        for rung in ("ancestor", "patch_equivalent", "squash_equivalent", "tree_equal")
+    ] + [verdict_of("not_merged", "none")] + [
+        verdict_of("unknown", reason=reason)
+        for reason in ("history_limit", "deadline", "failed")
+    ]
+    for shape in shapes:
+        accepted = doc_copy(document)
+        other_branches(first_clone(accepted))[0]["verdict"] = shape
+        assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    clone_document = first_clone(accepted)
+    clone_document["verdict_base"].update(basis="live", objects_from=clone_document["path"])
+    clone_document["branches"] = [
+        item for item in clone_document["branches"] if item["name"] != "trunk"
+    ]
+    assert all(item["verdict"] is not None for item in clone_document["branches"])
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_detached_checkout_with_a_verdict(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    detach(accepted, verdict_of("merged", "tree_equal"))
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_a_clone_with_a_base_and_no_other_branch(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    clone_document = first_clone(accepted)
+    clone_document["branches"] = [
+        item for item in clone_document["branches"] if item["name"] == "trunk"
+    ]
+    assert clone_document["verdict_base"] is not None
+    assert models.parse_checkouts(redigest(accepted))
+
+
+def test_parser_accepts_documents_without_a_base(sample):
+    document, _folder = sample
+    undecided = doc_copy(document)
+    undecided_without_a_base(undecided)
+    detach(undecided, verdict_of("unknown", reason="no_base"))
+    assert models.parse_checkouts(redigest(undecided))
+    assert all(
+        item["verdict"] == verdict_of("unknown", reason="no_base")
+        for item in first_clone(undecided)["branches"]
+    )
+
+    remoteless = doc_copy(document)
+    without_remote(remoteless)
+    assert first_clone(remoteless)["verdict_base"] is None
+    assert models.parse_checkouts(redigest(remoteless))
+
+
+def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
+    document, _folder = sample
+    limited = doc_copy(document)
+    clone_document = first_clone(limited)
+    clone_document["shallow"] = True
+    other_branches(clone_document)[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+    assert models.parse_checkouts(redigest(limited))
+    clone_document["shallow"] = False
+    clone_document["partial_clone"] = True
+    detach(limited, verdict_of("unknown", reason="incomplete_clone"))
+    assert models.parse_checkouts(redigest(limited))
+
+    old = doc_copy(document)
+    old["git"]["version"] = "2.38.1"
+    other_branches(first_clone(old))[0]["verdict"] = verdict_of("unknown", reason="git_too_old")
+    assert models.parse_checkouts(redigest(old))
+    old["git"]["version"] = "2.9.5"
+    assert models.parse_checkouts(redigest(old))
+
+
+def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
+    document, _folder = sample
+    retired = doc_copy(document)
+    retired["schema_version"] = 1
+    with pytest.raises(models.ProtocolError, match="schema"):
+        models.parse_checkouts(redigest(retired))
+
+
 NULLABLE_CLONE_FACTS = {
     "bare": (False, 0, "", []),
     "partial_clone": (False, 0, "", []),
@@ -1411,12 +1798,14 @@ NULLABLE_CLONE_FACTS = {
     "stash_count": (0, False, "", []),
     "worktrees": ([], "", 0, False),
     "branches": ([], "", 0, False),
+    "verdict_base": ({}, "", [], False, 0),
 }
 NULLABLE_WORKTREE_FACTS = {
     "head": ({}, "", [], False),
     "changes": ({}, "", [], False, 0),
     "operations": ([], "", 0, False),
     "index_lock": (False, 0, "", []),
+    "verdict": ({}, "", [], False, 0),
 }
 
 
@@ -1425,6 +1814,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
         local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        verdict_base=None,
     )
     return clone_document
 
@@ -1435,8 +1825,66 @@ def test_parser_accepts_non_ok_items_with_null_facts(sample):
     refused_clone(broken)
     other = broken["repositories"][0]["clones"][1]
     worktree = other["worktrees"][0]
-    worktree.update(status="timed_out", head=None, changes=None, operations=None, index_lock=None)
+    worktree.update(
+        status="timed_out", head=None, changes=None, operations=None, index_lock=None, verdict=None
+    )
     assert models.parse_checkouts(redigest(broken))
+
+
+def with_branch_count(document: dict[str, Any], count: int) -> dict[str, Any]:
+    """Give the first clone exactly ``count`` branches, each extra one a copy of a decided one."""
+    clone_document = first_clone(document)
+    template = other_branches(clone_document)[0]
+    kept = clone_document["branches"]
+    extras = [
+        {**template, "name": f"zz-extra-{n:03d}", "checked_out_in": []}
+        for n in range(count - len(kept))
+    ]
+    clone_document["branches"] = sorted([*kept, *extras], key=models.branch_sort_key)
+    assert len(clone_document["branches"]) == count
+    return clone_document
+
+
+def test_parser_limits_an_ok_clone_to_the_branch_cap(sample):
+    document, _folder = sample
+    at_cap = doc_copy(document)
+    with_branch_count(at_cap, models.CHECKOUT_BRANCH_CAP)
+    assert models.parse_checkouts(redigest(at_cap))
+
+    over = doc_copy(document)
+    with_branch_count(over, models.CHECKOUT_BRANCH_CAP + 1)
+    with pytest.raises(models.ProtocolError, match="more than 100 branches"):
+        models.parse_checkouts(redigest(over))
+
+
+def test_parser_accepts_a_clone_over_the_branch_cap_with_null_facts(sample):
+    document, _folder = sample
+    crowded = doc_copy(document)
+    refused_clone(crowded)["status"] = "too_many_branches"
+    assert models.parse_checkouts(redigest(crowded))
+
+
+def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
+    document, _folder = sample
+    broken = doc_copy(document)
+    main_worktree(first_clone(broken)).update(
+        status="too_many_branches", head=None, changes=None, operations=None,
+        index_lock=None, verdict=None,
+    )
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
+@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base"])
+def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
+    document, _folder = sample
+    ok_clone = first_clone(doc_copy(document))
+    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base")}
+    broken = doc_copy(document)
+    refused_clone(broken)["status"] = "too_many_branches"
+    first_clone(broken)[fact] = facts[fact]
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
 
 
 @pytest.mark.parametrize(
@@ -1479,12 +1927,16 @@ def test_oversized_document_is_refused_with_a_category(tmp_path):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
-    repository = clone(remote, folder / "repo")
-    head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    add_packed_refs(
-        repository, {f"refs/heads/never-pushed-{n:06d}": head for n in range(10_000)}
-    )
-    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 10_001
+    # Each clone holds the most branches one clone may (the default and 99
+    # more), all at the default's tip, and long names fill the document.
+    for index in range(48):
+        repository = clone(remote, folder / f"repo-{index:03d}")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/{index:03d}-{n:03d}-" + "x" * 230: head for n in range(99)},
+        )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
 
     with pytest.raises(checkouts.CheckoutsOutputTooLargeError) as error:
         checkouts.collect_checkouts(
@@ -2793,7 +3245,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 1
+    assert first["schema_version"] == 2
     borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -2876,3 +3328,3002 @@ def test_no_sibling_is_probed_when_the_clone_holds_the_head(tmp_path, monkeypatc
     calls = log.read_text().splitlines()
     assert any(f"-C {real(lagging)} rev-list --no-walk" in call for call in calls)
     assert not any(f"-C {real(holder)} rev-list --no-walk" in call for call in calls)
+
+
+# ---------------------------------------------------------------------------
+# Merge verdicts: the base and the git ladder
+# ---------------------------------------------------------------------------
+
+MERGED_ANCESTOR = ("merged", "ancestor", None)
+MERGED_PATCH = ("merged", "patch_equivalent", None)
+MERGED_SQUASH = ("merged", "squash_equivalent", None)
+MERGED_TREE = ("merged", "tree_equal", None)
+NOT_MERGED = ("not_merged", "none", None)
+
+
+def unknown(reason: str) -> tuple[str, None, str]:
+    return ("unknown", None, reason)
+
+
+def verdict_tuple(verdict: dict[str, Any] | None):
+    if verdict is None:
+        return None
+    return (verdict["state"], verdict["rung"], verdict["reason"])
+
+
+def verdicts_of(clone_document: dict[str, Any]) -> dict[str, Any]:
+    return {
+        branch["name"]: verdict_tuple(branch["verdict"])
+        for branch in clone_document["branches"]
+    }
+
+
+def write_bytes(repo: Path, name: str, content: bytes) -> None:
+    (repo / name).write_bytes(content)
+    git(repo, "add", name)
+
+
+def commit_bytes(repo: Path, name: str, content: bytes, message: str) -> str:
+    write_bytes(repo, name, content)
+    git(repo, "commit", "-q", "-m", message)
+    return rev(repo, "HEAD")
+
+
+def rev(repo: Path, name: str) -> str:
+    return git(repo, "rev-parse", name).stdout.strip()
+
+
+def apply_patch(repo: Path, patch: bytes) -> None:
+    result = subprocess.run(
+        ["git", "apply", "--index"], cwd=repo, input=patch, capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+SHARED_LINES = "".join(f"line {number}\n" for number in range(1, 11))
+
+EXPECTED_VERDICTS = {
+    "merged-noff": MERGED_ANCESTOR,
+    "picked": MERGED_PATCH,
+    "squashed": MERGED_SQUASH,
+    "split": MERGED_TREE,
+    "unmerged": NOT_MERGED,
+    "empty": NOT_MERGED,
+    "mixed": NOT_MERGED,
+    "cross": NOT_MERGED,
+    "bin-differs": NOT_MERGED,
+    "bin-picked": MERGED_PATCH,
+    "blobdiff": MERGED_PATCH,
+    "trunk": None,
+}
+
+
+def build_verdict_world(tmp_path: Path):
+    """One clone of a remote whose default is ``trunk``, with a branch per rung.
+
+    Each merge is made the way it happens in practice and pushed, so the
+    remote's ``trunk`` (the base) holds it while the branches stay local.
+    """
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, folder / "work")
+    write_bytes(work, "bin.dat", b"\0one\n")
+    write_bytes(work, "bin2.dat", b"\0two\n")
+    commit_file(work, "shared.txt", SHARED_LINES, "shared")
+    git(work, "push", "-q", "origin", "trunk")
+
+    def branch(name: str, start: str = "trunk") -> None:
+        git(work, "checkout", "-q", "-b", name, start)
+
+    branch("split")
+    write_bytes(work, "t1.txt", b"t1\n")
+    write_bytes(work, "t2.txt", b"t2\n")
+    git(work, "commit", "-q", "-m", "add both files at once")
+    branch("merged-noff")
+    commit_file(work, "a.txt", "a\n")
+    branch("picked")
+    commit_file(work, "p1.txt", "p1\n")
+    commit_file(work, "p2.txt", "p2\n")
+    branch("squashed")
+    for number in (1, 2, 3):
+        commit_file(work, f"s{number}.txt", f"s{number}\n")
+    branch("unmerged")
+    commit_file(work, "u.txt", "u\n")
+    branch("empty")
+    git(work, "commit", "-q", "--allow-empty", "-m", "empty")
+    branch("side")
+    commit_file(work, "side1.txt", "side1\n")
+    branch("mixed")
+    commit_file(work, "m1.txt", "m1\n")
+    git(work, "merge", "-q", "--no-commit", "--no-ff", "side")
+    write_bytes(work, "extra.txt", b"evil merge\n")
+    git(work, "commit", "-q", "-m", "merge side with a change")
+    git(work, "branch", "-q", "-D", "side")
+    branch("bin-differs")
+    commit_bytes(work, "bin.dat", b"\0branch\n", "binary on branch")
+    branch("bin-picked")
+    commit_bytes(work, "bin2.dat", b"\0picked\n", "binary picked")
+    branch("blobdiff")
+    commit_file(
+        work, "shared.txt", SHARED_LINES.replace("line 1\n", "line one\n"), "edit the first line"
+    )
+
+    git(work, "checkout", "-q", "trunk")
+    # Exact bytes, like the branch's copies: a text-mode write would end the
+    # lines in CRLF on Windows and the two trees would genuinely differ.
+    commit_bytes(work, "t1.txt", b"t1\n", "land t1 on trunk")
+    commit_bytes(work, "t2.txt", b"t2\n", "land t2 on trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    commit_bytes(work, "bin.dat", b"\0trunk\n", "binary on trunk")
+    commit_file(
+        work, "shared.txt", SHARED_LINES.replace("line 10\n", "line ten\n"), "edit the last line"
+    )
+    git(work, "cherry-pick", "picked~1", "picked")
+    git(work, "cherry-pick", "bin-picked", "blobdiff")
+    git(work, "cherry-pick", rev(work, "mixed^1"), rev(work, "mixed^2"))
+    git(work, "merge", "--squash", "squashed")
+    git(work, "commit", "-q", "-m", "squash squashed")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge merged-noff", "merged-noff")
+
+    # A criss-cross: two merge bases, and a later trunk commit whose patch is
+    # the one `git diff <first merge base> cross` prints.
+    branch("cross")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "a_cc.txt", "a\n")
+    git(work, "checkout", "-q", "cross")
+    side_tip = commit_file(work, "b_cc.txt", "b\n")
+    git(work, "merge", "-q", "--no-commit", "--no-ff", "trunk")
+    write_bytes(work, "extra_cc.txt", b"evil\n")
+    git(work, "commit", "-q", "-m", "cross merges trunk")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "trunk merges cross", side_tip)
+    first = git(work, "merge-base", "trunk", "cross").stdout.strip()
+    assert len(git(work, "merge-base", "--all", "trunk", "cross").stdout.split()) == 2
+    patch = subprocess.run(
+        ["git", "diff", first, "cross"], cwd=work, capture_output=True, check=True
+    ).stdout
+    git(work, "rm", "-q", "a_cc.txt", "b_cc.txt")
+    git(work, "commit", "-q", "-m", "drop the criss-cross files")
+    apply_patch(work, patch)
+    git(work, "commit", "-q", "-m", "land the criss-cross patch again")
+    git(work, "push", "-q", "origin", "trunk")
+
+    worktree = tmp_path / "squashed-worktree"
+    git(work, "worktree", "add", "-q", "--detach", str(worktree), "squashed")
+    return folder, remote, work, worktree
+
+
+def test_each_rung_proves_exactly_its_case(tmp_path):
+    folder, _remote, work, worktree = build_verdict_world(tmp_path)
+
+    document = collect([folder])
+
+    item = find_clone(document, work)
+    assert item["verdict_base"] == {
+        "name": "trunk", "sha": rev(work, "origin/trunk"), "basis": "cached",
+        "objects_from": None,
+    }
+    assert verdicts_of(item) == EXPECTED_VERDICTS
+    assert branch_of(item, "squashed")["sha"] == rev(work, "squashed")
+    detached = find_worktree(item, worktree)
+    assert detached["head"]["branch"] is None
+    assert verdict_tuple(detached["verdict"]) == MERGED_SQUASH
+    assert main_worktree(item)["verdict"] is None
+    base = "origin/trunk"
+    for name in ("picked", "bin-picked", "blobdiff"):
+        lines = git(work, "cherry", base, name).stdout.split("\n")
+        assert [line for line in lines if line] and all(line.startswith("-") for line in lines if line)
+    assert git(work, "cherry", base, "empty").stdout.startswith("+")
+    # No earlier rung proves the later cases.
+    for name in ("picked", "squashed", "split", "cross", "mixed", "empty", "bin-differs"):
+        proof = git(work, "merge-base", "--is-ancestor", name, base, check=False)
+        assert proof.returncode == 1
+    assert len(git(work, "merge-base", "--all", base, "cross").stdout.split()) == 2
+
+
+INDENT_ORIGINAL = "def main():\n    setup()\n    work()\n    cleanup()\n    finish()\n"
+INDENT_BRANCH = "def main():\n    setup()\n    work()\n        cleanup()\n    finish()\n"
+INDENT_BASE = "def main():\n    setup()\n    work()\ncleanup()\n    finish()\n"
+JOB_BLOCK = (
+    "job:\n  image: base\n  cache: none\n  retry: 1\n  script: make\n  after: done\n"
+    "  notify: no\n"
+)
+JOB_TIMEOUT = JOB_BLOCK.replace("  script: make\n", "  script: make\n  timeout: 30\n")
+JOBS_ORIGINAL = JOB_BLOCK * 3
+JOBS_BRANCH = JOB_TIMEOUT + JOB_BLOCK * 2
+JOBS_BASE = JOB_BLOCK + JOB_TIMEOUT + JOB_BLOCK
+
+
+def patch_identity(repo: Path, commit: str, mode: str) -> str:
+    shown = subprocess.run(
+        ["git", "show", "--format=", *checkouts._PATCH_FLAGS, commit],
+        cwd=repo, capture_output=True, check=True,
+    ).stdout
+    result = subprocess.run(
+        ["git", "patch-id", mode], input=shown, cwd=repo, capture_output=True, check=True
+    )
+    return result.stdout.split()[0].decode()
+
+
+def lookalike_world(tmp_path: Path, name: str, original: str, branch: str, base: str, shape: str):
+    """A branch and the base each change ``name`` in a way that is the same patch
+    once whitespace and line numbers are ignored, yet is a different change.
+
+    ``shape`` ``patch`` lands the base's change as its own commit, so the
+    branch could only match commit by commit; ``squash`` gives the branch two
+    commits and lands them on the base as one, so only the whole branch matches.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, name, original, f"add {name}")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+    commit_file(work, name, branch, f"change {name} on the branch")
+    git(work, "checkout", "-q", "trunk")
+    if shape == "squash":
+        write_bytes(work, "notes.txt", b"notes\n")
+    commit_file(work, name, base, f"change {name} on the base")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize("shape", ["patch", "squash"])
+@pytest.mark.parametrize(
+    ("name", "original", "branch", "base", "verbatim_differs"),
+    [
+        ("app.py", INDENT_ORIGINAL, INDENT_BRANCH, INDENT_BASE, True),
+        ("ci.yml", JOBS_ORIGINAL, JOBS_BRANCH, JOBS_BASE, False),
+    ],
+    ids=["indentation", "repeated-block"],
+)
+def test_a_lookalike_change_elsewhere_in_the_base_is_not_merged(
+    tmp_path, isolated_git, name, original, branch, base, verbatim_differs, shape
+):
+    cache = nyx_home(isolated_git)
+    folder, work = lookalike_world(tmp_path, name, original, branch, base, shape)
+    tip, landed = rev(work, "feature"), rev(work, "trunk~1")
+    if shape == "patch":
+        # The trap is real: the stable identities agree.  Where only whitespace
+        # differs the verbatim ones do not; where only the location differs no
+        # identity can tell, and the merge check alone refuses the match.
+        assert patch_identity(work, tip, "--stable") == patch_identity(work, landed, "--stable")
+        same = patch_identity(work, tip, "--verbatim") == patch_identity(work, landed, "--verbatim")
+        assert same != verbatim_differs
+    else:
+        # The squashed branch's whole change has the same identity as the base's commit.
+        fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
+        whole = subprocess.run(
+            ["git", "diff", *checkouts._PATCH_FLAGS, fork, tip, "--"],
+            cwd=work, capture_output=True, check=True
+        ).stdout
+        identity = subprocess.run(
+            ["git", "patch-id", "--stable"], input=whole, cwd=work, capture_output=True, check=True
+        ).stdout.split()[0].decode()
+        assert identity == patch_identity(work, landed, "--stable")
+
+    document = collect([folder])
+
+    item = find_clone(document, work)
+    assert verdicts_of(item)["feature"] == NOT_MERGED
+    key = f"{tip}.{rev(work, 'origin/trunk')}"
+    # What is stored under the pair is the decided ``none``, never a patch rung.
+    assert cache_entries(cache)[key] == "none"
+
+
+def test_a_change_the_base_later_rewrote_still_reads_merged_where_it_landed(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "f.txt", "a\nb\nc\n", "add f")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "f.txt", "A\nb\nc\n", "capitalise a")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "feature")
+    commit_file(work, "f.txt", "Z\nb\nc\n", "rewrite the same line later")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([tmp_path / "folder"])
+
+    # The base commit that landed the change made exactly the branch's change,
+    # so the branch is merged whatever the base did to those lines afterwards.
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+CHANGELOG = "# Changes\n\n- old\n"
+LIST_LINES = "a\nb\nc\nd\n"
+
+
+def landed_then_changed_world(tmp_path: Path, shape: str):
+    """A branch whose change landed on the base, which then changed around it.
+
+    Merging the branch into the base's current tip conflicts (or changes the
+    tree) in each of these worlds, yet the base commit that landed the change
+    made exactly the branch's change.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    name, original = (
+        ("CHANGELOG.md", CHANGELOG) if shape == "squash-above" else ("list.txt", LIST_LINES)
+    )
+    commit_file(work, name, original, f"add {name}")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash-above":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+        commit_file(work, name, CHANGELOG + "- feature A\n", "log feature A")
+    else:
+        commit_file(work, name, original.replace("b\n", "B\n"), "capitalise b")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    if shape == "squash-above":
+        git(work, "merge", "--squash", "feature")
+        git(work, "commit", "-q", "-m", "squash feature")
+        commit_file(work, name, CHANGELOG + "- feature B\n- feature A\n", "log feature B above")
+    else:
+        git(work, "cherry-pick", "feature")
+        if shape == "pick-adjacent":
+            commit_file(work, name, "a\nB\nC\nd\n", "edit the next line")
+        elif shape == "pick-before":
+            commit_file(work, name, "a\nx\nB\nc\nd\n", "insert a line before it")
+        else:
+            git(work, "revert", "--no-edit", "HEAD")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize(
+    ("shape", "verdict"),
+    [
+        ("squash-above", MERGED_SQUASH),
+        ("pick-adjacent", MERGED_PATCH),
+        ("pick-before", MERGED_PATCH),
+        ("pick-revert", MERGED_PATCH),
+    ],
+)
+def test_a_change_that_landed_reads_merged_however_the_base_changed_around_it_later(
+    tmp_path, shape, verdict
+):
+    folder, work = landed_then_changed_world(tmp_path, shape)
+    # The trap is real: merging the branch into the base now does not give the base.
+    attempt = git(work, "merge-tree", "--write-tree", "origin/trunk", "feature", check=False)
+    assert attempt.returncode == 1 or attempt.stdout.strip() != rev(work, "origin/trunk^{tree}")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == verdict
+
+
+def test_a_branch_with_its_own_root_commit_cherry_picked_into_the_base_reads_merged(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "--orphan", "feature")
+    git(work, "rm", "-rfq", ".")
+    commit_file(work, "orphan.txt", "one\n", "root of the unrelated branch")
+    commit_file(work, "orphan.txt", "one\ntwo\n", "extend it")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature~1", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    assert git(work, "merge-base", "feature", "trunk", check=False).returncode == 1
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+@pytest.mark.parametrize("shape", ["patch", "squash"])
+def test_a_lookalike_change_landed_on_a_shifted_file_is_not_merged_either(tmp_path, shape):
+    """The base's file differs from the branch's, so the landing check merges contents."""
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "ci.yml", "# head\n" + JOBS_ORIGINAL, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    if shape == "squash":
+        commit_file(work, "notes.txt", "notes\n", "add notes")
+    commit_file(work, "ci.yml", "# head\n" + JOBS_BRANCH, "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "ci.yml", "# HEAD\n" + JOBS_ORIGINAL, "retitle")
+    if shape == "squash":
+        write_bytes(work, "notes.txt", b"notes\n")
+    commit_file(work, "ci.yml", "# HEAD\n" + JOBS_BASE, "timeout on job 2")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    landed = rev(work, "trunk~1")
+    fork = git(work, "merge-base", "feature", "trunk").stdout.strip()
+    whole = subprocess.run(
+        ["git", "diff", *checkouts._PATCH_FLAGS, fork, "feature", "--"],
+        cwd=work, capture_output=True, check=True
+    ).stdout
+    wanted = patch_identity(work, landed, "--verbatim")
+    identities = {"patch": patch_identity(work, rev(work, "feature"), "--verbatim"), "squash": subprocess.run(
+        ["git", "patch-id", "--verbatim"], input=whole, cwd=work, capture_output=True, check=True
+    ).stdout.split()[0].decode()}
+    # The trap is real: the identities agree, so only the landing check refuses.
+    assert identities[shape] == wanted
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["feature"] == NOT_MERGED
+
+
+def shifted_world(tmp_path: Path):
+    """A cherry-pick whose base file differs from the branch's, so its change
+    lands at a shifted place and the landing check must merge file contents."""
+    folder, _remote, work = small_world(tmp_path)
+    lines = "".join(f"line {number}\n" for number in range(1, 13))
+    commit_file(work, "f.txt", lines, "add f")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "f.txt", lines.replace("line 10\n", "line ten\n"), "edit line 10")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "f.txt", lines.replace("line 2\n", "two\nextra\n"), "grow the top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+def test_a_cherry_pick_that_landed_at_a_shifted_place_reads_merged_through_a_content_merge(
+    tmp_path, monkeypatch
+):
+    folder, work = shifted_world(tmp_path)
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+    assert "merge-file" in calls
+    assert not {"merge-tree", "init"} & set(calls)
+
+
+def git_dir_of(repository: Path) -> Path:
+    return repository / ".git" if (repository / ".git").exists() else repository
+
+
+def file_times(repository: Path) -> dict[str, int]:
+    """Modification times of every file a verdict run could touch.
+
+    The git directory except the object store, which ``store_times`` compares
+    strictly, plus the working tree.
+    """
+    git_dir = git_dir_of(repository)
+    times: dict[str, int] = {}
+    for item in git_dir.rglob("*"):
+        relative = item.relative_to(git_dir).as_posix()
+        if not item.is_file() or relative.split("/")[0] == "objects":
+            continue
+        times[f".git/{relative}"] = item.stat().st_mtime_ns
+    if git_dir != repository:
+        for item in repository.rglob("*"):
+            relative = item.relative_to(repository).as_posix()
+            if item.is_file() and relative.split("/")[0] != ".git":
+                times[relative] = item.stat().st_mtime_ns
+    return times
+
+
+def store_times(repository: Path) -> dict[str, int]:
+    """Every file of the object store, loose or packed, with its modification time."""
+    objects = git_dir_of(repository) / "objects"
+    return {
+        item.relative_to(objects).as_posix(): item.stat().st_mtime_ns
+        for item in objects.rglob("*")
+        if item.is_file()
+    }
+
+
+def pack_names(repository: Path) -> list[str]:
+    return sorted(
+        item.name for item in (git_dir_of(repository) / "objects" / "pack").glob("*.pack")
+    )
+
+
+def loose_objects(repository: Path) -> list[str]:
+    objects = git_dir_of(repository) / "objects"
+    return sorted(
+        item.name for item in objects.glob("[0-9a-f][0-9a-f]/*") if item.is_file()
+    )
+
+
+def pack_everything(repository: Path) -> None:
+    """Put every object, reachable or not, in one pack and drop the loose copies."""
+    names = git(
+        repository, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"
+    ).stdout
+    destination = git_dir_of(repository) / "objects" / "pack" / "pack"
+    subprocess.run(
+        ["git", "pack-objects", "-q", str(destination)],
+        cwd=repository, input=names, text=True, capture_output=True, check=True,
+    )
+    git(repository, "prune-packed")
+    assert pack_names(repository) and loose_objects(repository) == []
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
+def test_the_landing_check_touches_no_object_store_not_even_a_timestamp(tmp_path, packed):
+    folder, remote, work, _worktree = build_verdict_world(tmp_path)
+    git(work, "push", "-q", "origin", "picked", "squashed", "bin-picked")
+    first = clone(remote, tmp_path / "chain" / "first", "--shared")
+    second = clone(first, folder / "second", "--shared")
+    for name in ("picked", "squashed", "bin-picked"):
+        git(second, "branch", name, rev(work, name))
+    if packed:
+        pack_everything(work)
+        pack_everything(remote)
+    stores = [work, remote, first, second]
+    # Each variant states its own layout: nothing packs on its own.
+    assert bool(pack_names(work)) == packed
+    assert bool(loose_objects(work)) == (not packed)
+    before = [(snapshot(store), file_times(store), store_times(store)) for store in stores]
+    time.sleep(0.05)
+
+    document = collect([folder])
+
+    verdicts = verdicts_of(find_clone(document, second))
+    assert (verdicts["picked"], verdicts["squashed"]) == (MERGED_PATCH, MERGED_SQUASH)
+    for store, (content, times, objects) in zip(stores, before, strict=True):
+        assert snapshot(store) == content
+        assert file_times(store) == times
+        # Housekeeping is pinned off, so any new, removed or touched object file is the run's.
+        assert store_times(store) == objects
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
+def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path, packed):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    holder = clone(remote, folder / "holder A")
+    other = clone(remote, folder / "other B")
+    git(other, "checkout", "-q", "-b", "feat")
+    commit_file(other, "feat.txt", "feat\n")
+    commit_file(holder, "held.txt", "held\n")
+    git(holder, "fetch", "-q", str(other), "feat")
+    git(holder, "cherry-pick", "FETCH_HEAD")
+    git(holder, "push", "-q", "origin", "trunk")
+    if packed:
+        pack_everything(holder)
+    stores = [holder, other, remote]
+    assert bool(pack_names(holder)) == packed
+    before = [(snapshot(store), file_times(store), store_times(store)) for store in stores]
+    time.sleep(0.05)
+
+    document = live([folder])
+
+    item = find_clone(document, other)
+    assert item["verdict_base"]["objects_from"] == real(holder)
+    assert verdicts_of(item)["feat"] == MERGED_PATCH
+    for store, (content, times, objects) in zip(stores, before, strict=True):
+        assert snapshot(store) == content
+        assert file_times(store) == times
+        # Housekeeping is pinned off, so any new, removed or touched object file is the run's.
+        assert store_times(store) == objects
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_a_cached_verdict_from_the_retired_schema_is_never_served(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = lookalike_world(
+        tmp_path, "app.py", INDENT_ORIGINAL, INDENT_BRANCH, INDENT_BASE, "patch"
+    )
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    document = {"schema_version": 1, "verdicts": {key: {"rung": "patch_equivalent", "at": 5}}}
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(json.dumps(document))
+
+    with path_with(monkeypatch, old):
+        retired = collect([folder])
+    assert verdicts_of(find_clone(retired, work))["feature"] == unknown("git_too_old")
+    assert retired["diagnostics"] == []
+
+    cache.write_text(json.dumps({**document, "schema_version": 2}))
+    with path_with(monkeypatch, old):
+        current = collect([folder])
+    assert verdicts_of(find_clone(current, work))["feature"] == MERGED_PATCH
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="needs a SHA-256 repository the lane may lack")
+def test_the_patch_rungs_confirm_a_cherry_pick_in_a_sha256_repository(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = served / "remote.git"
+    made = git(served, "init", "-q", "--bare", "--object-format=sha256", "-b", "trunk", str(remote),
+               check=False)
+    if made.returncode != 0:
+        pytest.skip("this git cannot make a SHA-256 repository")
+    seed = served / "seed"
+    git(served, "init", "-q", "--object-format=sha256", "-b", "trunk", str(seed))
+    commit_file(seed, "file.txt", "one\n", "seed")
+    git(seed, "remote", "add", "origin", str(remote))
+    git(seed, "push", "-q", "origin", "trunk")
+    work = clone(remote, folder / "work")
+    git(work, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(work, "p1.txt", "p1\n")
+    commit_file(work, "p2.txt", "p2\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked~1", "picked")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["picked"] == MERGED_PATCH
+
+
+def test_the_squash_rung_streams_its_diff_and_no_run_call_carries_diff_bytes(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+    streamed: list[str] = []
+    buffered: list[str] = []
+
+    def recording_run(self, arguments, **options):
+        if git_subcommand(arguments) in ("diff", "patch-id") or "stdin_bytes" in options:
+            buffered.append(git_subcommand(arguments))
+        return run(self, arguments, **options)
+
+    def recording_pipeline(self, producer, consumer, **options):
+        streamed.append(git_subcommand(producer))
+        return pipeline(self, producer, consumer, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(checkouts._GitRunner, "run", recording_run)
+        patched.setattr(checkouts._GitRunner, "pipeline", recording_pipeline)
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["squashed"] == MERGED_SQUASH
+    assert "diff" in streamed
+    assert buffered == []
+
+
+def test_a_commit_that_differs_from_a_base_commit_only_in_whitespace_is_not_its_counterpart(
+    tmp_path,
+):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "w.txt", "keep\nx\nkeep\n", "add w")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "w.txt", "keep\ny \nkeep\n", "y with a trailing space")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    commit_file(work, "w.txt", "keep\ny\nkeep\n", "y")
+    commit_file(work, "w.txt", "keep\ny \nkeep\n", "add the trailing space")
+    git(work, "push", "-q", "origin", "trunk")
+    tip, landed = rev(work, "feature"), rev(work, "trunk~1")
+    # Only whitespace tells the two commits apart, and merging the branch into
+    # the base would change nothing, so only an exact identity keeps them apart.
+    assert patch_identity(work, tip, "--stable") == patch_identity(work, landed, "--stable")
+    assert patch_identity(work, tip, "--verbatim") != patch_identity(work, landed, "--verbatim")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ('case "$*" in *" diff-tree "*) exit 2;; esac', "failed"),
+        ('case "$*" in *" diff-tree "*) sleep 3;; esac', "deadline"),
+    ],
+    ids=["landing-diff", "landing-diff-call-cap"],
+)
+def test_a_landing_check_that_fails_leaves_the_match_unknown_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, body, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    shim = stand_in(tmp_path, "failing-landing-check", body)
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=1.0)
+
+    verdicts = verdicts_of(find_clone(document, work))
+    stored = cache_entries(cache)
+    base = rev(work, "origin/trunk")
+    for name in ("picked", "squashed", "bin-picked", "blobdiff"):
+        assert verdicts[name] == unknown(reason), name
+        assert f"{rev(work, name)}.{base}" not in stored, name
+    # Tips that never reach the landing check are decided and stored as usual.
+    assert verdicts["unmerged"] == NOT_MERGED
+    assert verdicts["split"] == MERGED_TREE
+    assert stored[f"{rev(work, 'unmerged')}.{base}"] == "none"
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ('case "$*" in *" cat-file "*) exit 2;; esac', "failed"),
+        ('case "$*" in *" cat-file "*) sleep 3;; esac', "deadline"),
+        ('case "$*" in *" merge-file "*) exit 255;; esac', "failed"),
+        ('case "$*" in *" merge-file "*) sleep 3;; esac', "deadline"),
+    ],
+    ids=["read-blob", "read-blob-call-cap", "merge-file", "merge-file-call-cap"],
+)
+def test_a_content_merge_step_that_fails_leaves_the_match_unknown_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, body, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, work = shifted_world(tmp_path)
+    shim = stand_in(tmp_path, "failing-content-merge", body)
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=1.0)
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown(reason)
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
+@posix_only
+def test_a_symbolic_link_retargeted_where_the_base_edited_a_file_is_not_merged(
+    tmp_path, isolated_git
+):
+    """The base's file at that path is a regular file, the branch's a symbolic link."""
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "link", "a", "add link as a file")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for target, message in (("a", "make link a symbolic link"), ("b", "retarget link")):
+        (work / "link").unlink()
+        (work / "link").symlink_to(target)
+        git(work, "add", "link")
+        git(work, "commit", "-q", "-m", message)
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature~1")
+    (work / "link").unlink()
+    write_bytes(work, "link", b"a")
+    git(work, "commit", "-q", "-m", "make link a file again")
+    commit_file(work, "link", "b", "edit the file")
+    git(work, "push", "-q", "origin", "trunk")
+    # The trap is real: the retarget and the file edit share their exact identity.
+    assert patch_identity(work, rev(work, "feature"), "--verbatim") == patch_identity(
+        work, rev(work, "trunk"), "--verbatim"
+    )
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert cache_entries(cache)[f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"] == "none"
+
+
+def repeated_block_landings(work: Path, blocks: int, landed: list[int]) -> None:
+    """``ci.yml`` with ``blocks`` identical jobs; the base times out ``landed`` jobs
+    (0-based) one commit each, in that order, all with one patch identity."""
+    state = [JOB_BLOCK] * blocks
+    for index in landed:
+        state[index] = JOB_TIMEOUT
+        commit_file(work, "ci.yml", "".join(state), f"timeout on job {index + 1}")
+
+
+def test_a_landing_behind_a_newer_lookalike_with_its_identity_still_reads_merged(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "ci.yml", JOB_BLOCK * 3, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "ci.yml", JOB_TIMEOUT + JOB_BLOCK * 2, "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    commit_file(work, "ci.yml", JOB_TIMEOUT * 2 + JOB_BLOCK, "timeout on job 2")
+    git(work, "push", "-q", "origin", "trunk")
+    # The newest base commit with the branch's identity is the lookalike on job 2.
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    assert patch_identity(work, rev(work, "trunk"), "--verbatim") == identity
+    assert patch_identity(work, rev(work, "trunk~1"), "--verbatim") == identity
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+def test_more_base_commits_with_the_identity_than_the_bound_leave_the_branch_unknown(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.LANDING_CAP + 3
+    commit_file(work, "ci.yml", JOB_BLOCK * blocks, "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "ci.yml", JOB_TIMEOUT + JOB_BLOCK * (blocks - 1), "timeout on job 1")
+    git(work, "checkout", "-q", "trunk")
+    # One lookalike more than the bound, none of them on job 1.
+    repeated_block_landings(work, blocks, list(range(1, checkouts.LANDING_CAP + 2)))
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown("history_limit")
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
+def test_a_newer_candidate_over_a_bound_does_not_hide_an_older_exact_landing(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.MERGE_FILE_CAP // len(JOB_BLOCK) + 100
+    state = [JOB_BLOCK] * blocks
+    commit_file(work, "ci.yml", "".join(state), "add ci.yml")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    state[5] = JOB_TIMEOUT
+    commit_file(work, "ci.yml", "".join(state), "timeout on job 6")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    # The newest candidate looks the same on another copy of the block, and,
+    # starting from a file the branch never saw, confirming it needs a content
+    # merge of a file over the bound.
+    state.append("tail: 1\n")
+    commit_file(work, "ci.yml", "".join(state), "add a tail")
+    state[6] = JOB_TIMEOUT
+    commit_file(work, "ci.yml", "".join(state), "timeout on job 7")
+    git(work, "push", "-q", "origin", "trunk")
+    assert len(JOB_BLOCK) * blocks > checkouts.MERGE_FILE_CAP
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    assert patch_identity(work, rev(work, "trunk"), "--verbatim") == identity
+    assert patch_identity(work, rev(work, "trunk~2"), "--verbatim") == identity
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+
+
+def test_landing_content_merges_keep_only_a_bounded_amount_in_memory(tmp_path):
+    import tracemalloc
+
+    folder, _remote, work = small_world(tmp_path)
+    rows = [f"row {number:06d} {'x' * 40}\n" for number in range(18000)]
+    size = sum(len(row) for row in rows)
+    assert 0.8 * checkouts.MERGE_FILE_CAP < size < checkouts.MERGE_FILE_CAP
+    commit_file(work, "big.txt", "".join(rows), "add big")
+    git(work, "push", "-q", "origin", "trunk")
+    names = [f"f{number}" for number in range(8)]
+    for number, name in enumerate(names):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        edited = list(rows)
+        edited[9000 + number] = edited[9000 + number].upper()
+        commit_file(work, "big.txt", "".join(edited), f"edit row {number}")
+    git(work, "checkout", "-q", "trunk")
+    base = list(rows)
+    for number, name in enumerate(names):
+        base[number] = base[number].upper()
+        commit_file(work, "big.txt", "".join(base), f"base edit {number}")
+        git(work, "cherry-pick", name)
+    git(work, "push", "-q", "origin", "trunk")
+
+    tracemalloc.start()
+    try:
+        document = collect([folder])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    verdicts = verdicts_of(find_clone(document, work))
+    assert all(verdicts[name] == MERGED_PATCH for name in names)
+    assert peak < 6 * checkouts.MERGE_FILE_CAP, peak
+
+
+def test_one_landing_confirmation_keeps_a_bounded_amount_however_much_it_reads(tmp_path):
+    import tracemalloc
+
+    folder, _remote, work = small_world(tmp_path)
+    blocks = checkouts.MERGE_FILE_CAP // len(JOB_BLOCK) - 200
+    size = len(JOB_BLOCK) * blocks
+    assert 0.9 * checkouts.MERGE_FILE_CAP < size < checkouts.MERGE_FILE_CAP
+    names = ("one.yml", "two.yml")
+    states = {name: [JOB_BLOCK] * blocks for name in names}
+
+    def commit_states(message: str) -> None:
+        for name in names:
+            (work / name).write_bytes("".join(states[name]).encode())
+        git(work, "add", *names)
+        git(work, "commit", "-q", "-m", message)
+
+    commit_states("add jobs")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for name in names:
+        states[name][5] = JOB_TIMEOUT
+    commit_states("timeout on job 6 of both files")
+    git(work, "checkout", "-q", "trunk")
+    states = {name: [JOB_BLOCK] * blocks for name in names}
+    # Each of the eight landings makes the branch's change to ``one.yml`` but a
+    # lookalike change to ``two.yml``, each from a file the branch never saw, so
+    # every one needs a content merge of both files: one confirmation reads far
+    # more distinct file contents than it may keep.
+    for number in range(checkouts.LANDING_CAP):
+        states["one.yml"][5] = JOB_BLOCK
+        for name in names:
+            states[name][100 + number] = JOB_BLOCK.replace("image: base", "image: next")
+        commit_states(f"move the image of job {101 + number}")
+        states["one.yml"][5] = JOB_TIMEOUT
+        states["two.yml"][20 + number] = JOB_TIMEOUT
+        commit_states(f"timeout on jobs 6 and {21 + number}")
+    git(work, "push", "-q", "origin", "trunk")
+    identity = patch_identity(work, rev(work, "feature"), "--verbatim")
+    for number in range(checkouts.LANDING_CAP):
+        assert patch_identity(work, rev(work, f"trunk~{2 * number}"), "--verbatim") == identity
+    distinct = 2 * len(names) + 2 * len(names) * checkouts.LANDING_CAP
+    assert distinct * size > 4 * checkouts.MERGE_RETAIN_CAP
+
+    tracemalloc.start()
+    try:
+        document = collect([folder])
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert verdicts_of(find_clone(document, work))["feature"] == NOT_MERGED
+    assert peak < checkouts.MERGE_RETAIN_CAP + 8 * checkouts.MERGE_FILE_CAP, peak
+
+
+def content_merges_world(tmp_path: Path, files: int):
+    """A cherry-pick of one commit editing ``files`` files, each of which the base
+    edited elsewhere first, so each file needs its own content merge."""
+    folder, _remote, work = small_world(tmp_path)
+    lines = "".join(f"line {number}\n" for number in range(1, 13))
+    names = [f"m{number:02d}.txt" for number in range(files)]
+    for name in names:
+        write_bytes(work, name, lines.encode())
+    git(work, "commit", "-q", "-m", "add files")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for name in names:
+        write_bytes(work, name, lines.replace("line 10\n", "ten\n").encode())
+    git(work, "commit", "-q", "-m", "edit line 10 everywhere")
+    git(work, "checkout", "-q", "trunk")
+    for name in names:
+        write_bytes(work, name, lines.replace("line 2\n", "two\nextra\n").encode())
+    git(work, "commit", "-q", "-m", "grow every top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.parametrize("over", [False, True], ids=["at-bound", "over-bound"])
+def test_more_content_merges_than_the_bound_leave_the_branch_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git, over
+):
+    cache = nyx_home(isolated_git)
+    folder, work = content_merges_world(tmp_path, checkouts.MERGE_PATH_CAP + over)
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    verdict = verdicts_of(find_clone(document, work))["feature"]
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    stored = cache_entries(cache) if cache.exists() else {}
+    if over:
+        assert verdict == unknown("history_limit")
+        assert key not in stored
+        assert "merge-file" not in calls
+    else:
+        assert verdict == MERGED_PATCH
+        assert stored[key] == "patch_equivalent"
+        assert calls.count("merge-file") == checkouts.MERGE_PATH_CAP
+
+
+def test_a_content_merge_of_a_file_over_the_bound_is_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    rows = [
+        f"row {number:06d} {'x' * 40}\n" for number in range(checkouts.MERGE_FILE_CAP // 48 + 10)
+    ]
+    original = "".join(rows)
+    assert len(original) > checkouts.MERGE_FILE_CAP
+    commit_file(work, "big.txt", original, "add big")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "big.txt", original.replace(rows[-5], rows[-5].upper()), "edit near the end")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "big.txt", original.replace(rows[3], rows[3].upper()), "edit near the top")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+
+    with counted_git_calls(monkeypatch) as calls:
+        document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == unknown("history_limit")
+    assert "merge-file" not in calls
+    stored = cache_entries(cache) if cache.exists() else {}
+    assert f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}" not in stored
+
+
+@pytest.mark.parametrize("over", [False, True], ids=["at-bound", "over-bound"])
+def test_a_change_touching_more_paths_than_the_bound_is_unknown_and_unstored(
+    tmp_path, monkeypatch, isolated_git, over
+):
+    cache = nyx_home(isolated_git)
+    monkeypatch.setattr(checkouts, "CONFIRM_PATH_CAP", 3)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    for number in range(3 + over):
+        write_bytes(work, f"p{number}.txt", b"p\n")
+    git(work, "commit", "-q", "-m", "add files")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "feature")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    verdict = verdicts_of(find_clone(document, work))["feature"]
+    stored = cache_entries(cache) if cache.exists() else {}
+    key = f"{rev(work, 'feature')}.{rev(work, 'origin/trunk')}"
+    if over:
+        assert verdict == unknown("history_limit")
+        assert key not in stored
+    else:
+        assert verdict == MERGED_PATCH
+        assert stored[key] == "patch_equivalent"
+
+
+@posix_only
+def test_the_landing_check_runs_no_clone_merge_driver_and_touches_nothing_in_the_clone(
+    tmp_path, isolated_git
+):
+    folder, work = shifted_world(tmp_path)
+    marker = tmp_path / "driver-marker"
+    driver = marker_script(tmp_path / "scripts", "driver", marker, "exit 1")
+    git(work, "config", "merge.probe.driver", f"{driver} %O %A %B")
+    (work / ".git" / "info").mkdir(exist_ok=True)
+    (work / ".git" / "info" / "attributes").write_text("* merge=probe\n")
+    git(work, "merge-tree", "--write-tree", "origin/trunk", "feature", check=False)
+    assert marker.exists(), "control: a merge inside the clone runs its configured driver"
+    marker.unlink()
+    before = (snapshot(work), file_times(work))
+    time.sleep(0.05)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["feature"] == MERGED_PATCH
+    assert not marker.exists()
+    assert (snapshot(work), file_times(work)) == before
+
+
+def test_a_deleted_tip_object_is_failed_never_merged(tmp_path):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    cold = verdicts_of(find_clone(collect([folder]), work))
+    # A ref to an object no store of the clone holds, however it would be packed.
+    absent = "1234567890abcdef1234567890abcdef12345678"
+    assert git(work, "cat-file", "-e", absent, check=False).returncode != 0
+    ref = work / ".git" / "refs" / "heads" / "unmerged"
+    assert ref.is_file() and rev(work, "unmerged") != absent
+    ref.write_text(absent + "\n")
+
+    document = collect([folder])
+
+    after = verdicts_of(find_clone(document, work))
+    assert after["unmerged"] == unknown("failed")
+    for name, verdict in after.items():
+        assert verdict == cold[name] or verdict == unknown("failed")
+    assert all(value[0] != "merged" for name, value in after.items() if name == "unmerged")
+
+
+def snapshot(repository: Path) -> tuple[Any, ...]:
+    """What a repository holds, independent of how git lays it out on disk.
+
+    The references, the set of objects (loose or packed), the index file, every
+    lock file, the configuration, and the working tree.
+    """
+    git_dir = git_dir_of(repository)
+    objects = sorted(
+        git(repository, "cat-file", "--batch-all-objects", "--batch-check").stdout.splitlines()
+    )
+    index = git_dir / "index"
+    locks = sorted(
+        item.relative_to(git_dir).as_posix()
+        for item in git_dir.rglob("*.lock")
+        if item.name != "maintenance.lock"
+    )
+    tree = {}
+    if git_dir != repository:
+        tree = {
+            item.relative_to(repository).as_posix(): item.read_bytes()
+            for item in repository.rglob("*")
+            if item.is_file() and item.relative_to(repository).parts[0] != ".git"
+        }
+    return (
+        git(repository, "for-each-ref").stdout,
+        objects,
+        (index.read_bytes(), index.stat().st_mtime_ns) if index.exists() else None,
+        locks,
+        (git_dir / "config").read_bytes(),
+        tree,
+    )
+
+
+def test_verdicts_change_nothing_in_any_repository(tmp_path):
+    folder, remote, work, _worktree = build_verdict_world(tmp_path)
+    repositories = [work, remote]
+    before = [(snapshot(repository), store_times(repository)) for repository in repositories]
+
+    collect([folder])
+
+    assert [
+        (snapshot(repository), store_times(repository)) for repository in repositories
+    ] == before
+    assert not (work / ".git" / "index.lock").exists()
+
+
+def test_the_content_of_every_repository_survives_git_housekeeping_during_a_run(
+    tmp_path, monkeypatch
+):
+    """Tolerates housekeeping: only content is compared, never object files or their times."""
+    folder, remote, work, _worktree = build_verdict_world(tmp_path)
+    repositories = [work, remote]
+    before = [snapshot(repository) for repository in repositories]
+    expected = verdicts_of(find_clone(collect([folder]), work))
+    assert [snapshot(repository) for repository in repositories] == before
+    original = checkouts._GitRunner.run
+    housekeeping: list[str] = []
+
+    def run_with_housekeeping(self, arguments, **options):
+        if not housekeeping:
+            housekeeping.append("done")
+            for repository in repositories:
+                git(repository, "gc", "-q")
+                git(repository, "repack", "-A", "-d", "-q", "-f")
+                git(repository, "pack-refs", "--all")
+                git(repository, "commit-graph", "write")
+        return original(self, arguments, **options)
+
+    monkeypatch.setattr(checkouts._GitRunner, "run", run_with_housekeeping)
+
+    document = collect([folder])
+
+    assert housekeeping
+    assert verdicts_of(find_clone(document, work)) == expected
+    assert [snapshot(repository) for repository in repositories] == before
+
+
+def run_sh(body: str) -> str:
+    return f"#!/bin/sh\n{body}\n"
+
+
+def sign_trunk(work: Path) -> str:
+    """Put a commit carrying a ``gpgsig`` header on top of ``trunk`` and push it."""
+    git(work, "checkout", "-q", "trunk")
+    plain = git(
+        work, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "signed"
+    ).stdout.strip()
+    header, _, message = git(work, "cat-file", "commit", plain).stdout.partition("\n\n")
+    signature = (
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+        " \n"
+        " iQEzBAABCAAdFiEEnotarealsignatureAAAAAAAAAAAAAAAAAAAA=\n"
+        " =AAAA\n"
+        " -----END PGP SIGNATURE-----\n"
+    )
+    raw = f"{header}\n{signature}\n{message}".encode()
+    signed = subprocess.run(
+        ["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+        cwd=work, input=raw, capture_output=True, check=True,
+    ).stdout.decode().strip()
+    git(work, "update-ref", "refs/heads/trunk", signed)
+    git(work, "push", "-q", "origin", "trunk")
+    return signed
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the trap programs are shell scripts")
+def test_configured_programs_never_run_and_do_not_change_verdicts(tmp_path):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    signed = sign_trunk(work)
+    assert "gpgsig " in git(work, "cat-file", "commit", signed).stdout
+    baseline = verdicts_of(find_clone(collect([folder]), work))
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    for name in ("gpg", "external", "textconv"):
+        script = tmp_path / f"{name}.sh"
+        script.write_text(run_sh(f': > "{markers}/{name}"\ncat "$1" 2>/dev/null\nexit 0'))
+        script.chmod(0o755)
+    git(work, "config", "log.showSignature", "true")
+    git(work, "config", "gpg.program", str(tmp_path / "gpg.sh"))
+    git(work, "config", "diff.external", str(tmp_path / "external.sh"))
+    git(work, "config", "diff.trap.textconv", str(tmp_path / "textconv.sh"))
+    git(work, "config", "color.ui", "always")
+    info = work / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text("*.txt diff=trap\n*.dat diff=trap\n")
+
+    # The configuration really changes unpinned git: it runs a program.
+    git(work, "log", "-p", "--ext-diff", "-2", "picked", check=False)
+    git(work, "log", "-p", "-2", "picked", check=False)
+    git(work, "log", "-1", "--format=%T", "trunk", check=False)
+    assert {item.name for item in markers.iterdir()} >= {"external", "textconv", "gpg"}
+    for item in markers.iterdir():
+        item.unlink()
+
+    document = collect([folder])
+
+    assert list(markers.iterdir()) == []
+    assert verdicts_of(find_clone(document, work)) == baseline
+
+
+@pytest.mark.parametrize("trap", ["replace", "graft"])
+def test_replace_refs_and_grafts_do_not_change_a_verdict(tmp_path, trap):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    baseline = verdicts_of(find_clone(collect([folder]), work))
+    top = rev(work, "origin/trunk")
+    unmerged = rev(work, "unmerged")
+    if trap == "graft":
+        (work / ".git" / "info").mkdir(exist_ok=True)
+        (work / ".git" / "info" / "grafts").write_text(f"{top} {unmerged}\n")
+    else:
+        tree = rev(work, "origin/trunk^{tree}")
+        forged = git(work, "commit-tree", tree, "-p", unmerged, "-m", "forged").stdout.strip()
+        git(work, "replace", "-f", top, forged)
+    unpinned = git(work, "merge-base", "--is-ancestor", unmerged, top, check=False)
+    assert unpinned.returncode == 0
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work)) == baseline
+    assert verdicts_of(find_clone(document, work))["unmerged"] == NOT_MERGED
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the user-global attributes path differs on Windows")
+def test_user_global_attributes_do_not_change_a_patch_equivalent(tmp_path, isolated_git):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    (isolated_git / "git").mkdir(exist_ok=True)
+    (isolated_git / "git" / "attributes").write_text("shared.txt -diff\n")
+    picked = git(work, "cherry", "origin/trunk", "blobdiff").stdout
+    assert picked.startswith("+")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["blobdiff"] == MERGED_PATCH
+
+
+def test_a_repository_attribute_no_longer_present_does_not_keep_a_cached_unmerged(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    attributes = work / ".gitattributes"
+    attributes.write_text("shared.txt -diff\n")
+
+    stricter = collect([folder])
+    assert verdicts_of(find_clone(stricter, work))["blobdiff"] == NOT_MERGED
+
+    attributes.unlink()
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["blobdiff"] == MERGED_PATCH
+
+
+def test_a_cached_merged_never_replaces_an_unmerged_the_run_decides(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    base, blobdiff = rev(work, "origin/trunk"), rev(work, "blobdiff")
+
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work))["blobdiff"] == MERGED_PATCH
+    assert cache_entries(cache)[f"{blobdiff}.{base}"] == "patch_equivalent"
+    (work / ".git" / "info").mkdir(exist_ok=True)
+    (work / ".git" / "info" / "attributes").write_text("shared.txt -diff\n")
+
+    document = collect([folder])
+
+    # Every rung ran and proved nothing, so the run's own answer stands.
+    assert verdicts_of(find_clone(document, work))["blobdiff"] == NOT_MERGED
+
+
+def test_inherited_repository_variables_are_ignored(tmp_path, monkeypatch):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    baseline = verdicts_of(find_clone(collect([folder]), work))
+    other = tmp_path / "other"
+    git(tmp_path, "init", "-q", "-b", "trunk", str(other))
+    commit_file(other, "o.txt", "o\n")
+    before = (snapshot(other), (other / ".git" / "index").read_bytes())
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(other / ".git" / "objects"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+
+    document = collect([folder])
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(name)
+    assert verdicts_of(find_clone(document, work)) == baseline
+    assert (snapshot(other), (other / ".git" / "index").read_bytes()) == before
+
+
+# -- the verdict base ----------------------------------------------------
+
+
+def merge_world(tmp_path: Path, *, holder_inside: bool = True):
+    """Clone A merges B's pushed branch on the remote; clone B is not fetched."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    seed = rev(remote, "trunk")
+    holder = clone(remote, (folder if holder_inside else tmp_path / "away") / "holder A")
+    other = clone(remote, folder / "other B")
+    git(other, "checkout", "-q", "-b", "feat")
+    commit_file(other, "feat.txt", "feat\n")
+    git(other, "push", "-q", "origin", "feat")
+    git(holder, "fetch", "-q", "origin")
+    git(holder, "merge", "-q", "--no-ff", "-m", "merge feat", "origin/feat")
+    git(holder, "push", "-q", "origin", "trunk")
+    return folder, remote, holder, other, seed, rev(holder, "HEAD")
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the logging git stand-in is a shell script")
+def test_a_branch_merged_on_the_remote_is_merged_against_the_borrowed_live_head(
+    tmp_path, monkeypatch
+):
+    folder, _remote, holder, other, _seed, head = merge_world(tmp_path)
+    before = (snapshot(other), snapshot(holder))
+    assert git(other, "cat-file", "-e", head, check=False).returncode != 0
+    log = tmp_path / "calls.log"
+    shim = git_stand_in(tmp_path, f'printf "%s\\n" "$*" >> "{log}"')
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = live([folder])
+
+    item = find_clone(document, other)
+    assert item["verdict_base"] == {
+        "name": "trunk", "sha": head, "basis": "live", "objects_from": real(holder),
+    }
+    assert item["verdict_base"]["objects_from"] == item["cached_vs_live"]["objects_from"]
+    assert verdicts_of(item)["feat"] == MERGED_ANCESTOR
+    assert find_clone(document, holder)["verdict_base"]["objects_from"] is None
+    assert (snapshot(other), snapshot(holder)) == before
+    probes = [call for call in log.read_text().splitlines() if "rev-list --no-walk" in call]
+    named = [call for call in probes if head in call]
+    assert sum(f"-C {real(other)} " in call for call in named) == 1
+    assert sum(f"-C {real(holder)} " in call for call in probes) == 1
+
+
+def test_without_network_or_a_lender_the_base_is_cached_and_the_branch_unmerged(tmp_path):
+    folder, _remote, holder, other, _seed, _head = merge_world(tmp_path)
+
+    document = collect([folder])
+    item = find_clone(document, other)
+
+    assert item["verdict_base"]["basis"] == "cached"
+    assert item["verdict_base"]["objects_from"] is None
+    assert item["verdict_base"]["sha"] == rev(other, "origin/trunk")
+    assert verdicts_of(item)["feat"] == NOT_MERGED
+
+    away = tmp_path / "away-world"
+    away.mkdir()
+    folder, _remote, holder, other, _seed, _head = merge_world(away, holder_inside=False)
+    item = find_clone(live([folder]), other)
+    assert item["verdict_base"]["basis"] == "cached"
+    assert verdicts_of(item)["feat"] == NOT_MERGED
+
+
+def test_a_detached_remote_head_does_not_replace_the_cached_default_name(tmp_path):
+    folder, remote, holder, other, seed, head = merge_world(tmp_path)
+    third = clone(remote, folder / "third C")
+    git(third, "remote", "set-head", "origin", "-d")
+    git(remote, "update-ref", "--no-deref", "HEAD", seed)
+    assert git(remote, "symbolic-ref", "-q", "HEAD", check=False).returncode != 0
+
+    document = live([folder])
+
+    for path in (other, third):
+        base = find_clone(document, path)["verdict_base"]
+        assert base["name"] == "trunk"
+        assert base["sha"] == head
+        assert base["basis"] == "live"
+    assert find_clone(document, other)["verdict_base"]["objects_from"] == real(holder)
+    assert verdicts_of(find_clone(document, other))["feat"] == MERGED_ANCESTOR
+    assert group_of(document, other)["default_branch"]["name"] is None
+
+
+def test_clones_without_a_name_or_remote_have_no_base(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    nameless = clone(remote, folder / "nameless")
+    git(nameless, "branch", "feat")
+    git(nameless, "update-ref", "-d", "refs/remotes/origin/trunk")
+    git(nameless, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    standalone = folder / "standalone"
+    git(tmp_path, "init", "-q", "-b", "trunk", str(standalone))
+    commit_file(standalone, "s.txt", "s\n")
+    git(standalone, "branch", "feat")
+    detached = tmp_path / "standalone-detached"
+    git(standalone, "worktree", "add", "-q", "--detach", str(detached), "feat")
+
+    document = collect([folder])
+
+    first = find_clone(document, nameless)
+    assert first["verdict_base"] is None
+    assert verdicts_of(first) == {"feat": unknown("no_base"), "trunk": unknown("no_base")}
+    second = find_clone(document, standalone)
+    assert second["verdict_base"] is None
+    assert verdicts_of(second) == {"feat": unknown("no_base"), "trunk": unknown("no_base")}
+    assert verdict_tuple(find_worktree(second, detached)["verdict"]) == unknown("no_base")
+
+
+def test_the_default_branch_alone_and_a_deleted_default_branch(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "branch", "remote-only", "trunk")
+    alone = clone(remote, folder / "alone")
+    deleted = clone(remote, folder / "deleted")
+    git(deleted, "checkout", "-q", "-b", "feat")
+    git(deleted, "branch", "-q", "-D", "trunk")
+
+    document = collect([folder])
+
+    item = find_clone(document, alone)
+    assert item["verdict_base"]["name"] == "trunk"
+    assert verdicts_of(item) == {"trunk": None}
+    item = find_clone(document, deleted)
+    assert item["verdict_base"]["name"] == "trunk"
+    assert verdicts_of(item) == {"feat": MERGED_ANCESTOR}
+    live_document = live([folder])
+    assert verdicts_of(find_clone(live_document, alone)) == {"trunk": None}
+    assert "remote-only" not in verdicts_of(find_clone(live_document, deleted))
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the logging git stand-in is a shell script")
+def test_a_shallow_clone_with_a_moved_head_uses_its_cached_ref_and_probes_nothing(
+    tmp_path, monkeypatch
+):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    shallow = clone(f"file://{remote}", folder / "shallow", "--depth", "1")
+    cached = rev(shallow, "origin/trunk")
+    push_commit(remote, "trunk", tmp_path)
+    log = tmp_path / "calls.log"
+    shim = git_stand_in(tmp_path, f'printf "%s\\n" "$*" >> "{log}"')
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    item = find_clone(live([folder]), shallow)
+
+    assert item["shallow"] is True
+    assert item["verdict_base"] == {
+        "name": "trunk", "sha": cached, "basis": "cached", "objects_from": None,
+    }
+    assert not any(
+        f"-C {real(shallow)} " in call and "rev-list --no-walk" in call
+        for call in log.read_text().splitlines()
+    )
+
+
+# -- incomplete clones ---------------------------------------------------
+
+
+@pytest.mark.parametrize("options", [("--depth", "1"), ("--filter=blob:none",)])
+def test_incomplete_clones_run_only_the_ancestor_rung_and_fetch_nothing(tmp_path, options):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    push_commit(remote, "trunk", tmp_path / "s1")
+    incomplete = clone(f"file://{remote}", folder / "incomplete", *options)
+    git(incomplete, "checkout", "-q", "-b", "picked", "origin/trunk")
+    commit_file(incomplete, "picked.txt", "picked\n")
+    picker = clone(remote, tmp_path / "picker")
+    commit_file(picker, "picked.txt", "picked\n", "the same change on trunk")
+    git(picker, "push", "-q", "origin", "trunk")
+    git(incomplete, "fetch", "-q", *(("--depth", "1") if options[0] == "--depth" else ()), "origin")
+    git(incomplete, "branch", "equal", "origin/trunk")
+    before = (object_files(incomplete), pack_listing(incomplete))
+
+    document = collect([folder])
+
+    item = find_clone(document, incomplete)
+    assert item["shallow"] is (options[0] == "--depth")
+    assert item["partial_clone"] is (options[0] != "--depth")
+    verdicts = verdicts_of(item)
+    assert verdicts["picked"] == unknown("incomplete_clone")
+    assert verdicts["equal"] == MERGED_ANCESTOR
+    assert (object_files(incomplete), pack_listing(incomplete)) == before
+
+
+# -- caps, the git version gate and refs that move mid-collection --------
+
+
+def small_world(tmp_path: Path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, folder / "work")
+    return folder, remote, work
+
+
+def test_the_own_commit_cap_limits_history_and_decides_smaller_branches(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "three")
+    for number in (1, 2, 3):
+        commit_file(work, f"three{number}.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "two", "trunk")
+    for number in (1, 2):
+        commit_file(work, f"two{number}.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "x\n")
+    git(work, "cherry-pick", "two~1", "two")
+    git(work, "push", "-q", "origin", "trunk")
+    monkeypatch.setattr(checkouts, "OWN_COMMIT_CAP", 2)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["three"] == unknown("history_limit")
+    assert verdicts["two"] == MERGED_PATCH
+
+
+def test_the_shared_range_cap_evicts_the_largest_then_later_branch(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "line-a", "trunk")
+    for number in (1, 2, 3):
+        commit_file(work, f"a{number}.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "left-fork")
+    commit_file(work, "left.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "line-b", "trunk")
+    for number in (1, 2, 3):
+        commit_file(work, f"b{number}.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "right-fork")
+    commit_file(work, "right.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge a", "line-a")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge b", "line-b")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "line-a", "line-b")
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 5)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["left-fork"] == NOT_MERGED
+    assert verdicts["right-fork"] == unknown("history_limit")
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 6)
+    wide = verdicts_of(find_clone(collect([folder]), work))
+    assert wide["left-fork"] == wide["right-fork"] == NOT_MERGED
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_git_before_the_patch_fix_skips_the_patch_rungs(tmp_path, monkeypatch):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    shim = git_stand_in(
+        tmp_path,
+        'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder])
+
+    assert document["git"] == {"status": "available", "version": "2.38.0"}
+    verdicts = verdicts_of(find_clone(document, work))
+    for name in ("picked", "squashed", "bin-differs", "bin-picked", "blobdiff"):
+        assert verdicts[name] == unknown("git_too_old")
+    assert verdicts["merged-noff"] == MERGED_ANCESTOR
+    assert verdicts["split"] == MERGED_TREE
+    assert all(value[0] != "merged" for name, value in verdicts.items()
+               if value and name not in {"merged-noff", "split"})
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the moving stand-in is a shell script")
+def test_a_ref_moved_before_the_merged_listing_cannot_borrow_its_verdict(tmp_path, monkeypatch):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    tip = rev(work, "unmerged")
+    top = rev(work, "origin/trunk")
+    real_git = shutil.which("git")
+    done = tmp_path / "moved"
+    shim = git_stand_in(
+        tmp_path,
+        f'case "$*" in *"for-each-ref --merged"*) [ -e "{done}" ] || {{ : > "{done}"; '
+        f'"{real_git}" -C "{work}" update-ref refs/heads/unmerged {top}; }};; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder])
+
+    moved = branch_of(find_clone(document, work), "unmerged")
+    assert done.exists()
+    assert moved["sha"] == tip
+    assert verdict_tuple(moved["verdict"]) == NOT_MERGED
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the moving stand-in is a shell script")
+def test_a_merged_ref_moved_to_an_unmerged_commit_keeps_its_recorded_tip(tmp_path, monkeypatch):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    tip = rev(work, "merged-noff")
+    child = git(work, "commit-tree", f"{tip}^{{tree}}", "-p", tip, "-m", "unmerged").stdout.strip()
+    real_git = shutil.which("git")
+    done = tmp_path / "moved"
+    shim = git_stand_in(
+        tmp_path,
+        f'case "$*" in *"for-each-ref --merged"*) [ -e "{done}" ] || {{ : > "{done}"; '
+        f'"{real_git}" -C "{work}" update-ref refs/heads/merged-noff {child}; }};; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder])
+
+    moved = branch_of(find_clone(document, work), "merged-noff")
+    assert done.exists()
+    assert moved["sha"] == tip
+    assert verdict_tuple(moved["verdict"]) == MERGED_ANCESTOR
+
+
+def test_the_shared_range_cap_evicts_the_largest_branch_even_when_it_comes_first(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "line-a", "trunk")
+    commit_file(work, "a1.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "a-fork")
+    commit_file(work, "a-fork.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "line-b", "trunk")
+    for number in (1, 2, 3, 4):
+        commit_file(work, f"b{number}.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "b-fork")
+    commit_file(work, "b-fork.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge a", "line-a")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge b", "line-b")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "line-a", "line-b")
+    larger = git(work, "rev-list", "--count", "a-fork..origin/trunk").stdout.strip()
+    smaller = git(work, "rev-list", "--count", "b-fork..origin/trunk").stdout.strip()
+    assert (int(larger), int(smaller)) == (6, 3)
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 4)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["a-fork"] == unknown("history_limit")
+    assert verdicts["b-fork"] == NOT_MERGED
+
+
+def test_the_comparison_cap_limits_a_branch_far_behind_the_base(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "far", "trunk")
+    commit_file(work, "far.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c1.txt", "x\n")
+    commit_file(work, "c2.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "near")
+    commit_file(work, "near.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c3.txt", "x\n")
+    git(work, "push", "-q", "origin", "trunk")
+    monkeypatch.setattr(checkouts, "COMPARISON_CAP", 2)
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts["far"] == unknown("history_limit")
+    assert verdicts["near"] == NOT_MERGED
+
+
+def test_a_partial_clone_proves_a_strict_ancestor_without_fetching(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    push_commit(remote, "trunk", tmp_path / "s1")
+    push_commit(remote, "trunk", tmp_path / "s2")
+    partial = clone(f"file://{remote}", folder / "partial", "--filter=blob:none")
+    git(partial, "branch", "older", "origin/trunk~1")
+    assert rev(partial, "older") != rev(partial, "origin/trunk")
+    before = (object_files(partial), pack_listing(partial))
+
+    item = find_clone(collect([folder]), partial)
+
+    assert item["partial_clone"] is True
+    assert verdicts_of(item)["older"] == MERGED_ANCESTOR
+    assert (object_files(partial), pack_listing(partial)) == before
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "options", "reason"),
+    [
+        ("exit 1", {}, "failed"),
+        ("sleep 3", {"call_cap_seconds": 1.0}, "deadline"),
+    ],
+    ids=["failed", "timed_out"],
+)
+def test_a_tip_whose_patch_step_failed_is_never_decided_by_a_later_rung(
+    tmp_path, monkeypatch, body, options, reason
+):
+    folder, _remote, work, _worktree = build_verdict_world(tmp_path)
+    split = rev(work, "split")
+    assert verdicts_of(find_clone(collect([folder]), work))["split"] == MERGED_TREE
+    shim = git_stand_in(
+        tmp_path, f'case "$*" in *"rev-list --no-merges {split}.."*) {body};; esac'
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder], **options)
+
+    verdicts = verdicts_of(find_clone(document, work))
+    assert verdicts["split"] == unknown(reason)
+    assert verdicts["picked"] == MERGED_PATCH
+
+
+def test_branches_of_unrelated_histories_share_the_whole_base_range(tmp_path, monkeypatch):
+    folder, _remote, work = small_world(tmp_path)
+    seed = rev(work, "trunk")
+    git(work, "checkout", "-q", "--orphan", "second-root")
+    git(work, "rm", "-q", "-rf", ".")
+    second = commit_file(work, "root.txt", "second root\n")
+    git(work, "checkout", "-q", "-b", "y", "second-root")
+    commit_file(work, "y.txt", "y\n")
+    git(work, "checkout", "-q", "-b", "x", "trunk")
+    commit_file(work, "x.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(
+        work, "merge", "-q", "--no-ff", "--allow-unrelated-histories", "-m", "join", "second-root"
+    )
+    git(work, "cherry-pick", "x", "y")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "second-root")
+    assert git(work, "merge-base", "--octopus", seed, second, check=False).returncode == 1
+    assert rev(work, "x~1") == seed and rev(work, "y~1") == second
+
+    verdicts = verdicts_of(find_clone(collect([folder]), work))
+
+    assert verdicts == {"trunk": None, "x": MERGED_PATCH, "y": MERGED_PATCH}
+    # The whole base history holds four non-merge commits; with room for three
+    # the later of the two equally far branches is evicted and the other decided.
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 3)
+    limited = verdicts_of(find_clone(collect([folder]), work))
+    assert limited == {"trunk": None, "x": MERGED_PATCH, "y": unknown("history_limit")}
+
+
+# ---------------------------------------------------------------------------
+# The verdict cache and the verdict deadline
+# ---------------------------------------------------------------------------
+
+REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
+NOT_ROOT = ON_WINDOWS or os.geteuid() != 0
+
+
+def nyx_home(home: Path) -> Path:
+    """Create ``~/.nyx`` in the isolated home and return the cache file path."""
+    (home / ".nyx").mkdir(exist_ok=True)
+    return home / ".nyx" / "cache" / "checkouts.json"
+
+
+def cache_entries(cache: Path) -> dict[str, str]:
+    document = json.loads(cache.read_text())
+    assert document["schema_version"] == 2
+    return {key: entry["rung"] for key, entry in document["verdicts"].items()}
+
+
+def stable(document: dict[str, Any]) -> dict[str, Any]:
+    """The document without what a cache diagnostic or the clock may change."""
+    return {
+        key: value
+        for key, value in document.items()
+        if key not in {"observed_at", "checkouts_digest", "diagnostics"}
+    }
+
+
+def stand_in(tmp_path: Path, name: str, body: str) -> Path:
+    shim = tmp_path / name
+    shim.mkdir()
+    script = shim / "git"
+    script.write_text(f'#!/bin/sh\n{body}\nexec "{shutil.which("git")}" "$@"\n')
+    script.chmod(0o755)
+    return shim
+
+
+@contextlib.contextmanager
+def path_with(monkeypatch, shim: Path):
+    original = os.environ["PATH"]
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{original}")
+    try:
+        yield
+    finally:
+        monkeypatch.setenv("PATH", original)
+
+
+def recording(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    log = tmp_path / f"{name}.log"
+    return stand_in(tmp_path, name, f'printf "%s\\n" "$*" >> "{log}"'), log
+
+
+def patch_work(log: Path) -> list[str]:
+    calls = [line.split() for line in log.read_text().splitlines()] if log.exists() else []
+    return [
+        " ".join(call)
+        for call in calls
+        if "diff" in call or "patch-id" in call or ("log" in call and "-p" in call)
+    ]
+
+
+def cache_world(tmp_path: Path, tag: str = ""):
+    """One clone with a branch per cached outcome, all judged against ``trunk``."""
+    tmp_path.mkdir(exist_ok=True)
+    folder, _remote, work = small_world(tmp_path)
+
+    def branch(name: str) -> None:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+
+    branch("both")
+    commit_file(work, "both.txt", "both\n", "add both")
+    branch("noff")
+    commit_file(work, "noff.txt", "n\n")
+    branch("picked")
+    commit_file(work, "p1.txt", "p1\n")
+    commit_file(work, "p2.txt", "p2\n")
+    branch("unmerged")
+    commit_file(work, f"u{tag}.txt", f"u{tag}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "both.txt", "both\n", "land both by hand")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked~1", "picked")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge noff", "noff")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+CACHE_WORLD_VERDICTS = {
+    "both": MERGED_PATCH,
+    "noff": MERGED_ANCESTOR,
+    "picked": MERGED_PATCH,
+    "unmerged": NOT_MERGED,
+    "trunk": None,
+}
+
+
+def cache_times(cache: Path) -> dict[str, int]:
+    return {key: entry["at"] for key, entry in json.loads(cache.read_text())["verdicts"].items()}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_warm_collection_decides_again_and_stamps_what_it_verified(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work)) == CACHE_WORLD_VERDICTS
+    base = rev(work, "origin/trunk")
+    # Only complete, non-ancestor verdicts are stored.
+    stored = {
+        f"{rev(work, 'both')}.{base}": "patch_equivalent",
+        f"{rev(work, 'picked')}.{base}": "patch_equivalent",
+        f"{rev(work, 'unmerged')}.{base}": "none",
+    }
+    assert cache_entries(cache) == stored
+    write_cache(cache, {key: 10 for key in stored}, rungs=stored)
+    shim, log = recording(tmp_path, "warm")
+
+    with path_with(monkeypatch, shim):
+        second = collect([folder])
+
+    assert second["checkouts_digest"] == first["checkouts_digest"]
+    assert verdicts_of(find_clone(second, work)) == CACHE_WORLD_VERDICTS
+    # The cache fills only what the run leaves unknown, so the rungs run again,
+    # and every verdict the run decided again is stamped as verified now.
+    assert patch_work(log) != []
+    assert cache_entries(cache) == stored
+    assert all(at > 10 for at in cache_times(cache).values())
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_collection_that_verifies_nothing_rewrites_nothing(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    collect([folder])
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    slow = stand_in(tmp_path, "slow", DELAYED_PATCH_WORK)
+
+    with path_with(monkeypatch, slow):
+        document = collect([folder], seconds=3.0)
+
+    # Every re-check ran out of time, so saved answers stood in and were not re-stamped.
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
+
+
+def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
+    document = json.loads(valid)
+    good_key = next(iter(document["verdicts"]))
+    return {
+        "garbage": b"not json {",
+        "extra_key": json.dumps({**document, "extra": 1}).encode(),
+        "foreign_schema": json.dumps({**document, "schema_version": 3}).encode(),
+        "ancestor_rung": json.dumps(
+            {"schema_version": 2, "verdicts": {good_key: {"rung": "ancestor", "at": 1}}}
+        ).encode(),
+        "key_lengths": json.dumps(
+            {
+                "schema_version": 2,
+                "verdicts": {"a" * 40 + "." + "b" * 64: {"rung": "none", "at": 1}},
+            }
+        ).encode(),
+        "oversized": b" " * (5 * 1024 * 1024),
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["garbage", "extra_key", "foreign_schema", "ancestor_rung", "key_lengths", "oversized", "symlink"],
+)
+def test_an_unreadable_cache_changes_only_a_diagnostic_and_is_repaired(
+    tmp_path, isolated_git, kind
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    valid = cache.read_bytes()
+    cache.unlink()
+    if kind == "symlink":
+        target = tmp_path / "elsewhere.json"
+        target.write_bytes(valid)
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            cache.symlink_to(target)
+        except OSError:
+            pytest.skip("this lane does not grant the symbolic-link privilege")
+    else:
+        cache.write_bytes(invalid_cache_payloads(valid)[kind])
+
+    document = collect([folder])
+
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_unreadable", "path": str(cache)},
+    ]
+    assert not cache.is_symlink()
+    assert cache_entries(cache) == cache_entries_of(valid)
+    if kind == "symlink":
+        assert target.read_bytes() == valid
+
+
+def cache_entries_of(data: bytes) -> dict[str, str]:
+    return {key: entry["rung"] for key, entry in json.loads(data)["verdicts"].items()}
+
+
+@pytest.mark.skipif(not NOT_ROOT or ON_WINDOWS, reason="needs a read-only directory that binds")
+def test_a_read_only_cache_directory_gives_a_write_diagnostic(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    cache.unlink()
+    cache.parent.chmod(0o500)
+    try:
+        document = collect([folder])
+    finally:
+        cache.parent.chmod(0o700)
+
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_write_failed", "path": str(cache)},
+    ]
+    assert not cache.exists()
+
+
+def test_without_a_state_directory_nothing_is_read_written_or_reported(tmp_path, isolated_git):
+    folder, work = cache_world(tmp_path)
+    assert not (isolated_git / ".nyx").exists()
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert not (isolated_git / ".nyx").exists()
+
+
+def test_a_run_with_nothing_to_store_creates_neither_cache_directory_nor_file(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "merged", "trunk")
+    commit_file(work, "m.txt", "m\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge it", "merged")
+    git(work, "push", "-q", "origin", "trunk")
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work)) == {"merged": MERGED_ANCESTOR, "trunk": None}
+    assert document["diagnostics"] == []
+    assert list((isolated_git / ".nyx").iterdir()) == []
+    assert not cache.parent.exists()
+
+
+def incomplete_world(tmp_path: Path, option: str):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    push_commit(remote, "trunk", tmp_path / "s1")
+    incomplete = clone(f"file://{remote}", folder / "incomplete", option)
+    git(incomplete, "checkout", "-q", "-b", "other", "origin/trunk")
+    commit_file(incomplete, "other.txt", "other\n")
+    return folder, incomplete
+
+
+@pytest.mark.parametrize("option", ["--depth=1", "--filter=blob:none"])
+def test_incomplete_clones_leave_an_existing_cache_file_untouched(tmp_path, isolated_git, option):
+    cache = nyx_home(isolated_git)
+    cache.parent.mkdir()
+    stored = json.dumps(
+        {"schema_version": 2, "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}}}
+    ).encode()
+    cache.write_bytes(stored)
+    folder, incomplete = incomplete_world(tmp_path, option)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, incomplete))["other"] == unknown("incomplete_clone")
+    assert document["diagnostics"] == []
+    assert cache.read_bytes() == stored
+
+
+def test_a_cache_hit_gives_a_shallow_clone_the_full_clones_verdict(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    full_folder = tmp_path / "full"
+    shallow_folder = tmp_path / "shallow"
+    full_folder.mkdir()
+    shallow_folder.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, full_folder / "work")
+    git(work, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(work, "picked.txt", "picked\n")
+    git(work, "push", "-q", "origin", "picked")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "picked")
+    git(work, "push", "-q", "origin", "trunk")
+    shallow = clone(f"file://{remote}", shallow_folder / "shallow", "--depth=1", "--no-single-branch")
+    git(shallow, "checkout", "-q", "-b", "picked", "origin/picked")
+
+    full = verdicts_of(find_clone(collect([full_folder]), work))
+    assert full["picked"] == MERGED_PATCH
+    stored = cache.read_bytes()
+    cache.unlink()
+    cold = find_clone(collect([shallow_folder]), shallow)
+    assert cold["shallow"] is True
+    assert verdicts_of(cold)["picked"] == unknown("incomplete_clone")
+    cache.write_bytes(stored)
+
+    warm = find_clone(collect([shallow_folder]), shallow)
+
+    assert verdicts_of(warm)["picked"] == MERGED_PATCH
+    assert cache.read_bytes() == stored
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_git_before_the_patch_fix_stores_nothing_and_serves_cached_verdicts(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = cache_world(tmp_path)
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    with path_with(monkeypatch, old):
+        cold = collect([folder])
+    assert not cache.parent.exists()  # not even the tree_equal verdict is stored
+    assert verdicts_of(find_clone(cold, work)) == {
+        "both": MERGED_TREE,
+        "noff": MERGED_ANCESTOR,
+        "picked": unknown("git_too_old"),
+        "unmerged": unknown("git_too_old"),
+        "trunk": None,
+    }
+    collect([folder])
+    assert cache_entries(cache)
+
+    with path_with(monkeypatch, old):
+        warm = collect([folder])
+
+    # A hit stands in for git_too_old, but never replaces a rung the cold run decides.
+    assert verdicts_of(find_clone(warm, work)) == {
+        "both": MERGED_TREE,
+        "noff": MERGED_ANCESTOR,
+        "picked": MERGED_PATCH,
+        "unmerged": NOT_MERGED,
+        "trunk": None,
+    }
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
+def test_a_stronger_cached_rung_never_changes_what_old_git_reports(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "both", "trunk")
+    commit_file(work, "both.txt", "both\n", "add both")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "both.txt", "both\n", "land both by hand")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "push", "-q", "origin", "trunk")
+    old = stand_in(
+        tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
+    )
+    with path_with(monkeypatch, old):
+        cold_old = collect([folder])
+    assert verdicts_of(find_clone(cold_old, work))["both"] == MERGED_TREE
+    assert not cache.parent.exists()
+
+    real_cold = collect([folder])
+    real_warm = collect([folder])
+    assert verdicts_of(find_clone(real_cold, work))["both"] == MERGED_PATCH
+    assert real_warm["checkouts_digest"] == real_cold["checkouts_digest"]
+    assert list(cache_entries(cache).values()) == ["patch_equivalent"]
+
+    with path_with(monkeypatch, old):
+        warm_old = collect([folder])
+
+    assert verdicts_of(find_clone(warm_old, work))["both"] == MERGED_TREE
+    assert warm_old["checkouts_digest"] == cold_old["checkouts_digest"]
+
+
+COLLECT_PROCESS = (
+    "import sys, time\n"
+    "from nyx import checkouts\n"
+    "print(checkouts.collect_checkouts([sys.argv[1]], deadline_ns=time.monotonic_ns() + 60_000_000_000))\n"
+)
+
+
+def test_two_collector_processes_over_different_clones_both_complete(tmp_path, isolated_git):
+    cache = nyx_home(isolated_git)
+    folders = []
+    for name in ("one", "two"):
+        folder, _work = cache_world(tmp_path / name, tag=name)
+        folders.append(folder)
+    environment = dict(os.environ)
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", COLLECT_PROCESS, str(folder)],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for folder in folders
+    ]
+    outputs = [process.communicate(timeout=120)[0] for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0]
+    for output in outputs:
+        document = models.parse_checkouts(output)
+        codes = [item["code"] for item in document["diagnostics"]]
+        # A replace over a file the other process holds open may fail on Windows only.
+        assert codes == [] or (
+            ON_WINDOWS and codes in (["checkout_cache_unreadable"], ["checkout_cache_write_failed"])
+        )
+        assert all(
+            branch["verdict"] is not None or branch["name"] == "trunk"
+            for item in all_clones(document)
+            for branch in item["branches"]
+        )
+    assert cache_entries(cache)  # the file parses afterwards
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the lane's os.replace count is proven on POSIX")
+def test_one_collection_replaces_the_cache_file_exactly_once(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    worlds = [cache_world(tmp_path / name, tag=name) for name in ("one", "two")]
+    folders = [folder for folder, _work in worlds]
+    real_replace = os.replace
+    destinations: list[str] = []
+
+    def counting(source, destination, *args, **kwargs):
+        destinations.append(os.fspath(destination))
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", counting)
+
+    collect(folders)
+
+    assert destinations == [str(cache)]
+    stored = cache_entries(cache)
+    for _folder, work in worlds:  # each clone's newly decided verdict is in the one write
+        assert f"{rev(work, 'unmerged')}.{rev(work, 'origin/trunk')}" in stored
+
+
+def test_stale_temporaries_are_removed_by_the_next_write_and_recent_ones_stay(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    cache.parent.mkdir()
+    old = cache.parent / ".checkouts.json.stale1"
+    recent = cache.parent / ".checkouts.json.fresh1"
+    other = cache.parent / ".other.json.stale1"
+    for item, age in ((old, 660), (recent, 60), (other, 660)):
+        item.write_text("x")
+        stamp = time.time() - age
+        os.utime(item, (stamp, stamp))
+    folder, _work = cache_world(tmp_path)
+
+    collect([folder])
+
+    assert not old.exists()
+    assert recent.exists() and other.exists()
+    assert cache.is_file()
+
+
+def branch_cache_world(tmp_path: Path, names: list[str]):
+    folder, _remote, work = small_world(tmp_path)
+    for name in names:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    base = rev(work, "origin/trunk")
+    return folder, work, {name: f"{rev(work, name)}.{base}" for name in names}
+
+
+def write_cache(
+    cache: Path, entries: dict[str, int], rungs: dict[str, str] | None = None
+) -> None:
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "verdicts": {
+                    key: {"rung": (rungs or {}).get(key, "none"), "at": at}
+                    for key, at in entries.items()
+                },
+            }
+        )
+    )
+
+
+def test_eviction_keeps_the_used_entries_and_drops_the_oldest(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, _work, keys = branch_cache_world(tmp_path, [f"b{n}" for n in range(1, 7)])
+    base = keys["b1"].split(".")[1]
+    gone = {f"{letter * 40}.{base}": at for letter, at in zip("cdef", (10, 20, 30, 40))}
+    write_cache(cache, gone)
+    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 8)
+
+    collect([folder])
+
+    # The six verified entries are kept; of the four no branch uses, the newest two.
+    newest = {key for key, at in gone.items() if at >= 30}
+    assert set(cache_entries(cache)) == set(keys.values()) | newest
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+def test_eviction_drops_unused_newer_entries_and_breaks_ties_by_key(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work, keys = branch_cache_world(tmp_path, ["b1", "b2", "b3", "b4"])
+    base = keys["b1"].split(".")[1]
+    stale = "c" * 40 + "." + base
+    write_cache(cache, {stale: 4_000_000_000, keys["b1"]: 10, keys["b2"]: 10})
+    # b1 and b2 cannot be re-checked, so their saved answers stand in (used);
+    # b3 and b4 are verified by the run.
+    broken = stand_in(
+        tmp_path,
+        "broken",
+        f'case "$*" in *"...{rev(work, "b1")}"*|*"...{rev(work, "b2")}"*) exit 1;; esac',
+    )
+    monkeypatch.setattr(checkouts, "CACHE_ENTRY_CAP", 3)
+
+    with path_with(monkeypatch, broken):
+        collect([folder])
+
+    assert set(cache_entries(cache)) == {keys["b3"], keys["b4"], min(keys["b1"], keys["b2"])}
+    assert stale not in cache_entries(cache)
+
+
+def deadline_world(tmp_path: Path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("a-fast", "z-slow"):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "d1.txt", "diverged\n")
+    git(work, "cherry-pick", "a-fast", "z-slow")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+DELAYED_PATCH_WORK = 'case "$*" in *" log "*|*" diff "*|*" patch-id"*) exec sleep 30;; esac'
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_patch_work_past_the_deadline_is_unknown_then_decided_then_cached(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = deadline_world(tmp_path)
+    slow = stand_in(tmp_path, "slow", DELAYED_PATCH_WORK)
+
+    with path_with(monkeypatch, slow):
+        limited = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(limited, work)) == {
+        "a-fast": unknown("deadline"),
+        "z-slow": unknown("deadline"),
+        "trunk": None,
+    }
+    assert not cache.exists()
+
+    decided = collect([folder])
+    assert verdicts_of(find_clone(decided, work)) == {
+        "a-fast": MERGED_PATCH,
+        "z-slow": MERGED_PATCH,
+        "trunk": None,
+    }
+
+    with path_with(monkeypatch, slow):
+        again = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(again, work)) == verdicts_of(find_clone(decided, work))
+    assert again["diagnostics"] == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_the_verdict_reserve_leaves_time_to_cache_the_branch_that_finished(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = deadline_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    fast, slow_tip = rev(work, "a-fast"), rev(work, "z-slow")
+    slow = stand_in(
+        tmp_path, "slow", f'case "$*" in *" log "*"{slow_tip}"*) exec sleep 30;; esac'
+    )
+
+    with path_with(monkeypatch, slow):
+        document = collect([folder], seconds=3.0)
+
+    assert verdicts_of(find_clone(document, work)) == {
+        "a-fast": MERGED_PATCH,
+        "z-slow": unknown("deadline"),
+        "trunk": None,
+    }
+    assert document["diagnostics"] == []
+    assert cache_entries(cache) == {f"{fast}.{base}": "patch_equivalent"}
+
+    # The control: without the reserve the slow call runs to the real deadline
+    # and the write has no time left, so nothing is cached.
+    cache.unlink()
+    monkeypatch.setattr(checkouts, "VERDICT_RESERVE_NS", 0)
+    with path_with(monkeypatch, slow):
+        unreserved = collect([folder], seconds=3.0)
+    assert verdicts_of(find_clone(unreserved, work))["z-slow"] == unknown("deadline")
+    assert unreserved["diagnostics"] == [
+        {"code": "checkout_cache_write_failed", "path": str(cache)}
+    ]
+    assert not cache.exists()
+
+
+def own_step_world(tmp_path: Path):
+    """``one`` is cherry-picked onto a diverged trunk; ``other`` is unmerged."""
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("one", "other"):
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "diverged\n")
+    git(work, "cherry-pick", "one")
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+OWN_STEP_VERDICTS = {"one": MERGED_PATCH, "other": NOT_MERGED, "trunk": None}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize(
+    ("body", "options", "reason"),
+    [
+        ("exit 1", {}, "failed"),
+        ("sleep 3", {"call_cap_seconds": 1.0}, "deadline"),
+    ],
+    ids=["failed", "timed_out"],
+)
+def test_a_failed_own_commit_step_is_unknown_and_never_cached(
+    tmp_path, monkeypatch, isolated_git, body, options, reason
+):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    cold = collect([folder])
+    assert verdicts_of(find_clone(cold, work)) == OWN_STEP_VERDICTS
+    cache.unlink()
+    # Only the patch IDs of ``one``'s own commits fail; its single merge base
+    # would still let the squash rung decide it.
+    fault = stand_in(
+        tmp_path, "fault", f'case "$*" in *" log "*"{base}..{one} --"*) {body};; esac'
+    )
+
+    with path_with(monkeypatch, fault):
+        faulted = collect([folder], **options)
+
+    assert verdicts_of(find_clone(faulted, work)) == {**OWN_STEP_VERDICTS, "one": unknown(reason)}
+    assert cache_entries(cache) == {f"{other}.{base}": "none"}
+    warm = collect([folder])
+    assert stable(warm) == stable(cold)
+    assert warm["checkouts_digest"] == cold["checkouts_digest"]
+
+
+def test_a_tip_that_recorded_a_failure_stores_no_verdict(tmp_path, monkeypatch, isolated_git):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    original = checkouts._Ladder._patch_rungs
+
+    # A rung that decides a tip after one of its steps failed must not reach the cache.
+    def decided_after_a_failure(self, tip, mapped):
+        original(self, tip, mapped)
+        if tip.sha == one:
+            tip.fail("failed")
+            tip.verdict = checkouts._merged("squash_equivalent")
+
+    monkeypatch.setattr(checkouts._Ladder, "_patch_rungs", decided_after_a_failure)
+
+    document = collect([folder])
+
+    assert verdicts_of(find_clone(document, work))["one"] == MERGED_SQUASH
+    assert cache_entries(cache) == {f"{other}.{base}": "none"}
+
+
+def test_a_cached_verdict_survives_a_shared_range_that_would_evict_it(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "side", "trunk")
+    for number in range(1, 6):
+        commit_file(work, f"s{number}.txt", "x\n")
+    side_tip = rev(work, "side")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "c1.txt", "x\n")
+    commit_file(work, "c2.txt", "x\n")
+    git(work, "checkout", "-q", "-b", "bee", "trunk")
+    commit_file(work, "bee.txt", "x\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "side")
+    monkeypatch.setattr(checkouts, "SHARED_RANGE_CAP", 5)
+
+    alone = collect([folder])
+    assert verdicts_of(find_clone(alone, work)) == {"bee": NOT_MERGED, "trunk": None}
+    stored = cache.read_bytes()
+    git(work, "checkout", "-q", "-b", "aye", side_tip)
+    commit_file(work, "aye.txt", "x\n")
+    cache.unlink()
+
+    cold = collect([folder])
+    assert verdicts_of(find_clone(cold, work)) == {
+        "aye": NOT_MERGED, "bee": unknown("history_limit"), "trunk": None,
+    }
+    cache.write_bytes(stored)
+    warm = collect([folder])
+    assert verdicts_of(find_clone(warm, work)) == {
+        "aye": NOT_MERGED, "bee": NOT_MERGED, "trunk": None,
+    }
+
+
+def cherry_picked_world(tmp_path: Path, names: list[str]):
+    """Every branch is cherry-picked onto a diverged ``trunk``, so each is patch-equivalent."""
+    folder, _remote, work = small_world(tmp_path)
+    for name in names:
+        git(work, "checkout", "-q", "-b", name, "trunk")
+        commit_file(work, f"{name}.txt", f"{name}\n")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "diverged.txt", "diverged\n")
+    git(work, "cherry-pick", *names)
+    git(work, "push", "-q", "origin", "trunk")
+    return folder, work
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_clone_over_budget_converges_across_short_collections(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    base = rev(work, "origin/trunk")
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in names)
+    slow = stand_in(tmp_path, "slow", f'case "$*" in {cases}) sleep 1;; esac')
+
+    runs = []
+    with path_with(monkeypatch, slow):
+        for _ in range(MOST_SHORT_COLLECTIONS):
+            runs.append(verdicts_of(find_clone(collect([folder], seconds=4.0), work)))
+            if unknown("deadline") not in runs[-1].values():
+                break
+
+    # The deadline path is exercised: the first collection leaves work undecided.
+    assert unknown("deadline") in runs[0].values()
+    # Progress is monotone: a decided tip never returns to unknown, and no
+    # collection decides fewer tips than the one before it.
+    for earlier, later in zip(runs, runs[1:]):
+        for name, verdict in earlier.items():
+            if verdict is not None and verdict[0] != "unknown":
+                assert later[name] == verdict
+        assert decided(later) >= decided(earlier)
+    # Short collections add up to a verdict for every branch.
+    assert all(runs[-1][name] == MERGED_PATCH for name in names)
+
+
+MOST_SHORT_COLLECTIONS = 6
+
+
+def decided(verdicts: dict[str, Any]) -> int:
+    return sum(1 for verdict in verdicts.values() if verdict is not None and verdict[0] != "unknown")
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_an_uncached_tip_is_decided_whole_before_cached_tips_use_the_budget(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    base = rev(work, "origin/trunk")
+    collect([folder])
+    assert len(cache_entries(cache)) == 5
+    # ``u`` proves nothing; ``t`` is a commit and its revert, decided by no rung.
+    git(work, "checkout", "-q", "-b", "u", "trunk")
+    commit_file(work, "u.txt", "u\n")
+    git(work, "checkout", "-q", "-b", "t", "trunk")
+    commit_file(work, "t.txt", "t\n")
+    git(work, "revert", "--no-edit", "HEAD")
+    git(work, "checkout", "-q", "trunk")
+    log = tmp_path / "order.log"
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in [*names, "u", "t"])
+    slow = stand_in(
+        tmp_path, "slow", f'case "$*" in {cases}) printf "%s\\n" "$*" >> "{log}"; sleep 1;; esac'
+    )
+
+    with path_with(monkeypatch, slow):
+        collect([folder], seconds=4.0)
+        second = collect([folder], seconds=4.0)
+
+    verdicts = verdicts_of(find_clone(second, work))
+    assert verdicts["u"] == NOT_MERGED
+    assert verdicts["t"] == NOT_MERGED
+    assert all(verdicts[name] == MERGED_PATCH for name in names)
+    first_calls = log.read_text().splitlines()
+    tips = {rev(work, name): name for name in [*names, "u", "t"]}
+    worked = [
+        tips[token.split("..")[1]]
+        for line in first_calls
+        for token in line.split()
+        if ".." in token
+    ]
+    # Across both runs the uncached tips are worked before any cached one.
+    assert set(worked[:2]) == {"u", "t"}
+    assert f"{rev(work, 'u')}.{base}" in cache_entries(cache)
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_an_uncached_tree_equal_tip_is_decided_before_cached_tips_use_the_budget(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    names = [f"b{number}" for number in range(1, 6)]
+    folder, work = cherry_picked_world(tmp_path, names)
+    # ``te`` adds two files in one commit; trunk gets them as two separate commits.
+    git(work, "checkout", "-q", "-b", "te", "trunk")
+    (work / "te1.txt").write_text("1\n")
+    (work / "te2.txt").write_text("2\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", "te")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "te1.txt", "1\n")
+    commit_file(work, "te2.txt", "2\n")
+    git(work, "push", "-q", "origin", "trunk")
+    base, te = rev(work, "origin/trunk"), rev(work, "te")
+    first = collect([folder])
+    assert verdicts_of(find_clone(first, work))["te"] == ("merged", "tree_equal", None)
+    document = json.loads(cache.read_text())
+    assert document["verdicts"].pop(f"{te}.{base}")["rung"] == "tree_equal"
+    cache.write_text(json.dumps(document))
+    cases = "|".join(f'*" log "*"{base}..{rev(work, name)} --"*' for name in [*names, "te"])
+    slow = stand_in(tmp_path, "slow", f'case "$*" in {cases}) sleep 1;; esac')
+
+    with path_with(monkeypatch, slow):
+        collect([folder], seconds=4.0)
+        second = collect([folder], seconds=4.0)
+
+    assert verdicts_of(find_clone(second, work))["te"] == ("merged", "tree_equal", None)
+    assert cache_entries(cache)[f"{te}.{base}"] == "tree_equal"
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_uncached_tips_are_worked_first_then_the_oldest_saved_answer(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work, keys = branch_cache_world(tmp_path, ["n1", "n2", "n3", "n4"])
+    write_cache(cache, {keys["n1"]: 200, keys["n2"]: 100})
+    shim, log = recording(tmp_path, "order")
+
+    with path_with(monkeypatch, shim):
+        collect([folder])
+
+    tips = {rev(work, name): name for name in ("n1", "n2", "n3", "n4")}
+    sized = [
+        tips[token.split("...")[1]]
+        for line in log.read_text().splitlines()
+        if "--left-right" in line
+        for token in line.split()
+        if "..." in token
+    ]
+    assert sized == ["n3", "n4", "n2", "n1"]
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+def test_a_saved_answer_stands_in_only_where_the_recheck_does_not_finish(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, work = own_step_world(tmp_path)
+    base, one, other = rev(work, "origin/trunk"), rev(work, "one"), rev(work, "other")
+    cold = collect([folder])
+    assert verdicts_of(find_clone(cold, work)) == OWN_STEP_VERDICTS
+    stored = {f"{one}.{base}": "patch_equivalent", f"{other}.{base}": "none"}
+    assert cache_entries(cache) == stored
+    write_cache(cache, {key: 10 for key in stored}, rungs=stored)
+    # The re-check of ``one`` fails; ``other`` is re-checked and finishes.
+    fault = stand_in(
+        tmp_path, "fault", f'case "$*" in *" log "*"{base}..{one} --"*) exit 1;; esac'
+    )
+
+    with path_with(monkeypatch, fault):
+        warm = collect([folder])
+
+    assert verdicts_of(find_clone(warm, work)) == OWN_STEP_VERDICTS
+    assert warm["checkouts_digest"] == cold["checkouts_digest"]
+    times = cache_times(cache)
+    assert times[f"{one}.{base}"] == 10
+    assert times[f"{other}.{base}"] > 10
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the account home comes from HOME on POSIX only")
+def test_an_unusable_account_home_leaves_the_cache_unavailable_without_a_diagnostic(
+    tmp_path, isolated_git
+):
+    folder, work = cache_world(tmp_path)
+    cold = collect([folder])
+    environment = dict(os.environ)
+    environment["HOME"] = "relative-home"
+    environment.pop("USERPROFILE", None)
+    # Git still needs its isolated global configuration.
+    environment["GIT_CONFIG_GLOBAL"] = str(isolated_git / ".gitconfig")
+    environment["XDG_CONFIG_HOME"] = str(isolated_git)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", COLLECT_PROCESS, str(folder)],
+        cwd=tmp_path,
+        env={**environment, "PYTHONPATH": str(REPOSITORY_ROOT)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    document = models.parse_checkouts(completed.stdout)
+    assert stable(document) == stable(cold)
+    assert document["diagnostics"] == []
+    assert verdicts_of(find_clone(document, work)) == CACHE_WORLD_VERDICTS
+    assert not (tmp_path / "relative-home").exists()
+
+
+# ---------------------------------------------------------------------------
+# Supported clone size and the work a clone costs
+# ---------------------------------------------------------------------------
+
+
+def import_branches(repository: Path, count: int, tag: str = "b") -> list[str]:
+    """Add ``count`` one-commit branches, each unmerged, in one ``git fast-import`` run.
+
+    Every branch changes its own file, so none is an ancestor of the default
+    branch, patch-equivalent to a commit on it or tree-equal to one.
+    """
+    root = git(repository, "rev-parse", "HEAD").stdout.strip()
+    names = [f"{tag}{number:05d}" for number in range(count)]
+    stream = b"".join(
+        (
+            f"commit refs/heads/{name}\ncommitter T <t@example.com> 1700000000 +0000\n"
+            f"data {len(name) + 1}\n{name}\nfrom {root}\n"
+            f"M 100644 inline {name}.txt\ndata 2\nx\n\n"
+        ).encode("ascii")
+        for name in names
+    )
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repository,
+        input=stream,
+        capture_output=True,
+        check=True,
+    )
+    return names
+
+
+def git_subcommand(arguments: Any) -> str:
+    """The git subcommand of a runner call, past global options and ``-c`` pairs."""
+    pending = iter(arguments)
+    for argument in pending:
+        if argument == "-c":
+            next(pending, None)
+        elif not argument.startswith("-"):
+            return argument
+    return arguments[0] if arguments else ""
+
+
+@contextlib.contextmanager
+def counted_git_calls(monkeypatch):
+    """Record the subcommand of every ``_GitRunner.run`` and ``pipeline`` call."""
+    calls: list[str] = []
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+
+    def counting_run(self, arguments, **options):
+        calls.append(git_subcommand(arguments))
+        return run(self, arguments, **options)
+
+    def counting_pipeline(self, producer, consumer, **options):
+        calls.append(git_subcommand(producer))
+        return pipeline(self, producer, consumer, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(checkouts._GitRunner, "run", counting_run)
+        patched.setattr(checkouts._GitRunner, "pipeline", counting_pipeline)
+        yield calls
+
+
+def count_tip_equality(monkeypatch) -> list[int]:
+    """Count every ``_Tip.__eq__`` call; a list search over tips makes one per element."""
+    calls = [0]
+    compare = checkouts._Tip.__eq__
+
+    def counting_eq(self, other):
+        calls[0] += 1
+        return compare(self, other)
+
+    monkeypatch.setattr(checkouts._Tip, "__eq__", counting_eq)
+    return calls
+
+
+CLONE_FACTS = (
+    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
+    "stash_count", "worktrees", "branches", "verdict_base",
+)
+
+
+def test_a_clone_over_the_branch_cap_is_refused_and_its_neighbours_are_unaffected(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served, "one.git")
+    other_remote = make_remote(served, "two.git")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    exact = clone(remote, folder / "exact")
+    import_branches(exact, models.CHECKOUT_BRANCH_CAP - 1)
+    crowded = clone(remote, folder / "crowded")
+    import_branches(crowded, models.CHECKOUT_BRANCH_CAP)
+    sibling = clone(remote, folder / "sibling")
+    apart = clone(other_remote, folder / "apart")
+    assert len(git(exact, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
+    assert len(git(crowded, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+
+    document = collect([folder])
+
+    at_cap = find_clone(document, exact)
+    assert at_cap["status"] == "ok"
+    assert len(at_cap["branches"]) == 100
+    assert {
+        name: verdict for name, verdict in verdicts_of(at_cap).items() if name != "trunk"
+    } == {name: NOT_MERGED for name in verdicts_of(at_cap) if name != "trunk"}
+    over = find_clone(document, crowded)
+    assert over["status"] == "too_many_branches"
+    assert [over[fact] for fact in CLONE_FACTS] == [None] * len(CLONE_FACTS)
+    # The refused clone stays in its remote's group beside the sibling clone.
+    [group] = [
+        repository
+        for repository in document["repositories"]
+        if real(crowded) in [item["path"] for item in repository["clones"]]
+    ]
+    assert {item["path"] for item in group["clones"]} == {
+        real(path) for path in (exact, crowded, sibling)
+    }
+    assert find_clone(document, sibling)["status"] == "ok"
+    alone = collect([folder / "apart"])
+    assert find_clone(document, apart) == find_clone(alone, apart)
+
+
+def test_clones_over_the_branch_cap_cost_the_same_git_calls_whatever_their_branch_count(
+    tmp_path, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    counts: dict[int, list[str]] = {}
+    for extra in (100, 10_000):
+        folder = tmp_path / f"folder-{extra}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository, {f"refs/heads/never-pushed-{n:06d}": head for n in range(extra)}
+        )
+        assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == extra + 1
+        with counted_git_calls(monkeypatch) as calls:
+            document = collect([folder])
+        assert find_clone(document, repository)["status"] == "too_many_branches"
+        counts[extra] = list(calls)
+
+    assert sorted(counts[100]) == sorted(counts[10_000])
+    assert counts[100]
+    assert not {"rev-list", "merge-base", "log", "diff", "patch-id", "status"} & set(counts[100])
+
+
+def test_a_clone_over_the_branch_cap_is_refused_before_its_stash_is_counted(
+    tmp_path, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    counts: dict[bool, list[str]] = {}
+    for stashed in (False, True):
+        folder = tmp_path / f"folder-{stashed}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        if stashed:
+            (repository / "file.txt").write_text("changed\n")
+            git(repository, "stash", "-q")
+            # Within the cap the collector counts this stash with a git call.
+            within = find_clone(collect([folder]), repository)
+            assert (within["status"], within["stash_count"]) == ("ok", 1)
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/extra-{n:03d}": head for n in range(models.CHECKOUT_BRANCH_CAP)},
+        )
+        assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+        assert bool(git(repository, "for-each-ref", "refs/stash").stdout.strip()) == stashed
+        with counted_git_calls(monkeypatch) as calls:
+            document = collect([folder])
+        assert find_clone(document, repository)["status"] == "too_many_branches"
+        counts[stashed] = sorted(calls)
+
+    # A stash costs the over-cap clone nothing: the cap is checked first.
+    assert counts[True] == counts[False]
+    assert "rev-list" not in counts[True]
+
+
+def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    remote = make_remote(tmp_path)
+    calls_by_size: dict[int, Counter] = {}
+    for size in (100, 50, 25):
+        folder = tmp_path / f"folder-{size}"
+        folder.mkdir()
+        repository = clone(remote, folder / "repo")
+        tips = [
+            rev(repository, name) for name in import_branches(repository, size - 1, f"s{size}-")
+        ]
+        with monkeypatch.context() as patched:
+            equality = count_tip_equality(patched)
+            with counted_git_calls(patched) as calls:
+                document = collect([folder], seconds=600.0)
+        calls_by_size[size] = Counter(calls)
+        item = find_clone(document, repository)
+        assert item["status"] == "ok"
+        assert len(item["branches"]) == size
+        if size == 100:
+            assert verdicts_of(item) == {
+                "trunk": None,
+                **{branch["name"]: NOT_MERGED for branch in other_branches(item)},
+            }
+            assert len(other_branches(item)) == 99
+            assert document["diagnostics"] == []
+            base = item["verdict_base"]["sha"]
+            assert cache_entries(cache) == {f"{tip}.{base}": "none" for tip in tips}
+            # Looking a tip up must not compare tips pairwise.
+            assert equality[0] <= len(tips)
+
+    sizes = set().union(*calls_by_size.values())
+    for subcommand in sizes:
+        growth_small = calls_by_size[50][subcommand] - calls_by_size[25][subcommand]
+        growth_large = calls_by_size[100][subcommand] - calls_by_size[50][subcommand]
+        assert growth_large == 2 * growth_small, subcommand
+    assert calls_by_size[100]["rev-list"] > calls_by_size[50]["rev-list"]
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_no_git_process_starts_after_the_verdict_deadline_and_the_cache_write_lands(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, fast = cache_world(tmp_path)
+    slow = clone(tmp_path / "served" / "remote.git", folder / "slow")
+    import_branches(slow, 12)
+    log = tmp_path / "calls.log"
+    shim = stand_in(
+        tmp_path,
+        "slow-sizes",
+        f'case "$*" in *"{real(slow)}"*--left-right*) printf "size\\n" >> "{log}"; sleep 2;; esac',
+    )
+    starts: list[int] = []
+    start_process = subprocess.Popen
+
+    def recording_start(*arguments, **options):
+        starts.append(time.monotonic_ns())
+        return start_process(*arguments, **options)
+
+    # A call that returns timed out without starting a process; by then every
+    # other clone has finished, so only the slow clone's ladder is running.
+    idle: list[int] = []
+    run, pipeline = checkouts._GitRunner.run, checkouts._GitRunner.pipeline
+
+    def watching(call):
+        def watched(self, *arguments, **options):
+            before = len(starts)
+            outcome = call(self, *arguments, **options)
+            if outcome.timed_out and len(starts) == before:
+                idle.append(time.monotonic_ns())
+            return outcome
+
+        return watched
+
+    deadline_ns = time.monotonic_ns() + 5 * 10**9
+    with path_with(monkeypatch, shim), monkeypatch.context() as patched:
+        patched.setattr(subprocess, "Popen", recording_start)
+        patched.setattr(checkouts._GitRunner, "run", watching(run))
+        patched.setattr(checkouts._GitRunner, "pipeline", watching(pipeline))
+        text = checkouts.collect_checkouts([str(folder)], deadline_ns=deadline_ns)
+    finished = time.monotonic_ns()
+
+    verdict_deadline = deadline_ns - checkouts.VERDICT_RESERVE_NS
+    sizes_started = len(log.read_text().splitlines()) if log.exists() else 0
+    # The ladder began and was cut short by the deadline, not finished.
+    assert 1 <= sizes_started < 12
+    assert max(starts) <= verdict_deadline + 100_000_000
+    # Once the runner has refused a call for lack of time, no later call starts one.
+    assert idle
+    assert [moment for moment in starts if moment > min(idle)] == []
+    assert finished < deadline_ns
+    document = models.parse_checkouts(text)
+    reached = verdicts_of(find_clone(document, slow))
+    assert {name: reached[name] for name in reached if name != "trunk"} == {
+        name: unknown("deadline") for name in reached if name != "trunk"
+    }
+    assert verdicts_of(find_clone(document, fast)) == CACHE_WORLD_VERDICTS
+    assert document["diagnostics"] == []
+    assert set(cache_entries(cache).values()) == {"patch_equivalent", "none"}

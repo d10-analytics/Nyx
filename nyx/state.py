@@ -30,6 +30,10 @@ _LEGACY_POLICY_KEY = "hidden_stages"
 CONFIG_FILENAME = "config.json"
 DEPLOYMENT_FILENAME = "deployment.json"
 RUNTIME_DIRECTORY = "runtime"
+CACHE_DIRECTORY = "cache"
+CHECKOUT_CACHE_FILENAME = "checkouts.json"
+CHECKOUT_CACHE_MAX_BYTES = 4 * 1024 * 1024
+CHECKOUT_CACHE_TEMPORARY_MAX_AGE = 600.0
 _OMITTED = object()
 
 CONFIGURATION_UNAVAILABLE = "configuration_unavailable"
@@ -854,6 +858,65 @@ def _sync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+class _ReplaceVerificationError(Exception):
+    """The replacement failed or could not be verified; ``replaced`` says which."""
+
+    def __init__(self, message: str, *, replaced: bool) -> None:
+        super().__init__(message)
+        self.replaced = replaced
+
+
+def _atomic_replace(
+    directory: Path,
+    target: Path,
+    data: bytes,
+    *,
+    prefix: str,
+    deadline: float | None = None,
+    deadline_ns: int | None = None,
+) -> None:
+    """Write ``data`` to a temporary file in ``directory`` and replace ``target``.
+
+    Raises only ``OSError``, ``ValueError`` or ``_ReplaceVerificationError``.
+    The caller admits ``directory`` first.  After the replacement the target
+    must still be a regular, non-link file; a failure from then on is reported
+    as ``_ReplaceVerificationError(replaced=True)`` because the new content is
+    already in place.
+    """
+
+    temporary_name: str | None = None
+    try:
+        _check_deadline(deadline, deadline_ns)
+        fd, temporary_name = tempfile.mkstemp(prefix=prefix, dir=directory)
+        try:
+            written = 0
+            while written < len(data):
+                _check_deadline(deadline, deadline_ns)
+                written += os.write(fd, data[written:])
+            _check_deadline(deadline, deadline_ns)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _check_deadline(deadline, deadline_ns)
+        os.replace(temporary_name, target)
+        temporary_name = None
+        try:
+            details = target.lstat()
+            if _is_reparse_or_link(target, details) or not stat.S_ISREG(details.st_mode):
+                raise OSError("replaced file is not a regular file")
+            _sync_directory(directory)
+        except (OSError, ValueError) as error:
+            raise _ReplaceVerificationError(
+                "replacement could not be verified", replaced=True
+            ) from error
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
 def _atomic_write_configuration(
     paths: StatePaths,
     root: Path,
@@ -864,7 +927,6 @@ def _atomic_write_configuration(
     deadline: float | None = None,
     deadline_ns: int | None = None,
 ) -> None:
-    temporary_name: str | None = None
     replaced = False
     try:
         if not _admit_directory(paths.state_directory, create=False) or not _admit_directory(
@@ -872,25 +934,21 @@ def _atomic_write_configuration(
         ):
             raise ConfigurationError("Nyx configuration directory is unavailable")
         _check_deadline(deadline, deadline_ns)
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{CONFIG_FILENAME}.", dir=paths.config_directory
-        )
+        data = _configuration_bytes(root, stage_orders, completed_stages, checkout_settings)
         try:
-            data = _configuration_bytes(root, stage_orders, completed_stages, checkout_settings)
-            written = 0
-            while written < len(data):
-                _check_deadline(deadline, deadline_ns)
-                written += os.write(fd, data[written:])
-            _check_deadline(deadline, deadline_ns)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        _check_deadline(deadline, deadline_ns)
-        os.replace(temporary_name, paths.config_file)
-        temporary_name = None
+            _atomic_replace(
+                paths.config_directory,
+                paths.config_file,
+                data,
+                prefix=f".{CONFIG_FILENAME}.",
+                deadline=deadline,
+                deadline_ns=deadline_ns,
+            )
+        except _ReplaceVerificationError as error:
+            replaced = error.replaced
+            raise OSError("configuration replacement could not be verified") from error
         replaced = True
         _verify_record(paths.config_file)
-        _sync_directory(paths.config_directory)
     except (OSError, ValueError, ConfigurationError) as error:
         if isinstance(error, ConfigurationError):
             if replaced and not isinstance(error, ConfigurationCommitVerificationError):
@@ -903,12 +961,99 @@ def _atomic_write_configuration(
                 "Nyx configuration was replaced but could not be verified"
             ) from error
         raise ConfigurationError("cannot replace Nyx configuration") from error
-    finally:
-        if temporary_name is not None:
+
+
+class CheckoutCacheError(StateError):
+    """The checkout verdict cache cannot be read or written safely."""
+
+
+def checkout_cache_path() -> Path:
+    """The cache file, derived from the fixed state directory without touching disk."""
+
+    return _fixed_state_paths().state_directory / CACHE_DIRECTORY / CHECKOUT_CACHE_FILENAME
+
+
+def read_checkout_cache() -> bytes | None:
+    """Return the cache file's bytes, or ``None`` when no cache is stored.
+
+    A missing state directory, cache directory or file all mean "nothing
+    stored".  Any other failure (link, non-directory, non-regular file, more
+    than ``CHECKOUT_CACHE_MAX_BYTES``, unreadable) raises ``CheckoutCacheError``.
+    """
+
+    path = checkout_cache_path()
+    try:
+        if not _admit_directory(path.parent.parent, create=False):
+            return None
+        if not _admit_directory(path.parent, create=False):
+            return None
+        details = _lstat(path)
+        if details is None:
+            return None
+        if _is_reparse_or_link(path, details) or not stat.S_ISREG(details.st_mode):
+            raise CheckoutCacheError("Nyx checkout cache is not a regular file")
+        if details.st_size > CHECKOUT_CACHE_MAX_BYTES:
+            raise CheckoutCacheError("Nyx checkout cache is too large")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            data = handle.read(CHECKOUT_CACHE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except CheckoutCacheError:
+        raise
+    except (OSError, StateError) as error:
+        raise CheckoutCacheError("Nyx checkout cache is unavailable") from error
+    if len(data) > CHECKOUT_CACHE_MAX_BYTES:
+        raise CheckoutCacheError("Nyx checkout cache is too large")
+    return data
+
+
+def _remove_stale_temporaries(directory: Path, prefix: str, max_age: float) -> None:
+    """Best-effort removal of abandoned temporaries older than ``max_age`` seconds."""
+
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        candidate = directory / name
+        details = _lstat(candidate)
+        if details is None or not stat.S_ISREG(details.st_mode):
+            continue
+        if now - details.st_mtime > max_age:
             try:
-                os.unlink(temporary_name)
-            except FileNotFoundError:
+                os.unlink(candidate)
+            except OSError:
                 pass
+
+
+def write_checkout_cache(data: bytes, *, deadline_ns: int) -> bool:
+    """Atomically replace the cache file; return ``False`` when ``~/.nyx`` is missing.
+
+    Creates ``cache/`` but never the state directory.  Raises
+    ``CheckoutCacheError`` or ``OSError`` on any failure, including the
+    ``deadline_ns`` (a ``time.monotonic_ns`` instant) expiring.
+    """
+
+    path = checkout_cache_path()
+    try:
+        if not _admit_directory(path.parent.parent, create=False, deadline_ns=deadline_ns):
+            return False
+        _admit_directory(path.parent, create=True, deadline_ns=deadline_ns)
+        prefix = f".{CHECKOUT_CACHE_FILENAME}."
+        _remove_stale_temporaries(path.parent, prefix, CHECKOUT_CACHE_TEMPORARY_MAX_AGE)
+        _atomic_replace(path.parent, path, data, prefix=prefix, deadline_ns=deadline_ns)
+    except _ReplaceVerificationError as error:
+        raise CheckoutCacheError("Nyx checkout cache was replaced but could not be verified") from error
+    except StateError as error:
+        if isinstance(error, (CheckoutCacheError, OperationDeadlineError)):
+            raise
+        raise CheckoutCacheError("Nyx checkout cache is unavailable") from error
+    return True
 
 
 def _save_configuration(
@@ -1132,6 +1277,7 @@ def setup(
 __all__ = [
     "CHECKOUT_CONFIG_SCHEMA_VERSION",
     "CONFIG_SCHEMA_VERSION",
+    "CheckoutCacheError",
     "CheckoutSettings",
     "CONFIGURATION_STATES",
     "CONFIGURATION_UNAVAILABLE",
@@ -1163,6 +1309,9 @@ __all__ = [
     "configuration_revision",
     "validate_configuration_candidate",
     "revalidate_configuration",
+    "checkout_cache_path",
+    "read_checkout_cache",
+    "write_checkout_cache",
     "setup",
     "state_paths",
 ]

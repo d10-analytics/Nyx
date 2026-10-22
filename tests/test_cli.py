@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -630,6 +631,7 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
 import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
     GLOBAL_CONFIG,
+    add_packed_refs,
     allow_filters,
     clone,
     closed_port,
@@ -716,19 +718,29 @@ def _line_for(lines: list[str], path: Path | str, indent: str = "") -> str:
 
 
 def _file_listing(root: Path) -> list[str]:
-    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+    """Every path under ``root``, relative and with ``/`` separators on every platform."""
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
 
 
-def test_module_launch_prints_a_valid_document_on_every_host_without_touching_state(
+def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     tmp_path, account, monkeypatch
 ):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
     repository = clone(remote, folder / "listed")
+    git(repository, "checkout", "-q", "-b", "picked", "trunk")
+    commit_file(repository, "picked.txt", "picked\n")
+    git(repository, "checkout", "-q", "trunk")
+    commit_file(repository, "diverged.txt", "diverged\n")
+    git(repository, "cherry-pick", "picked")
+    git(repository, "push", "-q", "origin", "trunk")
+    tip = git(repository, "rev-parse", "picked").stdout.strip()
+    base = git(repository, "rev-parse", "origin/trunk").stdout.strip()
     record = _configure(tmp_path, [folder])
     before = record.read_bytes()
     listing = _file_listing(account / ".nyx")
+    runtime_before = state.observe_runtime()
 
     completed = subprocess.run(
         [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
@@ -744,9 +756,24 @@ def test_module_launch_prints_a_valid_document_on_every_host_without_touching_st
     document = models.parse_checkouts(completed.stdout)
     [item] = [c for r in document["repositories"] for c in r["clones"]]
     assert item["path"] == real(repository)
+    assert document["diagnostics"] == []
+    [picked] = [b for b in item["branches"] if b["name"] == "picked"]
+    assert picked["verdict"] == {
+        "state": "merged", "rung": "patch_equivalent", "reason": None,
+    }
     assert record.read_bytes() == before
-    assert _file_listing(account / ".nyx") == listing
-    assert not any(name.endswith(("instance.json", ".lock")) for name in listing)
+    after = _file_listing(account / ".nyx")
+    assert sorted(set(after) - set(listing)) == ["cache", "cache/checkouts.json"]
+    assert set(listing) <= set(after)
+    stored = json.loads((account / ".nyx" / "cache" / "checkouts.json").read_text())
+    assert set(stored) == {"schema_version", "verdicts"}
+    assert stored["schema_version"] == 2
+    assert {key: entry["rung"] for key, entry in stored["verdicts"].items()} == {
+        f"{tip}.{base}": "patch_equivalent"
+    }
+    assert not any(name.endswith(("instance.json", ".lock")) for name in after)
+    assert "runtime" not in {name.split("/")[0] for name in set(after) - set(listing)}
+    assert state.observe_runtime() == runtime_before
 
 
 def test_module_launch_with_an_empty_home_exits_zero_and_creates_no_state(tmp_path):
@@ -828,29 +855,16 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
-    repository = clone(remote, folder / "many")
-    head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    # Packed references need no file per branch, so no host path limit applies.
-    git(repository, "pack-refs", "--all")
-    packed_file = repository / ".git" / "packed-refs"
-    entries = {
-        line.split(" ", 1)[1]: line.split(" ", 1)[0]
-        for line in packed_file.read_bytes().decode("ascii").split("\n")
-        if line and line[0] not in "#^"
-    }
-    for index in range(7000):
-        entries[f"refs/heads/{index:05d}-{'x' * 180}"] = head
-    # Peel lines are not kept, so the header claims only sorted order and git
-    # peels on demand.  Bytes are written exactly: git rejects a CRLF ref line.
-    packed_file.write_bytes(
-        (
-            "# pack-refs with: sorted \n"
-            + "".join(f"{sha} {name}\n" for name, sha in sorted(entries.items()))
-        ).encode("ascii")
-    )
-    packed = packed_file.read_bytes()
-    assert packed.endswith(b"\n") and b"\r" not in packed
-    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 7001
+    # Each clone holds the most branches one clone may (the default and 99
+    # more), all at the default's tip, and long names fill the document.
+    for index in range(48):
+        repository = clone(remote, folder / f"many-{index:03d}")
+        head = git(repository, "rev-parse", "HEAD").stdout.strip()
+        add_packed_refs(
+            repository,
+            {f"refs/heads/{index:03d}-{n:03d}-" + "x" * 230: head for n in range(99)},
+        )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
     _configure(tmp_path, [folder])
 
     for arguments in ((), ("--json",), ("--no-network",), ("--json", "--no-network")):
@@ -860,6 +874,29 @@ def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
         assert err.startswith("nyx: ")
         assert "checkouts_output_too_large" in err
         assert len(err.splitlines()) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the scratch location is made unusable with a file")
+@pytest.mark.parametrize("arguments", [(), ("--json",)], ids=["human", "json"])
+def test_an_unusable_temporary_directory_is_one_error_line_not_a_traceback(
+    tmp_path, account, monkeypatch, capsys, arguments
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    clone(remote, folder / "work")
+    _configure(tmp_path, [folder])
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("a file cannot host the scratch directory")
+    monkeypatch.setattr(tempfile, "tempdir", str(blocker))
+
+    code, out, err = _run_checkouts(capsys, *arguments)
+
+    assert code == 1
+    assert out == ""
+    assert err.startswith("nyx: checkouts: ")
+    assert len(err.splitlines()) == 1
+    assert "Traceback" not in err
 
 
 def test_missing_git_exits_zero_in_both_modes(tmp_path, account, monkeypatch, capsys):
@@ -1131,6 +1168,26 @@ def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
     assert elements[1] == "remote off"
     assert elements[2] == "branches cached local-only 0 unknown 1"
     assert elements[3].startswith("default trunk cached equal ")
+
+
+def test_a_clone_over_the_branch_cap_prints_only_its_status(tmp_path, account, capsys):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "crowded")
+    head = git(repository, "rev-parse", "HEAD").stdout.strip()
+    add_packed_refs(
+        repository, {f"refs/heads/extra-{n:03d}": head for n in range(models.CHECKOUT_BRANCH_CAP)}
+    )
+    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 101
+    sibling = clone(remote, folder / "ordinary")
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys, "--no-network")
+
+    assert _line_for(lines, repository) == f"{cli._json_literal(real(repository))}  too_many_branches"
+    # The sibling clone of the same remote keeps its ordinary line.
+    assert "too_many_branches" not in _line_for(lines, sibling)
 
 
 def make_slow_clone_in_place(repository: Path) -> None:
