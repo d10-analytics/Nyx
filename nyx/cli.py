@@ -236,7 +236,8 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
         return 1
     except OSError as error:
-        # The verdict work needs a scratch directory; without one there is no document.
+        # Collection makes temporary files for git's output and a scratch directory for
+        # verdict work; when the system cannot provide them there is no document.
         reason = error.strerror or type(error).__name__
         print(f"nyx: checkouts: unable to collect ({reason})", file=sys.stderr)
         return 1
