@@ -1728,8 +1728,11 @@ class _Ladder:
         self._overlay: dict[str, str | None] = dict(settings.overlay)
         if base.alternate is not None:
             self._overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = base.alternate
-        # What the landing check read, kept so a commit or blob is read once.
+        # The paths each commit or range changes, kept for the clone's whole run so
+        # each is read once.
         self._change_sets: dict[tuple[str, ...], dict[bytes, _PathChange]] = {}
+        # File contents read for content merges, kept only within one landing
+        # confirmation and below MERGE_RETAIN_CAP, so a blob may be read again.
         self._blobs: dict[str, bytes] = {}
         self._blob_bytes = 0
 
