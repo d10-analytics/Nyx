@@ -69,11 +69,13 @@ COMPARISON_CAP = 5000
 SHARED_RANGE_CAP = 5000
 # Bounds of the check that a matching change landed where the branch made it:
 # base commits tried per patch identity, paths in one change, paths whose
-# contents must be merged, and bytes of one file read for that merge.
+# contents must be merged, bytes of one file read for that merge, and bytes of
+# file contents kept for reuse within one confirmation.
 LANDING_CAP = 8
 CONFIRM_PATH_CAP = 5000
 MERGE_PATH_CAP = 16
 MERGE_FILE_CAP = 1 << 20
+MERGE_RETAIN_CAP = 8 << 20
 # The verdict cache keeps at most this many entries; the file stays
 # far below the reader's byte bound because an entry is at most about 190 bytes.
 CACHE_ENTRY_CAP = 8192
@@ -1729,6 +1731,7 @@ class _Ladder:
         # What the landing check read, kept so a commit or blob is read once.
         self._change_sets: dict[tuple[str, ...], dict[bytes, _PathChange]] = {}
         self._blobs: dict[str, bytes] = {}
+        self._blob_bytes = 0
 
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
@@ -2077,12 +2080,25 @@ class _Ladder:
         """
         candidates = landings[identity]
         changes = branch()
+        self._forget_blobs()
+        bounded = False
         for commit in candidates[:LANDING_CAP]:
-            if self._same_change(changes, self._commit_changes(commit)):
-                return True
-        if len(candidates) > LANDING_CAP:
+            try:
+                if self._same_change(changes, self._commit_changes(commit)):
+                    return True
+            except _Unconfirmed as failure:
+                # A size, path or merge bound on one candidate leaves the older
+                # ones to try; a failed call or the deadline ends the check.
+                if failure.reason != "history_limit":
+                    raise
+                bounded = True
+        if bounded or len(candidates) > LANDING_CAP:
             raise _Unconfirmed("history_limit")
         return False
+
+    def _forget_blobs(self) -> None:
+        self._blobs.clear()
+        self._blob_bytes = 0
 
     def _commit_changes(self, commit: str) -> dict[bytes, _PathChange]:
         """The paths a non-merge commit changes, against its parent or the empty tree."""
@@ -2137,7 +2153,10 @@ class _Ladder:
         content = self._git(["cat-file", "blob", name])
         if not content.ok:
             raise _Unconfirmed(_call_failure(content))
+        if self._blob_bytes + len(content.out) > MERGE_RETAIN_CAP:
+            self._forget_blobs()
         self._blobs[name] = content.out
+        self._blob_bytes += len(content.out)
         return content.out
 
     def _same_change(
