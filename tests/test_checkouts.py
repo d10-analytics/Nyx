@@ -47,6 +47,9 @@ GLOBAL_CONFIG = """\
 \tauto = 0
 [maintenance]
 \tauto = false
+[receive]
+\tautogc = false
+\tunpackLimit = 10000
 """
 
 
@@ -65,14 +68,65 @@ def isolated_git(tmp_path_factory, monkeypatch):
     return home
 
 
+PINNED_HOUSEKEEPING = {
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    "receive.autogc": "false",
+    "receive.unpackLimit": "10000",
+}
+
+
 def test_automatic_housekeeping_is_off_in_every_repository_a_test_builds(tmp_path):
     served = tmp_path / "served"
     served.mkdir()
     remote = make_remote(served)
     work = clone(remote, tmp_path / "work")
     for repository in (remote, work):
-        assert git(repository, "config", "--get", "gc.auto").stdout.strip() == "0"
-        assert git(repository, "config", "--get", "maintenance.auto").stdout.strip() == "false"
+        for key, value in PINNED_HOUSEKEEPING.items():
+            assert git(repository, "config", "--get", key).stdout.strip() == value, key
+
+
+def push_many_objects(work: Path, count: int) -> None:
+    for number in range(count):
+        (work / f"bulk-{number}.txt").write_bytes(f"bulk {number} {time.time_ns()}\n".encode())
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "bulk")
+    git(work, "push", "-q", "origin", "trunk")
+
+
+def test_a_push_of_more_than_the_default_unpack_limit_leaves_the_remote_loose(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, tmp_path / "work")
+
+    push_many_objects(work, 150)
+
+    assert len(loose_objects(remote)) > 150
+    assert pack_names(remote) == []
+    before = store_times(remote)
+    git(remote, "gc", "--auto")
+    git(remote, "maintenance", "run", "--auto")
+    assert store_times(remote) == before
+    # A second push runs receive-pack again: nothing is packed or removed.  Modification
+    # times are not compared here because git freshens a loose object it receives again.
+    push_many_objects(work, 150)
+    after = store_times(remote)
+    assert pack_names(remote) == []
+    assert set(before) < set(after)
+
+
+def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
+    """Control: the loose result above is the pin's doing, and the probe can see a pack."""
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    git(remote, "config", "receive.unpackLimit", "100")
+    work = clone(remote, tmp_path / "work")
+
+    push_many_objects(work, 150)
+
+    assert pack_names(remote) != []
 
 
 def git(cwd: Path | str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
