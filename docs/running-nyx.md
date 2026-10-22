@@ -215,8 +215,9 @@ the identity, and a match among them proves `merged`; a file over 1 MiB that
 landed unchanged needs no content merge, so it does not prevent that. The verdict
 is `unknown` with the reason `history_limit`, never `merged`, only when no commit
 Nyx tried matched and the check could not finish: a landing that needed a content
-merge of a file over 1 MiB, a landing that touched more than 5,000 paths or needed
-more than 16 content merges, or more than eight base commits with the identity. `tree_equal`: the branch's file contents are identical to the content of
+merge of a file over 1 MiB, a branch change or a landing that touched more than
+5,000 paths, a landing that needed more than 16 content merges, or more than eight
+base commits with the identity. `tree_equal`: the branch's file contents are identical to the content of
 some commit on the base. `not_merged` has the rung `none`: every rung that could
 run found nothing. An `unknown` verdict has no rung and one of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
@@ -242,7 +243,8 @@ time, a failed call, a size bound or a clone limit. It never replaces a verdict 
 run differs from a cold run only where the cold run says `unknown`: the
 warm run may give the remembered verdict instead, whatever the reason
 (`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
-`history_limit` depends on the other branches in the clone, which is why a
+`history_limit` is a cost bound, not a fact about the branch, and the bound on the
+shared comparison depends on the other branches in the clone, which is why a
 remembered answer may stand in for it. A warm run therefore does the same git
 work as a cold run, spending the time it has left re-checking. It runs the size checks, the merge bases and the shared
 comparison for every remaining branch first, then each branch's own checks, its

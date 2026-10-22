@@ -196,6 +196,8 @@ CHECKOUT_RETIRED_WORDING = (
     "More than eight base commits with one identity, a file over 1 MiB, a change touching "
     "more than 5,000 files or needing more than 16 content merges make the verdict "
     "`unknown` with the reason `history_limit`, never `merged`.",
+    "a landing that touched more than 5,000 paths or needed more than 16 content merges",
+    "`history_limit` depends on the other branches in the clone",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -253,6 +255,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "can still read `not_merged` when the landing commit left a binary file",
         "`unknown` with the reason `history_limit`, never `merged`, only when no commit",
         "more than 16 content merges, or more than eight base commits with the identity",
+        "a branch change or a landing that touched more than 5,000 paths",
+        "`history_limit` is a cost bound, not a fact about the branch, and the bound on the "
+        "shared comparison depends on the other branches in the clone",
         "`tree_equal`: the branch's file contents are identical",
         "`not_merged` has the rung `none`",
         "`no_base`",
