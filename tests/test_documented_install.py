@@ -193,6 +193,9 @@ CHECKOUT_RETIRED_WORDING = (
     "A branch whose re-check finishes is remembered again with the time of that check",
     "so the oldest answers are always re-checked first",
     "a clone too large to check within the 60 seconds is covered a few branches at a time",
+    "More than eight base commits with one identity, a file over 1 MiB, a change touching "
+    "more than 5,000 files or needing more than 16 content merges make the verdict "
+    "`unknown` with the reason `history_limit`, never `merged`.",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -203,6 +206,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`--no-network` skips every remote check",
         "`--no-network` is accepted only with `checkouts`",
         "`remote live`, `remote off` or `remote failed <reason>`",
+        "Nyx tries the eight newest base commits with the identity, and a match among "
+        "them proves `merged`",
+        "a file over 1 MiB that landed unchanged needs no content merge",
+        "only when no commit Nyx tried matched and the check could not finish",
         "`unreachable`, `not_found`, `authentication_failed`, `timed_out` or `failed`",
         "`branches <basis> local-only <n>`",
         "`default <name> live <relation> cached <relation> tracking live <relation> "
@@ -244,7 +251,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "a branch with its own root commit, sharing no history with the base, is judged the same way",
         "it writes to no repository and does not even touch the modification time of an object file",
         "can still read `not_merged` when the landing commit left a binary file",
-        "make the verdict `unknown` with the reason `history_limit`, never `merged`",
+        "`unknown` with the reason `history_limit`, never `merged`, only when no commit",
+        "more than 16 content merges, or more than eight base commits with the identity",
         "`tree_equal`: the branch's file contents are identical",
         "`not_merged` has the rung `none`",
         "`no_base`",

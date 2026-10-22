@@ -210,10 +210,13 @@ touch the modification time of an object file. A branch can still read
 submodule differently from the branch, so no content merge applies, or when the
 content merge of a text file does not reproduce the file the commit left (a
 conflict, a landing resolved by hand, or one made with another diff algorithm
-than the default). More than eight base commits with one identity, a file over
-1 MiB, a change touching more than 5,000 files or needing more than 16 content
-merges make the verdict `unknown` with the reason `history_limit`, never
-`merged`. `tree_equal`: the branch's file contents are identical to the content of
+than the default). Nyx tries the eight newest base commits with
+the identity, and a match among them proves `merged`; a file over 1 MiB that
+landed unchanged needs no content merge, so it does not prevent that. The verdict
+is `unknown` with the reason `history_limit`, never `merged`, only when no commit
+Nyx tried matched and the check could not finish: a landing that needed a content
+merge of a file over 1 MiB, a landing that touched more than 5,000 paths or needed
+more than 16 content merges, or more than eight base commits with the identity. `tree_equal`: the branch's file contents are identical to the content of
 some commit on the base. `not_merged` has the rung `none`: every rung that could
 run found nothing. An `unknown` verdict has no rung and one of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
