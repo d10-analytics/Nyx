@@ -235,6 +235,11 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
         return 1
+    except OSError as error:
+        # The verdict work needs a scratch directory; without one there is no document.
+        reason = error.strerror or type(error).__name__
+        print(f"nyx: checkouts: unable to collect ({reason})", file=sys.stderr)
+        return 1
     if as_json:
         print(rendered)
     else:
