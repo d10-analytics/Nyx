@@ -168,9 +168,10 @@ Whether each local branch is already merged into the remote's default branch
 is a verdict, and appears only in the `--json` document: the plain lines above
 are unchanged and show no verdicts. In each clone, `verdict_base` names the
 default branch the verdicts are judged against, its commit, and its `basis`.
-The branch is the remote's default branch, or, when the remote did not answer,
-the name the clone's own remote-tracking copy points to, or the name every clone
-of the remote agrees on. The `live` basis is the remote's current commit for
+The branch is the remote's default branch, or, when the remote did not answer
+or has no default branch (an empty remote, or one with a detached `HEAD`), the
+name the clone's own remote-tracking copy points to, or the name every clone of
+the remote agrees on. The `live` basis is the remote's current commit for
 that name, taken from the clone itself or borrowed read-only from a sibling
 clone that has it (named in `objects_from`). The `cached` basis, "base stale",
 is the clone's own remote-tracking copy of that branch, which can be older than
@@ -239,7 +240,8 @@ needed. It stores only verdicts decided in full by git 2.39 or later in a clone
 that is neither shallow nor partial, and only for the rungs other than
 `ancestor`, together with the `not_merged` answer. A remembered answer is used
 only in place of an `unknown` verdict that this run could not decide for lack of
-time, a failed call, a size bound or a clone limit. It never replaces a verdict the run decides itself, so a warm
+time, a failed call, a size bound, a shallow or partial clone or a git older than
+2.39. It never replaces a verdict the run decides itself, so a warm
 run differs from a cold run only where the cold run says `unknown`: the
 warm run may give the remembered verdict instead, whatever the reason
 (`incomplete_clone`, `git_too_old`, `history_limit`, `deadline` or `failed`).
@@ -309,9 +311,14 @@ remote until you fetch.
 
 The command is read-only: it changes no repository, takes no git lock, writes
 no alternates file and never fetches, so asking a remote leaves every clone as
-it was. Its only write is the verdict cache file, which changes no repository. It exits 0 whenever it can print a document, including when git is
+it was. Its only lasting write is the verdict cache file, which changes no
+repository: the temporary files that hold git's output and the copies of file
+contents it compares are made in the system's temporary directory and removed
+before it exits. It exits 0 whenever it can print a document, including when git is
 missing, a folder is unavailable or a remote check failed; it exits 1 with one
-line only when the configuration is unavailable or the document exceeds 2 MiB.
+line only when the configuration is unavailable, the document exceeds 2 MiB, or
+a temporary file or directory it needs cannot be made, which it reports as
+`nyx: checkouts: unable to collect (<reason>)`.
 With no folders configured it says `no checkout folders are configured` and
 exits 0.
 

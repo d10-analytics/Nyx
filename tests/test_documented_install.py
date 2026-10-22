@@ -198,6 +198,10 @@ CHECKOUT_RETIRED_WORDING = (
     "`unknown` with the reason `history_limit`, never `merged`.",
     "a landing that touched more than 5,000 paths or needed more than 16 content merges",
     "`history_limit` depends on the other branches in the clone",
+    "Its only write is the verdict cache file",
+    "line only when the configuration is unavailable or the document exceeds 2 MiB",
+    "or, when the remote did not answer, the name the clone's own remote-tracking copy",
+    "a failed call, a size bound or a clone limit",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -235,8 +239,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "Checkout folders are set per workspace",
         "A settings editor arrives with the Checkouts view",
         "cannot be combined with `--setup`, `--stop` or `--status`",
-        "exits 1 with one line only when the configuration is unavailable "
-        "or the document exceeds 2 MiB",
+        "exits 1 with one line only when the configuration is unavailable, the document "
+        "exceeds 2 MiB, or a temporary file or directory it needs cannot be made",
+        "`nyx: checkouts: unable to collect (<reason>)`",
         "`no checkout folders are configured`",
         "`checkout_cache_unreadable` and `checkout_cache_write_failed`",
         "appears only in the `--json` document: the plain lines above are unchanged",
@@ -303,7 +308,11 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`~/.nyx/cache/checkouts.json`",
         "The cache is used only when `~/.nyx` already exists",
         "Deleting it only costs time",
-        "Its only write is the verdict cache file, which changes no repository",
+        "Its only lasting write is the verdict cache file, which changes no repository",
+        "are made in the system's temporary directory and removed before it exits",
+        "when the remote did not answer or has no default branch (an empty remote, or one "
+        "with a detached `HEAD`)",
+        "a size bound, a shallow or partial clone or a git older than 2.39",
     ),
     "docs/workspaces.md": (
         '"schema_version": 4',
