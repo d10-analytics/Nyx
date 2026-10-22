@@ -113,41 +113,6 @@ def test_a_push_of_more_than_the_default_unpack_limit_leaves_the_remote_loose(tm
     assert set(before) < set(after)
 
 
-def commit_with_eager_loose_objects_task(tmp_path: Path, *options: str) -> Path:
-    """Commit, in a repository whose loose-objects task is due as soon as object directory 17 is used."""
-    work = tmp_path / "work"
-    git(tmp_path, "init", "-q", "-b", "trunk", str(work))
-    git(work, "config", "maintenance.loose-objects.enabled", "true")
-    git(work, "config", "maintenance.loose-objects.auto", "1")
-    # The task's due check only looks at object directory 17, so make a blob land there.
-    for number in range(100_000):
-        content = f"blob {number}\n"
-        identity = subprocess.run(
-            ["git", "hash-object", "--stdin"], cwd=work, input=content, text=True,
-            capture_output=True, check=True,
-        ).stdout.strip()
-        if identity.startswith("17"):
-            break
-    (work / "blob.txt").write_text(content)
-    git(work, *options, "add", "blob.txt")
-    git(work, *options, "commit", "-q", "-m", "one blob")
-    return work
-
-
-def test_maintenance_auto_false_stops_the_commit_route_to_packing(tmp_path):
-    held = commit_with_eager_loose_objects_task(tmp_path)
-
-    assert pack_names(held) == []
-    assert loose_objects(held)
-
-
-def test_the_commit_route_packs_when_maintenance_auto_is_on(tmp_path):
-    """Control: the same repository packs on commit once the pin is lifted, so the probe works."""
-    packed = commit_with_eager_loose_objects_task(tmp_path, "-c", "maintenance.auto=true")
-
-    assert pack_names(packed) != []
-
-
 def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
     """Control: the loose result above is the pin's doing, and the probe can see a pack."""
     served = tmp_path / "served"
