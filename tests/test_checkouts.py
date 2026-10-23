@@ -1820,7 +1820,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
         local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
-        verdict_base=None, containment=None,
+        verdict_base=None, containment=None, removable_count=None,
     )
     return clone_document
 
@@ -6130,7 +6130,7 @@ def count_tip_equality(monkeypatch) -> list[int]:
 
 CLONE_FACTS = (
     "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
-    "stash_count", "worktrees", "branches", "verdict_base", "containment",
+    "stash_count", "worktrees", "branches", "verdict_base", "containment", "removable_count",
 )
 
 
@@ -6969,3 +6969,508 @@ def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
             del branch["contained_in"]
     with pytest.raises(models.ProtocolError, match="schema"):
         models.parse_checkouts(redigest(previous))
+
+
+# ---------------------------------------------------------------------------
+# Removable verdicts
+# ---------------------------------------------------------------------------
+
+BLOCKER_ONLY_NAMES = (
+    "verdict_unknown",
+    "checked_out_in_main_worktree",
+    "worktree_not_clean",
+    "worktree_locked",
+    "not_clean",
+)
+NO_CHANGES = {"staged": 0, "unstaged": 0, "untracked": 0, "conflicted": 0}
+
+
+def blockers_of(verdict: dict[str, Any] | None) -> list[str] | None:
+    if verdict is None:
+        return None
+    assert verdict["removable"] is (verdict["blockers"] == [])
+    return list(verdict["blockers"])
+
+
+def removable_view(clone_document: dict[str, Any]) -> dict[str, Any]:
+    """Every blocker list of a clone, keyed by branch name and worktree path."""
+    count = clone_document["removable_count"]
+    branches = {item["name"]: blockers_of(item["removable"]) for item in clone_document["branches"]}
+    worktrees = {item["path"]: blockers_of(item["removable"]) for item in clone_document["worktrees"]}
+    removable_branches = sum(1 for blockers in branches.values() if blockers == [])
+    removable_worktrees = sum(1 for blockers in worktrees.values() if blockers == [])
+    assert count == {"branches": removable_branches, "worktrees": removable_worktrees}
+    return {"branches": branches, "worktrees": worktrees, "count": count}
+
+
+def expected_view(
+    work: Path,
+    branches: dict[str, list[str] | None],
+    worktrees: dict[Path, list[str]] | None = None,
+    *,
+    count: tuple[int, int],
+    main: bool = True,
+) -> dict[str, Any]:
+    paths = {real(path): blockers for path, blockers in (worktrees or {}).items()}
+    if main:
+        paths[real(work)] = None
+    return {
+        "branches": branches,
+        "worktrees": paths,
+        "count": {"branches": count[0], "worktrees": count[1]},
+    }
+
+
+def land(work: Path, name: str, *, merged: bool = True) -> None:
+    """Make branch ``name`` of two commits and, by default, squash-merge it into ``trunk``."""
+    git(work, "checkout", "-q", "-b", name, "trunk")
+    commit_file(work, f"{name}-1.txt", f"{name} one\n")
+    commit_file(work, f"{name}-2.txt", f"{name} two\n")
+    git(work, "checkout", "-q", "trunk")
+    if merged:
+        git(work, "merge", "--squash", name)
+        git(work, "commit", "-q", "-m", f"land {name}")
+        git(work, "push", "-q", "origin", "trunk")
+
+
+def linked(work: Path, tmp_path: Path, name: str, *arguments: str) -> Path:
+    """Add a linked worktree; ``arguments`` are any options and then the commit-ish it holds."""
+    destination = tmp_path / f"wt-{name}"
+    *options, commit_ish = arguments
+    git(work, "worktree", "add", "-q", *options, str(destination), commit_ish)
+    return destination
+
+
+def removable_of(folder: Path, work: Path) -> dict[str, Any]:
+    return find_clone(collect([folder]), work)
+
+
+def test_a_squash_merged_branch_that_is_not_checked_out_is_removable(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    before = snapshot(work)
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, work)
+    assert verdicts_of(clone_document)["alder"] == MERGED_SQUASH
+    assert removable_view(clone_document) == expected_view(
+        work, {"alder": [], "birch": ["not_merged"], "trunk": None}, count=(1, 0)
+    )
+    assert document["diagnostics"] == []
+    assert snapshot(work) == before
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_untracked_files_block_a_worktree_and_its_branch_but_ignored_files_do_not(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch", "cedar"):
+        land(work, name)
+    (work / ".git" / "info" / "exclude").write_text("build/\n")
+    dirty = linked(work, tmp_path, "dirty", "alder")
+    ignoring = linked(work, tmp_path, "ignoring", "birch")
+    clean = linked(work, tmp_path, "clean", "cedar")
+    (dirty / "scratch.txt").write_text("x\n")
+    (ignoring / "build").mkdir()
+    (ignoring / "build" / "out.bin").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, dirty)["changes"] == {**NO_CHANGES, "untracked": 1}
+    assert find_worktree(clone_document, ignoring)["changes"] == NO_CHANGES
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "birch": [], "cedar": [], "trunk": None},
+        {dirty: ["not_clean"], ignoring: [], clean: []},
+        count=(2, 2),
+    )
+
+
+def stage(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("staged\n")
+    git(worktree, "add", "file.txt")
+
+
+def modify(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("unstaged\n")
+
+
+def start_bisect(worktree: Path) -> None:
+    git(worktree, "bisect", "start")
+
+
+def stop_at_a_break(worktree: Path) -> None:
+    editor = worktree.parent / "break-editor.sh"
+    editor.write_text('#!/bin/sh\nprintf "break\\n" | cat - "$1" > "$1.new" && mv "$1.new" "$1"\n')
+    editor.chmod(0o755)
+    environment = {**os.environ, "GIT_SEQUENCE_EDITOR": str(editor)}
+    result = subprocess.run(
+        ["git", "rebase", "-q", "-i", "trunk"], cwd=worktree, env=environment,
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def conflict_on_pop(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("mine\n")
+    git(worktree, "stash", "-q")
+    git(worktree, "reset", "-q", "--hard", "trunk")
+    git(worktree, "stash", "pop", check=False)
+
+
+def lock_the_index(worktree: Path) -> None:
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir").stdout.strip())
+    (git_dir / "index.lock").write_text("")
+
+
+NOT_CLEAN_SOURCES = {
+    "staged": (stage, {**NO_CHANGES, "staged": 1}, [], False),
+    "unstaged": (modify, {**NO_CHANGES, "unstaged": 1}, [], False),
+    "bisect": (start_bisect, NO_CHANGES, ["bisect"], False),
+    "conflicts": (conflict_on_pop, {**NO_CHANGES, "conflicted": 1}, [], False),
+    "index_lock": (lock_the_index, NO_CHANGES, [], True),
+}
+
+
+@pytest.mark.parametrize("source", list(NOT_CLEAN_SOURCES))
+def test_each_kind_of_unfinished_work_alone_makes_a_worktree_not_clean(tmp_path, source):
+    trigger, changes, operations, index_lock = NOT_CLEAN_SOURCES[source]
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    commit_file(work, "file.txt", "theirs\n", "move the shared file")
+    git(work, "push", "-q", "origin", "trunk")
+    held = linked(work, tmp_path, "held", "alder")
+    trigger(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert (document["changes"], document["operations"], document["index_lock"]) == (
+        changes, operations, index_lock
+    )
+    assert document["status"] == "ok"
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {held: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the sequence editor is a shell script")
+def test_an_interactive_rebase_stopped_at_a_break_makes_a_clean_tree_not_clean(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    commit_file(work, "later.txt", "later\n")
+    git(work, "push", "-q", "origin", "trunk")
+    held = linked(work, tmp_path, "held", "alder")
+    stop_at_a_break(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert (document["changes"], document["operations"]) == (NO_CHANGES, ["rebase"])
+    assert document["status"] == "ok"
+    assert blockers_of(document["removable"]) == ["not_clean"]
+
+
+def test_a_lock_blocks_a_clean_worktree_and_stacks_after_its_other_blockers(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    quiet = linked(work, tmp_path, "quiet", "alder")
+    busy = linked(work, tmp_path, "busy", "birch")
+    for held in (quiet, busy):
+        git(work, "worktree", "lock", str(held))
+    (busy / "scratch.txt").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {
+            "alder": ["worktree_locked"],
+            "birch": ["worktree_not_clean", "worktree_locked"],
+            "trunk": None,
+        },
+        {quiet: ["locked"], busy: ["not_clean", "locked"]},
+        count=(0, 0),
+    )
+
+
+@pytest.mark.parametrize("branch", ["alder", "birch"])
+def test_a_branch_checked_out_in_the_main_worktree_is_blocked_for_it(tmp_path, branch):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    git(work, "checkout", "-q", branch)
+
+    clone_document = removable_of(folder, work)
+
+    expected = {
+        "alder": ["checked_out_in_main_worktree"],
+        "birch": ["not_merged"],
+        "trunk": None,
+    }
+    if branch == "birch":
+        expected = {"alder": [], "birch": ["not_merged", "checked_out_in_main_worktree"], "trunk": None}
+    assert removable_view(clone_document) == expected_view(
+        work, expected, count=(1 if branch == "birch" else 0, 0)
+    )
+
+
+def test_a_worktree_on_an_unmerged_branch_lists_the_merge_state_before_its_dirt(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "birch", merged=False)
+    held = linked(work, tmp_path, "held", "birch")
+    (held / "scratch.txt").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"birch": ["not_merged", "worktree_not_clean"], "trunk": None},
+        {held: ["not_merged", "not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_a_detached_worktree_is_judged_by_the_commit_it_holds(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    on_merged = linked(work, tmp_path, "merged", "--detach", rev(work, "alder"))
+    on_unmerged = linked(work, tmp_path, "unmerged", "--detach", rev(work, "birch"))
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, on_merged)["head"]["branch"] is None
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": [], "birch": ["not_merged"], "trunk": None},
+        {on_merged: [], on_unmerged: ["not_merged"]},
+        count=(1, 1),
+    )
+
+
+def test_a_clone_with_no_base_blocks_everything_and_counts_nothing(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = folder / "work"
+    git(folder, "init", "-q", "-b", "trunk", str(work))
+    commit_file(work, "file.txt", "one\n")
+    land(work, "alder", merged=False)
+    git(work, "branch", "birch")
+    held = linked(work, tmp_path, "held", "alder")
+    adrift = linked(work, tmp_path, "adrift", "--detach", "birch")
+
+    clone_document = removable_of(folder, work)
+
+    assert clone_document["verdict_base"] is None
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {
+            "alder": ["verdict_unknown"],
+            "birch": ["verdict_unknown"],
+            "trunk": ["verdict_unknown", "checked_out_in_main_worktree"],
+        },
+        {held: ["verdict_unknown"], adrift: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_verdict_that_could_not_be_decided_blocks_a_branch_and_the_worktree_on_it(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch")
+    held = linked(work, tmp_path, "held", "alder")
+    monkeypatch.setattr(checkouts, "OWN_COMMIT_CAP", 1)
+
+    clone_document = removable_of(folder, work)
+
+    assert verdicts_of(clone_document)["alder"] == unknown("history_limit")
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["verdict_unknown"], "birch": ["verdict_unknown"], "trunk": None},
+        {held: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_on_a_branch_without_a_verdict_is_unknown(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    git(work, "checkout", "-q", "alder")
+    on_base = linked(work, tmp_path, "base", "trunk")
+    unborn = linked(work, tmp_path, "unborn", "--detach", "trunk")
+    git(unborn, "checkout", "-q", "--orphan", "fresh")
+    git(unborn, "rm", "-rfq", ".")
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, unborn)["head"] == {"branch": "fresh", "sha": None}
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["checked_out_in_main_worktree"], "trunk": None},
+        {on_base: ["verdict_unknown"], unborn: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_whose_directory_is_gone_blocks_nothing_but_its_own_verdict_and_lock(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    land(work, "cedar", merged=False)
+    gone = linked(work, tmp_path, "gone", "alder")
+    adrift = linked(work, tmp_path, "adrift", "--detach", rev(work, "birch"))
+    elsewhere = linked(work, tmp_path, "elsewhere", "cedar")
+    shutil.rmtree(gone)
+    shutil.rmtree(adrift)
+    shutil.rmtree(elsewhere)
+
+    clone_document = removable_of(folder, work)
+
+    for path in (gone, adrift, elsewhere):
+        document = find_worktree(clone_document, path)
+        assert document["prunable"] is True and document["status"] == "failed"
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": [], "birch": [], "cedar": ["not_merged"], "trunk": None},
+        {gone: [], adrift: ["verdict_unknown"], elsewhere: ["not_merged"]},
+        count=(2, 1),
+    )
+
+
+def test_a_locked_worktree_whose_directory_is_gone_is_not_prunable_and_so_not_clean(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    held = linked(work, tmp_path, "held", "alder")
+    git(work, "worktree", "lock", str(held))
+    shutil.rmtree(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert document["locked"] is True and document["prunable"] is False
+    assert document["status"] == "failed"
+    assert_unreadable(document)
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(held)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean", "worktree_locked"], "trunk": None},
+        {held: ["not_clean", "locked"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_with_an_unreadable_git_pointer_is_not_clean_and_so_is_its_branch(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    broken = linked(work, tmp_path, "broken", "alder")
+    replace_git_marker(broken, "garbage\n")
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, broken)
+    assert document["status"] == "failed" and document["prunable"] is False
+    assert_unreadable(document)
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(broken)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {broken: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_a_bare_clone_counts_its_removable_items_and_blocks_no_branch_for_a_main_worktree(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = clone(remote, tmp_path / "source")
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    land(work, "cedar")
+    git(work, "push", "-q", "origin", "alder", "birch", "cedar")
+    bare = tmp_path / "bare.git"
+    git(tmp_path, "clone", "-q", "--bare", str(remote), str(bare))
+    # The bare clone's own HEAD names a merged branch; nothing else holds it.
+    git(bare, "symbolic-ref", "HEAD", "refs/heads/cedar")
+    for branch in ("trunk", "alder", "birch", "cedar"):
+        git(bare, "update-ref", f"refs/remotes/origin/{branch}", rev(bare, f"refs/heads/{branch}"))
+    git(bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    held = folder / "held"
+    git(bare, "worktree", "add", "-q", str(held), "alder")
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, bare)
+    assert clone_document["bare"] is True and main_worktree_count(clone_document) == 0
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert removable_view(clone_document) == expected_view(
+        bare,
+        {"alder": [], "birch": ["not_merged"], "cedar": [], "trunk": None},
+        {held: []},
+        count=(2, 1),
+        main=False,
+    )
+
+
+def worktree_state(worktree: Path) -> tuple[Any, ...]:
+    """The files of one worktree and the commit it holds, read without running status."""
+    files = {
+        item.relative_to(worktree).as_posix(): item.read_bytes()
+        for item in worktree.rglob("*")
+        if item.is_file() and ".git" not in item.relative_to(worktree).parts[:1]
+    }
+    return files, rev(worktree, "HEAD")
+
+
+def test_a_dirty_main_worktree_on_another_branch_changes_only_that_branch(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch", "cedar"):
+        land(work, name)
+    land(work, "dogwood", merged=False)
+    held = linked(work, tmp_path, "held", "birch")
+    (held / "scratch.txt").write_text("x\n")
+    quiet = linked(work, tmp_path, "quiet", "cedar")
+    before = removable_view(removable_of(folder, work))
+    assert before == expected_view(
+        work,
+        {
+            "alder": [], "birch": ["worktree_not_clean"], "cedar": [], "dogwood": ["not_merged"],
+            "trunk": None,
+        },
+        {held: ["not_clean"], quiet: []},
+        count=(2, 1),
+    )
+    git(work, "checkout", "-q", "alder")
+    (work / "dirty.txt").write_text("x\n")
+    states = {path: worktree_state(path) for path in (work, held, quiet)}
+    refs = git(work, "for-each-ref").stdout
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    after = removable_view(removable_of(folder, work))
+
+    assert after == {
+        **before,
+        "branches": {**before["branches"], "alder": ["checked_out_in_main_worktree"]},
+        "count": {"branches": 1, "worktrees": 1},
+    }
+    assert {path: worktree_state(path) for path in states} == states
+    assert git(work, "for-each-ref").stdout == refs
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_the_collector_names_no_blocker_that_only_the_derivation_decides():
+    source = Path(checkouts.__file__).read_text()
+
+    assert [name for name in BLOCKER_ONLY_NAMES if name in source] == []
+    assert "derive_removable" in source
