@@ -208,6 +208,7 @@ CHECKOUT_RETIRED_WORDING = (
     "Two cases have no verdict to wait for, so no local action clears them",
     "A worktree whose directory is gone, shown with the status `failed` and `prunable`",
     "A branch that holds nothing its larger sibling lacks is folded",
+    "is fixed, by fetching, deepening a shallow clone or upgrading git",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -272,6 +273,11 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "It is a fact about data loss, not a prediction of any cleanup tool's checks",
         "`not_merged`, cleared when the branch is merged into the base",
         "`verdict_unknown`, cleared when the cause of its `unknown` verdict is fixed",
+        "a later run that finishes in time with no failing git call decides a `deadline` "
+        "or `failed` verdict",
+        "a branch too large to check, `history_limit`, stays blocked until its commits are "
+        "in the base's history or the branch changes to fit the bounds",
+        "is fixed, in the same ways as a branch's, and a later run then decides it",
         "`checked_out_in_main_worktree`, cleared by switching the main worktree to another branch",
         "`worktree_not_clean` and `worktree_locked`, cleared by cleaning that worktree and "
         "unlocking it",

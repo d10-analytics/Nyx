@@ -331,8 +331,12 @@ linked worktree of a clone a `removable` value, `{removable, blockers}`, where
 exactly when it is. The base branch and the main worktree have none, and the
 main worktree is never offered for removal. A branch's blockers are
 `not_merged`, cleared when the branch is merged into the base; `verdict_unknown`,
-cleared when the cause of its `unknown` verdict is fixed, by fetching, deepening a
-shallow clone or upgrading git; `checked_out_in_main_worktree`, cleared by
+cleared when the cause of its `unknown` verdict is fixed: a clone with no base gets
+one once it has an `origin` remote and has fetched its default branch, deepening a
+shallow clone or upgrading git lifts those limits, and a later run that finishes in
+time with no failing git call decides a `deadline` or `failed` verdict, but a branch
+too large to check, `history_limit`, stays blocked until its commits are in the
+base's history or the branch changes to fit the bounds; `checked_out_in_main_worktree`, cleared by
 switching the main worktree to another branch; and, for a linked worktree that
 holds the branch, `worktree_not_clean` and `worktree_locked`, cleared by
 cleaning that worktree and unlocking it. A branch held by a linked
@@ -343,8 +347,7 @@ removing it is safe. A linked worktree's blockers are `not_merged` and
 `not_clean`; and `locked`, cleared by unlocking it. A worktree's `not_merged` is
 cleared when its work lands on the remote's default branch and a later run sees
 it there. Its `verdict_unknown` is cleared when the cause of the `unknown`
-verdict is fixed, by fetching, deepening a shallow clone or upgrading git, and a
-later run then decides it. A worktree on the base branch, or on a branch with
+verdict is fixed, in the same ways as a branch's, and a later run then decides it. A worktree on the base branch, or on a branch with
 no commits yet, has no branch verdict that shows its commit is merged, so it stays
 `verdict_unknown` while it is on that branch. Moving it to another branch or
 removing it changes that, and a first commit on the unborn branch gives the branch
