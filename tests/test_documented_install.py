@@ -202,6 +202,13 @@ CHECKOUT_RETIRED_WORDING = (
     "line only when the configuration is unavailable or the document exceeds 2 MiB",
     "or, when the remote did not answer, the name the clone's own remote-tracking copy",
     "a failed call, a size bound or a clone limit",
+    "the plain lines above are unchanged and show no verdicts",
+    "The plain lines are otherwise unchanged.",
+    "the plain lines show only the Removable summary described below, never a verdict",
+    "Two cases have no verdict to wait for, so no local action clears them",
+    "A worktree whose directory is gone, shown with the status `failed` and `prunable`",
+    "A branch that holds nothing its larger sibling lacks is folded",
+    "is fixed, by fetching, deepening a shallow clone or upgrading git",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -244,7 +251,61 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`nyx: checkouts: unable to collect (<reason>)`",
         "`no checkout folders are configured`",
         "`checkout_cache_unreadable` and `checkout_cache_write_failed`",
-        "appears only in the `--json` document: the plain lines above are unchanged",
+        "appears only in the `--json` document: the plain lines never show a branch's "
+        "verdict itself, only the Removable summary described below",
+        "A non-default branch is contained in another non-default local branch of the same clone",
+        "A patch-identity match follows the change's patch, not the place it landed",
+        "so it also groups a change whose identical hunk sits at a different place in the "
+        "container's own history",
+        "the grouping then names a container that does not hold the change",
+        "This is a grouping only, never a statement about removal",
+        "a branch folds under the container with the fewest own commits, provided that "
+        "container has strictly more than the branch",
+        "Two branches at the same commit never fold into each other",
+        "A branch with more than 2,000 own commits neither folds nor contains",
+        "`containment` is one of six values",
+        "`complete`: every branch was examined",
+        "`deadline`: the 60 seconds ran out first, or a single git call reached its 10-second cap",
+        "`failed`: a git call failed",
+        "`no_base`: the clone has no base to measure own commits from",
+        "`incomplete`: the clone is shallow or partial",
+        "`git_too_old`: git is older than 2.39",
+        "It is a fact about data loss, not a prediction of any cleanup tool's checks",
+        "`not_merged`, cleared when the branch is merged into the base",
+        "`verdict_unknown`, cleared when the cause of its `unknown` verdict is fixed",
+        "a later run that finishes in time with no failing git call decides a `deadline` "
+        "or `failed` verdict",
+        "a branch too large to check, `history_limit`, stays blocked until its commits are "
+        "in the base's history or the branch changes to fit the bounds",
+        "is fixed, in the same ways as a branch's, and a later run then decides it",
+        "`checked_out_in_main_worktree`, cleared by switching the main worktree to another branch",
+        "`worktree_not_clean` and `worktree_locked`, cleared by cleaning that worktree and "
+        "unlocking it",
+        "`not_clean` is cleared by committing, stashing or discarding",
+        "`locked`, cleared by unlocking it",
+        "A worktree's `not_merged` is cleared when its work lands on the remote's default "
+        "branch and a later run sees it there",
+        "Its `verdict_unknown` is cleared when the cause of the `unknown` verdict is fixed",
+        "A worktree on the base branch, or on a branch with no commits yet, has no branch "
+        "verdict that shows its commit is merged, so it stays `verdict_unknown` while it is "
+        "on that branch",
+        "a first commit on the unborn branch gives the branch a normal verdict on the next run",
+        "A worktree whose directory is gone and that is not locked, shown with the status "
+        "`failed` and `prunable`",
+        "Git stops calling a locked worktree prunable, so a locked worktree whose directory "
+        "is gone reads as unreadable: it is `not_clean` and `locked`, its branch is "
+        "`worktree_not_clean` and `worktree_locked`, and its plain line is "
+        "`failed blocker not_clean`",
+        "Unlocking it lets a later run read it as prunable",
+        "is `not_clean` for as long as it cannot be read, and stays blocked until it is "
+        "readable again or is removed",
+        "Ignored files never block",
+        "A clone's `removable_count` gives `branches` and `worktrees`",
+        "a branch and the worktree holding it count once each",
+        "a clone line ends with `removable <b> branches, <w> worktrees`",
+        "Each linked worktree line ends with `removable` or `blocker <first blocker>`",
+        "`failed removable` is a worktree whose directory is gone and whose branch is merged",
+        "keeps its `<path> <status>` line and gains no count",
         "`verdict_base` names the default branch the verdicts are judged against",
         '"base stale"',
         "which can be older than the remote until you fetch",
@@ -292,7 +353,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "branch included)",
         "so it shows no facts and no verdicts",
         "lends them no objects and takes no part in choosing their default branch name",
-        "The plain lines are otherwise unchanged",
+        "A checkout that could not be read has no Removable elements",
         "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",

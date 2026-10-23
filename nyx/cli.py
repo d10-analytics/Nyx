@@ -194,15 +194,27 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
                 elements.append("no origin remote")
             else:
                 elements.extend(_remote_and_default_elements(clone, remote))
+            counts = clone["removable_count"]
+            elements.append(
+                f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
+            )
             lines.append("  ".join([path, *elements]))
             for worktree in clone["worktrees"]:
                 if worktree["main"]:
                     continue
                 wpath = _json_literal(worktree["path"])
+                removable = worktree["removable"]
+                verdict = (
+                    "removable"
+                    if removable["removable"]
+                    else f"blocker {removable['blockers'][0]}"
+                )
                 if worktree["status"] != "ok":
-                    lines.append(f"  {wpath}  {worktree['status']}")
+                    lines.append(f"  {wpath}  {worktree['status']}  {verdict}")
                 else:
-                    lines.append("  ".join([f"  {wpath}", *_worktree_elements(worktree)]))
+                    lines.append(
+                        "  ".join([f"  {wpath}", *_worktree_elements(worktree), verdict])
+                    )
     return lines
 
 

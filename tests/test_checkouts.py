@@ -325,14 +325,14 @@ def main_worktree_count(clone_document: dict[str, Any]) -> int:
     return sum(1 for item in clone_document["worktrees"] if item["main"])
 
 
-def test_worktree_without_its_git_file_is_prunable_and_unattached(tmp_path):
+def test_worktree_whose_directory_is_gone_is_prunable_and_unattached(tmp_path):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
     repository = clone(remote, folder / "repo")
     gone = folder / "gone"
     git(repository, "worktree", "add", "-q", str(gone), "-b", "gone")
-    (gone / ".git").unlink()
+    shutil.rmtree(gone)
 
     document = collect([folder])
 
@@ -1282,6 +1282,34 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(document))
 
 
+def rederive(document: dict[str, Any]) -> dict[str, Any]:
+    """Give every ``ok`` clone the Removable fields its present facts derive.
+
+    A clone whose facts the derivation cannot read (a mutation that broke their
+    shape) keeps its fields: the structural checks refuse it before they matter.
+    """
+    for item in all_clones(document):
+        if item["status"] != "ok":
+            continue
+        try:
+            derived = models.derive_removable(item)
+        except (KeyError, TypeError):
+            continue
+        for branch, verdict in zip(item["branches"], derived["branches"]):
+            branch["removable"] = verdict
+        for worktree, verdict in zip(item["worktrees"], derived["worktrees"]):
+            worktree["removable"] = verdict
+        item["removable_count"] = derived["removable_count"]
+    return document
+
+
+def refusal_of(document: dict[str, Any]) -> str:
+    """Return the message of the refusal of ``document``, which must carry a valid digest."""
+    with pytest.raises(models.ProtocolError) as error:
+        models.parse_checkouts(redigest(document))
+    return str(error.value)
+
+
 def first_clone(document: dict[str, Any]) -> dict[str, Any]:
     return document["repositories"][0]["clones"][0]
 
@@ -1405,7 +1433,8 @@ def mutate_prunable_ok(document):
         mutate_comparison_counts("unknown"),
         mutate_counts_contradict,
         mutate_schema(1),
-        mutate_schema(3),
+        mutate_schema(2),
+        mutate_schema(4),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1432,8 +1461,7 @@ def test_parser_rejects_a_contract_violation(sample, mutation):
     document, _folder = sample
     broken = doc_copy(document)
     mutation(broken)
-    with pytest.raises(models.ProtocolError):
-        models.parse_checkouts(redigest(broken))
+    assert "removable" not in refusal_of(rederive(broken))
 
 
 def test_parser_rejects_a_changed_field_with_the_old_digest(sample):
@@ -1498,6 +1526,7 @@ def undecided_without_a_base(document):
     """Drop the first clone's base, as for a group that agrees on no default name."""
     clone_document = first_clone(document)
     clone_document["verdict_base"] = None
+    clone_document["containment"] = "no_base"
     for branch in clone_document["branches"]:
         branch["verdict"] = verdict_of("unknown", reason="no_base")
 
@@ -1692,8 +1721,7 @@ def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sampl
     assert models.parse_checkouts(redigest(doc_copy(document)))
     broken = doc_copy(document)
     REJECTED_VERDICT_DOCUMENTS[mutation](broken)
-    with pytest.raises(models.ProtocolError):
-        models.parse_checkouts(redigest(broken))
+    assert "removable" not in refusal_of(rederive(broken))
 
 
 def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
@@ -1708,7 +1736,7 @@ def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
     for shape in shapes:
         accepted = doc_copy(document)
         other_branches(first_clone(accepted))[0]["verdict"] = shape
-        assert models.parse_checkouts(redigest(accepted))
+        assert models.parse_checkouts(redigest(rederive(accepted)))
 
 
 def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
@@ -1738,7 +1766,7 @@ def test_parser_accepts_a_clone_with_a_base_and_no_other_branch(sample):
         item for item in clone_document["branches"] if item["name"] == "trunk"
     ]
     assert clone_document["verdict_base"] is not None
-    assert models.parse_checkouts(redigest(accepted))
+    assert models.parse_checkouts(redigest(rederive(accepted)))
 
 
 def test_parser_accepts_documents_without_a_base(sample):
@@ -1746,7 +1774,7 @@ def test_parser_accepts_documents_without_a_base(sample):
     undecided = doc_copy(document)
     undecided_without_a_base(undecided)
     detach(undecided, verdict_of("unknown", reason="no_base"))
-    assert models.parse_checkouts(redigest(undecided))
+    assert models.parse_checkouts(redigest(rederive(undecided)))
     assert all(
         item["verdict"] == verdict_of("unknown", reason="no_base")
         for item in first_clone(undecided)["branches"]
@@ -1755,7 +1783,7 @@ def test_parser_accepts_documents_without_a_base(sample):
     remoteless = doc_copy(document)
     without_remote(remoteless)
     assert first_clone(remoteless)["verdict_base"] is None
-    assert models.parse_checkouts(redigest(remoteless))
+    assert models.parse_checkouts(redigest(rederive(remoteless)))
 
 
 def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
@@ -1763,21 +1791,24 @@ def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
     limited = doc_copy(document)
     clone_document = first_clone(limited)
     clone_document["shallow"] = True
+    clone_document["containment"] = "incomplete"
     other_branches(clone_document)[0]["verdict"] = verdict_of(
         "unknown", reason="incomplete_clone"
     )
-    assert models.parse_checkouts(redigest(limited))
+    assert models.parse_checkouts(redigest(rederive(limited)))
     clone_document["shallow"] = False
     clone_document["partial_clone"] = True
     detach(limited, verdict_of("unknown", reason="incomplete_clone"))
-    assert models.parse_checkouts(redigest(limited))
+    assert models.parse_checkouts(redigest(rederive(limited)))
 
     old = doc_copy(document)
     old["git"]["version"] = "2.38.1"
+    for item in all_clones(old):
+        item["containment"] = "git_too_old"
     other_branches(first_clone(old))[0]["verdict"] = verdict_of("unknown", reason="git_too_old")
-    assert models.parse_checkouts(redigest(old))
+    assert models.parse_checkouts(redigest(rederive(old)))
     old["git"]["version"] = "2.9.5"
-    assert models.parse_checkouts(redigest(old))
+    assert models.parse_checkouts(redigest(rederive(old)))
 
 
 def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
@@ -1799,6 +1830,8 @@ NULLABLE_CLONE_FACTS = {
     "worktrees": ([], "", 0, False),
     "branches": ([], "", 0, False),
     "verdict_base": ({}, "", [], False, 0),
+    "containment": ("complete", "", [], False, 0),
+    "removable_count": ({}, "", [], False, 0),
 }
 NULLABLE_WORKTREE_FACTS = {
     "head": ({}, "", [], False),
@@ -1814,7 +1847,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
         local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
-        verdict_base=None,
+        verdict_base=None, containment=None, removable_count=None,
     )
     return clone_document
 
@@ -1849,7 +1882,7 @@ def test_parser_limits_an_ok_clone_to_the_branch_cap(sample):
     document, _folder = sample
     at_cap = doc_copy(document)
     with_branch_count(at_cap, models.CHECKOUT_BRANCH_CAP)
-    assert models.parse_checkouts(redigest(at_cap))
+    assert models.parse_checkouts(redigest(rederive(at_cap)))
 
     over = doc_copy(document)
     with_branch_count(over, models.CHECKOUT_BRANCH_CAP + 1)
@@ -1875,11 +1908,16 @@ def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base"])
+@pytest.mark.parametrize(
+    "fact", ["stash_count", "branches", "verdict_base", "containment", "removable_count"]
+)
 def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
     document, _folder = sample
     ok_clone = first_clone(doc_copy(document))
-    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base")}
+    facts = {
+        name: ok_clone[name]
+        for name in ("stash_count", "branches", "verdict_base", "containment", "removable_count")
+    }
     broken = doc_copy(document)
     refused_clone(broken)["status"] = "too_many_branches"
     first_clone(broken)[fact] = facts[fact]
@@ -3245,7 +3283,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 2
+    assert first["schema_version"] == 3
     borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -6124,7 +6162,7 @@ def count_tip_equality(monkeypatch) -> list[int]:
 
 CLONE_FACTS = (
     "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
-    "stash_count", "worktrees", "branches", "verdict_base",
+    "stash_count", "worktrees", "branches", "verdict_base", "containment", "removable_count",
 )
 
 
@@ -6327,3 +6365,1564 @@ def test_no_git_process_starts_after_the_verdict_deadline_and_the_cache_write_la
     assert verdicts_of(find_clone(document, fast)) == CACHE_WORLD_VERDICTS
     assert document["diagnostics"] == []
     assert set(cache_entries(cache).values()) == {"patch_equivalent", "none"}
+
+
+# ---------------------------------------------------------------------------
+# Containment grouping
+# ---------------------------------------------------------------------------
+
+
+def containment_of(clone_document: dict[str, Any]) -> dict[str, str | None]:
+    return {branch["name"]: branch["contained_in"] for branch in clone_document["branches"]}
+
+
+def switch(work: Path, name: str, start: str) -> None:
+    git(work, "checkout", "-q", "-b", name, start)
+
+
+def containment_world(tmp_path: Path):
+    """One clone whose branches carry no naming convention, judged against ``origin/trunk``.
+
+    ``mid`` holds ``alpha`` by a merge commit and ``zeta`` holds ``mid`` by another
+    and cherry-picks ``pick``; ``copy`` shares ``zeta``'s tip.  ``host`` holds ``solo``
+    and nothing else.  ``synced`` is only a merge of a base commit.  The local
+    ``trunk`` is two commits ahead of ``origin/trunk``, one a cherry-pick of ``pick``.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    older = rev(work, "trunk~1")
+    switch(work, "pick", "trunk")
+    commit_file(work, "pick.txt", "pick\n")
+    switch(work, "alpha", "trunk")
+    commit_file(work, "alpha.txt", "alpha\n")
+    switch(work, "mid", "trunk")
+    commit_file(work, "mid.txt", "mid\n")
+    git(work, "merge", "-q", "--no-ff", "-m", "take alpha", "alpha")
+    switch(work, "zeta", "trunk")
+    commit_file(work, "zeta.txt", "zeta\n")
+    git(work, "merge", "-q", "--no-ff", "-m", "take mid", "mid")
+    git(work, "cherry-pick", "pick")
+    git(work, "branch", "copy", "zeta")
+    switch(work, "solo", "trunk")
+    commit_file(work, "solo.txt", "solo\n")
+    switch(work, "host", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "take solo", "solo")
+    switch(work, "stray", "trunk")
+    commit_file(work, "stray.txt", "stray\n")
+    git(work, "branch", "done", "trunk")
+    switch(work, "synced", older)
+    git(work, "merge", "-q", "--no-ff", "-m", "sync", "trunk")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "ahead.txt", "ahead\n")
+    git(work, "cherry-pick", "pick")
+    return folder, work
+
+
+CONTAINMENT_WORLD_FOLDS = {
+    "alpha": "mid",
+    "mid": "copy",
+    "pick": "copy",
+    "copy": None,
+    "zeta": None,
+    "solo": "host",
+    "host": None,
+    "stray": None,
+    "done": None,
+    "synced": None,
+    "trunk": None,
+}
+
+
+def test_branches_fold_under_the_nearest_branch_that_holds_all_their_commits(tmp_path):
+    folder, work = containment_world(tmp_path)
+    before = snapshot(work)
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, work)
+    assert clone_document["containment"] == "complete"
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert containment_of(clone_document) == CONTAINMENT_WORLD_FOLDS
+    assert document["diagnostics"] == []
+    assert snapshot(work) == before
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_a_default_branch_ahead_of_its_base_neither_contains_nor_folds(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    commit_file(work, "t2.txt", "t2\n")
+    commit_file(work, "t3.txt", "t3\n")
+    switch(work, "wide", "trunk")
+    commit_file(work, "wide.txt", "wide\n")
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"trunk": None, "wide": None}
+
+
+def test_the_default_branch_never_folds_even_when_the_pass_runs(tmp_path):
+    """``part`` shares the local default branch's tip, two commits ahead of its base,
+    and ``wide`` holds both: the pass runs and folds ``part`` but never the default branch."""
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    commit_file(work, "t2.txt", "t2\n")
+    commit_file(work, "t3.txt", "t3\n")
+    git(work, "branch", "part", "trunk")
+    switch(work, "wide", "trunk")
+    commit_file(work, "wide.txt", "wide\n")
+    git(work, "checkout", "-q", "trunk")
+
+    text = checkouts.collect_checkouts(
+        [str(folder)], deadline_ns=time.monotonic_ns() + int(60 * 1e9)
+    )
+    clone_document = find_clone(json.loads(text), work)
+
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"part": "wide", "trunk": None, "wide": None}
+    assert models.parse_checkouts(text)
+
+
+def import_chain(repository: Path, branch: str, count: int) -> None:
+    """Add ``branch`` as a chain of ``count`` commits from the current head."""
+    root = rev(repository, "HEAD")
+    stream = b"".join(
+        (
+            f"commit refs/heads/{branch}\ncommitter T <t@example.com> 1700000000 +0000\n"
+            f"data 2\nc\n{'from ' + root + chr(10) if number == 0 else ''}"
+            f"M 100644 inline c{number}.txt\ndata 2\nx\n\n"
+        ).encode("ascii")
+        for number in range(count)
+    )
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repository,
+        input=stream,
+        capture_output=True,
+        check=True,
+    )
+
+
+def test_branches_over_the_own_commit_cap_neither_fold_nor_contain(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    cap = checkouts.OWN_COMMIT_CAP
+    import_chain(work, "large-b", cap + 2)
+    git(work, "branch", "large-a", "large-b~1")
+    git(work, "branch", "tiny", f"large-b~{cap + 1}")
+    assert rev(work, "tiny") == rev(work, f"large-b~{cap + 1}")
+    assert git(work, "merge-base", "--is-ancestor", "tiny", "large-a", check=False).returncode == 0
+
+    clone_document = find_clone(collect([folder]), work)
+
+    verdicts = verdicts_of(clone_document)
+    assert verdicts["large-a"] == verdicts["large-b"] == unknown("history_limit")
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {
+        "large-a": None,
+        "large-b": None,
+        "tiny": None,
+        "trunk": None,
+    }
+
+
+def over_the_cap_world(tmp_path: Path):
+    """A clone with two branches over the own-commit cap and ``tiny`` within it."""
+    folder, _remote, work = small_world(tmp_path)
+    cap = checkouts.OWN_COMMIT_CAP
+    import_chain(work, "large-b", cap + 2)
+    git(work, "branch", "large-a", "large-b~1")
+    git(work, "branch", "tiny", f"large-b~{cap + 1}")
+    return folder, work
+
+
+def stream_tips(line: str, base: str) -> set[str]:
+    """The object ids a containment patch stream walks, apart from the base."""
+    return {word for word in line.split() if re.fullmatch(r"[0-9a-f]{40}", word)} - {base}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_the_containment_patch_stream_carries_only_branches_within_the_own_commit_cap(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = over_the_cap_world(tmp_path)
+    switch(work, "small", "trunk")
+    commit_file(work, "small.txt", "small\n")
+    git(work, "checkout", "-q", "trunk")
+    base = rev(work, "origin/trunk")
+    tips = {rev(work, name) for name in ("tiny", "small")}
+    assert not tips & {rev(work, "large-a"), rev(work, "large-b")}
+    shim, log = recording(tmp_path, "mixed")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    item = find_clone(document, work)
+    streams = containment_streams(log_lines(log, work), base)
+    assert item["containment"] == "complete"
+    assert len(streams) == 1
+    assert stream_tips(streams[0], base) == tips
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_single_branch_within_the_own_commit_cap_runs_no_patch_stream(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = over_the_cap_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    shim, log = recording(tmp_path, "single")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    item = find_clone(document, work)
+    lines = log_lines(log, work)
+    assert item["containment"] == "complete"
+    assert set(containment_of(item).values()) == {None}
+    assert containment_streams(lines, base) == []
+
+
+@pytest.mark.parametrize("trap", ["graft", "replace"])
+def test_a_graft_or_replace_ref_cannot_make_a_commit_look_held(tmp_path, trap):
+    folder, work = containment_world(tmp_path)
+    tip, stray = rev(work, "zeta"), rev(work, "stray")
+    parent = rev(work, "zeta~1")
+    if trap == "graft":
+        (work / ".git" / "info").mkdir(exist_ok=True)
+        (work / ".git" / "info" / "grafts").write_text(f"{tip} {parent} {stray}\n")
+    else:
+        git(work, "replace", "--graft", tip, parent, stray)
+    assert stray in git(work, "rev-list", "zeta").stdout.split()
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document)["stray"] is None
+    assert containment_of(clone_document) == CONTAINMENT_WORLD_FOLDS
+
+
+def test_a_base_lent_by_a_sibling_clone_still_folds_nested_branches(tmp_path):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    switch(lagging, "inner", "trunk")
+    commit_file(lagging, "inner.txt", "inner\n")
+    switch(lagging, "outer", "inner")
+    commit_file(lagging, "outer.txt", "outer\n")
+
+    document = collect([folder], remote_checks=True)
+
+    clone_document = find_clone(document, lagging)
+    assert clone_document["verdict_base"]["objects_from"] == real(holder)
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"inner": "outer", "outer": None, "trunk": None}
+
+
+# -- the pass inside the collection -----------------------------------------
+
+
+def nested_world(tmp_path: Path, tag: str = "", name: str = "work"):
+    """A clone with ``inner`` held by ``outer`` and an unrelated ``lone``."""
+    served = tmp_path / "served"
+    served.mkdir(exist_ok=True)
+    folder = tmp_path / "folder"
+    folder.mkdir(exist_ok=True)
+    remote = served / "remote.git"
+    if not remote.exists():
+        make_remote(served)
+    work = clone(remote, folder / name)
+    switch(work, "inner", "trunk")
+    commit_file(work, f"inner{tag}.txt", f"inner{tag}\n")
+    switch(work, "outer", "inner")
+    commit_file(work, f"outer{tag}.txt", f"outer{tag}\n")
+    switch(work, "lone", "trunk")
+    commit_file(work, f"lone{tag}.txt", f"lone{tag}\n")
+    git(work, "checkout", "-q", "trunk")
+    return folder, work
+
+
+NESTED_FOLDS = {"inner": "outer", "outer": None, "lone": None, "trunk": None}
+
+
+def log_lines(log: Path, repository: Path | None = None) -> list[str]:
+    lines = log.read_text().splitlines() if log.exists() else []
+    if repository is not None:
+        lines = [line for line in lines if f" -C {real(repository)} " in line]
+    return lines
+
+
+def containment_lists(lines: list[str]) -> list[str]:
+    return [line for line in lines if " rev-list " in line and "--max-count=" in line]
+
+
+def containment_streams(lines: list[str], base: str) -> list[str]:
+    """The streamed patch passes over branch tips: the revisions before ``--not <base>``."""
+    found = []
+    for line in lines:
+        words = line.split()
+        if " log " not in line or "-p" not in words or words[-3:-1] != ["--not", base]:
+            continue
+        if words[-4] != base:
+            found.append(line)
+    return found
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_the_fold_is_computed_in_every_collection_and_follows_the_recorded_tips(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = nested_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    logs = []
+    documents = []
+    for name in ("first", "second"):
+        shim, log = recording(tmp_path, name)
+        with path_with(monkeypatch, shim):
+            documents.append(collect([folder]))
+        logs.append(log)
+    first, second = documents
+
+    assert containment_of(find_clone(first, work)) == NESTED_FOLDS
+    assert second["checkouts_digest"] == first["checkouts_digest"]
+    for log in logs:
+        lines = log_lines(log)
+        assert len(containment_lists(lines)) == 3
+        assert len(containment_streams(lines, base)) == 1
+
+    # Moving one tip between runs moves the fold: nothing is served from before.
+    git(work, "checkout", "-q", "inner")
+    commit_file(work, "inner-more.txt", "more\n")
+    git(work, "checkout", "-q", "trunk")
+    moved = collect([folder])
+    assert moved["checkouts_digest"] != first["checkouts_digest"]
+    assert containment_of(find_clone(moved, work)) == {
+        "inner": None, "outer": None, "lone": None, "trunk": None
+    }
+    assert moved["diagnostics"] == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the moving stand-in is a shell script")
+def test_a_ref_moved_after_the_branches_were_listed_leaves_the_fold_on_the_recorded_tip(
+    tmp_path, monkeypatch
+):
+    folder, work = nested_world(tmp_path)
+    tip = rev(work, "outer")
+    top = rev(work, "origin/trunk")
+    real_git = shutil.which("git")
+    done = tmp_path / "moved"
+    shim = git_stand_in(
+        tmp_path,
+        f'case "$*" in *"for-each-ref --merged"*) [ -e "{done}" ] || {{ : > "{done}"; '
+        f'"{real_git}" -C "{work}" update-ref refs/heads/outer {top}; }};; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert done.exists()
+    assert rev(work, "outer") == top
+    assert branch_of(clone_document, "outer")["sha"] == tip
+    assert containment_of(clone_document) == NESTED_FOLDS
+
+
+FAILING_CONTAINMENT = {
+    "list": ('*"--max-count"*', "exit 1", "failed"),
+    "stream": ('*" log "*" --not {base} --"*', "exit 1", "failed"),
+    "late-stream": ('*" log "*" --not {base} --"*', "exec sleep 30", "deadline"),
+}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize("step", list(FAILING_CONTAINMENT))
+def test_a_containment_call_that_fails_or_runs_late_folds_nothing_and_changes_no_verdict(
+    tmp_path, monkeypatch, isolated_git, step
+):
+    cache = nyx_home(isolated_git)
+    folder, work = nested_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    control = collect([folder], seconds=3.0)
+    assert containment_of(find_clone(control, work)) == NESTED_FOLDS
+    pattern, action, outcome = FAILING_CONTAINMENT[step]
+    shim = stand_in(
+        tmp_path, "breaking", f"case \"$*\" in {pattern.format(base=base)}) {action};; esac"
+    )
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], seconds=3.0)
+
+    clone_document = find_clone(document, work)
+    assert clone_document["containment"] == outcome
+    assert set(containment_of(clone_document).values()) == {None}
+    assert verdicts_of(clone_document) == verdicts_of(find_clone(control, work))
+    assert document["diagnostics"] == []
+    assert cache.exists()
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_late_containment_pass_reports_deadline_for_its_clone_alone_and_keeps_the_cache_write(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, one = nested_world(tmp_path, "-one", "one")
+    _folder, two = nested_world(tmp_path, "-two", "two")
+    first = collect([folder], seconds=3.0)
+    assert containment_of(find_clone(first, one)) == NESTED_FOLDS
+    assert containment_of(find_clone(first, two)) == NESTED_FOLDS
+    stamps = cache_times(cache)
+    assert stamps
+    time.sleep(1.1)
+    marker = tmp_path / "delayed"
+    slow = stand_in(
+        tmp_path,
+        "late",
+        f'case "$*" in *" -C {real(two)} "*"--max-count"*) '
+        f'[ -e "{marker}" ] || {{ : > "{marker}"; exec sleep 30; }};; esac',
+    )
+
+    with path_with(monkeypatch, slow):
+        second = collect([folder], seconds=3.0)
+
+    assert marker.exists()
+    late = find_clone(second, two)
+    assert late["containment"] == "deadline"
+    assert set(containment_of(late).values()) == {None}
+    assert verdicts_of(late) == verdicts_of(find_clone(first, two))
+    on_time = find_clone(second, one)
+    assert on_time["containment"] == "complete"
+    assert containment_of(on_time) == NESTED_FOLDS
+    assert second["diagnostics"] == []
+    saved = json.loads(cache.read_text())
+    assert set(saved) == {"schema_version", "verdicts"}
+    assert saved["schema_version"] == 2
+    assert all(cache_times(cache)[key] > stamps[key] for key in stamps)
+
+    # The control: a pass on the full deadline leaves the write no time.
+    time.sleep(1.1)
+    monkeypatch.setattr(checkouts, "VERDICT_RESERVE_NS", 0)
+    marker.unlink()
+    with path_with(monkeypatch, slow):
+        unreserved = collect([folder], seconds=3.0)
+    assert unreserved["diagnostics"] == [
+        {"code": "checkout_cache_write_failed", "path": str(cache)}
+    ]
+
+
+def limited_world(tmp_path: Path):
+    """Clones that cannot prove patch equivalence, each with a held branch."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    commit_file(clone(remote, tmp_path / "seed"), "more.txt", "more\n")
+    git(tmp_path / "seed", "push", "-q", "origin", "trunk")
+    url = f"file://{remote}"
+    clones = {
+        "plain": clone(remote, folder / "plain"),
+        "shallow": clone(url, folder / "shallow", "--depth=1"),
+        "partial": clone(url, folder / "partial", "--filter=blob:none"),
+        "shallow-bare": clone(url, folder / "shallow-bare", "--depth=1"),
+    }
+    git(clones["shallow-bare"], "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    git(clones["shallow-bare"], "update-ref", "-d", "refs/remotes/origin/trunk")
+    standalone = folder / "standalone"
+    git(tmp_path, "init", "-q", "-b", "trunk", str(standalone))
+    commit_file(standalone, "s.txt", "s\n")
+    clones["standalone"] = standalone
+    for repository in clones.values():
+        switch(repository, "inner", "trunk")
+        commit_file(repository, "inner.txt", "inner\n")
+        switch(repository, "outer", "inner")
+        commit_file(repository, "outer.txt", "outer\n")
+        git(repository, "checkout", "-q", "trunk")
+    return folder, clones
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording and version stand-ins are shell scripts")
+def test_each_reason_to_skip_grouping_wins_in_its_order_and_runs_no_patch_stream(
+    tmp_path, monkeypatch
+):
+    folder, clones = limited_world(tmp_path)
+    base = rev(clones["plain"], "origin/trunk")
+    shim, log = recording(tmp_path, "limits")
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    expected = {
+        "plain": "complete",
+        "shallow": "incomplete",
+        "partial": "incomplete",
+        "shallow-bare": "no_base",
+        "standalone": "no_base",
+    }
+    for name, outcome in expected.items():
+        item = find_clone(document, clones[name])
+        assert item["containment"] == outcome, name
+        folds = containment_of(item)
+        assert set(folds.values()) == ({"outer"} | {None} if outcome == "complete" else {None})
+        streams = containment_streams(log_lines(log, clones[name]), base)
+        assert len(streams) == (1 if outcome == "complete" else 0), name
+    assert containment_of(find_clone(document, clones["plain"]))["inner"] == "outer"
+
+    old_log = tmp_path / "old.log"
+    recorder = stand_in(
+        tmp_path,
+        "old-recorder",
+        f'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac\n'
+        f'printf "%s\\n" "$*" >> "{old_log}"',
+    )
+    with path_with(monkeypatch, recorder):
+        older = collect([folder])
+
+    assert older["git"]["version"] == "2.38.0"
+    expected_old = {**expected, "plain": "git_too_old"}
+    for name, outcome in expected_old.items():
+        item = find_clone(older, clones[name])
+        assert item["containment"] == outcome, name
+        assert set(containment_of(item).values()) == {None}
+        assert containment_streams(log_lines(old_log, clones[name]), base) == []
+        assert containment_lists(log_lines(old_log, clones[name])) == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_clone_at_the_branch_cap_costs_one_commit_list_per_branch_and_one_patch_stream(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "repo")
+    import_branches(repository, models.CHECKOUT_BRANCH_CAP - 1)
+    base = rev(repository, "origin/trunk")
+    shim, log = recording(tmp_path, "cap")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], seconds=600.0)
+
+    item = find_clone(document, repository)
+    lines = log_lines(log, repository)
+    assert item["containment"] == "complete"
+    assert len(item["branches"]) == models.CHECKOUT_BRANCH_CAP
+    assert set(containment_of(item).values()) == {None}
+    assert len(containment_lists(lines)) <= models.CHECKOUT_BRANCH_CAP - 1
+    assert len(containment_streams(lines, base)) == 1
+    assert document["diagnostics"] == []
+    assert len(cache_entries(cache)) == models.CHECKOUT_BRANCH_CAP - 1
+
+
+# -- the parser ------------------------------------------------------------------
+
+
+def folded(document: dict[str, Any]) -> dict[str, Any]:
+    """Fold ``never-pushed`` under ``outside`` in the first clone of a valid sample."""
+    clone_document = first_clone(document)
+    assert clone_document["containment"] == "complete"
+    branch_of(clone_document, "never-pushed")["contained_in"] = "outside"
+    return clone_document
+
+
+def test_parser_accepts_folded_branches_and_every_outcome_where_it_applies(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    folded(accepted)
+    assert models.parse_checkouts(redigest(rederive(accepted)))
+    for outcome in ("deadline", "failed"):
+        accepted = doc_copy(document)
+        first_clone(accepted)["containment"] = outcome
+        assert models.parse_checkouts(redigest(rederive(accepted)))
+    shallow = doc_copy(document)
+    first_clone(shallow).update(shallow=True, containment="incomplete")
+    other_branches(first_clone(shallow))[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+    assert models.parse_checkouts(redigest(rederive(shallow)))
+    shallow_old = doc_copy(shallow)
+    set_git_version(shallow_old, "2.38.1", keep=first_clone(shallow_old))
+    assert models.parse_checkouts(redigest(rederive(shallow_old)))
+    old = doc_copy(document)
+    set_git_version(old, "2.38.1")
+    assert models.parse_checkouts(redigest(rederive(old)))
+
+
+def set_git_version(document: dict[str, Any], version: str, keep: Any = None) -> None:
+    """Change the git version and settle the containment outcome of every other clone."""
+    document["git"]["version"] = version
+    floor = tuple(int(part) for part in version.split(".")[:2]) < (2, 39)
+    for item in all_clones(document):
+        if item is not keep and item["verdict_base"] is not None and not item["shallow"]:
+            item["containment"] = "git_too_old" if floor else "complete"
+
+
+def only_contained_in(name: str, target: Any):
+    def mutate(document):
+        branch_of(folded(document), name)["contained_in"] = target
+
+    return mutate
+
+
+def mutate_cycle(document):
+    clone_document = folded(document)
+    branch_of(clone_document, "outside")["contained_in"] = "never-pushed"
+
+
+def mutate_base_branch_contained(document):
+    clone_document = folded(document)
+    branch_of(clone_document, "trunk")["contained_in"] = "outside"
+
+
+def with_outcome(outcome: Any, *, shallow: bool | None = None, version: str | None = None,
+                 no_base: bool = False, fold: bool = False):
+    def mutate(document):
+        if no_base:
+            undecided_without_a_base(document)
+        clone_document = first_clone(document)
+        if shallow is not None:
+            clone_document["shallow"] = shallow
+            if shallow:
+                for branch in other_branches(clone_document) if not no_base else []:
+                    branch["verdict"] = verdict_of("unknown", reason="incomplete_clone")
+        if version is not None:
+            set_git_version(document, version, keep=clone_document)
+            if version.startswith("2.38") and not no_base:
+                for branch in other_branches(clone_document):
+                    branch["verdict"] = verdict_of("unknown", reason="git_too_old")
+        clone_document["containment"] = outcome
+        if fold:
+            branch_of(clone_document, "never-pushed")["contained_in"] = "outside"
+
+    return mutate
+
+
+def mutate_containment_missing(document):
+    del first_clone(document)["containment"]
+
+
+def mutate_containment_on_a_refused_clone(document):
+    refused_clone(document)["containment"] = "complete"
+
+
+REJECTED_CONTAINMENT_DOCUMENTS = {
+    "contained_in_naming_the_base_branch": only_contained_in("never-pushed", "trunk"),
+    "contained_in_naming_itself": only_contained_in("never-pushed", "never-pushed"),
+    "contained_in_naming_an_unlisted_branch": only_contained_in("never-pushed", "absent"),
+    "contained_in_not_text": only_contained_in("never-pushed", 7),
+    "contained_in_cycle": mutate_cycle,
+    "contained_in_on_the_base_branch": mutate_base_branch_contained,
+    "contained_in_under_deadline": with_outcome("deadline", fold=True),
+    "contained_in_under_failed": with_outcome("failed", fold=True),
+    "contained_in_under_no_base": with_outcome("no_base", no_base=True, fold=True),
+    "contained_in_under_incomplete": with_outcome("incomplete", shallow=True, fold=True),
+    "contained_in_under_git_too_old": with_outcome("git_too_old", version="2.38.1", fold=True),
+    "containment_undefined": with_outcome(None),
+    "containment_key_missing": mutate_containment_missing,
+    "containment_foreign_value": with_outcome("partial"),
+    "containment_on_a_refused_clone": mutate_containment_on_a_refused_clone,
+    "no_base_with_a_base": with_outcome("no_base"),
+    "complete_without_a_base": with_outcome("complete", no_base=True),
+    "incomplete_on_a_full_clone": with_outcome("incomplete"),
+    "complete_on_a_shallow_clone": with_outcome("complete", shallow=True),
+    "git_too_old_under_a_new_git": with_outcome("git_too_old", version="2.43.0"),
+    "complete_under_an_old_git": with_outcome("complete", version="2.38.1"),
+    "incomplete_on_a_shallow_clone_without_a_base": with_outcome(
+        "incomplete", shallow=True, no_base=True
+    ),
+    "git_too_old_on_a_shallow_clone": with_outcome("git_too_old", shallow=True, version="2.38.1"),
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_CONTAINMENT_DOCUMENTS), ids=str)
+def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_CONTAINMENT_DOCUMENTS[mutation](broken)
+    assert "removable" not in refusal_of(rederive(broken))
+
+
+def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
+    document, _folder = sample
+    assert document["schema_version"] == 3 == models.CHECKOUTS_SCHEMA_VERSION
+    previous = doc_copy(document)
+    previous["schema_version"] = 2
+    for clone_item in all_clones(previous):
+        del clone_item["containment"]
+        for branch in clone_item["branches"] or []:
+            del branch["contained_in"]
+    with pytest.raises(models.ProtocolError, match="schema"):
+        models.parse_checkouts(redigest(previous))
+
+
+# ---------------------------------------------------------------------------
+# Removable recomputation by the parser
+# ---------------------------------------------------------------------------
+
+
+def settled_sample(document: dict[str, Any]) -> dict[str, Any]:
+    """Make ``never-pushed`` and ``outside`` merged, and ``outside``'s worktree clean.
+
+    Returns the first clone. Its Removable fields are derived from the settled
+    facts, so a branch, a linked worktree and the counts are all Removable.
+    """
+    clone_document = first_clone(document)
+    for name in ("never-pushed", "outside"):
+        branch_of(clone_document, name)["verdict"] = merged_verdict()
+    linked = linked_worktree(clone_document)
+    linked.update(locked=False, prunable=False, status="ok")
+    linked["changes"] = {"staged": 0, "unstaged": 0, "untracked": 0, "conflicted": 0}
+    linked["operations"] = []
+    linked["index_lock"] = False
+    rederive(document)
+    assert branch_of(clone_document, "never-pushed")["removable"] == {
+        "removable": True, "blockers": [],
+    }
+    assert clone_document["removable_count"] == {"branches": 2, "worktrees": 1}
+    return clone_document
+
+
+def linked_worktree(clone_document: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in clone_document["worktrees"] if not item["main"])
+
+
+def gone_worktree(clone_document: dict[str, Any]) -> None:
+    linked_worktree(clone_document).update(
+        status="failed", prunable=True, head=None, changes=None, operations=None,
+        index_lock=None,
+    )
+
+
+def set_change(field: str, value: Any):
+    def mutate(clone_document):
+        linked = linked_worktree(clone_document)
+        if field in ("untracked", "conflicted"):
+            linked["changes"][field] = value
+        else:
+            linked[field] = value
+
+    return mutate
+
+
+def mutate_verdict_state(clone_document):
+    branch_of(clone_document, "never-pushed")["verdict"] = verdict_of("not_merged", "none")
+
+
+def mutate_linked_verdict_state(clone_document):
+    branch_of(clone_document, "outside")["verdict"] = verdict_of("unknown", reason="failed")
+
+
+def mutate_unreadable_worktree(clone_document):
+    gone_worktree(clone_document)
+    linked_worktree(clone_document)["prunable"] = False
+
+
+def mutate_prunable_gone_to_present(clone_document):
+    gone_worktree(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    assert linked_worktree(clone_document)["removable"] == {"removable": True, "blockers": []}
+    linked_worktree(clone_document)["prunable"] = False
+
+
+def mutate_held_branch_moves_to_main(clone_document):
+    main = main_worktree(clone_document)["path"]
+    branch_of(clone_document, "never-pushed")["checked_out_in"] = [main]
+
+
+FACT_ONLY_REMOVABLE_MUTATIONS = {
+    "branch_verdict_becomes_not_merged": mutate_verdict_state,
+    "held_branch_verdict_becomes_unknown": mutate_linked_verdict_state,
+    "worktree_gains_an_untracked_file": set_change("untracked", 1),
+    "worktree_gains_a_conflict": set_change("conflicted", 1),
+    "worktree_starts_an_operation": set_change("operations", ["merge"]),
+    "worktree_gains_an_index_lock": set_change("index_lock", True),
+    "worktree_is_locked": set_change("locked", True),
+    "worktree_status_becomes_failed": mutate_unreadable_worktree,
+    "prunable_worktree_directory_returns": mutate_prunable_gone_to_present,
+    "branch_moves_to_the_main_worktree": mutate_held_branch_moves_to_main,
+}
+
+
+@pytest.mark.parametrize("mutation", list(FACT_ONLY_REMOVABLE_MUTATIONS), ids=str)
+def test_parser_refuses_a_removable_kept_after_one_of_its_facts_changes(sample, mutation):
+    document, _folder = sample
+    settled_sample(document)
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    FACT_ONLY_REMOVABLE_MUTATIONS[mutation](first_clone(broken))
+    # Nothing but the Removable fields is stale, and every structural check passes:
+    # only the recomputation can refuse the document.
+    assert "contradicts the facts of the clone" in refusal_of(broken)
+    models.parse_checkouts(redigest(rederive(broken)))
+
+
+def blocked_branch(clone_document: dict[str, Any]) -> dict[str, Any]:
+    """Give ``never-pushed`` two blockers, in the order the derivation lists them."""
+    branch = branch_of(clone_document, "never-pushed")
+    branch["verdict"] = verdict_of("not_merged", "none")
+    branch["checked_out_in"] = [main_worktree(clone_document)["path"]]
+    return branch
+
+
+def mutate_true_with_a_blocker(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = {
+        "removable": True, "blockers": ["not_merged"],
+    }
+
+
+def mutate_false_with_no_blocker(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = {
+        "removable": False, "blockers": [],
+    }
+
+
+def mutate_worktree_true_with_a_blocker(clone_document):
+    linked_worktree(clone_document)["removable"] = {
+        "removable": True, "blockers": ["locked"],
+    }
+
+
+def mutate_worktree_false_with_no_blocker(clone_document):
+    linked_worktree(clone_document)["removable"] = {"removable": False, "blockers": []}
+
+
+def mutate_null_on_a_branch(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = None
+
+
+def mutate_null_on_a_linked_worktree(clone_document):
+    linked_worktree(clone_document)["removable"] = None
+
+
+def mutate_set_on_the_main_worktree(clone_document):
+    main_worktree(clone_document)["removable"] = {"removable": True, "blockers": []}
+
+
+def mutate_set_on_the_base_branch(clone_document):
+    base = clone_document["verdict_base"]["name"]
+    branch_of(clone_document, base)["removable"] = {"removable": True, "blockers": []}
+
+
+def mutate_blockers_reordered(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    blockers = branch_of(clone_document, "never-pushed")["removable"]["blockers"]
+    assert blockers == ["not_merged", "checked_out_in_main_worktree"]
+    blockers.reverse()
+
+
+def mutate_blockers_duplicated(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].append("not_merged")
+
+
+def mutate_blockers_unknown(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].append("bogus")
+
+
+def mutate_blockers_missing_one(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].pop()
+
+
+def mutate_count_branches_high(clone_document):
+    clone_document["removable_count"]["branches"] += 1
+
+
+def mutate_count_branches_low(clone_document):
+    clone_document["removable_count"]["branches"] -= 1
+
+
+def mutate_count_worktrees_high(clone_document):
+    clone_document["removable_count"]["worktrees"] += 1
+
+
+def mutate_count_worktrees_low(clone_document):
+    clone_document["removable_count"]["worktrees"] -= 1
+
+
+def mutate_count_missing(clone_document):
+    clone_document["removable_count"] = None
+
+
+def mutate_count_key_missing(clone_document):
+    del clone_document["removable_count"]["worktrees"]
+
+
+def mutate_count_on_a_refused_clone(clone_document):
+    refused_clone({"repositories": [{"clones": [clone_document]}]})
+    clone_document["removable_count"] = {"branches": 0, "worktrees": 0}
+
+
+def mutate_count_negative(clone_document):
+    clone_document["removable_count"]["branches"] = -1
+
+
+def mutate_removable_flag_not_boolean(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"]["removable"] = 1
+
+
+def mutate_removable_extra_key(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"]["extra"] = 1
+
+
+def mutate_blockers_not_a_list(clone_document):
+    linked_worktree(clone_document)["removable"]["blockers"] = "locked"
+
+
+REJECTED_REMOVABLE_DOCUMENTS = {
+    "true_with_a_blocker": mutate_true_with_a_blocker,
+    "false_with_no_blocker": mutate_false_with_no_blocker,
+    "worktree_true_with_a_blocker": mutate_worktree_true_with_a_blocker,
+    "worktree_false_with_no_blocker": mutate_worktree_false_with_no_blocker,
+    "null_on_a_non_default_branch": mutate_null_on_a_branch,
+    "null_on_a_linked_worktree": mutate_null_on_a_linked_worktree,
+    "set_on_the_main_worktree": mutate_set_on_the_main_worktree,
+    "set_on_the_base_branch": mutate_set_on_the_base_branch,
+    "blockers_reordered": mutate_blockers_reordered,
+    "blockers_duplicated": mutate_blockers_duplicated,
+    "blockers_unknown": mutate_blockers_unknown,
+    "blockers_missing_one": mutate_blockers_missing_one,
+    "branch_count_one_high": mutate_count_branches_high,
+    "branch_count_one_low": mutate_count_branches_low,
+    "worktree_count_one_high": mutate_count_worktrees_high,
+    "worktree_count_one_low": mutate_count_worktrees_low,
+    "count_missing_on_an_ok_clone": mutate_count_missing,
+    "count_key_missing": mutate_count_key_missing,
+    "count_negative": mutate_count_negative,
+    "removable_flag_not_boolean": mutate_removable_flag_not_boolean,
+    "removable_extra_key": mutate_removable_extra_key,
+    "blockers_not_a_list": mutate_blockers_not_a_list,
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_REMOVABLE_DOCUMENTS), ids=str)
+def test_parser_rejects_a_removable_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    settled_sample(document)
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_REMOVABLE_DOCUMENTS[mutation](first_clone(broken))
+    assert "removable" in refusal_of(broken)
+
+
+def test_parser_refuses_a_count_on_a_clone_that_is_not_ok(sample):
+    document, _folder = sample
+    settled_sample(document)
+    broken = doc_copy(document)
+    mutate_count_on_a_refused_clone(first_clone(broken))
+    assert "must leave its facts null" in refusal_of(broken)
+
+
+def test_parser_accepts_every_removable_shape_the_derivation_returns(sample):
+    document, _folder = sample
+    settled_sample(document)
+    seen: set[tuple[bool, tuple[str, ...]]] = set()
+    for name, mutate in [
+        ("settled", lambda c: None),
+        ("branch", mutate_verdict_state),
+        ("held", mutate_linked_verdict_state),
+        ("untracked", set_change("untracked", 1)),
+        ("locked", set_change("locked", True)),
+        ("main", mutate_held_branch_moves_to_main),
+        ("two", blocked_branch),
+        ("gone", gone_worktree),
+    ]:
+        accepted = doc_copy(document)
+        clone_document = first_clone(accepted)
+        mutate(clone_document)
+        rederive(accepted)
+        assert models.parse_checkouts(redigest(accepted)), name
+        for item in (*clone_document["branches"], *clone_document["worktrees"]):
+            if item["removable"] is not None:
+                seen.add((item["removable"]["removable"], tuple(item["removable"]["blockers"])))
+    assert (True, ()) in seen
+    assert (False, ("not_merged",)) in seen
+    assert any(len(blockers) > 1 for _, blockers in seen)
+
+
+# ---------------------------------------------------------------------------
+# Removable verdicts
+# ---------------------------------------------------------------------------
+
+BLOCKER_ONLY_NAMES = (
+    "verdict_unknown",
+    "checked_out_in_main_worktree",
+    "worktree_not_clean",
+    "worktree_locked",
+    "not_clean",
+)
+NO_CHANGES = {"staged": 0, "unstaged": 0, "untracked": 0, "conflicted": 0}
+
+
+def blockers_of(verdict: dict[str, Any] | None) -> list[str] | None:
+    if verdict is None:
+        return None
+    assert verdict["removable"] is (verdict["blockers"] == [])
+    return list(verdict["blockers"])
+
+
+def removable_view(clone_document: dict[str, Any]) -> dict[str, Any]:
+    """Every blocker list of a clone, keyed by branch name and worktree path."""
+    count = clone_document["removable_count"]
+    branches = {item["name"]: blockers_of(item["removable"]) for item in clone_document["branches"]}
+    worktrees = {item["path"]: blockers_of(item["removable"]) for item in clone_document["worktrees"]}
+    removable_branches = sum(1 for blockers in branches.values() if blockers == [])
+    removable_worktrees = sum(1 for blockers in worktrees.values() if blockers == [])
+    assert count == {"branches": removable_branches, "worktrees": removable_worktrees}
+    return {"branches": branches, "worktrees": worktrees, "count": count}
+
+
+def expected_view(
+    work: Path,
+    branches: dict[str, list[str] | None],
+    worktrees: dict[Path, list[str]] | None = None,
+    *,
+    count: tuple[int, int],
+    main: bool = True,
+) -> dict[str, Any]:
+    paths = {real(path): blockers for path, blockers in (worktrees or {}).items()}
+    if main:
+        paths[real(work)] = None
+    return {
+        "branches": branches,
+        "worktrees": paths,
+        "count": {"branches": count[0], "worktrees": count[1]},
+    }
+
+
+def land(work: Path, name: str, *, merged: bool = True) -> None:
+    """Make branch ``name`` of two commits and, by default, squash-merge it into ``trunk``."""
+    git(work, "checkout", "-q", "-b", name, "trunk")
+    commit_file(work, f"{name}-1.txt", f"{name} one\n")
+    commit_file(work, f"{name}-2.txt", f"{name} two\n")
+    git(work, "checkout", "-q", "trunk")
+    if merged:
+        git(work, "merge", "--squash", name)
+        git(work, "commit", "-q", "-m", f"land {name}")
+        git(work, "push", "-q", "origin", "trunk")
+
+
+def linked(work: Path, tmp_path: Path, name: str, *arguments: str) -> Path:
+    """Add a linked worktree; ``arguments`` are any options and then the commit-ish it holds."""
+    destination = tmp_path / f"wt-{name}"
+    *options, commit_ish = arguments
+    git(work, "worktree", "add", "-q", *options, str(destination), commit_ish)
+    return destination
+
+
+def removable_of(folder: Path, work: Path) -> dict[str, Any]:
+    return find_clone(collect([folder]), work)
+
+
+def test_a_squash_merged_branch_that_is_not_checked_out_is_removable(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    before = snapshot(work)
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, work)
+    assert verdicts_of(clone_document)["alder"] == MERGED_SQUASH
+    assert removable_view(clone_document) == expected_view(
+        work, {"alder": [], "birch": ["not_merged"], "trunk": None}, count=(1, 0)
+    )
+    assert document["diagnostics"] == []
+    assert snapshot(work) == before
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_untracked_files_block_a_worktree_and_its_branch_but_ignored_files_do_not(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch", "cedar"):
+        land(work, name)
+    (work / ".git" / "info" / "exclude").write_text("build/\n")
+    dirty = linked(work, tmp_path, "dirty", "alder")
+    ignoring = linked(work, tmp_path, "ignoring", "birch")
+    clean = linked(work, tmp_path, "clean", "cedar")
+    (dirty / "scratch.txt").write_text("x\n")
+    (ignoring / "build").mkdir()
+    (ignoring / "build" / "out.bin").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, dirty)["changes"] == {**NO_CHANGES, "untracked": 1}
+    assert find_worktree(clone_document, ignoring)["changes"] == NO_CHANGES
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "birch": [], "cedar": [], "trunk": None},
+        {dirty: ["not_clean"], ignoring: [], clean: []},
+        count=(2, 2),
+    )
+
+
+def stage(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("staged\n")
+    git(worktree, "add", "file.txt")
+
+
+def modify(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("unstaged\n")
+
+
+def start_bisect(worktree: Path) -> None:
+    git(worktree, "bisect", "start")
+
+
+def stop_at_a_break(worktree: Path) -> None:
+    editor = worktree.parent / "break-editor.sh"
+    editor.write_text('#!/bin/sh\nprintf "break\\n" | cat - "$1" > "$1.new" && mv "$1.new" "$1"\n')
+    editor.chmod(0o755)
+    environment = {**os.environ, "GIT_SEQUENCE_EDITOR": str(editor)}
+    result = subprocess.run(
+        ["git", "rebase", "-q", "-i", "trunk"], cwd=worktree, env=environment,
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def conflict_on_pop(worktree: Path) -> None:
+    (worktree / "file.txt").write_text("mine\n")
+    git(worktree, "stash", "-q")
+    git(worktree, "reset", "-q", "--hard", "trunk")
+    git(worktree, "stash", "pop", check=False)
+
+
+def lock_the_index(worktree: Path) -> None:
+    git_dir = Path(git(worktree, "rev-parse", "--absolute-git-dir").stdout.strip())
+    (git_dir / "index.lock").write_text("")
+
+
+NOT_CLEAN_SOURCES = {
+    "staged": (stage, {**NO_CHANGES, "staged": 1}, [], False),
+    "unstaged": (modify, {**NO_CHANGES, "unstaged": 1}, [], False),
+    "bisect": (start_bisect, NO_CHANGES, ["bisect"], False),
+    "conflicts": (conflict_on_pop, {**NO_CHANGES, "conflicted": 1}, [], False),
+    "index_lock": (lock_the_index, NO_CHANGES, [], True),
+}
+
+
+@pytest.mark.parametrize("source", list(NOT_CLEAN_SOURCES))
+def test_each_kind_of_unfinished_work_alone_makes_a_worktree_not_clean(tmp_path, source):
+    trigger, changes, operations, index_lock = NOT_CLEAN_SOURCES[source]
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    commit_file(work, "file.txt", "theirs\n", "move the shared file")
+    git(work, "push", "-q", "origin", "trunk")
+    held = linked(work, tmp_path, "held", "alder")
+    trigger(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert (document["changes"], document["operations"], document["index_lock"]) == (
+        changes, operations, index_lock
+    )
+    assert document["status"] == "ok"
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {held: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the sequence editor is a shell script")
+def test_an_interactive_rebase_stopped_at_a_break_makes_a_clean_tree_not_clean(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    commit_file(work, "later.txt", "later\n")
+    git(work, "push", "-q", "origin", "trunk")
+    held = linked(work, tmp_path, "held", "alder")
+    stop_at_a_break(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert (document["changes"], document["operations"]) == (NO_CHANGES, ["rebase"])
+    assert document["status"] == "ok"
+    assert blockers_of(document["removable"]) == ["not_clean"]
+
+
+def test_a_lock_blocks_a_clean_worktree_and_stacks_after_its_other_blockers(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    quiet = linked(work, tmp_path, "quiet", "alder")
+    busy = linked(work, tmp_path, "busy", "birch")
+    for held in (quiet, busy):
+        git(work, "worktree", "lock", str(held))
+    (busy / "scratch.txt").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {
+            "alder": ["worktree_locked"],
+            "birch": ["worktree_not_clean", "worktree_locked"],
+            "trunk": None,
+        },
+        {quiet: ["locked"], busy: ["not_clean", "locked"]},
+        count=(0, 0),
+    )
+
+
+@pytest.mark.parametrize("branch", ["alder", "birch"])
+def test_a_branch_checked_out_in_the_main_worktree_is_blocked_for_it(tmp_path, branch):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    git(work, "checkout", "-q", branch)
+
+    clone_document = removable_of(folder, work)
+
+    expected = {
+        "alder": ["checked_out_in_main_worktree"],
+        "birch": ["not_merged"],
+        "trunk": None,
+    }
+    if branch == "birch":
+        expected = {"alder": [], "birch": ["not_merged", "checked_out_in_main_worktree"], "trunk": None}
+    assert removable_view(clone_document) == expected_view(
+        work, expected, count=(1 if branch == "birch" else 0, 0)
+    )
+
+
+def test_a_worktree_on_an_unmerged_branch_lists_the_merge_state_before_its_dirt(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "birch", merged=False)
+    held = linked(work, tmp_path, "held", "birch")
+    (held / "scratch.txt").write_text("x\n")
+
+    clone_document = removable_of(folder, work)
+
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"birch": ["not_merged", "worktree_not_clean"], "trunk": None},
+        {held: ["not_merged", "not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_a_detached_worktree_is_judged_by_the_commit_it_holds(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    on_merged = linked(work, tmp_path, "merged", "--detach", rev(work, "alder"))
+    on_unmerged = linked(work, tmp_path, "unmerged", "--detach", rev(work, "birch"))
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, on_merged)["head"]["branch"] is None
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": [], "birch": ["not_merged"], "trunk": None},
+        {on_merged: [], on_unmerged: ["not_merged"]},
+        count=(1, 1),
+    )
+
+
+def test_a_clone_with_no_base_blocks_everything_and_counts_nothing(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = folder / "work"
+    git(folder, "init", "-q", "-b", "trunk", str(work))
+    commit_file(work, "file.txt", "one\n")
+    land(work, "alder", merged=False)
+    git(work, "branch", "birch")
+    held = linked(work, tmp_path, "held", "alder")
+    adrift = linked(work, tmp_path, "adrift", "--detach", "birch")
+
+    clone_document = removable_of(folder, work)
+
+    assert clone_document["verdict_base"] is None
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {
+            "alder": ["verdict_unknown"],
+            "birch": ["verdict_unknown"],
+            "trunk": ["verdict_unknown", "checked_out_in_main_worktree"],
+        },
+        {held: ["verdict_unknown"], adrift: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_verdict_that_could_not_be_decided_blocks_a_branch_and_the_worktree_on_it(
+    tmp_path, monkeypatch
+):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    land(work, "birch")
+    held = linked(work, tmp_path, "held", "alder")
+    monkeypatch.setattr(checkouts, "OWN_COMMIT_CAP", 1)
+
+    clone_document = removable_of(folder, work)
+
+    assert verdicts_of(clone_document)["alder"] == unknown("history_limit")
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["verdict_unknown"], "birch": ["verdict_unknown"], "trunk": None},
+        {held: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_on_a_branch_without_a_verdict_is_unknown(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    git(work, "checkout", "-q", "alder")
+    on_base = linked(work, tmp_path, "base", "trunk")
+    unborn = linked(work, tmp_path, "unborn", "--detach", "trunk")
+    git(unborn, "checkout", "-q", "--orphan", "fresh")
+    git(unborn, "rm", "-rfq", ".")
+
+    clone_document = removable_of(folder, work)
+
+    assert find_worktree(clone_document, unborn)["head"] == {"branch": "fresh", "sha": None}
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["checked_out_in_main_worktree"], "trunk": None},
+        {on_base: ["verdict_unknown"], unborn: ["verdict_unknown"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_whose_directory_is_gone_blocks_nothing_but_its_own_verdict_and_lock(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    land(work, "cedar", merged=False)
+    gone = linked(work, tmp_path, "gone", "alder")
+    adrift = linked(work, tmp_path, "adrift", "--detach", rev(work, "birch"))
+    elsewhere = linked(work, tmp_path, "elsewhere", "cedar")
+    shutil.rmtree(gone)
+    shutil.rmtree(adrift)
+    shutil.rmtree(elsewhere)
+
+    clone_document = removable_of(folder, work)
+
+    for path in (gone, adrift, elsewhere):
+        document = find_worktree(clone_document, path)
+        assert document["prunable"] is True and document["status"] == "failed"
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": [], "birch": [], "cedar": ["not_merged"], "trunk": None},
+        {gone: [], adrift: ["verdict_unknown"], elsewhere: ["not_merged"]},
+        count=(2, 1),
+    )
+
+
+def test_a_locked_worktree_whose_directory_is_gone_is_not_prunable_and_so_not_clean(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    held = linked(work, tmp_path, "held", "alder")
+    git(work, "worktree", "lock", str(held))
+    shutil.rmtree(held)
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert document["locked"] is True and document["prunable"] is False
+    assert document["status"] == "failed"
+    assert_unreadable(document)
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(held)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean", "worktree_locked"], "trunk": None},
+        {held: ["not_clean", "locked"]},
+        count=(0, 0),
+    )
+
+
+def test_a_worktree_that_lost_only_its_git_link_still_holds_work_and_blocks(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    held = linked(work, tmp_path, "held", "alder")
+    (held / "land-note.txt").write_text("unsaved\n")
+    (held / "alder-1.txt").write_text("edited\n")
+    (held / ".git").unlink()
+    entry = git(work, "worktree", "list", "--porcelain").stdout
+    assert "prunable" in entry and held.is_dir()
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert document["prunable"] is False and document["status"] == "failed"
+    assert_unreadable(document)
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {held: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_an_unknown_verdict_state_blocks_as_not_merged():
+    # Any state other than merged and unknown must read as not merged, so a
+    # state added later blocks removal instead of passing as merged.
+    verdict = {"state": "merged_with_local_commits", "rung": None, "reason": None}
+    clone_document = {
+        "verdict_base": {"name": "trunk"},
+        "branches": [
+            {"name": "alder", "verdict": verdict, "checked_out_in": ["/w/held"]},
+            {"name": "trunk", "verdict": None, "checked_out_in": ["/w/main"]},
+        ],
+        "worktrees": [
+            {"path": "/w/main", "main": True, "locked": False, "prunable": False, "status": "ok",
+             "head": {"branch": "trunk", "sha": "0" * 39 + "1"}, "changes": NO_CHANGES,
+             "operations": [], "index_lock": False, "verdict": None},
+            {"path": "/w/held", "main": False, "locked": False, "prunable": False, "status": "ok",
+             "head": {"branch": "alder", "sha": "0" * 39 + "2"}, "changes": NO_CHANGES,
+             "operations": [], "index_lock": False, "verdict": None},
+        ],
+    }
+
+    derived = models.derive_removable(clone_document)
+
+    assert [blockers_of(item) for item in derived["branches"]] == [["not_merged"], None]
+    assert [blockers_of(item) for item in derived["worktrees"]] == [None, ["not_merged"]]
+    assert derived["removable_count"] == {"branches": 0, "worktrees": 0}
+
+
+def test_a_worktree_with_an_unreadable_git_pointer_is_not_clean_and_so_is_its_branch(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    broken = linked(work, tmp_path, "broken", "alder")
+    replace_git_marker(broken, "garbage\n")
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, broken)
+    assert document["status"] == "failed" and document["prunable"] is False
+    assert_unreadable(document)
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(broken)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {broken: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_a_bare_clone_counts_its_removable_items_and_blocks_no_branch_for_a_main_worktree(tmp_path):
+    served = tmp_path / "served"
+    served.mkdir()
+    remote = make_remote(served)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = clone(remote, tmp_path / "source")
+    land(work, "alder")
+    land(work, "birch", merged=False)
+    land(work, "cedar")
+    git(work, "push", "-q", "origin", "alder", "birch", "cedar")
+    bare = tmp_path / "bare.git"
+    git(tmp_path, "clone", "-q", "--bare", str(remote), str(bare))
+    # The bare clone's own HEAD names a merged branch; nothing else holds it.
+    git(bare, "symbolic-ref", "HEAD", "refs/heads/cedar")
+    for branch in ("trunk", "alder", "birch", "cedar"):
+        git(bare, "update-ref", f"refs/remotes/origin/{branch}", rev(bare, f"refs/heads/{branch}"))
+    git(bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    held = folder / "held"
+    git(bare, "worktree", "add", "-q", str(held), "alder")
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, bare)
+    assert clone_document["bare"] is True and main_worktree_count(clone_document) == 0
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert removable_view(clone_document) == expected_view(
+        bare,
+        {"alder": [], "birch": ["not_merged"], "cedar": [], "trunk": None},
+        {held: []},
+        count=(2, 1),
+        main=False,
+    )
+
+
+def worktree_state(worktree: Path) -> tuple[Any, ...]:
+    """The files of one worktree and the commit it holds, read without running status."""
+    files = {
+        item.relative_to(worktree).as_posix(): item.read_bytes()
+        for item in worktree.rglob("*")
+        if item.is_file() and ".git" not in item.relative_to(worktree).parts[:1]
+    }
+    return files, rev(worktree, "HEAD")
+
+
+def test_a_dirty_main_worktree_on_another_branch_changes_only_that_branch(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch", "cedar"):
+        land(work, name)
+    land(work, "dogwood", merged=False)
+    held = linked(work, tmp_path, "held", "birch")
+    (held / "scratch.txt").write_text("x\n")
+    quiet = linked(work, tmp_path, "quiet", "cedar")
+    before = removable_view(removable_of(folder, work))
+    assert before == expected_view(
+        work,
+        {
+            "alder": [], "birch": ["worktree_not_clean"], "cedar": [], "dogwood": ["not_merged"],
+            "trunk": None,
+        },
+        {held: ["not_clean"], quiet: []},
+        count=(2, 1),
+    )
+    git(work, "checkout", "-q", "alder")
+    (work / "dirty.txt").write_text("x\n")
+    states = {path: worktree_state(path) for path in (work, held, quiet)}
+    refs = git(work, "for-each-ref").stdout
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    after = removable_view(removable_of(folder, work))
+
+    assert after == {
+        **before,
+        "branches": {**before["branches"], "alder": ["checked_out_in_main_worktree"]},
+        "count": {"branches": 1, "worktrees": 1},
+    }
+    assert {path: worktree_state(path) for path in states} == states
+    assert git(work, "for-each-ref").stdout == refs
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_the_collector_names_no_blocker_that_only_the_derivation_decides():
+    source = Path(checkouts.__file__).read_text()
+
+    assert [name for name in BLOCKER_ONLY_NAMES if name in source] == []
+    assert "derive_removable" in source
+
+
+def test_a_branch_held_by_two_worktrees_is_blocked_by_either_of_them(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    first = linked(work, tmp_path, "calm", "alder")
+    second = linked(work, tmp_path, "dirty", "--force", "alder")
+    (second / "scratch.txt").write_text("x\n")
+    open_one = linked(work, tmp_path, "calm-too", "birch")
+    held_one = linked(work, tmp_path, "locked", "--force", "birch")
+    git(work, "worktree", "lock", str(held_one))
+
+    clone_document = removable_of(folder, work)
+
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(first), real(second)]
+    assert branch_of(clone_document, "birch")["checked_out_in"] == [real(open_one), real(held_one)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "birch": ["worktree_locked"], "trunk": None},
+        {first: [], second: ["not_clean"], open_one: [], held_one: ["locked"]},
+        count=(0, 2),
+    )

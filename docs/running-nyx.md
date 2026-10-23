@@ -165,8 +165,9 @@ separated by two spaces and in this order, three more elements.
   remote shows `no cached default`.
 
 Whether each local branch is already merged into the remote's default branch
-is a verdict, and appears only in the `--json` document: the plain lines above
-are unchanged and show no verdicts. In each clone, `verdict_base` names the
+is a verdict, and appears only in the `--json` document: the plain lines
+never show a branch's verdict itself, only the Removable summary described
+below. In each clone, `verdict_base` names the
 default branch the verdicts are judged against, its commit, and its `basis`.
 The branch is the remote's default branch, or, when the remote did not answer
 or has no default branch (an empty remote, or one with a detached `HEAD`), the
@@ -288,7 +289,96 @@ git refuses it for ownership, `timed_out` when git did not finish in time,
 branch included), and otherwise `failed`. A `too_many_branches` clone is not
 examined, so it shows no facts and no verdicts; it stays listed with the other
 clones of its remote but lends them no objects and takes no part in choosing
-their default branch name. The plain lines are otherwise unchanged.
+their default branch name. A checkout that could not be read has no Removable
+elements.
+
+A branch whose changes a larger sibling appears to carry is folded under that
+sibling, so a stack of task branches under one package branch reads as one
+group. The `--json` document records this as `contained_in` on the folded
+branch, and as a `containment` outcome on the clone. A non-default branch is
+contained in another non-default local branch of the same clone when every one of
+its own commits, the commits not on the base, is also an own commit of the other
+branch, or, for a commit that is not a merge, has a counterpart among the other
+branch's own commits with the same patch identity, as after a rebase or a
+cherry-pick. A patch-identity match follows the change's patch, not the place it
+landed, so it also groups a change whose identical hunk sits at a different
+place in the container's own history; the grouping then names a container that
+does not hold the change. This is a grouping only, never a statement about
+removal. A branch with no own commits
+does not fold. The default branch is never a container. The nearest container
+wins: a branch folds under the container with the fewest own commits, provided
+that container has strictly more than the branch, and a tie goes to the name that
+sorts first. Two branches at the same commit never fold into each other, and
+two branches that contain each other's changes fold only the smaller. A branch
+with more than 2,000 own commits neither folds nor contains. The grouping is
+computed fresh on every run and is never remembered. `containment` is one of six
+values. `complete`: every branch was examined, and `contained_in` is set where a
+branch folds. In every other value no branch is folded, because a partial grouping
+would hide the difference between "not contained" and "never checked".
+`deadline`: the 60 seconds ran out first, or a single git call reached its
+10-second cap. `failed`: a git call failed.
+`no_base`: the clone has no base to measure own commits from. `incomplete`: the
+clone is shallow or partial, so patch identity cannot be proved. `git_too_old`:
+git is older than 2.39, which the patch comparison needs.
+
+Removable says whether deleting a branch or removing a linked worktree would
+lose nothing that is not already on the base. It is a fact about data loss, not
+a prediction of any cleanup tool's checks: it does not require the main worktree
+to be on the default branch, clean or up to date, and it does not read a package's
+lifecycle stage. The `--json` document gives every non-default branch and every
+linked worktree of a clone a `removable` value, `{removable, blockers}`, where
+`blockers` lists in this order every reason it is not Removable and is empty
+exactly when it is. The base branch and the main worktree have none, and the
+main worktree is never offered for removal. A branch's blockers are
+`not_merged`, cleared when the branch is merged into the base; `verdict_unknown`,
+cleared when the cause of its `unknown` verdict is fixed: a clone with no base gets
+one once it has an `origin` remote and has fetched its default branch, deepening a
+shallow clone or upgrading git lifts those limits, and a later run that finishes in
+time with no failing git call decides a `deadline` or `failed` verdict, but a branch
+too large to check, `history_limit`, stays blocked until its commits are in the
+base's history or the branch changes to fit the bounds; `checked_out_in_main_worktree`, cleared by
+switching the main worktree to another branch; and, for a linked worktree that
+holds the branch, `worktree_not_clean` and `worktree_locked`, cleared by
+cleaning that worktree and unlocking it. A branch held by a linked
+worktree is Removable once that worktree is, because git refuses to delete a
+branch while the worktree exists, and the worktree's own blockers say when
+removing it is safe. A linked worktree's blockers are `not_merged` and
+`verdict_unknown`, the verdict of the branch it is on, or of its own detached commit;
+`not_clean`; and `locked`, cleared by unlocking it. A worktree's `not_merged` is
+cleared when its work lands on the remote's default branch and a later run sees
+it there. Its `verdict_unknown` is cleared when the cause of the `unknown`
+verdict is fixed, in the same ways as a branch's, and a later run then decides it. A worktree on the base branch, or on a branch with
+no commits yet, has no branch verdict that shows its commit is merged, so it stays
+`verdict_unknown` while it is on that branch. Moving it to another branch or
+removing it changes that, and a first commit on the unborn branch gives the branch
+a normal verdict on the next run. `not_clean` is cleared by
+committing, stashing or discarding any staged, unstaged, untracked or conflicted
+file, finishing an operation in progress or removing a stale `index.lock`. Ignored
+files never block. A worktree whose directory is gone and that is not locked,
+shown with the status `failed` and `prunable`, has no files to lose, so only its
+verdict and its lock apply. Git stops calling a locked worktree prunable, so a
+locked worktree whose directory is gone reads as unreadable: it is `not_clean` and
+`locked`, its branch is `worktree_not_clean` and `worktree_locked`, and its plain
+line is `failed  blocker not_clean`. Unlocking it lets a later run read it as
+prunable, and then only its verdict and its lock apply. A worktree git could not
+read for any other reason is `not_clean` for as
+long as it cannot be read, and stays blocked until it is readable again or is
+removed; one whose commit cannot be read is `verdict_unknown` on the same terms.
+Stashes belong to the
+whole clone and are untouched by either removal. A clone's `removable_count`
+gives `branches` and `worktrees`, the number of Removable non-default branches
+and of Removable linked worktrees. The two are counted separately, so a branch
+and the worktree holding it count once each. A clone with no base counts zero of
+both.
+
+In the plain output a clone line ends with
+`removable <b> branches, <w> worktrees`, equal to its `removable_count`, after
+the default facts, a bare repository's included. Each linked worktree line ends
+with `removable` or `blocker <first blocker>`, the first entry of its
+`blockers`, and this follows the status of a worktree that could not be read:
+`failed  removable` is a worktree whose directory is gone and whose branch is
+merged. A checkout that could not be read keeps its `<path>  <status>` line and
+gains no count.
 
 By default `nyx checkouts` is networked: it asks each distinct `origin` remote
 once, so clones that share a remote share one answer, and compares against what

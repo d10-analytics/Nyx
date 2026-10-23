@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 2)
+# Checkout facts document (schema 3)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 2
+CHECKOUTS_SCHEMA_VERSION = 3
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -843,8 +843,11 @@ _CLONE_KEYS = frozenset(
         "worktrees",
         "branches",
         "verdict_base",
+        "containment",
+        "removable_count",
     }
 )
+_CONTAINMENT_OUTCOMES = frozenset({"complete", "deadline", "failed"})
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
 _CLONE_STATUSES = _ITEM_STATUSES | {"too_many_branches"}
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
@@ -861,13 +864,24 @@ _WORKTREE_KEYS = frozenset(
         "operations",
         "index_lock",
         "verdict",
+        "removable",
     }
 )
 _HEAD_KEYS = frozenset({"branch", "sha"})
 _CHANGE_KEYS = frozenset({"staged", "unstaged", "untracked", "conflicted"})
 OPERATIONS = ("am", "bisect", "cherry_pick", "merge", "rebase", "revert")
 _BRANCH_KEYS = frozenset(
-    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote", "verdict"}
+    {
+        "name",
+        "sha",
+        "checked_out_in",
+        "upstream",
+        "upstream_mismatch",
+        "vs_remote",
+        "verdict",
+        "contained_in",
+        "removable",
+    }
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
@@ -1104,6 +1118,7 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
     if has_remote and item["vs_remote"] is None:
         raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
     _verdict(item["verdict"], f"{name}.verdict", nullable=True)
+    _nullable(item["contained_in"], _text, f"{name}.contained_in")
     return item
 
 
@@ -1117,6 +1132,117 @@ def _git_below_patch_floor(version: str | None) -> bool:
         return False
     parts = tuple(int(part) for part in numeric.group(0).split("."))
     return parts[: len(_VERDICT_PATCH_FLOOR)] < _VERDICT_PATCH_FLOOR
+
+
+def _worktree_not_clean(worktree: Mapping[str, Any]) -> bool:
+    """Say whether a linked worktree's tree holds anything a removal would lose.
+
+    A prunable worktree has no files left, so its ``failed`` status is the
+    registration's and not a tree that could not be read.
+    """
+    if worktree["prunable"]:
+        return False
+    if worktree["status"] != "ok":
+        return True
+    return (
+        any(worktree["changes"][field] for field in _CHANGE_KEYS)
+        or bool(worktree["operations"])
+        or worktree["index_lock"]
+    )
+
+
+def _verdict_blockers(verdict: Mapping[str, Any] | None) -> list[str]:
+    """Blockers a verdict puts on whatever holds that commit; none when merged."""
+    if verdict is None:
+        return ["verdict_unknown"]
+    if verdict["state"] == "unknown":
+        return ["verdict_unknown"]
+    return [] if verdict["state"] == "merged" else ["not_merged"]
+
+
+def _removable(blockers: list[str]) -> dict[str, Any]:
+    return {"removable": not blockers, "blockers": blockers}
+
+
+def derive_removable(clone: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive every Removable verdict of one ``ok`` clone from its collected facts.
+
+    Returns ``{"branches", "worktrees", "removable_count"}``. ``branches`` and
+    ``worktrees`` hold one entry per item of the clone's ``branches`` and
+    ``worktrees`` lists, in the same order: a ``{"removable", "blockers"}``
+    mapping, or ``None`` for the branch named by ``verdict_base`` and for the
+    main worktree. ``removable_count`` is ``{"branches", "worktrees"}``.
+
+    Branch blockers, in order: ``not_merged``, ``verdict_unknown``,
+    ``checked_out_in_main_worktree``, ``worktree_not_clean`` and
+    ``worktree_locked`` (the last two for a linked worktree that holds the
+    branch). Linked-worktree blockers, in order: ``not_merged``,
+    ``verdict_unknown``, ``not_clean``, ``locked``. A worktree takes the verdict
+    of the branch it is on, found through its own head when its status is
+    ``ok`` and through the branch's ``checked_out_in`` otherwise; a detached one
+    takes its own verdict, and one whose commit cannot be read, or whose branch
+    has no verdict, is ``verdict_unknown``. Ignored files never block.
+    """
+    base = clone["verdict_base"]
+    base_name = None if base is None else base["name"]
+    branches = clone["branches"]
+    worktrees = clone["worktrees"]
+    verdicts = {
+        branch["name"]: branch["verdict"]
+        for branch in branches
+        if branch["name"] != base_name
+    }
+    by_path = {worktree["path"]: worktree for worktree in worktrees}
+    main_paths = {worktree["path"] for worktree in worktrees if worktree["main"]}
+
+    def branch_of(worktree: Mapping[str, Any]) -> str | None:
+        if worktree["status"] == "ok":
+            return worktree["head"]["branch"]
+        for branch in branches:
+            if worktree["path"] in branch["checked_out_in"]:
+                return branch["name"]
+        return None
+
+    def worktree_blockers(worktree: Mapping[str, Any]) -> list[str]:
+        name = branch_of(worktree)
+        if name is not None:
+            blockers = _verdict_blockers(verdicts.get(name))
+        elif worktree["status"] == "ok":
+            blockers = _verdict_blockers(worktree["verdict"])
+        else:
+            blockers = ["verdict_unknown"]
+        if _worktree_not_clean(worktree):
+            blockers.append("not_clean")
+        if worktree["locked"]:
+            blockers.append("locked")
+        return blockers
+
+    branch_results: list[dict[str, Any] | None] = []
+    for branch in branches:
+        if branch["name"] == base_name:
+            branch_results.append(None)
+            continue
+        blockers = _verdict_blockers(branch["verdict"])
+        holders = [by_path[path] for path in branch["checked_out_in"]]
+        if any(path in main_paths for path in branch["checked_out_in"]):
+            blockers.append("checked_out_in_main_worktree")
+        if any(_worktree_not_clean(w) for w in holders if not w["main"]):
+            blockers.append("worktree_not_clean")
+        if any(w["locked"] for w in holders if not w["main"]):
+            blockers.append("worktree_locked")
+        branch_results.append(_removable(blockers))
+    worktree_results = [
+        None if worktree["main"] else _removable(worktree_blockers(worktree))
+        for worktree in worktrees
+    ]
+    return {
+        "branches": branch_results,
+        "worktrees": worktree_results,
+        "removable_count": {
+            "branches": sum(1 for r in branch_results if r is not None and r["removable"]),
+            "worktrees": sum(1 for r in worktree_results if r is not None and r["removable"]),
+        },
+    }
 
 
 def _clone_verdicts(
@@ -1163,6 +1289,107 @@ def _clone_verdicts(
             raise ProtocolError(f"{label} names an old git that is not old")
 
 
+def _clone_containment(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    git_version: str | None,
+    branches: list[dict[str, Any]],
+) -> None:
+    """Check the containment outcome and every ``contained_in`` of one ``ok`` clone.
+
+    The outcome follows one precedence: no base, then a shallow or partial
+    clone, then a git below the patch floor, then the work's own outcome.
+    A branch is contained only when the outcome is ``complete``.
+    """
+    base = item["verdict_base"]
+    outcome = item["containment"]
+    label = f"{name}.containment"
+    if base is None:
+        if outcome != "no_base":
+            raise ProtocolError(f"{label} must be no_base exactly when the clone has no base")
+    elif item["shallow"] or item["partial_clone"]:
+        if outcome != "incomplete":
+            raise ProtocolError(f"{label} must be incomplete for a shallow or partial clone")
+    elif _git_below_patch_floor(git_version):
+        if outcome != "git_too_old":
+            raise ProtocolError(f"{label} must be git_too_old below the patch floor")
+    elif type(outcome) is not str or outcome not in _CONTAINMENT_OUTCOMES:
+        raise ProtocolError(f"{label} contradicts the base, depth or git version of the clone")
+    containers = {branch["name"]: branch["contained_in"] for branch in branches}
+    for index, branch in enumerate(branches):
+        target = branch["contained_in"]
+        if target is None:
+            continue
+        where = f"{name}.branches[{index}].contained_in"
+        if outcome != "complete":
+            raise ProtocolError(f"{where} must be null unless containment is complete")
+        if branch["name"] == base["name"] or target == base["name"]:
+            raise ProtocolError(f"{where} involves the verdict base branch")
+        if target == branch["name"] or target not in containers:
+            raise ProtocolError(f"{where} must name another listed branch")
+    for start in containers:
+        seen = {start}
+        current = containers[start]
+        while current is not None:
+            if current in seen:
+                raise ProtocolError(f"{name} has a containment cycle")
+            seen.add(current)
+            current = containers[current]
+
+
+_REMOVABLE_KEYS = frozenset({"removable", "blockers"})
+_REMOVABLE_COUNT_KEYS = frozenset({"branches", "worktrees"})
+
+
+def _removable_shape(value: Any, name: str) -> None:
+    """Check the shape of one ``removable`` value; its content is checked by recomputation."""
+    if value is None:
+        return
+    item = _object(value, name)
+    _keys(item, _REMOVABLE_KEYS, name)
+    _bool(item["removable"], f"{name}.removable")
+    blockers = _list(item["blockers"], f"{name}.blockers")
+    for index, blocker in enumerate(blockers):
+        _text(blocker, f"{name}.blockers[{index}]")
+
+
+def _clone_removable(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    branches: list[dict[str, Any]],
+    worktrees: list[dict[str, Any]],
+) -> None:
+    """Check every Removable value and count of one ``ok`` clone against the derivation.
+
+    The shapes are checked first; then the document must equal what
+    ``derive_removable`` returns for the clone's own facts, which also settles
+    the null rules, blocker order and uniqueness, and the counts.
+    """
+    for index, branch in enumerate(branches):
+        _removable_shape(branch["removable"], f"{name}.branches[{index}].removable")
+    for index, worktree in enumerate(worktrees):
+        _removable_shape(worktree["removable"], f"{name}.worktrees[{index}].removable")
+    count = _object(item["removable_count"], f"{name}.removable_count")
+    _keys(count, _REMOVABLE_COUNT_KEYS, f"{name}.removable_count")
+    for field in sorted(_REMOVABLE_COUNT_KEYS):
+        _count(count[field], f"{name}.removable_count.{field}")
+    derived = derive_removable(item)
+    for index, (branch, expected) in enumerate(zip(branches, derived["branches"])):
+        if branch["removable"] != expected:
+            raise ProtocolError(
+                f"{name}.branches[{index}].removable contradicts the facts of the clone"
+            )
+    for index, (worktree, expected) in enumerate(zip(worktrees, derived["worktrees"])):
+        if worktree["removable"] != expected:
+            raise ProtocolError(
+                f"{name}.worktrees[{index}].removable contradicts the facts of the clone"
+            )
+    if count != derived["removable_count"]:
+        raise ProtocolError(f"{name}.removable_count contradicts the facts of the clone")
+
+
 def _clone(
     value: Any,
     name: str,
@@ -1186,6 +1413,8 @@ def _clone(
         "worktrees",
         "branches",
         "verdict_base",
+        "containment",
+        "removable_count",
     )
     if status != "ok":
         if any(item[field] is not None for field in facts):
@@ -1260,6 +1489,8 @@ def _clone(
         branches=parsed_branches,
         worktrees=parsed,
     )
+    _clone_containment(item, name, git_version=git_version, branches=parsed_branches)
+    _clone_removable(item, name, branches=parsed_branches, worktrees=parsed)
     return item
 
 
