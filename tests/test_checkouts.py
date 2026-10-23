@@ -6434,6 +6434,30 @@ def test_a_default_branch_ahead_of_its_base_neither_contains_nor_folds(tmp_path)
     assert containment_of(clone_document) == {"trunk": None, "wide": None}
 
 
+def test_the_default_branch_never_folds_even_when_the_pass_runs(tmp_path):
+    """``part`` shares the local default branch's tip, two commits ahead of its base,
+    and ``wide`` holds both: the pass runs and folds ``part`` but never the default branch."""
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    commit_file(work, "t2.txt", "t2\n")
+    commit_file(work, "t3.txt", "t3\n")
+    git(work, "branch", "part", "trunk")
+    switch(work, "wide", "trunk")
+    commit_file(work, "wide.txt", "wide\n")
+    git(work, "checkout", "-q", "trunk")
+
+    text = checkouts.collect_checkouts(
+        [str(folder)], deadline_ns=time.monotonic_ns() + int(60 * 1e9)
+    )
+    clone_document = find_clone(json.loads(text), work)
+
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"part": "wide", "trunk": None, "wide": None}
+    assert models.parse_checkouts(text)
+
+
 def import_chain(repository: Path, branch: str, count: int) -> None:
     """Add ``branch`` as a chain of ``count`` commits from the current head."""
     root = rev(repository, "HEAD")
