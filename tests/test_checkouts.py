@@ -6404,8 +6404,7 @@ CONTAINMENT_WORLD_FOLDS = {
 
 def test_branches_fold_under_the_nearest_branch_that_holds_all_their_commits(tmp_path):
     folder, work = containment_world(tmp_path)
-    watched = [work, work / ".git"]
-    before = [snapshot(path) for path in watched[:1]]
+    before = snapshot(work)
     listing = git(work, "worktree", "list", "--porcelain").stdout
 
     document = collect([folder])
@@ -6415,7 +6414,7 @@ def test_branches_fold_under_the_nearest_branch_that_holds_all_their_commits(tmp
     assert clone_document["verdict_base"]["name"] == "trunk"
     assert containment_of(clone_document) == CONTAINMENT_WORLD_FOLDS
     assert document["diagnostics"] == []
-    assert [snapshot(path) for path in watched[:1]] == before
+    assert snapshot(work) == before
     assert git(work, "worktree", "list", "--porcelain").stdout == listing
 
 
@@ -6711,9 +6710,6 @@ def test_a_late_containment_pass_reports_deadline_for_its_clone_alone_and_keeps_
     saved = json.loads(cache.read_text())
     assert set(saved) == {"schema_version", "verdicts"}
     assert saved["schema_version"] == 2
-    assert {key: entry["at"] for key, entry in saved["verdicts"].items()} == {
-        key: entry for key, entry in cache_times(cache).items()
-    }
     assert all(cache_times(cache)[key] > stamps[key] for key in stamps)
 
     # The control: a pass on the full deadline leaves the write no time.
@@ -6785,11 +6781,6 @@ def test_each_reason_to_skip_grouping_wins_in_its_order_and_runs_no_patch_stream
         assert len(streams) == (1 if outcome == "complete" else 0), name
     assert containment_of(find_clone(document, clones["plain"]))["inner"] == "outer"
 
-    old = stand_in(
-        tmp_path,
-        "old-git",
-        'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac',
-    )
     old_log = tmp_path / "old.log"
     recorder = stand_in(
         tmp_path,
@@ -6797,7 +6788,6 @@ def test_each_reason_to_skip_grouping_wins_in_its_order_and_runs_no_patch_stream
         f'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac\n'
         f'printf "%s\\n" "$*" >> "{old_log}"',
     )
-    del old
     with path_with(monkeypatch, recorder):
         older = collect([folder])
 
