@@ -7474,3 +7474,26 @@ def test_the_collector_names_no_blocker_that_only_the_derivation_decides():
 
     assert [name for name in BLOCKER_ONLY_NAMES if name in source] == []
     assert "derive_removable" in source
+
+
+def test_a_branch_held_by_two_worktrees_is_blocked_by_either_of_them(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    for name in ("alder", "birch"):
+        land(work, name)
+    first = linked(work, tmp_path, "calm", "alder")
+    second = linked(work, tmp_path, "dirty", "--force", "alder")
+    (second / "scratch.txt").write_text("x\n")
+    open_one = linked(work, tmp_path, "calm-too", "birch")
+    held_one = linked(work, tmp_path, "locked", "--force", "birch")
+    git(work, "worktree", "lock", str(held_one))
+
+    clone_document = removable_of(folder, work)
+
+    assert branch_of(clone_document, "alder")["checked_out_in"] == [real(first), real(second)]
+    assert branch_of(clone_document, "birch")["checked_out_in"] == [real(open_one), real(held_one)]
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "birch": ["worktree_locked"], "trunk": None},
+        {first: [], second: ["not_clean"], open_one: [], held_one: ["locked"]},
+        count=(0, 2),
+    )
