@@ -292,7 +292,7 @@ clones of its remote but lends them no objects and takes no part in choosing
 their default branch name. A checkout that could not be read has no Removable
 elements.
 
-A branch that holds nothing its larger sibling lacks is folded under that
+A branch whose changes a larger sibling appears to carry is folded under that
 sibling, so a stack of task branches under one package branch reads as one
 group. The `--json` document records this as `contained_in` on the folded
 branch, and as a `containment` outcome on the clone. A non-default branch is
@@ -300,7 +300,11 @@ contained in another non-default local branch of the same clone when every one o
 its own commits, the commits not on the base, is also an own commit of the other
 branch, or, for a commit that is not a merge, has a counterpart among the other
 branch's own commits with the same patch identity, as after a rebase or a
-cherry-pick. A branch with no own commits
+cherry-pick. A patch-identity match follows the change's patch, not the place it
+landed, so it also groups a change whose identical hunk sits at a different
+place in the container's own history; the grouping then names a container that
+does not hold the change. This is a grouping only, never a statement about
+removal. A branch with no own commits
 does not fold. The default branch is never a container. The nearest container
 wins: a branch folds under the container with the fewest own commits, provided
 that container has strictly more than the branch, and a tie goes to the name that

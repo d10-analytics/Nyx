@@ -207,6 +207,7 @@ CHECKOUT_RETIRED_WORDING = (
     "the plain lines show only the Removable summary described below, never a verdict",
     "Two cases have no verdict to wait for, so no local action clears them",
     "A worktree whose directory is gone, shown with the status `failed` and `prunable`",
+    "A branch that holds nothing its larger sibling lacks is folded",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -252,6 +253,11 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "appears only in the `--json` document: the plain lines never show a branch's "
         "verdict itself, only the Removable summary described below",
         "A non-default branch is contained in another non-default local branch of the same clone",
+        "A patch-identity match follows the change's patch, not the place it landed",
+        "so it also groups a change whose identical hunk sits at a different place in the "
+        "container's own history",
+        "the grouping then names a container that does not hold the change",
+        "This is a grouping only, never a statement about removal",
         "a branch folds under the container with the fewest own commits, provided that "
         "container has strictly more than the branch",
         "Two branches at the same commit never fold into each other",
