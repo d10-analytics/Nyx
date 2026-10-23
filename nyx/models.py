@@ -1155,11 +1155,9 @@ def _verdict_blockers(verdict: Mapping[str, Any] | None) -> list[str]:
     """Blockers a verdict puts on whatever holds that commit; none when merged."""
     if verdict is None:
         return ["verdict_unknown"]
-    if verdict["state"] == "not_merged":
-        return ["not_merged"]
     if verdict["state"] == "unknown":
         return ["verdict_unknown"]
-    return []
+    return [] if verdict["state"] == "merged" else ["not_merged"]
 
 
 def _removable(blockers: list[str]) -> dict[str, Any]:

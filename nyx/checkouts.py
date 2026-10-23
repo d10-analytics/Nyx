@@ -724,6 +724,9 @@ def _parse_worktrees(data: bytes) -> list[_ListedWorktree]:
         elif entries:
             label, _, value = text.partition(" ")
             entries[-1][label] = value
+    # Git marks an entry prunable as soon as its ``.git`` link is gone, even
+    # when the directory still holds work; only an entry whose path is gone
+    # too has no files left, so a leftover directory is read and fails instead.
     return [
         _ListedWorktree(
             path=entry["path"],
@@ -731,7 +734,7 @@ def _parse_worktrees(data: bytes) -> list[_ListedWorktree]:
             branch=entry.get("branch"),
             bare="bare" in entry,
             locked="locked" in entry,
-            prunable="prunable" in entry,
+            prunable="prunable" in entry and not os.path.lexists(entry["path"]),
         )
         for entry in entries
     ]
