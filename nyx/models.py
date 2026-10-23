@@ -844,6 +844,7 @@ _CLONE_KEYS = frozenset(
         "branches",
         "verdict_base",
         "containment",
+        "removable_count",
     }
 )
 _CONTAINMENT_OUTCOMES = frozenset({"complete", "deadline", "failed"})
@@ -863,6 +864,7 @@ _WORKTREE_KEYS = frozenset(
         "operations",
         "index_lock",
         "verdict",
+        "removable",
     }
 )
 _HEAD_KEYS = frozenset({"branch", "sha"})
@@ -878,6 +880,7 @@ _BRANCH_KEYS = frozenset(
         "vs_remote",
         "verdict",
         "contained_in",
+        "removable",
     }
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
@@ -1129,6 +1132,119 @@ def _git_below_patch_floor(version: str | None) -> bool:
         return False
     parts = tuple(int(part) for part in numeric.group(0).split("."))
     return parts[: len(_VERDICT_PATCH_FLOOR)] < _VERDICT_PATCH_FLOOR
+
+
+def _worktree_not_clean(worktree: Mapping[str, Any]) -> bool:
+    """Say whether a linked worktree's tree holds anything a removal would lose.
+
+    A prunable worktree has no files left, so its ``failed`` status is the
+    registration's and not a tree that could not be read.
+    """
+    if worktree["prunable"]:
+        return False
+    if worktree["status"] != "ok":
+        return True
+    return (
+        any(worktree["changes"][field] for field in _CHANGE_KEYS)
+        or bool(worktree["operations"])
+        or worktree["index_lock"]
+    )
+
+
+def _verdict_blockers(verdict: Mapping[str, Any] | None) -> list[str]:
+    """Blockers a verdict puts on whatever holds that commit; none when merged."""
+    if verdict is None:
+        return ["verdict_unknown"]
+    if verdict["state"] == "not_merged":
+        return ["not_merged"]
+    if verdict["state"] == "unknown":
+        return ["verdict_unknown"]
+    return []
+
+
+def _removable(blockers: list[str]) -> dict[str, Any]:
+    return {"removable": not blockers, "blockers": blockers}
+
+
+def derive_removable(clone: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive every Removable verdict of one ``ok`` clone from its collected facts.
+
+    Returns ``{"branches", "worktrees", "removable_count"}``. ``branches`` and
+    ``worktrees`` hold one entry per item of the clone's ``branches`` and
+    ``worktrees`` lists, in the same order: a ``{"removable", "blockers"}``
+    mapping, or ``None`` for the branch named by ``verdict_base`` and for the
+    main worktree. ``removable_count`` is ``{"branches", "worktrees"}``.
+
+    Branch blockers, in order: ``not_merged``, ``verdict_unknown``,
+    ``checked_out_in_main_worktree``, ``worktree_not_clean`` and
+    ``worktree_locked`` (the last two for a linked worktree that holds the
+    branch). Linked-worktree blockers, in order: ``not_merged``,
+    ``verdict_unknown``, ``not_clean``, ``locked``. A worktree takes the verdict
+    of the branch it is on, found through its own head when its status is
+    ``ok`` and through the branch's ``checked_out_in`` otherwise; a detached one
+    takes its own verdict, and one whose commit cannot be read, or whose branch
+    has no verdict, is ``verdict_unknown``. Ignored files never block.
+    """
+    base = clone["verdict_base"]
+    base_name = None if base is None else base["name"]
+    branches = clone["branches"]
+    worktrees = clone["worktrees"]
+    verdicts = {
+        branch["name"]: branch["verdict"]
+        for branch in branches
+        if branch["name"] != base_name
+    }
+    by_path = {worktree["path"]: worktree for worktree in worktrees}
+    main_paths = {worktree["path"] for worktree in worktrees if worktree["main"]}
+
+    def branch_of(worktree: Mapping[str, Any]) -> str | None:
+        if worktree["status"] == "ok":
+            return worktree["head"]["branch"]
+        for branch in branches:
+            if worktree["path"] in branch["checked_out_in"]:
+                return branch["name"]
+        return None
+
+    def worktree_blockers(worktree: Mapping[str, Any]) -> list[str]:
+        name = branch_of(worktree)
+        if name is not None:
+            blockers = _verdict_blockers(verdicts.get(name))
+        elif worktree["status"] == "ok":
+            blockers = _verdict_blockers(worktree["verdict"])
+        else:
+            blockers = ["verdict_unknown"]
+        if _worktree_not_clean(worktree):
+            blockers.append("not_clean")
+        if worktree["locked"]:
+            blockers.append("locked")
+        return blockers
+
+    branch_results: list[dict[str, Any] | None] = []
+    for branch in branches:
+        if branch["name"] == base_name:
+            branch_results.append(None)
+            continue
+        blockers = _verdict_blockers(branch["verdict"])
+        holders = [by_path[path] for path in branch["checked_out_in"]]
+        if any(path in main_paths for path in branch["checked_out_in"]):
+            blockers.append("checked_out_in_main_worktree")
+        if any(_worktree_not_clean(w) for w in holders if not w["main"]):
+            blockers.append("worktree_not_clean")
+        if any(w["locked"] for w in holders if not w["main"]):
+            blockers.append("worktree_locked")
+        branch_results.append(_removable(blockers))
+    worktree_results = [
+        None if worktree["main"] else _removable(worktree_blockers(worktree))
+        for worktree in worktrees
+    ]
+    return {
+        "branches": branch_results,
+        "worktrees": worktree_results,
+        "removable_count": {
+            "branches": sum(1 for r in branch_results if r is not None and r["removable"]),
+            "worktrees": sum(1 for r in worktree_results if r is not None and r["removable"]),
+        },
+    }
 
 
 def _clone_verdicts(

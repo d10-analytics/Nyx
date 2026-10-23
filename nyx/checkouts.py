@@ -41,6 +41,7 @@ from .models import (
     branch_sort_key,
     canonical_digest,
     clone_sort_key,
+    derive_removable,
     diagnostic_sort_key,
     folder_sort_key,
     load_strict_json,
@@ -647,6 +648,7 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
         "branches": None,
         "verdict_base": None,
         "containment": None,
+        "removable_count": None,
     }
 
 
@@ -865,6 +867,7 @@ def _worktree_document(
         "operations": None,
         "index_lock": None,
         "verdict": None,
+        "removable": None,
     }
     if listed.prunable:
         return document
@@ -1058,6 +1061,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                 "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
                 "verdict": None,
                 "contained_in": None,
+                "removable": None,
             }
         )
     branches.sort(key=branch_sort_key)
@@ -1096,6 +1100,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "branches": branches,
         "verdict_base": None,
         "containment": None,
+        "removable_count": None,
     }
     if not _all_text_safe(clone):
         return degraded("failed")
@@ -2358,6 +2363,20 @@ def _assign_clone_verdicts(
     return result
 
 
+def _assign_removable(repositories: list[dict[str, Any]]) -> None:
+    """Give every ``ok`` clone's branches and linked worktrees their Removable verdicts."""
+    for repository in repositories:
+        for clone in repository["clones"]:
+            if clone["status"] != "ok":
+                continue
+            derived = derive_removable(clone)
+            for branch, verdict in zip(clone["branches"], derived["branches"]):
+                branch["removable"] = verdict
+            for worktree, verdict in zip(clone["worktrees"], derived["worktrees"]):
+                worktree["removable"] = verdict
+            clone["removable_count"] = derived["removable_count"]
+
+
 def _assign_verdicts(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
@@ -2599,6 +2618,7 @@ def collect_checkouts(
                 max_parallel,
                 cache,
             )
+        _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, deadline_ns, diagnostics)
 
