@@ -1405,7 +1405,8 @@ def mutate_prunable_ok(document):
         mutate_comparison_counts("unknown"),
         mutate_counts_contradict,
         mutate_schema(1),
-        mutate_schema(3),
+        mutate_schema(2),
+        mutate_schema(4),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1498,6 +1499,7 @@ def undecided_without_a_base(document):
     """Drop the first clone's base, as for a group that agrees on no default name."""
     clone_document = first_clone(document)
     clone_document["verdict_base"] = None
+    clone_document["containment"] = "no_base"
     for branch in clone_document["branches"]:
         branch["verdict"] = verdict_of("unknown", reason="no_base")
 
@@ -1763,6 +1765,7 @@ def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
     limited = doc_copy(document)
     clone_document = first_clone(limited)
     clone_document["shallow"] = True
+    clone_document["containment"] = "incomplete"
     other_branches(clone_document)[0]["verdict"] = verdict_of(
         "unknown", reason="incomplete_clone"
     )
@@ -1774,6 +1777,8 @@ def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
 
     old = doc_copy(document)
     old["git"]["version"] = "2.38.1"
+    for item in all_clones(old):
+        item["containment"] = "git_too_old"
     other_branches(first_clone(old))[0]["verdict"] = verdict_of("unknown", reason="git_too_old")
     assert models.parse_checkouts(redigest(old))
     old["git"]["version"] = "2.9.5"
@@ -1799,6 +1804,7 @@ NULLABLE_CLONE_FACTS = {
     "worktrees": ([], "", 0, False),
     "branches": ([], "", 0, False),
     "verdict_base": ({}, "", [], False, 0),
+    "containment": ("complete", "", [], False, 0),
 }
 NULLABLE_WORKTREE_FACTS = {
     "head": ({}, "", [], False),
@@ -1814,7 +1820,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
         local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
-        verdict_base=None,
+        verdict_base=None, containment=None,
     )
     return clone_document
 
@@ -1875,11 +1881,11 @@ def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base"])
+@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base", "containment"])
 def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
     document, _folder = sample
     ok_clone = first_clone(doc_copy(document))
-    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base")}
+    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base", "containment")}
     broken = doc_copy(document)
     refused_clone(broken)["status"] = "too_many_branches"
     first_clone(broken)[fact] = facts[fact]
@@ -3245,7 +3251,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 2
+    assert first["schema_version"] == 3
     borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -6124,7 +6130,7 @@ def count_tip_equality(monkeypatch) -> list[int]:
 
 CLONE_FACTS = (
     "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
-    "stash_count", "worktrees", "branches", "verdict_base",
+    "stash_count", "worktrees", "branches", "verdict_base", "containment",
 )
 
 
@@ -6327,3 +6333,625 @@ def test_no_git_process_starts_after_the_verdict_deadline_and_the_cache_write_la
     assert verdicts_of(find_clone(document, fast)) == CACHE_WORLD_VERDICTS
     assert document["diagnostics"] == []
     assert set(cache_entries(cache).values()) == {"patch_equivalent", "none"}
+
+
+# ---------------------------------------------------------------------------
+# Containment grouping
+# ---------------------------------------------------------------------------
+
+
+def containment_of(clone_document: dict[str, Any]) -> dict[str, str | None]:
+    return {branch["name"]: branch["contained_in"] for branch in clone_document["branches"]}
+
+
+def switch(work: Path, name: str, start: str) -> None:
+    git(work, "checkout", "-q", "-b", name, start)
+
+
+def containment_world(tmp_path: Path):
+    """One clone whose branches carry no naming convention, judged against ``origin/trunk``.
+
+    ``mid`` holds ``alpha`` by a merge commit and ``zeta`` holds ``mid`` by another
+    and cherry-picks ``pick``; ``copy`` shares ``zeta``'s tip.  ``host`` holds ``solo``
+    and nothing else.  ``synced`` is only a merge of a base commit.  The local
+    ``trunk`` is two commits ahead of ``origin/trunk``, one a cherry-pick of ``pick``.
+    """
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    older = rev(work, "trunk~1")
+    switch(work, "pick", "trunk")
+    commit_file(work, "pick.txt", "pick\n")
+    switch(work, "alpha", "trunk")
+    commit_file(work, "alpha.txt", "alpha\n")
+    switch(work, "mid", "trunk")
+    commit_file(work, "mid.txt", "mid\n")
+    git(work, "merge", "-q", "--no-ff", "-m", "take alpha", "alpha")
+    switch(work, "zeta", "trunk")
+    commit_file(work, "zeta.txt", "zeta\n")
+    git(work, "merge", "-q", "--no-ff", "-m", "take mid", "mid")
+    git(work, "cherry-pick", "pick")
+    git(work, "branch", "copy", "zeta")
+    switch(work, "solo", "trunk")
+    commit_file(work, "solo.txt", "solo\n")
+    switch(work, "host", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "take solo", "solo")
+    switch(work, "stray", "trunk")
+    commit_file(work, "stray.txt", "stray\n")
+    git(work, "branch", "done", "trunk")
+    switch(work, "synced", older)
+    git(work, "merge", "-q", "--no-ff", "-m", "sync", "trunk")
+    git(work, "checkout", "-q", "trunk")
+    commit_file(work, "ahead.txt", "ahead\n")
+    git(work, "cherry-pick", "pick")
+    return folder, work
+
+
+CONTAINMENT_WORLD_FOLDS = {
+    "alpha": "mid",
+    "mid": "copy",
+    "pick": "copy",
+    "copy": None,
+    "zeta": None,
+    "solo": "host",
+    "host": None,
+    "stray": None,
+    "done": None,
+    "synced": None,
+    "trunk": None,
+}
+
+
+def test_branches_fold_under_the_nearest_branch_that_holds_all_their_commits(tmp_path):
+    folder, work = containment_world(tmp_path)
+    watched = [work, work / ".git"]
+    before = [snapshot(path) for path in watched[:1]]
+    listing = git(work, "worktree", "list", "--porcelain").stdout
+
+    document = collect([folder])
+
+    clone_document = find_clone(document, work)
+    assert clone_document["containment"] == "complete"
+    assert clone_document["verdict_base"]["name"] == "trunk"
+    assert containment_of(clone_document) == CONTAINMENT_WORLD_FOLDS
+    assert document["diagnostics"] == []
+    assert [snapshot(path) for path in watched[:1]] == before
+    assert git(work, "worktree", "list", "--porcelain").stdout == listing
+
+
+def test_a_default_branch_ahead_of_its_base_neither_contains_nor_folds(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    commit_file(work, "t1.txt", "t1\n")
+    git(work, "push", "-q", "origin", "trunk")
+    commit_file(work, "t2.txt", "t2\n")
+    commit_file(work, "t3.txt", "t3\n")
+    switch(work, "wide", "trunk")
+    commit_file(work, "wide.txt", "wide\n")
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"trunk": None, "wide": None}
+
+
+def import_chain(repository: Path, branch: str, count: int) -> None:
+    """Add ``branch`` as a chain of ``count`` commits from the current head."""
+    root = rev(repository, "HEAD")
+    stream = b"".join(
+        (
+            f"commit refs/heads/{branch}\ncommitter T <t@example.com> 1700000000 +0000\n"
+            f"data 2\nc\n{'from ' + root + chr(10) if number == 0 else ''}"
+            f"M 100644 inline c{number}.txt\ndata 2\nx\n\n"
+        ).encode("ascii")
+        for number in range(count)
+    )
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repository,
+        input=stream,
+        capture_output=True,
+        check=True,
+    )
+
+
+def test_branches_over_the_own_commit_cap_neither_fold_nor_contain(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    cap = checkouts.OWN_COMMIT_CAP
+    import_chain(work, "large-b", cap + 2)
+    git(work, "branch", "large-a", "large-b~1")
+    git(work, "branch", "tiny", f"large-b~{cap + 1}")
+    assert rev(work, "tiny") == rev(work, f"large-b~{cap + 1}")
+    assert git(work, "merge-base", "--is-ancestor", "tiny", "large-a", check=False).returncode == 0
+
+    clone_document = find_clone(collect([folder]), work)
+
+    verdicts = verdicts_of(clone_document)
+    assert verdicts["large-a"] == verdicts["large-b"] == unknown("history_limit")
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {
+        "large-a": None,
+        "large-b": None,
+        "tiny": None,
+        "trunk": None,
+    }
+
+
+@pytest.mark.parametrize("trap", ["graft", "replace"])
+def test_a_graft_or_replace_ref_cannot_make_a_commit_look_held(tmp_path, trap):
+    folder, work = containment_world(tmp_path)
+    tip, stray = rev(work, "zeta"), rev(work, "stray")
+    parent = rev(work, "zeta~1")
+    if trap == "graft":
+        (work / ".git" / "info").mkdir(exist_ok=True)
+        (work / ".git" / "info" / "grafts").write_text(f"{tip} {parent} {stray}\n")
+    else:
+        git(work, "replace", "--graft", tip, parent, stray)
+    assert stray in git(work, "rev-list", "zeta").stdout.split()
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document)["stray"] is None
+    assert containment_of(clone_document) == CONTAINMENT_WORLD_FOLDS
+
+
+def test_a_base_lent_by_a_sibling_clone_still_folds_nested_branches(tmp_path):
+    folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
+    switch(lagging, "inner", "trunk")
+    commit_file(lagging, "inner.txt", "inner\n")
+    switch(lagging, "outer", "inner")
+    commit_file(lagging, "outer.txt", "outer\n")
+
+    document = collect([folder], remote_checks=True)
+
+    clone_document = find_clone(document, lagging)
+    assert clone_document["verdict_base"]["objects_from"] == real(holder)
+    assert clone_document["containment"] == "complete"
+    assert containment_of(clone_document) == {"inner": "outer", "outer": None, "trunk": None}
+
+
+# -- the pass inside the collection -----------------------------------------
+
+
+def nested_world(tmp_path: Path, tag: str = "", name: str = "work"):
+    """A clone with ``inner`` held by ``outer`` and an unrelated ``lone``."""
+    served = tmp_path / "served"
+    served.mkdir(exist_ok=True)
+    folder = tmp_path / "folder"
+    folder.mkdir(exist_ok=True)
+    remote = served / "remote.git"
+    if not remote.exists():
+        make_remote(served)
+    work = clone(remote, folder / name)
+    switch(work, "inner", "trunk")
+    commit_file(work, f"inner{tag}.txt", f"inner{tag}\n")
+    switch(work, "outer", "inner")
+    commit_file(work, f"outer{tag}.txt", f"outer{tag}\n")
+    switch(work, "lone", "trunk")
+    commit_file(work, f"lone{tag}.txt", f"lone{tag}\n")
+    git(work, "checkout", "-q", "trunk")
+    return folder, work
+
+
+NESTED_FOLDS = {"inner": "outer", "outer": None, "lone": None, "trunk": None}
+
+
+def log_lines(log: Path, repository: Path | None = None) -> list[str]:
+    lines = log.read_text().splitlines() if log.exists() else []
+    if repository is not None:
+        lines = [line for line in lines if f" -C {real(repository)} " in line]
+    return lines
+
+
+def containment_lists(lines: list[str]) -> list[str]:
+    return [line for line in lines if " rev-list " in line and "--max-count=" in line]
+
+
+def containment_streams(lines: list[str], base: str) -> list[str]:
+    """The streamed patch passes over branch tips: the revisions before ``--not <base>``."""
+    found = []
+    for line in lines:
+        words = line.split()
+        if " log " not in line or "-p" not in words or words[-3:-1] != ["--not", base]:
+            continue
+        if words[-4] != base:
+            found.append(line)
+    return found
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_the_fold_is_computed_in_every_collection_and_follows_the_recorded_tips(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = nested_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    logs = []
+    documents = []
+    for name in ("first", "second"):
+        shim, log = recording(tmp_path, name)
+        with path_with(monkeypatch, shim):
+            documents.append(collect([folder]))
+        logs.append(log)
+    first, second = documents
+
+    assert containment_of(find_clone(first, work)) == NESTED_FOLDS
+    assert second["checkouts_digest"] == first["checkouts_digest"]
+    for log in logs:
+        lines = log_lines(log)
+        assert len(containment_lists(lines)) == 3
+        assert len(containment_streams(lines, base)) == 1
+
+    # Moving one tip between runs moves the fold: nothing is served from before.
+    git(work, "checkout", "-q", "inner")
+    commit_file(work, "inner-more.txt", "more\n")
+    git(work, "checkout", "-q", "trunk")
+    moved = collect([folder])
+    assert moved["checkouts_digest"] != first["checkouts_digest"]
+    assert containment_of(find_clone(moved, work)) == {
+        "inner": None, "outer": None, "lone": None, "trunk": None
+    }
+    assert moved["diagnostics"] == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the moving stand-in is a shell script")
+def test_a_ref_moved_after_the_branches_were_listed_leaves_the_fold_on_the_recorded_tip(
+    tmp_path, monkeypatch
+):
+    folder, work = nested_world(tmp_path)
+    tip = rev(work, "outer")
+    top = rev(work, "origin/trunk")
+    real_git = shutil.which("git")
+    done = tmp_path / "moved"
+    shim = git_stand_in(
+        tmp_path,
+        f'case "$*" in *"for-each-ref --merged"*) [ -e "{done}" ] || {{ : > "{done}"; '
+        f'"{real_git}" -C "{work}" update-ref refs/heads/outer {top}; }};; esac',
+    )
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    clone_document = find_clone(collect([folder]), work)
+
+    assert done.exists()
+    assert rev(work, "outer") == top
+    assert branch_of(clone_document, "outer")["sha"] == tip
+    assert containment_of(clone_document) == NESTED_FOLDS
+
+
+FAILING_CONTAINMENT = {
+    "list": ('*"--max-count"*', "exit 1", "failed"),
+    "stream": ('*" log "*" --not {base} --"*', "exit 1", "failed"),
+    "late-stream": ('*" log "*" --not {base} --"*', "exec sleep 30", "deadline"),
+}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the failing git stand-in is a shell script")
+@pytest.mark.parametrize("step", list(FAILING_CONTAINMENT))
+def test_a_containment_call_that_fails_or_runs_late_folds_nothing_and_changes_no_verdict(
+    tmp_path, monkeypatch, isolated_git, step
+):
+    cache = nyx_home(isolated_git)
+    folder, work = nested_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    control = collect([folder], seconds=3.0)
+    assert containment_of(find_clone(control, work)) == NESTED_FOLDS
+    pattern, action, outcome = FAILING_CONTAINMENT[step]
+    shim = stand_in(
+        tmp_path, "breaking", f"case \"$*\" in {pattern.format(base=base)}) {action};; esac"
+    )
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], seconds=3.0)
+
+    clone_document = find_clone(document, work)
+    assert clone_document["containment"] == outcome
+    assert set(containment_of(clone_document).values()) == {None}
+    assert verdicts_of(clone_document) == verdicts_of(find_clone(control, work))
+    assert document["diagnostics"] == []
+    assert cache.exists()
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
+def test_a_late_containment_pass_reports_deadline_for_its_clone_alone_and_keeps_the_cache_write(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, one = nested_world(tmp_path, "-one", "one")
+    _folder, two = nested_world(tmp_path, "-two", "two")
+    first = collect([folder], seconds=3.0)
+    assert containment_of(find_clone(first, one)) == NESTED_FOLDS
+    assert containment_of(find_clone(first, two)) == NESTED_FOLDS
+    stamps = cache_times(cache)
+    assert stamps
+    time.sleep(1.1)
+    marker = tmp_path / "delayed"
+    slow = stand_in(
+        tmp_path,
+        "late",
+        f'case "$*" in *" -C {real(two)} "*"--max-count"*) '
+        f'[ -e "{marker}" ] || {{ : > "{marker}"; exec sleep 30; }};; esac',
+    )
+
+    with path_with(monkeypatch, slow):
+        second = collect([folder], seconds=3.0)
+
+    assert marker.exists()
+    late = find_clone(second, two)
+    assert late["containment"] == "deadline"
+    assert set(containment_of(late).values()) == {None}
+    assert verdicts_of(late) == verdicts_of(find_clone(first, two))
+    on_time = find_clone(second, one)
+    assert on_time["containment"] == "complete"
+    assert containment_of(on_time) == NESTED_FOLDS
+    assert second["diagnostics"] == []
+    saved = json.loads(cache.read_text())
+    assert set(saved) == {"schema_version", "verdicts"}
+    assert saved["schema_version"] == 2
+    assert {key: entry["at"] for key, entry in saved["verdicts"].items()} == {
+        key: entry for key, entry in cache_times(cache).items()
+    }
+    assert all(cache_times(cache)[key] > stamps[key] for key in stamps)
+
+    # The control: a pass on the full deadline leaves the write no time.
+    time.sleep(1.1)
+    monkeypatch.setattr(checkouts, "VERDICT_RESERVE_NS", 0)
+    marker.unlink()
+    with path_with(monkeypatch, slow):
+        unreserved = collect([folder], seconds=3.0)
+    assert unreserved["diagnostics"] == [
+        {"code": "checkout_cache_write_failed", "path": str(cache)}
+    ]
+
+
+def limited_world(tmp_path: Path):
+    """Clones that cannot prove patch equivalence, each with a held branch."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    commit_file(clone(remote, tmp_path / "seed"), "more.txt", "more\n")
+    git(tmp_path / "seed", "push", "-q", "origin", "trunk")
+    url = f"file://{remote}"
+    clones = {
+        "plain": clone(remote, folder / "plain"),
+        "shallow": clone(url, folder / "shallow", "--depth=1"),
+        "partial": clone(url, folder / "partial", "--filter=blob:none"),
+        "shallow-bare": clone(url, folder / "shallow-bare", "--depth=1"),
+    }
+    git(clones["shallow-bare"], "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    git(clones["shallow-bare"], "update-ref", "-d", "refs/remotes/origin/trunk")
+    standalone = folder / "standalone"
+    git(tmp_path, "init", "-q", "-b", "trunk", str(standalone))
+    commit_file(standalone, "s.txt", "s\n")
+    clones["standalone"] = standalone
+    for repository in clones.values():
+        switch(repository, "inner", "trunk")
+        commit_file(repository, "inner.txt", "inner\n")
+        switch(repository, "outer", "inner")
+        commit_file(repository, "outer.txt", "outer\n")
+        git(repository, "checkout", "-q", "trunk")
+    return folder, clones
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording and version stand-ins are shell scripts")
+def test_each_reason_to_skip_grouping_wins_in_its_order_and_runs_no_patch_stream(
+    tmp_path, monkeypatch
+):
+    folder, clones = limited_world(tmp_path)
+    base = rev(clones["plain"], "origin/trunk")
+    shim, log = recording(tmp_path, "limits")
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    expected = {
+        "plain": "complete",
+        "shallow": "incomplete",
+        "partial": "incomplete",
+        "shallow-bare": "no_base",
+        "standalone": "no_base",
+    }
+    for name, outcome in expected.items():
+        item = find_clone(document, clones[name])
+        assert item["containment"] == outcome, name
+        folds = containment_of(item)
+        assert set(folds.values()) == ({"outer"} | {None} if outcome == "complete" else {None})
+        streams = containment_streams(log_lines(log, clones[name]), base)
+        assert len(streams) == (1 if outcome == "complete" else 0), name
+    assert containment_of(find_clone(document, clones["plain"]))["inner"] == "outer"
+
+    old = stand_in(
+        tmp_path,
+        "old-git",
+        'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac',
+    )
+    old_log = tmp_path / "old.log"
+    recorder = stand_in(
+        tmp_path,
+        "old-recorder",
+        f'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac\n'
+        f'printf "%s\\n" "$*" >> "{old_log}"',
+    )
+    del old
+    with path_with(monkeypatch, recorder):
+        older = collect([folder])
+
+    assert older["git"]["version"] == "2.38.0"
+    expected_old = {**expected, "plain": "git_too_old"}
+    for name, outcome in expected_old.items():
+        item = find_clone(older, clones[name])
+        assert item["containment"] == outcome, name
+        assert set(containment_of(item).values()) == {None}
+        assert containment_streams(log_lines(old_log, clones[name]), base) == []
+        assert containment_lists(log_lines(old_log, clones[name])) == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_clone_at_the_branch_cap_costs_one_commit_list_per_branch_and_one_patch_stream(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "repo")
+    import_branches(repository, models.CHECKOUT_BRANCH_CAP - 1)
+    base = rev(repository, "origin/trunk")
+    shim, log = recording(tmp_path, "cap")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], seconds=600.0)
+
+    item = find_clone(document, repository)
+    lines = log_lines(log, repository)
+    assert item["containment"] == "complete"
+    assert len(item["branches"]) == models.CHECKOUT_BRANCH_CAP
+    assert set(containment_of(item).values()) == {None}
+    assert len(containment_lists(lines)) <= models.CHECKOUT_BRANCH_CAP - 1
+    assert len(containment_streams(lines, base)) == 1
+    assert document["diagnostics"] == []
+    assert len(cache_entries(cache)) == models.CHECKOUT_BRANCH_CAP - 1
+
+
+# -- the parser ------------------------------------------------------------------
+
+
+def folded(document: dict[str, Any]) -> dict[str, Any]:
+    """Fold ``never-pushed`` under ``outside`` in the first clone of a valid sample."""
+    clone_document = first_clone(document)
+    assert clone_document["containment"] == "complete"
+    branch_of(clone_document, "never-pushed")["contained_in"] = "outside"
+    return clone_document
+
+
+def test_parser_accepts_folded_branches_and_every_outcome_where_it_applies(sample):
+    document, _folder = sample
+    accepted = doc_copy(document)
+    folded(accepted)
+    assert models.parse_checkouts(redigest(accepted))
+    for outcome in ("deadline", "failed"):
+        accepted = doc_copy(document)
+        first_clone(accepted)["containment"] = outcome
+        assert models.parse_checkouts(redigest(accepted))
+    shallow = doc_copy(document)
+    first_clone(shallow).update(shallow=True, containment="incomplete")
+    other_branches(first_clone(shallow))[0]["verdict"] = verdict_of(
+        "unknown", reason="incomplete_clone"
+    )
+    assert models.parse_checkouts(redigest(shallow))
+    shallow_old = doc_copy(shallow)
+    set_git_version(shallow_old, "2.38.1", keep=first_clone(shallow_old))
+    assert models.parse_checkouts(redigest(shallow_old))
+    old = doc_copy(document)
+    set_git_version(old, "2.38.1")
+    assert models.parse_checkouts(redigest(old))
+
+
+def set_git_version(document: dict[str, Any], version: str, keep: Any = None) -> None:
+    """Change the git version and settle the containment outcome of every other clone."""
+    document["git"]["version"] = version
+    floor = tuple(int(part) for part in version.split(".")[:2]) < (2, 39)
+    for item in all_clones(document):
+        if item is not keep and item["verdict_base"] is not None and not item["shallow"]:
+            item["containment"] = "git_too_old" if floor else "complete"
+
+
+def only_contained_in(name: str, target: Any):
+    def mutate(document):
+        branch_of(folded(document), name)["contained_in"] = target
+
+    return mutate
+
+
+def mutate_cycle(document):
+    clone_document = folded(document)
+    branch_of(clone_document, "outside")["contained_in"] = "never-pushed"
+
+
+def mutate_base_branch_contained(document):
+    clone_document = folded(document)
+    branch_of(clone_document, "trunk")["contained_in"] = "outside"
+
+
+def with_outcome(outcome: Any, *, shallow: bool | None = None, version: str | None = None,
+                 no_base: bool = False, fold: bool = False):
+    def mutate(document):
+        if no_base:
+            undecided_without_a_base(document)
+        clone_document = first_clone(document)
+        if shallow is not None:
+            clone_document["shallow"] = shallow
+            if shallow:
+                for branch in other_branches(clone_document) if not no_base else []:
+                    branch["verdict"] = verdict_of("unknown", reason="incomplete_clone")
+        if version is not None:
+            set_git_version(document, version, keep=clone_document)
+            if version.startswith("2.38") and not no_base:
+                for branch in other_branches(clone_document):
+                    branch["verdict"] = verdict_of("unknown", reason="git_too_old")
+        clone_document["containment"] = outcome
+        if fold:
+            branch_of(clone_document, "never-pushed")["contained_in"] = "outside"
+
+    return mutate
+
+
+def mutate_containment_missing(document):
+    del first_clone(document)["containment"]
+
+
+def mutate_containment_on_a_refused_clone(document):
+    refused_clone(document)["containment"] = "complete"
+
+
+REJECTED_CONTAINMENT_DOCUMENTS = {
+    "contained_in_naming_the_base_branch": only_contained_in("never-pushed", "trunk"),
+    "contained_in_naming_itself": only_contained_in("never-pushed", "never-pushed"),
+    "contained_in_naming_an_unlisted_branch": only_contained_in("never-pushed", "absent"),
+    "contained_in_not_text": only_contained_in("never-pushed", 7),
+    "contained_in_cycle": mutate_cycle,
+    "contained_in_on_the_base_branch": mutate_base_branch_contained,
+    "contained_in_under_deadline": with_outcome("deadline", fold=True),
+    "contained_in_under_failed": with_outcome("failed", fold=True),
+    "contained_in_under_no_base": with_outcome("no_base", no_base=True, fold=True),
+    "contained_in_under_incomplete": with_outcome("incomplete", shallow=True, fold=True),
+    "contained_in_under_git_too_old": with_outcome("git_too_old", version="2.38.1", fold=True),
+    "containment_undefined": with_outcome(None),
+    "containment_key_missing": mutate_containment_missing,
+    "containment_foreign_value": with_outcome("partial"),
+    "containment_on_a_refused_clone": mutate_containment_on_a_refused_clone,
+    "no_base_with_a_base": with_outcome("no_base"),
+    "complete_without_a_base": with_outcome("complete", no_base=True),
+    "incomplete_on_a_full_clone": with_outcome("incomplete"),
+    "complete_on_a_shallow_clone": with_outcome("complete", shallow=True),
+    "git_too_old_under_a_new_git": with_outcome("git_too_old", version="2.43.0"),
+    "complete_under_an_old_git": with_outcome("complete", version="2.38.1"),
+    "incomplete_on_a_shallow_clone_without_a_base": with_outcome(
+        "incomplete", shallow=True, no_base=True
+    ),
+    "git_too_old_on_a_shallow_clone": with_outcome("git_too_old", shallow=True, version="2.38.1"),
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_CONTAINMENT_DOCUMENTS), ids=str)
+def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_CONTAINMENT_DOCUMENTS[mutation](broken)
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(redigest(broken))
+
+
+def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
+    document, _folder = sample
+    assert document["schema_version"] == 3 == models.CHECKOUTS_SCHEMA_VERSION
+    previous = doc_copy(document)
+    previous["schema_version"] = 2
+    for clone_item in all_clones(previous):
+        del clone_item["containment"]
+        for branch in clone_item["branches"] or []:
+            del branch["contained_in"]
+    with pytest.raises(models.ProtocolError, match="schema"):
+        models.parse_checkouts(redigest(previous))
