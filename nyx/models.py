@@ -1338,6 +1338,58 @@ def _clone_containment(
             current = containers[current]
 
 
+_REMOVABLE_KEYS = frozenset({"removable", "blockers"})
+_REMOVABLE_COUNT_KEYS = frozenset({"branches", "worktrees"})
+
+
+def _removable_shape(value: Any, name: str) -> None:
+    """Check the shape of one ``removable`` value; its content is checked by recomputation."""
+    if value is None:
+        return
+    item = _object(value, name)
+    _keys(item, _REMOVABLE_KEYS, name)
+    _bool(item["removable"], f"{name}.removable")
+    blockers = _list(item["blockers"], f"{name}.blockers")
+    for index, blocker in enumerate(blockers):
+        _text(blocker, f"{name}.blockers[{index}]")
+
+
+def _clone_removable(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    branches: list[dict[str, Any]],
+    worktrees: list[dict[str, Any]],
+) -> None:
+    """Check every Removable value and count of one ``ok`` clone against the derivation.
+
+    The shapes are checked first; then the document must equal what
+    ``derive_removable`` returns for the clone's own facts, which also settles
+    the null rules, blocker order and uniqueness, and the counts.
+    """
+    for index, branch in enumerate(branches):
+        _removable_shape(branch["removable"], f"{name}.branches[{index}].removable")
+    for index, worktree in enumerate(worktrees):
+        _removable_shape(worktree["removable"], f"{name}.worktrees[{index}].removable")
+    count = _object(item["removable_count"], f"{name}.removable_count")
+    _keys(count, _REMOVABLE_COUNT_KEYS, f"{name}.removable_count")
+    for field in sorted(_REMOVABLE_COUNT_KEYS):
+        _count(count[field], f"{name}.removable_count.{field}")
+    derived = derive_removable(item)
+    for index, (branch, expected) in enumerate(zip(branches, derived["branches"])):
+        if branch["removable"] != expected:
+            raise ProtocolError(
+                f"{name}.branches[{index}].removable contradicts the facts of the clone"
+            )
+    for index, (worktree, expected) in enumerate(zip(worktrees, derived["worktrees"])):
+        if worktree["removable"] != expected:
+            raise ProtocolError(
+                f"{name}.worktrees[{index}].removable contradicts the facts of the clone"
+            )
+    if count != derived["removable_count"]:
+        raise ProtocolError(f"{name}.removable_count contradicts the facts of the clone")
+
+
 def _clone(
     value: Any,
     name: str,
@@ -1362,6 +1414,7 @@ def _clone(
         "branches",
         "verdict_base",
         "containment",
+        "removable_count",
     )
     if status != "ok":
         if any(item[field] is not None for field in facts):
@@ -1437,6 +1490,7 @@ def _clone(
         worktrees=parsed,
     )
     _clone_containment(item, name, git_version=git_version, branches=parsed_branches)
+    _clone_removable(item, name, branches=parsed_branches, worktrees=parsed)
     return item
 
 
