@@ -646,6 +646,7 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
         "worktrees": None,
         "branches": None,
         "verdict_base": None,
+        "containment": None,
     }
 
 
@@ -1056,6 +1057,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                 ),
                 "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
                 "verdict": None,
+                "contained_in": None,
             }
         )
     branches.sort(key=branch_sort_key)
@@ -1093,6 +1095,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "worktrees": worktrees,
         "branches": branches,
         "verdict_base": None,
+        "containment": None,
     }
     if not _all_text_safe(clone):
         return degraded("failed")
@@ -2223,6 +2226,54 @@ class _Ladder:
         # A positive count is the conflicts of the merge: the change is not there.
         return merged.code == 0 and merged.out == contents[3]
 
+    # -- containment ----------------------------------------------------
+
+    def contain(self, branches: Sequence[tuple[str, str]]) -> tuple[str, dict[str, str]]:
+        """Group ``branches`` (name, recorded tip) under the branch that holds their changes.
+
+        Returns the outcome (``complete``, ``deadline`` or ``failed``) and, for
+        a complete pass, each folded branch's container; any other outcome folds
+        nothing.  A branch's own commits are every commit of ``base..tip``,
+        merges included; one commit list per branch and one patch stream over
+        the branches within the own-commit cap answer every pair in memory.
+        """
+        own: dict[str, frozenset[str]] = {}
+        for name, sha in branches:
+            listing = self._git(
+                ["rev-list", f"--max-count={OWN_COMMIT_CAP + 1}", sha, "--not", self._base.sha, "--"]
+            )
+            if not listing.ok:
+                return _call_failure(listing), {}
+            commits = listing.out.decode("ascii", "replace").split()
+            if not all(_OBJECT_ID.fullmatch(item) for item in commits):
+                return "failed", {}
+            if 0 < len(commits) <= OWN_COMMIT_CAP:
+                own[name] = frozenset(commits)
+        if len(own) < 2:
+            return "complete", {}
+        tips = sorted({sha for name, sha in branches if name in own})
+        mapped = self._patch_ids([*tips, "--not", self._base.sha])
+        if isinstance(mapped, _Outcome):
+            return _call_failure(mapped), {}
+        identities = {
+            name: frozenset(mapped[item] for item in commits if item in mapped)
+            for name, commits in own.items()
+        }
+        ordered = sorted(own, key=lambda name: (len(own[name]), natural_key(name)))
+        folded: dict[str, str] = {}
+        for name in own:
+            changes = own[name]
+            for holder in ordered:
+                if len(own[holder]) <= len(changes):
+                    continue
+                rest = changes - own[holder]
+                if all(
+                    item in mapped and mapped[item] in identities[holder] for item in rest
+                ):
+                    folded[name] = holder
+                    break
+        return "complete", folded
+
     # -- tree rung ------------------------------------------------------
 
     def _tree_equal(self, tip: _Tip) -> bool:
@@ -2257,7 +2308,7 @@ def _assign_clone_verdicts(
     settings: _VerdictSettings,
     cache: Mapping[str, tuple[str, int]],
 ) -> _CloneVerdicts:
-    """Write one clone's ``verdict_base`` and every verdict.
+    """Write one clone's ``verdict_base``, every verdict and its containment.
 
     Returns the cache keys the verdicts used or decided.
     """
@@ -2268,6 +2319,7 @@ def _assign_clone_verdicts(
     ]
     if base is None:
         clone["verdict_base"] = None
+        clone["containment"] = "no_base"
         for branch in clone["branches"]:
             branch["verdict"] = _unknown("no_base")
         for worktree in detached:
@@ -2275,18 +2327,34 @@ def _assign_clone_verdicts(
         return _CloneVerdicts()
     clone["verdict_base"] = base.document()
     subjects = [branch for branch in clone["branches"] if branch["name"] != base.name]
-    if not subjects and not detached:
-        return _CloneVerdicts()
-    ladder = _Ladder(runner, context, base, settings, cache)
-    decided = ladder.decide(
-        [(branch["name"], branch["sha"]) for branch in subjects],
-        [worktree["head"]["sha"] for worktree in detached],
-    )
-    for branch in subjects:
-        branch["verdict"] = dict(decided[branch["sha"]])
-    for worktree in detached:
-        worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
-    return _CloneVerdicts(frozenset(ladder.used), dict(ladder.fresh))
+    ladder = _Ladder(runner, context, base, settings, cache) if subjects or detached else None
+    result = _CloneVerdicts()
+    if ladder is not None:
+        decided = ladder.decide(
+            [(branch["name"], branch["sha"]) for branch in subjects],
+            [worktree["head"]["sha"] for worktree in detached],
+        )
+        for branch in subjects:
+            branch["verdict"] = dict(decided[branch["sha"]])
+        for worktree in detached:
+            worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
+        result = _CloneVerdicts(frozenset(ladder.used), dict(ladder.fresh))
+    # Containment runs after the verdict rungs, on the same runner and so the
+    # same deadline, so the cache write keeps its reserve.  Patch equivalence
+    # cannot be proved in a shallow or partial clone or below the patch floor.
+    if context.shallow or context.partial:
+        clone["containment"] = "incomplete"
+    elif not settings.patch_rungs:
+        clone["containment"] = "git_too_old"
+    elif ladder is None:
+        clone["containment"] = "complete"
+    else:
+        clone["containment"], folds = ladder.contain(
+            [(branch["name"], branch["sha"]) for branch in subjects]
+        )
+        for branch in subjects:
+            branch["contained_in"] = folds.get(branch["name"])
+    return result
 
 
 def _assign_verdicts(

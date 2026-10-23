@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 2)
+# Checkout facts document (schema 3)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 2
+CHECKOUTS_SCHEMA_VERSION = 3
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -843,8 +843,10 @@ _CLONE_KEYS = frozenset(
         "worktrees",
         "branches",
         "verdict_base",
+        "containment",
     }
 )
+_CONTAINMENT_OUTCOMES = frozenset({"complete", "deadline", "failed"})
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
 _CLONE_STATUSES = _ITEM_STATUSES | {"too_many_branches"}
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
@@ -867,7 +869,16 @@ _HEAD_KEYS = frozenset({"branch", "sha"})
 _CHANGE_KEYS = frozenset({"staged", "unstaged", "untracked", "conflicted"})
 OPERATIONS = ("am", "bisect", "cherry_pick", "merge", "rebase", "revert")
 _BRANCH_KEYS = frozenset(
-    {"name", "sha", "checked_out_in", "upstream", "upstream_mismatch", "vs_remote", "verdict"}
+    {
+        "name",
+        "sha",
+        "checked_out_in",
+        "upstream",
+        "upstream_mismatch",
+        "vs_remote",
+        "verdict",
+        "contained_in",
+    }
 )
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
@@ -1104,6 +1115,7 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
     if has_remote and item["vs_remote"] is None:
         raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
     _verdict(item["verdict"], f"{name}.verdict", nullable=True)
+    _nullable(item["contained_in"], _text, f"{name}.contained_in")
     return item
 
 
@@ -1163,6 +1175,55 @@ def _clone_verdicts(
             raise ProtocolError(f"{label} names an old git that is not old")
 
 
+def _clone_containment(
+    item: Mapping[str, Any],
+    name: str,
+    *,
+    git_version: str | None,
+    branches: list[dict[str, Any]],
+) -> None:
+    """Check the containment outcome and every ``contained_in`` of one ``ok`` clone.
+
+    The outcome follows one precedence: no base, then a shallow or partial
+    clone, then a git below the patch floor, then the work's own outcome.
+    A branch is contained only when the outcome is ``complete``.
+    """
+    base = item["verdict_base"]
+    outcome = item["containment"]
+    label = f"{name}.containment"
+    if base is None:
+        if outcome != "no_base":
+            raise ProtocolError(f"{label} must be no_base exactly when the clone has no base")
+    elif item["shallow"] or item["partial_clone"]:
+        if outcome != "incomplete":
+            raise ProtocolError(f"{label} must be incomplete for a shallow or partial clone")
+    elif _git_below_patch_floor(git_version):
+        if outcome != "git_too_old":
+            raise ProtocolError(f"{label} must be git_too_old below the patch floor")
+    elif type(outcome) is not str or outcome not in _CONTAINMENT_OUTCOMES:
+        raise ProtocolError(f"{label} contradicts the base, depth or git version of the clone")
+    containers = {branch["name"]: branch["contained_in"] for branch in branches}
+    for index, branch in enumerate(branches):
+        target = branch["contained_in"]
+        if target is None:
+            continue
+        where = f"{name}.branches[{index}].contained_in"
+        if outcome != "complete":
+            raise ProtocolError(f"{where} must be null unless containment is complete")
+        if branch["name"] == base["name"] or target == base["name"]:
+            raise ProtocolError(f"{where} involves the verdict base branch")
+        if target == branch["name"] or target not in containers:
+            raise ProtocolError(f"{where} must name another listed branch")
+    for start in containers:
+        seen = {start}
+        current = containers[start]
+        while current is not None:
+            if current in seen:
+                raise ProtocolError(f"{name} has a containment cycle")
+            seen.add(current)
+            current = containers[current]
+
+
 def _clone(
     value: Any,
     name: str,
@@ -1186,6 +1247,7 @@ def _clone(
         "worktrees",
         "branches",
         "verdict_base",
+        "containment",
     )
     if status != "ok":
         if any(item[field] is not None for field in facts):
@@ -1260,6 +1322,7 @@ def _clone(
         branches=parsed_branches,
         worktrees=parsed,
     )
+    _clone_containment(item, name, git_version=git_version, branches=parsed_branches)
     return item
 
 
