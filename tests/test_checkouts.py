@@ -6531,6 +6531,64 @@ def test_branches_over_the_own_commit_cap_neither_fold_nor_contain(tmp_path):
     }
 
 
+def over_the_cap_world(tmp_path: Path):
+    """A clone with two branches over the own-commit cap and ``tiny`` within it."""
+    folder, _remote, work = small_world(tmp_path)
+    cap = checkouts.OWN_COMMIT_CAP
+    import_chain(work, "large-b", cap + 2)
+    git(work, "branch", "large-a", "large-b~1")
+    git(work, "branch", "tiny", f"large-b~{cap + 1}")
+    return folder, work
+
+
+def stream_tips(line: str, base: str) -> set[str]:
+    """The object ids a containment patch stream walks, apart from the base."""
+    return {word for word in line.split() if re.fullmatch(r"[0-9a-f]{40}", word)} - {base}
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_the_containment_patch_stream_carries_only_branches_within_the_own_commit_cap(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = over_the_cap_world(tmp_path)
+    switch(work, "small", "trunk")
+    commit_file(work, "small.txt", "small\n")
+    git(work, "checkout", "-q", "trunk")
+    base = rev(work, "origin/trunk")
+    tips = {rev(work, name) for name in ("tiny", "small")}
+    assert not tips & {rev(work, "large-a"), rev(work, "large-b")}
+    shim, log = recording(tmp_path, "mixed")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    item = find_clone(document, work)
+    streams = containment_streams(log_lines(log, work), base)
+    assert item["containment"] == "complete"
+    assert len(streams) == 1
+    assert stream_tips(streams[0], base) == tips
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason="the recording git stand-in is a shell script")
+def test_a_single_branch_within_the_own_commit_cap_runs_no_patch_stream(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, work = over_the_cap_world(tmp_path)
+    base = rev(work, "origin/trunk")
+    shim, log = recording(tmp_path, "single")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    item = find_clone(document, work)
+    lines = log_lines(log, work)
+    assert item["containment"] == "complete"
+    assert set(containment_of(item).values()) == {None}
+    assert containment_streams(lines, base) == []
+
+
 @pytest.mark.parametrize("trap", ["graft", "replace"])
 def test_a_graft_or_replace_ref_cannot_make_a_commit_look_held(tmp_path, trap):
     folder, work = containment_world(tmp_path)
