@@ -204,6 +204,7 @@ CHECKOUT_RETIRED_WORDING = (
     "a failed call, a size bound or a clone limit",
     "the plain lines above are unchanged and show no verdicts",
     "The plain lines are otherwise unchanged.",
+    "the plain lines show only the Removable summary described below, never a verdict",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -246,8 +247,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`nyx: checkouts: unable to collect (<reason>)`",
         "`no checkout folders are configured`",
         "`checkout_cache_unreadable` and `checkout_cache_write_failed`",
-        "appears only in the `--json` document: the plain lines show only the Removable "
-        "summary described below, never a verdict",
+        "appears only in the `--json` document: the plain lines never show a branch's "
+        "verdict itself, only the Removable summary described below",
         "A non-default branch is contained in another non-default local branch of the same clone",
         "a branch folds under the container with the fewest own commits, provided that "
         "container has strictly more than the branch",
@@ -266,8 +267,16 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`checked_out_in_main_worktree`, cleared by switching the main worktree to another branch",
         "`worktree_not_clean` and `worktree_locked`, cleared by cleaning that worktree and "
         "unlocking it",
-        "`not_clean`, cleared by committing, stashing or discarding",
+        "`not_clean` is cleared by committing, stashing or discarding",
         "`locked`, cleared by unlocking it",
+        "A worktree's `not_merged` is cleared when its work lands on the remote's default "
+        "branch and a later run sees it there",
+        "Its `verdict_unknown` is cleared when the cause of the `unknown` verdict is fixed",
+        "a worktree on the base branch, or on a branch with no commits yet, has no verdict "
+        "that shows its commit is merged, and is `verdict_unknown` until it is moved to "
+        "another branch or removed",
+        "is `not_clean` for as long as it cannot be read, and stays blocked until it is "
+        "readable again or is removed",
         "Ignored files never block",
         "A clone's `removable_count` gives `branches` and `worktrees`",
         "a branch and the worktree holding it count once each",

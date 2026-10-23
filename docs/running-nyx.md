@@ -165,8 +165,9 @@ separated by two spaces and in this order, three more elements.
   remote shows `no cached default`.
 
 Whether each local branch is already merged into the remote's default branch
-is a verdict, and appears only in the `--json` document: the plain lines show
-only the Removable summary described below, never a verdict. In each clone, `verdict_base` names the
+is a verdict, and appears only in the `--json` document: the plain lines
+never show a branch's verdict itself, only the Removable summary described
+below. In each clone, `verdict_base` names the
 default branch the verdicts are judged against, its commit, and its `basis`.
 The branch is the remote's default branch, or, when the remote did not answer
 or has no default branch (an empty remote, or one with a detached `HEAD`), the
@@ -334,15 +335,22 @@ worktree is Removable once that worktree is, because git refuses to delete a
 branch while the worktree exists, and the worktree's own blockers say when
 removing it is safe. A linked worktree's blockers are `not_merged` and
 `verdict_unknown`, the verdict of the branch it is on, or of its own detached commit;
-`not_clean`, cleared by committing, stashing or discarding any staged, unstaged,
-untracked or conflicted file, finishing an operation in progress or removing a
-stale `index.lock`; and `locked`, cleared by unlocking it. Ignored files never
-block. A worktree whose directory is gone, shown with the status `failed` and
-`prunable`, has no files to lose, so only its verdict and its lock apply. A
-worktree git could not read for any other reason is `not_clean`, and one whose
-commit cannot be read is `verdict_unknown`. A linked worktree on the base
-branch has no verdict that shows its commit is merged, so it is
-`verdict_unknown`. Stashes belong to the
+`not_clean`; and `locked`, cleared by unlocking it. A worktree's `not_merged` is
+cleared when its work lands on the remote's default branch and a later run sees
+it there. Its `verdict_unknown` is cleared when the cause of the `unknown`
+verdict is fixed, by fetching, deepening a shallow clone or upgrading git, and a
+later run then decides it. Two cases have no verdict to wait for, so no local
+action clears them: a worktree on the base branch, or on a branch with no commits
+yet, has no verdict that shows its commit is merged, and is `verdict_unknown`
+until it is moved to another branch or removed. `not_clean` is cleared by
+committing, stashing or discarding any staged, unstaged, untracked or conflicted
+file, finishing an operation in progress or removing a stale `index.lock`. Ignored
+files never block. A worktree whose directory is gone, shown with the status
+`failed` and `prunable`, has no files to lose, so only its verdict and its lock
+apply. A worktree git could not read for any other reason is `not_clean` for as
+long as it cannot be read, and stays blocked until it is readable again or is
+removed; one whose commit cannot be read is `verdict_unknown` on the same terms.
+Stashes belong to the
 whole clone and are untouched by either removal. A clone's `removable_count`
 gives `branches` and `worktrees`, the number of Removable non-default branches
 and of Removable linked worktrees. The two are counted separately, so a branch
