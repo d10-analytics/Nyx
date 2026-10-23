@@ -2346,7 +2346,8 @@ def _assign_clone_verdicts(
         clone["containment"] = "incomplete"
     elif not settings.patch_rungs:
         clone["containment"] = "git_too_old"
-    elif ladder is None:
+    elif len(subjects) < 2:
+        # One branch has nothing to fold under, so no git call is needed.
         clone["containment"] = "complete"
     else:
         clone["containment"], folds = ladder.contain(
