@@ -21,3 +21,5 @@ README is narrative only.
 - Used by `lifecycle-control` (the `nyx` command line).
 - Reuses the catalog byte bound; see
   [catalog invariants](../catalog/README.md#cross-system-invariants).
+- Calls `derive_removable`; see
+  [protocols invariants](../protocols/README.md#cross-system-invariants).
