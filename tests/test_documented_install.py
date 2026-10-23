@@ -205,6 +205,8 @@ CHECKOUT_RETIRED_WORDING = (
     "the plain lines above are unchanged and show no verdicts",
     "The plain lines are otherwise unchanged.",
     "the plain lines show only the Removable summary described below, never a verdict",
+    "Two cases have no verdict to wait for, so no local action clears them",
+    "A worktree whose directory is gone, shown with the status `failed` and `prunable`",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -256,7 +258,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "A branch with more than 2,000 own commits neither folds nor contains",
         "`containment` is one of six values",
         "`complete`: every branch was examined",
-        "`deadline`: the 60 seconds ran out first",
+        "`deadline`: the 60 seconds ran out first, or a single git call reached its 10-second cap",
         "`failed`: a git call failed",
         "`no_base`: the clone has no base to measure own commits from",
         "`incomplete`: the clone is shallow or partial",
@@ -272,9 +274,17 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "A worktree's `not_merged` is cleared when its work lands on the remote's default "
         "branch and a later run sees it there",
         "Its `verdict_unknown` is cleared when the cause of the `unknown` verdict is fixed",
-        "a worktree on the base branch, or on a branch with no commits yet, has no verdict "
-        "that shows its commit is merged, and is `verdict_unknown` until it is moved to "
-        "another branch or removed",
+        "A worktree on the base branch, or on a branch with no commits yet, has no branch "
+        "verdict that shows its commit is merged, so it stays `verdict_unknown` while it is "
+        "on that branch",
+        "a first commit on the unborn branch gives the branch a normal verdict on the next run",
+        "A worktree whose directory is gone and that is not locked, shown with the status "
+        "`failed` and `prunable`",
+        "Git stops calling a locked worktree prunable, so a locked worktree whose directory "
+        "is gone reads as unreadable: it is `not_clean` and `locked`, its branch is "
+        "`worktree_not_clean` and `worktree_locked`, and its plain line is "
+        "`failed blocker not_clean`",
+        "Unlocking it lets a later run read it as prunable",
         "is `not_clean` for as long as it cannot be read, and stays blocked until it is "
         "readable again or is removed",
         "Ignored files never block",

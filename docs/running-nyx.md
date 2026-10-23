@@ -311,7 +311,8 @@ computed fresh on every run and is never remembered. `containment` is one of six
 values. `complete`: every branch was examined, and `contained_in` is set where a
 branch folds. In every other value no branch is folded, because a partial grouping
 would hide the difference between "not contained" and "never checked".
-`deadline`: the 60 seconds ran out first. `failed`: a git call failed.
+`deadline`: the 60 seconds ran out first, or a single git call reached its
+10-second cap. `failed`: a git call failed.
 `no_base`: the clone has no base to measure own commits from. `incomplete`: the
 clone is shallow or partial, so patch identity cannot be proved. `git_too_old`:
 git is older than 2.39, which the patch comparison needs.
@@ -339,15 +340,21 @@ removing it is safe. A linked worktree's blockers are `not_merged` and
 cleared when its work lands on the remote's default branch and a later run sees
 it there. Its `verdict_unknown` is cleared when the cause of the `unknown`
 verdict is fixed, by fetching, deepening a shallow clone or upgrading git, and a
-later run then decides it. Two cases have no verdict to wait for, so no local
-action clears them: a worktree on the base branch, or on a branch with no commits
-yet, has no verdict that shows its commit is merged, and is `verdict_unknown`
-until it is moved to another branch or removed. `not_clean` is cleared by
+later run then decides it. A worktree on the base branch, or on a branch with
+no commits yet, has no branch verdict that shows its commit is merged, so it stays
+`verdict_unknown` while it is on that branch. Moving it to another branch or
+removing it changes that, and a first commit on the unborn branch gives the branch
+a normal verdict on the next run. `not_clean` is cleared by
 committing, stashing or discarding any staged, unstaged, untracked or conflicted
 file, finishing an operation in progress or removing a stale `index.lock`. Ignored
-files never block. A worktree whose directory is gone, shown with the status
-`failed` and `prunable`, has no files to lose, so only its verdict and its lock
-apply. A worktree git could not read for any other reason is `not_clean` for as
+files never block. A worktree whose directory is gone and that is not locked,
+shown with the status `failed` and `prunable`, has no files to lose, so only its
+verdict and its lock apply. Git stops calling a locked worktree prunable, so a
+locked worktree whose directory is gone reads as unreadable: it is `not_clean` and
+`locked`, its branch is `worktree_not_clean` and `worktree_locked`, and its plain
+line is `failed  blocker not_clean`. Unlocking it lets a later run read it as
+prunable, and then only its verdict and its lock apply. A worktree git could not
+read for any other reason is `not_clean` for as
 long as it cannot be read, and stays blocked until it is readable again or is
 removed; one whose commit cannot be read is `verdict_unknown` on the same terms.
 Stashes belong to the
