@@ -325,14 +325,14 @@ def main_worktree_count(clone_document: dict[str, Any]) -> int:
     return sum(1 for item in clone_document["worktrees"] if item["main"])
 
 
-def test_worktree_without_its_git_file_is_prunable_and_unattached(tmp_path):
+def test_worktree_whose_directory_is_gone_is_prunable_and_unattached(tmp_path):
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
     repository = clone(remote, folder / "repo")
     gone = folder / "gone"
     git(repository, "worktree", "add", "-q", str(gone), "-b", "gone")
-    (gone / ".git").unlink()
+    shutil.rmtree(gone)
 
     document = collect([folder])
 
@@ -7366,6 +7366,56 @@ def test_a_locked_worktree_whose_directory_is_gone_is_not_prunable_and_so_not_cl
         {held: ["not_clean", "locked"]},
         count=(0, 0),
     )
+
+
+def test_a_worktree_that_lost_only_its_git_link_still_holds_work_and_blocks(tmp_path):
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "alder")
+    held = linked(work, tmp_path, "held", "alder")
+    (held / "land-note.txt").write_text("unsaved\n")
+    (held / "alder-1.txt").write_text("edited\n")
+    (held / ".git").unlink()
+    entry = git(work, "worktree", "list", "--porcelain").stdout
+    assert "prunable" in entry and held.is_dir()
+
+    clone_document = removable_of(folder, work)
+
+    document = find_worktree(clone_document, held)
+    assert document["prunable"] is False and document["status"] == "failed"
+    assert_unreadable(document)
+    assert removable_view(clone_document) == expected_view(
+        work,
+        {"alder": ["worktree_not_clean"], "trunk": None},
+        {held: ["not_clean"]},
+        count=(0, 0),
+    )
+
+
+def test_an_unknown_verdict_state_blocks_as_not_merged():
+    # Any state other than merged and unknown must read as not merged, so a
+    # state added later blocks removal instead of passing as merged.
+    verdict = {"state": "merged_with_local_commits", "rung": None, "reason": None}
+    clone_document = {
+        "verdict_base": {"name": "trunk"},
+        "branches": [
+            {"name": "alder", "verdict": verdict, "checked_out_in": ["/w/held"]},
+            {"name": "trunk", "verdict": None, "checked_out_in": ["/w/main"]},
+        ],
+        "worktrees": [
+            {"path": "/w/main", "main": True, "locked": False, "prunable": False, "status": "ok",
+             "head": {"branch": "trunk", "sha": "0" * 39 + "1"}, "changes": NO_CHANGES,
+             "operations": [], "index_lock": False, "verdict": None},
+            {"path": "/w/held", "main": False, "locked": False, "prunable": False, "status": "ok",
+             "head": {"branch": "alder", "sha": "0" * 39 + "2"}, "changes": NO_CHANGES,
+             "operations": [], "index_lock": False, "verdict": None},
+        ],
+    }
+
+    derived = models.derive_removable(clone_document)
+
+    assert [blockers_of(item) for item in derived["branches"]] == [["not_merged"], None]
+    assert [blockers_of(item) for item in derived["worktrees"]] == [None, ["not_merged"]]
+    assert derived["removable_count"] == {"branches": 0, "worktrees": 0}
 
 
 def test_a_worktree_with_an_unreadable_git_pointer_is_not_clean_and_so_is_its_branch(tmp_path):
