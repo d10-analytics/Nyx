@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -761,6 +762,8 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     assert picked["verdict"] == {
         "state": "merged", "rung": "patch_equivalent", "reason": None,
     }
+    assert picked["removable"] == {"removable": True, "blockers": []}
+    assert item["removable_count"] == {"branches": 1, "worktrees": 0}
     assert record.read_bytes() == before
     after = _file_listing(account / ".nyx")
     assert sorted(set(after) - set(listing)) == ["cache", "cache/checkouts.json"]
@@ -989,6 +992,8 @@ def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account
     assert elements[2] == "remote off"
     assert elements[3] == "branches cached local-only 1"
     assert elements[4] == "default trunk cached ahead never fetched"
+    assert elements[5] == "removable 0 branches, 0 worktrees"
+    assert len(elements) == 6
     assert not any(element.startswith("operations") for element in elements)
 
 
@@ -1006,8 +1011,9 @@ def test_cached_default_shows_the_fetch_time_once_the_clone_has_fetched(
 
     assert re.fullmatch(
         r"default trunk cached equal fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
-        line.split("  ")[-1],
+        line.split("  ")[-2],
     )
+    assert line.split("  ")[-1] == "removable 0 branches, 0 worktrees"
     assert re.search(r"cached [0-9]{4}-", line) is None
 
 
@@ -1052,10 +1058,64 @@ def test_linked_worktrees_are_indented_lines_under_their_clone(tmp_path, account
     linked = _line_for(lines, outside, "  ")
     assert linked == (
         f"  {cli._json_literal(real(outside))}  branch side  "
-        "staged 0 unstaged 0 untracked 0 conflicted 0"
+        "staged 0 unstaged 0 untracked 0 conflicted 0  removable"
     )
     assert _line_for(lines, detached, "  ").split("  ")[2] == f"detached {sha}"
+    assert _line_for(lines, detached, "  ").split("  ")[-1] == "removable"
+    assert _line_for(lines, repository).split("  ")[-1] == "removable 1 branches, 2 worktrees"
     assert lines.index(linked) > clone_index
+
+
+def test_plain_output_ends_each_line_with_its_removable_verdict(
+    tmp_path, account, capsys
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "work")
+    git(repository, "branch", "spare")
+    wanted = {}
+    for name in ("clean", "locked", "dirty", "gone", "ahead"):
+        wanted[name] = tmp_path / "trees" / name
+        git(repository, "worktree", "add", "-q", "-b", name, str(wanted[name]))
+    git(repository, "worktree", "lock", str(wanted["locked"]))
+    (wanted["dirty"] / "scratch.txt").write_text("unsaved\n")
+    commit_file(wanted["ahead"], "ahead.txt", "unpushed\n")
+    (wanted["ahead"] / "scratch.txt").write_text("unsaved\n")
+    shutil.rmtree(wanted["gone"])
+    _configure(tmp_path, [folder])
+
+    lines = _plain_lines(capsys, "--no-network")
+
+    def verdict(name: str) -> str:
+        return _line_for(lines, wanted[name], "  ").split("  ")[-1]
+
+    assert verdict("clean") == "removable"
+    assert verdict("locked") == "blocker locked"
+    assert verdict("dirty") == "blocker not_clean"
+    assert verdict("ahead") == "blocker not_merged"
+    gone = _line_for(lines, wanted["gone"], "  ")
+    assert gone == f"  {cli._json_literal(real(wanted['gone']))}  failed  removable"
+    # spare, clean and gone are Removable branches; clean and gone are Removable worktrees.
+    assert _line_for(lines, repository).split("  ")[-1] == "removable 3 branches, 2 worktrees"
+    assert [
+        line for line in lines if line.startswith("  ")
+    ] == sorted(
+        (line for line in lines if line.startswith("  ")),
+        key=lambda line: models.natural_key(line.split("  ")[1]),
+    )
+
+    code = subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "checkouts", "--no-network"],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(account),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert (code.returncode, code.stderr) == (0, "")
+    assert code.stdout.splitlines() == lines
 
 
 def test_bare_repository_clone_line_has_no_head_or_counts_but_its_worktree_has(
@@ -1070,8 +1130,11 @@ def test_bare_repository_clone_line_has_no_head_or_counts_but_its_worktree_has(
 
     lines = _plain_lines(capsys)
 
-    assert _line_for(lines, remote) == f"{cli._json_literal(real(remote))}  no origin remote"
+    assert _line_for(lines, remote) == (
+        f"{cli._json_literal(real(remote))}  no origin remote  removable 0 branches, 0 worktrees"
+    )
     assert _line_for(lines, linked, "  ").split("  ")[2] == "branch trunk"
+    assert _line_for(lines, linked, "  ").endswith("  blocker verdict_unknown")
 
 
 def test_refused_clone_prints_its_status_instead_of_the_facts(
@@ -1110,6 +1173,7 @@ def test_tree_filtered_clone_prints_main_failed_and_keeps_remote_and_default(
     assert elements[2] == "branches cached local-only 0"
     assert elements[3].startswith("default trunk cached ")
     assert not any(element.startswith(("branch ", "staged ")) for element in elements)
+    assert elements[-1] == "removable 0 branches, 0 worktrees"
 
 
 def test_clone_without_origin_prints_no_origin_remote_and_no_remote_counts(
@@ -1128,6 +1192,7 @@ def test_clone_without_origin_prints_no_origin_remote_and_no_remote_counts(
     assert line.split("  ")[2:] == [
         "staged 0 unstaged 0 untracked 0 conflicted 0",
         "no origin remote",
+        "removable 0 branches, 0 worktrees",
     ]
     assert "local-only" not in line
     assert "default" not in line
@@ -1146,7 +1211,12 @@ def test_clone_of_an_empty_remote_under_no_network_prints_no_cached_default(
 
     elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
-    assert elements[-3:] == ["remote off", "branches cached local-only 1", "no cached default"]
+    assert elements[-4:] == [
+        "remote off",
+        "branches cached local-only 1",
+        "no cached default",
+        "removable 0 branches, 0 worktrees",
+    ]
 
 
 def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
@@ -1265,9 +1335,11 @@ def _relation(comparison: dict | None) -> str:
 
 
 def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
-    """Parse the three trailing elements and compare each captured field to the document."""
+    """Parse the trailing elements and compare each captured field to the document."""
 
-    remote, branches, default = line.split("  ")[-3:]
+    remote, branches, default, removable = line.split("  ")[-4:]
+    counts = item["removable_count"]
+    assert removable == f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
     check = group["remote"]["check"]
     parsed = REMOTE_ELEMENT.fullmatch(remote)
     assert parsed, remote
@@ -1394,7 +1466,7 @@ def test_live_plain_lines_follow_the_grammar_and_agree_with_the_document(
     }
 
     def tail(name: str) -> list[str]:
-        return by_path[real(paths[name])][0].split("  ")[-3:]
+        return by_path[real(paths[name])][0].split("  ")[-4:-1]
 
     assert tail("fetched")[:2] == ["remote live", "branches live local-only 0"]
     assert re.fullmatch(
@@ -1433,13 +1505,13 @@ def test_no_network_plain_lines_follow_the_cached_grammar(grammar_scenario, acco
         line, group, item = by_path[real(path)]
         assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
         _assert_line_matches_document(line, group, item)
-        remote, branches, default = line.split("  ")[-3:]
+        remote, branches, default = line.split("  ")[-4:-1]
         assert remote == "remote off"
         assert branches.startswith("branches cached local-only ")
         assert default.startswith(("default ", "no cached default"))
         assert " live " not in default
-    assert by_path[real(paths["empty"])][0].split("  ")[-1] == "no cached default"
-    assert by_path[real(paths["never"])][0].endswith(" never fetched")
+    assert by_path[real(paths["empty"])][0].split("  ")[-2] == "no cached default"
+    assert by_path[real(paths["never"])][0].split("  ")[-2].endswith(" never fetched")
     assert re.search(r"cached [0-9]{4}-", text) is None
     assert "s3cr3tpass" not in text and "someuser" not in text
 

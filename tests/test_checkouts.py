@@ -1282,6 +1282,34 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(document))
 
 
+def rederive(document: dict[str, Any]) -> dict[str, Any]:
+    """Give every ``ok`` clone the Removable fields its present facts derive.
+
+    A clone whose facts the derivation cannot read (a mutation that broke their
+    shape) keeps its fields: the structural checks refuse it before they matter.
+    """
+    for item in all_clones(document):
+        if item["status"] != "ok":
+            continue
+        try:
+            derived = models.derive_removable(item)
+        except (KeyError, TypeError):
+            continue
+        for branch, verdict in zip(item["branches"], derived["branches"]):
+            branch["removable"] = verdict
+        for worktree, verdict in zip(item["worktrees"], derived["worktrees"]):
+            worktree["removable"] = verdict
+        item["removable_count"] = derived["removable_count"]
+    return document
+
+
+def refusal_of(document: dict[str, Any]) -> str:
+    """Return the message of the refusal of ``document``, which must carry a valid digest."""
+    with pytest.raises(models.ProtocolError) as error:
+        models.parse_checkouts(redigest(document))
+    return str(error.value)
+
+
 def first_clone(document: dict[str, Any]) -> dict[str, Any]:
     return document["repositories"][0]["clones"][0]
 
@@ -1433,8 +1461,7 @@ def test_parser_rejects_a_contract_violation(sample, mutation):
     document, _folder = sample
     broken = doc_copy(document)
     mutation(broken)
-    with pytest.raises(models.ProtocolError):
-        models.parse_checkouts(redigest(broken))
+    assert "removable" not in refusal_of(rederive(broken))
 
 
 def test_parser_rejects_a_changed_field_with_the_old_digest(sample):
@@ -1694,8 +1721,7 @@ def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sampl
     assert models.parse_checkouts(redigest(doc_copy(document)))
     broken = doc_copy(document)
     REJECTED_VERDICT_DOCUMENTS[mutation](broken)
-    with pytest.raises(models.ProtocolError):
-        models.parse_checkouts(redigest(broken))
+    assert "removable" not in refusal_of(rederive(broken))
 
 
 def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
@@ -1710,7 +1736,7 @@ def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
     for shape in shapes:
         accepted = doc_copy(document)
         other_branches(first_clone(accepted))[0]["verdict"] = shape
-        assert models.parse_checkouts(redigest(accepted))
+        assert models.parse_checkouts(redigest(rederive(accepted)))
 
 
 def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
@@ -1740,7 +1766,7 @@ def test_parser_accepts_a_clone_with_a_base_and_no_other_branch(sample):
         item for item in clone_document["branches"] if item["name"] == "trunk"
     ]
     assert clone_document["verdict_base"] is not None
-    assert models.parse_checkouts(redigest(accepted))
+    assert models.parse_checkouts(redigest(rederive(accepted)))
 
 
 def test_parser_accepts_documents_without_a_base(sample):
@@ -1748,7 +1774,7 @@ def test_parser_accepts_documents_without_a_base(sample):
     undecided = doc_copy(document)
     undecided_without_a_base(undecided)
     detach(undecided, verdict_of("unknown", reason="no_base"))
-    assert models.parse_checkouts(redigest(undecided))
+    assert models.parse_checkouts(redigest(rederive(undecided)))
     assert all(
         item["verdict"] == verdict_of("unknown", reason="no_base")
         for item in first_clone(undecided)["branches"]
@@ -1757,7 +1783,7 @@ def test_parser_accepts_documents_without_a_base(sample):
     remoteless = doc_copy(document)
     without_remote(remoteless)
     assert first_clone(remoteless)["verdict_base"] is None
-    assert models.parse_checkouts(redigest(remoteless))
+    assert models.parse_checkouts(redigest(rederive(remoteless)))
 
 
 def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
@@ -1769,20 +1795,20 @@ def test_parser_accepts_limit_reasons_where_the_clone_has_the_limit(sample):
     other_branches(clone_document)[0]["verdict"] = verdict_of(
         "unknown", reason="incomplete_clone"
     )
-    assert models.parse_checkouts(redigest(limited))
+    assert models.parse_checkouts(redigest(rederive(limited)))
     clone_document["shallow"] = False
     clone_document["partial_clone"] = True
     detach(limited, verdict_of("unknown", reason="incomplete_clone"))
-    assert models.parse_checkouts(redigest(limited))
+    assert models.parse_checkouts(redigest(rederive(limited)))
 
     old = doc_copy(document)
     old["git"]["version"] = "2.38.1"
     for item in all_clones(old):
         item["containment"] = "git_too_old"
     other_branches(first_clone(old))[0]["verdict"] = verdict_of("unknown", reason="git_too_old")
-    assert models.parse_checkouts(redigest(old))
+    assert models.parse_checkouts(redigest(rederive(old)))
     old["git"]["version"] = "2.9.5"
-    assert models.parse_checkouts(redigest(old))
+    assert models.parse_checkouts(redigest(rederive(old)))
 
 
 def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
@@ -1805,6 +1831,7 @@ NULLABLE_CLONE_FACTS = {
     "branches": ([], "", 0, False),
     "verdict_base": ({}, "", [], False, 0),
     "containment": ("complete", "", [], False, 0),
+    "removable_count": ({}, "", [], False, 0),
 }
 NULLABLE_WORKTREE_FACTS = {
     "head": ({}, "", [], False),
@@ -1855,7 +1882,7 @@ def test_parser_limits_an_ok_clone_to_the_branch_cap(sample):
     document, _folder = sample
     at_cap = doc_copy(document)
     with_branch_count(at_cap, models.CHECKOUT_BRANCH_CAP)
-    assert models.parse_checkouts(redigest(at_cap))
+    assert models.parse_checkouts(redigest(rederive(at_cap)))
 
     over = doc_copy(document)
     with_branch_count(over, models.CHECKOUT_BRANCH_CAP + 1)
@@ -1881,11 +1908,16 @@ def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize("fact", ["stash_count", "branches", "verdict_base", "containment"])
+@pytest.mark.parametrize(
+    "fact", ["stash_count", "branches", "verdict_base", "containment", "removable_count"]
+)
 def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
     document, _folder = sample
     ok_clone = first_clone(doc_copy(document))
-    facts = {name: ok_clone[name] for name in ("stash_count", "branches", "verdict_base", "containment")}
+    facts = {
+        name: ok_clone[name]
+        for name in ("stash_count", "branches", "verdict_base", "containment", "removable_count")
+    }
     broken = doc_copy(document)
     refused_clone(broken)["status"] = "too_many_branches"
     first_clone(broken)[fact] = facts[fact]
@@ -6843,23 +6875,23 @@ def test_parser_accepts_folded_branches_and_every_outcome_where_it_applies(sampl
     document, _folder = sample
     accepted = doc_copy(document)
     folded(accepted)
-    assert models.parse_checkouts(redigest(accepted))
+    assert models.parse_checkouts(redigest(rederive(accepted)))
     for outcome in ("deadline", "failed"):
         accepted = doc_copy(document)
         first_clone(accepted)["containment"] = outcome
-        assert models.parse_checkouts(redigest(accepted))
+        assert models.parse_checkouts(redigest(rederive(accepted)))
     shallow = doc_copy(document)
     first_clone(shallow).update(shallow=True, containment="incomplete")
     other_branches(first_clone(shallow))[0]["verdict"] = verdict_of(
         "unknown", reason="incomplete_clone"
     )
-    assert models.parse_checkouts(redigest(shallow))
+    assert models.parse_checkouts(redigest(rederive(shallow)))
     shallow_old = doc_copy(shallow)
     set_git_version(shallow_old, "2.38.1", keep=first_clone(shallow_old))
-    assert models.parse_checkouts(redigest(shallow_old))
+    assert models.parse_checkouts(redigest(rederive(shallow_old)))
     old = doc_copy(document)
     set_git_version(old, "2.38.1")
-    assert models.parse_checkouts(redigest(old))
+    assert models.parse_checkouts(redigest(rederive(old)))
 
 
 def set_git_version(document: dict[str, Any], version: str, keep: Any = None) -> None:
@@ -6954,8 +6986,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
     assert models.parse_checkouts(redigest(doc_copy(document)))
     broken = doc_copy(document)
     REJECTED_CONTAINMENT_DOCUMENTS[mutation](broken)
-    with pytest.raises(models.ProtocolError):
-        models.parse_checkouts(redigest(broken))
+    assert "removable" not in refusal_of(rederive(broken))
 
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
@@ -6969,6 +7000,296 @@ def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
             del branch["contained_in"]
     with pytest.raises(models.ProtocolError, match="schema"):
         models.parse_checkouts(redigest(previous))
+
+
+# ---------------------------------------------------------------------------
+# Removable recomputation by the parser
+# ---------------------------------------------------------------------------
+
+
+def settled_sample(document: dict[str, Any]) -> dict[str, Any]:
+    """Make ``never-pushed`` and ``outside`` merged, and ``outside``'s worktree clean.
+
+    Returns the first clone. Its Removable fields are derived from the settled
+    facts, so a branch, a linked worktree and the counts are all Removable.
+    """
+    clone_document = first_clone(document)
+    for name in ("never-pushed", "outside"):
+        branch_of(clone_document, name)["verdict"] = merged_verdict()
+    linked = linked_worktree(clone_document)
+    linked.update(locked=False, prunable=False, status="ok")
+    linked["changes"] = {"staged": 0, "unstaged": 0, "untracked": 0, "conflicted": 0}
+    linked["operations"] = []
+    linked["index_lock"] = False
+    rederive(document)
+    assert branch_of(clone_document, "never-pushed")["removable"] == {
+        "removable": True, "blockers": [],
+    }
+    assert clone_document["removable_count"] == {"branches": 2, "worktrees": 1}
+    return clone_document
+
+
+def linked_worktree(clone_document: dict[str, Any]) -> dict[str, Any]:
+    return next(item for item in clone_document["worktrees"] if not item["main"])
+
+
+def gone_worktree(clone_document: dict[str, Any]) -> None:
+    linked_worktree(clone_document).update(
+        status="failed", prunable=True, head=None, changes=None, operations=None,
+        index_lock=None,
+    )
+
+
+def set_change(field: str, value: Any):
+    def mutate(clone_document):
+        linked = linked_worktree(clone_document)
+        if field in ("untracked", "conflicted"):
+            linked["changes"][field] = value
+        else:
+            linked[field] = value
+
+    return mutate
+
+
+def mutate_verdict_state(clone_document):
+    branch_of(clone_document, "never-pushed")["verdict"] = verdict_of("not_merged", "none")
+
+
+def mutate_linked_verdict_state(clone_document):
+    branch_of(clone_document, "outside")["verdict"] = verdict_of("unknown", reason="failed")
+
+
+def mutate_unreadable_worktree(clone_document):
+    gone_worktree(clone_document)
+    linked_worktree(clone_document)["prunable"] = False
+
+
+def mutate_prunable_gone_to_present(clone_document):
+    gone_worktree(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    assert linked_worktree(clone_document)["removable"] == {"removable": True, "blockers": []}
+    linked_worktree(clone_document)["prunable"] = False
+
+
+def mutate_held_branch_moves_to_main(clone_document):
+    main = main_worktree(clone_document)["path"]
+    branch_of(clone_document, "never-pushed")["checked_out_in"] = [main]
+
+
+FACT_ONLY_REMOVABLE_MUTATIONS = {
+    "branch_verdict_becomes_not_merged": mutate_verdict_state,
+    "held_branch_verdict_becomes_unknown": mutate_linked_verdict_state,
+    "worktree_gains_an_untracked_file": set_change("untracked", 1),
+    "worktree_gains_a_conflict": set_change("conflicted", 1),
+    "worktree_starts_an_operation": set_change("operations", ["merge"]),
+    "worktree_gains_an_index_lock": set_change("index_lock", True),
+    "worktree_is_locked": set_change("locked", True),
+    "worktree_status_becomes_failed": mutate_unreadable_worktree,
+    "prunable_worktree_directory_returns": mutate_prunable_gone_to_present,
+    "branch_moves_to_the_main_worktree": mutate_held_branch_moves_to_main,
+}
+
+
+@pytest.mark.parametrize("mutation", list(FACT_ONLY_REMOVABLE_MUTATIONS), ids=str)
+def test_parser_refuses_a_removable_kept_after_one_of_its_facts_changes(sample, mutation):
+    document, _folder = sample
+    settled_sample(document)
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    FACT_ONLY_REMOVABLE_MUTATIONS[mutation](first_clone(broken))
+    # Nothing but the Removable fields is stale, and every structural check passes:
+    # only the recomputation can refuse the document.
+    assert "contradicts the facts of the clone" in refusal_of(broken)
+    models.parse_checkouts(redigest(rederive(broken)))
+
+
+def blocked_branch(clone_document: dict[str, Any]) -> dict[str, Any]:
+    """Give ``never-pushed`` two blockers, in the order the derivation lists them."""
+    branch = branch_of(clone_document, "never-pushed")
+    branch["verdict"] = verdict_of("not_merged", "none")
+    branch["checked_out_in"] = [main_worktree(clone_document)["path"]]
+    return branch
+
+
+def mutate_true_with_a_blocker(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = {
+        "removable": True, "blockers": ["not_merged"],
+    }
+
+
+def mutate_false_with_no_blocker(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = {
+        "removable": False, "blockers": [],
+    }
+
+
+def mutate_worktree_true_with_a_blocker(clone_document):
+    linked_worktree(clone_document)["removable"] = {
+        "removable": True, "blockers": ["locked"],
+    }
+
+
+def mutate_worktree_false_with_no_blocker(clone_document):
+    linked_worktree(clone_document)["removable"] = {"removable": False, "blockers": []}
+
+
+def mutate_null_on_a_branch(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"] = None
+
+
+def mutate_null_on_a_linked_worktree(clone_document):
+    linked_worktree(clone_document)["removable"] = None
+
+
+def mutate_set_on_the_main_worktree(clone_document):
+    main_worktree(clone_document)["removable"] = {"removable": True, "blockers": []}
+
+
+def mutate_set_on_the_base_branch(clone_document):
+    base = clone_document["verdict_base"]["name"]
+    branch_of(clone_document, base)["removable"] = {"removable": True, "blockers": []}
+
+
+def mutate_blockers_reordered(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    blockers = branch_of(clone_document, "never-pushed")["removable"]["blockers"]
+    assert blockers == ["not_merged", "checked_out_in_main_worktree"]
+    blockers.reverse()
+
+
+def mutate_blockers_duplicated(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].append("not_merged")
+
+
+def mutate_blockers_unknown(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].append("bogus")
+
+
+def mutate_blockers_missing_one(clone_document):
+    blocked_branch(clone_document)
+    rederive({"repositories": [{"clones": [clone_document]}]})
+    branch_of(clone_document, "never-pushed")["removable"]["blockers"].pop()
+
+
+def mutate_count_branches_high(clone_document):
+    clone_document["removable_count"]["branches"] += 1
+
+
+def mutate_count_branches_low(clone_document):
+    clone_document["removable_count"]["branches"] -= 1
+
+
+def mutate_count_worktrees_high(clone_document):
+    clone_document["removable_count"]["worktrees"] += 1
+
+
+def mutate_count_worktrees_low(clone_document):
+    clone_document["removable_count"]["worktrees"] -= 1
+
+
+def mutate_count_missing(clone_document):
+    clone_document["removable_count"] = None
+
+
+def mutate_count_key_missing(clone_document):
+    del clone_document["removable_count"]["worktrees"]
+
+
+def mutate_count_on_a_refused_clone(clone_document):
+    refused_clone({"repositories": [{"clones": [clone_document]}]})
+    clone_document["removable_count"] = {"branches": 0, "worktrees": 0}
+
+
+def mutate_count_negative(clone_document):
+    clone_document["removable_count"]["branches"] = -1
+
+
+def mutate_removable_flag_not_boolean(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"]["removable"] = 1
+
+
+def mutate_removable_extra_key(clone_document):
+    branch_of(clone_document, "never-pushed")["removable"]["extra"] = 1
+
+
+def mutate_blockers_not_a_list(clone_document):
+    linked_worktree(clone_document)["removable"]["blockers"] = "locked"
+
+
+REJECTED_REMOVABLE_DOCUMENTS = {
+    "true_with_a_blocker": mutate_true_with_a_blocker,
+    "false_with_no_blocker": mutate_false_with_no_blocker,
+    "worktree_true_with_a_blocker": mutate_worktree_true_with_a_blocker,
+    "worktree_false_with_no_blocker": mutate_worktree_false_with_no_blocker,
+    "null_on_a_non_default_branch": mutate_null_on_a_branch,
+    "null_on_a_linked_worktree": mutate_null_on_a_linked_worktree,
+    "set_on_the_main_worktree": mutate_set_on_the_main_worktree,
+    "set_on_the_base_branch": mutate_set_on_the_base_branch,
+    "blockers_reordered": mutate_blockers_reordered,
+    "blockers_duplicated": mutate_blockers_duplicated,
+    "blockers_unknown": mutate_blockers_unknown,
+    "blockers_missing_one": mutate_blockers_missing_one,
+    "branch_count_one_high": mutate_count_branches_high,
+    "branch_count_one_low": mutate_count_branches_low,
+    "worktree_count_one_high": mutate_count_worktrees_high,
+    "worktree_count_one_low": mutate_count_worktrees_low,
+    "count_missing_on_an_ok_clone": mutate_count_missing,
+    "count_key_missing": mutate_count_key_missing,
+    "count_negative": mutate_count_negative,
+    "removable_flag_not_boolean": mutate_removable_flag_not_boolean,
+    "removable_extra_key": mutate_removable_extra_key,
+    "blockers_not_a_list": mutate_blockers_not_a_list,
+}
+
+
+@pytest.mark.parametrize("mutation", list(REJECTED_REMOVABLE_DOCUMENTS), ids=str)
+def test_parser_rejects_a_removable_invariant_violation_under_a_valid_digest(sample, mutation):
+    document, _folder = sample
+    settled_sample(document)
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    REJECTED_REMOVABLE_DOCUMENTS[mutation](first_clone(broken))
+    assert "removable" in refusal_of(broken)
+
+
+def test_parser_refuses_a_count_on_a_clone_that_is_not_ok(sample):
+    document, _folder = sample
+    settled_sample(document)
+    broken = doc_copy(document)
+    mutate_count_on_a_refused_clone(first_clone(broken))
+    assert "must leave its facts null" in refusal_of(broken)
+
+
+def test_parser_accepts_every_removable_shape_the_derivation_returns(sample):
+    document, _folder = sample
+    settled_sample(document)
+    seen: set[tuple[bool, tuple[str, ...]]] = set()
+    for name, mutate in [
+        ("settled", lambda c: None),
+        ("branch", mutate_verdict_state),
+        ("held", mutate_linked_verdict_state),
+        ("untracked", set_change("untracked", 1)),
+        ("locked", set_change("locked", True)),
+        ("main", mutate_held_branch_moves_to_main),
+        ("two", blocked_branch),
+        ("gone", gone_worktree),
+    ]:
+        accepted = doc_copy(document)
+        clone_document = first_clone(accepted)
+        mutate(clone_document)
+        rederive(accepted)
+        assert models.parse_checkouts(redigest(accepted)), name
+        for item in (*clone_document["branches"], *clone_document["worktrees"]):
+            if item["removable"] is not None:
+                seen.add((item["removable"]["removable"], tuple(item["removable"]["blockers"])))
+    assert (True, ()) in seen
+    assert (False, ("not_merged",)) in seen
+    assert any(len(blockers) > 1 for _, blockers in seen)
 
 
 # ---------------------------------------------------------------------------
