@@ -774,6 +774,7 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     [picked] = [b for b in item["branches"] if b["name"] == "picked"]
     assert picked["verdict"] == {
         "state": "merged", "rung": "patch_equivalent", "reason": None,
+        "pull_request": None,
     }
     assert picked["removable"] == {"removable": True, "blockers": []}
     assert item["removable_count"] == {"branches": 1, "worktrees": 0}
