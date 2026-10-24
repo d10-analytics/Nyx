@@ -10113,10 +10113,10 @@ def test_the_budget_orders_ties_and_skips_an_oversized_member_without_evicting_o
         return {"at": at, "default": "main", "head": tag * 40, "branches": {"main": tag * 40}}
 
     def pulls(at: int) -> dict[str, Any]:
-        return {"at": at, "by_head": {"main": []}}
+        return {"at": at, "by_head": {f"topic-{n:03d}": [] for n in range(30)}}
 
     records = {
-        "b": {"heads": heads(5, "2"), "pull_requests": None},
+        "b": {"heads": {**heads(5, "2"), "branches": {}}, "pull_requests": None},
         "a": {"heads": heads(5, "1"), "pull_requests": pulls(5)},
         "huge": {"heads": {**heads(9, "3"), "branches": {f"n{n}": "3" * 40 for n in range(500)}},
                  "pull_requests": None},
@@ -10131,6 +10131,7 @@ def test_the_budget_orders_ties_and_skips_an_oversized_member_without_evicting_o
         }
 
     # Room for exactly one tied member: key "a" before "b", heads before pull_requests.
+    # (The records of "a" are the larger, so the order also decides what fits.)
     fits_one = len(dumped(only(a={"heads": records["a"]["heads"]})))
     monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", fits_one)
     assert checkouts._within_budget(records) == only(a={"heads": records["a"]["heads"]})
