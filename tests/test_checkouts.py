@@ -8456,6 +8456,18 @@ CATEGORY_CASES = [
     ),
     ("over-8-mib", {"code": 0, "stdout": oversized_answer()}, "failed"),
     ("exit-2", {"code": 2}, "failed"),
+    (
+        "error-type-list",
+        {"code": 1, "stdout": {"errors": [{"type": ["RATE_LIMITED"]}]}},
+        "failed",
+    ),
+    (
+        "error-type-dict",
+        {"code": 1, "stdout": {"errors": [{"type": {"RATE_LIMITED": 1}}]}},
+        "failed",
+    ),
+    ("huge-integer-exit-0", {"code": 0, "stdout": "1" * 5000}, "failed"),
+    ("huge-integer-exit-1", {"code": 1, "stdout": "1" * 5000}, "failed"),
 ]
 
 
