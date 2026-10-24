@@ -9481,3 +9481,68 @@ def test_parser_accepts_a_pull_request_rung_where_a_branch_at_the_commit_lists_i
         {"number": number, "state": "closed", "head_matches": False} for number in range(1, 11)
     ]
     assert models.parse_checkouts(redigest(rederive(full)))
+
+
+@posix_only
+def test_the_first_ten_requests_in_answer_order_are_listed_and_the_base_lists_its_own(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "branch", "many", "trunk")
+    trunk_tip = rev(work, "trunk")
+    # The answer order is not the number order: the eleventh node has the highest
+    # number, so keeping the ten highest numbers would differ from the first ten.
+    answered = [5, 40, 3, 22, 17, 9, 31, 12, 2, 28, 50]
+    pulls = {
+        "many": [pr_node(number, "closed", UNRELATED_HEAD) for number in answered],
+        "trunk": [pr_node(1, "merged", trunk_tip, base="release")],
+    }
+    install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(local_names(work), pulls))
+
+    item = find_clone(github_collect(folder), work)
+
+    assert [pull["number"] for pull in many_of(item)] == sorted(answered[:10])
+    # The verdict base branch lists the requests that name it like any other branch.
+    trunk = branch_of(item, "trunk")
+    assert trunk["verdict"] is None
+    assert listed(trunk) == [(1, "merged", True)]
+
+
+LATE_PROBES = {
+    "in-the-clone": lambda first, second, head: (
+        f'case "$*" in *"-C {real(second)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exec sleep 30;; esac'
+    ),
+    "in-the-sibling": lambda first, second, head: (
+        f'case "$*" in *"-C {real(first)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exec sleep 30;; esac'
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(LATE_PROBES))
+@posix_only
+def test_a_probe_for_the_head_that_times_out_counts_as_an_unavailable_head(
+    tmp_path, monkeypatch, case
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=True)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(tmp_path, "probe-late", LATE_PROBES[case](first, second, head))
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder, call_cap_seconds=1.0)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+@pytest.mark.parametrize("value", [True, 1.0], ids=["boolean", "float"])
+def test_parser_rejects_a_rung_number_equal_to_a_listed_one_but_not_an_integer(sample, value):
+    document, _folder = sample
+    base = lookup_live(document)
+    branch = branch_of(first_clone(base), "never-pushed")
+    merged_by_request(branch, 1)
+    assert models.parse_checkouts(redigest(rederive(doc_copy(base))))
+    broken = doc_copy(base)
+    branch_of(first_clone(broken), "never-pushed")["verdict"]["pull_request"] = value
+    assert "pull_request" in refusal_of(rederive(broken))
