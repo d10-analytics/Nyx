@@ -3305,9 +3305,12 @@ def collect_checkouts(
     ``deadline_ns`` is a ``time.monotonic_ns`` instant; calls that cannot start
     or finish by then mark their item ``timed_out`` and the document is still
     produced. ``remote_checks`` adds one ``ls-remote`` per distinct remote and
-    the live comparisons built on it; left off, nothing contacts a remote.
+    the live comparisons built on it; left off, nothing contacts a remote. A
+    remote whose check is off or fails is answered from its last successful
+    check saved in the cache file, labelled ``recorded``, when there is one.
     ``github_lookup`` adds one ``gh`` call per GitHub repository, and only while
-    ``remote_checks`` is on.
+    ``remote_checks`` is on; a saved pull-request listing answers for a call that
+    is not made or fails.
     """
     observed_at = _utc_text(int(time.time()))
     discovery = _discover(os.fspath(folder) for folder in folders)
