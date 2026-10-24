@@ -642,7 +642,7 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
         "shallow": None,
         "cached_default": None,
         "local_default": None,
-        "cached_vs_live": None,
+        "cached_vs_remote": None,
         "stash_count": None,
         "worktrees": None,
         "branches": None,
@@ -1085,7 +1085,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
             local_default = {
                 "name": cached_head_target,
                 "sha": local_sha,
-                "vs_live": None,
+                "vs_remote": None,
                 "vs_cached": compare(local_sha, cached_sha),
             }
 
@@ -1097,7 +1097,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "shallow": anchor.shallow,
         "cached_default": cached_default,
         "local_default": local_default,
-        "cached_vs_live": None,
+        "cached_vs_remote": None,
         "stash_count": stash_count,
         "worktrees": worktrees,
         "branches": branches,
@@ -1202,7 +1202,7 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
                     "display": display,
                     "check": {"status": "off", "reason": "remote_checks_off"},
                 },
-                "default_branch": {"name": None, "live_sha": None},
+                "default_branch": {"name": None, "sha": None},
                 "clones": [],
             }
             grouped[key] = group
@@ -1368,18 +1368,18 @@ def _apply_live(
     Returns the clone's verdict base for ``base_name``, chosen from the same
     presence pass and lender as the comparisons.
     """
-    name, live_sha = answer.name, answer.sha
+    name, remote_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
     local_sha = context.local.get(name, (None, ""))[0] if name is not None else None
-    pairs = [(cached_sha, live_sha)]
+    pairs = [(cached_sha, remote_sha)]
     if name is not None:
-        pairs.append((local_sha, live_sha))
+        pairs.append((local_sha, remote_sha))
     for branch in clone["branches"]:
         pairs.append((branch["sha"], answer.branches.get(branch["name"])))
     guarded = context.partial or context.shallow
     base_head = answer.branches.get(base_name) if base_name is not None else None
     if base_head is None and base_name is not None and base_name == name:
-        base_head = live_sha
+        base_head = remote_sha
     held = set(context.cached.values()) | {sha for sha, _ in context.local.values()}
     probed = {right for left, right in pairs if left and right and left != right}
     if base_head is not None and base_head not in held:
@@ -1454,7 +1454,7 @@ def _apply_live(
                 memo[(left, right)] = borrowed(left, right)
         return memo[(left, right)]
 
-    clone["cached_vs_live"] = live(cached_sha, live_sha)
+    clone["cached_vs_remote"] = live(cached_sha, remote_sha)
     if name is None:
         clone["local_default"] = None
     else:
@@ -1479,7 +1479,7 @@ def _apply_live(
         clone["local_default"] = {
             "name": name,
             "sha": local_sha,
-            "vs_live": live(local_sha, live_sha),
+            "vs_remote": live(local_sha, remote_sha),
             "vs_cached": vs_cached,
         }
     for branch in clone["branches"]:
@@ -1546,7 +1546,7 @@ def _check_remotes(
                 group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
                 continue
             group["remote"]["check"] = {"status": "live", "reason": None}
-            group["default_branch"] = {"name": answer.name, "live_sha": answer.sha}
+            group["default_branch"] = {"name": answer.name, "sha": answer.sha}
             for clone in group["clones"]:
                 if clone["status"] == "ok" and clone["path"] in contexts:
                     work.append((contexts[clone["path"]], clone, answer, group))

@@ -154,8 +154,8 @@ def _remote_and_default_elements(
     if live:
         elements.append(
             f"default {local_default['name']} live "
-            f"{_comparison_text(local_default['vs_live'])} cached {vs_cached} "
-            f"tracking live {_comparison_text(clone['cached_vs_live'])} {fetched_text}"
+            f"{_comparison_text(local_default['vs_remote'])} cached {vs_cached} "
+            f"tracking live {_comparison_text(clone['cached_vs_remote'])} {fetched_text}"
         )
     else:
         elements.append(f"default {local_default['name']} cached {vs_cached} {fetched_text}")

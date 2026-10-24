@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 3)
+# Checkout facts document (schema 4)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 3
+CHECKOUTS_SCHEMA_VERSION = 4
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -828,7 +828,7 @@ _CHECK_STATUSES = frozenset({"live", "failed", "off"})
 _CHECK_FAILURE_REASONS = frozenset(
     {"unreachable", "not_found", "authentication_failed", "timed_out", "failed"}
 )
-_DEFAULT_BRANCH_KEYS = frozenset({"name", "live_sha"})
+_DEFAULT_BRANCH_KEYS = frozenset({"name", "sha"})
 _CLONE_KEYS = frozenset(
     {
         "path",
@@ -838,7 +838,7 @@ _CLONE_KEYS = frozenset(
         "shallow",
         "cached_default",
         "local_default",
-        "cached_vs_live",
+        "cached_vs_remote",
         "stash_count",
         "worktrees",
         "branches",
@@ -851,7 +851,7 @@ _CONTAINMENT_OUTCOMES = frozenset({"complete", "deadline", "failed"})
 _ITEM_STATUSES = frozenset({"ok", "unsafe_ownership", "failed", "timed_out"})
 _CLONE_STATUSES = _ITEM_STATUSES | {"too_many_branches"}
 _CACHED_DEFAULT_KEYS = frozenset({"name", "sha", "last_fetched_at", "fetched_since_clone"})
-_LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_live", "vs_cached"})
+_LOCAL_DEFAULT_KEYS = frozenset({"name", "sha", "vs_remote", "vs_cached"})
 _WORKTREE_KEYS = frozenset(
     {
         "path",
@@ -1408,7 +1408,7 @@ def _clone(
         "shallow",
         "cached_default",
         "local_default",
-        "cached_vs_live",
+        "cached_vs_remote",
         "stash_count",
         "worktrees",
         "branches",
@@ -1424,13 +1424,13 @@ def _clone(
     _bool(item["partial_clone"], f"{name}.partial_clone")
     _bool(item["shallow"], f"{name}.shallow")
     _count(item["stash_count"], f"{name}.stash_count")
-    _comparison(item["cached_vs_live"], f"{name}.cached_vs_live", nullable=True)
+    _comparison(item["cached_vs_remote"], f"{name}.cached_vs_remote", nullable=True)
     _verdict_base(item["verdict_base"], f"{name}.verdict_base")
 
     cached = item["cached_default"]
     local = item["local_default"]
     if not has_remote:
-        if cached is not None or local is not None or item["cached_vs_live"] is not None:
+        if cached is not None or local is not None or item["cached_vs_remote"] is not None:
             raise ProtocolError(f"{name} has remote facts without a remote")
     else:
         cached = _object(cached, f"{name}.cached_default")
@@ -1450,7 +1450,7 @@ def _clone(
             _keys(local, _LOCAL_DEFAULT_KEYS, f"{name}.local_default")
             _text(local["name"], f"{name}.local_default.name")
             _nullable(local["sha"], _object_id, f"{name}.local_default.sha")
-            _comparison(local["vs_live"], f"{name}.local_default.vs_live", nullable=True)
+            _comparison(local["vs_remote"], f"{name}.local_default.vs_remote", nullable=True)
             _comparison(local["vs_cached"], f"{name}.local_default.vs_cached")
 
     worktrees = _list(item["worktrees"], f"{name}.worktrees")
@@ -1529,7 +1529,7 @@ def _repository(
         default_branch = _object(default_branch, f"{name}.default_branch")
         _keys(default_branch, _DEFAULT_BRANCH_KEYS, f"{name}.default_branch")
         _nullable(default_branch["name"], _text, f"{name}.default_branch.name")
-        _nullable(default_branch["live_sha"], _object_id, f"{name}.default_branch.live_sha")
+        _nullable(default_branch["sha"], _object_id, f"{name}.default_branch.sha")
     clones = _list(item["clones"], f"{name}.clones")
     if not clones or (remote is None and len(clones) != 1):
         raise ProtocolError(f"{name}.clones has the wrong size")
