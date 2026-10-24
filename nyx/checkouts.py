@@ -1411,15 +1411,22 @@ def _github_request(owner: str, name: str, branches: Sequence[str]) -> bytes:
 
 
 def _valid_pull_request(node: Any) -> bool:
+    """Whether one answered node has every field in its expected form.
+
+    Each value is type-checked before it is compared, hashed or matched, so an
+    answer of any JSON shape is only invalid, never an error."""
     if not isinstance(node, dict):
         return False
     number = node.get("number")
+    state = node.get("state")
+    head = node.get("headRefOid")
     return (
         type(number) is int
         and number > 0
-        and node.get("state") in _GITHUB_STATES
-        and isinstance(node.get("headRefOid"), str)
-        and _OBJECT_ID.fullmatch(node["headRefOid"]) is not None
+        and type(state) is str
+        and state in _GITHUB_STATES
+        and type(head) is str
+        and _OBJECT_ID.fullmatch(head) is not None
         and _safe_text(node.get("baseRefName"))
         and type(node.get("isCrossRepository")) is bool
     )
