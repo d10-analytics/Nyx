@@ -10938,7 +10938,7 @@ def test_a_recorded_head_that_no_sibling_holds_differs_on_the_recorded_basis(
         assert item["verdict_base"] == cached_base(path)
 
 
-PROBE_FAILURES = [
+RECORDED_PROBE_FAILURES = [
     ("own", "differs", "exit 3"),
     ("own", "unknown", "sleep 30"),
     ("lender", "differs", "exit 3"),
@@ -10948,7 +10948,7 @@ PROBE_FAILURES = [
 
 @posix_only
 @pytest.mark.parametrize(
-    ("whose", "state", "action"), PROBE_FAILURES, ids=[f"{w}-{s}" for w, s, _ in PROBE_FAILURES]
+    ("whose", "state", "action"), RECORDED_PROBE_FAILURES, ids=[f"{w}-{s}" for w, s, _ in RECORDED_PROBE_FAILURES]
 )
 def test_a_recorded_comparison_whose_object_probe_cannot_say_keeps_that_state_on_the_recorded_basis(
     tmp_path, monkeypatch, isolated_git, whose, state, action
