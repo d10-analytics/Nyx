@@ -1334,8 +1334,9 @@ def _clone_verdicts(
             verdicts.append((label, worktree["verdict"], worktree["head"]["sha"]))
     limited = item["shallow"] or item["partial_clone"]
     for label, verdict, commit in verdicts:
+        # With no lookup no branch lists a request, so the rung cannot be named either.
         if verdict["rung"] == "pull_request" and (
-            not lookup_used or verdict["pull_request"] not in merged_at.get(commit, ())
+            verdict["pull_request"] not in merged_at.get(commit, ())
         ):
             raise ProtocolError(
                 f"{label} names a pull request no branch at its commit lists as merged"
