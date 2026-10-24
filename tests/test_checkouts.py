@@ -53,6 +53,31 @@ GLOBAL_CONFIG = """\
 """
 
 
+GITHUB_SCRUBBED = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_CONFIG_DIR",
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def outer_github_environment(tmp_path_factory):
+    """Hold every GitHub variable in the process environment, as an outer shell
+    would, before the per-test guard builds each test's environment."""
+    config = tmp_path_factory.mktemp("outer-gh-config")
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    values = {name: f"outer-{name.lower()}" for name in GITHUB_SCRUBBED}
+    values["GH_CONFIG_DIR"] = str(config)
+    with pytest.MonkeyPatch.context() as outer:
+        for name, value in values.items():
+            outer.setenv(name, value)
+        yield values
+
+
 @pytest.fixture(autouse=True)
 def isolated_git(tmp_path_factory, monkeypatch):
     """Point every git child at an empty home that owns the only global config."""
@@ -65,6 +90,10 @@ def isolated_git(tmp_path_factory, monkeypatch):
     for name in list(os.environ):
         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
             monkeypatch.delenv(name)
+    # No test may reach the network through the user's GitHub credentials; a test
+    # that needs one of these variables sets it in its own body.
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.delenv(name, raising=False)
     return home
 
 
@@ -1571,7 +1600,7 @@ def without_remote(document):
     """Reduce the first clone to a repository with no remote and so no base."""
     clone_document = first_clone(document)
     document["repositories"] = [
-        {"remote": None, "default_branch": None, "clones": [clone_document]}
+        {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone_document]}
     ]
     clone_document.update(cached_default=None, local_default=None, cached_vs_remote=None)
     for branch in clone_document["branches"]:
@@ -7971,3 +8000,622 @@ def test_a_branch_held_by_two_worktrees_is_blocked_by_either_of_them(tmp_path):
         {first: [], second: ["not_clean"], open_one: [], held_one: ["locked"]},
         count=(0, 2),
     )
+
+
+# ---------------------------------------------------------------------------
+# GitHub pull-request lookup: the one gh request per repository
+# ---------------------------------------------------------------------------
+
+GITHUB_URL = "https://github.com/acme/widget.git"
+GITHUB_KEY = "github.com/acme/widget"
+PR_NODE = {
+    "number": 7,
+    "state": "MERGED",
+    "headRefOid": "a" * 40,
+    "baseRefName": "trunk",
+    "isCrossRepository": False,
+}
+
+
+def github_answer(count: int, node: dict[str, Any] | None = PR_NODE) -> dict[str, Any]:
+    """A valid ``gh`` answer for ``count`` branch aliases."""
+    repository: dict[str, Any] = {"__typename": "Repository"}
+    for index in range(count):
+        repository[f"b{index}"] = {"nodes": [] if node is None else [dict(node)]}
+    return {"data": {"repository": repository}}
+
+
+class GhCall:
+    """One logged start of the fake ``gh``."""
+
+    def __init__(self, directory: Path) -> None:
+        self.args = (directory / "args").read_text().split("\n")[:-1]
+        self.environment = dict(
+            line.split("=", 1)
+            for line in (directory / "env").read_text().split("\n")
+            if "=" in line
+        )
+        body = directory / "body"
+        self.body = body.read_bytes() if body.exists() else None
+        input_file = directory / "input"
+        self.input_path = input_file.read_text() if input_file.exists() else None
+
+
+class FakeGh:
+    """A POSIX shell script standing in for ``gh``: it logs the arguments, the
+    environment, the request body and the start time of each call and replays a
+    chosen stdout, stderr, exit code and delay."""
+
+    def __init__(self, root: Path) -> None:
+        self.bin = root / "fake-gh-bin"
+        self.state = root / "fake-gh-state"
+        self.bin.mkdir(parents=True, exist_ok=True)
+        self.state.mkdir(parents=True, exist_ok=True)
+        script = self.bin / "gh"
+        script.write_text(
+            f"""#!/bin/sh
+state="{self.state}"
+call=$(mktemp -d "$state/call.XXXXXX")
+printf '%s\\n' "$@" > "$call/args"
+env > "$call/env"
+date +%s > "$call/started"
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "--input" ]; then
+    printf '%s' "$argument" > "$call/input"
+    cp "$argument" "$call/body"
+  fi
+  previous=$argument
+done
+if [ -f "$state/delay" ]; then sleep "$(cat "$state/delay")"; fi
+if [ -f "$state/stderr" ]; then cat "$state/stderr" >&2; fi
+if [ -f "$state/stdout" ]; then cat "$state/stdout"; fi
+exit "$(cat "$state/code")"
+"""
+        )
+        script.chmod(0o755)
+        self.replay()
+
+    def replay(
+        self, stdout: str | dict[str, Any] = "", stderr: str = "", code: int = 0, delay: float = 0
+    ) -> None:
+        text = stdout if isinstance(stdout, str) else json.dumps(stdout)
+        (self.state / "stdout").write_text(text)
+        (self.state / "stderr").write_text(stderr)
+        (self.state / "code").write_text(str(code))
+        (self.state / "delay").write_text(str(delay))
+
+    def calls(self) -> list[GhCall]:
+        return [GhCall(path) for path in sorted(self.state.glob("call.*"))]
+
+
+def install_fake_gh(tmp_path: Path, monkeypatch, **replay: Any) -> FakeGh:
+    """Put a fake ``gh`` first on ``PATH``."""
+    fake = FakeGh(tmp_path)
+    fake.replay(**replay)
+    monkeypatch.setenv("PATH", f"{fake.bin}{os.pathsep}{os.environ['PATH']}")
+    return fake
+
+
+def git_only_path(tmp_path: Path) -> str:
+    """A ``PATH`` that provides git and no ``gh``: ``gh`` may sit beside the real git."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    directory = tmp_path / "only-git"
+    directory.mkdir(exist_ok=True)
+    if ON_WINDOWS:
+        if (Path(real_git).parent / "gh.exe").exists():
+            pytest.skip("gh.exe sits beside git.exe on this host")
+        return str(Path(real_git).parent)
+    wrapper = directory / "git"
+    wrapper.write_text(f'#!/bin/sh\nexec "{real_git}" "$@"\n')
+    wrapper.chmod(0o755)
+    return str(directory)
+
+
+def point_origin_at(repository: Path, remote: Path, url: str) -> None:
+    """Configure ``url`` as origin while git reaches ``remote`` through ``insteadOf``."""
+    git(repository, "config", "remote.origin.url", url)
+    git(repository, "config", f"url.{remote.as_uri()}.insteadOf", url)
+
+
+def github_collect(folder: Path, **options: Any) -> dict[str, Any]:
+    options.setdefault("remote_checks", True)
+    options.setdefault("github_lookup", True)
+    return collect([folder], **options)
+
+
+def lookup_of(document: dict[str, Any]) -> dict[str, Any]:
+    [repository] = document["repositories"]
+    return repository["pr_lookup"]
+
+
+def lookup(status: str, reason: str | None) -> dict[str, Any]:
+    return {"status": status, "reason": reason, "checked_at": None}
+
+
+def two_clone_world(tmp_path: Path, url: str | None = GITHUB_URL) -> tuple[Path, Path, Path, Path]:
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    first = clone(remote, folder / "a")
+    second = clone(remote, folder / "b")
+    for repository, names in ((first, ["feature/x-1"]), (second, ["feature/x-1", "other"])):
+        for name in names:
+            git(repository, "branch", name)
+        if url is not None:
+            point_origin_at(repository, remote, url)
+    return folder, remote, first, second
+
+
+def branchless_world(tmp_path: Path) -> Path:
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    repository = clone(remote, folder / "empty")
+    git(repository, "checkout", "-q", "--detach")
+    git(repository, "update-ref", "-d", "refs/heads/trunk")
+    point_origin_at(repository, remote, GITHUB_URL)
+    return folder
+
+
+def merged_world(tmp_path: Path) -> Path:
+    """A GitHub-configured clone whose branch ``done`` was squash-merged into ``trunk``."""
+    folder, remote, work = small_world(tmp_path)
+    land(work, "done")
+    point_origin_at(work, remote, GITHUB_URL)
+    return folder
+
+
+@posix_only
+def test_one_gh_call_per_repository_carries_every_distinct_branch_name_in_a_body_file(
+    tmp_path, monkeypatch
+):
+    folder, _remote, _first, _second = two_clone_world(tmp_path)
+    names = ["feature/x-1", "other", "trunk"]
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(len(names)))
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setenv("GH_HOST", "elsewhere.example.invalid")
+    monkeypatch.setenv("GH_REPO", "other/repository")
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    assert call.args[:5] == ["api", "graphql", "--hostname", "github.com", "--input"]
+    assert len(call.args) == 6
+    assert call.input_path == call.args[5]
+    assert not any(name in argument for argument in call.args for name in names)
+    request = json.loads(call.body)
+    assert set(request) == {"query", "variables"}
+    assert request["variables"] == {
+        "owner": "acme", "name": "widget", "h0": names[0], "h1": names[1], "h2": names[2],
+    }
+    query = request["query"]
+    assert "repository(owner: $owner, name: $name)" in query
+    assert "__typename" in query
+    assert query.count("pullRequests(") == len(names)
+    for index in range(len(names)):
+        assert (
+            f"b{index}: pullRequests(headRefName: $h{index}, first: 10, "
+            "orderBy: {field: CREATED_AT, direction: DESC}) "
+            "{ nodes { number state headRefOid baseRefName isCrossRepository } }"
+        ) in query
+    assert not Path(call.input_path).exists()
+    assert not Path(call.input_path).parent.exists()
+    environment = call.environment
+    assert {name: environment.get(name) for name in (
+        "GH_PROMPT_DISABLED", "GH_NO_UPDATE_NOTIFIER", "GH_SPINNER_DISABLED", "NO_COLOR",
+    )} == {
+        "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_SPINNER_DISABLED": "1", "NO_COLOR": "1",
+    }
+    assert "GH_REPO" not in environment and "GH_HOST" not in environment
+    assert environment["GH_TOKEN"] == "test-token"
+    assert document["github_lookup"] == "on"
+    [repository] = document["repositories"]
+    assert repository["remote"]["key"] == GITHUB_KEY
+    assert repository["remote"]["check"] == {"status": "live", "reason": None}
+    assert repository["pr_lookup"] == lookup("live", None)
+
+
+@posix_only
+def test_a_gh_started_by_the_collector_receives_the_github_configuration_a_test_set(
+    tmp_path, monkeypatch
+):
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+    config = tmp_path / "gh-config"
+    config.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    monkeypatch.setenv("GITHUB_TOKEN", "body-token")
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    assert call.environment["GH_CONFIG_DIR"] == str(config)
+    assert call.environment["GITHUB_TOKEN"] == "body-token"
+
+
+@posix_only
+def test_the_guard_removes_every_github_variable_before_the_test_body(
+    tmp_path, monkeypatch, outer_github_environment
+):
+    # The outer environment did hold all seven, and a config directory with a hosts file.
+    assert set(outer_github_environment) == set(GITHUB_SCRUBBED)
+    assert (Path(outer_github_environment["GH_CONFIG_DIR"]) / "hosts.yml").is_file()
+    assert [name for name in GITHUB_SCRUBBED if name in os.environ] == []
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    assert [name for name in GITHUB_SCRUBBED if name in call.environment] == []
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"data": {"repository": {"__typename": "Repository"}}}, lookup("live", None)),
+        ({"data": {"repository": {}}}, lookup("unavailable", "failed")),
+    ],
+    ids=["typename", "no-typename"],
+)
+def test_a_repository_with_no_local_branch_still_makes_its_one_call(
+    tmp_path, monkeypatch, answer, expected
+):
+    folder = branchless_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=answer)
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    request = json.loads(call.body)
+    assert request["variables"] == {"owner": "acme", "name": "widget"}
+    assert "__typename" in request["query"]
+    assert "pullRequests" not in request["query"]
+    assert lookup_of(document) == expected
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://acme.ghe.com/acme/widget.git", "acme.ghe.com"),
+        ("https://gitlab.example.com/acme/widget.git", None),
+        ("https://github.com/acme/widget/extra.git", None),
+        (None, None),
+    ],
+    ids=["enterprise", "gitlab", "extra-path", "file-url"],
+)
+def test_only_a_github_host_with_an_owner_and_repository_path_is_called(
+    tmp_path, monkeypatch, url, host
+):
+    # With no URL the clones keep the plain file remote they were cloned from.
+    folder, *_ = two_clone_world(tmp_path, url)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    document = github_collect(folder)
+
+    if host is None:
+        assert fake.calls() == []
+        assert lookup_of(document) == lookup("off", "not_github")
+    else:
+        [call] = fake.calls()
+        assert call.args[2:4] == ["--hostname", host]
+        assert lookup_of(document) == lookup("live", None)
+
+
+@posix_only
+def test_a_gh_reachable_only_through_a_relative_path_entry_never_runs(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    fake = FakeGh(tmp_path)
+    fake.replay(stdout=github_answer(3))
+    only_git = git_only_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake.bin.name}{os.pathsep}{only_git}")
+
+    document = github_collect(folder)
+
+    assert fake.calls() == []
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="Windows resolution rules")
+def test_windows_runs_only_a_gh_exe_found_on_an_absolute_path_entry(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    marker = tmp_path / "cmd-marker"
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "gh.cmd").write_text(f'@echo ran> "{marker}"\r\n')
+    working = tmp_path / "working"
+    working.mkdir()
+    shutil.copy(os.environ["COMSPEC"], working / "gh.exe")
+    monkeypatch.chdir(working)
+    monkeypatch.setenv("PATH", f"{only_git}{os.pathsep}{shim}")
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="Windows resolution rules")
+def test_windows_finds_and_runs_a_gh_exe_first_on_the_path(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    program = tmp_path / "program"
+    program.mkdir()
+    shutil.copy(os.environ["COMSPEC"], program / "gh.exe")
+    monkeypatch.setenv("PATH", f"{program}{os.pathsep}{only_git}")
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "failed")
+
+
+def valid_for_merged_world() -> dict[str, Any]:
+    return github_answer(2)
+
+
+@posix_only
+def test_lookup_off_makes_no_call_and_reports_the_setting(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    baseline = github_collect(folder, github_lookup=False)
+
+    assert fake.calls() == []
+    assert baseline["github_lookup"] == "off"
+    assert lookup_of(baseline) == lookup("off", "setting_off")
+    assert baseline["repositories"][0]["remote"]["check"]["status"] == "live"
+
+
+@posix_only
+def test_remote_checks_off_makes_no_call_and_reports_it(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+
+    document = github_collect(folder, remote_checks=False)
+
+    assert fake.calls() == []
+    assert lookup_of(document) == lookup("off", "remote_checks_off")
+    assert document["repositories"][0]["remote"]["check"] == {
+        "status": "off", "reason": "remote_checks_off",
+    }
+
+
+@posix_only
+def test_a_path_with_git_and_no_gh_reports_gh_missing(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    monkeypatch.setenv("PATH", only_git)
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+
+
+def merged_answer_with(node_change: dict[str, Any]) -> dict[str, Any]:
+    answer = github_answer(2)
+    answer["data"]["repository"]["b0"]["nodes"][0].update(node_change)
+    return answer
+
+
+def oversized_answer() -> str:
+    return json.dumps(github_answer(2)) + " " * (8 << 20)
+
+
+HTTP_401 = "HTTP 401: Bad credentials (https://api.github.com/graphql)"
+RATE_LIMITED_BODY = {"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]}
+NOT_FOUND_BODY = {
+    "data": {"repository": None},
+    "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a Repository"}],
+}
+MISSING_NODES = github_answer(2)
+del MISSING_NODES["data"]["repository"]["b1"]["nodes"]
+NULL_REPOSITORY = {"data": {"repository": None}}
+
+CATEGORY_CASES = [
+    ("exit-4", {"code": 4}, "not_authenticated"),
+    ("http-401", {"code": 1, "stderr": HTTP_401}, "not_authenticated"),
+    ("auth-login", {"code": 1, "stderr": "To authenticate, run: gh auth login"}, "not_authenticated"),
+    ("rate-limit-text", {"code": 1, "stderr": "API rate limit exceeded"}, "rate_limited"),
+    (
+        "rate-limited-type",
+        {"code": 1, "stdout": RATE_LIMITED_BODY, "stderr": "something unrelated"},
+        "rate_limited",
+    ),
+    ("not-found-type", {"code": 1, "stdout": NOT_FOUND_BODY}, "not_found"),
+    ("null-repository", {"code": 0, "stdout": NULL_REPOSITORY}, "not_found"),
+    ("null-repository-exit-1", {"code": 1, "stdout": NULL_REPOSITORY}, "not_found"),
+    ("exit-4-beats-rate-limit", {"code": 4, "stderr": "rate limit"}, "not_authenticated"),
+    (
+        "rate-limit-beats-credentials",
+        {"code": 1, "stderr": f"rate limit and {HTTP_401}"},
+        "rate_limited",
+    ),
+    ("not-json", {"code": 0, "stdout": "this is not json"}, "failed"),
+    ("missing-nodes", {"code": 0, "stdout": MISSING_NODES}, "failed"),
+    ("draft-state", {"code": 0, "stdout": merged_answer_with({"state": "DRAFT"})}, "failed"),
+    ("zero-number", {"code": 0, "stdout": merged_answer_with({"number": 0})}, "failed"),
+    (
+        "bad-head-object",
+        {"code": 0, "stdout": merged_answer_with({"headRefOid": "not-an-object"})},
+        "failed",
+    ),
+    (
+        "cross-not-boolean",
+        {"code": 0, "stdout": merged_answer_with({"isCrossRepository": "no"})},
+        "failed",
+    ),
+    ("over-8-mib", {"code": 0, "stdout": oversized_answer()}, "failed"),
+    ("exit-2", {"code": 2}, "failed"),
+]
+
+
+@posix_only
+def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
+    tmp_path, monkeypatch
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    off = github_collect(folder, github_lookup=False)
+
+    document = github_collect(folder)
+
+    assert len(fake.calls()) == 1
+    assert lookup_of(document) == lookup("live", None)
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("replay", "reason"),
+    [case[1:] for case in CATEGORY_CASES],
+    ids=[case[0] for case in CATEGORY_CASES],
+)
+def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladder_alone(
+    tmp_path, monkeypatch, replay, reason
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, **replay)
+    off = github_collect(folder, github_lookup=False)
+
+    document = github_collect(folder)
+
+    assert len(fake.calls()) == 1
+    assert lookup_of(document) == lookup("unavailable", reason)
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+def test_a_gh_that_outlasts_the_call_cap_times_out_while_the_remote_check_stays_live(
+    tmp_path, monkeypatch
+):
+    folder = merged_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world(), delay=30)
+
+    started = time.monotonic()
+    document = github_collect(folder, call_cap_seconds=2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert lookup_of(document) == lookup("unavailable", "timed_out")
+    assert document["repositories"][0]["remote"]["check"] == {"status": "live", "reason": None}
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@pytest.mark.parametrize(
+    ("key", "identity"),
+    [
+        ("github.com/acme/widget", ("github.com", "acme", "widget")),
+        ("acme.ghe.com/acme/widget", ("acme.ghe.com", "acme", "widget")),
+        ("gitlab.example.com/acme/widget", None),
+        ("github.com/acme/widget/extra", None),
+        ("github.com/acme", None),
+        ("github.com:8443/acme/widget", None),
+        (".ghe.com/acme/widget", None),
+        ("github.com//widget", None),
+        ("ghe.com/acme/widget", None),
+    ],
+)
+def test_github_identity_accepts_only_a_github_host_with_an_owner_and_repository(key, identity):
+    assert models.github_identity(key) == identity
+
+
+def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lookup):
+    document = doc_copy(sample_document)
+    document["github_lookup"] = github_lookup
+    document["remote_checks"] = remote_checks
+    document["repositories"][0]["remote"]["key"] = key
+    document["repositories"][0]["pr_lookup"] = pr_lookup
+    return redigest(document)
+
+
+LOOKUP_ACCEPTED = [
+    ("off", "on", GITHUB_KEY, lookup("off", "setting_off")),
+    ("off", "off", GITHUB_KEY, lookup("off", "setting_off")),
+    ("on", "on", "example.com/acme/widget", lookup("off", "not_github")),
+    ("on", "off", "example.com/acme/widget", lookup("off", "not_github")),
+    ("on", "off", GITHUB_KEY, lookup("off", "remote_checks_off")),
+    ("on", "on", GITHUB_KEY, lookup("live", None)),
+    *[
+        ("on", "on", GITHUB_KEY, lookup("unavailable", reason))
+        for reason in (
+            "gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed",
+        )
+    ],
+]
+LOOKUP_REFUSED = [
+    ("off", "on", GITHUB_KEY, lookup("off", "not_github")),
+    ("off", "on", GITHUB_KEY, lookup("live", None)),
+    ("on", "on", "example.com/acme/widget", lookup("live", None)),
+    ("on", "on", GITHUB_KEY, lookup("off", "not_github")),
+    ("on", "on", GITHUB_KEY, lookup("off", "setting_off")),
+    ("on", "on", GITHUB_KEY, lookup("off", "remote_checks_off")),
+    ("on", "on", GITHUB_KEY, lookup("live", "failed")),
+    ("on", "on", GITHUB_KEY, lookup("unavailable", None)),
+    ("on", "on", GITHUB_KEY, lookup("unavailable", "setting_off")),
+    ("on", "off", GITHUB_KEY, lookup("live", None)),
+    ("on", "off", GITHUB_KEY, lookup("unavailable", "failed")),
+    ("on", "on", GITHUB_KEY, {**lookup("live", None), "checked_at": "2026-10-24T00:00:00Z"}),
+    ("on", "on", GITHUB_KEY, lookup("recorded", "remote_checks_off")),
+    ("on", "on", GITHUB_KEY, None),
+]
+
+
+@pytest.mark.parametrize(("github", "checks", "key", "pr_lookup"), LOOKUP_ACCEPTED)
+def test_parser_accepts_each_lookup_status_and_reason_combination(
+    sample, github, checks, key, pr_lookup
+):
+    document, _folder = sample
+    broken = lookup_document(
+        document, github_lookup=github, remote_checks=checks, key=key, pr_lookup=pr_lookup
+    )
+    assert models.parse_checkouts(broken)["repositories"][0]["pr_lookup"] == pr_lookup
+
+
+@pytest.mark.parametrize(("github", "checks", "key", "pr_lookup"), LOOKUP_REFUSED)
+def test_parser_refuses_a_lookup_status_that_contradicts_the_setting_or_the_remote(
+    sample, github, checks, key, pr_lookup
+):
+    document, _folder = sample
+    accepted = lookup_document(
+        document, github_lookup="off", remote_checks="on", key=GITHUB_KEY,
+        pr_lookup=lookup("off", "setting_off"),
+    )
+    assert models.parse_checkouts(accepted)
+    broken = doc_copy(accepted)
+    broken["github_lookup"] = github
+    broken["remote_checks"] = checks
+    broken["repositories"][0]["remote"]["key"] = key
+    broken["repositories"][0]["pr_lookup"] = pr_lookup
+    assert "pr_lookup" in refusal_of(broken)
+
+
+def test_parser_refuses_a_lookup_on_a_repository_with_no_remote_and_a_missing_one_with_a_remote(
+    sample,
+):
+    document, _folder = sample
+    remoteless = doc_copy(document)
+    without_remote(remoteless)
+    remoteless["repositories"][0]["pr_lookup"] = lookup("off", "setting_off")
+    assert "without a remote" in refusal_of(remoteless)
+    for key in ("github_lookup",):
+        missing = doc_copy(document)
+        del missing[key]
+        assert "invalid shape" in refusal_of(missing)
+    absent = doc_copy(document)
+    del absent["repositories"][0]["pr_lookup"]
+    assert "invalid shape" in refusal_of(absent)

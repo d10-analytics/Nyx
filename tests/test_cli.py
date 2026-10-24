@@ -41,7 +41,7 @@ def _subprocess_environment(home: Path) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"PYTHONPATH", "PYTHONHOME"}
+        if key not in {"PYTHONPATH", "PYTHONHOME", *GITHUB_SCRUBBED}
     }
     environment["HOME"] = str(home)
     environment["USERPROFILE"] = str(home)
@@ -631,6 +631,8 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
 
 import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
+    GITHUB_SCRUBBED,
+    GITHUB_URL,
     GLOBAL_CONFIG,
     add_packed_refs,
     allow_filters,
@@ -638,7 +640,11 @@ from test_checkouts import (  # noqa: E402
     closed_port,
     commit_file,
     git,
+    github_answer,
+    install_fake_gh,
     make_remote,
+    point_origin_at,
+    posix_only,
     real,
     trust_only,
     web_clone,
@@ -666,6 +672,10 @@ def account(tmp_path, monkeypatch):
     for name in list(os.environ):
         if name.startswith("GIT_") and name != "GIT_CONFIG_NOSYSTEM":
             monkeypatch.delenv(name)
+    # No test may reach the network through the user's GitHub credentials; a test
+    # that needs one of these variables sets it in its own body.
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.delenv(name, raising=False)
     return home
 
 
@@ -679,13 +689,16 @@ def _write_record(tmp_path: Path, payload: dict | bytes) -> Path:
     return paths.config_file
 
 
-def _configure(tmp_path: Path, folders: list[Path | str]) -> Path:
+def _configure(tmp_path: Path, folders: list[Path | str], github_lookup: bool = False) -> Path:
     """Write a schema 4 record for a workspace whose settings name ``folders``."""
 
     specification = tmp_path / "spec"
     specification.mkdir(exist_ok=True)
     key = str(specification.resolve())
-    entry = {"folders": sorted(str(folder) for folder in folders), "github_lookup": False}
+    entry = {
+        "folders": sorted(str(folder) for folder in folders),
+        "github_lookup": github_lookup,
+    }
     return _write_record(
         tmp_path,
         {
@@ -992,8 +1005,9 @@ def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account
     assert elements[2] == "remote off"
     assert elements[3] == "branches cached local-only 1"
     assert elements[4] == "default trunk cached ahead never fetched"
-    assert elements[5] == "removable 0 branches, 0 worktrees"
-    assert len(elements) == 6
+    assert elements[5] == "pr off setting_off"
+    assert elements[6] == "removable 0 branches, 0 worktrees"
+    assert len(elements) == 7
     assert not any(element.startswith("operations") for element in elements)
 
 
@@ -1011,8 +1025,9 @@ def test_cached_default_shows_the_fetch_time_once_the_clone_has_fetched(
 
     assert re.fullmatch(
         r"default trunk cached equal fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
-        line.split("  ")[-2],
+        line.split("  ")[-3],
     )
+    assert line.split("  ")[-2] == "pr off setting_off"
     assert line.split("  ")[-1] == "removable 0 branches, 0 worktrees"
     assert re.search(r"cached [0-9]{4}-", line) is None
 
@@ -1211,10 +1226,11 @@ def test_clone_of_an_empty_remote_under_no_network_prints_no_cached_default(
 
     elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
-    assert elements[-4:] == [
+    assert elements[-5:] == [
         "remote off",
         "branches cached local-only 1",
         "no cached default",
+        "pr off setting_off",
         "removable 0 branches, 0 worktrees",
     ]
 
@@ -1337,7 +1353,11 @@ def _relation(comparison: dict | None) -> str:
 def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
     """Parse the trailing elements and compare each captured field to the document."""
 
-    remote, branches, default, removable = line.split("  ")[-4:]
+    remote, branches, default, pr, removable = line.split("  ")[-5:]
+    lookup = group["pr_lookup"]
+    assert pr == (
+        "pr live" if lookup["status"] == "live" else f"pr {lookup['status']} {lookup['reason']}"
+    )
     counts = item["removable_count"]
     assert removable == f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
     check = group["remote"]["check"]
@@ -1466,7 +1486,7 @@ def test_live_plain_lines_follow_the_grammar_and_agree_with_the_document(
     }
 
     def tail(name: str) -> list[str]:
-        return by_path[real(paths[name])][0].split("  ")[-4:-1]
+        return by_path[real(paths[name])][0].split("  ")[-5:-2]
 
     assert tail("fetched")[:2] == ["remote live", "branches live local-only 0"]
     assert re.fullmatch(
@@ -1505,13 +1525,13 @@ def test_no_network_plain_lines_follow_the_cached_grammar(grammar_scenario, acco
         line, group, item = by_path[real(path)]
         assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
         _assert_line_matches_document(line, group, item)
-        remote, branches, default = line.split("  ")[-4:-1]
+        remote, branches, default = line.split("  ")[-5:-2]
         assert remote == "remote off"
         assert branches.startswith("branches cached local-only ")
         assert default.startswith(("default ", "no cached default"))
         assert " live " not in default
-    assert by_path[real(paths["empty"])][0].split("  ")[-2] == "no cached default"
-    assert by_path[real(paths["never"])][0].split("  ")[-2].endswith(" never fetched")
+    assert by_path[real(paths["empty"])][0].split("  ")[-3] == "no cached default"
+    assert by_path[real(paths["never"])][0].split("  ")[-3].endswith(" never fetched")
     assert re.search(r"cached [0-9]{4}-", text) is None
     assert "s3cr3tpass" not in text and "someuser" not in text
 
@@ -1617,3 +1637,189 @@ def test_exit_codes_do_not_depend_on_the_switch(tmp_path, account, monkeypatch, 
 
     record.write_bytes(b"{ not json")
     assert _run_checkouts(capsys, "--json", *flags) == (1, "", UNAVAILABLE)
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts: the workspace's GitHub lookup setting and the pr element
+# ---------------------------------------------------------------------------
+
+
+def _github_clone(tmp_path: Path, url: str | None = GITHUB_URL) -> tuple[Path, Path]:
+    """A folder holding one clone whose configured origin is ``url`` (redirected to a
+    local bare remote), or a plain file remote when ``url`` is ``None``."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    repository = clone(remote, folder / "work")
+    if url is not None:
+        point_origin_at(repository, remote, url)
+    return folder, repository
+
+
+def _pr_elements(line: str) -> list[str]:
+    return [element for element in line.split("  ")[1:] if element.startswith("pr ")]
+
+
+def _json_run(capsys, *arguments: str) -> dict:
+    code, out, err = _run_checkouts(capsys, "--json", *arguments)
+    assert (code, err) == (0, "")
+    return models.parse_checkouts(out)
+
+
+@posix_only
+def test_a_workspace_with_lookup_off_never_runs_gh_and_reports_the_setting(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    record = _configure(tmp_path, [folder], github_lookup=False)
+    before = record.read_bytes()
+
+    line = _line_for(_plain_lines(capsys), repository)
+    document = _json_run(capsys)
+
+    assert fake.calls() == []
+    assert document["github_lookup"] == "off"
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {"status": "off", "reason": "setting_off", "checked_at": None}
+    assert _pr_elements(line) == ["pr off setting_off"]
+    assert record.read_bytes() == before
+
+
+@posix_only
+def test_a_workspace_with_lookup_on_runs_gh_once_per_run_and_reports_live(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    record = _configure(tmp_path, [folder], github_lookup=True)
+    before = record.read_bytes()
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert len(fake.calls()) == 1
+    elements = line.split("  ")[1:]
+    default = next(index for index, element in enumerate(elements) if element.startswith("default "))
+    assert elements[default + 1 : default + 3] == [
+        "pr live",
+        "removable 0 branches, 0 worktrees",
+    ]
+    document = _json_run(capsys)
+    assert len(fake.calls()) == 2
+    assert document["github_lookup"] == "on"
+    assert document["repositories"][0]["pr_lookup"] == {
+        "status": "live", "reason": None, "checked_at": None,
+    }
+    assert record.read_bytes() == before
+
+
+@posix_only
+def test_no_network_with_lookup_on_prints_both_elements_off_and_never_runs_gh(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys, "--no-network"), repository)
+
+    assert fake.calls() == []
+    elements = line.split("  ")[1:]
+    assert "remote off" in elements
+    assert _pr_elements(line) == ["pr off remote_checks_off"]
+    assert elements[-2:] == ["pr off remote_checks_off", "removable 0 branches, 0 worktrees"]
+
+
+@posix_only
+def test_an_unauthenticated_gh_prints_the_category(tmp_path, account, capsys, monkeypatch):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, code=4)
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert len(fake.calls()) == 1
+    assert _pr_elements(line) == ["pr unavailable not_authenticated"]
+    assert "remote live" in line.split("  ")
+
+
+@posix_only
+def test_a_file_remote_prints_not_github_and_never_runs_gh(tmp_path, account, capsys, monkeypatch):
+    folder, repository = _github_clone(tmp_path, url=None)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert fake.calls() == []
+    assert _pr_elements(line) == ["pr off not_github"]
+
+
+@posix_only
+def test_the_pr_element_is_on_every_origin_line_and_no_other_line(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    linked = tmp_path / "linked"
+    git(repository, "worktree", "add", "-q", "-b", "side", str(linked))
+    local = folder / "local-only"
+    git(folder, "init", "-q", "-b", "main", str(local))
+    commit_file(local, "file.txt", "one\n")
+    install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(2))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    lines = _plain_lines(capsys)
+
+    assert _pr_elements(_line_for(lines, repository)) == ["pr live"]
+    assert _pr_elements(_line_for(lines, local)) == []
+    assert "no origin remote" in _line_for(lines, local)
+    assert _pr_elements(_line_for(lines, linked, "  ")) == []
+
+
+@posix_only
+def test_the_child_process_environment_drops_every_github_variable(tmp_path, monkeypatch):
+    config = tmp_path / "outer-gh"
+    config.mkdir()
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.setenv(name, "outer-value")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    home = tmp_path / "account"
+    home.mkdir(mode=0o755)
+
+    child = _subprocess_environment(home)
+
+    assert [name for name in GITHUB_SCRUBBED if name in child] == []
+    assert all(name in os.environ for name in GITHUB_SCRUBBED), "control: the parent holds them"
+
+
+@pytest.fixture
+def outer_github(monkeypatch, tmp_path):
+    config = tmp_path / "outer-gh"
+    config.mkdir()
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.setenv(name, "outer-value")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+
+
+@posix_only
+def test_the_account_fixture_leaves_no_github_variable_for_the_collection_or_its_children(
+    outer_github, account, tmp_path, capsys, monkeypatch
+):
+    assert [name for name in GITHUB_SCRUBBED if name in os.environ] == []
+    folder, _repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    _plain_lines(capsys)
+    # A child process built from the guarded parent environment sees none of them either.
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "set-in-body"))
+    result = _module_run(account, "checkouts")
+
+    assert result.returncode == 0
+    first, second = fake.calls()
+    assert [name for name in GITHUB_SCRUBBED if name in first.environment] == []
+    assert [name for name in GITHUB_SCRUBBED if name in second.environment] == []
