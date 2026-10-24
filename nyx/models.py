@@ -826,13 +826,13 @@ CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
 _REPOSITORY_KEYS = frozenset({"remote", "default_branch", "pr_lookup", "clones"})
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
-_CHECK_STATUSES = frozenset({"live", "failed", "off"})
+_CHECK_STATUSES = frozenset({"live", "recorded", "failed", "off"})
 _CHECK_FAILURE_REASONS = frozenset(
     {"unreachable", "not_found", "authentication_failed", "timed_out", "failed"}
 )
 _DEFAULT_BRANCH_KEYS = frozenset({"name", "sha"})
 _PR_LOOKUP_KEYS = frozenset({"status", "reason", "checked_at"})
-_PR_LOOKUP_STATUSES = frozenset({"live", "off", "unavailable"})
+_PR_LOOKUP_STATUSES = frozenset({"live", "recorded", "off", "unavailable"})
 _PR_LOOKUP_FAILURE_REASONS = frozenset(
     {"gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed"}
 )
@@ -899,7 +899,7 @@ _PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
 # request and list cap are built from it.
 PULL_REQUEST_LIST_CAP = 10
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
-_COMPARISON_BASES = frozenset({"live", "cached"})
+_COMPARISON_BASES = frozenset({"live", "recorded", "cached"})
 _VERDICT_PATCH_FLOOR = (2, 39)
 _NUMERIC_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 _VERDICT_BASE_KEYS = frozenset({"name", "sha", "basis", "objects_from"})
@@ -1077,8 +1077,8 @@ def _verdict_base(value: Any, name: str) -> None:
     _object_id(item["sha"], f"{name}.sha")
     basis = _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
     lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
-    if lender is not None and basis != "live":
-        raise ProtocolError(f"{name}.objects_from requires the live basis")
+    if lender is not None and basis == "cached":
+        raise ProtocolError(f"{name}.objects_from requires the live or recorded basis")
 
 
 def _head(value: Any, name: str) -> None:
@@ -1588,23 +1588,27 @@ def _pr_lookup(
     _keys(lookup, _PR_LOOKUP_KEYS, name)
     status = _choice(lookup["status"], _PR_LOOKUP_STATUSES, f"{name}.status")
     reason = lookup["reason"]
-    if lookup["checked_at"] is not None:
+    # Only a saved lookup carries the time it was taken.
+    if status == "recorded":
+        _timestamp(lookup["checked_at"], f"{name}.checked_at")
+    elif lookup["checked_at"] is not None:
         raise ProtocolError(f"{name}.checked_at must be null")
     if not github_lookup:
         expected: str | None = "setting_off"
     elif github_identity(remote_key) is None:
         expected = "not_github"
-    elif not remote_checks:
-        expected = "remote_checks_off"
     else:
         expected = None
     if expected is not None:
         valid = status == "off" and reason == expected
+    elif not remote_checks:
+        # Without remote checks no call is made: the lookup is off, or it is a saved one.
+        valid = status in ("off", "recorded") and reason == "remote_checks_off"
     elif status == "live":
         valid = reason is None
     else:
         valid = (
-            status == "unavailable"
+            status in ("unavailable", "recorded")
             and type(reason) is str
             and reason in _PR_LOOKUP_FAILURE_REASONS
         )
@@ -1638,13 +1642,19 @@ def _repository(
         _text(remote["key"], f"{name}.remote.key")
         _text(remote["display"], f"{name}.remote.display")
         check = _object(remote["check"], f"{name}.remote.check")
-        _keys(check, _CHECK_KEYS, f"{name}.remote.check")
+        recorded = check.get("status") == "recorded"
+        _keys(check, _CHECK_KEYS | {"checked_at"} if recorded else _CHECK_KEYS, f"{name}.remote.check")
         status = _choice(check["status"], _CHECK_STATUSES, f"{name}.remote.check.status")
         reason = check["reason"]
         if status == "live":
             valid = reason is None
         elif status == "off":
             valid = reason == "remote_checks_off"
+        elif status == "recorded":
+            _timestamp(check["checked_at"], f"{name}.remote.check.checked_at")
+            valid = type(reason) is str and (
+                reason == "remote_checks_off" or reason in _CHECK_FAILURE_REASONS
+            )
         else:
             valid = type(reason) is str and reason in _CHECK_FAILURE_REASONS
         if not valid:

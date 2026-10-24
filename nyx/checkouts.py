@@ -696,7 +696,9 @@ def _comparison(
 def _counted_comparison(outcome: _Outcome, basis: str) -> dict[str, Any]:
     """Read a ``rev-list --left-right --count`` outcome as a comparison."""
     fields = outcome.out.split()
-    if outcome.timed_out or (basis == "live" and outcome.code is None):
+    # A call that never ran to an answer is unknown on every remote-derived basis
+    # (live or recorded); only the cached basis reports it as a difference.
+    if outcome.timed_out or (basis != "cached" and outcome.code is None):
         return _comparison("unknown", basis=basis)
     if outcome.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
         ahead, behind = int(fields[0]), int(fields[1])
@@ -1685,8 +1687,12 @@ def _apply_live(
     answer: _LiveAnswer,
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
     base_name: str | None = None,
+    basis: str = "live",
 ) -> _Base | None:
-    """Replace one clone's cached comparisons with the live ones, in place.
+    """Replace one clone's cached comparisons with the remote's, in place.
+
+    ``answer`` is a live ``ls-remote`` answer (``basis`` ``live``) or a saved one
+    (``recorded``); every comparison and the verdict base carry ``basis``.
 
     Returns the clone's verdict base for ``base_name``, chosen from the same
     presence pass and lender as the comparisons.
@@ -1721,9 +1727,9 @@ def _apply_live(
     def borrowed(left: str, right: str) -> dict[str, Any]:
         source = lender(right)
         if source is None:
-            return _comparison("differs", basis="live")
+            return _comparison("differs", basis=basis)
         if isinstance(source, str):
-            return _comparison(source, basis="live")
+            return _comparison(source, basis=basis)
         sibling, sibling_context = source
         result = _counted_comparison(
             runner.run(
@@ -1736,7 +1742,7 @@ def _apply_live(
                     )
                 },
             ),
-            "live",
+            basis,
         )
         if result["relation"] in ("ahead", "behind", "diverged"):
             result["objects_from"] = sibling["path"]
@@ -1744,14 +1750,14 @@ def _apply_live(
 
     def live(left: str | None, right: str | None) -> dict[str, Any]:
         if left is None or right is None:
-            return _comparison("absent", basis="live")
+            return _comparison("absent", basis=basis)
         if left == right:
-            return _comparison("equal", 0, 0, "live")
+            return _comparison("equal", 0, 0, basis)
         if guarded:
-            return _comparison("differs", basis="live")
+            return _comparison("differs", basis=basis)
         state = presence.get(right, "missing")
         if state in ("unknown", "differs"):
-            return _comparison("unknown" if state == "unknown" else "differs", basis="live")
+            return _comparison("unknown" if state == "unknown" else "differs", basis=basis)
         if (left, right) not in memo:
             if state == "present":
                 memo[(left, right)] = _counted_comparison(
@@ -1760,7 +1766,7 @@ def _apply_live(
                         path=context.cwd,
                         ceiling=context.ceiling,
                     ),
-                    "live",
+                    basis,
                 )
             else:
                 memo[(left, right)] = borrowed(left, right)
@@ -1806,9 +1812,9 @@ def _apply_live(
     if base_head is None:
         return fallback
     if guarded:
-        return _Base(base_name, base_head, "live", None, None) if base_head == cached_base else fallback
+        return _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
     if base_head in held or presence.get(base_head) == "present":
-        return _Base(base_name, base_head, "live", None, None)
+        return _Base(base_name, base_head, basis, None, None)
     if presence.get(base_head) == "missing":
         source = lender(base_head)
         if isinstance(source, tuple):
@@ -1816,7 +1822,7 @@ def _apply_live(
             return _Base(
                 base_name,
                 base_head,
-                "live",
+                basis,
                 sibling["path"],
                 os.path.join(sibling_context.common, "objects"),
             )
@@ -1874,24 +1880,53 @@ def _pr_lookup_unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason, "checked_at": None}
 
 
+def _recorded_answer(heads: Mapping[str, Any]) -> _LiveAnswer:
+    """A saved ``heads`` record as the answer a live ``ls-remote`` gives; ``at`` is
+    the time the saved check was taken."""
+    return _LiveAnswer(
+        name=heads["default"],
+        sha=heads["head"],
+        branches=dict(heads["branches"]),
+        at=heads["at"],
+    )
+
+
+def _recorded_pull_requests(
+    saved: Mapping[str, Any],
+) -> dict[str, tuple[_PullRequest, ...]]:
+    """A saved ``pull_requests`` record as the listing a live ``gh`` call gives."""
+    return {
+        name: tuple(
+            _PullRequest(item["number"], item["state"], item["head"], item["base"])
+            for item in items
+        )
+        for name, items in saved["by_head"].items()
+    }
+
+
 def _check_remotes(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
     github_lookup: bool,
+    remote_checks: bool,
+    saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
 ) -> tuple[
     dict[str, _Base | None],
     dict[str, dict[str, tuple[_PullRequest, ...]]],
     dict[str, dict[str, dict[str, Any]]],
 ]:
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
-    lookup is on) then phase 3 (live comparisons per clone).
+    lookup is on; none when ``remote_checks`` is off) then phase 3 (per-clone
+    comparisons, on the live answer or, when the check is off or failed, on the
+    remote's saved ``heads``).
 
-    Returns the verdict base of each clone the live comparisons reached, the
-    pull requests GitHub listed per head branch name for each remote key whose
-    lookup answered, and the records of this run's successful checks: per remote
-    key, ``heads`` and ``pull_requests`` for the calls that answered."""
+    Returns the verdict base of each clone the comparisons reached, the pull
+    requests per head branch name for each remote key whose lookup answered or
+    whose saved listing applies, and the records of this run's successful
+    checks: per remote key, ``heads`` and ``pull_requests`` for the calls that
+    answered. ``saved`` holds the cache file's records per remote key."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -1903,7 +1938,7 @@ def _check_remotes(
         return _query_remote(runner, context) if context is not None else _LiveAnswer("failed")
 
     lookups: list[tuple[dict[str, Any], list[str]]] = []
-    if github_lookup:
+    if github_lookup and remote_checks:
         for group, first in zip(groups, chosen):
             if github_identity(group["remote"]["key"]) is None:
                 continue
@@ -1936,7 +1971,9 @@ def _check_remotes(
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         # Both kinds of call run in the one pool, and the barrier below waits for all.
         pending = [pool.submit(ask, job) for job in lookups]
-        answers = list(pool.map(query, chosen))
+        answers: list[_LiveAnswer | None] = (
+            list(pool.map(query, chosen)) if remote_checks else [None] * len(groups)
+        )
         for (group, _), future in zip(lookups, pending):
             reason, listed, asked_at = future.result()
             if reason is None:
@@ -1948,23 +1985,57 @@ def _check_remotes(
                 _list_pull_requests(group, listed)
             else:
                 group["pr_lookup"] = _pr_lookup_unavailable(reason)
-        work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
+        for group in groups:
+            # A lookup that made no call, or failed, falls back to the saved facts,
+            # unless the setting is off or the remote is not GitHub's.
+            lookup_state = group["pr_lookup"]
+            record = (saved.get(group["remote"]["key"]) or {}).get("pull_requests")
+            if (
+                github_lookup
+                and github_identity(group["remote"]["key"]) is not None
+                and lookup_state["status"] != "live"
+                and record is not None
+            ):
+                listed = _recorded_pull_requests(record)
+                group["pr_lookup"] = {
+                    "status": "recorded",
+                    "reason": lookup_state["reason"],
+                    "checked_at": _utc_text(record["at"]),
+                }
+                pulls[group["remote"]["key"]] = listed
+                _list_pull_requests(group, listed)
+        work: list[
+            tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str]
+        ] = []
         bases: dict[str, _Base | None] = {}
         for group, answer in zip(groups, answers):
-            if answer.reason is not None:
-                group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
-                continue
-            group["remote"]["check"] = {"status": "live", "reason": None}
-            checked.setdefault(group["remote"]["key"], {})["heads"] = _heads_record(answer)
+            key = group["remote"]["key"]
+            if answer is not None and answer.reason is None:
+                basis = "live"
+                group["remote"]["check"] = {"status": "live", "reason": None}
+                checked.setdefault(key, {})["heads"] = _heads_record(answer)
+            else:
+                heads = (saved.get(key) or {}).get("heads")
+                if heads is None:
+                    if answer is not None:
+                        group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
+                    continue
+                basis = "recorded"
+                group["remote"]["check"] = {
+                    "status": "recorded",
+                    "reason": "remote_checks_off" if answer is None else answer.reason,
+                    "checked_at": _utc_text(heads["at"]),
+                }
+                answer = _recorded_answer(heads)
             group["default_branch"] = {"name": answer.name, "sha": answer.sha}
             for clone, context in _usable_clones(group["clones"], contexts):
-                work.append((context, clone, answer, group))
+                work.append((context, clone, answer, group, basis))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
         def apply(
-            item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]],
+            item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str],
         ) -> tuple[str, _Base | None]:
-            context, clone, answer, group = item
+            context, clone, answer, group, basis = item
             siblings = _siblings(clone, group["clones"], contexts)
             cached_default = clone["cached_default"]
             base_name = (
@@ -1973,7 +2044,7 @@ def _check_remotes(
                 or _group_default_name(group["clones"])
             )
             return clone["path"], _apply_live(
-                runner, context, clone, answer, siblings, base_name
+                runner, context, clone, answer, siblings, base_name, basis
             )
 
         bases.update(pool.map(apply, work))
@@ -3287,16 +3358,11 @@ def collect_checkouts(
             for outcome in outcomes
             if outcome.clone is not None and outcome.context is not None
         }
-        bases: dict[str, _Base | None] = {}
-        pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
-        checked: dict[str, dict[str, dict[str, Any]]] = {}
-        if remote_checks:
-            bases, pulls, checked = _check_remotes(
-                runner, repositories, contexts, max_parallel, github_lookup
-            )
         # An account home that cannot be resolved, or a path the document
         # cannot carry, makes the cache unavailable: no read, no write and no
-        # diagnostic, since there is no path to report.
+        # diagnostic, since there is no path to report. The file is read before
+        # the remote phase because its saved checks stand in for a check that is
+        # off or fails.
         try:
             cache_path: str | None = str(checkout_cache_path())
         except (StateError, OSError):
@@ -3304,6 +3370,15 @@ def collect_checkouts(
         if cache_path is not None and not _representable(cache_path):
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
+        bases, pulls, checked = _check_remotes(
+            runner,
+            repositories,
+            contexts,
+            max_parallel,
+            github_lookup,
+            remote_checks,
+            cache.remote_checks,
+        )
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
