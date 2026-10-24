@@ -3328,6 +3328,11 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
     assert off["remote_checks"] == "off"
+    assert_cached_everywhere(off)
+    off_lagging = find_clone(off, lagging)
+    assert group_of(off, lagging)["default_branch"]["sha"] is None
+    assert off_lagging["local_default"]["vs_remote"] is None
+    assert off_lagging["cached_vs_remote"] is None
     assert first["observed_at"] != second["observed_at"]
     assert first["checkouts_digest"] == second["checkouts_digest"]
     assert {k: v for k, v in first.items() if k != "observed_at"} == {
