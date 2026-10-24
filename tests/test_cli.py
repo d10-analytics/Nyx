@@ -1823,3 +1823,27 @@ def test_the_account_fixture_leaves_no_github_variable_for_the_collection_or_its
     first, second = fake.calls()
     assert [name for name in GITHUB_SCRUBBED if name in first.environment] == []
     assert [name for name in GITHUB_SCRUBBED if name in second.environment] == []
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("url", "replay", "flags"),
+    [
+        (GITHUB_URL, {"stdout": github_answer(1)}, ("--no-network",)),
+        (GITHUB_URL, {"code": 4}, ()),
+        (None, {"stdout": github_answer(1)}, ()),
+    ],
+    ids=["no-network", "not-authenticated", "not-github"],
+)
+def test_a_lookup_that_is_off_or_unavailable_leaves_the_configuration_record_unchanged(
+    tmp_path, account, capsys, monkeypatch, url, replay, flags
+):
+    folder, _repository = _github_clone(tmp_path, url)
+    install_fake_gh(tmp_path, monkeypatch, **replay)
+    record = _configure(tmp_path, [folder], github_lookup=True)
+    before = record.read_bytes()
+
+    _plain_lines(capsys, *flags)
+    _json_run(capsys, *flags)
+
+    assert record.read_bytes() == before

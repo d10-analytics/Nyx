@@ -8619,3 +8619,66 @@ def test_parser_refuses_a_lookup_on_a_repository_with_no_remote_and_a_missing_on
     absent = doc_copy(document)
     del absent["repositories"][0]["pr_lookup"]
     assert "invalid shape" in refusal_of(absent)
+
+
+@posix_only
+def test_the_request_declares_every_variable_its_aliases_use(tmp_path, monkeypatch):
+    # GitHub refuses a query that uses an undeclared variable, so every real lookup
+    # would fail even though the fake accepts any body.
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    query = json.loads(call.body)["query"]
+    header = re.match(r"query\((?P<declarations>[^)]*)\)", query)
+    assert header is not None
+    declared = dict(
+        item.strip().split(": ", 1) for item in header["declarations"].split(",")
+    )
+    assert declared == {
+        "$owner": "String!", "$name": "String!",
+        "$h0": "String!", "$h1": "String!", "$h2": "String!",
+    }
+    assert set(re.findall(r"\$\w+", query[header.end():])) == set(declared)
+
+
+@posix_only
+@pytest.mark.parametrize("case", ["setting-off", "remote-checks-off", "gh-missing"])
+def test_a_lookup_that_makes_no_call_leaves_the_remote_check_and_the_git_ladder_alone(
+    tmp_path, monkeypatch, case
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    remote_checks = case != "remote-checks-off"
+    off = github_collect(folder, github_lookup=False, remote_checks=remote_checks)
+    if case == "gh-missing":
+        monkeypatch.setenv("PATH", git_only_path(tmp_path))
+
+    document = github_collect(
+        folder, github_lookup=case != "setting-off", remote_checks=remote_checks
+    )
+
+    assert fake.calls() == []
+    assert lookup_of(document) == {
+        "setting-off": lookup("off", "setting_off"),
+        "remote-checks-off": lookup("off", "remote_checks_off"),
+        "gh-missing": lookup("unavailable", "gh_missing"),
+    }[case]
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+def test_a_gh_call_is_cut_at_the_collection_deadline_before_its_call_cap(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world(), delay=30)
+
+    started = time.monotonic()
+    document = github_collect(folder, seconds=4, call_cap_seconds=20)
+    elapsed = time.monotonic() - started
+
+    assert lookup_of(document) == lookup("unavailable", "timed_out")
+    assert elapsed < 12
