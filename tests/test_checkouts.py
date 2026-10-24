@@ -155,10 +155,17 @@ def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
     assert pack_names(remote) != []
 
 
+# The whole second in which the last helper-run git command finished. A saved remote
+# check only yields to a tracking ref that moved at or after its own whole second, so a
+# networked collection waits for the next second before it takes its time.
+LAST_GIT_SECOND = [0]
+
+
 def git(cwd: Path | str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["git", *arguments], cwd=cwd, capture_output=True, text=True, check=False
     )
+    LAST_GIT_SECOND[0] = int(time.time())
     if check and result.returncode != 0:
         raise AssertionError(f"git {arguments} failed: {result.stderr}")
     return result
@@ -233,6 +240,8 @@ def collect(
     **options: Any,
 ) -> dict[str, Any]:
     """Run the real collector and return the parsed (strictly validated) document."""
+    if options.get("remote_checks"):
+        time.sleep(max(0.0, LAST_GIT_SECOND[0] + 1 - time.time()))
     text = checkouts.collect_checkouts(
         [str(folder) for folder in folders],
         deadline_ns=time.monotonic_ns() + int(seconds * 1e9),
@@ -11136,3 +11145,314 @@ def test_parser_refuses_a_recorded_lookup_with_a_reason_that_contradicts_the_che
     message = refusal_of(broken)
 
     assert message == "repositories[0].pr_lookup does not match the lookup setting and the remote"
+
+
+# ---------------------------------------------------------------------------
+# A newer remote-tracking ref beats the saved check
+# ---------------------------------------------------------------------------
+
+
+def vs(basis: str, relation: str, ahead: int | None = None, behind: int | None = None):
+    """A comparison with no lender; an ``equal`` one carries zero counts."""
+    if relation == "equal":
+        ahead, behind = 0, 0
+    return {
+        "basis": basis,
+        "relation": relation,
+        "ahead": ahead,
+        "behind": behind,
+        "objects_from": None,
+    }
+
+
+def push_from(work: Path, branch: str, name: str) -> str:
+    """Commit once on ``branch`` of ``work`` and push it with the branch's own upstream."""
+    git(work, "checkout", "-q", branch)
+    sha = commit_file(work, name, "x\n")
+    git(work, "push", "-q")
+    return sha
+
+
+class PushedWorld:
+    """Two fetched clones of one ``file://`` remote, each holding ``topic`` (pushed from
+    ``a``), and the networked collection that saved the remote's branches. Everything
+    done afterwards happens at least a whole second after the saved check."""
+
+    def __init__(self, tmp_path: Path, isolated_git: Path, *, reflogs: bool = True) -> None:
+        self.cache = nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        self.remote = make_remote(served)
+        self.a = clone(self.remote.as_uri(), self.folder / "a")
+        self.b = clone(self.remote.as_uri(), self.folder / "b")
+        if not reflogs:
+            git(self.a, "config", "core.logAllRefUpdates", "false")
+        git(self.a, "checkout", "-q", "-b", "topic")
+        commit_file(self.a, "topic.txt", "one\n")
+        git(self.a, "push", "-q", "-u", "origin", "topic")
+        git(self.a, "checkout", "-q", "trunk")
+        git(self.b, "fetch", "-q", "origin")
+        git(self.b, "branch", "topic", "origin/topic")
+        git(self.a, "fetch", "-q", "origin")
+        self.trunk = rev(self.remote, "trunk")
+        self.topic = rev(self.remote, "topic")
+        collect([self.folder], remote_checks=True)
+        self.saved = saved_file(self.cache)
+        [self.key] = self.saved["remote_checks"]
+        self.at = self.saved["remote_checks"][self.key]["heads"]["at"]
+        time.sleep(1.1)
+
+    def pushed(self) -> str:
+        """``a`` pushes a new ``topic`` commit and ``b`` pushes a new branch ``fresh``."""
+        tip = push_from(self.a, "topic", "topic-two.txt")
+        git(self.b, "checkout", "-q", "-b", "fresh", "trunk")
+        commit_file(self.b, "fresh.txt", "x\n")
+        git(self.b, "push", "-q", "-u", "origin", "fresh")
+        return tip
+
+    def set_record_time(self, at: int) -> None:
+        saved = saved_file(self.cache)
+        saved["remote_checks"][self.key]["heads"]["at"] = at
+        self.cache.write_text(json.dumps(saved))
+
+    def reflog_time(self, work: Path, name: str) -> int:
+        shown = git(
+            work, "reflog", "show", "-n", "1", "--date=unix", "--format=%gd",
+            f"refs/remotes/origin/{name}",
+        ).stdout.strip()
+        match = re.search(r"@\{([0-9]+)\}", shown)
+        assert match, f"no reflog time for {name}: {shown!r}"
+        return int(match.group(1))
+
+
+@posix_only
+def test_a_branch_pushed_after_the_saved_check_reads_equal_on_the_cached_basis(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    # Control: before any push every comparison is the saved check's.
+    before = collect([world.folder])
+    assert branch_of(find_clone(before, world.a), "topic")["vs_remote"] == vs("recorded", "equal")
+    tip = world.pushed()
+    assert rev(world.a, "topic") == tip != world.topic
+
+    document = collect([world.folder])
+
+    assert document["remote_checks"] == "off"
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    # The pushed branch: not ``ahead`` 1 on the saved tip.
+    assert branch_of(a_item, "topic")["vs_remote"] == vs("cached", "equal")
+    # A branch the saved check never saw: not ``absent``.
+    assert branch_of(b_item, "fresh")["vs_remote"] == vs("cached", "equal")
+    # Refs that did not move keep the saved check's answer.
+    assert branch_of(b_item, "topic")["vs_remote"] == vs("recorded", "equal")
+    assert branch_of(a_item, "trunk")["vs_remote"] == vs("recorded", "equal")
+    assert a_item["local_default"]["vs_remote"] == vs("recorded", "equal")
+    assert a_item["verdict_base"]["basis"] == "recorded"
+    assert b_item["verdict_base"]["basis"] == "recorded"
+
+
+@posix_only
+def test_a_trunk_pushed_after_the_saved_check_moves_the_default_and_base_but_not_the_saved_head(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    tip = push_from(world.a, "trunk", "trunk-two.txt")
+    assert rev(world.a, "refs/remotes/origin/trunk") == tip != world.trunk
+
+    document = collect([world.folder])
+
+    [group] = document["repositories"]
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    # The group's default is the saved check's, and the clone's own tracking ref
+    # is compared with it truthfully.
+    assert group["default_branch"] == {"name": "trunk", "sha": world.trunk}
+    assert a_item["cached_vs_remote"] == vs("recorded", "ahead", 1, 0)
+    assert a_item["local_default"]["vs_remote"] == vs("cached", "equal")
+    assert branch_of(a_item, "trunk")["vs_remote"] == vs("cached", "equal")
+    assert a_item["verdict_base"] == {
+        "name": "trunk",
+        "sha": tip,
+        "basis": "cached",
+        "objects_from": None,
+    }
+    # The clone whose ref did not move keeps the saved head.
+    assert b_item["cached_vs_remote"] == vs("recorded", "equal")
+    assert b_item["local_default"]["vs_remote"] == vs("recorded", "equal")
+    assert b_item["verdict_base"] == {
+        "name": "trunk",
+        "sha": world.trunk,
+        "basis": "recorded",
+        "objects_from": None,
+    }
+    line = next(
+        item
+        for item in cli.format_checkouts(document)
+        if item.startswith(cli._json_literal(real(world.a)))
+    )
+    [default] = [element for element in line.split("  ") if element.startswith("default ")]
+    assert re.fullmatch(
+        r"default trunk cached equal cached equal tracking recorded ahead "
+        r"fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
+        default,
+    ), default
+
+
+@posix_only
+def test_a_push_with_reflogs_disabled_leaves_the_saved_check_standing(tmp_path, isolated_git):
+    world = PushedWorld(tmp_path, isolated_git, reflogs=False)
+    world.pushed()
+    # The push moved the ref but wrote no reflog entry, so the clone cannot say when.
+    assert rev(world.a, "refs/remotes/origin/topic") == rev(world.a, "topic")
+    assert git(world.a, "reflog", "show", "refs/remotes/origin/topic").stdout.strip() == ""
+
+    document = collect([world.folder])
+
+    a_topic = branch_of(find_clone(document, world.a), "topic")
+    assert a_topic["vs_remote"] == vs("recorded", "ahead", 1, 0)
+    # Another clone, whose reflogs are on, is not affected by that known limit.
+    assert branch_of(find_clone(document, world.b), "fresh")["vs_remote"] == vs("cached", "equal")
+
+
+@posix_only
+def test_the_reflog_is_asked_once_for_each_name_whose_tracking_ref_differs_from_the_saved_one(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    shim, log = recording(tmp_path, "reflog-offline")
+
+    with path_with(monkeypatch, shim):
+        collect([world.folder])
+
+    asked = re.compile(
+        r"-C (\S+) reflog show -n 1 --date=unix --format=%gd refs/remotes/origin/(\S+)"
+    )
+    calls = sorted(
+        match.groups()
+        for line in log.read_text().splitlines()
+        if (match := asked.search(line))
+    )
+    assert calls == sorted([(real(world.a), "topic"), (real(world.b), "fresh")])
+
+    # A live check answers for the remote itself and asks no clone's reflog.
+    shim, log = recording(tmp_path, "reflog-networked")
+    with path_with(monkeypatch, shim):
+        live = collect([world.folder], remote_checks=True)
+    assert not [line for line in log.read_text().splitlines() if " reflog show " in line]
+    assert branch_of(find_clone(live, world.a), "topic")["vs_remote"] == vs("live", "equal")
+    assert branch_of(find_clone(live, world.b), "fresh")["vs_remote"] == vs("live", "equal")
+
+
+REFLOG_FAILURES = {
+    "fails": 'case "$*" in *" reflog show "*) echo "fatal: cannot show" >&2; exit 128;; esac',
+    "times-out": 'case "$*" in *" reflog show "*) sleep 30;; esac',
+}
+
+
+@posix_only
+@pytest.mark.parametrize("kind", list(REFLOG_FAILURES))
+def test_a_reflog_call_that_fails_or_times_out_leaves_the_saved_check_standing(
+    tmp_path, monkeypatch, isolated_git, kind
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    # Control: without the stand-in the same pushes read ``cached``.
+    control = collect([world.folder])
+    assert branch_of(find_clone(control, world.a), "topic")["vs_remote"] == vs("cached", "equal")
+    shim = stand_in(tmp_path, "reflog-" + kind, REFLOG_FAILURES[kind])
+
+    with path_with(monkeypatch, shim):
+        document = collect([world.folder], call_cap_seconds=2)
+
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    assert branch_of(a_item, "topic")["vs_remote"] == vs("recorded", "ahead", 1, 0)
+    assert branch_of(b_item, "fresh")["vs_remote"] == vs("recorded", "absent")
+    assert branch_of(b_item, "topic")["vs_remote"] == vs("recorded", "equal")
+
+
+@posix_only
+def test_a_tracking_ref_older_than_the_saved_check_keeps_the_recorded_value(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    a = clone(remote.as_uri(), folder / "a")
+    b = clone(remote.as_uri(), folder / "b")
+    git(a, "checkout", "-q", "-b", "topic")
+    commit_file(a, "topic.txt", "one\n")
+    git(a, "push", "-q", "-u", "origin", "topic")
+    git(b, "fetch", "-q", "origin")
+    git(b, "branch", "topic", "origin/topic")
+    time.sleep(1.1)
+    # Another clone pushes after B's fetch, and a networked run saves that tip.
+    newer = push_from(a, "topic", "topic-two.txt")
+    collect([folder], remote_checks=True)
+    assert rev(b, "refs/remotes/origin/topic") != newer
+
+    document = collect([folder])
+
+    comparison = branch_of(find_clone(document, b), "topic")["vs_remote"]
+    assert comparison == {
+        "basis": "recorded",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(a),
+    }
+
+
+@posix_only
+def test_a_tracking_ref_moved_in_the_second_of_the_saved_check_is_the_newer_one(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    moved = world.reflog_time(world.a, "topic")
+    assert moved > world.at
+
+    world.set_record_time(moved)
+    same_second = collect([world.folder])
+    world.set_record_time(moved + 1)
+    later_record = collect([world.folder])
+
+    assert branch_of(find_clone(same_second, world.a), "topic")["vs_remote"] == vs(
+        "cached", "equal"
+    )
+    assert branch_of(find_clone(later_record, world.a), "topic")["vs_remote"] == vs(
+        "recorded", "ahead", 1, 0
+    )
+
+
+@posix_only
+def test_the_reflog_time_test_answers_no_for_a_cut_a_missing_and_a_passed_deadline(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    context = checkouts._CloneContext(
+        cwd=real(world.a),
+        ceiling=real(world.folder),
+        partial=False,
+        shallow=False,
+        local={},
+        cached={},
+        ssh_configured=False,
+    )
+    executable = checkouts._resolve_program("git")
+    assert executable is not None
+    open_runner = checkouts._GitRunner(executable, time.monotonic_ns() + 60 * 10**9, 10)
+    expired = checkouts._GitRunner(executable, time.monotonic_ns() - 1, 10)
+
+    assert checkouts._ref_moved_since(open_runner, context, "topic", world.at) is True
+    assert checkouts._ref_moved_since(open_runner, context, "topic", 2**40) is False
+    assert checkouts._ref_moved_since(open_runner, context, "no-such-branch", 0) is False
+    assert checkouts._ref_moved_since(expired, context, "topic", world.at) is False
