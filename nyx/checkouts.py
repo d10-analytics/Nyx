@@ -1431,7 +1431,8 @@ def _github_document(data: bytes) -> Any:
         return None
     try:
         return load_strict_json(data, "gh")
-    except ProtocolError:
+    except (ProtocolError, ValueError):
+        # A number past the interpreter's digit limit raises ValueError, not a decode error.
         return None
 
 
@@ -1447,7 +1448,11 @@ def _github_failure(outcome: _Outcome, document: Any) -> str:
     if isinstance(document, dict):
         errors = document.get("errors")
         if isinstance(errors, list):
-            types = {item.get("type") for item in errors if isinstance(item, dict)}
+            types = {
+                item["type"]
+                for item in errors
+                if isinstance(item, dict) and isinstance(item.get("type"), str)
+            }
         data = document.get("data")
         if isinstance(data, dict) and "repository" in data:
             repository = data["repository"]
