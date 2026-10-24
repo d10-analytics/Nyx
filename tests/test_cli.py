@@ -1368,8 +1368,8 @@ def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
     if basis == "live":
         found = LIVE_DEFAULT.fullmatch(default)
         assert found, default
-        assert found["live"] == _relation(local["vs_live"])
-        assert found["tracking"] == _relation(item["cached_vs_live"])
+        assert found["live"] == _relation(local["vs_remote"])
+        assert found["tracking"] == _relation(item["cached_vs_remote"])
     else:
         found = CACHED_DEFAULT.fullmatch(default)
         assert found, default
@@ -1568,9 +1568,9 @@ def test_no_network_makes_no_request_and_the_default_makes_exactly_one(
 
 def _every_comparison(item: dict) -> list[dict]:
     found = [branch["vs_remote"] for branch in item["branches"]]
-    found.append(item["cached_vs_live"])
+    found.append(item["cached_vs_remote"])
     if item["local_default"] is not None:
-        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+        found += [item["local_default"]["vs_remote"], item["local_default"]["vs_cached"]]
     return [comparison for comparison in found if comparison is not None]
 
 

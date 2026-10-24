@@ -926,7 +926,7 @@ def test_clone_git_refuses_for_ownership_is_marked_and_siblings_complete(
     assert item["status"] == "unsafe_ownership"
     for fact in (
         "bare", "partial_clone", "shallow", "cached_default", "local_default",
-        "cached_vs_live", "stash_count", "worktrees", "branches",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
     ):
         assert item[fact] is None
     for sibling in trusted:
@@ -986,14 +986,14 @@ def assert_cached_everywhere(document: dict[str, Any]) -> None:
             assert repository["remote"]["check"] == {
                 "status": "off", "reason": "remote_checks_off"
             }
-            assert repository["default_branch"]["live_sha"] is None
+            assert repository["default_branch"]["sha"] is None
         for item in repository["clones"]:
             if item["status"] != "ok":
                 continue
-            assert item["cached_vs_live"] is None
+            assert item["cached_vs_remote"] is None
             comparisons = [branch["vs_remote"] for branch in item["branches"]]
             if item["local_default"] is not None:
-                assert item["local_default"]["vs_live"] is None
+                assert item["local_default"]["vs_remote"] is None
                 comparisons.append(item["local_default"]["vs_cached"])
             for comparison in filter(None, comparisons):
                 assert comparison["basis"] == "cached"
@@ -1018,7 +1018,7 @@ def test_cached_default_and_local_default_for_a_fresh_clone(tmp_path):
     assert item["local_default"]["vs_cached"] == {
         "basis": "cached", "relation": "equal", "ahead": 0, "behind": 0, "objects_from": None
     }
-    assert document["repositories"][0]["default_branch"] == {"name": "trunk", "live_sha": None}
+    assert document["repositories"][0]["default_branch"] == {"name": "trunk", "sha": None}
     assert_cached_everywhere(document)
 
 
@@ -1115,7 +1115,7 @@ def test_clones_with_different_origin_heads_leave_the_group_default_null(tmp_pat
 
     document = collect([folder])
 
-    assert document["repositories"][0]["default_branch"] == {"name": None, "live_sha": None}
+    assert document["repositories"][0]["default_branch"] == {"name": None, "sha": None}
     assert find_clone(document, first)["cached_default"]["name"] == "trunk"
     assert find_clone(document, second)["cached_default"]["name"] == "dev"
 
@@ -1235,7 +1235,7 @@ def test_origin_urls_group_by_normalized_key_and_hide_credentials(tmp_path):
     [orphan] = last["clones"]
     assert orphan["path"] == real(bare)
     assert orphan["cached_default"] is None and orphan["local_default"] is None
-    assert orphan["cached_vs_live"] is None
+    assert orphan["cached_vs_remote"] is None
     assert all(
         branch["vs_remote"] is None and branch["upstream_mismatch"] is False
         for branch in orphan["branches"]
@@ -1347,7 +1347,7 @@ def mutate_clone_repeated(document):
     duplicate = doc_copy(first_clone(document))
     duplicate.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
-        local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        local_default=None, cached_vs_remote=None, stash_count=None, worktrees=None, branches=None,
         verdict_base=None,
     )
     document["repositories"].append(
@@ -1434,7 +1434,8 @@ def mutate_prunable_ok(document):
         mutate_counts_contradict,
         mutate_schema(1),
         mutate_schema(2),
-        mutate_schema(4),
+        mutate_schema(3),
+        mutate_schema(5),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1462,6 +1463,41 @@ def test_parser_rejects_a_contract_violation(sample, mutation):
     broken = doc_copy(document)
     mutation(broken)
     assert "removable" not in refusal_of(rederive(broken))
+
+
+def rename_default_branch_sha(document):
+    default_branch = document["repositories"][0]["default_branch"]
+    default_branch["live_sha"] = default_branch.pop("sha")
+
+
+def rename_local_default_vs_remote(document):
+    local = first_clone(document)["local_default"]
+    local["vs_live"] = local.pop("vs_remote")
+
+
+def rename_cached_vs_remote(document):
+    item = first_clone(document)
+    item["cached_vs_live"] = item.pop("cached_vs_remote")
+
+
+@pytest.mark.parametrize(
+    "rename",
+    [rename_default_branch_sha, rename_local_default_vs_remote, rename_cached_vs_remote],
+    ids=lambda rename: rename.__name__,
+)
+def test_parser_refuses_a_schema_4_document_with_an_old_field_name(sample, rename):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    rename(broken)
+    assert "invalid shape" in refusal_of(broken)
+
+
+def test_parser_refuses_a_schema_3_document_under_a_valid_digest(sample):
+    document, _folder = sample
+    previous = doc_copy(document)
+    previous["schema_version"] = 3
+    assert "schema" in refusal_of(previous)
 
 
 def test_parser_rejects_a_changed_field_with_the_old_digest(sample):
@@ -1537,7 +1573,7 @@ def without_remote(document):
     document["repositories"] = [
         {"remote": None, "default_branch": None, "clones": [clone_document]}
     ]
-    clone_document.update(cached_default=None, local_default=None, cached_vs_live=None)
+    clone_document.update(cached_default=None, local_default=None, cached_vs_remote=None)
     for branch in clone_document["branches"]:
         branch.update(vs_remote=None, upstream_mismatch=False)
     undecided_without_a_base(document)
@@ -1825,7 +1861,7 @@ NULLABLE_CLONE_FACTS = {
     "shallow": (False, 0, "", []),
     "cached_default": ({}, "", [], False),
     "local_default": ({}, "", [], False),
-    "cached_vs_live": ({}, "", [], False),
+    "cached_vs_remote": ({}, "", [], False),
     "stash_count": (0, False, "", []),
     "worktrees": ([], "", 0, False),
     "branches": ([], "", 0, False),
@@ -1846,7 +1882,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document = first_clone(document)
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
-        local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        local_default=None, cached_vs_remote=None, stash_count=None, worktrees=None, branches=None,
         verdict_base=None, containment=None, removable_count=None,
     )
     return clone_document
@@ -2365,7 +2401,7 @@ def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tm
     assert failed["status"] == "failed"
     for fact in (
         "bare", "partial_clone", "shallow", "cached_default", "local_default",
-        "cached_vs_live", "stash_count", "worktrees", "branches",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
     ):
         assert failed[fact] is None
     assert groups[real(long_origin)]["remote"] is None
@@ -2376,7 +2412,7 @@ def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tm
     kept = find_clone(document, orphan)
     assert kept["status"] == "ok" and groups[real(orphan)]["remote"] is None
     assert kept["cached_default"] is None and kept["local_default"] is None
-    assert kept["cached_vs_live"] is None
+    assert kept["cached_vs_remote"] is None
     assert kept["branches"] and all(
         branch["vs_remote"] is None and branch["upstream_mismatch"] is False
         for branch in kept["branches"]
@@ -2557,21 +2593,21 @@ def group_of(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
 
 def comparisons_of(item: dict[str, Any]) -> list[dict[str, Any]]:
     found = [branch["vs_remote"] for branch in item["branches"]]
-    found.append(item["cached_vs_live"])
+    found.append(item["cached_vs_remote"])
     if item["local_default"] is not None:
-        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+        found += [item["local_default"]["vs_remote"], item["local_default"]["vs_cached"]]
     return [comparison for comparison in found if comparison is not None]
 
 
 def assert_fell_back_to_cached(group: dict[str, Any], reason: str) -> None:
     assert group["remote"]["check"] == {"status": "failed", "reason": reason}
-    assert group["default_branch"]["live_sha"] is None
+    assert group["default_branch"]["sha"] is None
     for item in group["clones"]:
         if item["status"] != "ok":
             continue
-        assert item["cached_vs_live"] is None
+        assert item["cached_vs_remote"] is None
         if item["local_default"] is not None:
-            assert item["local_default"]["vs_live"] is None
+            assert item["local_default"]["vs_remote"] is None
         assert {c["basis"] for c in comparisons_of(item)} <= {"cached"}
 
 
@@ -2694,36 +2730,40 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
+    assert document["schema_version"] == 4
     assert group["remote"]["check"] == {"status": "live", "reason": None}
-    assert group["default_branch"] == {"name": "trunk", "live_sha": pushed}
+    assert group["default_branch"] == {"name": "trunk", "sha": pushed}
+    assert set(group["default_branch"]) == {"name", "sha"}
     item = find_clone(document, main)
     default = item["local_default"]
+    assert set(default) == {"name", "sha", "vs_remote", "vs_cached"}
+    assert "cached_vs_remote" in item
     assert default["name"] == "trunk"
-    assert default["vs_live"] == {
+    assert default["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
     }
     assert default["vs_cached"]["basis"] == "cached"
     assert default["vs_cached"]["relation"] == "equal"
-    assert item["cached_vs_live"]["relation"] == "behind"
-    assert (item["cached_vs_live"]["behind"], item["cached_vs_live"]["basis"]) == (1, "live")
+    assert item["cached_vs_remote"]["relation"] == "behind"
+    assert (item["cached_vs_remote"]["behind"], item["cached_vs_remote"]["basis"]) == (1, "live")
     assert branch_of(item, "pushed")["vs_remote"]["relation"] == "equal"
     assert branch_of(item, "pushed")["vs_remote"]["basis"] == "live"
     assert branch_of(item, "private")["vs_remote"]["relation"] == "absent"
     assert branch_of(item, "private")["vs_remote"]["basis"] == "live"
 
-    stale = find_clone(document, lagging)["local_default"]["vs_live"]
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == outside_head
+    stale = find_clone(document, lagging)["local_default"]["vs_remote"]
+    assert group_of(document, lagging)["default_branch"]["sha"] == outside_head
     assert stale == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
 
     no_name = group_of(document, detached_clone)
-    assert no_name["default_branch"] == {"name": None, "live_sha": head}
+    assert no_name["default_branch"] == {"name": None, "sha": head}
     assert find_clone(document, detached_clone)["local_default"] is None
     nothing = group_of(document, empty_clone)
     assert nothing["remote"]["check"] == {"status": "live", "reason": None}
-    assert nothing["default_branch"]["live_sha"] is None
+    assert nothing["default_branch"]["sha"] is None
 
 
 def test_presence_probe_reads_a_present_id_beside_a_missing_one(tmp_path):
@@ -2754,7 +2794,7 @@ def test_presence_probe_reads_a_present_id_beside_a_missing_one(tmp_path):
     assert branch_of(item, "feature")["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
     }
-    assert item["local_default"]["vs_live"] == {
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -2828,8 +2868,8 @@ def test_partial_clone_that_fetched_the_live_head_still_differs_without_counts(t
 
     item = find_clone(document, partial)
     assert item["partial_clone"] is True
-    assert group_of(document, partial)["default_branch"]["live_sha"] == pushed
-    assert item["local_default"]["vs_live"] == {
+    assert group_of(document, partial)["default_branch"]["sha"] == pushed
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -2857,10 +2897,10 @@ def test_query_runs_in_the_first_partial_clone_and_adds_no_pack(tmp_path, record
     assert pack_listing(partial) == packs
     group = group_of(document, partial)
     assert group["remote"]["check"] == {"status": "live", "reason": None}
-    assert group["default_branch"]["live_sha"] == pushed
-    assert find_clone(document, partial)["local_default"]["vs_live"]["relation"] == "differs"
-    assert find_clone(document, partial)["local_default"]["vs_live"]["ahead"] is None
-    assert find_clone(document, full)["local_default"]["vs_live"]["relation"] == "equal"
+    assert group["default_branch"]["sha"] == pushed
+    assert find_clone(document, partial)["local_default"]["vs_remote"]["relation"] == "differs"
+    assert find_clone(document, partial)["local_default"]["vs_remote"]["ahead"] is None
+    assert find_clone(document, full)["local_default"]["vs_remote"]["relation"] == "equal"
 
 
 def test_shallow_clone_never_counts_a_live_comparison(tmp_path):
@@ -2878,7 +2918,7 @@ def test_shallow_clone_never_counts_a_live_comparison(tmp_path):
     item = find_clone(live([folder]), shallow)
 
     assert item["shallow"] is True
-    assert item["local_default"]["vs_live"]["relation"] == "differs"
+    assert item["local_default"]["vs_remote"]["relation"] == "differs"
     assert {c["relation"] for c in comparisons_of(item) if c["basis"] == "live"} <= {
         "equal", "differs"
     }
@@ -2966,8 +3006,8 @@ def test_blocked_query_keeps_a_later_comparison_from_starting(tmp_path, recorder
 
     group = group_of(document, lagging)
     assert group["remote"]["check"]["status"] == "live"
-    assert group["default_branch"]["live_sha"] == pushed
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert group["default_branch"]["sha"] == pushed
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3173,12 +3213,12 @@ def test_lagging_clone_counts_with_objects_borrowed_from_a_sibling(tmp_path):
     document = live([folder])
 
     item = find_clone(document, lagging)
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
-    assert item["local_default"]["vs_live"] == {
+    assert group_of(document, lagging)["default_branch"]["sha"] == head
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
         "objects_from": real(holder),
     }
-    assert item["cached_vs_live"]["objects_from"] == real(holder)
+    assert item["cached_vs_remote"]["objects_from"] == real(holder)
     assert (object_files(lagging), git(lagging, "count-objects", "-v").stdout) == before
     assert not (lagging / ".git" / "objects" / "info" / "alternates").exists()
     assert git(lagging, "cat-file", "-e", head, check=False).returncode != 0
@@ -3191,15 +3231,15 @@ def test_first_sibling_in_natural_order_that_holds_the_head_lends(tmp_path):
 
     item = find_clone(live([folder]), lagging)
 
-    assert item["local_default"]["vs_live"]["objects_from"] == real(folder / "holder 2")
-    assert item["local_default"]["vs_live"]["behind"] == 2
+    assert item["local_default"]["vs_remote"]["objects_from"] == real(folder / "holder 2")
+    assert item["local_default"]["vs_remote"]["behind"] == 2
 
 
 def test_removed_holder_leaves_the_lagging_clone_with_differs(tmp_path):
     folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
     remove_tree(holder)
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
@@ -3215,7 +3255,7 @@ def test_inherited_alternates_value_never_makes_an_unborrowed_count(tmp_path, mo
         "GIT_ALTERNATE_OBJECT_DIRECTORIES", str(kept / ".git" / "objects")
     )
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison["relation"] == "differs"
     assert comparison["behind"] is None and comparison["objects_from"] is None
@@ -3238,7 +3278,7 @@ def test_sibling_probe_cut_by_the_budget_is_unknown(tmp_path, monkeypatch):
 
     comparison = find_clone(
         live([folder], call_cap_seconds=1.0), lagging
-    )["local_default"]["vs_live"]
+    )["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
@@ -3265,8 +3305,8 @@ def test_partial_and_shallow_holders_never_lend_and_gain_no_pack(tmp_path):
 
     document = live([folder])
 
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert group_of(document, lagging)["default_branch"]["sha"] == head
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3283,8 +3323,8 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 3
-    borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
+    assert first["schema_version"] == 4
+    borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
     assert off["remote_checks"] == "off"
@@ -3325,7 +3365,7 @@ def test_sibling_probe_that_fails_gives_differs_not_unknown(tmp_path, monkeypatc
     )
     monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
@@ -3342,7 +3382,7 @@ def test_a_holder_of_another_remote_never_lends(tmp_path):
     document = live([folder])
 
     assert group_of(document, holder) is not group_of(document, lagging)
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3357,7 +3397,7 @@ def test_no_sibling_is_probed_when_the_clone_holds_the_head(tmp_path, monkeypatc
     shim = git_stand_in(tmp_path, f'printf "%s\\n" "$*" >> "{log}"')
     monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
@@ -4724,7 +4764,7 @@ def test_a_branch_merged_on_the_remote_is_merged_against_the_borrowed_live_head(
     assert item["verdict_base"] == {
         "name": "trunk", "sha": head, "basis": "live", "objects_from": real(holder),
     }
-    assert item["verdict_base"]["objects_from"] == item["cached_vs_live"]["objects_from"]
+    assert item["verdict_base"]["objects_from"] == item["cached_vs_remote"]["objects_from"]
     assert verdicts_of(item)["feat"] == MERGED_ANCESTOR
     assert find_clone(document, holder)["verdict_base"]["objects_from"] is None
     assert (snapshot(other), snapshot(holder)) == before
@@ -6161,7 +6201,7 @@ def count_tip_equality(monkeypatch) -> list[int]:
 
 
 CLONE_FACTS = (
-    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
+    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_remote",
     "stash_count", "worktrees", "branches", "verdict_base", "containment", "removable_count",
 )
 
@@ -7047,9 +7087,9 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
     assert "removable" not in refusal_of(rederive(broken))
 
 
-def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
+def test_parser_refuses_a_schema_2_document_and_reads_only_schema_4(sample):
     document, _folder = sample
-    assert document["schema_version"] == 3 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 4 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
