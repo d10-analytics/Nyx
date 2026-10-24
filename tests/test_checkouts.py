@@ -1565,8 +1565,8 @@ def test_unchanged_state_gives_a_new_observation_time_and_the_same_digest(repo):
     assert first["checkouts_digest"] == second["checkouts_digest"]
 
 
-def verdict_of(state, rung=None, reason=None):
-    return {"state": state, "rung": rung, "reason": reason}
+def verdict_of(state, rung=None, reason=None, pull_request=None):
+    return {"state": state, "rung": rung, "reason": reason, "pull_request": pull_request}
 
 
 def merged_verdict():
@@ -1744,7 +1744,7 @@ def mutate_missing_verdict_key(document):
 REJECTED_VERDICT_DOCUMENTS = {
     "merged_without_rung": mutate_verdict("merged", None, None),
     "merged_with_rung_none": mutate_verdict("merged", "none", None),
-    "merged_with_foreign_rung": mutate_verdict("merged", "pull_request", None),
+    "merged_with_foreign_rung": mutate_verdict("merged", "history", None),
     "not_merged_with_rung_ancestor": mutate_verdict("not_merged", "ancestor", None),
     "not_merged_without_rung": mutate_verdict("not_merged", None, None),
     "unknown_with_rung": mutate_verdict("unknown", "ancestor", "failed"),
@@ -8718,3 +8718,766 @@ def test_a_gh_call_is_cut_at_the_collection_deadline_before_its_call_cap(tmp_pat
 
     assert lookup_of(document) == lookup("unavailable", "timed_out")
     assert elapsed < 12
+
+
+# ---------------------------------------------------------------------------
+# GitHub pull requests: the facts of each branch and the pull-request rung
+# ---------------------------------------------------------------------------
+
+UNRELATED_HEAD = "b" * 40
+MISSING_HEAD = "c" * 40
+
+
+def pr_node(
+    number: int, state: str, head: str, base: str = "trunk", cross: bool = False
+) -> dict[str, Any]:
+    return {
+        "number": number,
+        "state": state.upper(),
+        "headRefOid": head,
+        "baseRefName": base,
+        "isCrossRepository": cross,
+    }
+
+
+def local_names(*repositories: Path) -> list[str]:
+    """The distinct local branch names of the clones, sorted as the request sorts them."""
+    names: set[str] = set()
+    for repository in repositories:
+        listing = git(repository, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+        names.update(listing.stdout.split())
+    return sorted(names)
+
+
+def pr_answer(names: list[str], pulls: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """A valid ``gh`` answer: ``pulls`` by branch name, one alias per sorted name."""
+    repository: dict[str, Any] = {"__typename": "Repository"}
+    for index, name in enumerate(names):
+        repository[f"b{index}"] = {"nodes": [dict(node) for node in pulls.get(name, [])]}
+    return {"data": {"repository": repository}}
+
+
+def verdict_facts(branch_or_worktree: dict[str, Any]):
+    verdict = branch_or_worktree["verdict"]
+    return None if verdict is None else (
+        verdict["state"], verdict["rung"], verdict["reason"], verdict["pull_request"]
+    )
+
+
+def pr_verdict(number: int) -> tuple[str, str, None, int]:
+    return ("merged", "pull_request", None, number)
+
+
+NOT_MERGED_FACTS = ("not_merged", "none", None, None)
+
+
+def listed(branch: dict[str, Any]) -> list[tuple[int, str, bool]]:
+    return [(pull["number"], pull["state"], pull["head_matches"]) for pull in branch["pull_requests"]]
+
+
+@posix_only
+def test_each_branch_lists_the_same_repository_pull_requests_that_name_it(tmp_path, monkeypatch):
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(work, "topic.txt", "topic\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "branch", "plain", "trunk")
+    git(work, "branch", "many", "trunk")
+    names = local_names(work)
+    many = [pr_node(number, "closed", UNRELATED_HEAD) for number in range(40, 29, -1)]
+    pulls = {
+        "topic": [
+            pr_node(9, "closed", UNRELATED_HEAD),
+            pr_node(7, "open", tip),
+            pr_node(5, "merged", UNRELATED_HEAD),
+            pr_node(6, "merged", tip, base="release"),
+            pr_node(8, "merged", tip, cross=True),
+        ],
+        "many": many,
+    }
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, pulls))
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("live", None)
+    [item] = all_clones(document)
+    assert [pull["number"] for pull in many_of(item)] == list(range(31, 41))
+    assert branch_of(item, "topic")["pull_requests"] == [
+        {"number": 5, "state": "merged", "head_matches": False},
+        {"number": 6, "state": "merged", "head_matches": True},
+        {"number": 7, "state": "open", "head_matches": True},
+        {"number": 9, "state": "closed", "head_matches": False},
+    ]
+    # An open request, one into another base and a cross-repository one never decide.
+    assert verdict_facts(branch_of(item, "topic")) == NOT_MERGED_FACTS
+    # Every branch carries the list, the verdict base's and a branch with no node included.
+    assert branch_of(item, "trunk")["pull_requests"] == []
+    assert branch_of(item, "plain")["pull_requests"] == []
+    assert all("pull_requests" in branch for branch in item["branches"])
+
+    # Nothing is listed when the lookup is off, cannot answer, or the clone has no origin.
+    off = github_collect(folder, github_lookup=False)
+    assert all(b["pull_requests"] == [] for b in find_clone(off, work)["branches"])
+    unchecked = github_collect(folder, remote_checks=False)
+    assert lookup_of(unchecked) == lookup("off", "remote_checks_off")
+    assert all(b["pull_requests"] == [] for b in find_clone(unchecked, work)["branches"])
+    fake.replay(code=4)
+    refused = github_collect(folder)
+    assert lookup_of(refused) == lookup("unavailable", "not_authenticated")
+    assert all(b["pull_requests"] == [] for b in find_clone(refused, work)["branches"])
+    git(work, "remote", "remove", "origin")
+    fake.replay(stdout=pr_answer(names, pulls))
+    remoteless = github_collect(folder)
+    [repository] = remoteless["repositories"]
+    assert repository["pr_lookup"] is None
+    assert all(b["pull_requests"] == [] for b in all_clones(remoteless)[0]["branches"])
+
+
+def many_of(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return branch_of(item, "many")["pull_requests"]
+
+
+def landed_world(tmp_path: Path):
+    """A clone with ``done`` and ``sq`` squash-merged, ``open`` unmerged, all on GitHub."""
+    folder, remote, work = small_world(tmp_path)
+    land(work, "done")
+    land(work, "sq")
+    git(work, "checkout", "-q", "-b", "open", "trunk")
+    commit_file(work, "open.txt", "open\n")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    return folder, remote, work
+
+
+@posix_only
+def test_a_merged_pull_request_whose_head_is_the_tip_proves_the_branch_merged_uncached(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = landed_world(tmp_path)
+    tip = rev(work, "done")
+    detached = linked(work, tmp_path, "at-done", "--detach", "done")
+    names = local_names(work)
+    pulls = {"done": [pr_node(4, "merged", tip), pr_node(3, "merged", tip)]}
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, pulls))
+
+    document = github_collect(folder)
+
+    item = find_clone(document, work)
+    assert branch_of(item, "done")["verdict"] == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 3,
+    }
+    assert "not_merged" not in branch_of(item, "done")["removable"]["blockers"]
+    assert branch_of(item, "done")["removable"] == {"removable": True, "blockers": []}
+    # Every other verdict has no pull request, and the git ladder decided them.
+    assert verdict_facts(branch_of(item, "sq")) == ("merged", "squash_equivalent", None, None)
+    assert verdict_facts(branch_of(item, "open")) == NOT_MERGED_FACTS
+    assert branch_of(item, "trunk")["verdict"] is None
+    # A linked detached worktree at the tip takes the commit's one verdict.
+    linked_at_tip = find_worktree(item, detached)
+    assert verdict_facts(linked_at_tip) == pr_verdict(3)
+    assert "not_merged" not in linked_at_tip["removable"]["blockers"]
+    # No pull-request verdict is remembered, while a git-ladder verdict is.
+    base = rev(work, "origin/trunk")
+    stored = cache_entries(cache)
+    assert f"{tip}.{base}" not in stored
+    assert stored[f"{rev(work, 'sq')}.{base}"] == "squash_equivalent"
+    assert stored[f"{rev(work, 'open')}.{base}"] == "none"
+
+    # With the lookup unable to answer, the same branches have their git verdicts.
+    fake.replay(code=4)
+    plain = github_collect(folder)
+    plain_item = find_clone(plain, work)
+    assert verdict_facts(branch_of(plain_item, "done")) == ("merged", "squash_equivalent", None, None)
+    assert verdict_facts(find_worktree(plain_item, detached)) == (
+        "merged", "squash_equivalent", None, None,
+    )
+    assert all(
+        (b["verdict"] or {"pull_request": None})["pull_request"] is None
+        for b in plain_item["branches"]
+    )
+
+
+@posix_only
+def test_a_branch_the_base_already_contains_stays_ancestor_beside_a_merged_request(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "joined", "trunk")
+    tip = commit_file(work, "joined.txt", "joined\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge joined", "joined")
+    git(work, "push", "-q", "origin", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"joined": [pr_node(2, "merged", tip)]}),
+    )
+
+    joined = branch_of(find_clone(github_collect(folder), work), "joined")
+
+    assert verdict_facts(joined) == ("merged", "ancestor", None, None)
+    assert listed(joined) == [(2, "merged", True)]
+
+
+@posix_only
+def test_branches_at_one_commit_share_the_verdict_of_the_pull_request_that_names_one(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "x", "trunk")
+    tip = commit_file(work, "x.txt", "x\n")
+    git(work, "branch", "y", "x")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"x": [pr_node(15, "merged", tip)]}),
+    )
+
+    item = find_clone(github_collect(folder), work)
+
+    assert verdict_facts(branch_of(item, "x")) == pr_verdict(15)
+    assert verdict_facts(branch_of(item, "y")) == pr_verdict(15)
+    assert listed(branch_of(item, "x")) == [(15, "merged", True)]
+    assert listed(branch_of(item, "y")) == []
+
+
+@posix_only
+def test_a_detached_worktree_at_a_commit_no_local_branch_holds_never_takes_the_rung(
+    tmp_path, monkeypatch
+):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    first = clone(remote, folder / "a")
+    second = clone(remote, folder / "b")
+    git(second, "checkout", "-q", "-b", "elsewhere", "trunk")
+    head = commit_file(second, "elsewhere.txt", "elsewhere\n")
+    git(first, "fetch", "-q", str(second), "elsewhere")
+    detached = linked(first, tmp_path, "at-head", "--detach", head)
+    for repository in (first, second):
+        point_origin_at(repository, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(first, second), {"elsewhere": [pr_node(31, "merged", head)]}),
+    )
+
+    document = github_collect(folder)
+
+    assert verdict_facts(find_worktree(find_clone(document, first), detached)) == NOT_MERGED_FACTS
+    # The clone that holds the named branch is decided by the same request.
+    assert verdict_facts(branch_of(find_clone(document, second), "elsewhere")) == pr_verdict(31)
+
+
+@posix_only
+def test_a_shallow_clone_takes_the_rung_before_its_incomplete_clone_verdict(
+    tmp_path, monkeypatch
+):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    author = clone(remote, tmp_path / "author")
+    git(author, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(author, "topic.txt", "topic\n")
+    git(author, "push", "-q", "origin", "topic")
+    shallow = clone(remote.as_uri(), folder / "shallow", "--depth=1", "--no-single-branch")
+    git(shallow, "branch", "topic", "origin/topic")
+    point_origin_at(shallow, remote, GITHUB_URL)
+    names = local_names(shallow)
+    fake = install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(names, {"topic": [pr_node(21, "merged", tip)]}),
+    )
+
+    item = find_clone(github_collect(folder), shallow)
+
+    assert item["shallow"] is True
+    assert verdict_facts(branch_of(item, "topic")) == pr_verdict(21)
+    fake.replay(code=4)
+    undecided = find_clone(github_collect(folder), shallow)
+    assert verdict_facts(branch_of(undecided, "topic")) == (
+        "unknown", None, "incomplete_clone", None,
+    )
+
+
+def squash_world(
+    tmp_path: Path, *, first_inside: bool = True, filtered: bool = False, trunk_fetched: bool = False
+):
+    """Clones ``a`` and ``b`` share ``topic`` at ``tip``; ``a`` then adds two commits,
+    pushes ``topic`` and squash-merges it into ``trunk``, and ``b`` fetches nothing
+    (only ``trunk``, when ``trunk_fetched``: the head of ``topic`` stays missing).
+
+    Returns the folder, the clones and the commits ``tip`` and ``head``."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    if filtered:
+        allow_filters(remote)
+    first = clone(remote, (folder if first_inside else tmp_path / "outside") / "a")
+    git(first, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(first, "topic.txt", "topic\n")
+    git(first, "push", "-q", "origin", "topic")
+    if filtered:
+        second = clone(remote.as_uri(), folder / "b", "--filter=blob:none")
+    else:
+        second = clone(remote, folder / "b")
+    git(second, "branch", "topic", "origin/topic")
+    commit_file(first, "topic-2.txt", "two\n")
+    head = commit_file(first, "topic-3.txt", "three\n")
+    git(first, "push", "-q", "origin", "topic")
+    git(first, "checkout", "-q", "trunk")
+    git(first, "merge", "--squash", "topic")
+    git(first, "commit", "-q", "-m", "land topic")
+    git(first, "push", "-q", "origin", "trunk")
+    for repository in (first, second):
+        point_origin_at(repository, remote, GITHUB_URL)
+    if trunk_fetched:
+        git(second, "fetch", "-q", "origin", "trunk")
+    return folder, remote, first, second, tip, head
+
+
+def squash_answer(
+    clones: tuple[Path, ...], head: str, *, number: int = 12, **node: Any
+) -> dict[str, Any]:
+    pulls = [pr_node(number, node.pop("state", "merged"), head, **node)]
+    return pr_answer(local_names(*clones), {"topic": pulls})
+
+
+@posix_only
+def test_a_tip_that_is_an_ancestor_of_a_merged_head_found_in_a_sibling_is_merged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    assert git(second, "cat-file", "-e", head, check=False).returncode != 0
+    before = object_files(second)
+
+    document = github_collect(folder)
+
+    item = find_clone(document, second)
+    topic = branch_of(item, "topic")
+    assert topic["sha"] == tip
+    assert verdict_facts(topic) == pr_verdict(12)
+    assert listed(topic) == [(12, "merged", False)]
+    assert listed(branch_of(find_clone(document, first), "topic")) == [(12, "merged", True)]
+    assert verdict_facts(branch_of(find_clone(document, first), "topic")) == pr_verdict(12)
+    # Nothing was fetched into the lagging clone: the head was read from the sibling.
+    assert object_files(second) == before
+    assert git(second, "cat-file", "-e", head, check=False).returncode != 0
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"base": "release"}, {"state": "open"}, {"state": "closed"}, {"cross": True}],
+    ids=["other-base", "open", "closed", "cross-repository"],
+)
+@posix_only
+def test_a_request_that_is_not_a_merged_same_repository_one_into_the_base_never_decides(
+    tmp_path, monkeypatch, change
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head, **change))
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert len(topic["pull_requests"]) == (0 if change.get("cross") else 1)
+
+
+@posix_only
+def test_unavailable_and_non_ancestor_heads_are_skipped_in_number_order(tmp_path, monkeypatch):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    seed = rev(second, "origin/trunk")
+    nodes = [
+        pr_node(12, "merged", head),
+        pr_node(11, "merged", MISSING_HEAD),
+        pr_node(9, "merged", seed),
+    ]
+    stdout = pr_answer(local_names(first, second), {"topic": nodes})
+    install_fake_gh(tmp_path, monkeypatch, stdout=stdout)
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    # #9 has the tip as no ancestor, #11 is held by no clone, and #12 decides.
+    assert verdict_facts(topic) == pr_verdict(12)
+    assert listed(topic) == [(9, "merged", False), (11, "merged", False), (12, "merged", False)]
+
+
+@posix_only
+def test_commits_after_the_merge_and_a_branch_name_reused_afterwards_are_not_merged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    git(second, "checkout", "-q", "topic")
+    commit_file(second, "later.txt", "later\n")
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+
+    document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+    assert "not_merged" in topic["removable"]["blockers"]
+
+    # A clone fetched after the merge that starts a new topic from the merged trunk.
+    third = clone(_remote, folder / "c")
+    point_origin_at(third, _remote, GITHUB_URL)
+    git(third, "checkout", "-q", "-b", "topic", "trunk")
+    commit_file(third, "fresh.txt", "fresh\n")
+    install_fake_gh(tmp_path / "again", monkeypatch, stdout=squash_answer((first, second, third), head))
+    reused = branch_of(find_clone(github_collect(folder), third), "topic")
+    assert git(third, "cat-file", "-e", head, check=False).returncode == 0
+    assert verdict_facts(reused) == NOT_MERGED_FACTS
+    assert listed(reused) == [(12, "merged", False)]
+
+
+@posix_only
+def test_a_reused_branch_name_after_a_merge_commit_is_not_merged_whichever_way_ancestry_runs(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    earlier = commit_file(work, "earlier.txt", "earlier\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge topic", "topic")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "topic")
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    commit_file(work, "again.txt", "again\n")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    # The earlier head is in the history of the base and of the new topic.
+    assert git(work, "merge-base", "--is-ancestor", earlier, "topic", check=False).returncode == 0
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"topic": [pr_node(20, "merged", earlier)]}),
+    )
+
+    topic = branch_of(find_clone(github_collect(folder), work), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(20, "merged", False)]
+
+
+@posix_only
+def test_a_head_held_only_by_a_clone_outside_the_folders_leaves_the_git_ladder_to_decide(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, first_inside=False)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+def objects_snapshot(repository: Path) -> list[tuple[str, bytes]]:
+    root = repository / ".git" / "objects"
+    return sorted(
+        (item.relative_to(root).as_posix(), item.read_bytes())
+        for item in root.rglob("*")
+        if item.is_file()
+    )
+
+
+def ladder_probe_log(tmp_path: Path, head: str) -> tuple[Path, Path]:
+    """A git stand-in that logs the lazy-fetch and alternates variables of every
+    verdict call that names ``head``."""
+    log = tmp_path / "head-calls.log"
+    body = (
+        f'case "$*" in *"--no-replace-objects"*{head}*) '
+        f'printf "%s|%s|%s\\n" "$GIT_NO_LAZY_FETCH" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" "$*" '
+        f'>> "{log}";; esac'
+    )
+    return stand_in(tmp_path, "probe", body), log
+
+
+@pytest.mark.parametrize("trunk_fetched", [False, True], ids=["base-lent", "head-lent"])
+@posix_only
+def test_every_call_that_looks_for_a_head_runs_without_a_lazy_fetch(
+    tmp_path, monkeypatch, trunk_fetched
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=trunk_fetched)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim, log = ladder_probe_log(tmp_path, head)
+
+    with path_with(monkeypatch, shim):
+        topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == pr_verdict(12)
+    calls = [line.split("|", 2) for line in log.read_text().splitlines()]
+    probes = [call for call in calls if "rev-list --no-walk" in call[2]]
+    ancestry = [call for call in calls if "merge-base --is-ancestor" in call[2]]
+    # The clone alone reads the head through the sibling that lent the base; when
+    # the clone holds the base, the first sibling that holds the head is asked and
+    # lends its objects to the ancestry test.
+    assert len(ancestry) == 1
+    assert len(probes) == (2 if trunk_fetched else 1)
+    assert {call[0] for call in calls} == {"1"}
+    assert ancestry[0][1] == os.path.join(real(first), ".git", "objects")
+    assert probes[0][1] == ("" if trunk_fetched else ancestry[0][1])
+
+
+@posix_only
+def test_a_blobless_clone_lacking_the_head_is_left_byte_for_byte_unchanged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(
+        tmp_path, first_inside=False, filtered=True
+    )
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim, log = ladder_probe_log(tmp_path, head)
+    before = objects_snapshot(second)
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert find_clone(document, second)["partial_clone"] is True
+    assert verdict_facts(topic) == ("unknown", None, "incomplete_clone", None)
+    assert listed(topic) == [(12, "merged", False)]
+    assert objects_snapshot(second) == before
+    calls = [line.split("|", 2) for line in log.read_text().splitlines()]
+    assert calls and {call[0] for call in calls} == {"1"}
+
+
+ANCESTRY_FAILURES = {
+    "failed": ("exit 128", "failed"),
+    "late": ("exec sleep 30", "deadline"),
+}
+
+
+@pytest.mark.parametrize("case", list(ANCESTRY_FAILURES))
+@posix_only
+def test_a_failed_or_late_ancestry_test_fails_the_tip_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, case
+):
+    cache = nyx_home(isolated_git)
+    action, reason = ANCESTRY_FAILURES[case]
+    folder, _remote, first, second, tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(
+        tmp_path, "ancestry", f'case "$*" in *"merge-base --is-ancestor {tip} {head}"*) {action};; esac'
+    )
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder, call_cap_seconds=1.0)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == ("unknown", None, reason, None)
+    assert listed(topic) == [(12, "merged", False)]
+    base = rev(second, "origin/trunk")
+    assert f"{tip}.{base}" not in (cache_entries(cache) if cache.exists() else {})
+
+
+PROBE_FAILURES = {
+    "in-the-clone": lambda first, second, head: (
+        f'case "$*" in *"-C {real(second)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exit 128;; esac'
+    ),
+    "in-the-sibling": lambda first, second, head: (
+        f'case "$*" in *"-C {real(first)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exit 128;; esac'
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(PROBE_FAILURES))
+@posix_only
+def test_a_probe_for_the_head_that_cannot_say_counts_as_an_unavailable_head(
+    tmp_path, monkeypatch, case
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=True)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(tmp_path, "probe-fails", PROBE_FAILURES[case](first, second, head))
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+# -- the parser ---------------------------------------------------------------
+
+
+def lookup_live(document: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``document`` whose one repository is a GitHub one with a live lookup."""
+    return rederive(
+        lookup_document(
+            document, github_lookup="on", remote_checks="on", key=GITHUB_KEY,
+            pr_lookup=lookup("live", None),
+        )
+    )
+
+
+def merged_by_request(branch: dict[str, Any], number: int = 12, listed_on=None) -> None:
+    branch["verdict"] = verdict_of("merged", "pull_request", pull_request=number)
+    (listed_on or branch)["pull_requests"] = [
+        {"number": number, "state": "merged", "head_matches": False}
+    ]
+
+
+def mutate_request_without_a_lookup(document):
+    merged_by_request(branch_of(first_clone(document), "never-pushed"))
+
+
+def mutate_list_without_a_lookup(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": 3, "state": "open", "head_matches": True}
+    ]
+
+
+def mutate_rung_names_an_unlisted_request(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch, 12)
+    branch["pull_requests"] = []
+
+
+def mutate_rung_names_an_open_request(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch, 12)
+    branch["pull_requests"][0]["state"] = "open"
+
+
+def mutate_rung_names_another_commits_request(document):
+    clone_document = first_clone(document)
+    assert branch_of(clone_document, "trunk")["sha"] != branch_of(clone_document, "never-pushed")["sha"]
+    merged_by_request(
+        branch_of(clone_document, "never-pushed"), 12, listed_on=branch_of(clone_document, "trunk")
+    )
+    branch_of(clone_document, "never-pushed")["pull_requests"] = []
+
+
+def mutate_number_with_another_rung(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch)
+    branch["verdict"]["rung"] = "ancestor"
+
+
+def mutate_rung_without_a_number(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch)
+    branch["verdict"]["pull_request"] = None
+
+
+def mutate_number_on_an_undecided_verdict(document):
+    branch_of(first_clone(document), "never-pushed")["verdict"] = verdict_of(
+        "unknown", reason="failed", pull_request=12
+    )
+
+
+def mutate_number_that_is_not_positive(value):
+    def mutate(document):
+        branch = branch_of(first_clone(document), "never-pushed")
+        merged_by_request(branch)
+        branch["verdict"]["pull_request"] = value
+
+    return mutate
+
+
+def mutate_detached_rung_at_an_unheld_commit(document):
+    clone_document = first_clone(document)
+    worktree = detach(document, verdict_of("merged", "pull_request", pull_request=12))
+    worktree["head"]["sha"] = "d" * 40
+    branch_of(clone_document, "never-pushed")["pull_requests"] = [
+        {"number": 12, "state": "merged", "head_matches": False}
+    ]
+
+
+def mutate_list_entry(change):
+    def mutate(document):
+        branch_of(first_clone(document), "never-pushed")["pull_requests"] = [change]
+
+    return mutate
+
+
+def mutate_unsorted_list(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "open", "head_matches": False} for number in (2, 1)
+    ]
+
+
+def mutate_repeated_number(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": 1, "state": "open", "head_matches": False},
+        {"number": 1, "state": "closed", "head_matches": False},
+    ]
+
+
+def mutate_eleven_requests(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "open", "head_matches": False} for number in range(1, 12)
+    ]
+
+
+def mutate_list_missing(document):
+    del branch_of(first_clone(document), "never-pushed")["pull_requests"]
+
+
+GOOD_ENTRY = {"number": 3, "state": "open", "head_matches": True}
+REJECTED_PULL_REQUEST_DOCUMENTS = {
+    "rung_without_a_lookup": (False, mutate_request_without_a_lookup),
+    "list_without_a_lookup": (False, mutate_list_without_a_lookup),
+    "rung_names_an_unlisted_request": (True, mutate_rung_names_an_unlisted_request),
+    "rung_names_an_open_request": (True, mutate_rung_names_an_open_request),
+    "rung_names_another_commits_request": (True, mutate_rung_names_another_commits_request),
+    "number_with_another_rung": (True, mutate_number_with_another_rung),
+    "rung_without_a_number": (True, mutate_rung_without_a_number),
+    "number_on_an_undecided_verdict": (True, mutate_number_on_an_undecided_verdict),
+    "zero_number": (True, mutate_number_that_is_not_positive(0)),
+    "boolean_number": (True, mutate_number_that_is_not_positive(True)),
+    "text_number": (True, mutate_number_that_is_not_positive("12")),
+    "detached_rung_at_an_unheld_commit": (True, mutate_detached_rung_at_an_unheld_commit),
+    "unsorted_list": (True, mutate_unsorted_list),
+    "repeated_number": (True, mutate_repeated_number),
+    "eleven_requests": (True, mutate_eleven_requests),
+    "list_missing": (True, mutate_list_missing),
+    "foreign_state": (True, mutate_list_entry({**GOOD_ENTRY, "state": "draft"})),
+    "text_head_matches": (True, mutate_list_entry({**GOOD_ENTRY, "head_matches": "yes"})),
+    "boolean_entry_number": (True, mutate_list_entry({**GOOD_ENTRY, "number": True})),
+    "zero_entry_number": (True, mutate_list_entry({**GOOD_ENTRY, "number": 0})),
+    "extra_entry_key": (True, mutate_list_entry({**GOOD_ENTRY, "title": "x"})),
+    "missing_entry_key": (True, mutate_list_entry({"number": 3, "state": "open"})),
+}
+
+
+@pytest.mark.parametrize("name", list(REJECTED_PULL_REQUEST_DOCUMENTS))
+def test_parser_rejects_a_pull_request_violation_under_a_valid_digest(sample, name):
+    document, _folder = sample
+    lookup_used, mutation = REJECTED_PULL_REQUEST_DOCUMENTS[name]
+    base = lookup_live(document) if lookup_used else doc_copy(document)
+    assert models.parse_checkouts(redigest(rederive(doc_copy(base))))
+    broken = doc_copy(base)
+    mutation(broken)
+    assert "removable" not in refusal_of(rederive(broken))
+
+
+def test_parser_accepts_a_pull_request_rung_where_a_branch_at_the_commit_lists_it(sample):
+    document, _folder = sample
+    own = lookup_live(document)
+    merged_by_request(branch_of(first_clone(own), "never-pushed"))
+    assert models.parse_checkouts(redigest(rederive(own)))["repositories"][0]["pr_lookup"] == lookup(
+        "live", None
+    )
+    # A detached worktree takes the verdict through a branch at its commit.
+    shared = lookup_live(document)
+    clone_document = first_clone(shared)
+    branch = branch_of(clone_document, "outside")
+    branch["pull_requests"] = [{"number": 12, "state": "merged", "head_matches": False}]
+    detach(shared, verdict_of("merged", "pull_request", pull_request=12))
+    assert models.parse_checkouts(redigest(rederive(shared)))
+    # A list of ten is the bound.
+    full = lookup_live(document)
+    branch_of(first_clone(full), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "closed", "head_matches": False} for number in range(1, 11)
+    ]
+    assert models.parse_checkouts(redigest(rederive(full)))
