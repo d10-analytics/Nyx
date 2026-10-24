@@ -9641,3 +9641,19 @@ def test_the_first_sibling_in_natural_order_lends_to_both_the_live_apply_and_the
     assert ancestry[0] == os.path.join(real(earlier), ".git", "objects")
     # The search stops at the first holder: the later sibling is never asked.
     assert not [call for call in calls if real(later) in call[1]]
+    # Each phase asks the clone itself once, then only its siblings: the clone is
+    # never among its own lender candidates.
+    places = {real(path): path.name for path in (second, earlier, later)}
+
+    def asked(ladder: bool) -> list[str]:
+        return [
+            name
+            for _alternates, arguments in calls
+            if "rev-list --no-walk" in arguments
+            and ("--no-replace-objects" in arguments) == ladder
+            for path, name in places.items()
+            if f"-C {path} " in arguments
+        ]
+
+    assert asked(ladder=False) == [second.name, earlier.name]
+    assert asked(ladder=True) == [second.name, earlier.name]
