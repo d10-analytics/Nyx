@@ -10,7 +10,11 @@ transfers no objects. When the active workspace turns GitHub lookup on, the same
 phase also makes one ``gh api graphql`` request per GitHub repository, asking for
 the pull requests of its local branch names; it runs the user's own ``gh`` with
 the user's credentials, is never retried, and a missing or failing ``gh`` only
-marks that repository's lookup unavailable.
+marks that repository's lookup unavailable. A merged pull request into the verdict
+base, whose head branch is a local branch at a commit, proves that commit merged
+when the request's head is the commit or has it as an ancestor; the ancestry test
+reads only objects already on disk, in the clone or a sibling clone of the same
+remote, and such a verdict is never remembered.
 """
 
 from __future__ import annotations
@@ -1083,6 +1087,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                     and upstream != f"refs/remotes/origin/{name}"
                 ),
                 "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
+                "pull_requests": [],
                 "verdict": None,
                 "contained_in": None,
                 "removable": None,
@@ -1432,6 +1437,34 @@ def _valid_pull_request(node: Any) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _PullRequest:
+    """One same-repository pull request GitHub listed for a head branch name."""
+
+    number: int
+    state: str
+    head: str
+    base: str
+
+
+def _pull_requests_of(nodes: Sequence[Any]) -> tuple[_PullRequest, ...]:
+    """The listed pull requests of one branch name, by number.
+
+    Only same-repository requests count; the first ``_GITHUB_NODE_CAP`` in
+    answer order (newest first) are kept, a repeated number once."""
+    kept: dict[int, _PullRequest] = {}
+    for node in nodes:
+        if node["isCrossRepository"] or len(kept) >= _GITHUB_NODE_CAP:
+            continue
+        kept.setdefault(
+            node["number"],
+            _PullRequest(
+                node["number"], node["state"].lower(), node["headRefOid"], node["baseRefName"]
+            ),
+        )
+    return tuple(sorted(kept.values(), key=lambda item: item.number))
+
+
 def _github_document(data: bytes) -> Any:
     """Decode a ``gh`` answer; ``None`` when it is oversized or not JSON."""
     if len(data) > GITHUB_OUTPUT_CAP:
@@ -1472,35 +1505,36 @@ def _github_failure(outcome: _Outcome, document: Any) -> str:
     return "failed"
 
 
-def _github_reason(outcome: _Outcome, count: int) -> str | None:
-    """``None`` when ``gh`` answered validly for ``count`` branch aliases, else
-    the failure category."""
+def _github_answer(
+    outcome: _Outcome, branches: Sequence[str]
+) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
+    """The failure category of a ``gh`` call, or ``None`` and the pull requests of
+    each of ``branches`` when it answered validly for every alias."""
     document = _github_document(outcome.out) if not outcome.timed_out else None
     if outcome.code != 0:
-        return _github_failure(outcome, document)
+        return _github_failure(outcome, document), {}
     data = document.get("data") if isinstance(document, dict) else None
     if isinstance(data, dict) and data.get("repository", {}) is None:
-        return "not_found"
+        return "not_found", {}
     repository = data.get("repository") if isinstance(data, dict) else None
     if not isinstance(repository, dict) or repository.get("__typename") != "Repository":
-        return "failed"
-    for index in range(count):
+        return "failed", {}
+    pulls: dict[str, tuple[_PullRequest, ...]] = {}
+    for index, branch in enumerate(branches):
         alias = repository.get(f"b{index}")
         nodes = alias.get("nodes") if isinstance(alias, dict) else None
-        if (
-            not isinstance(nodes, list)
-            or len(nodes) > _GITHUB_NODE_CAP
-            or not all(_valid_pull_request(node) for node in nodes)
-        ):
-            return "failed"
-    return None
+        if not isinstance(nodes, list) or not all(_valid_pull_request(node) for node in nodes):
+            return "failed", {}
+        pulls[branch] = _pull_requests_of(nodes)
+    return None, pulls
 
 
 def _query_github(
     runner: _GitRunner, executable: str, key: str, branches: Sequence[str]
-) -> str | None:
-    """The group's one ``gh api graphql`` call; ``None`` when GitHub answered, else
-    the failure category. The request file lives in a directory removed on return."""
+) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
+    """The group's one ``gh api graphql`` call: ``None`` and the pull requests of
+    each branch name when GitHub answered, else the failure category and nothing.
+    The request file lives in a directory removed on return."""
     identity = github_identity(key)
     assert identity is not None
     host, owner, name = identity
@@ -1512,24 +1546,31 @@ def _query_github(
             [executable, "api", "graphql", "--hostname", host, "--input", request],
             _github_environment(),
         )
-    return _github_reason(outcome, len(branches))
+    return _github_answer(outcome, branches)
 
 
 def _present_objects(
-    runner: _GitRunner, context: _CloneContext, wanted: Sequence[str]
+    runner: _GitRunner,
+    context: _CloneContext,
+    wanted: Sequence[str],
+    *,
+    overlay: Mapping[str, str | None] | None = None,
+    pinned: Sequence[str] = (),
 ) -> dict[str, str]:
     """Classify each wanted ID as ``present``, ``missing``, ``unknown`` or ``differs``.
 
     The IDs are arguments because the runner closes stdin; git prints the
     present ones, in no promised order, and exits 0 when some are missing.
+    ``pinned`` options and the ``overlay`` environment apply to every call.
     """
     result: dict[str, str] = {}
     for start in range(0, len(wanted), _PROBE_CHUNK):
         chunk = list(wanted[start : start + _PROBE_CHUNK])
         outcome = runner.run(
-            ["rev-list", "--no-walk", "--ignore-missing", *chunk],
+            [*pinned, "rev-list", "--no-walk", "--ignore-missing", *chunk],
             path=context.cwd,
             ceiling=context.ceiling,
+            overlay=overlay,
         )
         if outcome.timed_out or outcome.code is None:
             state = dict.fromkeys(chunk, "unknown")
@@ -1552,6 +1593,54 @@ def _lendable(context: _CloneContext) -> bool:
         and os.pathsep not in context.common
         and not context.common.startswith('"')
     )
+
+
+class _LenderSearch:
+    """Find the first lendable sibling, in natural order, that holds an object.
+
+    Each sibling is asked once about every ID it is asked of, so a search for
+    several IDs shares its probes. A probe that cannot say stops the search with
+    its state (``unknown`` or ``differs``)."""
+
+    def __init__(
+        self,
+        runner: _GitRunner,
+        siblings: Sequence[tuple[dict[str, Any], _CloneContext]],
+        *,
+        overlay: Mapping[str, str | None] | None = None,
+        pinned: Sequence[str] = (),
+    ) -> None:
+        self._runner = runner
+        self._candidates = [(c, x) for c, x in siblings if _lendable(x)]
+        self._overlay = overlay
+        self._pinned = pinned
+        self._known: dict[int, dict[str, str]] = {}
+
+    def find(
+        self, right: str, lacking: Sequence[str]
+    ) -> tuple[dict[str, Any], _CloneContext] | str | None:
+        """The first lendable sibling holding ``right``, or the state of a probe
+        that could not say. ``lacking`` lists the IDs a sibling is asked about
+        when first visited and must name ``right``."""
+        for index, (sibling, sibling_context) in enumerate(self._candidates):
+            known = self._known.setdefault(index, {})
+            unasked = [item for item in lacking if item not in known]
+            if unasked:
+                known.update(
+                    _present_objects(
+                        self._runner,
+                        sibling_context,
+                        unasked,
+                        overlay=self._overlay,
+                        pinned=self._pinned,
+                    )
+                )
+            state = known.get(right, "missing")
+            if state == "present":
+                return sibling, sibling_context
+            if state != "missing":
+                return state
+        return None
 
 
 def _apply_live(
@@ -1589,21 +1678,10 @@ def _apply_live(
     )
     memo: dict[tuple[str, str], dict[str, Any]] = {}
     lacking = [item for item in wanted if presence.get(item) == "missing"]
-    candidates = [(c, x) for c, x in siblings if _lendable(x)]
-    sibling_presence: dict[int, dict[str, str]] = {}
+    lenders = _LenderSearch(runner, siblings)
 
     def lender(right: str) -> tuple[dict[str, Any], _CloneContext] | str | None:
-        """The first lendable sibling in natural order holding ``right``, or the
-        state (``unknown`` or ``differs``) of a probe that could not say."""
-        for index, (sibling, sibling_context) in enumerate(candidates):
-            if index not in sibling_presence:
-                sibling_presence[index] = _present_objects(runner, sibling_context, lacking)
-            state = sibling_presence[index].get(right, "missing")
-            if state == "present":
-                return sibling, sibling_context
-            if state != "missing":
-                return state
-        return None
+        return lenders.find(right, lacking)
 
     def borrowed(left: str, right: str) -> dict[str, Any]:
         source = lender(right)
@@ -1710,6 +1788,25 @@ def _apply_live(
     return fallback
 
 
+def _list_pull_requests(
+    group: dict[str, Any], listed: Mapping[str, Sequence[_PullRequest]]
+) -> None:
+    """Give every branch of the group's usable clones the pull requests listed for
+    its name; ``head_matches`` is whether the request's head is the branch's tip."""
+    for clone in group["clones"]:
+        if clone["status"] != "ok":
+            continue
+        for branch in clone["branches"]:
+            branch["pull_requests"] = [
+                {
+                    "number": pull.number,
+                    "state": pull.state,
+                    "head_matches": pull.head == branch["sha"],
+                }
+                for pull in listed.get(branch["name"], ())
+            ]
+
+
 def _pr_lookup_unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason, "checked_at": None}
 
@@ -1720,11 +1817,13 @@ def _check_remotes(
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
     github_lookup: bool,
-) -> dict[str, _Base | None]:
+) -> tuple[dict[str, _Base | None], dict[str, dict[str, tuple[_PullRequest, ...]]]]:
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
     lookup is on) then phase 3 (live comparisons per clone).
 
-    Returns the verdict base of each clone the live comparisons reached."""
+    Returns the verdict base of each clone the live comparisons reached, and the
+    pull requests GitHub listed per head branch name for each remote key whose
+    lookup answered."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -1759,12 +1858,15 @@ def _check_remotes(
             lookups.append((group, sorted(names)))
     # Resolved once, and only when a call will be made.
     gh = _resolve_program("gh") if lookups else None
+    pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
     if lookups and gh is None:
         for group, _ in lookups:
             group["pr_lookup"] = _pr_lookup_unavailable("gh_missing")
         lookups = []
 
-    def ask(job: tuple[dict[str, Any], list[str]]) -> str | None:
+    def ask(
+        job: tuple[dict[str, Any], list[str]],
+    ) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
         group, names = job
         assert gh is not None
         return _query_github(runner, gh, group["remote"]["key"], names)
@@ -1774,12 +1876,13 @@ def _check_remotes(
         pending = [pool.submit(ask, job) for job in lookups]
         answers = list(pool.map(query, chosen))
         for (group, _), future in zip(lookups, pending):
-            reason = future.result()
-            group["pr_lookup"] = (
-                {"status": "live", "reason": None, "checked_at": None}
-                if reason is None
-                else _pr_lookup_unavailable(reason)
-            )
+            reason, listed = future.result()
+            if reason is None:
+                group["pr_lookup"] = {"status": "live", "reason": None, "checked_at": None}
+                pulls[group["remote"]["key"]] = listed
+                _list_pull_requests(group, listed)
+            else:
+                group["pr_lookup"] = _pr_lookup_unavailable(reason)
         work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
         bases: dict[str, _Base | None] = {}
         for group, answer in zip(groups, answers):
@@ -1815,7 +1918,7 @@ def _check_remotes(
             )
 
         bases.update(pool.map(apply, work))
-    return bases
+    return bases, pulls
 
 
 # ---------------------------------------------------------------------------
@@ -1903,16 +2006,18 @@ def _verdict_settings(scratch: str, version: str | None) -> _VerdictSettings:
     )
 
 
-def _merged(rung: str) -> dict[str, Any]:
-    return {"state": "merged", "rung": rung, "reason": None}
+def _merged(rung: str, pull_request: int | None = None) -> dict[str, Any]:
+    return {"state": "merged", "rung": rung, "reason": None, "pull_request": pull_request}
 
 
 def _unknown(reason: str) -> dict[str, Any]:
-    return {"state": "unknown", "rung": None, "reason": reason}
+    return {"state": "unknown", "rung": None, "reason": reason, "pull_request": None}
 
 
-_NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None}
-# The rungs a cache entry may hold; ``ancestor`` and every ``unknown`` never.
+_NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None, "pull_request": None}
+# The rungs a cache entry may hold; ``ancestor``, ``pull_request`` and every
+# ``unknown`` never: a pull request's state is another service's answer, so no
+# verdict built on it is remembered.
 CACHE_RUNGS = frozenset({"patch_equivalent", "squash_equivalent", "tree_equal", "none"})
 
 
@@ -1957,6 +2062,21 @@ class _Tip:
             self.error = reason
 
 
+@dataclass(frozen=True)
+class _PullRung:
+    """What the pull-request rung of one clone knows.
+
+    ``requests`` are the repository's pull requests by head branch name;
+    ``holders`` name the clone's local branches at each commit, the only names a
+    commit is ever matched through; ``siblings`` are the other usable clones of
+    the repository, which may lend the objects of a head the clone lacks.
+    """
+
+    requests: Mapping[str, Sequence[_PullRequest]]
+    holders: Mapping[str, Sequence[str]]
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = ()
+
+
 class _Ladder:
     """Decide the merge verdict of tips against one clone's base, read-only."""
 
@@ -1967,12 +2087,14 @@ class _Ladder:
         base: _Base,
         settings: _VerdictSettings,
         cache: Mapping[str, tuple[str, int]] | None = None,
+        pulls: _PullRung | None = None,
     ) -> None:
         self._runner = runner
         self._context = context
         self._base = base
         self._settings = settings
         self._cache = cache or {}
+        self._pulls = pulls
         # Cache keys that stood in for a verdict, and entries decided by a
         # complete computation in this collection (key -> rung).
         self.used: set[str] = set()
@@ -1991,12 +2113,14 @@ class _Ladder:
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
 
-    def _git(self, arguments: Sequence[str]) -> _Outcome:
+    def _git(
+        self, arguments: Sequence[str], overlay: Mapping[str, str | None] | None = None
+    ) -> _Outcome:
         return self._runner.run(
             self._args(arguments),
             path=self._context.cwd,
             ceiling=self._context.ceiling,
-            overlay=self._overlay,
+            overlay=self._overlay if overlay is None else overlay,
         )
 
     def _stream(self, producer: Sequence[str], consumer: Sequence[str]) -> _Outcome:
@@ -2033,6 +2157,7 @@ class _Ladder:
         for sha in [sha for _, sha in branches] + list(detached):
             tips.setdefault(sha, _Tip(sha, order=len(tips)))
         self._ancestors(tips, branches, detached)
+        self._pull_requests(tips)
         incomplete = self._context.shallow or self._context.partial
         # A shallow or partial clone runs no rung beyond ``ancestor``, so its
         # lookup precedes the size checks.  Otherwise the rungs run first and a
@@ -2167,6 +2292,80 @@ class _Ladder:
                     tip.verdict = _merged("ancestor")
                 else:
                     is_ancestor(tip)
+
+    # -- pull-request rung ----------------------------------------------
+
+    def _pull_requests(self, tips: Mapping[str, _Tip]) -> None:
+        """Decide a tip no earlier rung settled from the merged pull requests whose
+        head branch is a local branch at its commit and whose base is the verdict base.
+
+        A request whose head is the tip decides first, the lowest number winning;
+        then, in number order, one whose head has the tip as an ancestor. A head
+        no clone holds, or one whose presence cannot be told, is skipped; a failed
+        or late ancestry call fails the tip as the ancestor rung does. Nothing
+        else decides, and nothing decided here is remembered."""
+        rung = self._pulls
+        if rung is None:
+            return
+        sources: dict[str, dict[str, str | None] | None] = {}
+        lenders = _LenderSearch(
+            self._runner,
+            rung.siblings,
+            overlay=self._settings.overlay,
+            pinned=self._settings.pinned,
+        )
+
+        def source(head: str) -> dict[str, str | None] | None:
+            """The overlay that lets this clone read ``head``, or ``None`` when no
+            clone holds it or the probes could not say."""
+            if head not in sources:
+                state = _present_objects(
+                    self._runner,
+                    self._context,
+                    [head],
+                    overlay=self._overlay,
+                    pinned=self._settings.pinned,
+                )[head]
+                found: dict[str, str | None] | None = None
+                if state == "present":
+                    found = dict(self._overlay)
+                elif state == "missing":
+                    lender = lenders.find(head, [head])
+                    if isinstance(lender, tuple):
+                        found = {
+                            **self._settings.overlay,
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.join(
+                                lender[1].common, "objects"
+                            ),
+                        }
+                sources[head] = found
+            return sources[head]
+
+        for tip in tips.values():
+            if tip.verdict is not None or tip.error is not None:
+                continue
+            merged: dict[int, _PullRequest] = {}
+            for name in rung.holders.get(tip.sha, ()):
+                for pull in rung.requests.get(name, ()):
+                    if pull.state == "merged" and pull.base == self._base.name:
+                        merged[pull.number] = pull
+            eligible = [merged[number] for number in sorted(merged)]
+            same = next((pull for pull in eligible if pull.head == tip.sha), None)
+            if same is not None:
+                tip.verdict = _merged("pull_request", same.number)
+                continue
+            for pull in eligible:
+                overlay = source(pull.head)
+                if overlay is None:
+                    continue
+                outcome = self._git(["merge-base", "--is-ancestor", tip.sha, pull.head], overlay)
+                if outcome.code == 0 and not outcome.timed_out:
+                    tip.verdict = _merged("pull_request", pull.number)
+                    break
+                if outcome.code == 1 and not outcome.timed_out:
+                    continue
+                tip.fail(_call_failure(outcome))
+                break
 
     # -- step 2 ---------------------------------------------------------
 
@@ -2556,10 +2755,13 @@ def _assign_clone_verdicts(
     base: _Base | None,
     settings: _VerdictSettings,
     cache: Mapping[str, tuple[str, int]],
+    requests: Mapping[str, Sequence[_PullRequest]] | None = None,
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
 ) -> _CloneVerdicts:
     """Write one clone's ``verdict_base``, every verdict and its containment.
 
-    Returns the cache keys the verdicts used or decided.
+    ``requests`` are the repository's pull requests by head branch name when its
+    lookup answered. Returns the cache keys the verdicts used or decided.
     """
     detached = [
         worktree
@@ -2576,7 +2778,15 @@ def _assign_clone_verdicts(
         return _CloneVerdicts()
     clone["verdict_base"] = base.document()
     subjects = [branch for branch in clone["branches"] if branch["name"] != base.name]
-    ladder = _Ladder(runner, context, base, settings, cache) if subjects or detached else None
+    pulls = None
+    if requests is not None:
+        holders: dict[str, list[str]] = {}
+        for branch in clone["branches"]:
+            holders.setdefault(branch["sha"], []).append(branch["name"])
+        pulls = _PullRung(requests, holders, siblings)
+    ladder = (
+        _Ladder(runner, context, base, settings, cache, pulls) if subjects or detached else None
+    )
     result = _CloneVerdicts()
     if ladder is not None:
         decided = ladder.decide(
@@ -2621,6 +2831,15 @@ def _assign_removable(repositories: list[dict[str, Any]]) -> None:
             clone["removable_count"] = derived["removable_count"]
 
 
+_VerdictJob = tuple[
+    dict[str, Any],
+    _CloneContext,
+    _Base | None,
+    Mapping[str, Sequence[_PullRequest]] | None,
+    list[tuple[dict[str, Any], _CloneContext]],
+]
+
+
 def _assign_verdicts(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
@@ -2629,6 +2848,7 @@ def _assign_verdicts(
     settings: _VerdictSettings,
     max_parallel: int,
     cache: Mapping[str, tuple[str, int]],
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]] | None = None,
 ) -> dict[str, _CloneVerdicts]:
     """Give every usable clone its verdict base and verdicts, one clone per task.
 
@@ -2637,7 +2857,7 @@ def _assign_verdicts(
     Returns each clone's cache keys for the caller's cache write.  ``cache`` is
     only read here; the caller writes it afterwards.
     """
-    jobs: list[tuple[dict[str, Any], _CloneContext, _Base | None]] = []
+    jobs: list[_VerdictJob] = []
     for repository in repositories:
         agreed = (
             _group_default_name(repository["clones"])
@@ -2654,11 +2874,23 @@ def _assign_verdicts(
                 cached_default = clone["cached_default"]
                 name = (cached_default["name"] if cached_default is not None else None) or agreed
                 base = _cached_base(context, name)
-            jobs.append((clone, context, base))
+            requests = (
+                (pulls or {}).get(repository["remote"]["key"])
+                if repository["remote"] is not None
+                else None
+            )
+            siblings = [
+                (other, contexts[other["path"]])
+                for other in repository["clones"]
+                if other is not clone and other["status"] == "ok" and other["path"] in contexts
+            ]
+            jobs.append((clone, context, base, requests, siblings))
 
-    def decide(job: tuple[dict[str, Any], _CloneContext, _Base | None]) -> tuple[str, _CloneVerdicts]:
-        clone, context, base = job
-        return clone["path"], _assign_clone_verdicts(runner, clone, context, base, settings, cache)
+    def decide(job: _VerdictJob) -> tuple[str, _CloneVerdicts]:
+        clone, context, base, requests, siblings = job
+        return clone["path"], _assign_clone_verdicts(
+            runner, clone, context, base, settings, cache, requests, siblings
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         return dict(pool.map(decide, jobs))
@@ -2843,8 +3075,9 @@ def collect_checkouts(
             if outcome.clone is not None and outcome.context is not None
         }
         bases: dict[str, _Base | None] = {}
+        pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
         if remote_checks:
-            bases = _check_remotes(
+            bases, pulls = _check_remotes(
                 runner, repositories, contexts, max_parallel, github_lookup
             )
         # An account home that cannot be resolved, or a path the document
@@ -2868,6 +3101,7 @@ def collect_checkouts(
                 _verdict_settings(scratch, git_state["version"]),
                 max_parallel,
                 cache,
+                pulls,
             )
         _assign_removable(repositories)
         if cache_path is not None:

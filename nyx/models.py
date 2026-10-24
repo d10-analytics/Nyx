@@ -887,20 +887,25 @@ _BRANCH_KEYS = frozenset(
         "upstream",
         "upstream_mismatch",
         "vs_remote",
+        "pull_requests",
         "verdict",
         "contained_in",
         "removable",
     }
 )
+_PULL_REQUEST_KEYS = frozenset({"number", "state", "head_matches"})
+_PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
+# At most this many pull requests are listed for one branch.
+PULL_REQUEST_LIST_CAP = 10
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
 _VERDICT_PATCH_FLOOR = (2, 39)
 _NUMERIC_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 _VERDICT_BASE_KEYS = frozenset({"name", "sha", "basis", "objects_from"})
-_VERDICT_KEYS = frozenset({"state", "rung", "reason"})
+_VERDICT_KEYS = frozenset({"state", "rung", "reason", "pull_request"})
 _VERDICT_STATES = frozenset({"merged", "not_merged", "unknown"})
 _VERDICT_MERGED_RUNGS = frozenset(
-    {"ancestor", "patch_equivalent", "squash_equivalent", "tree_equal"}
+    {"ancestor", "pull_request", "patch_equivalent", "squash_equivalent", "tree_equal"}
 )
 _VERDICT_UNKNOWN_REASONS = frozenset(
     {"no_base", "incomplete_clone", "git_too_old", "history_limit", "deadline", "failed"}
@@ -1045,6 +1050,7 @@ def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
     _keys(item, _VERDICT_KEYS, name)
     state = _choice(item["state"], _VERDICT_STATES, f"{name}.state")
     rung, reason = item["rung"], item["reason"]
+    number = item["pull_request"]
     if state == "merged":
         _choice(rung, _VERDICT_MERGED_RUNGS, f"{name}.rung")
         valid = reason is None
@@ -1055,6 +1061,10 @@ def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
         valid = rung is None
     if not valid:
         raise ProtocolError(f"{name} carries a rung or reason its state does not allow")
+    if number is not None and (type(number) is not int or number < 1):
+        raise ProtocolError(f"{name}.pull_request must be a positive integer or null")
+    if (number is not None) != (rung == "pull_request"):
+        raise ProtocolError(f"{name}.pull_request must be set exactly for the pull_request rung")
 
 
 def _verdict_base(value: Any, name: str) -> None:
@@ -1110,6 +1120,26 @@ def _worktree(value: Any, name: str) -> dict[str, Any]:
     return item
 
 
+def _pull_requests(value: Any, name: str) -> None:
+    """Check one branch's pull-request list: bounded, unique, ordered by number."""
+    listed = _list(value, name)
+    if len(listed) > PULL_REQUEST_LIST_CAP:
+        raise ProtocolError(f"{name} lists more than {PULL_REQUEST_LIST_CAP} pull requests")
+    numbers: list[int] = []
+    for index, raw in enumerate(listed):
+        label = f"{name}[{index}]"
+        item = _object(raw, label)
+        _keys(item, _PULL_REQUEST_KEYS, label)
+        number = item["number"]
+        if type(number) is not int or number < 1:
+            raise ProtocolError(f"{label}.number must be a positive integer")
+        _choice(item["state"], _PULL_REQUEST_STATES, f"{label}.state")
+        _bool(item["head_matches"], f"{label}.head_matches")
+        numbers.append(number)
+    if any(left >= right for left, right in zip(numbers, numbers[1:])):
+        raise ProtocolError(f"{name} must be unique and sorted by number")
+
+
 def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _BRANCH_KEYS, name)
@@ -1126,6 +1156,7 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
         raise ProtocolError(f"{name} compares with a remote the clone does not have")
     if has_remote and item["vs_remote"] is None:
         raise ProtocolError(f"{name}.vs_remote is required for a clone with a remote")
+    _pull_requests(item["pull_requests"], f"{name}.pull_requests")
     _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     _nullable(item["contained_in"], _text, f"{name}.contained_in")
     return item
@@ -1259,15 +1290,30 @@ def _clone_verdicts(
     name: str,
     *,
     has_remote: bool,
+    lookup_used: bool,
     git_version: str | None,
     branches: list[dict[str, Any]],
     worktrees: list[dict[str, Any]],
 ) -> None:
-    """Check the verdicts of one ``ok`` clone against its base and its own limits."""
+    """Check the verdicts of one ``ok`` clone against its base and its own limits.
+
+    ``lookup_used`` says the repository's pull-request lookup is ``live`` or
+    ``recorded``: only then may a branch list pull requests or a verdict
+    carry the ``pull_request`` rung.
+    """
     base = item["verdict_base"]
     if base is not None and not has_remote:
         raise ProtocolError(f"{name}.verdict_base requires a remote")
-    verdicts: list[tuple[str, Mapping[str, Any]]] = []
+    merged_at: dict[str, set[int]] = {}
+    for index, branch in enumerate(branches):
+        if branch["pull_requests"] and not lookup_used:
+            raise ProtocolError(
+                f"{name}.branches[{index}].pull_requests requires a pull-request lookup"
+            )
+        merged_at.setdefault(branch["sha"], set()).update(
+            pull["number"] for pull in branch["pull_requests"] if pull["state"] == "merged"
+        )
+    verdicts: list[tuple[str, Mapping[str, Any], str | None]] = []
     for index, branch in enumerate(branches):
         label = f"{name}.branches[{index}].verdict"
         verdict = branch["verdict"]
@@ -1275,7 +1321,7 @@ def _clone_verdicts(
         if names_base != (verdict is None):
             raise ProtocolError(f"{label} must be null exactly for the verdict base branch")
         if verdict is not None:
-            verdicts.append((label, verdict))
+            verdicts.append((label, verdict, branch["sha"]))
     for index, worktree in enumerate(worktrees):
         label = f"{name}.worktrees[{index}].verdict"
         detached = (
@@ -1285,9 +1331,15 @@ def _clone_verdicts(
         if detached != (worktree["verdict"] is not None):
             raise ProtocolError(f"{label} must be present exactly for a detached checkout")
         if worktree["verdict"] is not None:
-            verdicts.append((label, worktree["verdict"]))
+            verdicts.append((label, worktree["verdict"], worktree["head"]["sha"]))
     limited = item["shallow"] or item["partial_clone"]
-    for label, verdict in verdicts:
+    for label, verdict, commit in verdicts:
+        if verdict["rung"] == "pull_request" and (
+            not lookup_used or verdict["pull_request"] not in merged_at.get(commit, ())
+        ):
+            raise ProtocolError(
+                f"{label} names a pull request no branch at its commit lists as merged"
+            )
         no_base = _verdict_state(verdict) == ("unknown", "no_base")
         if no_base != (base is None):
             raise ProtocolError(f"{label} contradicts the verdict base of the clone")
@@ -1404,6 +1456,7 @@ def _clone(
     name: str,
     *,
     has_remote: bool,
+    lookup_used: bool,
     worktree_paths: set[str],
     git_version: str | None,
 ) -> dict[str, Any]:
@@ -1494,6 +1547,7 @@ def _clone(
         item,
         name,
         has_remote=has_remote,
+        lookup_used=lookup_used,
         git_version=git_version,
         branches=parsed_branches,
         worktrees=parsed,
@@ -1604,6 +1658,7 @@ def _repository(
             github_lookup=github_lookup,
             remote_checks=remote_checks,
         )
+    lookup_used = remote is not None and item["pr_lookup"]["status"] in ("live", "recorded")
     clones = _list(item["clones"], f"{name}.clones")
     if not clones or (remote is None and len(clones) != 1):
         raise ProtocolError(f"{name}.clones has the wrong size")
@@ -1612,6 +1667,7 @@ def _repository(
             raw,
             f"{name}.clones[{clone_index}]",
             has_remote=remote is not None,
+            lookup_used=lookup_used,
             worktree_paths=worktree_paths,
             git_version=git_version,
         )
