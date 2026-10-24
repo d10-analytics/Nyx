@@ -42,6 +42,7 @@ from .models import (
     CHECKOUTS_DIGEST_OMITTED,
     CHECKOUTS_SCHEMA_VERSION,
     OPERATIONS,
+    PULL_REQUEST_LIST_CAP,
     ProtocolError,
     _keys,
     _object,
@@ -1376,8 +1377,10 @@ _GITHUB_REMOVED_VARIABLES = frozenset({"GH_REPO", "GH_HOST"})
 _GITHUB_UNAUTHENTICATED_EXIT = 4
 _GITHUB_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
 _GITHUB_NODE_FIELDS = "number state headRefOid baseRefName isCrossRepository"
-_GITHUB_ALIAS_ARGUMENTS = "first: 10, orderBy: {field: CREATED_AT, direction: DESC}"
-_GITHUB_NODE_CAP = 10
+# The request asks for exactly as many pull requests as a branch may list.
+_GITHUB_ALIAS_ARGUMENTS = (
+    f"first: {PULL_REQUEST_LIST_CAP}, orderBy: {{field: CREATED_AT, direction: DESC}}"
+)
 _RATE_LIMIT_PHRASES = ("rate limit",)
 _GITHUB_AUTH_PHRASES = ("http 401", "bad credentials", "gh auth login")
 
@@ -1450,11 +1453,11 @@ class _PullRequest:
 def _pull_requests_of(nodes: Sequence[Any]) -> tuple[_PullRequest, ...]:
     """The listed pull requests of one branch name, by number.
 
-    Only same-repository requests count; the first ``_GITHUB_NODE_CAP`` in
+    Only same-repository requests count; the first ``PULL_REQUEST_LIST_CAP`` in
     answer order (newest first) are kept, a repeated number once."""
     kept: dict[int, _PullRequest] = {}
     for node in nodes:
-        if node["isCrossRepository"] or len(kept) >= _GITHUB_NODE_CAP:
+        if node["isCrossRepository"] or len(kept) >= PULL_REQUEST_LIST_CAP:
             continue
         kept.setdefault(
             node["number"],

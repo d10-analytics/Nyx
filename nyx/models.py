@@ -895,7 +895,8 @@ _BRANCH_KEYS = frozenset(
 )
 _PULL_REQUEST_KEYS = frozenset({"number", "state", "head_matches"})
 _PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
-# At most this many pull requests are listed for one branch.
+# At most this many pull requests are listed for one branch; the collector's
+# request and list cap are built from it.
 PULL_REQUEST_LIST_CAP = 10
 _COMPARISON_KEYS = frozenset({"basis", "relation", "ahead", "behind", "objects_from"})
 _COMPARISON_BASES = frozenset({"live", "cached"})
