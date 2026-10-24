@@ -9601,3 +9601,43 @@ def test_a_clone_the_lender_rule_refuses_lends_to_neither_the_live_apply_nor_the
         assert lent["local_default"]["vs_remote"]["objects_from"] == real(first)
         assert refused["local_default"]["vs_remote"]["objects_from"] is None
         assert refused["local_default"]["vs_remote"]["relation"] == "differs"
+
+
+@posix_only
+def test_the_first_sibling_in_natural_order_lends_to_both_the_live_apply_and_the_rung(
+    tmp_path, monkeypatch
+):
+    folder, remote, _first, second, tip, head = squash_world(
+        tmp_path, first_inside=False, trunk_fetched=True
+    )
+    holders = []
+    for name in ("holder 10", "holder 2"):
+        holder = clone(remote, folder / name)
+        point_origin_at(holder, remote, GITHUB_URL)
+        assert git(holder, "cat-file", "-e", head, check=False).returncode == 0
+        holders.append(holder)
+    later, earlier = holders
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((second, *holders), head))
+    log = tmp_path / "head-calls.log"
+    shim = stand_in(
+        tmp_path,
+        "alternates",
+        f'case "$*" in *{head}*) '
+        f'printf "%s|%s\\n" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" "$*" >> "{log}";; esac',
+    )
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert topic["sha"] == tip
+    # Both siblings hold the head; the one first in natural order lends it, to the
+    # live comparison of the branch and to the ancestry test of the rung alike.
+    assert topic["vs_remote"]["relation"] == "behind"
+    assert topic["vs_remote"]["objects_from"] == real(earlier)
+    assert verdict_facts(topic) == pr_verdict(12)
+    calls = [line.split("|", 1) for line in log.read_text().splitlines()]
+    [ancestry] = [call for call in calls if "merge-base --is-ancestor" in call[1]]
+    assert ancestry[0] == os.path.join(real(earlier), ".git", "objects")
+    # The search stops at the first holder: the later sibling is never asked.
+    assert not [call for call in calls if real(later) in call[1]]
