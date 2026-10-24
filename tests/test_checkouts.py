@@ -9546,3 +9546,58 @@ def test_parser_rejects_a_rung_number_equal_to_a_listed_one_but_not_an_integer(s
     broken = doc_copy(base)
     branch_of(first_clone(broken), "never-pushed")["verdict"]["pull_request"] = value
     assert "pull_request" in refusal_of(rederive(broken))
+
+
+@posix_only
+def test_the_request_limit_and_the_list_cap_both_come_from_the_parser_constant(
+    tmp_path, monkeypatch
+):
+    cap = models.PULL_REQUEST_LIST_CAP
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "branch", "many", "trunk")
+    names = local_names(work)
+    nodes = [pr_node(number, "closed", UNRELATED_HEAD) for number in range(cap + 5, 0, -1)]
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, {"many": nodes}))
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    query = json.loads(call.body)["query"]
+    assert query.count(f"first: {cap},") == len(names)
+    assert query.count("first:") == len(names)
+    many = branch_of(find_clone(document, work), "many")["pull_requests"]
+    assert [pull["number"] for pull in many] == list(range(6, cap + 6))
+
+
+def refuse_lending(monkeypatch, *repositories: Path) -> None:
+    """Make the lender rule refuse the clones at ``repositories``."""
+    refused = {os.path.join(real(repository), ".git") for repository in repositories}
+    original = checkouts._lendable
+    monkeypatch.setattr(
+        checkouts,
+        "_lendable",
+        lambda context: os.path.realpath(context.common) not in refused and original(context),
+    )
+
+
+@pytest.mark.parametrize("trunk_fetched", [False, True], ids=["base-lent", "head-lent"])
+@posix_only
+def test_a_clone_the_lender_rule_refuses_lends_to_neither_the_live_apply_nor_the_rung(
+    tmp_path, monkeypatch, trunk_fetched
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=trunk_fetched)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    lent = find_clone(github_collect(folder), second)
+    assert verdict_facts(branch_of(lent, "topic")) == pr_verdict(12)
+
+    refuse_lending(monkeypatch, first)
+    refused = find_clone(github_collect(folder), second)
+
+    assert verdict_facts(branch_of(refused, "topic")) == NOT_MERGED_FACTS
+    assert listed(branch_of(refused, "topic")) == [(12, "merged", False)]
+    if not trunk_fetched:
+        # The live apply borrows from the same candidates: without one it cannot count.
+        assert lent["local_default"]["vs_remote"]["objects_from"] == real(first)
+        assert refused["local_default"]["vs_remote"]["objects_from"] is None
+        assert refused["local_default"]["vs_remote"]["relation"] == "differs"
