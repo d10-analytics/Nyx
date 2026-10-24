@@ -8920,7 +8920,12 @@ def test_a_merged_pull_request_whose_head_is_the_tip_proves_the_branch_merged_un
     assert stored[f"{rev(work, 'sq')}.{base}"] == "squash_equivalent"
     assert stored[f"{rev(work, 'open')}.{base}"] == "none"
 
-    # With the lookup unable to answer, the same branches have their git verdicts.
+    # With the lookup unable to answer and no saved listing to stand in for it, the
+    # same branches have their git verdicts.
+    saved = saved_file(cache)
+    for record in saved["remote_checks"].values():
+        record["pull_requests"] = None
+    cache.write_text(json.dumps(saved))
     fake.replay(code=4)
     plain = github_collect(folder)
     plain_item = find_clone(plain, work)
@@ -9952,9 +9957,10 @@ def test_a_networked_run_whose_every_check_fails_and_decides_no_verdict_leaves_t
     # Every check was made and failed; nothing was written, not even a time.
     assert len(log.read_text().splitlines()) == 4
     assert len(fake.calls()) == 2
-    assert {r["remote"]["check"]["status"] for r in document["repositories"]} == {"failed"}
+    assert {r["remote"]["check"]["status"] for r in document["repositories"]} == {"recorded"}
     [hub_group] = [r for r in document["repositories"] if r["remote"]["key"] == GITHUB_KEY]
-    assert hub_group["pr_lookup"]["status"] == "unavailable"
+    assert hub_group["pr_lookup"]["status"] == "recorded"
+    assert hub_group["pr_lookup"]["reason"] == "failed"
     assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
 
 
@@ -9989,7 +9995,7 @@ def test_a_new_verdict_is_written_whatever_the_checks_did_and_keeps_the_saved_re
     move_away(other)
     fake.replay(code=1)
     failing = github_collect(folder)
-    assert {r["remote"]["check"]["status"] for r in failing["repositories"]} == {"failed"}
+    assert {r["remote"]["check"]["status"] for r in failing["repositories"]} == {"recorded"}
     failed_saved = saved_file(cache)
     assert len(failed_saved["verdicts"]) == 2
     assert failed_saved["remote_checks"] == saved["remote_checks"]
@@ -10262,6 +10268,17 @@ def test_a_remote_whose_answer_alone_exceeds_the_budget_keeps_no_heads_record(
     assert stable(offline_after) == stable(offline_before)
 
 
+def without_group(document: dict[str, Any], key: str) -> dict[str, Any]:
+    return {
+        **document,
+        "repositories": [
+            group
+            for group in document["repositories"]
+            if group["remote"] is None or group["remote"]["key"] != key
+        ],
+    }
+
+
 def valid_saved_file() -> dict[str, Any]:
     head = "a" * 40
     return {
@@ -10328,11 +10345,525 @@ def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
 
     result = collect([folder])
 
-    assert stable(result) == stable(cold)
     if kind == "valid":
         assert result["diagnostics"] == cold["diagnostics"] == []
+        # The file is read; its saved checks stand in for the checks an offline run
+        # does not make, for the one remote it holds, and for no other.
+        [saved_group] = [r for r in result["repositories"] if r["remote"]["key"] == GITHUB_KEY]
+        assert saved_group["remote"]["check"] == {
+            "status": "recorded",
+            "reason": "remote_checks_off",
+            "checked_at": "1970-01-01T00:00:05Z",
+        }
+        assert stable(without_group(result, GITHUB_KEY)) == stable(
+            without_group(cold, GITHUB_KEY)
+        )
+        return
+    assert stable(result) == stable(cold)
+    assert result["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_unreadable", "path": str(cache)},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Using the saved remote checks
+# ---------------------------------------------------------------------------
+
+
+def utc_text(seconds: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def as_recorded(value: Any) -> Any:
+    """A document fragment with every ``live`` basis named ``recorded``."""
+    if isinstance(value, dict):
+        return {
+            key: "recorded" if key == "basis" and item == "live" else as_recorded(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [as_recorded(item) for item in value]
+    return value
+
+
+def remote_bases(item: dict[str, Any]) -> set[str]:
+    """The basis of every remote-derived comparison and of the verdict base of a clone."""
+    found = {branch["vs_remote"]["basis"] for branch in item["branches"]}
+    found.add(item["cached_vs_remote"]["basis"])
+    found.add(item["local_default"]["vs_remote"]["basis"])
+    found.add(item["verdict_base"]["basis"])
+    return found
+
+
+def group_with_key(document: dict[str, Any], key: str) -> dict[str, Any]:
+    [group] = [item for item in document["repositories"] if item["remote"]["key"] == key]
+    return group
+
+
+class SavedWorld:
+    """A GitHub-identity remote with two clones, a local-only branch, a merged pull
+    request, a remote that moved ahead of one clone, and the networked run that
+    saved its checks."""
+
+    def __init__(self, tmp_path: Path, monkeypatch, isolated_git: Path) -> None:
+        self.tmp_path = tmp_path
+        self.cache = nyx_home(isolated_git)
+        self.folder, self.remote, self.work = landed_world(tmp_path)
+        git(self.work, "branch", "wip", "trunk")
+        self.second = clone(self.remote, self.folder / "second")
+        point_origin_at(self.second, self.remote, GITHUB_URL)
+        self.head = push_commit(self.remote, "trunk", tmp_path)
+        git(self.second, "fetch", "-q", "origin")
+        self.names = local_names(self.work, self.second)
+        self.answer = pr_answer(
+            self.names, {"done": [pr_node(7, "merged", rev(self.work, "done"))]}
+        )
+        self.fake = install_fake_gh(tmp_path, monkeypatch, stdout=self.answer)
+        self.markers = [guard_remote(path, tmp_path) for path in (self.work, self.second)]
+        self.shim, self.log = ls_remote_log(tmp_path)
+        with path_with(monkeypatch, self.shim):
+            self.live = github_collect(self.folder)
+        self.saved = saved_file(self.cache)["remote_checks"][GITHUB_KEY]
+
+    def contacts(self) -> bool:
+        """Whether any upload-pack of the remote ran since the markers were last cleared."""
+        found = any(marker.exists() for marker in self.markers)
+        for marker in self.markers:
+            marker.unlink(missing_ok=True)
+        return found
+
+    def ls_remotes(self) -> int:
+        return len(self.log.read_text().splitlines()) if self.log.exists() else 0
+
+
+@posix_only
+def test_an_offline_collection_answers_from_the_saved_checks_as_the_networked_run_did(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    live_group = world.live["repositories"][0]
+    live_work = find_clone(world.live, world.work)
+    # Control: the networked run contacted the remote and compared on live objects.
+    assert world.contacts()
+    assert live_work["local_default"]["vs_remote"] == {
+        "basis": "live",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(world.second),
+    }
+    assert verdict_facts(branch_of(live_work, "done")) == pr_verdict(7)
+    contacts, gh_calls = world.ls_remotes(), len(world.fake.calls())
+
+    with path_with(monkeypatch, world.shim):
+        offline = collect([world.folder], github_lookup=True)
+
+    assert offline["remote_checks"] == "off"
+    [group] = offline["repositories"]
+    assert group["remote"]["check"] == {
+        "status": "recorded",
+        "reason": "remote_checks_off",
+        "checked_at": utc_text(world.saved["heads"]["at"]),
+    }
+    assert TIMESTAMP.fullmatch(group["remote"]["check"]["checked_at"])
+    assert group["default_branch"] == {"name": "trunk", "sha": world.head}
+    assert group["default_branch"] == live_group["default_branch"]
+    assert group["pr_lookup"] == {
+        "status": "recorded",
+        "reason": "remote_checks_off",
+        "checked_at": utc_text(world.saved["pull_requests"]["at"]),
+    }
+    # The remote saw nothing and no tool was started.
+    assert not world.contacts()
+    assert world.ls_remotes() == contacts
+    assert len(world.fake.calls()) == gh_calls
+    for path in (world.work, world.second):
+        item = find_clone(offline, path)
+        assert remote_bases(item) == {"recorded"}
+        assert item["local_default"]["vs_cached"]["basis"] == "cached"
+        # The same relations, counts, lenders, pull requests, verdicts and base.
+        assert item == as_recorded(find_clone(world.live, path))
+    # A verdict decided from saved pull-request facts is not remembered.
+    stored = cache_entries(world.cache)
+    assert f"{rev(world.work, 'done')}.{world.head}" not in stored
+    assert set(stored.values()) <= checkouts.CACHE_RUNGS
+    work = find_clone(offline, world.work)
+    assert branch_of(work, "wip")["vs_remote"]["relation"] == "absent"
+    assert verdict_facts(branch_of(work, "done")) == pr_verdict(7)
+    assert [pull["number"] for pull in branch_of(work, "done")["pull_requests"]] == [7]
+    assert work["verdict_base"]["objects_from"] == real(world.second)
+
+
+@posix_only
+def test_equal_collections_have_equal_digests_and_a_live_check_carries_no_time(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    first = collect([world.folder], github_lookup=True)
+    time.sleep(1.1)
+    second = collect([world.folder], github_lookup=True)
+    assert first["checkouts_digest"] == second["checkouts_digest"]
+
+    time.sleep(1.1)
+    again = github_collect(world.folder)
+
+    assert again["checkouts_digest"] == world.live["checkouts_digest"]
+    [group] = again["repositories"]
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    assert group["pr_lookup"] == {"status": "live", "reason": None, "checked_at": None}
+    # The networked run renewed both saved checks, so the next offline run reads newer times.
+    renewed = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert renewed["heads"]["at"] > world.saved["heads"]["at"]
+    later = collect([world.folder], github_lookup=True)
+    assert later["repositories"][0]["remote"]["check"]["checked_at"] == utc_text(
+        renewed["heads"]["at"]
+    )
+    assert later["checkouts_digest"] != first["checkouts_digest"]
+
+
+@posix_only
+def test_a_networked_collection_whose_remote_moved_away_reports_the_saved_check(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    move_away(world.remote)
+
+    document = github_collect(world.folder)
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"] == {
+        "status": "recorded",
+        "reason": "not_found",
+        "checked_at": utc_text(world.saved["heads"]["at"]),
+    }
+    assert group["default_branch"] == {"name": "trunk", "sha": world.head}
+    # The pull-request lookup was live in the same run.
+    assert group["pr_lookup"] == {"status": "live", "reason": None, "checked_at": None}
+    for path in (world.work, world.second):
+        assert find_clone(document, path) == as_recorded(find_clone(world.live, path))
+    # A failed check wrote no time of its own.
+    assert saved_file(world.cache)["remote_checks"][GITHUB_KEY]["heads"] == world.saved["heads"]
+
+
+GH_FAILURES = [
+    ("not_authenticated", {"code": 4}),
+    ("rate_limited", {"code": 1, "stderr": "API rate limit exceeded"}),
+    ("not_found", {"code": 0, "stdout": NULL_REPOSITORY}),
+    ("failed", {"code": 0, "stdout": "this is not json"}),
+    ("timed_out", {"code": 0, "delay": 30}),
+    ("gh_missing", None),
+]
+
+
+@posix_only
+@pytest.mark.parametrize(("reason", "replay"), GH_FAILURES, ids=[case[0] for case in GH_FAILURES])
+def test_a_failed_pull_request_lookup_is_answered_from_the_saved_facts(
+    tmp_path, monkeypatch, isolated_git, reason, replay
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    options: dict[str, Any] = {}
+    if replay is None:
+        monkeypatch.setenv("PATH", git_only_path(tmp_path))
     else:
-        assert result["diagnostics"] == [
-            *cold["diagnostics"],
-            {"code": "checkout_cache_unreadable", "path": str(cache)},
+        world.fake.replay(**replay)
+    if reason == "timed_out":
+        options["call_cap_seconds"] = 2
+    calls = len(world.fake.calls())
+
+    document = github_collect(world.folder, **options)
+
+    assert len(world.fake.calls()) == calls + (0 if replay is None else 1)
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {
+        "status": "recorded",
+        "reason": reason,
+        "checked_at": utc_text(world.saved["pull_requests"]["at"]),
+    }
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    work = find_clone(document, world.work)
+    assert verdict_facts(branch_of(work, "done")) == pr_verdict(7)
+    assert find_clone(document, world.work) == find_clone(world.live, world.work)
+    assert saved_file(world.cache)["remote_checks"][GITHUB_KEY]["pull_requests"] == (
+        world.saved["pull_requests"]
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("options", [{}, {"remote_checks": True}], ids=["offline", "networked"])
+def test_a_collection_with_the_lookup_off_never_uses_the_saved_pull_requests(
+    tmp_path, monkeypatch, isolated_git, options
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    assert verdict_facts(branch_of(find_clone(world.live, world.work), "done")) == pr_verdict(7)
+
+    document = collect([world.folder], github_lookup=False, **options)
+
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {"status": "off", "reason": "setting_off", "checked_at": None}
+    for item in all_clones(document):
+        assert all(branch["pull_requests"] == [] for branch in item["branches"])
+        rungs = [branch["verdict"]["pull_request"] for branch in item["branches"] if branch["verdict"]]
+        assert rungs == [None] * len(rungs)
+    work = find_clone(document, world.work)
+    assert verdict_facts(branch_of(work, "done")) == ("merged", "squash_equivalent", None, None)
+
+
+@posix_only
+def test_a_saved_pull_request_listing_is_never_used_for_a_remote_that_is_not_github(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "done")
+    collect([folder], remote_checks=True, github_lookup=True)
+    saved = saved_file(cache)
+    [key] = saved["remote_checks"]
+    saved["remote_checks"][key]["pull_requests"] = {
+        "at": 5,
+        "by_head": {
+            "done": [{"number": 7, "state": "merged", "head": rev(work, "done"), "base": "trunk"}]
+        },
+    }
+    cache.write_text(json.dumps(saved))
+
+    document = collect([folder], github_lookup=True)
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["pr_lookup"] == {"status": "off", "reason": "not_github", "checked_at": None}
+    item = find_clone(document, work)
+    assert branch_of(item, "done")["pull_requests"] == []
+    assert verdict_facts(branch_of(item, "done")) == ("merged", "squash_equivalent", None, None)
+
+
+@posix_only
+def test_a_branch_created_after_the_saved_check_is_absent_with_no_pull_requests(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    git(world.work, "branch", "late", "trunk")
+
+    document = collect([world.folder], github_lookup=True)
+
+    late = branch_of(find_clone(document, world.work), "late")
+    assert late["vs_remote"] == {
+        "basis": "recorded",
+        "relation": "absent",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+    assert late["pull_requests"] == []
+    # The saved listing still serves the branches it names.
+    done = branch_of(find_clone(document, world.work), "done")
+    assert [pull["number"] for pull in done["pull_requests"]] == [7]
+
+
+@posix_only
+def test_the_saved_check_of_an_empty_remote_leaves_no_default_and_every_branch_absent(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    empty = served / "empty.git"
+    git(served, "init", "-q", "--bare", str(empty))
+    work = clone(empty, folder / "work")
+    commit_file(work, "file.txt", "one\n")
+    git(work, "branch", "other")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["default_branch"] == {"name": None, "sha": None}
+    item = find_clone(document, work)
+    assert item["local_default"] is None
+    assert item["cached_vs_remote"]["relation"] == "absent"
+    assert item["cached_vs_remote"]["basis"] == "recorded"
+    assert [
+        (branch["vs_remote"]["relation"], branch["vs_remote"]["basis"])
+        for branch in item["branches"]
+    ] == [("absent", "recorded")] * 2
+
+
+@posix_only
+@pytest.mark.parametrize("kind", ["no-home", "empty-file"])
+def test_with_no_saved_check_an_offline_collection_reports_the_cached_state(
+    tmp_path, isolated_git, kind
+):
+    folder, _remote, work = landed_world(tmp_path)
+    if kind == "empty-file":
+        write_cache(nyx_home(isolated_git), {})
+    else:
+        assert not (isolated_git / ".nyx").exists()
+
+    document = collect([folder], github_lookup=True)
+
+    assert document["diagnostics"] == []
+    [group] = document["repositories"]
+    assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
+    assert group["pr_lookup"] == {"status": "off", "reason": "remote_checks_off", "checked_at": None}
+    assert group["default_branch"] == {"name": "trunk", "sha": None}
+    item = find_clone(document, work)
+    assert {comparison["basis"] for comparison in comparisons_of(item)} == {"cached"}
+    assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_recorded_comparison_borrows_the_saved_head_from_a_sibling_clone_and_names_it(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, lagging = small_world(tmp_path)
+    lender = clone(remote, folder / "a-lender")
+    head = push_commit(remote, "trunk", tmp_path)
+    git(lender, "fetch", "-q", "origin")
+    markers = [guard_remote(path, tmp_path) for path in (lagging, lender)]
+    collect([folder], remote_checks=True)
+    assert any(marker.exists() for marker in markers), "control: the networked run made contact"
+    for marker in markers:
+        marker.unlink(missing_ok=True)
+
+    document = collect([folder])
+
+    item = find_clone(document, lagging)
+    assert item["local_default"]["vs_remote"] == {
+        "basis": "recorded",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(lender),
+    }
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": head,
+        "basis": "recorded",
+        "objects_from": real(lender),
+    }
+    assert not any(marker.exists() for marker in markers)
+
+
+@posix_only
+def test_a_recorded_check_leaves_shallow_and_partial_clones_to_differ_without_object_calls(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    push_commit(remote, "trunk", tmp_path)
+    full = clone(remote.as_uri(), folder / "a-full")
+    partial = clone(remote.as_uri(), folder / "b-partial", "--filter=blob:none")
+    shallow = clone(remote.as_uri(), folder / "c-shallow", "--depth=1")
+    push_commit(remote, "trunk", tmp_path)
+    collect([folder], remote_checks=True)
+    shim, log = recording(tmp_path, "object-calls")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    def object_calls(path: Path) -> list[str]:
+        return [
+            line
+            for line in log.read_text().splitlines()
+            if f"-C {real(path)} " in line and ("--ignore-missing" in line or "--left-right" in line)
         ]
+
+    # Control: a complete clone does look for the saved head.
+    assert object_calls(full)
+    for path in (partial, shallow):
+        assert object_calls(path) == []
+        item = find_clone(document, path)
+        for comparison in (
+            item["cached_vs_remote"],
+            item["local_default"]["vs_remote"],
+            branch_of(item, "trunk")["vs_remote"],
+        ):
+            assert comparison == {
+                "basis": "recorded",
+                "relation": "differs",
+                "ahead": None,
+                "behind": None,
+                "objects_from": None,
+            }
+
+
+@posix_only
+def test_a_recorded_count_call_that_times_out_is_unknown_not_a_difference(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "feature.txt", "local\n")
+    git(work, "checkout", "-q", "trunk")
+    push_commit(remote, "feature", tmp_path)
+    # The clone holds the saved commit but has no remote-tracking ref for it, so the
+    # recorded comparison is the only count in the run.
+    git(work, "fetch", "-q", "origin", "feature")
+    git(work, "update-ref", "-d", "refs/remotes/origin/feature")
+    collect([folder], remote_checks=True)
+    control = branch_of(find_clone(collect([folder]), work), "feature")["vs_remote"]
+    assert (control["basis"], control["relation"]) == ("recorded", "diverged")
+    shim = stand_in(tmp_path, "slow-count", 'case "$*" in *"--left-right --count"*) sleep 30;; esac')
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=2)
+
+    comparison = branch_of(find_clone(document, work), "feature")["vs_remote"]
+    assert comparison == {
+        "basis": "recorded",
+        "relation": "unknown",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+
+
+@pytest.mark.parametrize("basis", ["live", "recorded"])
+def test_a_count_call_that_never_ran_is_unknown_on_every_remote_basis(basis):
+    never = checkouts._Outcome(None)
+
+    assert checkouts._counted_comparison(never, basis) == {
+        "basis": basis,
+        "relation": "unknown",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+    assert checkouts._counted_comparison(never, "cached")["relation"] == "differs"
+
+
+@posix_only
+def test_a_networked_run_that_decides_no_verdict_moves_the_head_an_offline_run_reports(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    first_time = utc_text(saved_file(cache)["remote_checks"][GITHUB_KEY]["heads"]["at"])
+    time.sleep(1.1)
+    # A clone outside the folders moves the remote's trunk.
+    pushed = push_commit(hub, "trunk", tmp_path)
+    github_collect(folder)
+    after = saved_file(cache)
+    assert after["verdicts"] == {}, "control: the run decided no verdict to store"
+    saved_bytes = cache.read_bytes()
+
+    document = collect([folder], github_lookup=True)
+
+    group = group_with_key(document, GITHUB_KEY)
+    assert group["default_branch"] == {"name": "trunk", "sha": pushed}
+    checked_at = group["remote"]["check"]["checked_at"]
+    assert checked_at == utc_text(after["remote_checks"][GITHUB_KEY]["heads"]["at"])
+    assert checked_at > first_time
+    assert cache.read_bytes() == saved_bytes
