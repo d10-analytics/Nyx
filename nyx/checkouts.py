@@ -30,7 +30,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1294,6 +1294,8 @@ class _LiveAnswer:
     name: str | None = None
     sha: str | None = None
     branches: Mapping[str, str] = field(default_factory=dict)
+    # Unix seconds taken just before the call started; set on a successful answer.
+    at: int = 0
 
 
 def _failure_reason(outcome: _Outcome) -> str:
@@ -1350,6 +1352,7 @@ def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
         and not context.ssh_configured
     ):
         overlay["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    at = int(time.time())
     outcome = runner.run(
         ["ls-remote", "--symref", "origin", "HEAD", "refs/heads/*"],
         path=context.cwd,
@@ -1359,7 +1362,7 @@ def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
     if not outcome.ok:
         return _LiveAnswer(_failure_reason(outcome))
     answer = _parse_listing(outcome.out)
-    return answer if answer is not None else _LiveAnswer("failed")
+    return replace(answer, at=at) if answer is not None else _LiveAnswer("failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1534,9 +1537,10 @@ def _github_answer(
 
 def _query_github(
     runner: _GitRunner, executable: str, key: str, branches: Sequence[str]
-) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
+) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]], int]:
     """The group's one ``gh api graphql`` call: ``None`` and the pull requests of
-    each branch name when GitHub answered, else the failure category and nothing.
+    each branch name when GitHub answered, else the failure category and nothing;
+    last, the Unix second taken just before the call started.
     The request file lives in a directory removed on return."""
     identity = github_identity(key)
     assert identity is not None
@@ -1545,11 +1549,13 @@ def _query_github(
         request = os.path.join(scratch, "request.json")
         with open(request, "wb") as handle:
             handle.write(_github_request(owner, name, branches))
+        at = int(time.time())
         outcome = runner.run_program(
             [executable, "api", "graphql", "--hostname", host, "--input", request],
             _github_environment(),
         )
-    return _github_answer(outcome, branches)
+    reason, listed = _github_answer(outcome, branches)
+    return reason, listed, at
 
 
 def _present_objects(
@@ -1836,6 +1842,34 @@ def _list_pull_requests(
             ]
 
 
+def _heads_record(answer: _LiveAnswer) -> dict[str, Any]:
+    """The saved form of one successful ``ls-remote``: its whole answer."""
+    return {
+        "at": answer.at,
+        "default": answer.name,
+        "head": answer.sha,
+        "branches": dict(answer.branches),
+    }
+
+
+def _pull_requests_record(
+    at: int, listed: Mapping[str, Sequence[_PullRequest]]
+) -> dict[str, Any]:
+    """The saved form of one successful ``gh`` call: the pull requests of every
+    queried branch name, an empty list for a name with none."""
+    return {
+        "at": at,
+        "by_head": {
+            name: [
+                {"number": pull.number, "state": pull.state, "head": pull.head, "base": pull.base}
+                for pull in pulls
+            ]
+            for name, pulls in listed.items()
+            if _safe_text(name)
+        },
+    }
+
+
 def _pr_lookup_unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason, "checked_at": None}
 
@@ -1846,13 +1880,18 @@ def _check_remotes(
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
     github_lookup: bool,
-) -> tuple[dict[str, _Base | None], dict[str, dict[str, tuple[_PullRequest, ...]]]]:
+) -> tuple[
+    dict[str, _Base | None],
+    dict[str, dict[str, tuple[_PullRequest, ...]]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
     lookup is on) then phase 3 (live comparisons per clone).
 
-    Returns the verdict base of each clone the live comparisons reached, and the
+    Returns the verdict base of each clone the live comparisons reached, the
     pull requests GitHub listed per head branch name for each remote key whose
-    lookup answered."""
+    lookup answered, and the records of this run's successful checks: per remote
+    key, ``heads`` and ``pull_requests`` for the calls that answered."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -1881,6 +1920,7 @@ def _check_remotes(
     # Resolved once, and only when a call will be made.
     gh = _resolve_program("gh") if lookups else None
     pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
+    checked: dict[str, dict[str, dict[str, Any]]] = {}
     if lookups and gh is None:
         for group, _ in lookups:
             group["pr_lookup"] = _pr_lookup_unavailable("gh_missing")
@@ -1888,7 +1928,7 @@ def _check_remotes(
 
     def ask(
         job: tuple[dict[str, Any], list[str]],
-    ) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
+    ) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]], int]:
         group, names = job
         assert gh is not None
         return _query_github(runner, gh, group["remote"]["key"], names)
@@ -1898,10 +1938,13 @@ def _check_remotes(
         pending = [pool.submit(ask, job) for job in lookups]
         answers = list(pool.map(query, chosen))
         for (group, _), future in zip(lookups, pending):
-            reason, listed = future.result()
+            reason, listed, asked_at = future.result()
             if reason is None:
                 group["pr_lookup"] = {"status": "live", "reason": None, "checked_at": None}
                 pulls[group["remote"]["key"]] = listed
+                checked.setdefault(group["remote"]["key"], {})["pull_requests"] = (
+                    _pull_requests_record(asked_at, listed)
+                )
                 _list_pull_requests(group, listed)
             else:
                 group["pr_lookup"] = _pr_lookup_unavailable(reason)
@@ -1912,6 +1955,7 @@ def _check_remotes(
                 group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
                 continue
             group["remote"]["check"] = {"status": "live", "reason": None}
+            checked.setdefault(group["remote"]["key"], {})["heads"] = _heads_record(answer)
             group["default_branch"] = {"name": answer.name, "sha": answer.sha}
             for clone, context in _usable_clones(group["clones"], contexts):
                 work.append((context, clone, answer, group))
@@ -1933,7 +1977,7 @@ def _check_remotes(
             )
 
         bases.update(pool.map(apply, work))
-    return bases, pulls
+    return bases, pulls, checked
 
 
 # ---------------------------------------------------------------------------
@@ -2905,20 +2949,126 @@ def _assign_verdicts(
 
 
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
-_CACHE_KEYS = frozenset({"schema_version", "verdicts"})
-# Version 1 stored patch rungs decided by a patch identity that ignored
-# whitespace and line numbers; its entries are never served.
-_CACHE_SCHEMA = 2
-_RETIRED_CACHE_SCHEMA = 1
+_CACHE_KEYS = frozenset({"schema_version", "verdicts", "remote_checks"})
+_CACHE_SCHEMA = 3
+# Earlier files held only verdicts. Version 1 stored patch rungs decided by a
+# patch identity that ignored whitespace and line numbers, and version 2 had no
+# saved remote checks. They are recognised by their own key set, read as empty
+# and replaced by the next write.
+_RETIRED_CACHE_KEYS = frozenset({"schema_version", "verdicts"})
+_RETIRED_CACHE_SCHEMAS = (1, 2)
 _CACHE_ENTRY_KEYS = frozenset({"rung", "at"})
+# The serialized ``remote_checks`` value is held to this many bytes, so the file
+# (at most ``CACHE_ENTRY_CAP`` verdicts of about 177 bytes, and this) stays far
+# below the reader's own bound.
+REMOTE_CHECKS_BUDGET = 2 * 1024 * 1024
+_REMOTE_MEMBERS = ("heads", "pull_requests")
+_REMOTE_KEYS = frozenset(_REMOTE_MEMBERS)
+_HEADS_KEYS = frozenset({"at", "default", "head", "branches"})
+_SAVED_PULL_REQUESTS_KEYS = frozenset({"at", "by_head"})
+_SAVED_PULL_REQUEST_KEYS = frozenset({"number", "state", "head", "base"})
+_SAVED_PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
 
 
-def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
+@dataclass(frozen=True)
+class _SavedCache:
+    """What the cache file holds: verdicts by key, and per remote key its saved
+    ``heads`` and ``pull_requests`` (each a record or ``None``)."""
+
+    verdicts: Mapping[str, tuple[str, int]] = field(default_factory=dict)
+    remote_checks: Mapping[str, Mapping[str, dict[str, Any] | None]] = field(
+        default_factory=dict
+    )
+
+
+def _saved_time(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise ProtocolError("checkout cache time is invalid")
+    return value
+
+
+def _saved_object_id(value: Any) -> str:
+    if type(value) is not str or _OBJECT_ID.fullmatch(value) is None:
+        raise ProtocolError("checkout cache object ID is invalid")
+    return value
+
+
+def _saved_text(value: Any) -> str:
+    if not _safe_text(value):
+        raise ProtocolError("checkout cache text is invalid")
+    return value
+
+
+def _parse_heads(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    record = _object(value, "checkout cache heads")
+    _keys(record, _HEADS_KEYS, "checkout cache heads")
+    default, head = record["default"], record["head"]
+    branches = _object(record["branches"], "checkout cache branches")
+    return {
+        "at": _saved_time(record["at"]),
+        "default": None if default is None else _saved_text(default),
+        "head": None if head is None else _saved_object_id(head),
+        "branches": {_saved_text(name): _saved_object_id(sha) for name, sha in branches.items()},
+    }
+
+
+def _parse_saved_pull_request(value: Any) -> dict[str, Any]:
+    record = _object(value, "checkout cache pull request")
+    _keys(record, _SAVED_PULL_REQUEST_KEYS, "checkout cache pull request")
+    number, state = record["number"], record["state"]
+    if type(number) is not int or number < 1:
+        raise ProtocolError("checkout cache pull request number is invalid")
+    if type(state) is not str or state not in _SAVED_PULL_REQUEST_STATES:
+        raise ProtocolError("checkout cache pull request state is invalid")
+    return {
+        "number": number,
+        "state": state,
+        "head": _saved_object_id(record["head"]),
+        "base": _saved_text(record["base"]),
+    }
+
+
+def _parse_saved_pull_requests(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    record = _object(value, "checkout cache pull requests")
+    _keys(record, _SAVED_PULL_REQUESTS_KEYS, "checkout cache pull requests")
+    by_head: dict[str, list[dict[str, Any]]] = {}
+    for name, raw in _object(record["by_head"], "checkout cache by_head").items():
+        if type(raw) is not list or len(raw) > PULL_REQUEST_LIST_CAP:
+            raise ProtocolError("checkout cache pull request list is invalid")
+        by_head[_saved_text(name)] = [_parse_saved_pull_request(item) for item in raw]
+    return {"at": _saved_time(record["at"]), "by_head": by_head}
+
+
+def _parse_remote_checks(value: Any) -> dict[str, dict[str, dict[str, Any] | None]]:
+    section = _object(value, "checkout cache remote checks")
+    checks: dict[str, dict[str, dict[str, Any] | None]] = {}
+    for key, raw in section.items():
+        record = _object(raw, "checkout cache remote")
+        _keys(record, _REMOTE_KEYS, "checkout cache remote")
+        heads = _parse_heads(record["heads"])
+        pull_requests = _parse_saved_pull_requests(record["pull_requests"])
+        if heads is None and pull_requests is None:
+            raise ProtocolError("checkout cache remote has no record")
+        checks[_saved_text(key)] = {"heads": heads, "pull_requests": pull_requests}
+    return checks
+
+
+def _parse_cache(data: bytes) -> _SavedCache:
     """Validate the cache file strictly; any deviation raises ``ProtocolError``."""
     document = _object(load_strict_json(data, "checkout cache"), "checkout cache")
+    version = document.get("schema_version")
+    if (
+        set(document) == _RETIRED_CACHE_KEYS
+        and type(version) is int
+        and version in _RETIRED_CACHE_SCHEMAS
+    ):
+        return _SavedCache()
     _keys(document, _CACHE_KEYS, "checkout cache")
-    version = document["schema_version"]
-    if type(version) is not int or version not in (_RETIRED_CACHE_SCHEMA, _CACHE_SCHEMA):
+    if type(version) is not int or version != _CACHE_SCHEMA:
         raise ProtocolError("checkout cache schema_version is unsupported")
     verdicts = _object(document["verdicts"], "checkout cache verdicts")
     if len(verdicts) > CACHE_ENTRY_CAP:
@@ -2929,70 +3079,124 @@ def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
             raise ProtocolError("checkout cache key is invalid")
         entry = _object(raw, "checkout cache entry")
         _keys(entry, _CACHE_ENTRY_KEYS, "checkout cache entry")
-        rung, at = entry["rung"], entry["at"]
+        rung = entry["rung"]
         if type(rung) is not str or rung not in CACHE_RUNGS:
             raise ProtocolError("checkout cache rung is invalid")
-        if type(at) is not int or at < 0:
-            raise ProtocolError("checkout cache time is invalid")
-        entries[key] = (rung, at)
-    # A retired file is well formed but holds nothing to trust; the next write
-    # replaces it.
-    return entries if version == _CACHE_SCHEMA else {}
+        entries[key] = (rung, _saved_time(entry["at"]))
+    return _SavedCache(entries, _parse_remote_checks(document["remote_checks"]))
 
 
-def _cache_bytes(entries: Mapping[str, tuple[str, int]]) -> bytes:
+def _dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _within_budget(
+    records: Mapping[str, Mapping[str, dict[str, Any] | None]],
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """The members that fit ``REMOTE_CHECKS_BUDGET``, newest ``at`` first (ties by
+    remote key, then ``heads`` before ``pull_requests``).
+
+    Each member is added only if the serialized section still fits; one that does
+    not is left out and later, older members are still tried. A remote with no
+    member kept is omitted."""
+    members = sorted(
+        (
+            (record["at"], key, order, name)
+            for key, remote in records.items()
+            for order, name in enumerate(_REMOTE_MEMBERS)
+            if (record := remote[name]) is not None
+        ),
+        key=lambda item: (-item[0], item[1], item[2]),
+    )
+    empty = len(_dump(dict.fromkeys(_REMOTE_MEMBERS)))
+    kept: dict[str, dict[str, dict[str, Any] | None]] = {}
+    total = len("{}")
+    for _, key, _, name in members:
+        member = records[key][name]
+        growth = len(_dump(member)) - len("null")
+        if key not in kept:
+            growth += len(_dump(key)) + len(":") + empty + (len(",") if kept else 0)
+        if total + growth > REMOTE_CHECKS_BUDGET:
+            continue
+        total += growth
+        kept.setdefault(key, dict.fromkeys(_REMOTE_MEMBERS))[name] = member
+    return kept
+
+
+def _merge_remote_checks(
+    saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
+    fresh: Mapping[str, Mapping[str, dict[str, Any]]],
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """Per remote and per member, the record with the newer ``at``; a tie goes to
+    the run's own."""
+    merged = {key: dict(remote) for key, remote in saved.items()}
+    for key, members in fresh.items():
+        remote = merged.setdefault(key, dict.fromkeys(_REMOTE_MEMBERS))
+        for name, record in members.items():
+            current = remote[name]
+            if current is None or record["at"] >= current["at"]:
+                remote[name] = record
+    return merged
+
+
+def _cache_bytes(
+    entries: Mapping[str, tuple[str, int]],
+    remote_checks: Mapping[str, Mapping[str, dict[str, Any] | None]],
+) -> bytes:
     document = {
         "schema_version": _CACHE_SCHEMA,
         "verdicts": {key: {"rung": rung, "at": at} for key, (rung, at) in entries.items()},
+        "remote_checks": remote_checks,
     }
-    return (
-        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    return (_dump(document) + "\n").encode("utf-8")
 
 
-def _load_cache(path: str, diagnostics: list[dict[str, Any]]) -> dict[str, tuple[str, int]]:
+def _load_cache(path: str, diagnostics: list[dict[str, Any]]) -> _SavedCache:
     """Read the cache once; a missing ``~/.nyx`` or file is empty, a bad file is a diagnostic."""
     try:
         data = read_checkout_cache()
-        return {} if data is None else _parse_cache(data)
+        return _SavedCache() if data is None else _parse_cache(data)
     except (StateError, ProtocolError, OSError):
         diagnostics.append({"code": "checkout_cache_unreadable", "path": path})
-        return {}
+        return _SavedCache()
 
 
 def _store_cache(
     path: str,
     results: Iterable[_CloneVerdicts],
-    loaded: Mapping[str, tuple[str, int]],
+    loaded: _SavedCache,
+    checked: Mapping[str, Mapping[str, dict[str, Any]]],
     deadline_ns: int,
     diagnostics: list[dict[str, Any]],
 ) -> None:
-    """Merge this collection's new verdicts into the file with one atomic write.
+    """Merge this collection's new verdicts and successful remote checks into the
+    file with one atomic write.
 
-    Nothing decided by this run, nothing written; a verdict the run decided
-    again gets a fresh time so the oldest saved answers are re-checked first
-    next time. The file is read again so entries another
-    process stored meanwhile survive; a lost race only loses entries, which are
-    recomputed.
+    A run that decided no new verdict and made no successful check writes
+    nothing; a verdict the run decided again gets a fresh time so the oldest
+    saved answers are re-checked first next time. The file is read again so
+    entries another process stored meanwhile survive, and of each remote's saved
+    ``heads`` and ``pull_requests`` the newer ``at`` wins; a lost race only loses
+    entries, which are recomputed.
     """
     fresh: dict[str, str] = {}
     used: set[str] = set()
     for result in results:
         fresh.update(result.fresh)
         used |= result.used
-    if not fresh:
+    if not fresh and not checked:
         return
     try:
         try:
             existing = read_checkout_cache()
-            current = {} if existing is None else _parse_cache(existing)
+            current = _SavedCache() if existing is None else _parse_cache(existing)
         except (StateError, ProtocolError, OSError):
-            existing, current = None, {}
+            existing, current = None, _SavedCache()
         now = int(time.time())
-        merged = dict(current)
+        merged = dict(current.verdicts)
         for key in used:
-            if key not in merged and key in loaded:
-                merged[key] = loaded[key]
+            if key not in merged and key in loaded.verdicts:
+                merged[key] = loaded.verdicts[key]
         # A verdict this run decided is verified now, so its entry rotates to
         # the back of the next collection's re-check order.
         for key, rung in fresh.items():
@@ -3001,7 +3205,8 @@ def _store_cache(
             merged.items(),
             key=lambda item: (item[0] not in used and item[0] not in fresh, -item[1][1], item[0]),
         )[:CACHE_ENTRY_CAP]
-        payload = _cache_bytes(dict(kept))
+        records = _within_budget(_merge_remote_checks(current.remote_checks, checked))
+        payload = _cache_bytes(dict(kept), records)
         if payload != existing:
             write_checkout_cache(payload, deadline_ns=deadline_ns)
     except (StateError, ValueError, OSError):
@@ -3084,8 +3289,9 @@ def collect_checkouts(
         }
         bases: dict[str, _Base | None] = {}
         pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
+        checked: dict[str, dict[str, dict[str, Any]]] = {}
         if remote_checks:
-            bases, pulls = _check_remotes(
+            bases, pulls, checked = _check_remotes(
                 runner, repositories, contexts, max_parallel, github_lookup
             )
         # An account home that cannot be resolved, or a path the document
@@ -3097,7 +3303,7 @@ def collect_checkouts(
             cache_path = None
         if cache_path is not None and not _representable(cache_path):
             cache_path = None
-        cache = _load_cache(cache_path, diagnostics) if cache_path is not None else {}
+        cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
@@ -3108,12 +3314,12 @@ def collect_checkouts(
                 bases,
                 _verdict_settings(scratch, git_state["version"]),
                 max_parallel,
-                cache,
+                cache.verdicts,
                 pulls,
             )
         _assign_removable(repositories)
         if cache_path is not None:
-            _store_cache(cache_path, verdicts.values(), cache, deadline_ns, diagnostics)
+            _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
