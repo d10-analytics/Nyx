@@ -11474,3 +11474,44 @@ def test_a_clone_behind_its_own_newer_tracking_ref_counts_against_that_ref(
     assert branch_of(item, "trunk")["vs_remote"] == behind_one
     assert item["local_default"]["vs_remote"] == behind_one
     assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_partial_clone_behind_its_own_newer_tracking_ref_reads_the_same_comparison_twice(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    partial = clone(world.remote.as_uri(), world.folder / "partial", "--filter=blob:none")
+    push_from(partial, "trunk", "partial-two.txt")
+    git(partial, "reset", "-q", "--hard", "HEAD~1")
+
+    item = find_clone(collect([world.folder]), partial)
+
+    behind_one = vs("cached", "behind", 0, 1)
+    assert item["local_default"]["vs_cached"] == behind_one
+    assert item["local_default"]["vs_remote"] == behind_one
+    assert branch_of(item, "trunk")["vs_remote"] == behind_one
+    assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_clone_without_the_default_branch_takes_its_own_newer_tip_as_the_base(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    headless = clone(world.remote.as_uri(), world.folder / "headless-of-trunk")
+    git(headless, "checkout", "-q", "-b", "elsewhere")
+    git(headless, "branch", "-q", "-D", "trunk")
+    assert "trunk" not in git(headless, "branch", "--format=%(refname:short)").stdout.split()
+    tip = push_from(world.a, "trunk", "trunk-two.txt")
+    git(headless, "fetch", "-q", "origin")
+    assert rev(headless, "refs/remotes/origin/trunk") == tip != world.trunk
+
+    item = find_clone(collect([world.folder]), headless)
+
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": tip,
+        "basis": "cached",
+        "objects_from": None,
+    }
