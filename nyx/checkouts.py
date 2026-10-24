@@ -1598,6 +1598,32 @@ def _lendable(context: _CloneContext) -> bool:
     )
 
 
+def _usable_clones(
+    clones: Sequence[dict[str, Any]], contexts: Mapping[str, _CloneContext]
+) -> list[tuple[dict[str, Any], _CloneContext]]:
+    """The clones that collected cleanly and have a context, with that context,
+    in the order given (the group's natural order)."""
+    return [
+        (clone, contexts[clone["path"]])
+        for clone in clones
+        if clone["status"] == "ok" and clone["path"] in contexts
+    ]
+
+
+def _siblings(
+    clone: dict[str, Any],
+    clones: Sequence[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+) -> list[tuple[dict[str, Any], _CloneContext]]:
+    """The other usable clones of ``clone``'s group, in natural order: the
+    candidates every lender search for that clone is given."""
+    return [
+        (other, context)
+        for other, context in _usable_clones(clones, contexts)
+        if other is not clone
+    ]
+
+
 class _LenderSearch:
     """Find the first lendable sibling, in natural order, that holds an object.
 
@@ -1830,15 +1856,8 @@ def _check_remotes(
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
-        first = next(
-            (
-                contexts[clone["path"]]
-                for clone in group["clones"]
-                if clone["status"] == "ok" and clone["path"] in contexts
-            ),
-            None,
-        )
-        chosen.append(first)
+        usable = _usable_clones(group["clones"], contexts)
+        chosen.append(usable[0][1] if usable else None)
 
     def query(context: _CloneContext | None) -> _LiveAnswer:
         # A group with no usable clone makes no call.
@@ -1894,22 +1913,15 @@ def _check_remotes(
                 continue
             group["remote"]["check"] = {"status": "live", "reason": None}
             group["default_branch"] = {"name": answer.name, "sha": answer.sha}
-            for clone in group["clones"]:
-                if clone["status"] == "ok" and clone["path"] in contexts:
-                    work.append((contexts[clone["path"]], clone, answer, group))
+            for clone, context in _usable_clones(group["clones"], contexts):
+                work.append((context, clone, answer, group))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
         def apply(
             item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]],
         ) -> tuple[str, _Base | None]:
             context, clone, answer, group = item
-            siblings = [
-                (other, contexts[other["path"]])
-                for other in group["clones"]
-                if other is not clone
-                and other["status"] == "ok"
-                and other["path"] in contexts
-            ]
+            siblings = _siblings(clone, group["clones"], contexts)
             cached_default = clone["cached_default"]
             base_name = (
                 answer.name
@@ -2867,10 +2879,7 @@ def _assign_verdicts(
             if repository["remote"] is not None
             else None
         )
-        for clone in repository["clones"]:
-            context = contexts.get(clone["path"])
-            if clone["status"] != "ok" or context is None:
-                continue
+        for clone, context in _usable_clones(repository["clones"], contexts):
             if clone["path"] in bases:
                 base = bases[clone["path"]]
             else:
@@ -2882,11 +2891,7 @@ def _assign_verdicts(
                 if repository["remote"] is not None
                 else None
             )
-            siblings = [
-                (other, contexts[other["path"]])
-                for other in repository["clones"]
-                if other is not clone and other["status"] == "ok" and other["path"] in contexts
-            ]
+            siblings = _siblings(clone, repository["clones"], contexts)
             jobs.append((clone, context, base, requests, siblings))
 
     def decide(job: _VerdictJob) -> tuple[str, _CloneVerdicts]:
