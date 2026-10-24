@@ -1724,9 +1724,9 @@ def _apply_live(
 
     Under a saved answer, a branch name whose own remote-tracking ref differs from
     the saved value and moved at or after the saved check (for example by a push
-    from this clone) is judged against that ref instead, on the ``cached`` basis:
-    the branch comparisons, the local default's comparison with the remote and the
-    verdict base. ``default_branch`` and ``cached_vs_remote`` always compare with
+    from this clone) keeps the clone's own cached comparison, on the ``cached``
+    basis: the branch's comparison, the local default's comparison with the remote
+    and the verdict base. ``default_branch`` and ``cached_vs_remote`` always compare with
     the saved head.
 
     Returns the clone's verdict base for ``base_name``, chosen from the same
@@ -1757,19 +1757,12 @@ def _apply_live(
         # The clone's own base stands: it is the cached fallback below.
         base_head = None
 
-    def target(item: str) -> tuple[str | None, str]:
-        if item in newer:
-            return context.cached[item], "cached"
-        return answer.branches.get(item), basis
-
-    target_default = (
-        (context.cached[name], "cached") if name in newer else (remote_sha, basis)
-    )
     pairs = [(cached_sha, remote_sha)]
-    if name is not None:
-        pairs.append((local_sha, target_default[0]))
+    if name is not None and name not in newer:
+        pairs.append((local_sha, remote_sha))
     for branch in clone["branches"]:
-        pairs.append((branch["sha"], target(branch["name"])[0]))
+        if branch["name"] not in newer:
+            pairs.append((branch["sha"], answer.branches.get(branch["name"])))
     guarded = context.partial or context.shallow
     held = set(context.cached.values()) | {sha for sha, _ in context.local.values()}
     probed = {right for left, right in pairs if left and right and left != right}
@@ -1859,11 +1852,14 @@ def _apply_live(
         clone["local_default"] = {
             "name": name,
             "sha": local_sha,
-            "vs_remote": live(local_sha, *target_default),
+            "vs_remote": (
+                vs_cached if name in newer else live(local_sha, remote_sha)
+            ),
             "vs_cached": vs_cached,
         }
     for branch in clone["branches"]:
-        branch["vs_remote"] = live(branch["sha"], *target(branch["name"]))
+        if branch["name"] not in newer:
+            branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
 
     if base_name is None:
         return None
