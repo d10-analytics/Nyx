@@ -10047,6 +10047,47 @@ def test_a_file_replaced_during_the_run_keeps_the_newer_member_and_takes_the_run
     assert len(fake.calls()) == 2
 
 
+@posix_only
+def test_a_file_replaced_after_the_cache_was_loaded_keeps_the_newer_member_and_takes_the_runs_members(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    document = github_collect(folder)
+    other_key = remote_key_of(document, second)
+    replacement = saved_file(cache)
+    future = int(time.time()) + 3600
+    replacement["remote_checks"][GITHUB_KEY]["heads"]["at"] = future
+    replacement["remote_checks"][GITHUB_KEY]["heads"]["head"] = "d" * 40
+    del replacement["remote_checks"][other_key]
+    source = tmp_path / "replacement.json"
+    source.write_text(json.dumps(replacement))
+    staged = cache.with_name("race.tmp")
+    log = tmp_path / "race.log"
+    # Calls that carry the verdict scratch directory belong to the verdict phase,
+    # which runs after the cache load.
+    shim = stand_in(
+        tmp_path,
+        "race",
+        f'case "$*" in *nyx-verdicts-*) echo "$*" >> "{log}"; '
+        f'cp "{source}" "{staged}" && mv "{staged}" "{cache}";; esac',
+    )
+    started = int(time.time())
+
+    with path_with(monkeypatch, shim):
+        github_collect(folder)
+
+    assert log.read_text().strip()
+    merged = saved_file(cache)["remote_checks"]
+    # The newer member written by the other collection survives this run's write.
+    assert merged[GITHUB_KEY]["heads"] == replacement["remote_checks"][GITHUB_KEY]["heads"]
+    assert merged[GITHUB_KEY]["pull_requests"]["at"] >= started
+    # The remote absent from the replacement gets this run's answer.
+    assert merged[other_key]["heads"]["at"] >= started
+    assert merged[other_key]["heads"]["head"] == rev(other, "trunk")
+
+
 def fill_file(cache: Path, count: int, remotes: int, branches: int) -> dict[str, Any]:
     """Write a maximal file: ``count`` verdicts with SHA-256 key pairs, 10-digit
     times and the longest rung name, and ``remotes`` saved remotes of distinct times."""
@@ -10152,6 +10193,43 @@ def test_the_budget_orders_ties_and_skips_an_oversized_member_without_evicting_o
     assert checkouts._within_budget(records) == only(
         a=records["a"], b={"heads": records["b"]["heads"]}, old={"heads": records["old"]["heads"]}
     )
+
+
+def test_the_budget_prefers_heads_to_a_smaller_pull_requests_record_of_the_same_second(
+    monkeypatch,
+):
+    heads = {
+        "at": 7,
+        "default": "main",
+        "head": "1" * 40,
+        "branches": {f"branch-{n:02d}": "1" * 40 for n in range(8)},
+    }
+    pulls = {"at": 7, "by_head": {"topic": []}}
+    assert len(dumped(pulls)) < len(dumped(heads))
+    records = {"a": {"heads": heads, "pull_requests": pulls}}
+    alone_heads = len(dumped({"a": {"heads": heads, "pull_requests": None}}))
+    alone_pulls = len(dumped({"a": {"heads": None, "pull_requests": pulls}}))
+    both = len(dumped(records))
+    # Each member fits alone, the two do not fit together.
+    assert max(alone_heads, alone_pulls) < both
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", alone_heads)
+
+    assert checkouts._within_budget(records) == {"a": {"heads": heads, "pull_requests": None}}
+
+
+def test_the_budget_keeps_the_first_remote_key_of_equal_tied_members(monkeypatch):
+    def heads(tag: str) -> dict[str, Any]:
+        return {"at": 7, "default": "main", "head": tag * 40, "branches": {"main": tag * 40}}
+
+    records = {
+        "b": {"heads": heads("2"), "pull_requests": None},
+        "a": {"heads": heads("1"), "pull_requests": None},
+    }
+    monkeypatch.setattr(
+        checkouts, "REMOTE_CHECKS_BUDGET", len(dumped({"a": records["a"]}))
+    )
+
+    assert checkouts._within_budget(records) == {"a": records["a"]}
 
 
 @posix_only
