@@ -802,6 +802,7 @@ _CHECKOUTS_KEYS = frozenset(
         "observed_at",
         "git",
         "remote_checks",
+        "github_lookup",
         "folders",
         "repositories",
         "diagnostics",
@@ -810,6 +811,7 @@ _CHECKOUTS_KEYS = frozenset(
 _GIT_KEYS = frozenset({"status", "version"})
 _GIT_STATUSES = frozenset({"available", "missing", "too_old"})
 _REMOTE_CHECKS = frozenset({"on", "off"})
+_GITHUB_LOOKUP = frozenset({"on", "off"})
 _FOLDER_KEYS = frozenset({"path", "status"})
 _FOLDER_STATUSES = frozenset({"ok", "missing", "unreadable", "not_directory"})
 _CHECKOUTS_DIAGNOSTIC_KEYS = frozenset({"code", "path"})
@@ -821,7 +823,7 @@ CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
         "checkout_cache_write_failed",
     }
 )
-_REPOSITORY_KEYS = frozenset({"remote", "default_branch", "clones"})
+_REPOSITORY_KEYS = frozenset({"remote", "default_branch", "pr_lookup", "clones"})
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
 _CHECK_STATUSES = frozenset({"live", "failed", "off"})
@@ -829,6 +831,13 @@ _CHECK_FAILURE_REASONS = frozenset(
     {"unreachable", "not_found", "authentication_failed", "timed_out", "failed"}
 )
 _DEFAULT_BRANCH_KEYS = frozenset({"name", "sha"})
+_PR_LOOKUP_KEYS = frozenset({"status", "reason", "checked_at"})
+_PR_LOOKUP_STATUSES = frozenset({"live", "off", "unavailable"})
+_PR_LOOKUP_FAILURE_REASONS = frozenset(
+    {"gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed"}
+)
+_GITHUB_HOST = "github.com"
+_GITHUB_ENTERPRISE_SUFFIX = ".ghe.com"
 _CLONE_KEYS = frozenset(
     {
         "path",
@@ -1494,12 +1503,68 @@ def _clone(
     return item
 
 
+def github_identity(remote_key: str) -> tuple[str, str, str] | None:
+    """Return ``(host, owner, repository)`` when a remote key names a GitHub repository.
+
+    The host is ``github.com`` or a ``*.ghe.com`` host and the path is exactly
+    ``owner/repository``; any other key is not a GitHub remote.
+    """
+    parts = remote_key.split("/")
+    if len(parts) != 3 or not all(parts):
+        return None
+    host, owner, repository = parts
+    if host == _GITHUB_HOST or (
+        host.endswith(_GITHUB_ENTERPRISE_SUFFIX) and len(host) > len(_GITHUB_ENTERPRISE_SUFFIX)
+    ):
+        return host, owner, repository
+    return None
+
+
+def _pr_lookup(
+    value: Any,
+    name: str,
+    *,
+    remote_key: str,
+    github_lookup: bool,
+    remote_checks: bool,
+) -> None:
+    lookup = _object(value, name)
+    _keys(lookup, _PR_LOOKUP_KEYS, name)
+    status = _choice(lookup["status"], _PR_LOOKUP_STATUSES, f"{name}.status")
+    reason = lookup["reason"]
+    if lookup["checked_at"] is not None:
+        raise ProtocolError(f"{name}.checked_at must be null")
+    if not github_lookup:
+        expected: str | None = "setting_off"
+    elif github_identity(remote_key) is None:
+        expected = "not_github"
+    elif not remote_checks:
+        expected = "remote_checks_off"
+    else:
+        expected = None
+    if expected is not None:
+        valid = status == "off" and reason == expected
+    elif status == "live":
+        valid = reason is None
+    else:
+        valid = (
+            status == "unavailable"
+            and type(reason) is str
+            and reason in _PR_LOOKUP_FAILURE_REASONS
+        )
+    if not valid:
+        raise ProtocolError(f"{name} does not match the lookup setting and the remote")
+
+
 def _repository(
     value: Any,
     index: int,
     clone_paths: set[str],
     worktree_paths: set[str],
     git_version: str | None,
+    *,
+    github_lookup: bool,
+    remote_checks: bool,
 ) -> dict[str, Any]:
     name = f"repositories[{index}]"
     item = _object(value, name)
@@ -1509,6 +1574,8 @@ def _repository(
     if remote is None:
         if default_branch is not None:
             raise ProtocolError(f"{name} has a default branch without a remote")
+        if item["pr_lookup"] is not None:
+            raise ProtocolError(f"{name} has a pull-request lookup without a remote")
     else:
         remote = _object(remote, f"{name}.remote")
         _keys(remote, _REMOTE_KEYS, f"{name}.remote")
@@ -1530,6 +1597,13 @@ def _repository(
         _keys(default_branch, _DEFAULT_BRANCH_KEYS, f"{name}.default_branch")
         _nullable(default_branch["name"], _text, f"{name}.default_branch.name")
         _nullable(default_branch["sha"], _object_id, f"{name}.default_branch.sha")
+        _pr_lookup(
+            item["pr_lookup"],
+            f"{name}.pr_lookup",
+            remote_key=remote["key"],
+            github_lookup=github_lookup,
+            remote_checks=remote_checks,
+        )
     clones = _list(item["clones"], f"{name}.clones")
     if not clones or (remote is None and len(clones) != 1):
         raise ProtocolError(f"{name}.clones has the wrong size")
@@ -1582,7 +1656,8 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
         raise ProtocolError("git.version must be null when git is missing")
     if git_status == "available" and version is None:
         raise ProtocolError("git.version is required when git is available")
-    _choice(document["remote_checks"], _REMOTE_CHECKS, "remote_checks")
+    remote_checks = _choice(document["remote_checks"], _REMOTE_CHECKS, "remote_checks")
+    github_lookup = _choice(document["github_lookup"], _GITHUB_LOOKUP, "github_lookup")
 
     folders = _list(document["folders"], "folders")
     for index, raw_folder in enumerate(folders):
@@ -1609,7 +1684,15 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     worktree_paths: set[str] = set()
     remote_keys: set[str] = set()
     parsed = [
-        _repository(raw_repository, index, clone_paths, worktree_paths, version)
+        _repository(
+            raw_repository,
+            index,
+            clone_paths,
+            worktree_paths,
+            version,
+            github_lookup=github_lookup == "on",
+            remote_checks=remote_checks == "on",
+        )
         for index, raw_repository in enumerate(repositories)
     ]
     for repository in parsed:

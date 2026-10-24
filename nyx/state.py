@@ -184,6 +184,14 @@ class Configuration:
         return () if entry is None else entry.folders
 
     @property
+    def checkout_github_lookup(self) -> bool:
+        """Return whether the active workspace turned pull-request lookup on."""
+
+        assert self.checkout_settings is not None
+        entry = self.checkout_settings.get(str(self.specification_root))
+        return False if entry is None else entry.github_lookup
+
+    @property
     def revision(self) -> str:
         """Return the digest of the validated, canonical configuration bytes."""
 

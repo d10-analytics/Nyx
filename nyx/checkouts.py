@@ -6,7 +6,11 @@ fetches, writes or locks anything. Local commands run with every transport
 denied. The one exception is the optional remote check: a single
 ``git ls-remote`` per distinct remote, the only call that lifts the transport
 denial (so git applies the user's own transport policy and credentials), and it
-transfers no objects.
+transfers no objects. When the active workspace turns GitHub lookup on, the same
+phase also makes one ``gh api graphql`` request per GitHub repository, asking for
+the pull requests of its local branch names; it runs the user's own ``gh`` with
+the user's credentials, is never retried, and a missing or failing ``gh`` only
+marks that repository's lookup unavailable.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from .models import (
     derive_removable,
     diagnostic_sort_key,
     folder_sort_key,
+    github_identity,
     load_strict_json,
     natural_key,
     repository_sort_key,
@@ -84,7 +89,6 @@ CACHE_ENTRY_CAP = 8192
 VERDICT_RESERVE_NS = 500_000_000
 
 _ON_WINDOWS = os.name == "nt"
-_GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
 _VERSION_LINE = re.compile(r"git version (?P<version>[0-9]+(?:\.[0-9]+)+\S*)")
 _NUMERIC_PREFIX = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 _CONFIG_PATTERN = (
@@ -153,15 +157,52 @@ class _Outcome:
         return "failed"
 
 
-def _resolve_git() -> str | None:
-    """Find git among the absolute ``PATH`` entries only."""
+def _resolve_program(stem: str) -> str | None:
+    """Find ``stem`` among the absolute ``PATH`` entries only.
+
+    On Windows only ``<stem>.exe`` counts, never a ``.cmd`` shim or a file in
+    the working directory; elsewhere the file must be executable.
+    """
+    name = f"{stem}.exe" if _ON_WINDOWS else stem
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or not os.path.isabs(entry):
             continue
-        candidate = os.path.join(entry, _GIT_EXECUTABLE)
+        candidate = os.path.join(entry, name)
         if os.path.isfile(candidate) and (_ON_WINDOWS or os.access(candidate, os.X_OK)):
             return candidate
     return None
+
+
+def _start(command: Sequence[str], environment: Mapping[str, str], timeout: float) -> _Outcome:
+    """Run one child with standard input closed, its output kept in temporary
+    files, and a kill when ``timeout`` seconds pass."""
+    if timeout <= 0:
+        return _Outcome(None, timed_out=True)
+    # Output goes to temporary files, not pipes, so a program the child started
+    # and left behind cannot keep this call waiting after the child is killed.
+    with (
+        tempfile.TemporaryFile() as out,
+        tempfile.TemporaryFile() as err,
+    ):
+        try:
+            process = subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                env=dict(environment),
+            )
+        except OSError:
+            return _Outcome(None)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return _Outcome(None, timed_out=True)
+        out.seek(0)
+        err.seek(0)
+        return _Outcome(process.returncode, out.read(), err.read())
 
 
 class _GitRunner:
@@ -254,31 +295,11 @@ class _GitRunner:
         if timeout <= 0:
             return _Outcome(None, timed_out=True)
         command, environment = self._prepare(arguments, path, ceiling, overlay)
-        # Output goes to temporary files, not pipes, so a program git started
-        # and left behind cannot keep this call waiting after git is killed.
-        with (
-            tempfile.TemporaryFile() as out,
-            tempfile.TemporaryFile() as err,
-        ):
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    env=environment,
-                )
-            except OSError:
-                return _Outcome(None)
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                return _Outcome(None, timed_out=True)
-            out.seek(0)
-            err.seek(0)
-            return _Outcome(process.returncode, out.read(), err.read())
+        return _start(command, environment, timeout)
+
+    def run_program(self, command: Sequence[str], environment: Mapping[str, str]) -> _Outcome:
+        """Run another program under this runner's per-call cap and deadline."""
+        return _start(command, environment, self._timeout())
 
     def pipeline(
         self,
@@ -1180,7 +1201,23 @@ def _group_default_name(clones: list[dict[str, Any]]) -> str | None:
     return next(iter(names)) if len(names) == 1 else None
 
 
-def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]]:
+def _pr_lookup_off(key: str, github_lookup: bool, remote_checks: bool) -> dict[str, Any]:
+    """A group's lookup status before any ``gh`` call: the reason no call is made, or
+    a failure for a group that will be called and whose answer replaces it."""
+    if not github_lookup:
+        status, reason = "off", "setting_off"
+    elif github_identity(key) is None:
+        status, reason = "off", "not_github"
+    elif not remote_checks:
+        status, reason = "off", "remote_checks_off"
+    else:
+        status, reason = "unavailable", "failed"
+    return {"status": status, "reason": reason, "checked_at": None}
+
+
+def _assemble_repositories(
+    outcomes: list[_CloneOutcome], *, github_lookup: bool, remote_checks: bool
+) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     repositories: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -1191,7 +1228,9 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
         seen_paths.add(clone["path"])
         remote = outcome.remote
         if remote is None:
-            repositories.append({"remote": None, "default_branch": None, "clones": [clone]})
+            repositories.append(
+                {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone]}
+            )
             continue
         key, display = remote
         group = grouped.get(key)
@@ -1203,6 +1242,7 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
                     "check": {"status": "off", "reason": "remote_checks_off"},
                 },
                 "default_branch": {"name": None, "sha": None},
+                "pr_lookup": _pr_lookup_off(key, github_lookup, remote_checks),
                 "clones": [],
             }
             grouped[key] = group
@@ -1314,6 +1354,153 @@ def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
         return _LiveAnswer(_failure_reason(outcome))
     answer = _parse_listing(outcome.out)
     return answer if answer is not None else _LiveAnswer("failed")
+
+
+# ---------------------------------------------------------------------------
+# The one GitHub request per repository
+# ---------------------------------------------------------------------------
+
+GITHUB_OUTPUT_CAP = 8 << 20
+_GITHUB_PROMPT_VARIABLES = {
+    "GH_PROMPT_DISABLED": "1",
+    "GH_NO_UPDATE_NOTIFIER": "1",
+    "GH_SPINNER_DISABLED": "1",
+    "NO_COLOR": "1",
+}
+_GITHUB_REMOVED_VARIABLES = frozenset({"GH_REPO", "GH_HOST"})
+_GITHUB_UNAUTHENTICATED_EXIT = 4
+_GITHUB_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+_GITHUB_NODE_FIELDS = "number state headRefOid baseRefName isCrossRepository"
+_GITHUB_ALIAS_ARGUMENTS = "first: 10, orderBy: {field: CREATED_AT, direction: DESC}"
+_GITHUB_NODE_CAP = 10
+_RATE_LIMIT_PHRASES = ("rate limit",)
+_GITHUB_AUTH_PHRASES = ("http 401", "bad credentials", "gh auth login")
+
+
+def _github_environment() -> dict[str, str]:
+    """The user's environment for ``gh``: its own configuration directory and
+    credentials stay, a repository or host override goes, and nothing may prompt."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if (key.upper() if _ON_WINDOWS else key) not in _GITHUB_REMOVED_VARIABLES
+    }
+    environment.update(_GITHUB_PROMPT_VARIABLES)
+    return environment
+
+
+def _github_request(owner: str, name: str, branches: Sequence[str]) -> bytes:
+    """The ``{query, variables}`` body for one repository.
+
+    The selection always holds the scalar ``__typename``, so a repository with no
+    local branch still sends a valid query, and one alias ``bN`` per branch name
+    in ``branches`` (GraphQL aliases cannot hold ``/`` or ``-``)."""
+    declarations = "".join(f", $h{index}: String!" for index in range(len(branches)))
+    aliases = "".join(
+        f" b{index}: pullRequests(headRefName: $h{index}, {_GITHUB_ALIAS_ARGUMENTS})"
+        f" {{ nodes {{ {_GITHUB_NODE_FIELDS} }} }}"
+        for index in range(len(branches))
+    )
+    query = (
+        f"query($owner: String!, $name: String!{declarations}) "
+        f"{{ repository(owner: $owner, name: $name) {{ __typename{aliases} }} }}"
+    )
+    variables: dict[str, str] = {"owner": owner, "name": name}
+    variables.update({f"h{index}": branch for index, branch in enumerate(branches)})
+    return json.dumps({"query": query, "variables": variables}).encode("ascii")
+
+
+def _valid_pull_request(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    number = node.get("number")
+    return (
+        type(number) is int
+        and number > 0
+        and node.get("state") in _GITHUB_STATES
+        and isinstance(node.get("headRefOid"), str)
+        and _OBJECT_ID.fullmatch(node["headRefOid"]) is not None
+        and _safe_text(node.get("baseRefName"))
+        and type(node.get("isCrossRepository")) is bool
+    )
+
+
+def _github_document(data: bytes) -> Any:
+    """Decode a ``gh`` answer; ``None`` when it is oversized or not JSON."""
+    if len(data) > GITHUB_OUTPUT_CAP:
+        return None
+    try:
+        return load_strict_json(data, "gh")
+    except ProtocolError:
+        return None
+
+
+def _github_failure(outcome: _Outcome, document: Any) -> str:
+    """Name a failed ``gh`` call by category; first match wins, in this order."""
+    if outcome.timed_out:
+        return "timed_out"
+    if outcome.code == _GITHUB_UNAUTHENTICATED_EXIT:
+        return "not_authenticated"
+    stderr = outcome.err.decode("utf-8", "replace").lower()
+    types: set[Any] = set()
+    repository: Any = {}
+    if isinstance(document, dict):
+        errors = document.get("errors")
+        if isinstance(errors, list):
+            types = {item.get("type") for item in errors if isinstance(item, dict)}
+        data = document.get("data")
+        if isinstance(data, dict) and "repository" in data:
+            repository = data["repository"]
+    if "RATE_LIMITED" in types or any(phrase in stderr for phrase in _RATE_LIMIT_PHRASES):
+        return "rate_limited"
+    if any(phrase in stderr for phrase in _GITHUB_AUTH_PHRASES):
+        return "not_authenticated"
+    if "NOT_FOUND" in types or repository is None:
+        return "not_found"
+    return "failed"
+
+
+def _github_reason(outcome: _Outcome, count: int) -> str | None:
+    """``None`` when ``gh`` answered validly for ``count`` branch aliases, else
+    the failure category."""
+    document = _github_document(outcome.out) if not outcome.timed_out else None
+    if outcome.code != 0:
+        return _github_failure(outcome, document)
+    data = document.get("data") if isinstance(document, dict) else None
+    if isinstance(data, dict) and data.get("repository", {}) is None:
+        return "not_found"
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict) or repository.get("__typename") != "Repository":
+        return "failed"
+    for index in range(count):
+        alias = repository.get(f"b{index}")
+        nodes = alias.get("nodes") if isinstance(alias, dict) else None
+        if (
+            not isinstance(nodes, list)
+            or len(nodes) > _GITHUB_NODE_CAP
+            or not all(_valid_pull_request(node) for node in nodes)
+        ):
+            return "failed"
+    return None
+
+
+def _query_github(
+    runner: _GitRunner, executable: str, key: str, branches: Sequence[str]
+) -> str | None:
+    """The group's one ``gh api graphql`` call; ``None`` when GitHub answered, else
+    the failure category. The request file lives in a directory removed on return."""
+    identity = github_identity(key)
+    assert identity is not None
+    host, owner, name = identity
+    with tempfile.TemporaryDirectory(prefix="nyx-gh-") as scratch:
+        request = os.path.join(scratch, "request.json")
+        with open(request, "wb") as handle:
+            handle.write(_github_request(owner, name, branches))
+        outcome = runner.run_program(
+            [executable, "api", "graphql", "--hostname", host, "--input", request],
+            _github_environment(),
+        )
+    return _github_reason(outcome, len(branches))
 
 
 def _present_objects(
@@ -1511,13 +1698,19 @@ def _apply_live(
     return fallback
 
 
+def _pr_lookup_unavailable(reason: str) -> dict[str, Any]:
+    return {"status": "unavailable", "reason": reason, "checked_at": None}
+
+
 def _check_remotes(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
+    github_lookup: bool,
 ) -> dict[str, _Base | None]:
-    """Phase 2 (one query per remote) then phase 3 (live comparisons per clone).
+    """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
+    lookup is on) then phase 3 (live comparisons per clone).
 
     Returns the verdict base of each clone the live comparisons reached."""
     groups = [item for item in repositories if item["remote"] is not None]
@@ -1537,8 +1730,44 @@ def _check_remotes(
         # A group with no usable clone makes no call.
         return _query_remote(runner, context) if context is not None else _LiveAnswer("failed")
 
+    lookups: list[tuple[dict[str, Any], list[str]]] = []
+    if github_lookup:
+        for group, first in zip(groups, chosen):
+            if github_identity(group["remote"]["key"]) is None:
+                continue
+            if first is None:
+                group["pr_lookup"] = _pr_lookup_unavailable("failed")
+                continue
+            names = {
+                branch["name"]
+                for clone in group["clones"]
+                if clone["status"] == "ok"
+                for branch in clone["branches"]
+            }
+            lookups.append((group, sorted(names)))
+    # Resolved once, and only when a call will be made.
+    gh = _resolve_program("gh") if lookups else None
+    if lookups and gh is None:
+        for group, _ in lookups:
+            group["pr_lookup"] = _pr_lookup_unavailable("gh_missing")
+        lookups = []
+
+    def ask(job: tuple[dict[str, Any], list[str]]) -> str | None:
+        group, names = job
+        assert gh is not None
+        return _query_github(runner, gh, group["remote"]["key"], names)
+
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+        # Both kinds of call run in the one pool, and the barrier below waits for all.
+        pending = [pool.submit(ask, job) for job in lookups]
         answers = list(pool.map(query, chosen))
+        for (group, _), future in zip(lookups, pending):
+            reason = future.result()
+            group["pr_lookup"] = (
+                {"status": "live", "reason": None, "checked_at": None}
+                if reason is None
+                else _pr_lookup_unavailable(reason)
+            )
         work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
         bases: dict[str, _Base | None] = {}
         for group, answer in zip(groups, answers):
@@ -2541,6 +2770,7 @@ def collect_checkouts(
     call_cap_seconds: float = CALL_CAP_SECONDS,
     max_parallel: int = MAX_PARALLEL_CLONES,
     remote_checks: bool = False,
+    github_lookup: bool = False,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
@@ -2548,6 +2778,8 @@ def collect_checkouts(
     or finish by then mark their item ``timed_out`` and the document is still
     produced. ``remote_checks`` adds one ``ls-remote`` per distinct remote and
     the live comparisons built on it; left off, nothing contacts a remote.
+    ``github_lookup`` adds one ``gh`` call per GitHub repository, and only while
+    ``remote_checks`` is on.
     """
     observed_at = _utc_text(int(time.time()))
     discovery = _discover(os.fspath(folder) for folder in folders)
@@ -2555,7 +2787,7 @@ def collect_checkouts(
     repositories: list[dict[str, Any]] = []
     diagnostics = list(discovery.diagnostics)
 
-    executable = _resolve_git()
+    executable = _resolve_program("git")
     runner: _GitRunner | None = None
     if executable is not None:
         runner = _GitRunner(executable, deadline_ns, call_cap_seconds)
@@ -2590,7 +2822,9 @@ def collect_checkouts(
             )
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
-        repositories = _assemble_repositories(outcomes)
+        repositories = _assemble_repositories(
+            outcomes, github_lookup=github_lookup, remote_checks=remote_checks
+        )
         contexts = {
             outcome.clone["path"]: outcome.context
             for outcome in outcomes
@@ -2598,7 +2832,9 @@ def collect_checkouts(
         }
         bases: dict[str, _Base | None] = {}
         if remote_checks:
-            bases = _check_remotes(runner, repositories, contexts, max_parallel)
+            bases = _check_remotes(
+                runner, repositories, contexts, max_parallel, github_lookup
+            )
         # An account home that cannot be resolved, or a path the document
         # cannot carry, makes the cache unavailable: no read, no write and no
         # diagnostic, since there is no path to report.
@@ -2634,6 +2870,7 @@ def collect_checkouts(
         "observed_at": observed_at,
         "git": git_state,
         "remote_checks": "on" if remote_checks else "off",
+        "github_lookup": "on" if github_lookup else "off",
         "folders": sorted(discovery.folders, key=folder_sort_key),
         "repositories": repositories,
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),

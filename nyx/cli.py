@@ -162,6 +162,12 @@ def _remote_and_default_elements(
     return elements
 
 
+def _pr_element(lookup: dict[str, Any]) -> str:
+    if lookup["status"] == "live":
+        return "pr live"
+    return f"pr {lookup['status']} {lookup['reason']}"
+
+
 def format_checkouts(document: dict[str, Any]) -> list[str]:
     """Return the plain-output lines of a parsed checkout document."""
 
@@ -194,6 +200,7 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
                 elements.append("no origin remote")
             else:
                 elements.extend(_remote_and_default_elements(clone, remote))
+                elements.append(_pr_element(repository["pr_lookup"]))
             counts = clone["removable_count"]
             elements.append(
                 f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
@@ -236,13 +243,21 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
         if configuration.status == "configured"
         else ()
     )
+    github_lookup = (
+        configuration.configuration.checkout_github_lookup
+        if configuration.status == "configured"
+        else False
+    )
     if not folders:
         print("no checkout folders are configured")
         return 0
     deadline = time.monotonic_ns() + _CHECKOUTS_DEADLINE_SECONDS * 1_000_000_000
     try:
         rendered = checkouts.collect_checkouts(
-            folders, deadline_ns=deadline, remote_checks=not no_network
+            folders,
+            deadline_ns=deadline,
+            remote_checks=not no_network,
+            github_lookup=github_lookup,
         )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
