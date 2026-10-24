@@ -1680,6 +1680,34 @@ class _LenderSearch:
         return None
 
 
+_REFLOG_TIME = re.compile(r"@\{([0-9]+)\}")
+
+
+def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
+    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``.
+
+    A ref that is missing, a reflog that is empty or switched off, a failed or cut
+    call and a time that does not read as Unix seconds all answer no.
+    """
+    outcome = runner.run(
+        [
+            "reflog",
+            "show",
+            "-n",
+            "1",
+            "--date=unix",
+            "--format=%gd",
+            f"refs/remotes/origin/{name}",
+        ],
+        path=context.cwd,
+        ceiling=context.ceiling,
+    )
+    if not outcome.ok or outcome.timed_out:
+        return False
+    match = _REFLOG_TIME.search(_decode(outcome.out).strip())
+    return match is not None and int(match.group(1)) >= at
+
+
 def _apply_live(
     runner: _GitRunner,
     context: _CloneContext,
@@ -1694,21 +1722,55 @@ def _apply_live(
     ``answer`` is a live ``ls-remote`` answer (``basis`` ``live``) or a saved one
     (``recorded``); every comparison and the verdict base carry ``basis``.
 
+    Under a saved answer, a branch name whose own remote-tracking ref differs from
+    the saved value and moved at or after the saved check (for example by a push
+    from this clone) is judged against that ref instead, on the ``cached`` basis:
+    the branch comparisons, the local default's comparison with the remote and the
+    verdict base. ``default_branch`` and ``cached_vs_remote`` always compare with
+    the saved head.
+
     Returns the clone's verdict base for ``base_name``, chosen from the same
     presence pass and lender as the comparisons.
     """
     name, remote_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
     local_sha = context.local.get(name, (None, ""))[0] if name is not None else None
-    pairs = [(cached_sha, remote_sha)]
-    if name is not None:
-        pairs.append((local_sha, remote_sha))
-    for branch in clone["branches"]:
-        pairs.append((branch["sha"], answer.branches.get(branch["name"])))
-    guarded = context.partial or context.shallow
     base_head = answer.branches.get(base_name) if base_name is not None else None
     if base_head is None and base_name is not None and base_name == name:
         base_head = remote_sha
+    newer: set[str] = set()
+    if basis == "recorded":
+        asked = {branch["name"] for branch in clone["branches"]}
+        asked.update(item for item in (name, base_name) if item is not None)
+        for item in sorted(asked):
+            held_tip = context.cached.get(item)
+            saved_tip = answer.branches.get(item)
+            if saved_tip is None and item == name:
+                saved_tip = remote_sha
+            if (
+                held_tip is not None
+                and held_tip != saved_tip
+                and _ref_moved_since(runner, context, item, answer.at)
+            ):
+                newer.add(item)
+    if base_name in newer:
+        # The clone's own base stands: it is the cached fallback below.
+        base_head = None
+
+    def target(item: str) -> tuple[str | None, str]:
+        if item in newer:
+            return context.cached[item], "cached"
+        return answer.branches.get(item), basis
+
+    target_default = (
+        (context.cached[name], "cached") if name in newer else (remote_sha, basis)
+    )
+    pairs = [(cached_sha, remote_sha)]
+    if name is not None:
+        pairs.append((local_sha, target_default[0]))
+    for branch in clone["branches"]:
+        pairs.append((branch["sha"], target(branch["name"])[0]))
+    guarded = context.partial or context.shallow
     held = set(context.cached.values()) | {sha for sha, _ in context.local.values()}
     probed = {right for left, right in pairs if left and right and left != right}
     if base_head is not None and base_head not in held:
@@ -1717,19 +1779,19 @@ def _apply_live(
     presence = (
         _present_objects(runner, context, wanted) if wanted and not guarded else {}
     )
-    memo: dict[tuple[str, str], dict[str, Any]] = {}
+    memo: dict[tuple[str, str, str], dict[str, Any]] = {}
     lacking = [item for item in wanted if presence.get(item) == "missing"]
     lenders = _LenderSearch(runner, siblings)
 
     def lender(right: str) -> tuple[dict[str, Any], _CloneContext] | str | None:
         return lenders.find(right, lacking)
 
-    def borrowed(left: str, right: str) -> dict[str, Any]:
+    def borrowed(left: str, right: str, how: str) -> dict[str, Any]:
         source = lender(right)
         if source is None:
-            return _comparison("differs", basis=basis)
+            return _comparison("differs", basis=how)
         if isinstance(source, str):
-            return _comparison(source, basis=basis)
+            return _comparison(source, basis=how)
         sibling, sibling_context = source
         result = _counted_comparison(
             runner.run(
@@ -1742,35 +1804,35 @@ def _apply_live(
                     )
                 },
             ),
-            basis,
+            how,
         )
         if result["relation"] in ("ahead", "behind", "diverged"):
             result["objects_from"] = sibling["path"]
         return result
 
-    def live(left: str | None, right: str | None) -> dict[str, Any]:
+    def live(left: str | None, right: str | None, how: str = basis) -> dict[str, Any]:
         if left is None or right is None:
-            return _comparison("absent", basis=basis)
+            return _comparison("absent", basis=how)
         if left == right:
-            return _comparison("equal", 0, 0, basis)
+            return _comparison("equal", 0, 0, how)
         if guarded:
-            return _comparison("differs", basis=basis)
+            return _comparison("differs", basis=how)
         state = presence.get(right, "missing")
         if state in ("unknown", "differs"):
-            return _comparison("unknown" if state == "unknown" else "differs", basis=basis)
-        if (left, right) not in memo:
+            return _comparison("unknown" if state == "unknown" else "differs", basis=how)
+        if (left, right, how) not in memo:
             if state == "present":
-                memo[(left, right)] = _counted_comparison(
+                memo[(left, right, how)] = _counted_comparison(
                     runner.run(
                         ["rev-list", "--left-right", "--count", f"{left}...{right}"],
                         path=context.cwd,
                         ceiling=context.ceiling,
                     ),
-                    basis,
+                    how,
                 )
             else:
-                memo[(left, right)] = borrowed(left, right)
-        return memo[(left, right)]
+                memo[(left, right, how)] = borrowed(left, right, how)
+        return memo[(left, right, how)]
 
     clone["cached_vs_remote"] = live(cached_sha, remote_sha)
     if name is None:
@@ -1797,11 +1859,11 @@ def _apply_live(
         clone["local_default"] = {
             "name": name,
             "sha": local_sha,
-            "vs_remote": live(local_sha, remote_sha),
+            "vs_remote": live(local_sha, *target_default),
             "vs_cached": vs_cached,
         }
     for branch in clone["branches"]:
-        branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
+        branch["vs_remote"] = live(branch["sha"], *target(branch["name"]))
 
     if base_name is None:
         return None
