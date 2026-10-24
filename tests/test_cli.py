@@ -755,6 +755,7 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     before = record.read_bytes()
     listing = _file_listing(account / ".nyx")
     runtime_before = state.observe_runtime()
+    started = int(time.time())
 
     completed = subprocess.run(
         [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
@@ -765,10 +766,12 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
         timeout=120,
         check=False,
     )
+    finished = int(time.time())
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
     [item] = [c for r in document["repositories"] for c in r["clones"]]
+    [remote_key] = [r["remote"]["key"] for r in document["repositories"]]
     assert item["path"] == real(repository)
     assert document["diagnostics"] == []
     [picked] = [b for b in item["branches"] if b["name"] == "picked"]
@@ -783,8 +786,18 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     assert sorted(set(after) - set(listing)) == ["cache", "cache/checkouts.json"]
     assert set(listing) <= set(after)
     stored = json.loads((account / ".nyx" / "cache" / "checkouts.json").read_text())
-    assert set(stored) == {"schema_version", "verdicts"}
-    assert stored["schema_version"] == 2
+    assert set(stored) == {"schema_version", "verdicts", "remote_checks"}
+    assert stored["schema_version"] == 3
+    # The run's one remote check is saved under the group's key; a file remote
+    # has no pull-request record.
+    assert set(stored["remote_checks"]) == {remote_key}
+    saved = stored["remote_checks"][remote_key]
+    assert saved["pull_requests"] is None
+    assert set(saved["heads"]) == {"at", "default", "head", "branches"}
+    assert started <= saved["heads"]["at"] <= finished
+    assert saved["heads"]["default"] == "trunk"
+    assert saved["heads"]["head"] == base
+    assert saved["heads"]["branches"] == {"trunk": base}
     assert {key: entry["rung"] for key, entry in stored["verdicts"].items()} == {
         f"{tip}.{base}": "patch_equivalent"
     }
