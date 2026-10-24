@@ -11456,3 +11456,21 @@ def test_the_reflog_time_test_answers_no_for_a_cut_a_missing_and_a_passed_deadli
     assert checkouts._ref_moved_since(open_runner, context, "topic", 2**40) is False
     assert checkouts._ref_moved_since(open_runner, context, "no-such-branch", 0) is False
     assert checkouts._ref_moved_since(expired, context, "topic", world.at) is False
+
+
+@posix_only
+def test_a_clone_behind_its_own_newer_tracking_ref_counts_against_that_ref(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    for branch in ("topic", "trunk"):
+        push_from(world.a, branch, f"{branch}-two.txt")
+        git(world.a, "reset", "-q", "--hard", "HEAD~1")
+
+    item = find_clone(collect([world.folder]), world.a)
+
+    behind_one = vs("cached", "behind", 0, 1)
+    assert branch_of(item, "topic")["vs_remote"] == behind_one
+    assert branch_of(item, "trunk")["vs_remote"] == behind_one
+    assert item["local_default"]["vs_remote"] == behind_one
+    assert item["verdict_base"]["basis"] == "cached"
