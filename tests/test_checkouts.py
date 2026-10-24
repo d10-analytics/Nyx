@@ -8614,13 +8614,24 @@ def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lo
     return redigest(document)
 
 
+def recorded_lookup(reason: str | None, checked_at: str | None = "2026-10-24T00:00:00Z"):
+    return {"status": "recorded", "reason": reason, "checked_at": checked_at}
+
+
 LOOKUP_ACCEPTED = [
     ("off", "on", GITHUB_KEY, lookup("off", "setting_off")),
     ("off", "off", GITHUB_KEY, lookup("off", "setting_off")),
     ("on", "on", "example.com/acme/widget", lookup("off", "not_github")),
     ("on", "off", "example.com/acme/widget", lookup("off", "not_github")),
     ("on", "off", GITHUB_KEY, lookup("off", "remote_checks_off")),
+    ("on", "off", GITHUB_KEY, recorded_lookup("remote_checks_off")),
     ("on", "on", GITHUB_KEY, lookup("live", None)),
+    *[
+        ("on", "on", GITHUB_KEY, recorded_lookup(reason))
+        for reason in (
+            "gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed",
+        )
+    ],
     *[
         ("on", "on", GITHUB_KEY, lookup("unavailable", reason))
         for reason in (
@@ -8641,7 +8652,7 @@ LOOKUP_REFUSED = [
     ("on", "off", GITHUB_KEY, lookup("live", None)),
     ("on", "off", GITHUB_KEY, lookup("unavailable", "failed")),
     ("on", "on", GITHUB_KEY, {**lookup("live", None), "checked_at": "2026-10-24T00:00:00Z"}),
-    ("on", "on", GITHUB_KEY, lookup("recorded", "remote_checks_off")),
+    ("on", "on", GITHUB_KEY, recorded_lookup("remote_checks_off")),
     ("on", "on", GITHUB_KEY, None),
 ]
 
@@ -10867,3 +10878,261 @@ def test_a_networked_run_that_decides_no_verdict_moves_the_head_an_offline_run_r
     assert checked_at == utc_text(after["remote_checks"][GITHUB_KEY]["heads"]["at"])
     assert checked_at > first_time
     assert cache.read_bytes() == saved_bytes
+
+
+@posix_only
+def test_each_saved_check_reports_the_time_of_its_own_record(tmp_path, monkeypatch, isolated_git):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    saved = saved_file(world.cache)
+    heads_at = saved["remote_checks"][GITHUB_KEY]["heads"]["at"]
+    pulls_at = heads_at - 7200
+    saved["remote_checks"][GITHUB_KEY]["pull_requests"]["at"] = pulls_at
+    world.cache.write_text(json.dumps(saved))
+    assert utc_text(pulls_at) != utc_text(heads_at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["checked_at"] == utc_text(heads_at)
+    assert group["pr_lookup"]["checked_at"] == utc_text(pulls_at)
+
+
+def recorded_comparison(relation: str) -> dict[str, Any]:
+    return {
+        "basis": "recorded",
+        "relation": relation,
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+
+
+def cached_base(path: Path) -> dict[str, Any]:
+    """The verdict base a clone keeps when the saved head cannot be reached: its own
+    cached default, on the cached basis."""
+    return {
+        "name": "trunk",
+        "sha": rev(path, "refs/remotes/origin/trunk"),
+        "basis": "cached",
+        "objects_from": None,
+    }
+
+
+@posix_only
+def test_a_recorded_head_that_no_sibling_holds_differs_on_the_recorded_basis(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    other = clone(remote, folder / "other")
+    push_commit(remote, "trunk", tmp_path)
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    for path in (work, other):
+        item = find_clone(document, path)
+        assert item["cached_vs_remote"] == recorded_comparison("differs")
+        assert item["local_default"]["vs_remote"] == recorded_comparison("differs")
+        assert branch_of(item, "trunk")["vs_remote"] == recorded_comparison("differs")
+        assert item["verdict_base"] == cached_base(path)
+
+
+PROBE_FAILURES = [
+    ("own", "differs", "exit 3"),
+    ("own", "unknown", "sleep 30"),
+    ("lender", "differs", "exit 3"),
+    ("lender", "unknown", "sleep 30"),
+]
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("whose", "state", "action"), PROBE_FAILURES, ids=[f"{w}-{s}" for w, s, _ in PROBE_FAILURES]
+)
+def test_a_recorded_comparison_whose_object_probe_cannot_say_keeps_that_state_on_the_recorded_basis(
+    tmp_path, monkeypatch, isolated_git, whose, state, action
+):
+    nyx_home(isolated_git)
+    folder, remote, lagging = small_world(tmp_path)
+    lender = clone(remote, folder / "a-lender")
+    push_commit(remote, "trunk", tmp_path)
+    git(lender, "fetch", "-q", "origin")
+    collect([folder], remote_checks=True)
+    probed = lagging if whose == "own" else lender
+    shim = stand_in(
+        tmp_path,
+        "failing-probe",
+        f'case "$*" in *"-C {real(probed)} "*"--ignore-missing"*) {action};; esac',
+    )
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=2)
+
+    item = find_clone(document, lagging)
+    assert item["cached_vs_remote"] == recorded_comparison(state)
+    assert item["local_default"]["vs_remote"] == recorded_comparison(state)
+    assert branch_of(item, "trunk")["vs_remote"] == recorded_comparison(state)
+    assert item["verdict_base"] == cached_base(lagging)
+
+
+@posix_only
+def test_a_guarded_clone_takes_the_recorded_basis_for_its_base_only_when_its_cached_ref_is_the_saved_head(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    push_commit(remote, "trunk", tmp_path)
+    stale = clone(remote.as_uri(), folder / "a-stale", "--depth=1")
+    head = push_commit(remote, "trunk", tmp_path)
+    shallow = clone(remote.as_uri(), folder / "b-shallow", "--depth=1")
+    partial = clone(remote.as_uri(), folder / "c-partial", "--filter=blob:none")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    for path in (shallow, partial):
+        assert find_clone(document, path)["verdict_base"] == {
+            "name": "trunk",
+            "sha": head,
+            "basis": "recorded",
+            "objects_from": None,
+        }
+    # A guarded clone behind the saved head keeps its cached base.
+    item = find_clone(document, stale)
+    assert item["verdict_base"] == cached_base(stale)
+    assert item["verdict_base"]["sha"] != head
+
+
+@posix_only
+def test_the_verdict_base_is_named_by_the_saved_default_not_by_the_clones_cached_one(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    push_commit(remote, "other", tmp_path)
+    git(work, "fetch", "-q", "origin")
+    git(work, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    item = find_clone(document, work)
+    assert item["cached_default"]["name"] == "other", "control: the clone caches another default"
+    [group] = document["repositories"]
+    assert group["default_branch"]["name"] == "trunk"
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": group["default_branch"]["sha"],
+        "basis": "recorded",
+        "objects_from": None,
+    }
+
+
+RECORDED_TIME = "2026-10-24T00:00:00Z"
+CHECK_FAILURE_REASONS = ["unreachable", "not_found", "authentication_failed", "timed_out", "failed"]
+
+
+def with_check(document: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
+    broken = doc_copy(document)
+    broken["repositories"][0]["remote"]["check"] = check
+    return broken
+
+
+@pytest.mark.parametrize("reason", ["remote_checks_off", *CHECK_FAILURE_REASONS])
+def test_parser_accepts_a_recorded_remote_check_with_a_time_and_either_kind_of_reason(
+    sample, reason
+):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": reason, "checked_at": RECORDED_TIME}
+
+    parsed = models.parse_checkouts(redigest(with_check(document, check)))
+
+    assert parsed["repositories"][0]["remote"]["check"] == check
+
+
+@pytest.mark.parametrize(
+    "checked_at", [None, "", "yesterday", "2026-13-45T25:61:61Z", "2026-10-24T00:00:00", 5]
+)
+def test_parser_refuses_a_recorded_remote_check_without_a_valid_time(sample, checked_at):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": "remote_checks_off", "checked_at": checked_at}
+
+    message = refusal_of(with_check(document, check))
+
+    assert message == "repositories[0].remote.check.checked_at must be a UTC timestamp"
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"status": "live", "reason": None},
+        {"status": "off", "reason": "remote_checks_off"},
+        {"status": "failed", "reason": "unreachable"},
+    ],
+    ids=["live", "off", "failed"],
+)
+def test_parser_refuses_a_time_on_a_remote_check_that_is_not_a_saved_one(sample, check):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(with_check(document, dict(check))))
+
+    message = refusal_of(with_check(document, {**check, "checked_at": RECORDED_TIME}))
+
+    assert message == "repositories[0].remote.check has an invalid shape"
+
+
+@pytest.mark.parametrize(
+    "reason", [None, "", "setting_off", "not_github", "bogus", "live", 7, ["failed"]]
+)
+def test_parser_refuses_a_recorded_remote_check_whose_reason_is_none_of_the_allowed_ones(
+    sample, reason
+):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": reason, "checked_at": RECORDED_TIME}
+
+    message = refusal_of(with_check(document, check))
+
+    assert message == "repositories[0].remote.check.reason does not match its status"
+
+
+@pytest.mark.parametrize("checked_at", [None, "", "yesterday", "2026-13-45T25:61:61Z", 5])
+@pytest.mark.parametrize("reason", ["remote_checks_off", "failed"])
+def test_parser_refuses_a_recorded_lookup_without_a_valid_time(sample, reason, checked_at):
+    document, _folder = sample
+    accepted = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks="off" if reason == "remote_checks_off" else "on",
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup(reason),
+    )
+    assert models.parse_checkouts(accepted)
+    broken = doc_copy(accepted)
+    broken["repositories"][0]["pr_lookup"]["checked_at"] = checked_at
+
+    message = refusal_of(broken)
+
+    assert message == "repositories[0].pr_lookup.checked_at must be a UTC timestamp"
+
+
+@pytest.mark.parametrize("reason", ["bogus", "setting_off", "not_github", None])
+def test_parser_refuses_a_recorded_lookup_with_a_reason_that_contradicts_the_checks(
+    sample, reason
+):
+    document, _folder = sample
+    broken = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks="on",
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup(reason),
+    )
+
+    message = refusal_of(broken)
+
+    assert message == "repositories[0].pr_lookup does not match the lookup setting and the remote"
