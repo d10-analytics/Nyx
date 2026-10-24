@@ -8421,6 +8421,29 @@ MISSING_NODES = github_answer(2)
 del MISSING_NODES["data"]["repository"]["b1"]["nodes"]
 NULL_REPOSITORY = {"data": {"repository": None}}
 
+
+def answer_with_repository_field(name: str, value: Any) -> dict[str, Any]:
+    answer = github_answer(2)
+    answer["data"]["repository"][name] = value
+    return answer
+
+
+# Values of the wrong JSON type at each place the answer is read: each must make
+# the lookup fail rather than raise while it is hashed, compared or indexed.
+ODD_SHAPE_CASES = [
+    ("state-list", merged_answer_with({"state": ["MERGED"]})),
+    ("state-dict", merged_answer_with({"state": {"MERGED": True}})),
+    ("number-list", merged_answer_with({"number": [7]})),
+    ("head-object-list", merged_answer_with({"headRefOid": ["a" * 40]})),
+    ("base-name-dict", merged_answer_with({"baseRefName": {"trunk": 1}})),
+    ("data-list", {"data": [{"repository": None}]}),
+    ("repository-list", {"data": {"repository": [{"__typename": "Repository"}]}}),
+    ("typename-list", answer_with_repository_field("__typename", ["Repository"])),
+    ("alias-list", answer_with_repository_field("b0", [{"nodes": []}])),
+    ("nodes-object", answer_with_repository_field("b0", {"nodes": {}})),
+    ("node-list", answer_with_repository_field("b0", {"nodes": [[7, "MERGED"]]})),
+]
+
 CATEGORY_CASES = [
     ("exit-4", {"code": 4}, "not_authenticated"),
     ("http-401", {"code": 1, "stderr": HTTP_401}, "not_authenticated"),
@@ -8468,6 +8491,7 @@ CATEGORY_CASES = [
     ),
     ("huge-integer-exit-0", {"code": 0, "stdout": "1" * 5000}, "failed"),
     ("huge-integer-exit-1", {"code": 1, "stdout": "1" * 5000}, "failed"),
+    *((name, {"code": 0, "stdout": answer}, "failed") for name, answer in ODD_SHAPE_CASES),
 ]
 
 
