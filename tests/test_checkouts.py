@@ -9535,6 +9535,7 @@ def test_parser_accepts_a_pull_request_rung_where_a_branch_at_the_commit_lists_i
     clone_document = first_clone(shared)
     branch = branch_of(clone_document, "outside")
     branch["pull_requests"] = [{"number": 12, "state": "merged", "head_matches": False}]
+    branch["verdict"] = verdict_of("merged", "pull_request", pull_request=12)
     detach(shared, verdict_of("merged", "pull_request", pull_request=12))
     assert models.parse_checkouts(redigest(rederive(shared)))
     # A list of ten is the bound.
@@ -11156,6 +11157,24 @@ def test_parser_refuses_a_recorded_lookup_with_a_reason_that_contradicts_the_che
     assert message == "repositories[0].pr_lookup does not match the lookup setting and the remote"
 
 
+@pytest.mark.parametrize("remote_checks", ["on", "off"])
+def test_parser_refuses_a_recorded_not_github_lookup_on_a_github_group(sample, remote_checks):
+    document, _folder = sample
+    broken = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks=remote_checks,
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup("not_github"),
+    )
+
+    message = refusal_of(broken)
+
+    assert message == (
+        "repositories[0].pr_lookup.reason is not_github exactly when the remote is not GitHub's"
+    )
+
+
 # ---------------------------------------------------------------------------
 # A newer remote-tracking ref beats the saved check
 # ---------------------------------------------------------------------------
@@ -11966,6 +11985,38 @@ def test_a_detached_worktree_takes_the_rung_only_at_a_commit_a_local_branch_hold
     assert refusal_after(document, rung_at_an_unheld_commit) == (
         f"{worktree_label(document, path, pull_requests.detached)}.verdict "
         "names a pull request at a commit no branch holds"
+    )
+
+
+@posix_only
+def test_a_detached_worktree_takes_the_rung_only_as_the_verdict_of_a_branch_at_its_commit(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    clone_document = find_clone(document, path)
+    assert branch_of(clone_document, "x")["sha"] == branch_of(clone_document, "y")["sha"]
+    assert verdict_facts(branch_of(clone_document, "x")) == pr_verdict(15)
+
+    def detached_at_the_shared_commit(broken):
+        item = find_clone(broken, path)
+        worktree = find_worktree(item, pull_requests.detached)
+        worktree["head"]["sha"] = branch_of(item, "x")["sha"]
+        worktree["verdict"] = verdict_of("merged", "pull_request", pull_request=15)
+
+    shared = doc_copy(document)
+    detached_at_the_shared_commit(shared)
+    assert models.parse_checkouts(redigest(rederive(shared)))
+
+    def branches_hold_another_verdict(broken):
+        detached_at_the_shared_commit(broken)
+        item = find_clone(broken, path)
+        for name in ("x", "y"):
+            branch_of(item, name)["verdict"] = verdict_of("not_merged", "none")
+
+    assert refusal_after(document, branches_hold_another_verdict) == (
+        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
+        "differs from the verdict of every branch at its commit"
     )
 
 
