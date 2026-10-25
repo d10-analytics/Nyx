@@ -1772,19 +1772,19 @@ def _apply_live(
     presence = (
         _present_objects(runner, context, wanted) if wanted and not guarded else {}
     )
-    memo: dict[tuple[str, str, str], dict[str, Any]] = {}
+    memo: dict[tuple[str, str], dict[str, Any]] = {}
     lacking = [item for item in wanted if presence.get(item) == "missing"]
     lenders = _LenderSearch(runner, siblings)
 
     def lender(right: str) -> tuple[dict[str, Any], _CloneContext] | str | None:
         return lenders.find(right, lacking)
 
-    def borrowed(left: str, right: str, how: str) -> dict[str, Any]:
+    def borrowed(left: str, right: str) -> dict[str, Any]:
         source = lender(right)
         if source is None:
-            return _comparison("differs", basis=how)
+            return _comparison("differs", basis=basis)
         if isinstance(source, str):
-            return _comparison(source, basis=how)
+            return _comparison(source, basis=basis)
         sibling, sibling_context = source
         result = _counted_comparison(
             runner.run(
@@ -1797,35 +1797,35 @@ def _apply_live(
                     )
                 },
             ),
-            how,
+            basis,
         )
         if result["relation"] in ("ahead", "behind", "diverged"):
             result["objects_from"] = sibling["path"]
         return result
 
-    def live(left: str | None, right: str | None, how: str = basis) -> dict[str, Any]:
+    def live(left: str | None, right: str | None) -> dict[str, Any]:
         if left is None or right is None:
-            return _comparison("absent", basis=how)
+            return _comparison("absent", basis=basis)
         if left == right:
-            return _comparison("equal", 0, 0, how)
+            return _comparison("equal", 0, 0, basis)
         if guarded:
-            return _comparison("differs", basis=how)
+            return _comparison("differs", basis=basis)
         state = presence.get(right, "missing")
         if state in ("unknown", "differs"):
-            return _comparison("unknown" if state == "unknown" else "differs", basis=how)
-        if (left, right, how) not in memo:
+            return _comparison("unknown" if state == "unknown" else "differs", basis=basis)
+        if (left, right) not in memo:
             if state == "present":
-                memo[(left, right, how)] = _counted_comparison(
+                memo[(left, right)] = _counted_comparison(
                     runner.run(
                         ["rev-list", "--left-right", "--count", f"{left}...{right}"],
                         path=context.cwd,
                         ceiling=context.ceiling,
                     ),
-                    how,
+                    basis,
                 )
             else:
-                memo[(left, right, how)] = borrowed(left, right, how)
-        return memo[(left, right, how)]
+                memo[(left, right)] = borrowed(left, right)
+        return memo[(left, right)]
 
     clone["cached_vs_remote"] = live(cached_sha, remote_sha)
     if name is None:
