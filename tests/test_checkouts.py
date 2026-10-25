@@ -9535,7 +9535,11 @@ def test_parser_accepts_a_pull_request_rung_where_a_branch_at_the_commit_lists_i
     clone_document = first_clone(shared)
     branch = branch_of(clone_document, "outside")
     branch["pull_requests"] = [{"number": 12, "state": "merged", "head_matches": False}]
-    branch["verdict"] = verdict_of("merged", "pull_request", pull_request=12)
+    # Every branch at the commit carries the one verdict the worktree shares.
+    holders = [item for item in clone_document["branches"] if item["sha"] == branch["sha"]]
+    assert [item["name"] for item in holders] == ["never-pushed", "outside"]
+    for holder in holders:
+        holder["verdict"] = verdict_of("merged", "pull_request", pull_request=12)
     detach(shared, verdict_of("merged", "pull_request", pull_request=12))
     assert models.parse_checkouts(redigest(rederive(shared)))
     # A list of ten is the bound.
@@ -12008,16 +12012,110 @@ def test_a_detached_worktree_takes_the_rung_only_as_the_verdict_of_a_branch_at_i
     detached_at_the_shared_commit(shared)
     assert models.parse_checkouts(redigest(rederive(shared)))
 
+    message = (
+        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
+        "differs from the verdict of a branch at its commit"
+    )
+
     def branches_hold_another_verdict(broken):
         detached_at_the_shared_commit(broken)
         item = find_clone(broken, path)
         for name in ("x", "y"):
             branch_of(item, name)["verdict"] = verdict_of("not_merged", "none")
 
-    assert refusal_after(document, branches_hold_another_verdict) == (
-        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
-        "differs from the verdict of every branch at its commit"
+    assert refusal_after(document, branches_hold_another_verdict) == message
+
+    # One branch at the commit agreeing is not enough: the commit has one verdict.
+    def one_branch_holds_another_verdict(broken):
+        detached_at_the_shared_commit(broken)
+        branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of("not_merged", "none")
+
+    assert refusal_after(document, one_branch_holds_another_verdict) == message
+
+
+class BaseAheadWorld:
+    """One GitHub clone whose local ``trunk``, the verdict base's name, is one commit
+    ahead of ``origin/trunk`` with a detached worktree at that commit. Merged request 7
+    names ``trunk`` with its head at that commit, or, for ``descendant``, at a child of
+    it that branch ``later`` holds. With ``beside``, branch ``x`` also sits at the
+    commit. ``live`` is the networked collection and ``recorded`` the offline one."""
+
+    def __init__(
+        self, tmp_path: Path, monkeypatch, isolated_git: Path, *, descendant: bool, beside: bool
+    ) -> None:
+        nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        remote = make_remote(served)
+        self.work = clone(remote, folder / "work")
+        self.tip = commit_file(self.work, "ahead.txt", "ahead\n")
+        head = self.tip
+        if descendant:
+            git(self.work, "checkout", "-q", "-b", "later")
+            head = commit_file(self.work, "later.txt", "later\n")
+            git(self.work, "checkout", "-q", "trunk")
+        if beside:
+            git(self.work, "branch", "x", "trunk")
+        self.detached = linked(self.work, tmp_path, "ahead", "--detach", self.tip)
+        point_origin_at(self.work, remote, GITHUB_URL)
+        install_fake_gh(
+            tmp_path,
+            monkeypatch,
+            stdout=pr_answer(local_names(self.work), {"trunk": [pr_node(7, "merged", head)]}),
+        )
+        self.live = github_collect(folder)
+        self.recorded = github_collect(folder, remote_checks=False)
+        for document in (self.live, self.recorded):
+            item = find_clone(document, self.work)
+            assert item["verdict_base"]["name"] == "trunk"
+            assert item["verdict_base"]["sha"] != self.tip
+            trunk = branch_of(item, "trunk")
+            assert trunk["sha"] == self.tip and trunk["verdict"] is None
+            assert listed(trunk) == [(7, "merged", not descendant)]
+            assert verdict_facts(find_worktree(item, self.detached)) == pr_verdict(7)
+        assert group_of_document(self.recorded)["pr_lookup"]["status"] == "recorded"
+
+
+@posix_only
+@pytest.mark.parametrize("descendant", [False, True], ids=["head", "descendant"])
+def test_a_detached_worktree_the_base_branch_alone_shares_a_commit_with_keeps_the_rung(
+    tmp_path, monkeypatch, isolated_git, descendant
+):
+    # The candidate names of a commit include the verdict base branch, which itself
+    # takes no verdict, so the detached worktree's verdict has no branch verdict to
+    # match. Each document already parsed strictly inside ``collect``.
+    world = BaseAheadWorld(
+        tmp_path, monkeypatch, isolated_git, descendant=descendant, beside=False
     )
+    for document in (world.live, world.recorded):
+        item = find_clone(document, world.work)
+        assert [b["name"] for b in item["branches"] if b["sha"] == world.tip] == ["trunk"]
+        assert models.parse_checkouts(redigest(rederive(doc_copy(document))))
+
+
+@posix_only
+def test_a_branch_beside_the_base_branch_at_a_commit_holds_the_detached_worktree_to_its_verdict(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = BaseAheadWorld(tmp_path, monkeypatch, isolated_git, descendant=False, beside=True)
+    path = world.work
+    for document in (world.live, world.recorded):
+        item = find_clone(document, path)
+        # ``x`` takes request 7 through the base branch's name at the same commit.
+        assert verdict_facts(branch_of(item, "x")) == pr_verdict(7)
+        assert listed(branch_of(item, "x")) == []
+
+        def beside_holds_another_verdict(broken):
+            branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of(
+                "not_merged", "none"
+            )
+
+        assert refusal_after(document, beside_holds_another_verdict) == (
+            f"{worktree_label(document, path, world.detached)}.verdict "
+            "differs from the verdict of a branch at its commit"
+        )
 
 
 @posix_only
