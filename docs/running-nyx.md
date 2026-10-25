@@ -309,7 +309,11 @@ hold the whole answer of the last successful `git ls-remote` (its default branch
 and every branch tip) and of the last successful `gh` request (for each branch name asked about, the
 same-repository pull requests among the newest 10 from any repository), each
 with the time the check was started. A successful check replaces only its own half, and a failed
-check changes nothing. All saved checks together are held to 2 MiB, newest first; a
+check changes nothing. When two runs save a check of the same remote at once, the
+one started later is kept. A saved check dated more than five minutes after the
+current time, as a clock that ran ahead can leave, is not believed: Nyx treats that
+half as never saved, so the remote is shown as it would be with no saved check,
+and the next write of the file leaves it out. All saved checks together are held to 2 MiB, newest first; a
 remote whose saved check alone exceeds that is not kept and behaves as if it had
 none. A file written by an earlier version of Nyx, which has no saved checks, is
 read as empty without a diagnostic and replaced on the next write, so the verdicts
