@@ -160,10 +160,10 @@ separated by two spaces and in this order, four more elements.
   comparison could not be made. `<basis>` is `live` under a live check,
   `recorded` under a recorded one and `cached` when the check is off or failed
   with no saved check, whatever the number of local branches.
-  `local-only <n>` counts local branches with no same-name branch on `origin`,
-  including a branch whose comparison the clone's own newer remote-tracking
-  branch decided, which is compared on the `cached` basis (see recorded values
-  below).
+  `local-only <n>` counts local branches with no same-name branch on `origin`.
+  `branches recorded` is the status of the check; under it an individual branch
+  that the clone's own newer remote-tracking branch decided is compared on the
+  `cached` basis (see recorded values below).
 - The default branch, in one of three forms. With a live check:
   `default <name> live <relation> cached <relation> tracking live <relation>
   fetched <time>`, comparing the local default branch with the remote's, then
@@ -187,10 +187,12 @@ is a verdict, and appears only in the `--json` document: the plain lines
 never show a branch's verdict itself, only the Removable summary described
 below. In each clone, `verdict_base` names the
 default branch the verdicts are judged against, its commit, and its `basis`.
-The branch is the default branch of the live check, else of the saved check,
-else, when neither names one (an empty remote, or one with a detached `HEAD`), the
-name the clone's own remote-tracking copy points to, or the name every clone of
-the remote agrees on. The `live` basis is the remote's current commit for
+The branch is the default branch named by the check the verdicts rest on: the
+live check when it answered, otherwise the saved check. When that check names
+none (an empty remote, or one with a detached `HEAD`), and when there is no
+check, it is the name the clone's own remote-tracking copy points to, or else the
+name every clone of the remote agrees on. A saved check's name is never used
+while the live check answered. The `live` basis is the remote's current commit for
 that name, taken from the clone itself or borrowed read-only from a sibling
 clone that has it (named in `objects_from`). The `recorded` basis is the commit
 the last successful check saw for that name, found in the clone or borrowed from
@@ -304,9 +306,9 @@ runs then show only the clone's own fetched refs until a networked run checks ag
 
 The saved remote checks are kept per remote in the same file. For each remote they
 hold the whole answer of the last successful `git ls-remote` (its default branch
-and every branch tip) and of the last successful `gh` request (the newest 10
-same-repository pull requests of each branch name asked about), each with the time
-the check was started. A successful check replaces only its own half, and a failed
+and every branch tip) and of the last successful `gh` request (for each branch name asked about, the
+same-repository pull requests among the newest 10 from any repository), each
+with the time the check was started. A successful check replaces only its own half, and a failed
 check changes nothing. All saved checks together are held to 2 MiB, newest first; a
 remote whose saved check alone exceeds that is not kept and behaves as if it had
 none. A file written by an earlier version of Nyx, which has no saved checks, is
@@ -474,9 +476,11 @@ A saved lookup stands in when the request was not made because of
 `remote_checks_off` or failed with any reason except `setting_off` and
 `not_github`.
 
-With a lookup, each branch in `--json` lists `pull_requests`: the newest 10
-pull requests from the same repository (not a fork) whose head branch has the
-branch's name, each with its `number`, `state` and `head_matches`, which is true
+With a lookup, each branch in `--json` lists `pull_requests`: of the
+newest 10 pull requests whose head branch has the branch's name, those from the
+same repository (not a fork), so fewer than 10 may be listed and an older
+same-repository request is not, each with its `number`, `state` and
+`head_matches`, which is true
 when the request's head is the branch's current commit. The `pull_request` rung
 reports `merged` when a merged pull request from the same repository into the
 base branch has a head branch that is a local branch at the commit, and its head
