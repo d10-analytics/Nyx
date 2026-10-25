@@ -3097,6 +3097,11 @@ _HEADS_KEYS = frozenset({"at", "default", "head", "branches"})
 _SAVED_PULL_REQUESTS_KEYS = frozenset({"at", "by_head"})
 _SAVED_PULL_REQUEST_KEYS = frozenset({"number", "state", "head", "base"})
 _SAVED_PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
+# A saved remote check dated later than now plus this many seconds was written
+# by a clock that ran ahead and is not believed. It must exceed the skew between
+# concurrent collections, whose records legitimately differ by seconds, and stay
+# far below the hour a mis-set clock or time zone typically leaves.
+SAVED_CHECK_FUTURE_TOLERANCE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -3172,8 +3177,22 @@ def _parse_saved_pull_requests(value: Any) -> dict[str, Any] | None:
     return {"at": _saved_time(record["at"]), "by_head": by_head}
 
 
+def _credible(record: dict[str, Any] | None, now: int) -> dict[str, Any] | None:
+    """``record`` unless its ``at`` lies beyond ``now`` plus the tolerance.
+
+    Such a record would outrank every later check and could not always be shown
+    as a UTC time, so it counts as missing. ``now`` plus the tolerance is a time
+    the document can show, which bounds every kept ``at``."""
+    if record is None or record["at"] > now + SAVED_CHECK_FUTURE_TOLERANCE_SECONDS:
+        return None
+    return record
+
+
 def _parse_remote_checks(value: Any) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """The saved remote checks, each member kept only when :func:`_credible`; a
+    remote left with no member is omitted. A malformed file is still rejected."""
     section = _object(value, "checkout cache remote checks")
+    now = int(time.time())
     checks: dict[str, dict[str, dict[str, Any] | None]] = {}
     for key, raw in section.items():
         record = _object(raw, "checkout cache remote")
@@ -3182,7 +3201,10 @@ def _parse_remote_checks(value: Any) -> dict[str, dict[str, dict[str, Any] | Non
         pull_requests = _parse_saved_pull_requests(record["pull_requests"])
         if heads is None and pull_requests is None:
             raise ProtocolError("checkout cache remote has no record")
-        checks[_saved_text(key)] = {"heads": heads, "pull_requests": pull_requests}
+        name = _saved_text(key)
+        heads, pull_requests = _credible(heads, now), _credible(pull_requests, now)
+        if heads is not None or pull_requests is not None:
+            checks[name] = {"heads": heads, "pull_requests": pull_requests}
     return checks
 
 
