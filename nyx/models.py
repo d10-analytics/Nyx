@@ -1019,15 +1019,43 @@ def _ordered(items: list[Any], key, name: str) -> None:
         raise ProtocolError(f"{name} must be unique and in canonical order")
 
 
-def _comparison(value: Any, name: str, *, nullable: bool = False) -> None:
+def _basis(basis: Any, name: str, check: str | None) -> str:
+    """Check a comparison's or verdict base's basis against its group's remote check.
+
+    ``check`` is the status of the group's ``remote.check``, or ``None`` for a
+    clone with no remote. The ``live`` basis needs a ``live`` check and the
+    ``recorded`` basis a ``recorded`` one; ``cached`` stands under any.
+    """
+    basis = _choice(basis, _COMPARISON_BASES, f"{name}.basis")
+    if basis in ("live", "recorded") and check != basis:
+        raise ProtocolError(f"{name}.basis is {basis} without a {basis} remote check")
+    return basis
+
+
+# The bases a branch's comparison may take under each remote check: the saved
+# check may be overridden by a newer remote-tracking ref of the clone itself.
+_BRANCH_BASES: dict[str | None, frozenset[str]] = {
+    "live": frozenset({"live"}),
+    "recorded": frozenset({"recorded", "cached"}),
+    "off": frozenset({"cached"}),
+    "failed": frozenset({"cached"}),
+    None: frozenset({"cached"}),
+}
+
+
+def _comparison(
+    value: Any, name: str, *, check: str | None, nullable: bool = False
+) -> None:
     if value is None and nullable:
         return
     item = _object(value, name)
     _keys(item, _COMPARISON_KEYS, name)
-    _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
+    basis = _basis(item["basis"], name, check)
     relation = _choice(item["relation"], _COMPARISON_RELATIONS, f"{name}.relation")
     ahead, behind = item["ahead"], item["behind"]
-    _nullable(item["objects_from"], _text, f"{name}.objects_from")
+    lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
+    if lender is not None and basis == "cached":
+        raise ProtocolError(f"{name}.objects_from requires the live or recorded basis")
     if relation in {"differs", "absent", "unknown"}:
         if ahead is not None or behind is not None or item["objects_from"] is not None:
             raise ProtocolError(f"{name} must not carry counts for {relation}")
@@ -1068,14 +1096,14 @@ def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
         raise ProtocolError(f"{name}.pull_request must be set exactly for the pull_request rung")
 
 
-def _verdict_base(value: Any, name: str) -> None:
+def _verdict_base(value: Any, name: str, *, check: str | None) -> None:
     if value is None:
         return
     item = _object(value, name)
     _keys(item, _VERDICT_BASE_KEYS, name)
     _text(item["name"], f"{name}.name")
     _object_id(item["sha"], f"{name}.sha")
-    basis = _choice(item["basis"], _COMPARISON_BASES, f"{name}.basis")
+    basis = _basis(item["basis"], name, check)
     lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
     if lender is not None and basis == "cached":
         raise ProtocolError(f"{name}.objects_from requires the live or recorded basis")
@@ -1141,7 +1169,9 @@ def _pull_requests(value: Any, name: str) -> None:
         raise ProtocolError(f"{name} must be unique and sorted by number")
 
 
-def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
+def _branch(
+    value: Any, name: str, *, has_remote: bool, check: str | None
+) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _BRANCH_KEYS, name)
     _text(item["name"], f"{name}.name")
@@ -1152,7 +1182,10 @@ def _branch(value: Any, name: str, *, has_remote: bool) -> dict[str, Any]:
     _ordered(paths, natural_key, f"{name}.checked_out_in")
     _nullable(item["upstream"], _text, f"{name}.upstream")
     mismatch = _bool(item["upstream_mismatch"], f"{name}.upstream_mismatch")
-    _comparison(item["vs_remote"], f"{name}.vs_remote", nullable=True)
+    _comparison(item["vs_remote"], f"{name}.vs_remote", check=check, nullable=True)
+    compared = item["vs_remote"]
+    if compared is not None and compared["basis"] not in _BRANCH_BASES[check]:
+        raise ProtocolError(f"{name}.vs_remote.basis does not fit the {check} remote check")
     if not has_remote and (item["vs_remote"] is not None or mismatch):
         raise ProtocolError(f"{name} compares with a remote the clone does not have")
     if has_remote and item["vs_remote"] is None:
@@ -1335,13 +1368,16 @@ def _clone_verdicts(
             verdicts.append((label, worktree["verdict"], worktree["head"]["sha"]))
     limited = item["shallow"] or item["partial_clone"]
     for label, verdict, commit in verdicts:
-        # With no lookup no branch lists a request, so the rung cannot be named either.
-        if verdict["rung"] == "pull_request" and (
-            verdict["pull_request"] not in merged_at.get(commit, ())
-        ):
-            raise ProtocolError(
-                f"{label} names a pull request no branch at its commit lists as merged"
-            )
+        if verdict["rung"] == "pull_request":
+            if not lookup_used:
+                raise ProtocolError(f"{label} names a pull request without a pull-request lookup")
+            # A detached checkout shares the verdict of a branch at its commit.
+            if commit not in merged_at:
+                raise ProtocolError(f"{label} names a pull request at a commit no branch holds")
+            if verdict["pull_request"] not in merged_at[commit]:
+                raise ProtocolError(
+                    f"{label} names a pull request no branch at its commit lists as merged"
+                )
         no_base = _verdict_state(verdict) == ("unknown", "no_base")
         if no_base != (base is None):
             raise ProtocolError(f"{label} contradicts the verdict base of the clone")
@@ -1458,6 +1494,7 @@ def _clone(
     name: str,
     *,
     has_remote: bool,
+    check: str | None,
     lookup_used: bool,
     worktree_paths: set[str],
     git_version: str | None,
@@ -1488,8 +1525,12 @@ def _clone(
     _bool(item["partial_clone"], f"{name}.partial_clone")
     _bool(item["shallow"], f"{name}.shallow")
     _count(item["stash_count"], f"{name}.stash_count")
-    _comparison(item["cached_vs_remote"], f"{name}.cached_vs_remote", nullable=True)
-    _verdict_base(item["verdict_base"], f"{name}.verdict_base")
+    _comparison(item["cached_vs_remote"], f"{name}.cached_vs_remote", check=check, nullable=True)
+    _verdict_base(item["verdict_base"], f"{name}.verdict_base", check=check)
+    # Without a live or saved answer there is nothing for the clone to compare with.
+    answered = check in ("live", "recorded")
+    if has_remote and item["cached_vs_remote"] is not None and not answered:
+        raise ProtocolError(f"{name}.cached_vs_remote requires a live or recorded remote check")
 
     cached = item["cached_default"]
     local = item["local_default"]
@@ -1514,8 +1555,14 @@ def _clone(
             _keys(local, _LOCAL_DEFAULT_KEYS, f"{name}.local_default")
             _text(local["name"], f"{name}.local_default.name")
             _nullable(local["sha"], _object_id, f"{name}.local_default.sha")
-            _comparison(local["vs_remote"], f"{name}.local_default.vs_remote", nullable=True)
-            _comparison(local["vs_cached"], f"{name}.local_default.vs_cached")
+            _comparison(
+                local["vs_remote"], f"{name}.local_default.vs_remote", check=check, nullable=True
+            )
+            if local["vs_remote"] is not None and not answered:
+                raise ProtocolError(
+                    f"{name}.local_default.vs_remote requires a live or recorded remote check"
+                )
+            _comparison(local["vs_cached"], f"{name}.local_default.vs_cached", check=check)
 
     worktrees = _list(item["worktrees"], f"{name}.worktrees")
     parsed = [
@@ -1538,7 +1585,7 @@ def _clone(
     if len(branches) > CHECKOUT_BRANCH_CAP:
         raise ProtocolError(f"{name} lists more than {CHECKOUT_BRANCH_CAP} branches")
     parsed_branches = [
-        _branch(raw, f"{name}.branches[{index}]", has_remote=has_remote)
+        _branch(raw, f"{name}.branches[{index}]", has_remote=has_remote, check=check)
         for index, raw in enumerate(branches)
     ]
     _ordered(parsed_branches, branch_sort_key, f"{name}.branches")
@@ -1594,24 +1641,33 @@ def _pr_lookup(
     elif lookup["checked_at"] is not None:
         raise ProtocolError(f"{name}.checked_at must be null")
     if not github_lookup:
-        expected: str | None = "setting_off"
-    elif github_identity(remote_key) is None:
-        expected = "not_github"
+        # With the setting off every lookup is off, whatever the remote is.
+        if status != "off":
+            raise ProtocolError(f"{name} must be off when the lookup setting is off")
+        if reason != "setting_off":
+            raise ProtocolError(f"{name}.reason must be setting_off when the setting is off")
+        return
+    github = github_identity(remote_key) is not None
+    if (reason == "not_github") == github:
+        raise ProtocolError(f"{name}.reason is not_github exactly when the remote is not GitHub's")
+    failure = type(reason) is str and reason in _PR_LOOKUP_FAILURE_REASONS
+    if remote_checks:
+        if reason == "remote_checks_off":
+            raise ProtocolError(f"{name}.reason cannot be remote_checks_off with remote checks on")
     else:
-        expected = None
-    if expected is not None:
-        valid = status == "off" and reason == expected
-    elif not remote_checks:
         # Without remote checks no call is made: the lookup is off, or it is a saved one.
-        valid = status in ("off", "recorded") and reason == "remote_checks_off"
+        if status not in ("off", "recorded"):
+            raise ProtocolError(f"{name} must be off or recorded with remote checks off")
+        if failure:
+            raise ProtocolError(f"{name}.reason cannot be a failure with remote checks off")
+    if not github:
+        valid = status == "off"
+    elif not remote_checks:
+        valid = reason == "remote_checks_off"
     elif status == "live":
         valid = reason is None
     else:
-        valid = (
-            status in ("unavailable", "recorded")
-            and type(reason) is str
-            and reason in _PR_LOOKUP_FAILURE_REASONS
-        )
+        valid = status in ("unavailable", "recorded") and failure
     if not valid:
         raise ProtocolError(f"{name} does not match the lookup setting and the remote")
 
@@ -1631,6 +1687,7 @@ def _repository(
     _keys(item, _REPOSITORY_KEYS, name)
     remote = item["remote"]
     default_branch = item["default_branch"]
+    check_status: str | None = None
     if remote is None:
         if default_branch is not None:
             raise ProtocolError(f"{name} has a default branch without a remote")
@@ -1645,6 +1702,7 @@ def _repository(
         recorded = check.get("status") == "recorded"
         _keys(check, _CHECK_KEYS | {"checked_at"} if recorded else _CHECK_KEYS, f"{name}.remote.check")
         status = _choice(check["status"], _CHECK_STATUSES, f"{name}.remote.check.status")
+        check_status = status
         reason = check["reason"]
         if status == "live":
             valid = reason is None
@@ -1659,10 +1717,23 @@ def _repository(
             valid = type(reason) is str and reason in _CHECK_FAILURE_REASONS
         if not valid:
             raise ProtocolError(f"{name}.remote.check.reason does not match its status")
+        if remote_checks:
+            if reason == "remote_checks_off":
+                raise ProtocolError(
+                    f"{name}.remote.check.reason cannot be remote_checks_off with remote checks on"
+                )
+        elif status not in ("off", "recorded"):
+            raise ProtocolError(f"{name}.remote.check must be off or recorded with remote checks off")
+        elif reason != "remote_checks_off":
+            raise ProtocolError(
+                f"{name}.remote.check.reason cannot be a failure with remote checks off"
+            )
         default_branch = _object(default_branch, f"{name}.default_branch")
         _keys(default_branch, _DEFAULT_BRANCH_KEYS, f"{name}.default_branch")
         _nullable(default_branch["name"], _text, f"{name}.default_branch.name")
-        _nullable(default_branch["sha"], _object_id, f"{name}.default_branch.sha")
+        default_sha = _nullable(default_branch["sha"], _object_id, f"{name}.default_branch.sha")
+        if default_sha is not None and status not in ("live", "recorded"):
+            raise ProtocolError(f"{name}.default_branch.sha requires a live or recorded remote check")
         _pr_lookup(
             item["pr_lookup"],
             f"{name}.pr_lookup",
@@ -1679,6 +1750,7 @@ def _repository(
             raw,
             f"{name}.clones[{clone_index}]",
             has_remote=remote is not None,
+            check=check_status,
             lookup_used=lookup_used,
             worktree_paths=worktree_paths,
             git_version=git_version,
