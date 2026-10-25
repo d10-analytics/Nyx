@@ -10038,7 +10038,9 @@ def test_a_file_replaced_during_the_run_keeps_the_newer_member_and_takes_the_run
     document = github_collect(folder)
     other_key = remote_key_of(document, second)
     replacement = saved_file(cache)
-    future = int(time.time()) + 3600
+    # Another collection's heads, a little newer than this run's own check but
+    # within the tolerance for concurrent runs.
+    future = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
     record = replacement["remote_checks"][GITHUB_KEY]
     record["heads"]["at"] = future
     record["heads"]["head"] = "d" * 40
@@ -10066,8 +10068,9 @@ def test_a_file_replaced_during_the_run_keeps_the_newer_member_and_takes_the_run
         github_collect(folder)
 
     merged = saved_file(cache)["remote_checks"]
-    # The future heads survive, though the run's own answer is older.
+    # The newer heads survive, though the run's own answer is older.
     assert merged[GITHUB_KEY]["heads"] == record["heads"]
+    assert merged[GITHUB_KEY]["heads"]["at"] > started
     # The pull requests are the run's own, not the replaced file's older record.
     own = merged[GITHUB_KEY]["pull_requests"]
     assert own["at"] >= started
@@ -10090,7 +10093,7 @@ def test_a_file_replaced_after_the_cache_was_loaded_keeps_the_newer_member_and_t
     document = github_collect(folder)
     other_key = remote_key_of(document, second)
     replacement = saved_file(cache)
-    future = int(time.time()) + 3600
+    future = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
     replacement["remote_checks"][GITHUB_KEY]["heads"]["at"] = future
     replacement["remote_checks"][GITHUB_KEY]["heads"]["head"] = "d" * 40
     del replacement["remote_checks"][other_key]
@@ -10119,6 +10122,180 @@ def test_a_file_replaced_after_the_cache_was_loaded_keeps_the_newer_member_and_t
     # The remote absent from the replacement gets this run's answer.
     assert merged[other_key]["heads"]["at"] >= started
     assert merged[other_key]["heads"]["head"] == rev(other, "trunk")
+
+
+def set_saved_time(cache: Path, key: str, member: str, at: int) -> bytes:
+    """Rewrite the ``at`` of one saved member and return the bytes now on disk."""
+    saved = saved_file(cache)
+    saved["remote_checks"][key][member]["at"] = at
+    # The canonical form, so that a run which writes nothing leaves these bytes.
+    cache.write_bytes((checkouts._dump(saved) + "\n").encode("utf-8"))
+    return cache.read_bytes()
+
+
+def other_member(member: str) -> str:
+    return "pull_requests" if member == "heads" else "heads"
+
+
+def recorded_basis_in(item: dict[str, Any]) -> bool:
+    """Whether any comparison or the verdict base of a clone rests on a saved check."""
+    return '"basis": "recorded"' in json.dumps(item)
+
+
+UNREPRESENTABLE_OR_AHEAD = [
+    pytest.param(253402300800, id="year-10000"),
+    pytest.param(10**30, id="huge"),
+    pytest.param(None, id="an-hour-ahead"),
+]
+
+
+@posix_only
+@pytest.mark.parametrize("member", ["heads", "pull_requests"])
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_a_saved_member_dated_beyond_reach_is_missing_offline_and_nothing_is_rewritten(
+    tmp_path, monkeypatch, isolated_git, member, bad
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    at = int(time.time()) + 3600 if bad is None else bad
+    before = set_saved_time(world.cache, GITHUB_KEY, member, at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    heads_check, pulls_check = group["remote"]["check"], group["pr_lookup"]
+    if member == "heads":
+        # No record to answer from: nothing is labelled recorded.
+        assert heads_check["status"] != "recorded"
+        for path in (world.work, world.second):
+            assert not recorded_basis_in(find_clone(offline, path))
+        assert pulls_check["status"] == "recorded"
+        assert pulls_check["checked_at"] == utc_text(world.saved["pull_requests"]["at"])
+    else:
+        assert pulls_check["status"] != "recorded"
+        assert heads_check["status"] == "recorded"
+        assert heads_check["checked_at"] == utc_text(world.saved["heads"]["at"])
+    # The run decided a verdict, so it rewrites the file: the good member is
+    # kept as it was and the ignored one is not carried forward.
+    kept = other_member(member)
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert stored[kept] == world.saved[kept]
+    assert stored[member] is None
+    assert world.cache.read_bytes() != before
+
+
+@posix_only
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_a_remote_whose_saved_members_are_all_beyond_reach_is_treated_as_never_checked(
+    tmp_path, monkeypatch, isolated_git, bad
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    at = int(time.time()) + 3600 if bad is None else bad
+    set_saved_time(world.cache, GITHUB_KEY, "heads", at)
+    before = set_saved_time(world.cache, GITHUB_KEY, "pull_requests", at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert group["pr_lookup"]["status"] != "recorded"
+    assert GITHUB_KEY not in saved_file(world.cache)["remote_checks"]
+    assert world.cache.read_bytes() != before
+
+
+@posix_only
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_an_offline_run_that_verifies_nothing_does_not_rewrite_a_file_with_an_ignored_member(
+    tmp_path, monkeypatch, isolated_git, bad
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    at = int(time.time()) + 3600 if bad is None else bad
+    before = set_saved_time(cache, GITHUB_KEY, "heads", at)
+
+    offline = collect([folder], github_lookup=True)
+
+    # The ignored heads are not shown, the pull requests are, and the file is untouched.
+    group = group_with_key(offline, GITHUB_KEY)
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert group["pr_lookup"]["status"] == "recorded"
+    assert cache.read_bytes() == before
+
+
+@posix_only
+def test_a_saved_member_within_the_tolerance_is_still_used(tmp_path, monkeypatch, isolated_git):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    near = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
+    set_saved_time(world.cache, GITHUB_KEY, "heads", near)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["remote"]["check"]["checked_at"] == utc_text(near)
+
+
+@posix_only
+@pytest.mark.parametrize("member", ["heads", "pull_requests"])
+def test_a_successful_check_replaces_a_member_dated_in_the_future(
+    tmp_path, monkeypatch, isolated_git, member
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    other = other_member(member)
+    ahead = int(time.time()) + 3600
+    set_saved_time(world.cache, GITHUB_KEY, member, ahead)
+    started = int(time.time())
+
+    github_collect(world.folder)
+
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert started <= stored[member]["at"] < ahead
+    assert stored[other]["at"] >= started
+    # The later offline run reports the time of the real check.
+    offline = collect([world.folder], github_lookup=True)
+    [group] = offline["repositories"]
+    shown = group["remote"]["check"] if member == "heads" else group["pr_lookup"]
+    assert shown["status"] == "recorded"
+    assert shown["checked_at"] == utc_text(stored[member]["at"])
+
+
+@posix_only
+def test_a_member_dated_in_the_future_is_dropped_when_another_member_alone_is_checked(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    ahead = int(time.time()) + 3600
+    set_saved_time(world.cache, GITHUB_KEY, "pull_requests", ahead)
+    started = int(time.time())
+
+    # Remote checks on, lookup off: only the heads are verified.
+    collect([world.folder], remote_checks=True)
+
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert stored["heads"]["at"] >= started
+    assert stored["pull_requests"] is None
+
+
+@posix_only
+def test_a_saved_check_dated_in_the_future_does_not_defeat_the_clones_newer_tracking_ref(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    tip = world.pushed()
+    moved = world.reflog_time(world.a, "topic")
+    # Control: a good saved check older than the push gives way to the clone's ref.
+    control = collect([world.folder])
+    assert branch_of(find_clone(control, world.a), "topic")["vs_remote"] == vs("cached", "equal")
+    assert rev(world.a, "topic") == tip
+
+    # A check dated after the push would hide it; dated in the future it is not believed.
+    world.set_record_time(max(moved, int(time.time())) + 3600)
+    future = collect([world.folder])
+
+    [group] = future["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert not recorded_basis_in(find_clone(future, world.a))
 
 
 def fill_file(cache: Path, count: int, remotes: int, branches: int) -> dict[str, Any]:

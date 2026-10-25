@@ -809,6 +809,37 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     assert state.observe_runtime() == runtime_before
 
 
+@pytest.mark.parametrize("at", [253402300800, 10**30])
+def test_offline_checkouts_ignores_a_saved_check_dated_beyond_reach(
+    tmp_path, account, capsys, at
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "listed")
+    _configure(tmp_path, [folder])
+    code, out, err = _run_checkouts(capsys, "--json")
+    assert (code, err) == (0, "")
+    [group] = models.parse_checkouts(out)["repositories"]
+    assert group["remote"]["check"]["status"] == "live"
+    cache = account / ".nyx" / "cache" / "checkouts.json"
+    stored = json.loads(cache.read_text())
+    [key] = stored["remote_checks"]
+    stored["remote_checks"][key]["heads"]["at"] = at
+    cache.write_text(json.dumps(stored))
+
+    code, out, err = _run_checkouts(capsys, "--json", "--no-network")
+
+    assert (code, err) == (0, "")
+    document = models.parse_checkouts(out)
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert [c["path"] for c in group["clones"]] == [real(repository)]
+    code, out, err = _run_checkouts(capsys, "--no-network")
+    assert (code, err) == (0, "")
+    assert "recorded" not in out
+
+
 def test_module_launch_with_an_empty_home_exits_zero_and_creates_no_state(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
