@@ -1817,7 +1817,7 @@ def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
 
 def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
     document, _folder = sample
-    accepted = doc_copy(document)
+    accepted = with_check(document, {"status": "live", "reason": None})
     clone_document = first_clone(accepted)
     clone_document["verdict_base"].update(basis="live", objects_from=clone_document["path"])
     clone_document["branches"] = [
@@ -8615,7 +8615,11 @@ def test_github_identity_accepts_only_a_github_host_with_an_owner_and_repository
 
 
 def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lookup):
-    document = doc_copy(sample_document)
+    # With remote checks on the group's check is a live one; off, the sample's own.
+    check = {"status": "live", "reason": None}
+    document = (
+        with_check(sample_document, check) if remote_checks == "on" else doc_copy(sample_document)
+    )
     document["github_lookup"] = github_lookup
     document["remote_checks"] = remote_checks
     document["repositories"][0]["remote"]["key"] = key
@@ -8683,15 +8687,13 @@ def test_parser_refuses_a_lookup_status_that_contradicts_the_setting_or_the_remo
 ):
     document, _folder = sample
     accepted = lookup_document(
-        document, github_lookup="off", remote_checks="on", key=GITHUB_KEY,
+        document, github_lookup="off", remote_checks=checks, key=GITHUB_KEY,
         pr_lookup=lookup("off", "setting_off"),
     )
     assert models.parse_checkouts(accepted)
-    broken = doc_copy(accepted)
-    broken["github_lookup"] = github
-    broken["remote_checks"] = checks
-    broken["repositories"][0]["remote"]["key"] = key
-    broken["repositories"][0]["pr_lookup"] = pr_lookup
+    broken = lookup_document(
+        document, github_lookup=github, remote_checks=checks, key=key, pr_lookup=pr_lookup
+    )
     assert "pr_lookup" in refusal_of(broken)
 
 
@@ -11048,8 +11050,15 @@ CHECK_FAILURE_REASONS = ["unreachable", "not_found", "authentication_failed", "t
 
 
 def with_check(document: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
+    """A copy whose one repository carries ``check``, with the setting and the branch
+    bases that check implies (remote checks are off exactly for a check that names that)."""
     broken = doc_copy(document)
+    broken["remote_checks"] = "off" if check["reason"] == "remote_checks_off" else "on"
     broken["repositories"][0]["remote"]["check"] = check
+    if check["status"] == "live":
+        for item in broken["repositories"][0]["clones"]:
+            for branch in item["branches"]:
+                branch["vs_remote"]["basis"] = "live"
     return broken
 
 
@@ -11129,7 +11138,7 @@ def test_parser_refuses_a_recorded_lookup_without_a_valid_time(sample, reason, c
     assert message == "repositories[0].pr_lookup.checked_at must be a UTC timestamp"
 
 
-@pytest.mark.parametrize("reason", ["bogus", "setting_off", "not_github", None])
+@pytest.mark.parametrize("reason", ["bogus", "setting_off", None])
 def test_parser_refuses_a_recorded_lookup_with_a_reason_that_contradicts_the_checks(
     sample, reason
 ):
@@ -11515,3 +11524,510 @@ def test_a_clone_without_the_default_branch_takes_its_own_newer_tip_as_the_base(
         "basis": "cached",
         "objects_from": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# The cross-field rules of the document: one mutation of a collector document each
+# ---------------------------------------------------------------------------
+
+
+def refusal_after(document: dict[str, Any], mutate) -> str:
+    """The refusal of ``document`` after one ``mutate`` and a fresh digest and Removable.
+
+    The unmutated document must parse again first, so the refusal is the mutation's.
+    """
+    assert models.parse_checkouts(redigest(rederive(doc_copy(document))))
+    broken = doc_copy(document)
+    mutate(broken)
+    return refusal_of(rederive(broken))
+
+
+def group_label(document: dict[str, Any]) -> str:
+    assert len(document["repositories"]) == 1
+    return "repositories[0]"
+
+
+def clone_label(document: dict[str, Any], path: Path | str) -> str:
+    paths = [item["path"] for item in document["repositories"][0]["clones"]]
+    return f"{group_label(document)}.clones[{paths.index(real(path))}]"
+
+
+def branch_label(document: dict[str, Any], path: Path | str, name: str) -> str:
+    item = find_clone(document, path)
+    names = [branch["name"] for branch in item["branches"]]
+    return f"{clone_label(document, path)}.branches[{names.index(name)}]"
+
+
+def worktree_label(document: dict[str, Any], path: Path | str, worktree: Path | str) -> str:
+    item = find_clone(document, path)
+    paths = [entry["path"] for entry in item["worktrees"]]
+    return f"{clone_label(document, path)}.worktrees[{paths.index(real(worktree))}]"
+
+
+def group_of_document(document: dict[str, Any]) -> dict[str, Any]:
+    return document["repositories"][0]
+
+
+class PullRequestWorld:
+    """One GitHub repository of two clones whose lookup answered: ``x`` and ``y`` sit
+    at one commit that request 15 names on ``x`` alone, ``a`` holds a detached worktree
+    at a commit only ``b`` has a branch for, and request 31 names that branch. ``live``
+    is the networked collection and ``recorded`` the offline one that follows it."""
+
+    def __init__(self, tmp_path: Path, monkeypatch, isolated_git: Path) -> None:
+        nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        remote = make_remote(served)
+        self.a = clone(remote, self.folder / "a")
+        self.b = clone(remote, self.folder / "b")
+        git(self.a, "checkout", "-q", "-b", "x", "trunk")
+        self.tip = commit_file(self.a, "x.txt", "x\n")
+        git(self.a, "branch", "y", "x")
+        git(self.a, "checkout", "-q", "trunk")
+        git(self.b, "checkout", "-q", "-b", "elsewhere", "trunk")
+        self.head = commit_file(self.b, "elsewhere.txt", "elsewhere\n")
+        git(self.a, "fetch", "-q", str(self.b), "elsewhere")
+        self.detached = linked(self.a, tmp_path, "at-head", "--detach", self.head)
+        for repository in (self.a, self.b):
+            point_origin_at(repository, remote, GITHUB_URL)
+        install_fake_gh(
+            tmp_path,
+            monkeypatch,
+            stdout=pr_answer(
+                local_names(self.a, self.b),
+                {
+                    "x": [pr_node(15, "merged", self.tip)],
+                    "elsewhere": [pr_node(31, "merged", self.head)],
+                },
+            ),
+        )
+        self.live = github_collect(self.folder)
+        self.recorded = github_collect(self.folder, remote_checks=False)
+        a_item = find_clone(self.live, self.a)
+        assert verdict_facts(branch_of(a_item, "x")) == pr_verdict(15)
+        assert verdict_facts(branch_of(a_item, "y")) == pr_verdict(15)
+        assert listed(branch_of(a_item, "x")) == [(15, "merged", True)]
+        assert listed(branch_of(a_item, "y")) == []
+        assert verdict_facts(find_worktree(a_item, self.detached)) == NOT_MERGED_FACTS
+        assert verdict_facts(branch_of(find_clone(self.live, self.b), "elsewhere")) == (
+            pr_verdict(31)
+        )
+
+
+@pytest.fixture
+def pull_requests(tmp_path, monkeypatch, isolated_git):
+    return PullRequestWorld(tmp_path, monkeypatch, isolated_git)
+
+
+class OfflineWorld:
+    """One remote with a ``topic`` branch, collected without remote checks as a file
+    remote with the lookup off and on, and as a GitHub one with the lookup on."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        root = tmp_path / "offline"
+        root.mkdir()
+        self.folder, remote, self.work = small_world(root)
+        git(self.work, "branch", "topic")
+        self.setting_off = collect([self.folder])
+        self.not_github = collect([self.folder], github_lookup=True)
+        point_origin_at(self.work, remote, GITHUB_URL)
+        self.github = collect([self.folder], github_lookup=True)
+        self.github_off = collect([self.folder])
+
+
+@pytest.fixture
+def offline(tmp_path):
+    return OfflineWorld(tmp_path)
+
+
+def test_the_collector_documents_of_every_kind_parse_through_the_collect_helper(offline):
+    # Each document below went through ``parse_checkouts`` inside ``collect``.
+    assert group_of_document(offline.setting_off)["pr_lookup"] == lookup("off", "setting_off")
+    assert group_of_document(offline.not_github)["pr_lookup"] == lookup("off", "not_github")
+    assert group_of_document(offline.github)["pr_lookup"] == lookup("off", "remote_checks_off")
+    assert group_of_document(offline.github_off)["pr_lookup"] == lookup("off", "setting_off")
+    assert group_of_document(offline.github)["remote"]["check"] == {
+        "status": "off", "reason": "remote_checks_off",
+    }
+
+
+@posix_only
+def test_the_collector_documents_with_a_lookup_parse_live_and_recorded(pull_requests):
+    live, recorded = pull_requests.live, pull_requests.recorded
+    assert group_of_document(live)["remote"]["check"] == {"status": "live", "reason": None}
+    assert group_of_document(live)["pr_lookup"] == lookup("live", None)
+    assert group_of_document(recorded)["remote"]["check"]["status"] == "recorded"
+    assert group_of_document(recorded)["remote"]["check"]["reason"] == "remote_checks_off"
+    assert group_of_document(recorded)["pr_lookup"]["status"] == "recorded"
+    assert group_of_document(recorded)["pr_lookup"]["reason"] == "remote_checks_off"
+    # The recorded document keeps the pull-request rung the live one found.
+    recorded_a = find_clone(recorded, pull_requests.a)
+    assert verdict_facts(branch_of(recorded_a, "y")) == pr_verdict(15)
+
+
+@posix_only
+def test_the_collector_document_of_a_failed_check_and_of_cached_comparisons_parse(
+    tmp_path, isolated_git
+):
+    gone_served = tmp_path / "gone"
+    gone_served.mkdir()
+    folder = tmp_path / "failed-folder"
+    folder.mkdir()
+    gone = make_remote(gone_served)
+    survivor = clone(gone, folder / "survivor")
+    remove_tree(gone)
+    failed = collect([folder], remote_checks=True)
+    assert group_of_document(failed)["remote"]["check"] == {
+        "status": "failed", "reason": "not_found",
+    }
+    assert find_clone(failed, survivor)["cached_vs_remote"] is None
+
+    pushed_root = tmp_path / "pushed"
+    pushed_root.mkdir()
+    world = PushedWorld(pushed_root, isolated_git)
+    world.pushed()
+    push_from(world.a, "trunk", "trunk-two.txt")
+    cached = collect([world.folder])
+    a_item = find_clone(cached, world.a)
+    assert branch_of(a_item, "topic")["vs_remote"]["basis"] == "cached"
+    assert a_item["verdict_base"]["basis"] == "cached"
+    assert group_of_document(cached)["remote"]["check"]["status"] == "recorded"
+
+
+def test_a_lookup_setting_off_refuses_a_lookup_that_is_not_off(offline):
+    document = offline.github
+    group = group_label(document)
+
+    def lookup_live_under_the_setting_off(broken):
+        broken["github_lookup"] = "off"
+        group_of_document(broken)["pr_lookup"] = lookup("live", None)
+
+    assert refusal_after(document, lookup_live_under_the_setting_off) == (
+        f"{group}.pr_lookup must be off when the lookup setting is off"
+    )
+
+
+def test_the_reason_precedence_names_the_setting_before_the_remote(offline):
+    document = offline.setting_off
+    assert group_of_document(document)["remote"]["key"].startswith("file:")
+
+    def not_github_with_the_setting_off(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "not_github"
+
+    assert refusal_after(document, not_github_with_the_setting_off) == (
+        f"{group_label(document)}.pr_lookup.reason must be setting_off when the setting is off"
+    )
+
+
+def test_not_github_holds_exactly_when_the_remote_key_is_not_a_github_identity(offline):
+    github = offline.github
+    assert group_of_document(github)["remote"]["key"] == GITHUB_KEY
+    message = f"{group_label(github)}.pr_lookup.reason is not_github exactly when the remote is not GitHub's"
+
+    def not_github_on_a_github_group(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "not_github"
+
+    assert refusal_after(github, not_github_on_a_github_group) == message
+
+    plain = offline.not_github
+    assert group_of_document(plain)["remote"]["key"].startswith("file:")
+
+    def checks_off_on_a_file_group(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "remote_checks_off"
+
+    assert refusal_after(plain, checks_off_on_a_file_group) == message
+
+
+@posix_only
+def test_remote_checks_off_refuses_a_failed_check_and_an_unavailable_or_failed_lookup(
+    offline, pull_requests
+):
+    document = offline.github
+    group = group_label(document)
+
+    def failed_check(broken):
+        group_of_document(broken)["remote"]["check"] = {"status": "failed", "reason": "unreachable"}
+
+    assert refusal_after(document, failed_check) == (
+        f"{group}.remote.check must be off or recorded with remote checks off"
+    )
+
+    def unavailable_lookup(broken):
+        group_of_document(broken)["pr_lookup"] = lookup("unavailable", "failed")
+
+    assert refusal_after(document, unavailable_lookup) == (
+        f"{group}.pr_lookup must be off or recorded with remote checks off"
+    )
+
+    # A saved check or lookup with the failure that was current when it was taken is a
+    # lookup of the networked run, not of one with the checks off.
+    recorded = pull_requests.recorded
+    assert recorded["remote_checks"] == "off"
+
+    def recorded_check_with_a_failure(broken):
+        group_of_document(broken)["remote"]["check"]["reason"] = "failed"
+
+    assert refusal_after(recorded, recorded_check_with_a_failure) == (
+        f"{group_label(recorded)}.remote.check.reason cannot be a failure with remote checks off"
+    )
+
+    def recorded_lookup_with_a_failure(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "failed"
+
+    assert refusal_after(recorded, recorded_lookup_with_a_failure) == (
+        f"{group_label(recorded)}.pr_lookup.reason cannot be a failure with remote checks off"
+    )
+
+
+@posix_only
+def test_remote_checks_on_refuses_a_remote_checks_off_reason_anywhere(pull_requests):
+    document = pull_requests.live
+    assert document["remote_checks"] == "on"
+    group = group_label(document)
+
+    def check_off(broken):
+        group_of_document(broken)["remote"]["check"] = {
+            "status": "off", "reason": "remote_checks_off",
+        }
+
+    assert refusal_after(document, check_off) == (
+        f"{group}.remote.check.reason cannot be remote_checks_off with remote checks on"
+    )
+
+    def lookup_off(broken):
+        group_of_document(broken)["pr_lookup"] = lookup("off", "remote_checks_off")
+
+    assert refusal_after(document, lookup_off) == (
+        f"{group}.pr_lookup.reason cannot be remote_checks_off with remote checks on"
+    )
+
+
+@posix_only
+def test_a_basis_names_a_check_of_its_own_kind(pull_requests):
+    live, recorded = pull_requests.live, pull_requests.recorded
+    path = pull_requests.a
+
+    def recorded_basis_under_live(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "recorded"
+
+    assert refusal_after(live, recorded_basis_under_live) == (
+        f"{branch_label(live, path, 'x')}.vs_remote.basis is recorded without a recorded remote check"
+    )
+
+    def live_basis_under_recorded(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "live"
+
+    assert refusal_after(recorded, live_basis_under_recorded) == (
+        f"{branch_label(recorded, path, 'x')}.vs_remote.basis is live without a live remote check"
+    )
+
+
+def test_an_unanswered_check_refuses_a_default_head_and_a_comparison_with_the_remote(
+    tmp_path, offline
+):
+    off = offline.github
+    assert group_of_document(off)["remote"]["check"]["status"] == "off"
+
+    def head_under_off(broken):
+        group_of_document(broken)["default_branch"]["sha"] = "a" * 40
+
+    assert refusal_after(off, head_under_off) == (
+        f"{group_label(off)}.default_branch.sha requires a live or recorded remote check"
+    )
+
+    gone_served = tmp_path / "gone"
+    gone_served.mkdir()
+    folder = tmp_path / "failed-folder"
+    folder.mkdir()
+    gone = make_remote(gone_served)
+    survivor = clone(gone, folder / "survivor")
+    remove_tree(gone)
+    failed = collect([folder], remote_checks=True)
+    assert group_of_document(failed)["remote"]["check"]["status"] == "failed"
+    label = clone_label(failed, survivor)
+
+    def cached_comparison_under_failed(broken):
+        find_clone(broken, survivor)["cached_vs_remote"] = vs("cached", "equal")
+
+    assert refusal_after(failed, cached_comparison_under_failed) == (
+        f"{label}.cached_vs_remote requires a live or recorded remote check"
+    )
+
+    def local_default_comparison_under_failed(broken):
+        find_clone(broken, survivor)["local_default"]["vs_remote"] = vs("cached", "equal")
+
+    assert refusal_after(failed, local_default_comparison_under_failed) == (
+        f"{label}.local_default.vs_remote requires a live or recorded remote check"
+    )
+
+
+@posix_only
+def test_a_live_check_refuses_a_cached_branch_comparison(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+
+    def cached_under_live(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "cached"
+
+    assert refusal_after(document, cached_under_live) == (
+        f"{branch_label(document, path, 'x')}.vs_remote.basis does not fit the live remote check"
+    )
+
+
+@posix_only
+def test_only_a_live_or_recorded_basis_may_name_the_clone_that_lent_the_objects(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    push_from(world.a, "trunk", "trunk-two.txt")
+    document = collect([world.folder])
+    a_item = find_clone(document, world.a)
+    assert a_item["verdict_base"]["basis"] == "cached"
+    assert branch_of(a_item, "topic")["vs_remote"]["basis"] == "cached"
+    lender = real(world.b)
+
+    def comparison_lender(broken):
+        branch_of(find_clone(broken, world.a), "topic")["vs_remote"]["objects_from"] = lender
+
+    assert refusal_after(document, comparison_lender) == (
+        f"{branch_label(document, world.a, 'topic')}.vs_remote.objects_from "
+        "requires the live or recorded basis"
+    )
+
+    def base_lender(broken):
+        find_clone(broken, world.a)["verdict_base"]["objects_from"] = lender
+
+    assert refusal_after(document, base_lender) == (
+        f"{clone_label(document, world.a)}.verdict_base.objects_from "
+        "requires the live or recorded basis"
+    )
+
+
+@posix_only
+def test_the_pull_request_number_and_rung_are_set_together_and_only_for_a_merged_verdict(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    message = f"{branch_label(document, path, 'x')}.verdict.pull_request must be set exactly for the pull_request rung"
+
+    def number_with_another_rung(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of(
+            "merged", "tree_equal", pull_request=15
+        )
+
+    assert refusal_after(document, number_with_another_rung) == message
+
+    def rung_without_a_number(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"]["pull_request"] = None
+
+    assert refusal_after(document, rung_without_a_number) == message
+
+
+def test_the_pull_request_rung_needs_a_lookup(offline):
+    document = offline.github
+    assert group_of_document(document)["pr_lookup"]["status"] == "off"
+    path = offline.work
+
+    def rung_with_the_lookup_off(broken):
+        branch_of(find_clone(broken, path), "topic")["verdict"] = verdict_of(
+            "merged", "pull_request", pull_request=15
+        )
+
+    assert refusal_after(document, rung_with_the_lookup_off) == (
+        f"{branch_label(document, path, 'topic')}.verdict "
+        "names a pull request without a pull-request lookup"
+    )
+
+
+@posix_only
+def test_a_detached_worktree_takes_the_rung_only_at_a_commit_a_local_branch_holds(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    held = find_clone(document, path)
+    assert pull_requests.head not in {branch["sha"] for branch in held["branches"]}
+
+    def rung_at_an_unheld_commit(broken):
+        clone_document = find_clone(broken, path)
+        find_worktree(clone_document, pull_requests.detached)["verdict"] = verdict_of(
+            "merged", "pull_request", pull_request=31
+        )
+        # Request 31 is listed as merged by a branch of this clone, at another commit.
+        branch_of(clone_document, "x")["pull_requests"].append(
+            {"number": 31, "state": "merged", "head_matches": False}
+        )
+
+    assert refusal_after(document, rung_at_an_unheld_commit) == (
+        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
+        "names a pull request at a commit no branch holds"
+    )
+
+
+@posix_only
+def test_the_rung_number_must_be_listed_as_merged_by_a_branch_at_the_commit(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+    label = f"{branch_label(document, path, 'x')}.verdict"
+    message = f"{label} names a pull request no branch at its commit lists as merged"
+
+    def number_nobody_lists(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"]["pull_request"] = 16
+
+    assert refusal_after(document, number_nobody_lists) == message
+
+    def listed_as_open(broken):
+        branch_of(find_clone(broken, path), "x")["pull_requests"][0]["state"] = "open"
+
+    assert refusal_after(document, listed_as_open) == message
+
+    def listed_by_no_branch(broken):
+        branch_of(find_clone(broken, path), "x")["pull_requests"] = []
+
+    assert refusal_after(document, listed_by_no_branch) == message
+
+
+def test_a_branch_lists_no_pull_request_while_the_lookup_is_off(offline):
+    document = offline.github
+    path = offline.work
+
+    def listed_request(broken):
+        branch_of(find_clone(broken, path), "topic")["pull_requests"] = [
+            {"number": 3, "state": "open", "head_matches": True}
+        ]
+
+    assert refusal_after(document, listed_request) == (
+        f"{branch_label(document, path, 'topic')}.pull_requests requires a pull-request lookup"
+    )
+
+
+@posix_only
+def test_a_pull_request_list_is_sorted_unique_and_capped(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+    label = f"{branch_label(document, path, 'x')}.pull_requests"
+    entry = {"number": 15, "state": "merged", "head_matches": True}
+
+    def other(number):
+        return {"number": number, "state": "open", "head_matches": False}
+
+    def listing(*entries):
+        def mutate(broken):
+            branch_of(find_clone(broken, path), "x")["pull_requests"] = list(entries)
+
+        return mutate
+
+    unsorted = refusal_after(document, listing(entry, other(3)))
+    repeated = refusal_after(document, listing(entry, dict(entry)))
+    assert unsorted == repeated == f"{label} must be unique and sorted by number"
+    cap = models.PULL_REQUEST_LIST_CAP
+    assert cap == 10
+    crowd = [other(number) for number in range(1, cap + 1)]
+    assert refusal_after(document, listing(*crowd, entry)) == (
+        f"{label} lists more than {cap} pull requests"
+    )
