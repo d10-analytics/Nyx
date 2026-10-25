@@ -226,6 +226,13 @@ CHECKOUT_RETIRED_WORDING = (
     "so only the `ancestor` rung runs",
     "where no check beyond `ancestor` can run",
     "adds, separated by two spaces and in this order, three more elements",
+    "including a branch whose comparison the clone's own newer remote-tracking branch "
+    "decided, which is compared on the `cached` basis",
+    "the default branch of the live check, else of the saved check, else",
+    "when neither names one (an empty remote, or one with a detached `HEAD`), the name the "
+    "clone's own remote-tracking copy points to",
+    "the newest 10 pull requests from the same repository (not a fork)",
+    "the newest 10 same-repository pull requests of each branch name",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -399,15 +406,20 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`remote_checks_off` when `--no-network` was given",
         "`<basis>` is `live` under a live check, `recorded` under a recorded one and `cached` "
         "when the check is off or failed with no saved check",
-        "including a branch whose comparison the clone's own newer remote-tracking branch "
-        "decided, which is compared on the `cached` basis",
+        "`branches recorded` is the status of the check; under it an individual branch that "
+        "the clone's own newer remote-tracking branch decided is compared on the `cached` "
+        "basis",
         "Under a recorded check each comparison with the remote shows `recorded` in place of "
         "`live`",
         "`no recorded default`",
         "`pr live`, `pr recorded <reason> <time>`, `pr off <reason>` or "
         "`pr unavailable <reason>`",
         "It is on every line of a clone with an `origin` remote",
-        "the default branch of the live check, else of the saved check, else",
+        "The branch is the default branch named by the check the verdicts rest on: the live "
+        "check when it answered, otherwise the saved check",
+        "and when there is no check, it is the name the clone's own remote-tracking copy "
+        "points to, or else the name every clone of the remote agrees on",
+        "A saved check's name is never used while the live check answered",
         "The `recorded` basis is the commit the last successful check saw for that name",
         "a saved check's commit counts as the remote's current commit here",
         "`pull_request`: GitHub lookup",
@@ -447,8 +459,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`failed`: any other failure",
         "A saved lookup stands in when the request was not made because of "
         "`remote_checks_off` or failed with any reason except `setting_off` and `not_github`",
-        "each branch in `--json` lists `pull_requests`: the newest 10 pull requests from the "
-        "same repository (not a fork)",
+        "each branch in `--json` lists `pull_requests`: of the newest 10 pull requests whose "
+        "head branch has the branch's name, those from the same repository (not a fork), so "
+        "fewer than 10 may be listed and an older same-repository request is not",
+        "the same-repository pull requests among the newest 10 from any repository",
         "`head_matches`, which is true when the request's head is the branch's current commit",
         "reports `merged` when a merged pull request from the same repository into the base "
         "branch has a head branch that is a local branch at the commit",
