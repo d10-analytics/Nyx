@@ -1373,16 +1373,21 @@ def _clone_verdicts(
         if verdict["rung"] == "pull_request":
             if not lookup_used:
                 raise ProtocolError(f"{label} names a pull request without a pull-request lookup")
-            # A detached checkout shares the verdict of a branch at its commit.
+            # A detached checkout takes the rung only through a branch at its commit.
             if commit not in merged_at:
                 raise ProtocolError(f"{label} names a pull request at a commit no branch holds")
             if verdict["pull_request"] not in merged_at[commit]:
                 raise ProtocolError(
                     f"{label} names a pull request no branch at its commit lists as merged"
                 )
-            if detached_checkout and verdict not in branch_verdicts.get(commit, []):
+            # One commit has one verdict: every branch that takes a verdict at it
+            # carries the same one.  The verdict base branch takes none, so a
+            # detached checkout it alone shares a commit with has nothing to match.
+            if detached_checkout and any(
+                other != verdict for other in branch_verdicts.get(commit, ())
+            ):
                 raise ProtocolError(
-                    f"{label} differs from the verdict of every branch at its commit"
+                    f"{label} differs from the verdict of a branch at its commit"
                 )
         no_base = _verdict_state(verdict) == ("unknown", "no_base")
         if no_base != (base is None):
