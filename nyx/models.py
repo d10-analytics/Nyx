@@ -1347,7 +1347,8 @@ def _clone_verdicts(
         merged_at.setdefault(branch["sha"], set()).update(
             pull["number"] for pull in branch["pull_requests"] if pull["state"] == "merged"
         )
-    verdicts: list[tuple[str, Mapping[str, Any], str | None]] = []
+    verdicts: list[tuple[str, Mapping[str, Any], str | None, bool]] = []
+    branch_verdicts: dict[str, list[Mapping[str, Any]]] = {}
     for index, branch in enumerate(branches):
         label = f"{name}.branches[{index}].verdict"
         verdict = branch["verdict"]
@@ -1355,7 +1356,8 @@ def _clone_verdicts(
         if names_base != (verdict is None):
             raise ProtocolError(f"{label} must be null exactly for the verdict base branch")
         if verdict is not None:
-            verdicts.append((label, verdict, branch["sha"]))
+            verdicts.append((label, verdict, branch["sha"], False))
+            branch_verdicts.setdefault(branch["sha"], []).append(verdict)
     for index, worktree in enumerate(worktrees):
         label = f"{name}.worktrees[{index}].verdict"
         detached = (
@@ -1365,9 +1367,9 @@ def _clone_verdicts(
         if detached != (worktree["verdict"] is not None):
             raise ProtocolError(f"{label} must be present exactly for a detached checkout")
         if worktree["verdict"] is not None:
-            verdicts.append((label, worktree["verdict"], worktree["head"]["sha"]))
+            verdicts.append((label, worktree["verdict"], worktree["head"]["sha"], True))
     limited = item["shallow"] or item["partial_clone"]
-    for label, verdict, commit in verdicts:
+    for label, verdict, commit, detached_checkout in verdicts:
         if verdict["rung"] == "pull_request":
             if not lookup_used:
                 raise ProtocolError(f"{label} names a pull request without a pull-request lookup")
@@ -1377,6 +1379,10 @@ def _clone_verdicts(
             if verdict["pull_request"] not in merged_at[commit]:
                 raise ProtocolError(
                     f"{label} names a pull request no branch at its commit lists as merged"
+                )
+            if detached_checkout and verdict not in branch_verdicts.get(commit, []):
+                raise ProtocolError(
+                    f"{label} differs from the verdict of every branch at its commit"
                 )
         no_base = _verdict_state(verdict) == ("unknown", "no_base")
         if no_base != (base is None):
