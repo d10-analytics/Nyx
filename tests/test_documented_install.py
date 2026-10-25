@@ -209,6 +209,23 @@ CHECKOUT_RETIRED_WORDING = (
     "A worktree whose directory is gone, shown with the status `failed` and `prunable`",
     "A branch that holds nothing its larger sibling lacks is folded",
     "is fixed, by fetching, deepening a shallow clone or upgrading git",
+    "`remote live`, `remote off` or `remote failed <reason>`",
+    "A run that re-checks nothing leaves the file untouched",
+    "Deleting it only costs time",
+    "Its only lasting write is the verdict cache file",
+    "when the remote did not answer or has no default branch (an empty remote, or one "
+    "with a detached `HEAD`)",
+    "Every branch whose check the run finishes, `ancestor` aside, is remembered again "
+    "with the time of this run",
+    "only for the rungs other than `ancestor`, together with the `not_merged` answer",
+    "falls back to cached values and shows `remote failed <reason>`",
+    "`remote off`, and every value comes from the remote-tracking branches the clone "
+    "already has",
+    "`<basis>` is `live` when the remote check was live and `cached` otherwise",
+    "`off` means `--no-network` was given;",
+    "so only the `ancestor` rung runs",
+    "where no check beyond `ancestor` can run",
+    "adds, separated by two spaces and in this order, three more elements",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -218,7 +235,6 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "nyx checkouts --no-network",
         "`--no-network` skips every remote check",
         "`--no-network` is accepted only with `checkouts`",
-        "`remote live`, `remote off` or `remote failed <reason>`",
         "Nyx tries the eight newest base commits with the identity, and a match among "
         "them proves `merged`",
         "a file over 1 MiB that landed unchanged needs no content merge",
@@ -354,7 +370,6 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "so it shows no facts and no verdicts",
         "lends them no objects and takes no part in choosing their default branch name",
         "A checkout that could not be read has no Removable elements",
-        "A run that re-checks nothing leaves the file untouched",
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",
         "so once the attributes are gone a run that decides the branch reports its own verdict",
@@ -368,17 +383,99 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "`failed` means a git call failed",
         "`~/.nyx/cache/checkouts.json`",
         "The cache is used only when `~/.nyx` already exists",
-        "Deleting it only costs time",
-        "Its only lasting write is the verdict cache file, which changes no repository",
         "are made in the system's temporary directory and removed before it exits",
-        "when the remote did not answer or has no default branch (an empty remote, or one "
-        "with a detached `HEAD`)",
-        "a size bound, a shallow or partial clone or a git older than 2.39",
+        "A run that decides no new verdict and makes no successful remote check leaves "
+        "the file untouched; every successful remote check rewrites it with that check's time",
+        "Deleting it costs time, because the verdicts are recomputed, and it loses the saved "
+        "remote checks: offline runs then show only the clone's own fetched refs until a "
+        "networked run checks again",
+        "Its only lasting write is the cache file of remembered verdicts and the last "
+        "successful remote checks, which changes no repository",
+        "`remote live`, `remote recorded <reason> <time>`, `remote off` or `remote failed "
+        "<reason>`",
+        "`recorded` means it did not get one, and Nyx used the last successful check of that "
+        "remote it had saved",
+        "`off` means `--no-network` was given and no check of that remote was saved",
+        "`remote_checks_off` when `--no-network` was given",
+        "`<basis>` is `live` under a live check, `recorded` under a recorded one and `cached` "
+        "when the check is off or failed with no saved check",
+        "including a branch whose comparison the clone's own newer remote-tracking branch "
+        "decided, which is compared on the `cached` basis",
+        "Under a recorded check each comparison with the remote shows `recorded` in place of "
+        "`live`",
+        "`no recorded default`",
+        "`pr live`, `pr recorded <reason> <time>`, `pr off <reason>` or "
+        "`pr unavailable <reason>`",
+        "It is on every line of a clone with an `origin` remote",
+        "the default branch of the live check, else of the saved check, else",
+        "The `recorded` basis is the commit the last successful check saw for that name",
+        "a saved check's commit counts as the remote's current commit here",
+        "`pull_request`: GitHub lookup",
+        "only the `ancestor` and `pull_request` rungs run",
+        "`ancestor` and `pull_request` aside, is remembered again with the time of this run",
+        "only for the rungs other than `ancestor` and `pull_request`, together with the "
+        "`not_merged` answer",
+        "The same file keeps the last successful remote checks",
+        "A successful check replaces only its own half, and a failed check changes nothing",
+        "All saved checks together are held to 2 MiB, newest first",
+        "a remote whose saved check alone exceeds that is not kept and behaves as if it had none",
+        "read as empty without a diagnostic and replaced on the next write",
+        "falls back to its last saved check, shown as `remote recorded <reason> <time>`, or, "
+        "with none saved, to the clone's cached values, shown as `remote failed <reason>`",
+        "answers from the checks that earlier networked runs saved, shown as "
+        "`remote recorded remote_checks_off <time>`",
+        "A remote with no saved check shows `remote off`",
+        "GitHub lookup is optional and off until the workspace's `github_lookup` setting "
+        "turns it on",
+        "found in an absolute `PATH` directory (`gh.exe` on Windows) and logged in",
+        "one `gh` request per GitHub repository, however many clones share it",
+        "and `--no-network` makes none",
+        "the newest 10 pull requests whose head branch has each local branch name",
+        "judged from the `origin` URL as configured, even when an `insteadOf` rewrite sends "
+        "git elsewhere",
+        "the host must be `github.com` or a `*.ghe.com` host, and the path exactly `owner/repo`",
+        "Any other host, a GitHub Enterprise Server host included, is `not_github` and is "
+        "never asked",
+        "`setting_off`: `github_lookup` is off for the workspace",
+        "`remote_checks_off`: `--no-network` was given",
+        "`not_github`: the `origin` URL is not a GitHub repository",
+        "`gh_missing`: no `gh` was found",
+        "`not_authenticated`: `gh` has no valid login for that host",
+        "`not_found`: GitHub does not show the repository to that login",
+        "`rate_limited`: GitHub's rate limit was reached",
+        "`timed_out`: `gh` did not answer within 10 seconds or the time left",
+        "`failed`: any other failure",
+        "A saved lookup stands in when the request was not made because of "
+        "`remote_checks_off` or failed with any reason except `setting_off` and `not_github`",
+        "each branch in `--json` lists `pull_requests`: the newest 10 pull requests from the "
+        "same repository (not a fork)",
+        "`head_matches`, which is true when the request's head is the branch's current commit",
+        "reports `merged` when a merged pull request from the same repository into the base "
+        "branch has a head branch that is a local branch at the commit",
+        "A pull request is never matched on the commit alone",
+        "one whose `head_matches` is false decides only if it is merged into the base and its "
+        "head contains the commit; otherwise the git checks decide",
+        "A commit no local branch holds takes no `pull_request` rung",
+        "The rung is never remembered in the cache file",
+        "Recorded values are the last successful remote check and pull-request lookup of each "
+        "remote",
+        "`remote.check` carries `checked_at` only when its status is `recorded`, while "
+        "`pr_lookup` always carries it",
+        "The clone's own newer push or fetch takes precedence",
+        "its reflog shows an update at or after the saved check's time, Nyx keeps the clone's "
+        "own value, on the `cached` basis",
+        "when reflogs are disabled, when the branch was deleted with `git push --delete` or "
+        "the remote-tracking branch pruned with `git fetch --prune`, or when a force-push "
+        "moved the remote branch back to an older commit",
+        "the saved value then stands until a networked run checks again",        "a size bound, a shallow or partial clone or a git older than 2.39",
     ),
     "docs/workspaces.md": (
         '"schema_version": 4',
         '"checkout_settings"',
         '"github_lookup": false',
+        "`github_lookup` is the workspace's switch for the optional GitHub pull-request "
+        "lookup of `nyx checkouts`",
+        "The settings editor that arrives with the Checkouts view will set it",
         "The key under `checkout_settings` is the record's own `specification_root` value",
         "Each entry in `folders` must be an absolute path, and the list must be sorted",
         "write each backslash as `\\\\` in JSON",
