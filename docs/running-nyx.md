@@ -142,46 +142,67 @@ string, and then gives, separated by two spaces, its branch as `branch <name>`,
 in progress such as `merge`. A clone line shows its main worktree's branch and
 counts, or `main <status>` when that worktree could not be read; a bare
 repository's line has neither. A clone line with an `origin` remote then adds,
-separated by two spaces and in this order, three more elements.
+separated by two spaces and in this order, four more elements.
 
-- `remote live`, `remote off` or `remote failed <reason>`. `live` means Nyx
-  asked `origin` and got an answer; `off` means `--no-network` was given;
-  `failed` means the check did not succeed, and the reason is one of
+- `remote live`, `remote recorded <reason> <time>`, `remote off` or
+  `remote failed <reason>`. `live` means Nyx asked `origin` and got an answer;
+  `recorded` means it did not get one, and Nyx used the last successful check of
+  that remote it had saved, taken at `<time>` (UTC, such as
+  `2026-10-23T09:15:00Z`): the reason is why no check was used, either
+  `remote_checks_off` when `--no-network` was given or one of the failure reasons
+  below; `off` means `--no-network` was given and no check of that remote was
+  saved; `failed` means the check did not succeed and none was saved, and the
+  reason is one of
   `unreachable`, `not_found`, `authentication_failed`, `timed_out` or `failed`.
   The reason is only a category: no URL, user name, password or error text is
   ever printed.
 - `branches <basis> local-only <n>`, followed by `unknown <m>` when a
-  comparison could not be made. `<basis>` is `live` when the remote check was
-  live and `cached` otherwise, including for a clone with no local branches.
-  `local-only <n>` counts local branches with no same-name branch on `origin`.
+  comparison could not be made. `<basis>` is `live` under a live check,
+  `recorded` under a recorded one and `cached` when the check is off or failed
+  with no saved check, whatever the number of local branches.
+  `local-only <n>` counts local branches with no same-name branch on `origin`,
+  including a branch whose comparison the clone's own newer remote-tracking
+  branch decided, which is compared on the `cached` basis (see recorded values
+  below).
 - The default branch, in one of three forms. With a live check:
   `default <name> live <relation> cached <relation> tracking live <relation>
   fetched <time>`, comparing the local default branch with the remote's, then
-  with this clone's remote-tracking copy, and that copy with the remote's. Without
-  one: `default <name> cached <relation> fetched <time>`. A clone that has never
-  fetched shows `never fetched` in place of `fetched <time>`. A clone whose
-  remote has no default branch (an empty remote, or one with a detached `HEAD`)
-  shows `no live default`, and one whose default is not known without asking the
-  remote shows `no cached default`.
+  with this clone's remote-tracking copy, and that copy with the remote's. Under a
+  recorded check each comparison with the remote shows `recorded` in place of
+  `live`, and one the clone's own newer remote-tracking branch decided shows
+  `cached`. Without a check: `default <name> cached <relation> fetched <time>`. A
+  clone that has never fetched shows `never fetched` in place of
+  `fetched <time>`. A clone whose remote has no default branch (an empty remote,
+  or one with a detached `HEAD`) shows `no live default`, or `no recorded default`
+  when the saved check has none, and one whose default is not known without asking
+  the remote shows `no cached default`.
+- The pull-request lookup, in one of four forms: `pr live`,
+  `pr recorded <reason> <time>`, `pr off <reason>` or `pr unavailable <reason>`.
+  It is on every line of a clone with an `origin` remote, and GitHub lookup
+  below explains each form. The plain lines show only this summary; each branch's
+  pull requests are in the `--json` document.
 
 Whether each local branch is already merged into the remote's default branch
 is a verdict, and appears only in the `--json` document: the plain lines
 never show a branch's verdict itself, only the Removable summary described
 below. In each clone, `verdict_base` names the
 default branch the verdicts are judged against, its commit, and its `basis`.
-The branch is the remote's default branch, or, when the remote did not answer
-or has no default branch (an empty remote, or one with a detached `HEAD`), the
+The branch is the default branch of the live check, else of the saved check,
+else, when neither names one (an empty remote, or one with a detached `HEAD`), the
 name the clone's own remote-tracking copy points to, or the name every clone of
 the remote agrees on. The `live` basis is the remote's current commit for
 that name, taken from the clone itself or borrowed read-only from a sibling
-clone that has it (named in `objects_from`). The `cached` basis, "base stale",
+clone that has it (named in `objects_from`). The `recorded` basis is the commit
+the last successful check saw for that name, found in the clone or borrowed from
+a sibling in the same way. The `cached` basis, "base stale",
 is the clone's own remote-tracking copy of that branch, which can be older than
 the remote until you fetch; a branch shown as merged against a stale base was
 merged into what the clone last saw, which the remote may since have moved
 past. A clone with no `origin` remote or no default branch name has no base. So
 does a clone that has a default branch name but neither the remote's current
 commit for it (in the clone or borrowed from a sibling) nor its own
-remote-tracking copy of that branch. Every verdict in a clone with no base is
+remote-tracking copy of that branch; a saved check's commit counts as the
+remote's current commit here. Every verdict in a clone with no base is
 `unknown` with the reason `no_base`. A clone git could not read or that has too
 many branches, described below, has no branches, no worktrees and no base, so it
 has no verdicts at all. In every other clone, every local branch except the base branch
@@ -190,7 +211,8 @@ itself, and every worktree on a detached `HEAD`, gets a verdict: `state` is
 
 A `merged` verdict names the first rung of this ladder that proved it, tried in
 this order. `ancestor`: the branch's commit is already in the base's history, so
-nothing on the branch is missing from the base. `patch_equivalent`: the branch
+nothing on the branch is missing from the base. `pull_request`: GitHub lookup,
+described below, lists a merged pull request that proves it. `patch_equivalent`: the branch
 has no merge commits and every one of its own commits has a counterpart in the
 base with the same change (the same patch identity, whitespace included), as
 after a rebase or a cherry-pick. `squash_equivalent`: the branch's whole change
@@ -223,11 +245,11 @@ base commits with the identity. `tree_equal`: the branch's file contents are ide
 some commit on the base. `not_merged` has the rung `none`: every rung that could
 run found nothing. An `unknown` verdict has no rung and one of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
-partial, so only the `ancestor` rung runs and the others are skipped rather
+partial, so only the `ancestor` and `pull_request` rungs run and the others are skipped rather
 than fetching missing files. `git_too_old` means git is older than 2.39: the two
 patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact patch
 identities and telling two different changes to the same binary file apart, so they
-are skipped, and `ancestor` and `tree_equal` still run. `history_limit` means the branch or the
+are skipped, and `ancestor`, `pull_request` and `tree_equal` still run. `history_limit` means the branch or the
 comparison was too large to check within the fixed bounds. `deadline` means one
 git call reached its 10-second cap or the 60 seconds, less the half second kept
 for the cache write, ran out, and `failed` means a git call failed. A shallow or
@@ -235,11 +257,12 @@ partial clone shows `incomplete_clone` in preference to `git_too_old`.
 
 Verdicts that took git a long time to compute are remembered in
 `~/.nyx/cache/checkouts.json`, so a later run that cannot decide a branch in
-time can still answer from them. The cache is used only when `~/.nyx` already exists; Nyx never creates that
+time can still answer from them. The same file keeps the last successful remote
+checks, described below. The cache is used only when `~/.nyx` already exists; Nyx never creates that
 directory for it, and it is created inside `~/.nyx` as `cache/` when first
 needed. It stores only verdicts decided in full by git 2.39 or later in a clone
 that is neither shallow nor partial, and only for the rungs other than
-`ancestor`, together with the `not_merged` answer. A remembered answer is used
+`ancestor` and `pull_request`, together with the `not_merged` answer. A remembered answer is used
 only in place of an `unknown` verdict that this run could not decide for lack of
 time, a failed call, a size bound, a shallow or partial clone or a git older than
 2.39. It never replaces a verdict the run decides itself, so a warm
@@ -256,7 +279,7 @@ starts. Both steps take the branches in one order: those with no remembered
 answer first, then those with the oldest remembered answer, then the newest. A
 verdict the run decides always wins over a remembered one, and a remembered
 answer stands in only where that re-check does not finish. Every branch whose
-check the run finishes, `ancestor` aside, is remembered again with the time of
+check the run finishes, `ancestor` and `pull_request` aside, is remembered again with the time of
 this run, so the oldest answers are re-checked first next time and a clone is
 covered a few branches at a time over successive runs, but only within these
 limits. A budget that ends inside the shared steps (the size checks, merge
@@ -264,9 +287,9 @@ bases and shared comparison) decides no new branch, although remembered answers
 still stand in. Branches that can never be remembered, because one of their
 steps fails or reaches the 10-second cap or because they are `history_limit`,
 are worked first on every run. The 8,192 remembered answers are shared by all
-clones, and any beyond them are dropped and recomputed. A run that re-checks
-nothing leaves the file
-untouched. Only a shallow or partial clone, where no check beyond `ancestor` can
+clones, and any beyond them are dropped and recomputed. A run that decides no new
+verdict and makes no successful remote check leaves the file untouched; every
+successful remote check rewrites it with that check's time. Only a shallow or partial clone, where no check beyond `ancestor` and `pull_request` can
 run, looks up first. Under git older than 2.39, the lookup comes after the size
 check and the `tree_equal` rung, so a remembered answer never replaces a
 `tree_equal` verdict that the cold run decides. A repository's diff attributes
@@ -275,12 +298,24 @@ file by its blob identity instead of by hunks, which can only make matching
 stricter. A `not_merged` they caused is remembered like any other, but it
 stands in only for a later `unknown`, so once the attributes are gone a run
 that decides the branch reports its own verdict. A file that is
-missing, damaged, too large or from another version is ignored. Deleting it only
-costs time, because the verdicts are recomputed.
+missing, damaged, too large or from another version is ignored. Deleting it costs time,
+because the verdicts are recomputed, and it loses the saved remote checks: offline
+runs then show only the clone's own fetched refs until a networked run checks again.
+
+The saved remote checks are kept per remote in the same file. For each remote they
+hold the whole answer of the last successful `git ls-remote` (its default branch
+and every branch tip) and of the last successful `gh` request (the newest 10
+same-repository pull requests of each branch name asked about), each with the time
+the check was started. A successful check replaces only its own half, and a failed
+check changes nothing. All saved checks together are held to 2 MiB, newest first; a
+remote whose saved check alone exceeds that is not kept and behaves as if it had
+none. A file written by an earlier version of Nyx, which has no saved checks, is
+read as empty without a diagnostic and replaced on the next write, so the verdicts
+are recomputed once.
 
 The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
 but not counted, as in a shallow clone), `absent` (one of the two branches does
-not exist) or `unknown`. `cached` only ever labels a basis; the time a clone
+not exist) or `unknown`. `cached` only ever labels a basis, as `live` and `recorded` do; the time a clone
 last fetched is always `fetched <time>`. A clone without an `origin` remote shows
 `no origin remote` and no branch or default elements. A checkout git refused or
 could not read shows its path and its status instead: `unsafe_ownership` when
@@ -383,8 +418,9 @@ gains no count.
 By default `nyx checkouts` is networked: it asks each distinct `origin` remote
 once, so clones that share a remote share one answer, and compares against what
 the remote has now. It stops waiting after 60 seconds in total; a remote it
-could not ask or finish asking falls back to cached values and shows
-`remote failed <reason>`. When a clone lacks a commit that it needs for a count,
+could not ask or finish asking falls back to its last saved check, shown as
+`remote recorded <reason> <time>`, or, with none saved, to the clone's cached
+values, shown as `remote failed <reason>`. When a clone lacks a commit that it needs for a count,
 the count may be borrowed read-only from a sibling clone of the same remote
 that has the commit; the JSON document names that sibling. Nyx's own SSH runs
 in batch mode, so it never stops to ask for a password or passphrase, unless you
@@ -395,15 +431,86 @@ but not the programs git started to reach the remote, such as your SSH command,
 a credential helper or git's HTTP helper. Such a program can keep running after
 `nyx checkouts` has printed its result and exited, and a prompt it opened can
 stay on the terminal until that program ends or you stop it. `--no-network`
-makes no network connection at all: `remote off`, and every value comes from
-the remote-tracking branches the clone already has, so it can be older than the
+makes no network connection at all and answers from the checks that earlier
+networked runs saved, shown as `remote recorded remote_checks_off <time>`. A
+remote with no saved check shows `remote off`, and its values come from the
+remote-tracking branches the clone already has, so they can be older than the
 remote until you fetch.
+
+GitHub lookup is optional and off until the workspace's `github_lookup` setting
+turns it on (see [Your specification workspace](workspaces.md#checkout-folders)).
+It needs the GitHub CLI, `gh`, found in an absolute `PATH` directory (`gh.exe` on
+Windows) and logged in; Nyx uses the login and token variables you already have
+and ignores `GH_HOST` and `GH_REPO`. A networked run makes one `gh` request per
+GitHub repository, however many clones share it, in the same 60 seconds as the git
+remote checks, and `--no-network` makes none. The request only reads: it asks for
+the newest 10 pull requests whose head branch has each local branch name of that
+repository's clones. Whether a remote is on GitHub is judged from the `origin` URL
+as configured, even when an `insteadOf` rewrite sends git elsewhere: the host must
+be `github.com` or a `*.ghe.com` host, and the path exactly `owner/repo`. Any
+other host, a GitHub Enterprise Server host included, is `not_github` and is never
+asked.
+
+The `--json` document gives each remote a `pr_lookup` of `status`, `reason` and
+`checked_at`. `live` means GitHub answered this run. `recorded` means no answer was
+used and the last successful lookup is shown, with its time. `off` means no
+request was made, and `unavailable` means it was tried and failed with no saved
+lookup. The reason says why, and what clears it:
+
+- `setting_off`: `github_lookup` is off for the workspace; turn it on.
+- `remote_checks_off`: `--no-network` was given; run without it.
+- `not_github`: the `origin` URL is not a GitHub repository by the rule above; it
+  clears only when the URL is.
+- `gh_missing`: no `gh` was found; install it or put its directory on `PATH`.
+- `not_authenticated`: `gh` has no valid login for that host; run `gh auth login`.
+- `not_found`: GitHub does not show the repository to that login; it clears when
+  the login can see it.
+- `rate_limited`: GitHub's rate limit was reached; it clears when the limit resets.
+- `timed_out`: `gh` did not answer within 10 seconds or the time left; try again.
+- `failed`: any other failure, including an answer Nyx cannot use and a remote
+  with no readable clone to ask from.
+
+A saved lookup stands in when the request was not made because of
+`remote_checks_off` or failed with any reason except `setting_off` and
+`not_github`.
+
+With a lookup, each branch in `--json` lists `pull_requests`: the newest 10
+pull requests from the same repository (not a fork) whose head branch has the
+branch's name, each with its `number`, `state` and `head_matches`, which is true
+when the request's head is the branch's current commit. The `pull_request` rung
+reports `merged` when a merged pull request from the same repository into the
+base branch has a head branch that is a local branch at the commit, and its head
+is the commit or contains it; the verdict names the request in `pull_request`. A
+pull request is never matched on the commit alone, and one whose
+`head_matches` is false decides only if it is merged into the base and its head
+contains the commit; otherwise the git checks decide as if it were not listed. A
+commit no local branch holds takes no `pull_request` rung. The rung is never
+remembered in the cache file.
+
+Recorded values are the last successful remote check and pull-request lookup of
+each remote, kept in the cache file and used when a run is offline or a check
+fails. They are labelled `recorded` with the check's time in `remote recorded
+<reason> <time>`, `pr recorded <reason> <time>`, `branches recorded` and the
+default element's comparisons, and in `--json` `remote.check` carries `checked_at`
+only when its status is `recorded`, while `pr_lookup` always carries it. A value
+is as old as its time: a branch pushed since is not in it. The clone's own newer
+push or fetch takes precedence for the branch comparisons, the local default
+branch's comparison with the remote and the verdict base: where the clone's
+remote-tracking branch differs from the saved value and its reflog shows an update
+at or after the saved check's time, Nyx keeps the clone's own value, on the
+`cached` basis. That depends on the clone keeping a reflog for the remote-tracking
+branch. It does not see a newer push when reflogs are disabled, when the branch was
+deleted with `git push --delete` or the remote-tracking branch pruned with
+`git fetch --prune`, or when a force-push moved the remote branch back to an older
+commit and left the clone's ref unchanged; the saved value then stands until a
+networked run checks again. The comparison of the remote's default branch with the
+clone's remote-tracking copy always uses the saved value.
 
 The command is read-only: it changes no repository, takes no git lock, writes
 no alternates file and never fetches, so asking a remote leaves every clone as
-it was. Its only lasting write is the verdict cache file, which changes no
-repository: the temporary files that hold git's output and the copies of file
-contents it compares are made in the system's temporary directory and removed
+it was. Its only lasting write is the cache file of remembered verdicts and the last
+successful remote checks, which changes no repository: the temporary files that hold the output of git and `gh`, the `gh` request file
+and the copies of file contents it compares are made in the system's temporary directory and removed
 before it exits. It exits 0 whenever it can print a document, including when git is
 missing, a folder is unavailable or a remote check failed; it exits 1 with one
 line only when the configuration is unavailable, the document exceeds 2 MiB, or
