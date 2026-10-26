@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from .catalog import MAX_OUTPUT_BYTES
+from .catalog import MAX_OUTPUT_BYTES, PackageHeads, scan_package_heads
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -3371,6 +3371,55 @@ def _render(document: dict[str, Any]) -> str:
     return rendered
 
 
+@dataclass(frozen=True)
+class PackageScan:
+    """The specification inputs of the package list: its root and finished stages."""
+
+    spec_root: Path | None
+    completed_stage_names: tuple[str, ...] = ()
+
+
+def _scan_packages(package_scan: PackageScan | None) -> PackageHeads | None:
+    """Scan the specification root; ``None`` when there is no readable root."""
+    if package_scan is None or package_scan.spec_root is None:
+        return None
+    try:
+        return scan_package_heads(
+            package_scan.spec_root,
+            completed_stage_names=package_scan.completed_stage_names,
+        )
+    except ValueError:
+        return None
+
+
+def _package_entries(scan: PackageHeads | None) -> list[dict[str, Any]]:
+    """The packages that name a target repository or a branch, in catalog order."""
+    if scan is None:
+        return []
+    entries = []
+    for head in scan.heads:
+        if head.target_repo.status == "absent" and head.branch.status == "absent":
+            continue
+        entries.append(
+            {
+                "package_path": head.package_path,
+                "package_id": head.package_id,
+                "finished": head.finished,
+                "superseded": head.superseded,
+                "target": {
+                    "status": "unchecked"
+                    if head.target_repo.status == "usable"
+                    else head.target_repo.status,
+                    "clone": None,
+                    "worktree": None,
+                },
+                "branch": {"status": head.branch.status, "name": head.branch.name},
+                "code_status": None,
+            }
+        )
+    return entries
+
+
 def collect_checkouts(
     folders: Iterable[str | os.PathLike[str]],
     *,
@@ -3379,6 +3428,7 @@ def collect_checkouts(
     max_parallel: int = MAX_PARALLEL_CLONES,
     remote_checks: bool = False,
     github_lookup: bool = False,
+    package_scan: PackageScan | None = None,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
@@ -3390,9 +3440,12 @@ def collect_checkouts(
     check saved in the cache file, labelled ``recorded``, when there is one.
     ``github_lookup`` adds one ``gh`` call per GitHub repository, and only while
     ``remote_checks`` is on; a saved pull-request listing answers for a call that
-    is not made or fails.
+    is not made or fails. ``package_scan`` names the specification root whose
+    packages are listed; without it, or when the root cannot be read, the
+    document says the package scan is ``unavailable`` and lists no package.
     """
     observed_at = _utc_text(int(time.time()))
+    package_heads = _scan_packages(package_scan)
     discovery = _discover(os.fspath(folder) for folder in folders)
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
@@ -3492,6 +3545,13 @@ def collect_checkouts(
         "folders": sorted(discovery.folders, key=folder_sort_key),
         "repositories": repositories,
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),
+        "package_scan": {
+            "status": package_heads.status if package_heads is not None else "unavailable",
+            "finished_policy": package_heads.finished_policy
+            if package_heads is not None
+            else "not_configured",
+        },
+        "packages": _package_entries(package_heads),
     }
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
     return _render(document)

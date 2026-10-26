@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 4)
+# Checkout facts document (schema 5)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 4
+CHECKOUTS_SCHEMA_VERSION = 5
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -806,7 +806,40 @@ _CHECKOUTS_KEYS = frozenset(
         "folders",
         "repositories",
         "diagnostics",
+        "package_scan",
+        "packages",
     }
+)
+_PACKAGE_SCAN_KEYS = frozenset({"status", "finished_policy"})
+_PACKAGE_SCAN_STATUSES = frozenset({"complete", "incomplete", "unavailable"})
+_FINISHED_POLICIES = frozenset({"configured", "not_configured"})
+_PACKAGE_KEYS = frozenset(
+    {
+        "package_path",
+        "package_id",
+        "finished",
+        "superseded",
+        "target",
+        "branch",
+        "code_status",
+    }
+)
+_PACKAGE_TARGET_KEYS = frozenset({"status", "clone", "worktree"})
+_PACKAGE_TARGET_STATUSES = frozenset(
+    {
+        "clone",
+        "worktree",
+        "missing",
+        "not_git",
+        "outside_folders",
+        "invalid",
+        "absent",
+        "unchecked",
+    }
+)
+_PACKAGE_BRANCH_KEYS = frozenset({"status", "name"})
+_PACKAGE_BRANCH_STATUSES = frozenset(
+    {"declared", "default_branch", "not_applicable", "invalid", "absent"}
 )
 _GIT_KEYS = frozenset({"status", "version"})
 _GIT_STATUSES = frozenset({"available", "missing", "too_old"})
@@ -1776,6 +1809,44 @@ def _repository(
     return item
 
 
+def package_sort_key(package: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Order package entries by ``package_path`` in code-point order."""
+    return (package["package_path"],)
+
+
+def _package(value: Any, name: str) -> dict[str, Any]:
+    item = _object(value, name)
+    _keys(item, _PACKAGE_KEYS, name)
+    _text(item["package_path"], f"{name}.package_path")
+    _uuid4(item["package_id"], f"{name}.package_id", nullable=True)
+    _bool(item["finished"], f"{name}.finished")
+    _bool(item["superseded"], f"{name}.superseded")
+    target = _object(item["target"], f"{name}.target")
+    _keys(target, _PACKAGE_TARGET_KEYS, f"{name}.target")
+    status = _choice(target["status"], _PACKAGE_TARGET_STATUSES, f"{name}.target.status")
+    for key in ("clone", "worktree"):
+        _nullable(target[key], _text, f"{name}.target.{key}")
+    if status not in ("clone", "worktree") and target["clone"] is not None:
+        raise ProtocolError(f"{name}.target.clone must be null without a clone")
+    if status != "worktree" and target["worktree"] is not None:
+        raise ProtocolError(f"{name}.target.worktree must be null without a worktree")
+    if status in ("clone", "worktree") and target["clone"] is None:
+        raise ProtocolError(f"{name}.target.clone is required for {status}")
+    if status == "worktree" and target["worktree"] is None:
+        raise ProtocolError(f"{name}.target.worktree is required for worktree")
+    branch = _object(item["branch"], f"{name}.branch")
+    _keys(branch, _PACKAGE_BRANCH_KEYS, f"{name}.branch")
+    branch_status = _choice(
+        branch["status"], _PACKAGE_BRANCH_STATUSES, f"{name}.branch.status"
+    )
+    _nullable(branch["name"], _text, f"{name}.branch.name")
+    if (branch["name"] is not None) != (branch_status == "declared"):
+        raise ProtocolError(f"{name}.branch.name is set exactly for declared")
+    if item["code_status"] is not None:
+        raise ProtocolError(f"{name}.code_status must be null")
+    return item
+
+
 def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     """Parse, strictly validate, and authenticate one checkout facts document."""
     if isinstance(payload, (bytes, str)):
@@ -1853,6 +1924,31 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
                 raise ProtocolError("remote keys must be unique across the document")
             remote_keys.add(key)
     _ordered(parsed, repository_sort_key, "repositories")
+
+    package_scan = _object(document["package_scan"], "package_scan")
+    _keys(package_scan, _PACKAGE_SCAN_KEYS, "package_scan")
+    scan_status = _choice(
+        package_scan["status"], _PACKAGE_SCAN_STATUSES, "package_scan.status"
+    )
+    _choice(
+        package_scan["finished_policy"], _FINISHED_POLICIES, "package_scan.finished_policy"
+    )
+    packages = _list(document["packages"], "packages")
+    if scan_status == "unavailable" and packages:
+        raise ProtocolError("packages must be empty when the package scan is unavailable")
+    for index, raw_package in enumerate(packages):
+        package = _package(raw_package, f"packages[{index}]")
+        if git_status != "available" and package["target"]["status"] in (
+            "clone",
+            "worktree",
+            "missing",
+            "not_git",
+            "outside_folders",
+        ):
+            raise ProtocolError(
+                f"packages[{index}].target.status requires git to be available"
+            )
+    _ordered(packages, package_sort_key, "packages")
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     return dict(document)

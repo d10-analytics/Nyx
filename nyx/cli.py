@@ -270,6 +270,10 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
             deadline_ns=deadline,
             remote_checks=not no_network,
             github_lookup=github_lookup,
+            package_scan=checkouts.PackageScan(
+                configuration.configuration.specification_root,
+                configuration.configuration.completed_stage_names,
+            ),
         )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
