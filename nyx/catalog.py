@@ -1398,6 +1398,14 @@ def _branch_head(raw: str | None) -> BranchHead:
     return BranchHead("invalid", None)
 
 
+def finished_policy(
+    completed_stage_names: Iterable[str] | None,
+) -> Literal["configured", "not_configured"]:
+    """Say whether ``completed_stage_names`` is a valid, non-empty completion policy."""
+    value = _completion_policy(completed_stage_names)
+    return "configured" if value is not _INVALID_POLICY and value else "not_configured"
+
+
 def scan_package_heads(
     spec_root: Path,
     *,

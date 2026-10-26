@@ -1,7 +1,8 @@
 """Read-only collector for the git state of the configured checkout folders.
 
-Every fact comes from a git command run through one runner, or from a direct
-look at the files git keeps inside a repository's own directories. Nothing here
+Every repository fact comes from a git command run through one runner, or from
+a direct look at the files git keeps inside a repository's own directories; the
+package list comes from the specification scan of the catalog. Nothing here
 fetches, writes or locks anything. Local commands run with every transport
 denied. The one exception is the optional remote check: a single
 ``git ls-remote`` per distinct remote, the only call that lifts the transport
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from .catalog import MAX_OUTPUT_BYTES, PackageHeads, scan_package_heads
+from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -3547,9 +3548,9 @@ def collect_checkouts(
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),
         "package_scan": {
             "status": package_heads.status if package_heads is not None else "unavailable",
-            "finished_policy": package_heads.finished_policy
-            if package_heads is not None
-            else "not_configured",
+            "finished_policy": finished_policy(
+                package_scan.completed_stage_names if package_scan is not None else None
+            ),
         },
         "packages": _package_entries(package_heads),
     }

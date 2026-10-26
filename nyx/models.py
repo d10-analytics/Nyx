@@ -1817,7 +1817,7 @@ def package_sort_key(package: Mapping[str, Any]) -> tuple[Any, ...]:
 def _package(value: Any, name: str) -> dict[str, Any]:
     item = _object(value, name)
     _keys(item, _PACKAGE_KEYS, name)
-    _text(item["package_path"], f"{name}.package_path")
+    _package_path(item["package_path"])
     _uuid4(item["package_id"], f"{name}.package_id", nullable=True)
     _bool(item["finished"], f"{name}.finished")
     _bool(item["superseded"], f"{name}.superseded")
