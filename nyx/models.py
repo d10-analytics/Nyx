@@ -973,7 +973,8 @@ def natural_key(text: str) -> tuple[Any, ...]:
 
 
 def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+    suffix = "" if count == 1 else "es" if noun.endswith("ch") else "s"
+    return f"{count} {noun}{suffix}"
 
 
 def _path_name(path: str) -> str:
