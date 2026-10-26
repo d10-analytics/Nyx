@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHub state)
     clone,
+    commit_file,
+    doc_copy,
     git,
     import_branches,
     isolated_git,
@@ -21,6 +23,8 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     path_with,
     posix_only,
     real,
+    redigest,
+    refusal_of,
     stand_in,
 )
 
@@ -138,7 +142,13 @@ def test_a_missing_specification_root_lists_no_package_and_keeps_repositories(wo
         "finished_policy": "configured",
     }
     assert document["packages"] == []
-    assert document["repositories"] == present["repositories"]
+    unreferenced = doc_copy(present)
+    for repository in unreferenced["repositories"]:
+        repository["package_branches"] = []
+        for member in repository["clones"]:
+            for branch in member["branches"]:
+                branch["packages"] = []
+    assert document["repositories"] == unreferenced["repositories"]
     unset = collect_packages([folder], gone)
     assert unset["package_scan"] == {
         "status": "unavailable",
@@ -622,3 +632,291 @@ def test_a_path_that_cannot_be_examined_is_not_a_git_checkout(tmp_path):
         closed.chmod(0o700)
 
     assert status == "not_git"
+
+
+# ---------------------------------------------------------------------------
+# Branch matching
+# ---------------------------------------------------------------------------
+
+
+def references_of(clone_document: dict[str, Any], name: str) -> list[tuple[str, str]]:
+    """The (package_path, basis) pairs of one local branch, field by field."""
+    (branch,) = [b for b in clone_document["branches"] if b["name"] == name]
+    pairs = []
+    for reference in branch["packages"]:
+        assert set(reference) == models._BRANCH_PACKAGE_KEYS
+        pairs.append((reference["package_path"], reference["basis"]))
+    return pairs
+
+
+def entries_of(repository: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    pairs = []
+    for entry in repository["package_branches"]:
+        assert set(entry) == models._PACKAGE_BRANCH_ENTRY_KEYS
+        pairs.append((entry["name"], entry["packages"]))
+    return pairs
+
+
+def clone_at(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
+    (found,) = [
+        c for r in document["repositories"] for c in r["clones"] if c["path"] == real(path)
+    ]
+    return found
+
+
+def repository_of(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
+    (found,) = [
+        r
+        for r in document["repositories"]
+        if any(c["path"] == real(path) for c in r["clones"])
+    ]
+    return found
+
+
+def push_branch(repository: Path, name: str) -> None:
+    git(repository, "push", "-q", "origin", name)
+
+
+@pytest.fixture
+def matching(tmp_path):
+    """Clones A and B of remote R, clone C of remote S, a clone D with no remote."""
+    remote_r = make_remote(tmp_path, "r.git")
+    remote_s = make_remote(tmp_path, "s.git")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    a = clone(remote_r, folder / "a")
+    b = clone(remote_r, folder / "b")
+    c = clone(remote_s, folder / "c")
+    d = folder / "d"
+    git(folder, "init", "-q", "-b", "trunk", str(d))
+    commit_file(d, "file.txt", "one\n", "seed")
+    for repository in (a, b, c, d):
+        git(repository, "checkout", "-q", "-b", "helper")
+        commit_file(repository, "helper.txt", "helper\n", "helper work")
+        git(repository, "checkout", "-q", "-b", "topic")
+        commit_file(repository, "topic.txt", "topic\n", "topic work")
+        git(repository, "checkout", "-q", "trunk")
+    root = tmp_path / "spec"
+    headers = {
+        "target": f"Target repo: {a}\nBranch: topic\n",
+        "proposed": f"Target repo: {a}\nProposed branch: topic\n",
+        "inapplicable": f"Target repo: {a}\nBranch: not applicable \u2014 x\n",
+        "default": f"Target repo: {a}\nBranch: trunk\n",
+        "missing": f"Target repo: {tmp_path / 'nowhere'}\nBranch: topic\n",
+        "on_c": f"Target repo: {c}\nBranch: topic\n",
+        "on_d": f"Target repo: {d}\nBranch: topic\n",
+    }
+    for name, header in headers.items():
+        make_package(root, "Drafts", name, header)
+    return {"folder": folder, "root": root, "a": a, "b": b, "c": c, "d": d}
+
+
+def path_of(name: str) -> str:
+    return f"Fictional/Drafts/{name}"
+
+
+def test_a_branch_is_matched_by_repository_group_and_not_by_name(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    a = clone_at(document, matching["a"])
+    assert a["verdict_base"] is not None and a["containment"] == "complete"
+    assert references_of(a, "topic") == [(path_of("target"), "target_clone")]
+    assert references_of(clone_at(document, matching["b"]), "topic") == [
+        (path_of("target"), "sibling_clone")
+    ]
+    # Clone C shares the branch name with another repository's package, and the
+    # package that targets C is the only one it serves.
+    assert references_of(clone_at(document, matching["c"]), "topic") == [
+        (path_of("on_c"), "target_clone")
+    ]
+    assert references_of(clone_at(document, matching["d"]), "topic") == [
+        (path_of("on_d"), "target_clone")
+    ]
+    assert entries_of(repository_of(document, matching["a"])) == [
+        ("topic", [path_of("target")])
+    ]
+    assert entries_of(repository_of(document, matching["c"])) == [
+        ("topic", [path_of("on_c")])
+    ]
+    assert entries_of(repository_of(document, matching["d"])) == [
+        ("topic", [path_of("on_d")])
+    ]
+
+
+def test_a_helper_branch_contained_in_a_package_branch_is_folded_under_it(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    for member in (matching["a"], matching["b"]):
+        helper = [b for b in clone_at(document, member)["branches"] if b["name"] == "helper"]
+        assert [b["contained_in"] for b in helper] == ["topic"]
+        assert references_of(clone_at(document, member), "helper") == [
+            (path_of("target"), "contained")
+        ]
+    # The other repository's helper folds under its own topic and serves only
+    # the package that targets that repository.
+    assert references_of(clone_at(document, matching["c"]), "helper") == [
+        (path_of("on_c"), "contained")
+    ]
+    assert references_of(clone_at(document, matching["a"]), "trunk") == []
+
+
+def test_packages_that_name_no_declared_branch_match_nothing(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    served = {
+        reference["package_path"]
+        for repository in document["repositories"]
+        for member in repository["clones"]
+        for branch in member["branches"]
+        for reference in branch["packages"]
+    }
+    listed = {
+        path
+        for repository in document["repositories"]
+        for entry in repository["package_branches"]
+        for path in entry["packages"]
+    }
+    by_name = {p["package_path"]: p for p in document["packages"]}
+    assert by_name[path_of("proposed")]["branch"]["status"] == "absent"
+    assert by_name[path_of("inapplicable")]["branch"]["status"] == "not_applicable"
+    assert by_name[path_of("missing")]["target"]["status"] == "missing"
+    expected = {path_of("target"), path_of("on_c"), path_of("on_d")}
+    assert served == expected
+    assert listed == expected
+
+
+def test_a_package_naming_the_default_branch_is_not_matched(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    package = {p["package_path"]: p for p in document["packages"]}[path_of("default")]
+    assert set(package["branch"]) == models._PACKAGE_BRANCH_KEYS
+    assert package["branch"]["status"] == "default_branch"
+    assert package["branch"]["name"] is None
+    assert path_of("default") not in {
+        path
+        for entry in repository_of(document, matching["a"])["package_branches"]
+        for path in entry["packages"]
+    }
+    for member in (matching["a"], matching["b"]):
+        assert all(
+            reference[0] != path_of("default")
+            for branch in clone_at(document, member)["branches"]
+            for reference in references_of(clone_at(document, member), branch["name"])
+        )
+
+
+def test_without_a_known_default_the_base_of_any_clone_names_it(matching, tmp_path):
+    a, b = matching["a"], matching["b"]
+    git(a, "push", "-q", "origin", "trunk:master")
+    git(a, "fetch", "-q", "origin")
+    git(b, "fetch", "-q", "origin")
+    git(a, "remote", "set-head", "origin", "trunk")
+    git(b, "remote", "set-head", "origin", "master")
+    root = tmp_path / "defaults"
+    make_package(root, "Drafts", "other", f"Target repo: {a}\nBranch: master\n")
+
+    document = collect_packages([matching["folder"]], root)
+
+    repository = repository_of(document, a)
+    assert repository["remote"]["check"]["status"] == "off"
+    assert repository["default_branch"]["name"] is None
+    assert {
+        (clone_at(document, member)["verdict_base"]["name"])
+        for member in (a, b)
+    } == {"trunk", "master"}
+    (package,) = document["packages"]
+    assert package["branch"]["status"] == "default_branch"
+    assert package["branch"]["name"] is None
+    assert repository["package_branches"] == []
+
+
+def test_a_package_targeting_a_worktree_serves_the_branch_of_its_clone(matching, tmp_path):
+    a = matching["a"]
+    worktree = tmp_path / "linked-checkout"
+    git(a, "worktree", "add", "-q", "-b", "other", str(worktree), "trunk")
+    root = tmp_path / "worktrees"
+    make_package(root, "Drafts", "w", f"Target repo: {worktree}\nBranch: topic\n")
+
+    document = collect_packages([matching["folder"]], root)
+
+    (package,) = document["packages"]
+    assert package["target"]["status"] == "worktree"
+    assert references_of(clone_at(document, a), "topic") == [
+        ("Fictional/Drafts/w", "target_clone")
+    ]
+    assert references_of(clone_at(document, matching["b"]), "topic") == [
+        ("Fictional/Drafts/w", "sibling_clone")
+    ]
+
+
+def test_several_packages_naming_one_branch_share_its_entry(matching, tmp_path):
+    root = tmp_path / "shared"
+    make_package(root, "Drafts", "one", f"Target repo: {matching['a']}\nBranch: topic\n")
+    make_package(root, "Shelf", "two", f"Target repo: {matching['b']}\nBranch: topic\n")
+
+    document = collect_packages([matching["folder"]], root)
+
+    assert entries_of(repository_of(document, matching["a"])) == [
+        ("topic", ["Fictional/Drafts/one", "Fictional/Shelf/two"])
+    ]
+    assert references_of(clone_at(document, matching["a"]), "topic") == [
+        ("Fictional/Drafts/one", "target_clone"),
+        ("Fictional/Shelf/two", "sibling_clone"),
+    ]
+    assert references_of(clone_at(document, matching["b"]), "topic") == [
+        ("Fictional/Drafts/one", "sibling_clone"),
+        ("Fictional/Shelf/two", "target_clone"),
+    ]
+
+
+def reference_mutation(document: dict[str, Any], change) -> str:
+    mutated = doc_copy(document)
+    change(mutated)
+    return refusal_of(mutated)
+
+
+def test_the_parser_refuses_a_reference_its_package_does_not_back(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+    a_index = document["repositories"].index(repository_of(document, matching["a"]))
+
+    def topic(doc: dict[str, Any], member: Path) -> dict[str, Any]:
+        (found,) = [b for b in clone_at(doc, member)["branches"] if b["name"] == "topic"]
+        return found
+
+    def helper(doc: dict[str, Any], member: Path) -> dict[str, Any]:
+        (found,) = [b for b in clone_at(doc, member)["branches"] if b["name"] == "helper"]
+        return found
+
+    def sibling_as_target(doc):
+        topic(doc, matching["b"])["packages"][0]["basis"] = "target_clone"
+
+    def target_as_sibling(doc):
+        topic(doc, matching["a"])["packages"][0]["basis"] = "sibling_clone"
+
+    def other_repository(doc):
+        topic(doc, matching["c"])["packages"][0]["package_path"] = path_of("target")
+
+    def not_contained(doc):
+        helper(doc, matching["a"])["packages"][0]["basis"] = "contained"
+        helper(doc, matching["a"])["contained_in"] = None
+
+    def unknown_package(doc):
+        topic(doc, matching["a"])["packages"][0]["package_path"] = "Fictional/Drafts/zz"
+
+    def wrong_name(doc):
+        doc["repositories"][a_index]["package_branches"][0]["name"] = "helper"
+
+    def entry_of_another_repository(doc):
+        doc["repositories"][a_index]["package_branches"][0]["packages"] = [path_of("on_c")]
+
+    assert models.parse_checkouts(json.dumps(redigest(doc_copy(document))))
+    for change, message in (
+        (sibling_as_target, "target_clone reference its package does not back"),
+        (target_as_sibling, "sibling_clone reference its package does not back"),
+        (other_repository, "target_clone reference its package does not back"),
+        (not_contained, "contained reference its package does not back"),
+        (unknown_package, "names a package the document does not list"),
+        (wrong_name, "lists a package that names another branch"),
+        (entry_of_another_repository, "lists a package of another repository"),
+    ):
+        assert message in reference_mutation(document, change), change.__name__
