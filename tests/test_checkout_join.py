@@ -95,7 +95,7 @@ def test_packages_with_a_target_or_branch_are_listed_in_path_order(world):
     assert (second["package_id"], second["finished"], second["superseded"]) == (ID_B, True, True)
     assert first["branch"] == {"status": "declared", "name": "spec/alpha"}
     assert second["branch"] == {"status": "declared", "name": "spec/beta"}
-    assert first["target"] == {"status": "clone", "clone": real(repository), "worktree": None}
+    assert_target(first["target"], "clone", real(repository))
     assert second["target"]["status"] == "absent"
     assert {p["code_status"] for p in document["packages"]} == {None}
     assert [r["clones"][0]["path"] for r in document["repositories"]] == [real(repository)]
@@ -185,7 +185,7 @@ def test_an_unusable_target_and_branch_are_reported_without_the_path(tmp_path):
     relative, tabbed = document["packages"]
     assert relative["target"]["status"] == "invalid"
     assert relative["branch"] == {"status": "not_applicable", "name": None}
-    assert tabbed["target"] == {"status": "missing", "clone": None, "worktree": None}
+    assert_target(tabbed["target"], "missing")
     assert tabbed["branch"] == {"status": "invalid", "name": None}
 
 
@@ -235,8 +235,14 @@ def resolve(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
-def clone_target(clone_path: Path | str) -> dict[str, Any]:
-    return {"status": "clone", "clone": real(clone_path), "worktree": None}
+def assert_target(
+    target: dict[str, Any], status: str, clone: str | None = None, worktree: str | None = None
+) -> None:
+    """Compare a target field by field, through the parser's own key set."""
+    assert set(target) == models._PACKAGE_TARGET_KEYS
+    assert target["status"] == status
+    assert target["clone"] == clone
+    assert target["worktree"] == worktree
 
 
 @pytest.fixture
@@ -288,71 +294,6 @@ def targets(tmp_path):
     return layout
 
 
-@posix_only
-def test_every_target_resolves_to_the_checkout_at_its_path(targets, tmp_path, monkeypatch):
-    folder = targets["folder"]
-    wanted: dict[str, Path | str | None] = {
-        "clone": targets["main"],
-        "linked": targets["linked"],
-        "bare": targets["bare"],
-        "barework": targets["bare_work"],
-        "holder": targets["holder"],
-        "busy": targets["busy"],
-        "busywork": targets["busy_work"],
-        "inside": targets["main"] / "src",
-        "missing": folder / "No Such Folder",
-        "plain": folder / "Plain",
-        "outside": targets["elsewhere"],
-        "gone": targets["gone"],
-    }
-    if "alias" in targets:
-        wanted["alias"] = targets["alias"]
-    (targets["main"] / "src").mkdir()
-    root = package_root(tmp_path, wanted)
-    shim, log = recording_with_directory(tmp_path)
-
-    with path_with(monkeypatch, shim):
-        document = collect_packages([folder], root)
-
-    found = resolve(document)
-    documented = {c["path"]: c for r in document["repositories"] for c in r["clones"]}
-    assert documented[real(targets["busy"])]["status"] == "too_many_branches"
-    assert documented[str(targets["holder"])]["status"] == "failed"
-    assert found["clone"] == clone_target(targets["main"])
-    assert found["linked"] == {
-        "status": "worktree",
-        "clone": real(targets["main"]),
-        "worktree": real(targets["linked"]),
-    }
-    if "alias" in targets:
-        assert found["alias"] == clone_target(targets["main"])
-    assert found["bare"] == clone_target(targets["bare"])
-    assert found["barework"] == {
-        "status": "worktree",
-        "clone": real(targets["bare"]),
-        "worktree": real(targets["bare_work"]),
-    }
-    assert found["holder"] == {"status": "clone", "clone": str(targets["holder"]), "worktree": None}
-    assert found["busy"] == clone_target(targets["busy"])
-    assert found["busywork"] == clone_target(targets["busy"])
-    assert found["inside"] == {"status": "not_git", "clone": None, "worktree": None}
-    assert found["missing"]["status"] == "missing"
-    assert found["plain"]["status"] == "not_git"
-    assert found["outside"] == {"status": "outside_folders", "clone": None, "worktree": None}
-    assert found["gone"]["status"] == "missing"
-    calls = log.read_text().splitlines()
-    assert calls
-    assert not [c for c in calls if c.startswith(real(targets["elsewhere"]) + "\t")]
-    assert not [c for c in calls if c.startswith(str(targets["main"] / "src") + "\t")]
-
-
-def recording_with_directory(tmp_path: Path) -> tuple[Path, Path]:
-    """A ``git`` stand-in that logs the directory and arguments of each call."""
-    log = tmp_path / "directories.log"
-    body = f'printf "%s\\t%s\\n" "$(pwd -P)" "$*" >> "{log}"'
-    return stand_in(tmp_path, "directory-recorder", body), log
-
-
 def test_a_listed_linked_worktree_resolves_to_a_worktree_even_inside_the_folder(targets):
     document = collect_packages(
         [targets["folder"]], package_root(targets["folder"].parent, {"w": targets["bare_work"]})
@@ -373,7 +314,7 @@ def test_a_clone_path_in_another_letter_case_resolves_to_the_clone(targets, tmp_
 
     document = collect_packages([targets["folder"]], root)
 
-    assert resolve(document)["variant"] == clone_target(targets["main"])
+    assert_target(resolve(document)["variant"], "clone", real(targets["main"]))
 
 
 def test_the_join_compares_keys_not_strings():
@@ -419,7 +360,7 @@ def test_a_worktree_of_an_unreadable_clone_is_refused_by_the_parser(targets, tmp
     )
     package = document["packages"][0]
     busy = real(targets["busy"])
-    assert package["target"] == {"status": "clone", "clone": busy, "worktree": None}
+    assert_target(package["target"], "clone", busy)
     package["target"] = {"status": "worktree", "clone": busy, "worktree": real(targets["busy_work"])}
     document["checkouts_digest"] = models.canonical_digest(
         document, omit=models.CHECKOUTS_DIGEST_OMITTED
@@ -457,13 +398,14 @@ def assert_unchecked(document: dict[str, Any], git_status: str) -> None:
     assert document["git"]["status"] == git_status
     assert document["repositories"] == []
     assert document["package_scan"]["status"] == "complete"
-    assert {k: v["status"] for k, v in resolve(document).items()} == {
+    found = resolve(document)
+    for name, status in {
         "exists": "unchecked",
         "gone": "unchecked",
         "relative": "invalid",
         "none": "absent",
-    }
-    assert all(t["clone"] is None and t["worktree"] is None for t in resolve(document).values())
+    }.items():
+        assert_target(found[name], status)
 
 
 def test_without_git_a_usable_target_is_unchecked(tmp_path, monkeypatch):
@@ -531,7 +473,7 @@ def test_git_runs_in_no_target_directory_that_discovery_did_not_admit(
     assert found["outside"]["status"] == "outside_folders"
     assert found["inside"]["status"] == "not_git"
     assert found["plain"]["status"] == "not_git"
-    assert found["clone"] == clone_target(targets["main"])
+    assert_target(found["clone"], "clone", real(targets["main"]))
     directories = directories_of(log)
     assert real(targets["main"]) in directories, "control: the log names each directory"
     for name, path in unadmitted.items():
@@ -555,8 +497,8 @@ def test_a_candidate_git_does_not_accept_as_a_repository_is_not_a_git_checkout(t
     assert {"code": "not_a_repository", "path": str(fake)} in document["diagnostics"]
     assert {"code": "not_a_repository", "path": str(redirected)} in document["diagnostics"]
     found = resolve(document)
-    assert found["fake"] == {"status": "not_git", "clone": None, "worktree": None}
-    assert found["redirected"] == {"status": "not_git", "clone": None, "worktree": None}
+    assert_target(found["fake"], "not_git")
+    assert_target(found["redirected"], "not_git")
 
 
 def test_the_parser_refuses_a_worktree_its_readable_clone_does_not_list(targets, tmp_path):
@@ -639,8 +581,44 @@ def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
         "gone": "missing",
     }
     for name, status in unmatched.items():
-        assert found[name] == {"status": status, "clone": None, "worktree": None}, name
+        assert_target(found[name], status)
     lines = cli.format_checkouts(document)
     busy = found["busy"]["clone"]
     assert f"{json.dumps(busy)}  too_many_branches" in lines
     assert any(line.startswith(json.dumps(found["bare"]["clone"]) + "  ") for line in lines)
+
+
+def test_a_path_that_cannot_name_anything_is_missing(tmp_path):
+    long_name = tmp_path / ("x" * 300)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    root = package_root(tmp_path, {"long": long_name})
+
+    document = collect_packages([folder], root)
+
+    assert_target(resolve(document)["long"], "missing")
+    assert checkouts._unmatched_target_status("/fictional/nul\0byte") == "missing"
+
+
+@posix_only
+def test_a_symbolic_link_loop_is_missing(tmp_path):
+    first = tmp_path / "loop-a"
+    second = tmp_path / "loop-b"
+    first.symlink_to(second)
+    second.symlink_to(first)
+
+    assert checkouts._unmatched_target_status(str(first)) == "missing"
+
+
+@posix_only
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores modes")
+def test_a_path_that_cannot_be_examined_is_not_a_git_checkout(tmp_path):
+    closed = tmp_path / "closed"
+    (closed / "inner").mkdir(parents=True)
+    closed.chmod(0)
+    try:
+        status = checkouts._unmatched_target_status(str(closed / "inner"))
+    finally:
+        closed.chmod(0o700)
+
+    assert status == "not_git"
