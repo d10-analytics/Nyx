@@ -24,9 +24,10 @@ README is narrative only.
   usable target is unchecked. A path inside a clone that is not its top level
   is not a git checkout. A path that cannot be examined at all (for example,
   access denied) is reported as not a git checkout, because no `.git` entry can
-  be shown. A discovered checkout whose own path the document cannot carry
-  (`unrepresentable_path`) has no clone record, so a target at that path is
-  reported as outside the checkout folders; this is a known limit.
+  be shown. A discovered checkout whose clone's path, as git lists
+  it, the document cannot carry (`unrepresentable_path`) has no clone record, so
+  a target at the checkout is reported as outside the checkout folders; this is
+  a known limit.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no
   git call and reads no file; `nyx/checkouts.py` owns every git call and
   filesystem read and builds the path identities it is given.
