@@ -1693,3 +1693,8 @@ def test_code_status_text_counts_worktrees_when_the_names_do_not_fit():
         status_fields("unknown", checked_out_elsewhere=astral)
     )
     assert counted == f"merge state unknown {DOT} in 2 other worktrees"
+
+
+def test_code_status_text_count_form_is_singular_for_one_oversized_name():
+    fields = status_fields("unknown", checked_out_elsewhere=["/w/" + "x" * 1010])
+    assert models.code_status_text(fields) == f"merge state unknown {DOT} in 1 other worktree"
