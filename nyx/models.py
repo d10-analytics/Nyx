@@ -932,7 +932,11 @@ _BRANCH_KEYS = frozenset(
 # How a local branch serves a package.
 _BRANCH_PACKAGE_KEYS = frozenset({"package_path", "basis"})
 _BRANCH_PACKAGE_BASES = frozenset({"target_clone", "sibling_clone", "contained"})
-_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "packages"})
+_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "packages"})
+# A package branch's remote copy: what the group's remote answered, or the clones' own
+# remote-tracking refs when it did not.
+_REMOTE_COPY_KEYS = frozenset({"state", "sha", "basis"})
+_REMOTE_COPY_STATES = frozenset({"present", "absent", "unknown"})
 _PULL_REQUEST_KEYS = frozenset({"number", "state", "head_matches"})
 _PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
 # At most this many pull requests are listed for one branch; the collector's
@@ -1547,6 +1551,26 @@ def _clone_removable(
         raise ProtocolError(f"{name}.removable_count contradicts the facts of the clone")
 
 
+def _remote_copy(value: Any, name: str, *, has_remote: bool, check: str | None) -> None:
+    """Validate a package branch's remote copy against its repository's remote check."""
+    if not has_remote:
+        if value is not None:
+            raise ProtocolError(f"{name} must be null without a remote")
+        return
+    copy = _object(value, name)
+    _keys(copy, _REMOTE_COPY_KEYS, name)
+    state = _choice(copy["state"], _REMOTE_COPY_STATES, f"{name}.state")
+    present = state == "present"
+    if (copy["sha"] is not None) != present or (copy["basis"] is not None) != present:
+        raise ProtocolError(f"{name} sets sha and basis exactly for present")
+    if present:
+        _object_id(copy["sha"], f"{name}.sha")
+        if _choice(copy["basis"], _COMPARISON_BASES, f"{name}.basis") not in _BRANCH_BASES[check]:
+            raise ProtocolError(f"{name}.basis does not match the remote check")
+    elif state == "unknown" and check in ("live", "recorded"):
+        raise ProtocolError(f"{name} cannot be unknown under a {check} remote check")
+
+
 def _clone(
     value: Any,
     name: str,
@@ -1822,6 +1846,9 @@ def _repository(
         entry = _object(raw_entry, label)
         _keys(entry, _PACKAGE_BRANCH_ENTRY_KEYS, label)
         _text(entry["name"], f"{label}.name")
+        _remote_copy(
+            entry["remote"], f"{label}.remote", has_remote=remote is not None, check=check_status
+        )
         listed = _list(entry["packages"], f"{label}.packages")
         if not listed:
             raise ProtocolError(f"{label}.packages must not be empty")

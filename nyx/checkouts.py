@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -39,7 +39,17 @@ from typing import Any
 from urllib.parse import unquote
 
 from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
-from .checkout_join import PathKey, TargetIndex, join_branches, resolve_target
+from .checkout_join import (
+    CloneRefs,
+    PathKey,
+    RemoteAnswer,
+    RemoteFacts,
+    TargetIndex,
+    declared_branch_names,
+    join_branches,
+    moved_at_or_after,
+    resolve_target,
+)
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -1694,11 +1704,11 @@ class _LenderSearch:
 _REFLOG_TIME = re.compile(r"@\{([0-9]+)\}")
 
 
-def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
-    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``.
+def _ref_moved_at(runner: _GitRunner, context: _CloneContext, name: str) -> int | None:
+    """When the clone's own ``refs/remotes/origin/<name>`` last moved, in Unix seconds.
 
     A ref that is missing, a reflog that is empty or switched off, a failed or cut
-    call and a time that does not read as Unix seconds all answer no.
+    call and a time that does not read as Unix seconds all answer ``None``.
     """
     outcome = runner.run(
         [
@@ -1714,9 +1724,14 @@ def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: 
         ceiling=context.ceiling,
     )
     if not outcome.ok or outcome.timed_out:
-        return False
+        return None
     match = _REFLOG_TIME.search(_decode(outcome.out).strip())
-    return match is not None and int(match.group(1)) >= at
+    return int(match.group(1)) if match is not None else None
+
+
+def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
+    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``."""
+    return moved_at_or_after(_ref_moved_at(runner, context, name), at)
 
 
 def _apply_live(
@@ -1727,7 +1742,8 @@ def _apply_live(
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
     base_name: str | None = None,
     basis: str = "live",
-) -> _Base | None:
+    package_names: Collection[str] = (),
+) -> tuple[_Base | None, dict[str, int | None]]:
     """Replace one clone's cached comparisons with the remote's, in place.
 
     ``answer`` is a live ``ls-remote`` answer (``basis`` ``live``) or a saved one
@@ -1741,7 +1757,11 @@ def _apply_live(
     the saved head.
 
     Returns the clone's verdict base for ``base_name``, chosen from the same
-    presence pass and lender as the comparisons.
+    presence pass and lender as the comparisons, and the move time of each remote-tracking
+    ref read under a saved answer (``None`` for a read that could not finish). A ref is
+    read at most once, for the clone's own branch names, the default and base names and
+    ``package_names``, and only when the clone's tip differs from the saved one; the clone's
+    comparisons and the remote copy of a package branch both use that one value.
     """
     name, remote_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
@@ -1750,20 +1770,20 @@ def _apply_live(
     if base_head is None and base_name is not None and base_name == name:
         base_head = remote_sha
     newer: set[str] = set()
+    moved: dict[str, int | None] = {}
     if basis == "recorded":
         asked = {branch["name"] for branch in clone["branches"]}
         asked.update(item for item in (name, base_name) if item is not None)
+        asked.update(package_names)
         for item in sorted(asked):
             held_tip = context.cached.get(item)
             saved_tip = answer.branches.get(item)
             if saved_tip is None and item == name:
                 saved_tip = remote_sha
-            if (
-                held_tip is not None
-                and held_tip != saved_tip
-                and _ref_moved_since(runner, context, item, answer.at)
-            ):
-                newer.add(item)
+            if held_tip is not None and held_tip != saved_tip:
+                moved[item] = _ref_moved_at(runner, context, item)
+                if moved_at_or_after(moved[item], answer.at):
+                    newer.add(item)
     if base_name in newer:
         # The clone's own base stands: it is the cached fallback below.
         base_head = None
@@ -1873,29 +1893,34 @@ def _apply_live(
             branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
 
     if base_name is None:
-        return None
+        return None, moved
     cached_base = context.cached.get(base_name)
     fallback = (
         _Base(base_name, cached_base, "cached", None, None) if cached_base is not None else None
     )
     if base_head is None:
-        return fallback
+        return fallback, moved
     if guarded:
-        return _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
+        return (
+            _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
+        ), moved
     if base_head in held or presence.get(base_head) == "present":
-        return _Base(base_name, base_head, basis, None, None)
+        return _Base(base_name, base_head, basis, None, None), moved
     if presence.get(base_head) == "missing":
         source = lender(base_head)
         if isinstance(source, tuple):
             sibling, sibling_context = source
-            return _Base(
-                base_name,
-                base_head,
-                basis,
-                sibling["path"],
-                os.path.join(sibling_context.common, "objects"),
+            return (
+                _Base(
+                    base_name,
+                    base_head,
+                    basis,
+                    sibling["path"],
+                    os.path.join(sibling_context.common, "objects"),
+                ),
+                moved,
             )
-    return fallback
+    return fallback, moved
 
 
 def _list_pull_requests(
@@ -1981,10 +2006,12 @@ def _check_remotes(
     github_lookup: bool,
     remote_checks: bool,
     saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
+    package_names: Mapping[str, Collection[str]],
 ) -> tuple[
     dict[str, _Base | None],
     dict[str, dict[str, tuple[_PullRequest, ...]]],
     dict[str, dict[str, dict[str, Any]]],
+    dict[str, RemoteFacts],
 ]:
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
     lookup is on; none when ``remote_checks`` is off) then phase 3 (per-clone
@@ -1995,7 +2022,13 @@ def _check_remotes(
     requests per head branch name for each remote key whose lookup answered or
     whose saved listing applies, and the records of this run's successful
     checks: per remote key, ``heads`` and ``pull_requests`` for the calls that
-    answered. ``saved`` holds the cache file's records per remote key."""
+    answered. ``saved`` holds the cache file's records per remote key.
+
+    ``package_names`` holds, per remote key, the branch names that packages declare
+    for the group. For each such group the last result carries the facts the remote
+    copy of those branches is decided from: the group's answer and its basis (none when
+    the check failed or is off with no saved answer), and per usable clone its own
+    remote-tracking tips and the move times read once under a saved answer."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -2077,6 +2110,7 @@ def _check_remotes(
             tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str]
         ] = []
         bases: dict[str, _Base | None] = {}
+        remote_answers: dict[str, RemoteAnswer] = {}
         for group, answer in zip(groups, answers):
             key = group["remote"]["key"]
             if answer is not None and answer.reason is None:
@@ -2097,13 +2131,14 @@ def _check_remotes(
                 }
                 answer = _recorded_answer(heads)
             group["default_branch"] = {"name": answer.name, "sha": answer.sha}
+            remote_answers[key] = RemoteAnswer(basis, answer.at, dict(answer.branches))
             for clone, context in _usable_clones(group["clones"], contexts):
                 work.append((context, clone, answer, group, basis))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
         def apply(
             item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str],
-        ) -> tuple[str, _Base | None]:
+        ) -> tuple[str, _Base | None, dict[str, int | None]]:
             context, clone, answer, group, basis = item
             siblings = _siblings(clone, group["clones"], contexts)
             cached_default = clone["cached_default"]
@@ -2112,12 +2147,38 @@ def _check_remotes(
                 or (cached_default["name"] if cached_default is not None else None)
                 or _group_default_name(group["clones"])
             )
-            return clone["path"], _apply_live(
-                runner, context, clone, answer, siblings, base_name, basis
+            base, moved = _apply_live(
+                runner,
+                context,
+                clone,
+                answer,
+                siblings,
+                base_name,
+                basis,
+                package_names.get(group["remote"]["key"], ()),
             )
+            return clone["path"], base, moved
 
-        bases.update(pool.map(apply, work))
-    return bases, pulls, checked
+        moves: dict[str, dict[str, int | None]] = {}
+        for path, base, moved in pool.map(apply, work):
+            bases[path] = base
+            moves[path] = moved
+    facts: dict[str, RemoteFacts] = {}
+    for group in groups:
+        key = group["remote"]["key"]
+        names = package_names.get(key, ())
+        if names:
+            facts[key] = RemoteFacts(
+                remote_answers.get(key),
+                {
+                    clone["path"]: CloneRefs(
+                        {name: context.cached[name] for name in names if name in context.cached},
+                        moves.get(clone["path"], {}),
+                    )
+                    for clone, context in _usable_clones(group["clones"], contexts)
+                },
+            )
+    return bases, pulls, checked, facts
 
 
 # ---------------------------------------------------------------------------
@@ -3529,7 +3590,8 @@ def collect_checkouts(
     discovery = _discover(os.fspath(folder) for folder in folders)
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
-    target_index: TargetIndex | None = None
+    packages: list[dict[str, Any]]
+    remote_facts: dict[str, RemoteFacts] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -3595,7 +3657,9 @@ def collect_checkouts(
         if cache_path is not None and not _representable(cache_path):
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
-        bases, pulls, checked = _check_remotes(
+        target_index = _target_index(repositories, candidate_clones, not_git_candidates)
+        packages = _package_entries(package_heads, target_index)
+        bases, pulls, checked, remote_facts = _check_remotes(
             runner,
             repositories,
             contexts,
@@ -3603,6 +3667,7 @@ def collect_checkouts(
             github_lookup,
             remote_checks,
             cache.remote_checks,
+            declared_branch_names(repositories, packages),
         )
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
@@ -3620,13 +3685,13 @@ def collect_checkouts(
         _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
-        target_index = _target_index(repositories, candidate_clones, not_git_candidates)
+    else:
+        packages = _package_entries(package_heads, None)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
     }.values()
-    packages = _package_entries(package_heads, target_index)
-    join_branches(repositories, packages)
+    join_branches(repositories, packages, remote_facts)
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
