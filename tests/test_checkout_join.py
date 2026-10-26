@@ -920,3 +920,138 @@ def test_the_parser_refuses_a_reference_its_package_does_not_back(matching):
         (entry_of_another_repository, "lists a package of another repository"),
     ):
         assert message in reference_mutation(document, change), change.__name__
+
+
+@pytest.fixture
+def stacked(tmp_path):
+    """Clone A of a remote whose branches stack: work-1 under work-9 under work-10."""
+    base = tmp_path / "stacked"
+    base.mkdir()
+    remote = make_remote(base, "r.git")
+    folder = base / "folder"
+    folder.mkdir()
+    a = clone(remote, folder / "a")
+    for name in ("work-1", "work-9", "work-10"):
+        git(a, "checkout", "-q", "-b", name)
+        commit_file(a, f"{name}.txt", f"{name}\n", f"{name} work")
+    git(a, "checkout", "-q", "trunk")
+    root = base / "spec"
+    make_package(root, "Drafts", "a-outer", f"Target repo: {a}\nBranch: work-10\n")
+    make_package(root, "Drafts", "z-middle", f"Target repo: {a}\nBranch: work-9\n")
+    return {"folder": folder, "root": root, "a": a}
+
+
+def test_a_branch_folds_under_every_package_branch_its_chain_reaches(stacked):
+    document = collect_packages([stacked["folder"]], stacked["root"])
+
+    a = clone_at(document, stacked["a"])
+    assert a["containment"] == "complete"
+    assert {b["name"]: b["contained_in"] for b in a["branches"]} == {
+        "trunk": None,
+        "work-1": "work-9",
+        "work-9": "work-10",
+        "work-10": None,
+    }
+    outer, middle = "Fictional/Drafts/a-outer", "Fictional/Drafts/z-middle"
+    assert references_of(a, "work-10") == [(outer, "target_clone")]
+    # A package's own branch and a branch folded under another package's branch
+    # are listed together, by package path.
+    assert references_of(a, "work-9") == [(outer, "contained"), (middle, "target_clone")]
+    # Two links away from work-10, work-1 still serves the package naming it.
+    assert references_of(a, "work-1") == [(outer, "contained"), (middle, "contained")]
+    assert references_of(a, "trunk") == []
+    # Entries follow branch order (digit runs as numbers), not code-point order.
+    assert entries_of(repository_of(document, stacked["a"])) == [
+        ("work-9", [middle]),
+        ("work-10", [outer]),
+    ]
+
+
+def test_a_package_on_a_refused_clone_is_served_by_its_readable_sibling(tmp_path):
+    remote = make_remote(tmp_path, "r.git")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    readable = clone(remote, folder / "readable")
+    crowded = clone(remote, folder / "crowded")
+    for repository in (readable, crowded):
+        git(repository, "checkout", "-q", "-b", "topic")
+        commit_file(repository, "topic.txt", "topic\n", "topic work")
+        git(repository, "checkout", "-q", "trunk")
+    import_branches(crowded, models.CHECKOUT_BRANCH_CAP)
+    root = tmp_path / "spec"
+    make_package(root, "Drafts", "crowded", f"Target repo: {crowded}\nBranch: topic\n")
+    make_package(root, "Drafts", "default", f"Target repo: {crowded}\nBranch: trunk\n")
+
+    document = collect_packages([folder], root)
+
+    assert clone_at(document, crowded)["status"] == "too_many_branches"
+    repository = repository_of(document, readable)
+    assert repository is repository_of(document, crowded)
+    assert repository["default_branch"]["name"] == "trunk"
+    by_path = {p["package_path"]: p for p in document["packages"]}
+    assert_target(by_path["Fictional/Drafts/crowded"]["target"], "clone", real(crowded))
+    assert references_of(clone_at(document, readable), "topic") == [
+        ("Fictional/Drafts/crowded", "sibling_clone")
+    ]
+    assert entries_of(repository) == [("topic", ["Fictional/Drafts/crowded"])]
+    assert by_path["Fictional/Drafts/default"]["branch"] == {
+        "status": "default_branch",
+        "name": None,
+    }
+
+
+def test_the_parser_refuses_misplaced_or_misordered_package_references(matching, stacked):
+    document = collect_packages([matching["folder"]], matching["root"])
+    stack = collect_packages([stacked["folder"]], stacked["root"])
+
+    def branch_of(doc: dict[str, Any], member: Path, name: str) -> dict[str, Any]:
+        (found,) = [b for b in clone_at(doc, member)["branches"] if b["name"] == name]
+        return found
+
+    def entries(doc: dict[str, Any], member: Path) -> list[dict[str, Any]]:
+        return repository_of(doc, member)["package_branches"]
+
+    def helper_as_target(doc):
+        branch_of(doc, matching["a"], "helper")["packages"][0]["basis"] = "target_clone"
+
+    def helper_as_sibling(doc):
+        branch_of(doc, matching["b"], "helper")["packages"][0]["basis"] = "sibling_clone"
+
+    def sibling_in_another_repository(doc):
+        branch_of(doc, matching["c"], "topic")["packages"] = [
+            {"package_path": path_of("target"), "basis": "sibling_clone"}
+        ]
+
+    def folded_into_another_repository(doc):
+        branch_of(doc, matching["c"], "helper")["packages"] = [
+            {"package_path": path_of("target"), "basis": "contained"}
+        ]
+
+    def empty_entry(doc):
+        entries(doc, matching["a"])[0]["packages"] = []
+
+    def repeated_package(doc):
+        listed = entries(doc, matching["a"])[0]["packages"]
+        listed.append(listed[0])
+
+    for change, message in (
+        (helper_as_target, "target_clone reference its package does not back"),
+        (helper_as_sibling, "sibling_clone reference its package does not back"),
+        (sibling_in_another_repository, "sibling_clone reference its package does not back"),
+        (folded_into_another_repository, "contained reference its package does not back"),
+        (empty_entry, "package_branches[0].packages must not be empty"),
+        (repeated_package, "package_branches[0].packages must be unique and in canonical order"),
+    ):
+        assert message in reference_mutation(document, change), change.__name__
+
+    def swapped_entries(doc):
+        entries(doc, stacked["a"]).reverse()
+
+    def swapped_references(doc):
+        branch_of(doc, stacked["a"], "work-9")["packages"].reverse()
+
+    for change, message in (
+        (swapped_entries, ".package_branches must be unique and in canonical order"),
+        (swapped_references, ".packages must be unique and in canonical order"),
+    ):
+        assert message in reference_mutation(stack, change), change.__name__
