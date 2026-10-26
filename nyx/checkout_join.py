@@ -23,6 +23,12 @@ read, under the same moved-ref rule the clones' own comparisons use
 (``moved_at_or_after``): the group's remote answer when the check was live, the saved
 answer unless a clone holds a tracking ref that differs from it and moved at or after
 the check, and otherwise the tracking ref of the clone fetched most recently.
+
+Each such package also gets its Code Status. The facts are the branch's local copies (the
+branches of that name in the readable clones of the repository) and its remote copy. A
+remote copy whose tip equals no local copy's tip has no verdict and counts as unknown,
+never merged. The fields are stored in ``code_status`` and ``models.code_status_text``
+renders them, so a reader recomputes the text from the fields.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .models import natural_key
+from .models import code_status_text, natural_key
 
 PathKey = tuple[Any, ...]
 
@@ -251,6 +257,104 @@ def _contained_chain(branches: Mapping[str, str | None], start: str) -> list[str
     return reached
 
 
+def _local_copies(repository: Mapping[str, Any], name: str) -> list[dict[str, Any]]:
+    """The local branches named ``name`` in the readable clones of ``repository``."""
+    return [
+        branch
+        for clone in repository["clones"]
+        if clone["status"] == "ok"
+        for branch in clone["branches"]
+        if branch["name"] == name
+    ]
+
+
+def _verdict_state(branch: Mapping[str, Any]) -> str:
+    verdict = branch["verdict"]
+    return "unknown" if verdict is None else verdict["state"]
+
+
+def _push_fragment(local: Sequence[Mapping[str, Any]], remote: Mapping[str, Any] | None) -> tuple[str, int | None]:
+    """The push state of a branch and the unpushed commit count when it has one."""
+    if remote is None:
+        return "unknown", None
+    if remote["state"] == "absent":
+        return "not_pushed", None
+    ahead = [
+        copy["vs_remote"]["ahead"]
+        for copy in local
+        if copy["vs_remote"] is not None and copy["vs_remote"]["relation"] in ("ahead", "diverged")
+    ]
+    if ahead:
+        return "unpushed", max(ahead)
+    if all(
+        copy["vs_remote"] is not None and copy["vs_remote"]["relation"] in ("equal", "behind")
+        for copy in local
+    ):
+        return "pushed", None
+    return "unknown", None
+
+
+def _code_status(
+    package: Mapping[str, Any],
+    local: Sequence[Mapping[str, Any]],
+    remote: Mapping[str, Any] | None,
+    *,
+    every_package_finished: bool,
+) -> dict[str, Any] | None:
+    """The Code Status of ``package`` from the copies of its branch, or ``None`` when the
+    branch is found nowhere."""
+    remote_present = remote is not None and remote["state"] == "present"
+    if not local and not remote_present:
+        return None
+    verdicts = [_verdict_state(copy) for copy in local]
+    if remote_present:
+        tips = {copy["sha"]: _verdict_state(copy) for copy in reversed(local)}
+        verdicts.append(tips.get(remote["sha"], "unknown"))
+
+    held = sorted(
+        {path for copy in local for path in copy["checked_out_in"]}, key=natural_key
+    )
+    target = package["target"]
+    own = target["worktree"] if target["status"] == "worktree" else target["clone"]
+    status: dict[str, Any] = {
+        "state": "unknown",
+        "text": "",
+        "pull_request": None,
+        "push": None,
+        "unpushed": None,
+        "cleanup": None,
+        "checked_out_elsewhere": [path for path in held if path != own],
+    }
+    push, unpushed = _push_fragment(local, remote)
+    open_pulls = [
+        pull["number"]
+        for copy in local
+        for pull in copy["pull_requests"]
+        if pull["state"] == "open"
+    ]
+    if all(verdict == "merged" for verdict in verdicts):
+        status["state"] = "merged"
+        status["cleanup"] = (
+            {"worktrees": len(held), "branches": 0}
+            if held
+            else {"worktrees": 0, "branches": len(local)}
+        )
+    elif open_pulls:
+        status["state"] = "pr_open"
+        status["pull_request"] = max(open_pulls)
+        status["push"], status["unpushed"] = push, unpushed
+    elif "not_merged" in verdicts:
+        if every_package_finished:
+            status["state"] = "awaiting_merge"
+        elif package["superseded"]:
+            status["state"] = "superseded"
+        else:
+            status["state"] = "in_progress"
+            status["push"], status["unpushed"] = push, unpushed
+    status["text"] = code_status_text(status)
+    return status
+
+
 def join_branches(
     repositories: Sequence[dict[str, Any]],
     packages: Sequence[dict[str, Any]],
@@ -264,7 +368,8 @@ def join_branches(
     matched to nothing. Every other such package is listed in its repository's
     ``package_branches``, with the remote copy of the branch (``None`` for a repository
     without a remote), and on each local branch of that repository's readable clones that
-    carries its branch name or is folded under it. Both are rewritten in place.
+    carries its branch name or is folded under it, and every package whose branch has a
+    copy gets its Code Status. All three are rewritten in place.
     """
     named: dict[int, dict[str, list[dict[str, Any]]]] = {}
     for repository, package in _declared(repositories, packages):
@@ -289,6 +394,14 @@ def join_branches(
         ]
         if not by_name:
             continue
+        copies = {entry["name"]: entry["remote"] for entry in repository["package_branches"]}
+        for name, named_packages in by_name.items():
+            local = _local_copies(repository, name)
+            every_finished = all(package["finished"] for package in named_packages)
+            for package in named_packages:
+                package["code_status"] = _code_status(
+                    package, local, copies[name], every_package_finished=every_finished
+                )
         for clone in repository["clones"]:
             if clone["status"] != "ok":
                 continue

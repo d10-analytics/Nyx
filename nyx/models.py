@@ -824,6 +824,22 @@ _PACKAGE_KEYS = frozenset(
         "code_status",
     }
 )
+_CODE_STATUS_KEYS = frozenset(
+    {
+        "state",
+        "text",
+        "pull_request",
+        "push",
+        "unpushed",
+        "cleanup",
+        "checked_out_elsewhere",
+    }
+)
+_CODE_STATUS_STATES = frozenset(
+    {"merged", "pr_open", "awaiting_merge", "superseded", "in_progress", "unknown"}
+)
+_CODE_STATUS_PUSHES = frozenset({"pushed", "unpushed", "not_pushed", "unknown"})
+_CLEANUP_KEYS = frozenset({"worktrees", "branches"})
 _PACKAGE_TARGET_KEYS = frozenset({"status", "clone", "worktree"})
 _PACKAGE_TARGET_STATUSES = frozenset(
     {
@@ -1950,9 +1966,50 @@ def _package(value: Any, name: str) -> dict[str, Any]:
     _nullable(branch["name"], _text, f"{name}.branch.name")
     if (branch["name"] is not None) != (branch_status == "declared"):
         raise ProtocolError(f"{name}.branch.name is set exactly for declared")
-    if item["code_status"] is not None:
-        raise ProtocolError(f"{name}.code_status must be null")
+    _code_status(
+        item["code_status"],
+        f"{name}.code_status",
+        allowed=branch_status == "declared" and status in ("clone", "worktree"),
+    )
     return item
+
+
+def _code_status(value: Any, name: str, *, allowed: bool) -> None:
+    """Check one package's Code Status: every field's type, the fields' agreement with the
+    state, and the text against the one text function."""
+    if value is None:
+        return
+    if not allowed:
+        raise ProtocolError(f"{name} requires a declared branch and a resolved target")
+    item = _object(value, name)
+    _keys(item, _CODE_STATUS_KEYS, name)
+    state = _choice(item["state"], _CODE_STATUS_STATES, f"{name}.state")
+    _string(item["text"], f"{name}.text")
+    _nullable(item["push"], lambda raw, label: _choice(raw, _CODE_STATUS_PUSHES, label), f"{name}.push")
+    for key in ("pull_request", "unpushed"):
+        number = item[key]
+        if number is not None and (type(number) is not int or number < 1):
+            raise ProtocolError(f"{name}.{key} must be a positive integer or null")
+    cleanup = item["cleanup"]
+    if cleanup is not None:
+        cleanup = _object(cleanup, f"{name}.cleanup")
+        _keys(cleanup, _CLEANUP_KEYS, f"{name}.cleanup")
+        for key in ("worktrees", "branches"):
+            _count(cleanup[key], f"{name}.cleanup.{key}")
+    paths = _list(item["checked_out_elsewhere"], f"{name}.checked_out_elsewhere")
+    for index, path in enumerate(paths):
+        _text(path, f"{name}.checked_out_elsewhere[{index}]")
+    _ordered(paths, natural_key, f"{name}.checked_out_elsewhere")
+    if (item["push"] is not None) != (state in ("in_progress", "pr_open")):
+        raise ProtocolError(f"{name}.push is set exactly for in_progress and pr_open")
+    if (item["pull_request"] is not None) != (state == "pr_open"):
+        raise ProtocolError(f"{name}.pull_request is set exactly for pr_open")
+    if (cleanup is not None) != (state == "merged"):
+        raise ProtocolError(f"{name}.cleanup is set exactly for merged")
+    if (item["unpushed"] is not None) != (item["push"] == "unpushed"):
+        raise ProtocolError(f"{name}.unpushed is a count exactly when push is unpushed")
+    if item["text"] != code_status_text(item):
+        raise ProtocolError(f"{name}.text does not match its fields")
 
 
 def _check_package_references(
