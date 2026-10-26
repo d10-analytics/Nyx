@@ -128,9 +128,17 @@ def test_a_missing_specification_root_lists_no_package_and_keeps_repositories(wo
 
     document = collect_packages([folder], gone, ("Shipped",))
 
-    assert document["package_scan"]["status"] == "unavailable"
+    assert document["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "configured",
+    }
     assert document["packages"] == []
     assert document["repositories"] == present["repositories"]
+    unset = collect_packages([folder], gone)
+    assert unset["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "not_configured",
+    }
 
 
 def test_without_a_package_scan_the_scan_is_unavailable(world):
@@ -141,16 +149,22 @@ def test_without_a_package_scan_the_scan_is_unavailable(world):
     )
     document = models.parse_checkouts(text)
 
-    assert document["package_scan"]["status"] == "unavailable"
+    assert document["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "not_configured",
+    }
     assert document["packages"] == []
 
 
 def test_no_specification_root_is_unavailable(world):
     folder, _repository, _root = world
 
-    document = collect_packages([folder], None)
+    document = collect_packages([folder], None, ("Shipped",))
 
-    assert document["package_scan"]["status"] == "unavailable"
+    assert document["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "configured",
+    }
     assert document["packages"] == []
 
 
@@ -190,6 +204,9 @@ def test_the_parser_refuses_a_package_list_that_contradicts_the_scan(world):
     assert "canonical order" in refused(lambda d: d["packages"].reverse())
     assert "set exactly for declared" in refused(
         lambda d: d["packages"][0]["branch"].update(name=None)
+    )
+    assert "relative" in refused(
+        lambda d: d["packages"][0].update(package_path="../escape")
     )
     assert "invalid shape" in refused(lambda d: d["packages"][0].pop("superseded"))
     assert "is invalid" in refused(

@@ -2219,12 +2219,28 @@ def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["package_scan"]["status"] == "unavailable"
+    assert document["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "configured",
+    }
     assert document["packages"] == []
     assert document["repositories"] == before["repositories"]
     assert [c["path"] for r in document["repositories"] for c in r["clones"]] == [
         real(repository)
     ]
+
+
+def test_subprocess_unavailable_scan_without_the_setting_is_not_configured(tmp_path, account):
+    _folder, _repository, root, _record = _package_world(tmp_path, None)
+    shutil.rmtree(root)
+
+    completed = _checkouts_subprocess(account, "--json", "--no-network")
+
+    assert completed.returncode == 0, completed.stderr
+    assert models.parse_checkouts(completed.stdout)["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "not_configured",
+    }
 
 
 def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):
