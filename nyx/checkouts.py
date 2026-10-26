@@ -6,7 +6,15 @@ fetches, writes or locks anything. Local commands run with every transport
 denied. The one exception is the optional remote check: a single
 ``git ls-remote`` per distinct remote, the only call that lifts the transport
 denial (so git applies the user's own transport policy and credentials), and it
-transfers no objects.
+transfers no objects. When the active workspace turns GitHub lookup on, the same
+phase also makes one ``gh api graphql`` request per GitHub repository, asking for
+the pull requests of its local branch names; it runs the user's own ``gh`` with
+the user's credentials, is never retried, and a missing or failing ``gh`` only
+marks that repository's lookup unavailable. A merged pull request into the verdict
+base, whose head branch is a local branch at a commit, proves that commit merged
+when the request's head is the commit or has it as an ancestor; the ancestry test
+reads only objects already on disk, in the clone or a sibling clone of the same
+remote, and such a verdict is never remembered.
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +42,7 @@ from .models import (
     CHECKOUTS_DIGEST_OMITTED,
     CHECKOUTS_SCHEMA_VERSION,
     OPERATIONS,
+    PULL_REQUEST_LIST_CAP,
     ProtocolError,
     _keys,
     _object,
@@ -44,6 +53,7 @@ from .models import (
     derive_removable,
     diagnostic_sort_key,
     folder_sort_key,
+    github_identity,
     load_strict_json,
     natural_key,
     repository_sort_key,
@@ -84,7 +94,6 @@ CACHE_ENTRY_CAP = 8192
 VERDICT_RESERVE_NS = 500_000_000
 
 _ON_WINDOWS = os.name == "nt"
-_GIT_EXECUTABLE = "git.exe" if _ON_WINDOWS else "git"
 _VERSION_LINE = re.compile(r"git version (?P<version>[0-9]+(?:\.[0-9]+)+\S*)")
 _NUMERIC_PREFIX = re.compile(r"[0-9]+(?:\.[0-9]+)+")
 _CONFIG_PATTERN = (
@@ -153,15 +162,52 @@ class _Outcome:
         return "failed"
 
 
-def _resolve_git() -> str | None:
-    """Find git among the absolute ``PATH`` entries only."""
+def _resolve_program(stem: str) -> str | None:
+    """Find ``stem`` among the absolute ``PATH`` entries only.
+
+    On Windows only ``<stem>.exe`` counts, never a ``.cmd`` shim or a file in
+    the working directory; elsewhere the file must be executable.
+    """
+    name = f"{stem}.exe" if _ON_WINDOWS else stem
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or not os.path.isabs(entry):
             continue
-        candidate = os.path.join(entry, _GIT_EXECUTABLE)
+        candidate = os.path.join(entry, name)
         if os.path.isfile(candidate) and (_ON_WINDOWS or os.access(candidate, os.X_OK)):
             return candidate
     return None
+
+
+def _start(command: Sequence[str], environment: Mapping[str, str], timeout: float) -> _Outcome:
+    """Run one child with standard input closed, its output kept in temporary
+    files, and a kill when ``timeout`` seconds pass."""
+    if timeout <= 0:
+        return _Outcome(None, timed_out=True)
+    # Output goes to temporary files, not pipes, so a program the child started
+    # and left behind cannot keep this call waiting after the child is killed.
+    with (
+        tempfile.TemporaryFile() as out,
+        tempfile.TemporaryFile() as err,
+    ):
+        try:
+            process = subprocess.Popen(
+                list(command),
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                env=dict(environment),
+            )
+        except OSError:
+            return _Outcome(None)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return _Outcome(None, timed_out=True)
+        out.seek(0)
+        err.seek(0)
+        return _Outcome(process.returncode, out.read(), err.read())
 
 
 class _GitRunner:
@@ -254,31 +300,11 @@ class _GitRunner:
         if timeout <= 0:
             return _Outcome(None, timed_out=True)
         command, environment = self._prepare(arguments, path, ceiling, overlay)
-        # Output goes to temporary files, not pipes, so a program git started
-        # and left behind cannot keep this call waiting after git is killed.
-        with (
-            tempfile.TemporaryFile() as out,
-            tempfile.TemporaryFile() as err,
-        ):
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    env=environment,
-                )
-            except OSError:
-                return _Outcome(None)
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                return _Outcome(None, timed_out=True)
-            out.seek(0)
-            err.seek(0)
-            return _Outcome(process.returncode, out.read(), err.read())
+        return _start(command, environment, timeout)
+
+    def run_program(self, command: Sequence[str], environment: Mapping[str, str]) -> _Outcome:
+        """Run another program under this runner's per-call cap and deadline."""
+        return _start(command, environment, self._timeout())
 
     def pipeline(
         self,
@@ -642,7 +668,7 @@ def _unavailable_clone(path: str, status: str) -> dict[str, Any]:
         "shallow": None,
         "cached_default": None,
         "local_default": None,
-        "cached_vs_live": None,
+        "cached_vs_remote": None,
         "stash_count": None,
         "worktrees": None,
         "branches": None,
@@ -670,7 +696,9 @@ def _comparison(
 def _counted_comparison(outcome: _Outcome, basis: str) -> dict[str, Any]:
     """Read a ``rev-list --left-right --count`` outcome as a comparison."""
     fields = outcome.out.split()
-    if outcome.timed_out or (basis == "live" and outcome.code is None):
+    # A call that never ran to an answer is unknown on every remote-derived basis
+    # (live or recorded); only the cached basis reports it as a difference.
+    if outcome.timed_out or (basis != "cached" and outcome.code is None):
         return _comparison("unknown", basis=basis)
     if outcome.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
         ahead, behind = int(fields[0]), int(fields[1])
@@ -1062,6 +1090,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                     and upstream != f"refs/remotes/origin/{name}"
                 ),
                 "vs_remote": compare(sha, cached.get(name)) if has_remote else None,
+                "pull_requests": [],
                 "verdict": None,
                 "contained_in": None,
                 "removable": None,
@@ -1085,7 +1114,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
             local_default = {
                 "name": cached_head_target,
                 "sha": local_sha,
-                "vs_live": None,
+                "vs_remote": None,
                 "vs_cached": compare(local_sha, cached_sha),
             }
 
@@ -1097,7 +1126,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
         "shallow": anchor.shallow,
         "cached_default": cached_default,
         "local_default": local_default,
-        "cached_vs_live": None,
+        "cached_vs_remote": None,
         "stash_count": stash_count,
         "worktrees": worktrees,
         "branches": branches,
@@ -1180,7 +1209,23 @@ def _group_default_name(clones: list[dict[str, Any]]) -> str | None:
     return next(iter(names)) if len(names) == 1 else None
 
 
-def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]]:
+def _pr_lookup_off(key: str, github_lookup: bool, remote_checks: bool) -> dict[str, Any]:
+    """A group's lookup status before any ``gh`` call: the reason no call is made, or
+    a failure for a group that will be called and whose answer replaces it."""
+    if not github_lookup:
+        status, reason = "off", "setting_off"
+    elif github_identity(key) is None:
+        status, reason = "off", "not_github"
+    elif not remote_checks:
+        status, reason = "off", "remote_checks_off"
+    else:
+        status, reason = "unavailable", "failed"
+    return {"status": status, "reason": reason, "checked_at": None}
+
+
+def _assemble_repositories(
+    outcomes: list[_CloneOutcome], *, github_lookup: bool, remote_checks: bool
+) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     repositories: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -1191,7 +1236,9 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
         seen_paths.add(clone["path"])
         remote = outcome.remote
         if remote is None:
-            repositories.append({"remote": None, "default_branch": None, "clones": [clone]})
+            repositories.append(
+                {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone]}
+            )
             continue
         key, display = remote
         group = grouped.get(key)
@@ -1202,7 +1249,8 @@ def _assemble_repositories(outcomes: list[_CloneOutcome]) -> list[dict[str, Any]
                     "display": display,
                     "check": {"status": "off", "reason": "remote_checks_off"},
                 },
-                "default_branch": {"name": None, "live_sha": None},
+                "default_branch": {"name": None, "sha": None},
+                "pr_lookup": _pr_lookup_off(key, github_lookup, remote_checks),
                 "clones": [],
             }
             grouped[key] = group
@@ -1248,6 +1296,8 @@ class _LiveAnswer:
     name: str | None = None
     sha: str | None = None
     branches: Mapping[str, str] = field(default_factory=dict)
+    # Unix seconds taken just before the call started; set on a successful answer.
+    at: int = 0
 
 
 def _failure_reason(outcome: _Outcome) -> str:
@@ -1304,6 +1354,7 @@ def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
         and not context.ssh_configured
     ):
         overlay["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    at = int(time.time())
     outcome = runner.run(
         ["ls-remote", "--symref", "origin", "HEAD", "refs/heads/*"],
         path=context.cwd,
@@ -1313,24 +1364,224 @@ def _query_remote(runner: _GitRunner, context: _CloneContext) -> _LiveAnswer:
     if not outcome.ok:
         return _LiveAnswer(_failure_reason(outcome))
     answer = _parse_listing(outcome.out)
-    return answer if answer is not None else _LiveAnswer("failed")
+    return replace(answer, at=at) if answer is not None else _LiveAnswer("failed")
+
+
+# ---------------------------------------------------------------------------
+# The one GitHub request per repository
+# ---------------------------------------------------------------------------
+
+GITHUB_OUTPUT_CAP = 8 << 20
+_GITHUB_PROMPT_VARIABLES = {
+    "GH_PROMPT_DISABLED": "1",
+    "GH_NO_UPDATE_NOTIFIER": "1",
+    "GH_SPINNER_DISABLED": "1",
+    "NO_COLOR": "1",
+}
+_GITHUB_REMOVED_VARIABLES = frozenset({"GH_REPO", "GH_HOST"})
+_GITHUB_UNAUTHENTICATED_EXIT = 4
+_GITHUB_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+_GITHUB_NODE_FIELDS = "number state headRefOid baseRefName isCrossRepository"
+# The request asks for exactly as many pull requests as a branch may list.
+_GITHUB_ALIAS_ARGUMENTS = (
+    f"first: {PULL_REQUEST_LIST_CAP}, orderBy: {{field: CREATED_AT, direction: DESC}}"
+)
+_RATE_LIMIT_PHRASES = ("rate limit",)
+_GITHUB_AUTH_PHRASES = ("http 401", "bad credentials", "gh auth login")
+
+
+def _github_environment() -> dict[str, str]:
+    """The user's environment for ``gh``: its own configuration directory and
+    credentials stay, a repository or host override goes, and nothing may prompt."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if (key.upper() if _ON_WINDOWS else key) not in _GITHUB_REMOVED_VARIABLES
+    }
+    environment.update(_GITHUB_PROMPT_VARIABLES)
+    return environment
+
+
+def _github_request(owner: str, name: str, branches: Sequence[str]) -> bytes:
+    """The ``{query, variables}`` body for one repository.
+
+    The selection always holds the scalar ``__typename``, so a repository with no
+    local branch still sends a valid query, and one alias ``bN`` per branch name
+    in ``branches`` (GraphQL aliases cannot hold ``/`` or ``-``)."""
+    declarations = "".join(f", $h{index}: String!" for index in range(len(branches)))
+    aliases = "".join(
+        f" b{index}: pullRequests(headRefName: $h{index}, {_GITHUB_ALIAS_ARGUMENTS})"
+        f" {{ nodes {{ {_GITHUB_NODE_FIELDS} }} }}"
+        for index in range(len(branches))
+    )
+    query = (
+        f"query($owner: String!, $name: String!{declarations}) "
+        f"{{ repository(owner: $owner, name: $name) {{ __typename{aliases} }} }}"
+    )
+    variables: dict[str, str] = {"owner": owner, "name": name}
+    variables.update({f"h{index}": branch for index, branch in enumerate(branches)})
+    return json.dumps({"query": query, "variables": variables}).encode("ascii")
+
+
+def _valid_pull_request(node: Any) -> bool:
+    """Whether one answered node has every field in its expected form.
+
+    Each value is type-checked before it is compared, hashed or matched, so an
+    answer of any JSON shape is only invalid, never an error."""
+    if not isinstance(node, dict):
+        return False
+    number = node.get("number")
+    state = node.get("state")
+    head = node.get("headRefOid")
+    return (
+        type(number) is int
+        and number > 0
+        and type(state) is str
+        and state in _GITHUB_STATES
+        and type(head) is str
+        and _OBJECT_ID.fullmatch(head) is not None
+        and _safe_text(node.get("baseRefName"))
+        and type(node.get("isCrossRepository")) is bool
+    )
+
+
+@dataclass(frozen=True)
+class _PullRequest:
+    """One same-repository pull request GitHub listed for a head branch name."""
+
+    number: int
+    state: str
+    head: str
+    base: str
+
+
+def _pull_requests_of(nodes: Sequence[Any]) -> tuple[_PullRequest, ...]:
+    """The listed pull requests of one branch name, by number.
+
+    Only same-repository requests count; the first ``PULL_REQUEST_LIST_CAP`` in
+    answer order (newest first) are kept, a repeated number once."""
+    kept: dict[int, _PullRequest] = {}
+    for node in nodes:
+        if node["isCrossRepository"] or len(kept) >= PULL_REQUEST_LIST_CAP:
+            continue
+        kept.setdefault(
+            node["number"],
+            _PullRequest(
+                node["number"], node["state"].lower(), node["headRefOid"], node["baseRefName"]
+            ),
+        )
+    return tuple(sorted(kept.values(), key=lambda item: item.number))
+
+
+def _github_document(data: bytes) -> Any:
+    """Decode a ``gh`` answer; ``None`` when it is oversized or not JSON."""
+    if len(data) > GITHUB_OUTPUT_CAP:
+        return None
+    try:
+        return load_strict_json(data, "gh")
+    except (ProtocolError, ValueError):
+        # A number past the interpreter's digit limit raises ValueError, not a decode error.
+        return None
+
+
+def _github_failure(outcome: _Outcome, document: Any) -> str:
+    """Name a failed ``gh`` call by category; first match wins, in this order."""
+    if outcome.timed_out:
+        return "timed_out"
+    if outcome.code == _GITHUB_UNAUTHENTICATED_EXIT:
+        return "not_authenticated"
+    stderr = outcome.err.decode("utf-8", "replace").lower()
+    types: set[Any] = set()
+    repository: Any = {}
+    if isinstance(document, dict):
+        errors = document.get("errors")
+        if isinstance(errors, list):
+            types = {
+                item["type"]
+                for item in errors
+                if isinstance(item, dict) and isinstance(item.get("type"), str)
+            }
+        data = document.get("data")
+        if isinstance(data, dict) and "repository" in data:
+            repository = data["repository"]
+    if "RATE_LIMITED" in types or any(phrase in stderr for phrase in _RATE_LIMIT_PHRASES):
+        return "rate_limited"
+    if any(phrase in stderr for phrase in _GITHUB_AUTH_PHRASES):
+        return "not_authenticated"
+    if "NOT_FOUND" in types or repository is None:
+        return "not_found"
+    return "failed"
+
+
+def _github_answer(
+    outcome: _Outcome, branches: Sequence[str]
+) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]]]:
+    """The failure category of a ``gh`` call, or ``None`` and the pull requests of
+    each of ``branches`` when it answered validly for every alias."""
+    document = _github_document(outcome.out) if not outcome.timed_out else None
+    if outcome.code != 0:
+        return _github_failure(outcome, document), {}
+    data = document.get("data") if isinstance(document, dict) else None
+    if isinstance(data, dict) and data.get("repository", {}) is None:
+        return "not_found", {}
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict) or repository.get("__typename") != "Repository":
+        return "failed", {}
+    pulls: dict[str, tuple[_PullRequest, ...]] = {}
+    for index, branch in enumerate(branches):
+        alias = repository.get(f"b{index}")
+        nodes = alias.get("nodes") if isinstance(alias, dict) else None
+        if not isinstance(nodes, list) or not all(_valid_pull_request(node) for node in nodes):
+            return "failed", {}
+        pulls[branch] = _pull_requests_of(nodes)
+    return None, pulls
+
+
+def _query_github(
+    runner: _GitRunner, executable: str, key: str, branches: Sequence[str]
+) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]], int]:
+    """The group's one ``gh api graphql`` call: ``None`` and the pull requests of
+    each branch name when GitHub answered, else the failure category and nothing;
+    last, the Unix second taken just before the call started.
+    The request file lives in a directory removed on return."""
+    identity = github_identity(key)
+    assert identity is not None
+    host, owner, name = identity
+    with tempfile.TemporaryDirectory(prefix="nyx-gh-") as scratch:
+        request = os.path.join(scratch, "request.json")
+        with open(request, "wb") as handle:
+            handle.write(_github_request(owner, name, branches))
+        at = int(time.time())
+        outcome = runner.run_program(
+            [executable, "api", "graphql", "--hostname", host, "--input", request],
+            _github_environment(),
+        )
+    reason, listed = _github_answer(outcome, branches)
+    return reason, listed, at
 
 
 def _present_objects(
-    runner: _GitRunner, context: _CloneContext, wanted: Sequence[str]
+    runner: _GitRunner,
+    context: _CloneContext,
+    wanted: Sequence[str],
+    *,
+    overlay: Mapping[str, str | None] | None = None,
+    pinned: Sequence[str] = (),
 ) -> dict[str, str]:
     """Classify each wanted ID as ``present``, ``missing``, ``unknown`` or ``differs``.
 
     The IDs are arguments because the runner closes stdin; git prints the
     present ones, in no promised order, and exits 0 when some are missing.
+    ``pinned`` options and the ``overlay`` environment apply to every call.
     """
     result: dict[str, str] = {}
     for start in range(0, len(wanted), _PROBE_CHUNK):
         chunk = list(wanted[start : start + _PROBE_CHUNK])
         outcome = runner.run(
-            ["rev-list", "--no-walk", "--ignore-missing", *chunk],
+            [*pinned, "rev-list", "--no-walk", "--ignore-missing", *chunk],
             path=context.cwd,
             ceiling=context.ceiling,
+            overlay=overlay,
         )
         if outcome.timed_out or outcome.code is None:
             state = dict.fromkeys(chunk, "unknown")
@@ -1355,6 +1606,108 @@ def _lendable(context: _CloneContext) -> bool:
     )
 
 
+def _usable_clones(
+    clones: Sequence[dict[str, Any]], contexts: Mapping[str, _CloneContext]
+) -> list[tuple[dict[str, Any], _CloneContext]]:
+    """The clones that collected cleanly and have a context, with that context,
+    in the order given (the group's natural order)."""
+    return [
+        (clone, contexts[clone["path"]])
+        for clone in clones
+        if clone["status"] == "ok" and clone["path"] in contexts
+    ]
+
+
+def _siblings(
+    clone: dict[str, Any],
+    clones: Sequence[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+) -> list[tuple[dict[str, Any], _CloneContext]]:
+    """The other usable clones of ``clone``'s group, in natural order: the
+    candidates every lender search for that clone is given."""
+    return [
+        (other, context)
+        for other, context in _usable_clones(clones, contexts)
+        if other is not clone
+    ]
+
+
+class _LenderSearch:
+    """Find the first lendable sibling, in natural order, that holds an object.
+
+    Each sibling is asked once about every ID it is asked of, so a search for
+    several IDs shares its probes. A probe that cannot say stops the search with
+    its state (``unknown`` or ``differs``)."""
+
+    def __init__(
+        self,
+        runner: _GitRunner,
+        siblings: Sequence[tuple[dict[str, Any], _CloneContext]],
+        *,
+        overlay: Mapping[str, str | None] | None = None,
+        pinned: Sequence[str] = (),
+    ) -> None:
+        self._runner = runner
+        self._candidates = [(c, x) for c, x in siblings if _lendable(x)]
+        self._overlay = overlay
+        self._pinned = pinned
+        self._known: dict[int, dict[str, str]] = {}
+
+    def find(
+        self, right: str, lacking: Sequence[str]
+    ) -> tuple[dict[str, Any], _CloneContext] | str | None:
+        """The first lendable sibling holding ``right``, or the state of a probe
+        that could not say. ``lacking`` lists the IDs a sibling is asked about
+        when first visited and must name ``right``."""
+        for index, (sibling, sibling_context) in enumerate(self._candidates):
+            known = self._known.setdefault(index, {})
+            unasked = [item for item in lacking if item not in known]
+            if unasked:
+                known.update(
+                    _present_objects(
+                        self._runner,
+                        sibling_context,
+                        unasked,
+                        overlay=self._overlay,
+                        pinned=self._pinned,
+                    )
+                )
+            state = known.get(right, "missing")
+            if state == "present":
+                return sibling, sibling_context
+            if state != "missing":
+                return state
+        return None
+
+
+_REFLOG_TIME = re.compile(r"@\{([0-9]+)\}")
+
+
+def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
+    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``.
+
+    A ref that is missing, a reflog that is empty or switched off, a failed or cut
+    call and a time that does not read as Unix seconds all answer no.
+    """
+    outcome = runner.run(
+        [
+            "reflog",
+            "show",
+            "-n",
+            "1",
+            "--date=unix",
+            "--format=%gd",
+            f"refs/remotes/origin/{name}",
+        ],
+        path=context.cwd,
+        ceiling=context.ceiling,
+    )
+    if not outcome.ok or outcome.timed_out:
+        return False
+    match = _REFLOG_TIME.search(_decode(outcome.out).strip())
+    return match is not None and int(match.group(1)) >= at
+
+
 def _apply_live(
     runner: _GitRunner,
     context: _CloneContext,
@@ -1362,24 +1715,55 @@ def _apply_live(
     answer: _LiveAnswer,
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
     base_name: str | None = None,
+    basis: str = "live",
 ) -> _Base | None:
-    """Replace one clone's cached comparisons with the live ones, in place.
+    """Replace one clone's cached comparisons with the remote's, in place.
+
+    ``answer`` is a live ``ls-remote`` answer (``basis`` ``live``) or a saved one
+    (``recorded``); every comparison and the verdict base carry ``basis``.
+
+    Under a saved answer, a branch name whose own remote-tracking ref differs from
+    the saved value and moved at or after the saved check (for example by a push
+    from this clone) keeps the clone's own cached comparison, on the ``cached``
+    basis: the branch's comparison, the local default's comparison with the remote
+    and the verdict base. ``default_branch`` and ``cached_vs_remote`` always compare with
+    the saved head.
 
     Returns the clone's verdict base for ``base_name``, chosen from the same
     presence pass and lender as the comparisons.
     """
-    name, live_sha = answer.name, answer.sha
+    name, remote_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
     local_sha = context.local.get(name, (None, ""))[0] if name is not None else None
-    pairs = [(cached_sha, live_sha)]
-    if name is not None:
-        pairs.append((local_sha, live_sha))
-    for branch in clone["branches"]:
-        pairs.append((branch["sha"], answer.branches.get(branch["name"])))
-    guarded = context.partial or context.shallow
     base_head = answer.branches.get(base_name) if base_name is not None else None
     if base_head is None and base_name is not None and base_name == name:
-        base_head = live_sha
+        base_head = remote_sha
+    newer: set[str] = set()
+    if basis == "recorded":
+        asked = {branch["name"] for branch in clone["branches"]}
+        asked.update(item for item in (name, base_name) if item is not None)
+        for item in sorted(asked):
+            held_tip = context.cached.get(item)
+            saved_tip = answer.branches.get(item)
+            if saved_tip is None and item == name:
+                saved_tip = remote_sha
+            if (
+                held_tip is not None
+                and held_tip != saved_tip
+                and _ref_moved_since(runner, context, item, answer.at)
+            ):
+                newer.add(item)
+    if base_name in newer:
+        # The clone's own base stands: it is the cached fallback below.
+        base_head = None
+
+    pairs = [(cached_sha, remote_sha)]
+    if name is not None and name not in newer:
+        pairs.append((local_sha, remote_sha))
+    for branch in clone["branches"]:
+        if branch["name"] not in newer:
+            pairs.append((branch["sha"], answer.branches.get(branch["name"])))
+    guarded = context.partial or context.shallow
     held = set(context.cached.values()) | {sha for sha, _ in context.local.values()}
     probed = {right for left, right in pairs if left and right and left != right}
     if base_head is not None and base_head not in held:
@@ -1390,28 +1774,17 @@ def _apply_live(
     )
     memo: dict[tuple[str, str], dict[str, Any]] = {}
     lacking = [item for item in wanted if presence.get(item) == "missing"]
-    candidates = [(c, x) for c, x in siblings if _lendable(x)]
-    sibling_presence: dict[int, dict[str, str]] = {}
+    lenders = _LenderSearch(runner, siblings)
 
     def lender(right: str) -> tuple[dict[str, Any], _CloneContext] | str | None:
-        """The first lendable sibling in natural order holding ``right``, or the
-        state (``unknown`` or ``differs``) of a probe that could not say."""
-        for index, (sibling, sibling_context) in enumerate(candidates):
-            if index not in sibling_presence:
-                sibling_presence[index] = _present_objects(runner, sibling_context, lacking)
-            state = sibling_presence[index].get(right, "missing")
-            if state == "present":
-                return sibling, sibling_context
-            if state != "missing":
-                return state
-        return None
+        return lenders.find(right, lacking)
 
     def borrowed(left: str, right: str) -> dict[str, Any]:
         source = lender(right)
         if source is None:
-            return _comparison("differs", basis="live")
+            return _comparison("differs", basis=basis)
         if isinstance(source, str):
-            return _comparison(source, basis="live")
+            return _comparison(source, basis=basis)
         sibling, sibling_context = source
         result = _counted_comparison(
             runner.run(
@@ -1424,7 +1797,7 @@ def _apply_live(
                     )
                 },
             ),
-            "live",
+            basis,
         )
         if result["relation"] in ("ahead", "behind", "diverged"):
             result["objects_from"] = sibling["path"]
@@ -1432,14 +1805,14 @@ def _apply_live(
 
     def live(left: str | None, right: str | None) -> dict[str, Any]:
         if left is None or right is None:
-            return _comparison("absent", basis="live")
+            return _comparison("absent", basis=basis)
         if left == right:
-            return _comparison("equal", 0, 0, "live")
+            return _comparison("equal", 0, 0, basis)
         if guarded:
-            return _comparison("differs", basis="live")
+            return _comparison("differs", basis=basis)
         state = presence.get(right, "missing")
         if state in ("unknown", "differs"):
-            return _comparison("unknown" if state == "unknown" else "differs", basis="live")
+            return _comparison("unknown" if state == "unknown" else "differs", basis=basis)
         if (left, right) not in memo:
             if state == "present":
                 memo[(left, right)] = _counted_comparison(
@@ -1448,13 +1821,13 @@ def _apply_live(
                         path=context.cwd,
                         ceiling=context.ceiling,
                     ),
-                    "live",
+                    basis,
                 )
             else:
                 memo[(left, right)] = borrowed(left, right)
         return memo[(left, right)]
 
-    clone["cached_vs_live"] = live(cached_sha, live_sha)
+    clone["cached_vs_remote"] = live(cached_sha, remote_sha)
     if name is None:
         clone["local_default"] = None
     else:
@@ -1479,11 +1852,14 @@ def _apply_live(
         clone["local_default"] = {
             "name": name,
             "sha": local_sha,
-            "vs_live": live(local_sha, live_sha),
+            "vs_remote": (
+                vs_cached if name in newer else live(local_sha, remote_sha)
+            ),
             "vs_cached": vs_cached,
         }
     for branch in clone["branches"]:
-        branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
+        if branch["name"] not in newer:
+            branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
 
     if base_name is None:
         return None
@@ -1494,9 +1870,9 @@ def _apply_live(
     if base_head is None:
         return fallback
     if guarded:
-        return _Base(base_name, base_head, "live", None, None) if base_head == cached_base else fallback
+        return _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
     if base_head in held or presence.get(base_head) == "present":
-        return _Base(base_name, base_head, "live", None, None)
+        return _Base(base_name, base_head, basis, None, None)
     if presence.get(base_head) == "missing":
         source = lender(base_head)
         if isinstance(source, tuple):
@@ -1504,11 +1880,86 @@ def _apply_live(
             return _Base(
                 base_name,
                 base_head,
-                "live",
+                basis,
                 sibling["path"],
                 os.path.join(sibling_context.common, "objects"),
             )
     return fallback
+
+
+def _list_pull_requests(
+    group: dict[str, Any], listed: Mapping[str, Sequence[_PullRequest]]
+) -> None:
+    """Give every branch of the group's usable clones the pull requests listed for
+    its name; ``head_matches`` is whether the request's head is the branch's tip."""
+    for clone in group["clones"]:
+        if clone["status"] != "ok":
+            continue
+        for branch in clone["branches"]:
+            branch["pull_requests"] = [
+                {
+                    "number": pull.number,
+                    "state": pull.state,
+                    "head_matches": pull.head == branch["sha"],
+                }
+                for pull in listed.get(branch["name"], ())
+            ]
+
+
+def _heads_record(answer: _LiveAnswer) -> dict[str, Any]:
+    """The saved form of one successful ``ls-remote``: its whole answer."""
+    return {
+        "at": answer.at,
+        "default": answer.name,
+        "head": answer.sha,
+        "branches": dict(answer.branches),
+    }
+
+
+def _pull_requests_record(
+    at: int, listed: Mapping[str, Sequence[_PullRequest]]
+) -> dict[str, Any]:
+    """The saved form of one successful ``gh`` call: the pull requests of every
+    queried branch name, an empty list for a name with none."""
+    return {
+        "at": at,
+        "by_head": {
+            name: [
+                {"number": pull.number, "state": pull.state, "head": pull.head, "base": pull.base}
+                for pull in pulls
+            ]
+            for name, pulls in listed.items()
+            if _safe_text(name)
+        },
+    }
+
+
+def _pr_lookup_unavailable(reason: str) -> dict[str, Any]:
+    return {"status": "unavailable", "reason": reason, "checked_at": None}
+
+
+def _recorded_answer(heads: Mapping[str, Any]) -> _LiveAnswer:
+    """A saved ``heads`` record as the answer a live ``ls-remote`` gives; ``at`` is
+    the time the saved check was taken."""
+    return _LiveAnswer(
+        name=heads["default"],
+        sha=heads["head"],
+        branches=dict(heads["branches"]),
+        at=heads["at"],
+    )
+
+
+def _recorded_pull_requests(
+    saved: Mapping[str, Any],
+) -> dict[str, tuple[_PullRequest, ...]]:
+    """A saved ``pull_requests`` record as the listing a live ``gh`` call gives."""
+    return {
+        name: tuple(
+            _PullRequest(item["number"], item["state"], item["head"], item["base"])
+            for item in items
+        )
+        for name, items in saved["by_head"].items()
+    }
 
 
 def _check_remotes(
@@ -1516,53 +1967,134 @@ def _check_remotes(
     repositories: list[dict[str, Any]],
     contexts: Mapping[str, _CloneContext],
     max_parallel: int,
-) -> dict[str, _Base | None]:
-    """Phase 2 (one query per remote) then phase 3 (live comparisons per clone).
+    github_lookup: bool,
+    remote_checks: bool,
+    saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
+) -> tuple[
+    dict[str, _Base | None],
+    dict[str, dict[str, tuple[_PullRequest, ...]]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
+    """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
+    lookup is on; none when ``remote_checks`` is off) then phase 3 (per-clone
+    comparisons, on the live answer or, when the check is off or failed, on the
+    remote's saved ``heads``).
 
-    Returns the verdict base of each clone the live comparisons reached."""
+    Returns the verdict base of each clone the comparisons reached, the pull
+    requests per head branch name for each remote key whose lookup answered or
+    whose saved listing applies, and the records of this run's successful
+    checks: per remote key, ``heads`` and ``pull_requests`` for the calls that
+    answered. ``saved`` holds the cache file's records per remote key."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
-        first = next(
-            (
-                contexts[clone["path"]]
-                for clone in group["clones"]
-                if clone["status"] == "ok" and clone["path"] in contexts
-            ),
-            None,
-        )
-        chosen.append(first)
+        usable = _usable_clones(group["clones"], contexts)
+        chosen.append(usable[0][1] if usable else None)
 
     def query(context: _CloneContext | None) -> _LiveAnswer:
         # A group with no usable clone makes no call.
         return _query_remote(runner, context) if context is not None else _LiveAnswer("failed")
 
+    lookups: list[tuple[dict[str, Any], list[str]]] = []
+    if github_lookup and remote_checks:
+        for group, first in zip(groups, chosen):
+            if github_identity(group["remote"]["key"]) is None:
+                continue
+            if first is None:
+                group["pr_lookup"] = _pr_lookup_unavailable("failed")
+                continue
+            names = {
+                branch["name"]
+                for clone in group["clones"]
+                if clone["status"] == "ok"
+                for branch in clone["branches"]
+            }
+            lookups.append((group, sorted(names)))
+    # Resolved once, and only when a call will be made.
+    gh = _resolve_program("gh") if lookups else None
+    pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
+    checked: dict[str, dict[str, dict[str, Any]]] = {}
+    if lookups and gh is None:
+        for group, _ in lookups:
+            group["pr_lookup"] = _pr_lookup_unavailable("gh_missing")
+        lookups = []
+
+    def ask(
+        job: tuple[dict[str, Any], list[str]],
+    ) -> tuple[str | None, dict[str, tuple[_PullRequest, ...]], int]:
+        group, names = job
+        assert gh is not None
+        return _query_github(runner, gh, group["remote"]["key"], names)
+
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
-        answers = list(pool.map(query, chosen))
-        work: list[tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]]] = []
+        # Both kinds of call run in the one pool, and the barrier below waits for all.
+        pending = [pool.submit(ask, job) for job in lookups]
+        answers: list[_LiveAnswer | None] = (
+            list(pool.map(query, chosen)) if remote_checks else [None] * len(groups)
+        )
+        for (group, _), future in zip(lookups, pending):
+            reason, listed, asked_at = future.result()
+            if reason is None:
+                group["pr_lookup"] = {"status": "live", "reason": None, "checked_at": None}
+                pulls[group["remote"]["key"]] = listed
+                checked.setdefault(group["remote"]["key"], {})["pull_requests"] = (
+                    _pull_requests_record(asked_at, listed)
+                )
+                _list_pull_requests(group, listed)
+            else:
+                group["pr_lookup"] = _pr_lookup_unavailable(reason)
+        for group in groups:
+            # A lookup that made no call, or failed, falls back to the saved facts,
+            # unless the setting is off or the remote is not GitHub's.
+            lookup_state = group["pr_lookup"]
+            record = (saved.get(group["remote"]["key"]) or {}).get("pull_requests")
+            if (
+                github_lookup
+                and github_identity(group["remote"]["key"]) is not None
+                and lookup_state["status"] != "live"
+                and record is not None
+            ):
+                listed = _recorded_pull_requests(record)
+                group["pr_lookup"] = {
+                    "status": "recorded",
+                    "reason": lookup_state["reason"],
+                    "checked_at": _utc_text(record["at"]),
+                }
+                pulls[group["remote"]["key"]] = listed
+                _list_pull_requests(group, listed)
+        work: list[
+            tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str]
+        ] = []
         bases: dict[str, _Base | None] = {}
         for group, answer in zip(groups, answers):
-            if answer.reason is not None:
-                group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
-                continue
-            group["remote"]["check"] = {"status": "live", "reason": None}
-            group["default_branch"] = {"name": answer.name, "live_sha": answer.sha}
-            for clone in group["clones"]:
-                if clone["status"] == "ok" and clone["path"] in contexts:
-                    work.append((contexts[clone["path"]], clone, answer, group))
+            key = group["remote"]["key"]
+            if answer is not None and answer.reason is None:
+                basis = "live"
+                group["remote"]["check"] = {"status": "live", "reason": None}
+                checked.setdefault(key, {})["heads"] = _heads_record(answer)
+            else:
+                heads = (saved.get(key) or {}).get("heads")
+                if heads is None:
+                    if answer is not None:
+                        group["remote"]["check"] = {"status": "failed", "reason": answer.reason}
+                    continue
+                basis = "recorded"
+                group["remote"]["check"] = {
+                    "status": "recorded",
+                    "reason": "remote_checks_off" if answer is None else answer.reason,
+                    "checked_at": _utc_text(heads["at"]),
+                }
+                answer = _recorded_answer(heads)
+            group["default_branch"] = {"name": answer.name, "sha": answer.sha}
+            for clone, context in _usable_clones(group["clones"], contexts):
+                work.append((context, clone, answer, group, basis))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
         def apply(
-            item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any]],
+            item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str],
         ) -> tuple[str, _Base | None]:
-            context, clone, answer, group = item
-            siblings = [
-                (other, contexts[other["path"]])
-                for other in group["clones"]
-                if other is not clone
-                and other["status"] == "ok"
-                and other["path"] in contexts
-            ]
+            context, clone, answer, group, basis = item
+            siblings = _siblings(clone, group["clones"], contexts)
             cached_default = clone["cached_default"]
             base_name = (
                 answer.name
@@ -1570,11 +2102,11 @@ def _check_remotes(
                 or _group_default_name(group["clones"])
             )
             return clone["path"], _apply_live(
-                runner, context, clone, answer, siblings, base_name
+                runner, context, clone, answer, siblings, base_name, basis
             )
 
         bases.update(pool.map(apply, work))
-    return bases
+    return bases, pulls, checked
 
 
 # ---------------------------------------------------------------------------
@@ -1662,16 +2194,18 @@ def _verdict_settings(scratch: str, version: str | None) -> _VerdictSettings:
     )
 
 
-def _merged(rung: str) -> dict[str, Any]:
-    return {"state": "merged", "rung": rung, "reason": None}
+def _merged(rung: str, pull_request: int | None = None) -> dict[str, Any]:
+    return {"state": "merged", "rung": rung, "reason": None, "pull_request": pull_request}
 
 
 def _unknown(reason: str) -> dict[str, Any]:
-    return {"state": "unknown", "rung": None, "reason": reason}
+    return {"state": "unknown", "rung": None, "reason": reason, "pull_request": None}
 
 
-_NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None}
-# The rungs a cache entry may hold; ``ancestor`` and every ``unknown`` never.
+_NOT_MERGED = {"state": "not_merged", "rung": "none", "reason": None, "pull_request": None}
+# The rungs a cache entry may hold; ``ancestor``, ``pull_request`` and every
+# ``unknown`` never: a pull request's state is another service's answer, so no
+# verdict built on it is remembered.
 CACHE_RUNGS = frozenset({"patch_equivalent", "squash_equivalent", "tree_equal", "none"})
 
 
@@ -1716,6 +2250,21 @@ class _Tip:
             self.error = reason
 
 
+@dataclass(frozen=True)
+class _PullRung:
+    """What the pull-request rung of one clone knows.
+
+    ``requests`` are the repository's pull requests by head branch name;
+    ``holders`` name the clone's local branches at each commit, the only names a
+    commit is ever matched through; ``siblings`` are the other usable clones of
+    the repository, which may lend the objects of a head the clone lacks.
+    """
+
+    requests: Mapping[str, Sequence[_PullRequest]]
+    holders: Mapping[str, Sequence[str]]
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = ()
+
+
 class _Ladder:
     """Decide the merge verdict of tips against one clone's base, read-only."""
 
@@ -1726,12 +2275,14 @@ class _Ladder:
         base: _Base,
         settings: _VerdictSettings,
         cache: Mapping[str, tuple[str, int]] | None = None,
+        pulls: _PullRung | None = None,
     ) -> None:
         self._runner = runner
         self._context = context
         self._base = base
         self._settings = settings
         self._cache = cache or {}
+        self._pulls = pulls
         # Cache keys that stood in for a verdict, and entries decided by a
         # complete computation in this collection (key -> rung).
         self.used: set[str] = set()
@@ -1750,12 +2301,14 @@ class _Ladder:
     def _args(self, arguments: Sequence[str]) -> list[str]:
         return [*self._settings.pinned, *arguments]
 
-    def _git(self, arguments: Sequence[str]) -> _Outcome:
+    def _git(
+        self, arguments: Sequence[str], overlay: Mapping[str, str | None] | None = None
+    ) -> _Outcome:
         return self._runner.run(
             self._args(arguments),
             path=self._context.cwd,
             ceiling=self._context.ceiling,
-            overlay=self._overlay,
+            overlay=self._overlay if overlay is None else overlay,
         )
 
     def _stream(self, producer: Sequence[str], consumer: Sequence[str]) -> _Outcome:
@@ -1792,6 +2345,7 @@ class _Ladder:
         for sha in [sha for _, sha in branches] + list(detached):
             tips.setdefault(sha, _Tip(sha, order=len(tips)))
         self._ancestors(tips, branches, detached)
+        self._pull_requests(tips)
         incomplete = self._context.shallow or self._context.partial
         # A shallow or partial clone runs no rung beyond ``ancestor``, so its
         # lookup precedes the size checks.  Otherwise the rungs run first and a
@@ -1926,6 +2480,80 @@ class _Ladder:
                     tip.verdict = _merged("ancestor")
                 else:
                     is_ancestor(tip)
+
+    # -- pull-request rung ----------------------------------------------
+
+    def _pull_requests(self, tips: Mapping[str, _Tip]) -> None:
+        """Decide a tip no earlier rung settled from the merged pull requests whose
+        head branch is a local branch at its commit and whose base is the verdict base.
+
+        A request whose head is the tip decides first, the lowest number winning;
+        then, in number order, one whose head has the tip as an ancestor. A head
+        no clone holds, or one whose presence cannot be told, is skipped; a failed
+        or late ancestry call fails the tip as the ancestor rung does. Nothing
+        else decides, and nothing decided here is remembered."""
+        rung = self._pulls
+        if rung is None:
+            return
+        sources: dict[str, dict[str, str | None] | None] = {}
+        lenders = _LenderSearch(
+            self._runner,
+            rung.siblings,
+            overlay=self._settings.overlay,
+            pinned=self._settings.pinned,
+        )
+
+        def source(head: str) -> dict[str, str | None] | None:
+            """The overlay that lets this clone read ``head``, or ``None`` when no
+            clone holds it or the probes could not say."""
+            if head not in sources:
+                state = _present_objects(
+                    self._runner,
+                    self._context,
+                    [head],
+                    overlay=self._overlay,
+                    pinned=self._settings.pinned,
+                )[head]
+                found: dict[str, str | None] | None = None
+                if state == "present":
+                    found = dict(self._overlay)
+                elif state == "missing":
+                    lender = lenders.find(head, [head])
+                    if isinstance(lender, tuple):
+                        found = {
+                            **self._settings.overlay,
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.join(
+                                lender[1].common, "objects"
+                            ),
+                        }
+                sources[head] = found
+            return sources[head]
+
+        for tip in tips.values():
+            if tip.verdict is not None or tip.error is not None:
+                continue
+            merged: dict[int, _PullRequest] = {}
+            for name in rung.holders.get(tip.sha, ()):
+                for pull in rung.requests.get(name, ()):
+                    if pull.state == "merged" and pull.base == self._base.name:
+                        merged[pull.number] = pull
+            eligible = [merged[number] for number in sorted(merged)]
+            same = next((pull for pull in eligible if pull.head == tip.sha), None)
+            if same is not None:
+                tip.verdict = _merged("pull_request", same.number)
+                continue
+            for pull in eligible:
+                overlay = source(pull.head)
+                if overlay is None:
+                    continue
+                outcome = self._git(["merge-base", "--is-ancestor", tip.sha, pull.head], overlay)
+                if outcome.code == 0 and not outcome.timed_out:
+                    tip.verdict = _merged("pull_request", pull.number)
+                    break
+                if outcome.code == 1 and not outcome.timed_out:
+                    continue
+                tip.fail(_call_failure(outcome))
+                break
 
     # -- step 2 ---------------------------------------------------------
 
@@ -2315,10 +2943,13 @@ def _assign_clone_verdicts(
     base: _Base | None,
     settings: _VerdictSettings,
     cache: Mapping[str, tuple[str, int]],
+    requests: Mapping[str, Sequence[_PullRequest]] | None = None,
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
 ) -> _CloneVerdicts:
     """Write one clone's ``verdict_base``, every verdict and its containment.
 
-    Returns the cache keys the verdicts used or decided.
+    ``requests`` are the repository's pull requests by head branch name when its
+    lookup answered. Returns the cache keys the verdicts used or decided.
     """
     detached = [
         worktree
@@ -2335,7 +2966,15 @@ def _assign_clone_verdicts(
         return _CloneVerdicts()
     clone["verdict_base"] = base.document()
     subjects = [branch for branch in clone["branches"] if branch["name"] != base.name]
-    ladder = _Ladder(runner, context, base, settings, cache) if subjects or detached else None
+    pulls = None
+    if requests is not None:
+        holders: dict[str, list[str]] = {}
+        for branch in clone["branches"]:
+            holders.setdefault(branch["sha"], []).append(branch["name"])
+        pulls = _PullRung(requests, holders, siblings)
+    ladder = (
+        _Ladder(runner, context, base, settings, cache, pulls) if subjects or detached else None
+    )
     result = _CloneVerdicts()
     if ladder is not None:
         decided = ladder.decide(
@@ -2380,6 +3019,15 @@ def _assign_removable(repositories: list[dict[str, Any]]) -> None:
             clone["removable_count"] = derived["removable_count"]
 
 
+_VerdictJob = tuple[
+    dict[str, Any],
+    _CloneContext,
+    _Base | None,
+    Mapping[str, Sequence[_PullRequest]] | None,
+    list[tuple[dict[str, Any], _CloneContext]],
+]
+
+
 def _assign_verdicts(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
@@ -2388,6 +3036,7 @@ def _assign_verdicts(
     settings: _VerdictSettings,
     max_parallel: int,
     cache: Mapping[str, tuple[str, int]],
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]] | None = None,
 ) -> dict[str, _CloneVerdicts]:
     """Give every usable clone its verdict base and verdicts, one clone per task.
 
@@ -2396,48 +3045,181 @@ def _assign_verdicts(
     Returns each clone's cache keys for the caller's cache write.  ``cache`` is
     only read here; the caller writes it afterwards.
     """
-    jobs: list[tuple[dict[str, Any], _CloneContext, _Base | None]] = []
+    jobs: list[_VerdictJob] = []
     for repository in repositories:
         agreed = (
             _group_default_name(repository["clones"])
             if repository["remote"] is not None
             else None
         )
-        for clone in repository["clones"]:
-            context = contexts.get(clone["path"])
-            if clone["status"] != "ok" or context is None:
-                continue
+        for clone, context in _usable_clones(repository["clones"], contexts):
             if clone["path"] in bases:
                 base = bases[clone["path"]]
             else:
                 cached_default = clone["cached_default"]
                 name = (cached_default["name"] if cached_default is not None else None) or agreed
                 base = _cached_base(context, name)
-            jobs.append((clone, context, base))
+            requests = (
+                (pulls or {}).get(repository["remote"]["key"])
+                if repository["remote"] is not None
+                else None
+            )
+            siblings = _siblings(clone, repository["clones"], contexts)
+            jobs.append((clone, context, base, requests, siblings))
 
-    def decide(job: tuple[dict[str, Any], _CloneContext, _Base | None]) -> tuple[str, _CloneVerdicts]:
-        clone, context, base = job
-        return clone["path"], _assign_clone_verdicts(runner, clone, context, base, settings, cache)
+    def decide(job: _VerdictJob) -> tuple[str, _CloneVerdicts]:
+        clone, context, base, requests, siblings = job
+        return clone["path"], _assign_clone_verdicts(
+            runner, clone, context, base, settings, cache, requests, siblings
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         return dict(pool.map(decide, jobs))
 
 
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
-_CACHE_KEYS = frozenset({"schema_version", "verdicts"})
-# Version 1 stored patch rungs decided by a patch identity that ignored
-# whitespace and line numbers; its entries are never served.
-_CACHE_SCHEMA = 2
-_RETIRED_CACHE_SCHEMA = 1
+_CACHE_KEYS = frozenset({"schema_version", "verdicts", "remote_checks"})
+_CACHE_SCHEMA = 3
+# Earlier files held only verdicts. Version 1 stored patch rungs decided by a
+# patch identity that ignored whitespace and line numbers, and version 2 had no
+# saved remote checks. They are recognised by their own key set, read as empty
+# and replaced by the next write.
+_RETIRED_CACHE_KEYS = frozenset({"schema_version", "verdicts"})
+_RETIRED_CACHE_SCHEMAS = (1, 2)
 _CACHE_ENTRY_KEYS = frozenset({"rung", "at"})
+# The serialized ``remote_checks`` value is held to this many bytes, so the file
+# (at most ``CACHE_ENTRY_CAP`` verdicts of about 177 bytes, and this) stays far
+# below the reader's own bound.
+REMOTE_CHECKS_BUDGET = 2 * 1024 * 1024
+_REMOTE_MEMBERS = ("heads", "pull_requests")
+_REMOTE_KEYS = frozenset(_REMOTE_MEMBERS)
+_HEADS_KEYS = frozenset({"at", "default", "head", "branches"})
+_SAVED_PULL_REQUESTS_KEYS = frozenset({"at", "by_head"})
+_SAVED_PULL_REQUEST_KEYS = frozenset({"number", "state", "head", "base"})
+_SAVED_PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
+# A saved remote check dated later than now plus this many seconds was written
+# by a clock that ran ahead and is not believed. It must exceed the skew between
+# concurrent collections, whose records legitimately differ by seconds, and stay
+# far below the hour a mis-set clock or time zone typically leaves.
+SAVED_CHECK_FUTURE_TOLERANCE_SECONDS = 300
 
 
-def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
+@dataclass(frozen=True)
+class _SavedCache:
+    """What the cache file holds: verdicts by key, and per remote key its saved
+    ``heads`` and ``pull_requests`` (each a record or ``None``)."""
+
+    verdicts: Mapping[str, tuple[str, int]] = field(default_factory=dict)
+    remote_checks: Mapping[str, Mapping[str, dict[str, Any] | None]] = field(
+        default_factory=dict
+    )
+
+
+def _saved_time(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise ProtocolError("checkout cache time is invalid")
+    return value
+
+
+def _saved_object_id(value: Any) -> str:
+    if type(value) is not str or _OBJECT_ID.fullmatch(value) is None:
+        raise ProtocolError("checkout cache object ID is invalid")
+    return value
+
+
+def _saved_text(value: Any) -> str:
+    if not _safe_text(value):
+        raise ProtocolError("checkout cache text is invalid")
+    return value
+
+
+def _parse_heads(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    record = _object(value, "checkout cache heads")
+    _keys(record, _HEADS_KEYS, "checkout cache heads")
+    default, head = record["default"], record["head"]
+    branches = _object(record["branches"], "checkout cache branches")
+    return {
+        "at": _saved_time(record["at"]),
+        "default": None if default is None else _saved_text(default),
+        "head": None if head is None else _saved_object_id(head),
+        "branches": {_saved_text(name): _saved_object_id(sha) for name, sha in branches.items()},
+    }
+
+
+def _parse_saved_pull_request(value: Any) -> dict[str, Any]:
+    record = _object(value, "checkout cache pull request")
+    _keys(record, _SAVED_PULL_REQUEST_KEYS, "checkout cache pull request")
+    number, state = record["number"], record["state"]
+    if type(number) is not int or number < 1:
+        raise ProtocolError("checkout cache pull request number is invalid")
+    if type(state) is not str or state not in _SAVED_PULL_REQUEST_STATES:
+        raise ProtocolError("checkout cache pull request state is invalid")
+    return {
+        "number": number,
+        "state": state,
+        "head": _saved_object_id(record["head"]),
+        "base": _saved_text(record["base"]),
+    }
+
+
+def _parse_saved_pull_requests(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    record = _object(value, "checkout cache pull requests")
+    _keys(record, _SAVED_PULL_REQUESTS_KEYS, "checkout cache pull requests")
+    by_head: dict[str, list[dict[str, Any]]] = {}
+    for name, raw in _object(record["by_head"], "checkout cache by_head").items():
+        if type(raw) is not list or len(raw) > PULL_REQUEST_LIST_CAP:
+            raise ProtocolError("checkout cache pull request list is invalid")
+        by_head[_saved_text(name)] = [_parse_saved_pull_request(item) for item in raw]
+    return {"at": _saved_time(record["at"]), "by_head": by_head}
+
+
+def _credible(record: dict[str, Any] | None, now: int) -> dict[str, Any] | None:
+    """``record`` unless its ``at`` lies beyond ``now`` plus the tolerance.
+
+    Such a record would outrank every later check and could not always be shown
+    as a UTC time, so it counts as missing. ``now`` plus the tolerance is a time
+    the document can show, which bounds every kept ``at``."""
+    if record is None or record["at"] > now + SAVED_CHECK_FUTURE_TOLERANCE_SECONDS:
+        return None
+    return record
+
+
+def _parse_remote_checks(value: Any) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """The saved remote checks, each member kept only when :func:`_credible`; a
+    remote left with no member is omitted. A malformed file is still rejected."""
+    section = _object(value, "checkout cache remote checks")
+    now = int(time.time())
+    checks: dict[str, dict[str, dict[str, Any] | None]] = {}
+    for key, raw in section.items():
+        record = _object(raw, "checkout cache remote")
+        _keys(record, _REMOTE_KEYS, "checkout cache remote")
+        heads = _parse_heads(record["heads"])
+        pull_requests = _parse_saved_pull_requests(record["pull_requests"])
+        if heads is None and pull_requests is None:
+            raise ProtocolError("checkout cache remote has no record")
+        name = _saved_text(key)
+        heads, pull_requests = _credible(heads, now), _credible(pull_requests, now)
+        if heads is not None or pull_requests is not None:
+            checks[name] = {"heads": heads, "pull_requests": pull_requests}
+    return checks
+
+
+def _parse_cache(data: bytes) -> _SavedCache:
     """Validate the cache file strictly; any deviation raises ``ProtocolError``."""
     document = _object(load_strict_json(data, "checkout cache"), "checkout cache")
+    version = document.get("schema_version")
+    if (
+        set(document) == _RETIRED_CACHE_KEYS
+        and type(version) is int
+        and version in _RETIRED_CACHE_SCHEMAS
+    ):
+        return _SavedCache()
     _keys(document, _CACHE_KEYS, "checkout cache")
-    version = document["schema_version"]
-    if type(version) is not int or version not in (_RETIRED_CACHE_SCHEMA, _CACHE_SCHEMA):
+    if type(version) is not int or version != _CACHE_SCHEMA:
         raise ProtocolError("checkout cache schema_version is unsupported")
     verdicts = _object(document["verdicts"], "checkout cache verdicts")
     if len(verdicts) > CACHE_ENTRY_CAP:
@@ -2448,70 +3230,124 @@ def _parse_cache(data: bytes) -> dict[str, tuple[str, int]]:
             raise ProtocolError("checkout cache key is invalid")
         entry = _object(raw, "checkout cache entry")
         _keys(entry, _CACHE_ENTRY_KEYS, "checkout cache entry")
-        rung, at = entry["rung"], entry["at"]
+        rung = entry["rung"]
         if type(rung) is not str or rung not in CACHE_RUNGS:
             raise ProtocolError("checkout cache rung is invalid")
-        if type(at) is not int or at < 0:
-            raise ProtocolError("checkout cache time is invalid")
-        entries[key] = (rung, at)
-    # A retired file is well formed but holds nothing to trust; the next write
-    # replaces it.
-    return entries if version == _CACHE_SCHEMA else {}
+        entries[key] = (rung, _saved_time(entry["at"]))
+    return _SavedCache(entries, _parse_remote_checks(document["remote_checks"]))
 
 
-def _cache_bytes(entries: Mapping[str, tuple[str, int]]) -> bytes:
+def _dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _within_budget(
+    records: Mapping[str, Mapping[str, dict[str, Any] | None]],
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """The members that fit ``REMOTE_CHECKS_BUDGET``, newest ``at`` first (ties by
+    remote key, then ``heads`` before ``pull_requests``).
+
+    Each member is added only if the serialized section still fits; one that does
+    not is left out and later, older members are still tried. A remote with no
+    member kept is omitted."""
+    members = sorted(
+        (
+            (record["at"], key, order, name)
+            for key, remote in records.items()
+            for order, name in enumerate(_REMOTE_MEMBERS)
+            if (record := remote[name]) is not None
+        ),
+        key=lambda item: (-item[0], item[1], item[2]),
+    )
+    empty = len(_dump(dict.fromkeys(_REMOTE_MEMBERS)))
+    kept: dict[str, dict[str, dict[str, Any] | None]] = {}
+    total = len("{}")
+    for _, key, _, name in members:
+        member = records[key][name]
+        growth = len(_dump(member)) - len("null")
+        if key not in kept:
+            growth += len(_dump(key)) + len(":") + empty + (len(",") if kept else 0)
+        if total + growth > REMOTE_CHECKS_BUDGET:
+            continue
+        total += growth
+        kept.setdefault(key, dict.fromkeys(_REMOTE_MEMBERS))[name] = member
+    return kept
+
+
+def _merge_remote_checks(
+    saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
+    fresh: Mapping[str, Mapping[str, dict[str, Any]]],
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    """Per remote and per member, the record with the newer ``at``; a tie goes to
+    the run's own."""
+    merged = {key: dict(remote) for key, remote in saved.items()}
+    for key, members in fresh.items():
+        remote = merged.setdefault(key, dict.fromkeys(_REMOTE_MEMBERS))
+        for name, record in members.items():
+            current = remote[name]
+            if current is None or record["at"] >= current["at"]:
+                remote[name] = record
+    return merged
+
+
+def _cache_bytes(
+    entries: Mapping[str, tuple[str, int]],
+    remote_checks: Mapping[str, Mapping[str, dict[str, Any] | None]],
+) -> bytes:
     document = {
         "schema_version": _CACHE_SCHEMA,
         "verdicts": {key: {"rung": rung, "at": at} for key, (rung, at) in entries.items()},
+        "remote_checks": remote_checks,
     }
-    return (
-        json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    return (_dump(document) + "\n").encode("utf-8")
 
 
-def _load_cache(path: str, diagnostics: list[dict[str, Any]]) -> dict[str, tuple[str, int]]:
+def _load_cache(path: str, diagnostics: list[dict[str, Any]]) -> _SavedCache:
     """Read the cache once; a missing ``~/.nyx`` or file is empty, a bad file is a diagnostic."""
     try:
         data = read_checkout_cache()
-        return {} if data is None else _parse_cache(data)
+        return _SavedCache() if data is None else _parse_cache(data)
     except (StateError, ProtocolError, OSError):
         diagnostics.append({"code": "checkout_cache_unreadable", "path": path})
-        return {}
+        return _SavedCache()
 
 
 def _store_cache(
     path: str,
     results: Iterable[_CloneVerdicts],
-    loaded: Mapping[str, tuple[str, int]],
+    loaded: _SavedCache,
+    checked: Mapping[str, Mapping[str, dict[str, Any]]],
     deadline_ns: int,
     diagnostics: list[dict[str, Any]],
 ) -> None:
-    """Merge this collection's new verdicts into the file with one atomic write.
+    """Merge this collection's new verdicts and successful remote checks into the
+    file with one atomic write.
 
-    Nothing decided by this run, nothing written; a verdict the run decided
-    again gets a fresh time so the oldest saved answers are re-checked first
-    next time. The file is read again so entries another
-    process stored meanwhile survive; a lost race only loses entries, which are
-    recomputed.
+    A run that decided no new verdict and made no successful check writes
+    nothing; a verdict the run decided again gets a fresh time so the oldest
+    saved answers are re-checked first next time. The file is read again so
+    entries another process stored meanwhile survive, and of each remote's saved
+    ``heads`` and ``pull_requests`` the newer ``at`` wins; a lost race only loses
+    entries, which are recomputed.
     """
     fresh: dict[str, str] = {}
     used: set[str] = set()
     for result in results:
         fresh.update(result.fresh)
         used |= result.used
-    if not fresh:
+    if not fresh and not checked:
         return
     try:
         try:
             existing = read_checkout_cache()
-            current = {} if existing is None else _parse_cache(existing)
+            current = _SavedCache() if existing is None else _parse_cache(existing)
         except (StateError, ProtocolError, OSError):
-            existing, current = None, {}
+            existing, current = None, _SavedCache()
         now = int(time.time())
-        merged = dict(current)
+        merged = dict(current.verdicts)
         for key in used:
-            if key not in merged and key in loaded:
-                merged[key] = loaded[key]
+            if key not in merged and key in loaded.verdicts:
+                merged[key] = loaded.verdicts[key]
         # A verdict this run decided is verified now, so its entry rotates to
         # the back of the next collection's re-check order.
         for key, rung in fresh.items():
@@ -2520,7 +3356,8 @@ def _store_cache(
             merged.items(),
             key=lambda item: (item[0] not in used and item[0] not in fresh, -item[1][1], item[0]),
         )[:CACHE_ENTRY_CAP]
-        payload = _cache_bytes(dict(kept))
+        records = _within_budget(_merge_remote_checks(current.remote_checks, checked))
+        payload = _cache_bytes(dict(kept), records)
         if payload != existing:
             write_checkout_cache(payload, deadline_ns=deadline_ns)
     except (StateError, ValueError, OSError):
@@ -2541,13 +3378,19 @@ def collect_checkouts(
     call_cap_seconds: float = CALL_CAP_SECONDS,
     max_parallel: int = MAX_PARALLEL_CLONES,
     remote_checks: bool = False,
+    github_lookup: bool = False,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
     ``deadline_ns`` is a ``time.monotonic_ns`` instant; calls that cannot start
     or finish by then mark their item ``timed_out`` and the document is still
     produced. ``remote_checks`` adds one ``ls-remote`` per distinct remote and
-    the live comparisons built on it; left off, nothing contacts a remote.
+    the live comparisons built on it; left off, nothing contacts a remote. A
+    remote whose check is off or fails is answered from its last successful
+    check saved in the cache file, labelled ``recorded``, when there is one.
+    ``github_lookup`` adds one ``gh`` call per GitHub repository, and only while
+    ``remote_checks`` is on; a saved pull-request listing answers for a call that
+    is not made or fails.
     """
     observed_at = _utc_text(int(time.time()))
     discovery = _discover(os.fspath(folder) for folder in folders)
@@ -2555,7 +3398,7 @@ def collect_checkouts(
     repositories: list[dict[str, Any]] = []
     diagnostics = list(discovery.diagnostics)
 
-    executable = _resolve_git()
+    executable = _resolve_program("git")
     runner: _GitRunner | None = None
     if executable is not None:
         runner = _GitRunner(executable, deadline_ns, call_cap_seconds)
@@ -2590,25 +3433,35 @@ def collect_checkouts(
             )
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
-        repositories = _assemble_repositories(outcomes)
+        repositories = _assemble_repositories(
+            outcomes, github_lookup=github_lookup, remote_checks=remote_checks
+        )
         contexts = {
             outcome.clone["path"]: outcome.context
             for outcome in outcomes
             if outcome.clone is not None and outcome.context is not None
         }
-        bases: dict[str, _Base | None] = {}
-        if remote_checks:
-            bases = _check_remotes(runner, repositories, contexts, max_parallel)
         # An account home that cannot be resolved, or a path the document
         # cannot carry, makes the cache unavailable: no read, no write and no
-        # diagnostic, since there is no path to report.
+        # diagnostic, since there is no path to report. The file is read before
+        # the remote phase because its saved checks stand in for a check that is
+        # off or fails.
         try:
             cache_path: str | None = str(checkout_cache_path())
         except (StateError, OSError):
             cache_path = None
         if cache_path is not None and not _representable(cache_path):
             cache_path = None
-        cache = _load_cache(cache_path, diagnostics) if cache_path is not None else {}
+        cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
+        bases, pulls, checked = _check_remotes(
+            runner,
+            repositories,
+            contexts,
+            max_parallel,
+            github_lookup,
+            remote_checks,
+            cache.remote_checks,
+        )
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
@@ -2619,11 +3472,12 @@ def collect_checkouts(
                 bases,
                 _verdict_settings(scratch, git_state["version"]),
                 max_parallel,
-                cache,
+                cache.verdicts,
+                pulls,
             )
         _assign_removable(repositories)
         if cache_path is not None:
-            _store_cache(cache_path, verdicts.values(), cache, deadline_ns, diagnostics)
+            _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
@@ -2634,6 +3488,7 @@ def collect_checkouts(
         "observed_at": observed_at,
         "git": git_state,
         "remote_checks": "on" if remote_checks else "off",
+        "github_lookup": "on" if github_lookup else "off",
         "folders": sorted(discovery.folders, key=folder_sort_key),
         "repositories": repositories,
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),

@@ -123,18 +123,25 @@ def _comparison_text(comparison: dict[str, Any] | None) -> str:
     return "unknown" if comparison is None else comparison["relation"]
 
 
+def _time_suffix(item: dict[str, Any]) -> str:
+    return f" {item['checked_at']}"
+
+
 def _remote_and_default_elements(
     clone: dict[str, Any], remote: dict[str, Any]
 ) -> list[str]:
     check = remote["check"]
-    live = check["status"] == "live"
-    if live:
+    status = check["status"]
+    if status == "live":
         elements = ["remote live"]
-    elif check["status"] == "off":
+    elif status == "off":
         elements = ["remote off"]
+    elif status == "recorded":
+        elements = [f"remote recorded {check['reason']}{_time_suffix(check)}"]
     else:
         elements = [f"remote failed {check['reason']}"]
-    basis = "live" if live else "cached"
+    # Live and recorded checks answer; any other check leaves the cached refs.
+    basis = status if status in ("live", "recorded") else "cached"
     relations = [
         (branch["vs_remote"] or {}).get("relation") for branch in clone["branches"]
     ]
@@ -145,21 +152,32 @@ def _remote_and_default_elements(
     elements.append(branches)
     local_default = clone["local_default"]
     if local_default is None:
-        elements.append("no live default" if live else "no cached default")
+        elements.append(f"no {basis} default")
         return elements
     cached = clone["cached_default"]
     fetched = None if cached is None else cached["last_fetched_at"]
     fetched_text = "never fetched" if fetched is None else f"fetched {fetched}"
     vs_cached = _comparison_text(local_default["vs_cached"])
-    if live:
+    vs_remote = local_default["vs_remote"]
+    if vs_remote is not None:
+        # Each comparison names the basis it was made on.
+        tracking = clone["cached_vs_remote"]
         elements.append(
-            f"default {local_default['name']} live "
-            f"{_comparison_text(local_default['vs_live'])} cached {vs_cached} "
-            f"tracking live {_comparison_text(clone['cached_vs_live'])} {fetched_text}"
+            f"default {local_default['name']} {vs_remote['basis']} "
+            f"{_comparison_text(vs_remote)} cached {vs_cached} "
+            f"tracking {tracking['basis']} {_comparison_text(tracking)} {fetched_text}"
         )
     else:
         elements.append(f"default {local_default['name']} cached {vs_cached} {fetched_text}")
     return elements
+
+
+def _pr_element(lookup: dict[str, Any]) -> str:
+    if lookup["status"] == "live":
+        return "pr live"
+    if lookup["status"] == "recorded":
+        return f"pr recorded {lookup['reason']}{_time_suffix(lookup)}"
+    return f"pr {lookup['status']} {lookup['reason']}"
 
 
 def format_checkouts(document: dict[str, Any]) -> list[str]:
@@ -194,6 +212,7 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
                 elements.append("no origin remote")
             else:
                 elements.extend(_remote_and_default_elements(clone, remote))
+                elements.append(_pr_element(repository["pr_lookup"]))
             counts = clone["removable_count"]
             elements.append(
                 f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
@@ -236,13 +255,21 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
         if configuration.status == "configured"
         else ()
     )
+    github_lookup = (
+        configuration.configuration.checkout_github_lookup
+        if configuration.status == "configured"
+        else False
+    )
     if not folders:
         print("no checkout folders are configured")
         return 0
     deadline = time.monotonic_ns() + _CHECKOUTS_DEADLINE_SECONDS * 1_000_000_000
     try:
         rendered = checkouts.collect_checkouts(
-            folders, deadline_ns=deadline, remote_checks=not no_network
+            folders,
+            deadline_ns=deadline,
+            remote_checks=not no_network,
+            github_lookup=github_lookup,
         )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)

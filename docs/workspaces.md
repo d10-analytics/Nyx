@@ -291,6 +291,14 @@ folders uses schema 4:
   value, copied exactly. On Linux `nyx --status` prints the same path after
   `Workspace:`; desktop hosts refuse `--status`, so copy the value from the
   record itself.
+- `github_lookup` is the workspace's switch for the optional GitHub
+  pull-request lookup of `nyx checkouts`. Write `false` (no request is made) or
+  `true`, without quotes; both keys of an entry are required. With `true`, a
+  networked run asks GitHub about the pull requests of each GitHub repository
+  among the checkouts, through an authenticated `gh` on `PATH`; see
+  [Inspect checkouts](running-nyx.md#inspect-checkouts). The settings editor that
+  arrives with the Checkouts view will set it; until then it is edited by hand
+  like the folders.
 - Each entry in `folders` must be an absolute path, and the list must be sorted
   by character code, with no duplicates and at least one entry. Write each path
   already normalized in the host's own separators, with no trailing separator

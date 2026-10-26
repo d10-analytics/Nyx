@@ -41,7 +41,7 @@ def _subprocess_environment(home: Path) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"PYTHONPATH", "PYTHONHOME"}
+        if key not in {"PYTHONPATH", "PYTHONHOME", *GITHUB_SCRUBBED}
     }
     environment["HOME"] = str(home)
     environment["USERPROFILE"] = str(home)
@@ -631,6 +631,8 @@ def test_status_reports_unavailable_without_traceback_for_unparseable_record(kin
 
 import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
+    GITHUB_SCRUBBED,
+    GITHUB_URL,
     GLOBAL_CONFIG,
     add_packed_refs,
     allow_filters,
@@ -638,7 +640,14 @@ from test_checkouts import (  # noqa: E402
     closed_port,
     commit_file,
     git,
+    github_answer,
+    install_fake_gh,
+    local_names,
     make_remote,
+    move_away,
+    point_origin_at,
+    posix_only,
+    pr_answer,
     real,
     trust_only,
     web_clone,
@@ -666,6 +675,10 @@ def account(tmp_path, monkeypatch):
     for name in list(os.environ):
         if name.startswith("GIT_") and name != "GIT_CONFIG_NOSYSTEM":
             monkeypatch.delenv(name)
+    # No test may reach the network through the user's GitHub credentials; a test
+    # that needs one of these variables sets it in its own body.
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.delenv(name, raising=False)
     return home
 
 
@@ -679,13 +692,16 @@ def _write_record(tmp_path: Path, payload: dict | bytes) -> Path:
     return paths.config_file
 
 
-def _configure(tmp_path: Path, folders: list[Path | str]) -> Path:
+def _configure(tmp_path: Path, folders: list[Path | str], github_lookup: bool = False) -> Path:
     """Write a schema 4 record for a workspace whose settings name ``folders``."""
 
     specification = tmp_path / "spec"
     specification.mkdir(exist_ok=True)
     key = str(specification.resolve())
-    entry = {"folders": sorted(str(folder) for folder in folders), "github_lookup": False}
+    entry = {
+        "folders": sorted(str(folder) for folder in folders),
+        "github_lookup": github_lookup,
+    }
     return _write_record(
         tmp_path,
         {
@@ -742,6 +758,7 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     before = record.read_bytes()
     listing = _file_listing(account / ".nyx")
     runtime_before = state.observe_runtime()
+    started = int(time.time())
 
     completed = subprocess.run(
         [sys.executable, "-m", "nyx.cli", "checkouts", "--json"],
@@ -752,15 +769,18 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
         timeout=120,
         check=False,
     )
+    finished = int(time.time())
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
     [item] = [c for r in document["repositories"] for c in r["clones"]]
+    [remote_key] = [r["remote"]["key"] for r in document["repositories"]]
     assert item["path"] == real(repository)
     assert document["diagnostics"] == []
     [picked] = [b for b in item["branches"] if b["name"] == "picked"]
     assert picked["verdict"] == {
         "state": "merged", "rung": "patch_equivalent", "reason": None,
+        "pull_request": None,
     }
     assert picked["removable"] == {"removable": True, "blockers": []}
     assert item["removable_count"] == {"branches": 1, "worktrees": 0}
@@ -769,14 +789,55 @@ def test_module_launch_prints_a_valid_document_and_adds_only_the_cache_file(
     assert sorted(set(after) - set(listing)) == ["cache", "cache/checkouts.json"]
     assert set(listing) <= set(after)
     stored = json.loads((account / ".nyx" / "cache" / "checkouts.json").read_text())
-    assert set(stored) == {"schema_version", "verdicts"}
-    assert stored["schema_version"] == 2
+    assert set(stored) == {"schema_version", "verdicts", "remote_checks"}
+    assert stored["schema_version"] == 3
+    # The run's one remote check is saved under the group's key; a file remote
+    # has no pull-request record.
+    assert set(stored["remote_checks"]) == {remote_key}
+    saved = stored["remote_checks"][remote_key]
+    assert saved["pull_requests"] is None
+    assert set(saved["heads"]) == {"at", "default", "head", "branches"}
+    assert started <= saved["heads"]["at"] <= finished
+    assert saved["heads"]["default"] == "trunk"
+    assert saved["heads"]["head"] == base
+    assert saved["heads"]["branches"] == {"trunk": base}
     assert {key: entry["rung"] for key, entry in stored["verdicts"].items()} == {
         f"{tip}.{base}": "patch_equivalent"
     }
     assert not any(name.endswith(("instance.json", ".lock")) for name in after)
     assert "runtime" not in {name.split("/")[0] for name in set(after) - set(listing)}
     assert state.observe_runtime() == runtime_before
+
+
+@pytest.mark.parametrize("at", [253402300800, 10**30])
+def test_offline_checkouts_ignores_a_saved_check_dated_beyond_reach(
+    tmp_path, account, capsys, at
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "listed")
+    _configure(tmp_path, [folder])
+    code, out, err = _run_checkouts(capsys, "--json")
+    assert (code, err) == (0, "")
+    [group] = models.parse_checkouts(out)["repositories"]
+    assert group["remote"]["check"]["status"] == "live"
+    cache = account / ".nyx" / "cache" / "checkouts.json"
+    stored = json.loads(cache.read_text())
+    [key] = stored["remote_checks"]
+    stored["remote_checks"][key]["heads"]["at"] = at
+    cache.write_text(json.dumps(stored))
+
+    code, out, err = _run_checkouts(capsys, "--json", "--no-network")
+
+    assert (code, err) == (0, "")
+    document = models.parse_checkouts(out)
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert [c["path"] for c in group["clones"]] == [real(repository)]
+    code, out, err = _run_checkouts(capsys, "--no-network")
+    assert (code, err) == (0, "")
+    assert "recorded" not in out
 
 
 def test_module_launch_with_an_empty_home_exits_zero_and_creates_no_state(tmp_path):
@@ -992,8 +1053,9 @@ def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account
     assert elements[2] == "remote off"
     assert elements[3] == "branches cached local-only 1"
     assert elements[4] == "default trunk cached ahead never fetched"
-    assert elements[5] == "removable 0 branches, 0 worktrees"
-    assert len(elements) == 6
+    assert elements[5] == "pr off setting_off"
+    assert elements[6] == "removable 0 branches, 0 worktrees"
+    assert len(elements) == 7
     assert not any(element.startswith("operations") for element in elements)
 
 
@@ -1011,8 +1073,9 @@ def test_cached_default_shows_the_fetch_time_once_the_clone_has_fetched(
 
     assert re.fullmatch(
         r"default trunk cached equal fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
-        line.split("  ")[-2],
+        line.split("  ")[-3],
     )
+    assert line.split("  ")[-2] == "pr off setting_off"
     assert line.split("  ")[-1] == "removable 0 branches, 0 worktrees"
     assert re.search(r"cached [0-9]{4}-", line) is None
 
@@ -1211,10 +1274,11 @@ def test_clone_of_an_empty_remote_under_no_network_prints_no_cached_default(
 
     elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
-    assert elements[-4:] == [
+    assert elements[-5:] == [
         "remote off",
         "branches cached local-only 1",
         "no cached default",
+        "pr off setting_off",
         "removable 0 branches, 0 worktrees",
     ]
 
@@ -1299,23 +1363,25 @@ def test_origin_credentials_never_reach_either_output(tmp_path, account, capsys,
 # nyx checkouts: networked default, --no-network and the plain-output grammar
 # ---------------------------------------------------------------------------
 
+TIME = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"
 REMOTE_ELEMENT = re.compile(
-    r"remote (?P<state>live|off|failed (?P<reason>unreachable|not_found|"
-    r"authentication_failed|timed_out|failed))"
+    r"remote (?P<state>live|off|recorded (?P<recorded_reason>[a-z_]+) (?P<recorded_time>" + TIME
+    + r")|failed (?P<reason>unreachable|not_found|authentication_failed|timed_out|failed))"
 )
 BRANCHES_ELEMENT = re.compile(
-    r"branches (?P<basis>live|cached) local-only (?P<local_only>[0-9]+)"
+    r"branches (?P<basis>live|recorded|cached) local-only (?P<local_only>[0-9]+)"
     r"(?: unknown (?P<unknown>[0-9]+))?"
 )
-FRESHNESS = r"(?:never fetched|fetched (?P<fetched>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z))"
+FRESHNESS = r"(?:never fetched|fetched (?P<fetched>" + TIME + "))"
 LIVE_DEFAULT = re.compile(
-    r"default (?P<name>\S+) live (?P<live>[a-z]+) cached (?P<cached>[a-z]+) "
-    r"tracking live (?P<tracking>[a-z]+) " + FRESHNESS
+    r"default (?P<name>\S+) (?P<remote_basis>live|recorded|cached) (?P<live>[a-z]+) "
+    r"cached (?P<cached>[a-z]+) "
+    r"tracking (?P<tracking_basis>live|recorded|cached) (?P<tracking>[a-z]+) " + FRESHNESS
 )
 CACHED_DEFAULT = re.compile(
     r"default (?P<name>\S+) cached (?P<cached>[a-z]+) " + FRESHNESS
 )
-NO_DEFAULT = re.compile(r"no (?P<basis>live|cached) default")
+NO_DEFAULT = re.compile(r"no (?P<basis>live|recorded|cached) default")
 
 
 def _module_run(account: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1337,18 +1403,28 @@ def _relation(comparison: dict | None) -> str:
 def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
     """Parse the trailing elements and compare each captured field to the document."""
 
-    remote, branches, default, removable = line.split("  ")[-4:]
+    remote, branches, default, pr, removable = line.split("  ")[-5:]
+    lookup = group["pr_lookup"]
+    if lookup["status"] == "live":
+        assert pr == "pr live"
+    elif lookup["status"] == "recorded":
+        assert pr == f"pr recorded {lookup['reason']} {lookup['checked_at']}"
+    else:
+        assert pr == f"pr {lookup['status']} {lookup['reason']}"
     counts = item["removable_count"]
     assert removable == f"removable {counts['branches']} branches, {counts['worktrees']} worktrees"
     check = group["remote"]["check"]
     parsed = REMOTE_ELEMENT.fullmatch(remote)
     assert parsed, remote
-    assert parsed["state"].split()[0] == {"live": "live", "off": "off", "failed": "failed"}[
-        check["status"]
-    ]
+    assert parsed["state"].split()[0] == check["status"]
     assert parsed["reason"] == (check["reason"] if check["status"] == "failed" else None)
+    if check["status"] == "recorded":
+        assert (parsed["recorded_reason"], parsed["recorded_time"]) == (
+            check["reason"],
+            check["checked_at"],
+        )
 
-    basis = "live" if check["status"] == "live" else "cached"
+    basis = check["status"] if check["status"] in ("live", "recorded") else "cached"
     counted = BRANCHES_ELEMENT.fullmatch(branches)
     assert counted, branches
     relations = [_relation(branch["vs_remote"]) for branch in item["branches"]]
@@ -1365,11 +1441,14 @@ def _assert_line_matches_document(line: str, group: dict, item: dict) -> dict:
         found = NO_DEFAULT.fullmatch(default)
         assert found and found["basis"] == basis
         return {"default": None}
-    if basis == "live":
+    if local["vs_remote"] is not None:
         found = LIVE_DEFAULT.fullmatch(default)
         assert found, default
-        assert found["live"] == _relation(local["vs_live"])
-        assert found["tracking"] == _relation(item["cached_vs_live"])
+        # Each comparison is labelled with its own basis.
+        assert found["live"] == _relation(local["vs_remote"])
+        assert found["remote_basis"] == local["vs_remote"]["basis"]
+        assert found["tracking"] == _relation(item["cached_vs_remote"])
+        assert found["tracking_basis"] == item["cached_vs_remote"]["basis"]
     else:
         found = CACHED_DEFAULT.fullmatch(default)
         assert found, default
@@ -1466,7 +1545,7 @@ def test_live_plain_lines_follow_the_grammar_and_agree_with_the_document(
     }
 
     def tail(name: str) -> list[str]:
-        return by_path[real(paths[name])][0].split("  ")[-4:-1]
+        return by_path[real(paths[name])][0].split("  ")[-5:-2]
 
     assert tail("fetched")[:2] == ["remote live", "branches live local-only 0"]
     assert re.fullmatch(
@@ -1505,13 +1584,13 @@ def test_no_network_plain_lines_follow_the_cached_grammar(grammar_scenario, acco
         line, group, item = by_path[real(path)]
         assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
         _assert_line_matches_document(line, group, item)
-        remote, branches, default = line.split("  ")[-4:-1]
+        remote, branches, default = line.split("  ")[-5:-2]
         assert remote == "remote off"
         assert branches.startswith("branches cached local-only ")
         assert default.startswith(("default ", "no cached default"))
         assert " live " not in default
-    assert by_path[real(paths["empty"])][0].split("  ")[-2] == "no cached default"
-    assert by_path[real(paths["never"])][0].split("  ")[-2].endswith(" never fetched")
+    assert by_path[real(paths["empty"])][0].split("  ")[-3] == "no cached default"
+    assert by_path[real(paths["never"])][0].split("  ")[-3].endswith(" never fetched")
     assert re.search(r"cached [0-9]{4}-", text) is None
     assert "s3cr3tpass" not in text and "someuser" not in text
 
@@ -1568,9 +1647,9 @@ def test_no_network_makes_no_request_and_the_default_makes_exactly_one(
 
 def _every_comparison(item: dict) -> list[dict]:
     found = [branch["vs_remote"] for branch in item["branches"]]
-    found.append(item["cached_vs_live"])
+    found.append(item["cached_vs_remote"])
     if item["local_default"] is not None:
-        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+        found += [item["local_default"]["vs_remote"], item["local_default"]["vs_cached"]]
     return [comparison for comparison in found if comparison is not None]
 
 
@@ -1617,3 +1696,405 @@ def test_exit_codes_do_not_depend_on_the_switch(tmp_path, account, monkeypatch, 
 
     record.write_bytes(b"{ not json")
     assert _run_checkouts(capsys, "--json", *flags) == (1, "", UNAVAILABLE)
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts: the workspace's GitHub lookup setting and the pr element
+# ---------------------------------------------------------------------------
+
+
+def _github_clone(tmp_path: Path, url: str | None = GITHUB_URL) -> tuple[Path, Path]:
+    """A folder holding one clone whose configured origin is ``url`` (redirected to a
+    local bare remote), or a plain file remote when ``url`` is ``None``."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    repository = clone(remote, folder / "work")
+    if url is not None:
+        point_origin_at(repository, remote, url)
+    return folder, repository
+
+
+def _pr_elements(line: str) -> list[str]:
+    return [element for element in line.split("  ")[1:] if element.startswith("pr ")]
+
+
+def _json_run(capsys, *arguments: str) -> dict:
+    code, out, err = _run_checkouts(capsys, "--json", *arguments)
+    assert (code, err) == (0, "")
+    return models.parse_checkouts(out)
+
+
+@posix_only
+def test_a_workspace_with_lookup_off_never_runs_gh_and_reports_the_setting(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    record = _configure(tmp_path, [folder], github_lookup=False)
+    before = record.read_bytes()
+
+    line = _line_for(_plain_lines(capsys), repository)
+    document = _json_run(capsys)
+
+    assert fake.calls() == []
+    assert document["github_lookup"] == "off"
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {"status": "off", "reason": "setting_off", "checked_at": None}
+    assert _pr_elements(line) == ["pr off setting_off"]
+    assert record.read_bytes() == before
+
+
+@posix_only
+def test_a_workspace_with_lookup_on_runs_gh_once_per_run_and_reports_live(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    record = _configure(tmp_path, [folder], github_lookup=True)
+    before = record.read_bytes()
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert len(fake.calls()) == 1
+    elements = line.split("  ")[1:]
+    default = next(index for index, element in enumerate(elements) if element.startswith("default "))
+    assert elements[default + 1 : default + 3] == [
+        "pr live",
+        "removable 0 branches, 0 worktrees",
+    ]
+    document = _json_run(capsys)
+    assert len(fake.calls()) == 2
+    assert document["github_lookup"] == "on"
+    assert document["repositories"][0]["pr_lookup"] == {
+        "status": "live", "reason": None, "checked_at": None,
+    }
+    assert record.read_bytes() == before
+
+
+@posix_only
+def test_no_network_with_lookup_on_prints_both_elements_off_and_never_runs_gh(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys, "--no-network"), repository)
+
+    assert fake.calls() == []
+    elements = line.split("  ")[1:]
+    assert "remote off" in elements
+    assert _pr_elements(line) == ["pr off remote_checks_off"]
+    assert elements[-2:] == ["pr off remote_checks_off", "removable 0 branches, 0 worktrees"]
+
+
+@posix_only
+def test_an_unauthenticated_gh_prints_the_category(tmp_path, account, capsys, monkeypatch):
+    folder, repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, code=4)
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert len(fake.calls()) == 1
+    assert _pr_elements(line) == ["pr unavailable not_authenticated"]
+    assert "remote live" in line.split("  ")
+
+
+@posix_only
+def test_a_file_remote_prints_not_github_and_never_runs_gh(tmp_path, account, capsys, monkeypatch):
+    folder, repository = _github_clone(tmp_path, url=None)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    line = _line_for(_plain_lines(capsys), repository)
+
+    assert fake.calls() == []
+    assert _pr_elements(line) == ["pr off not_github"]
+
+
+@posix_only
+def test_the_pr_element_is_on_every_origin_line_and_no_other_line(
+    tmp_path, account, capsys, monkeypatch
+):
+    folder, repository = _github_clone(tmp_path)
+    linked = tmp_path / "linked"
+    git(repository, "worktree", "add", "-q", "-b", "side", str(linked))
+    local = folder / "local-only"
+    git(folder, "init", "-q", "-b", "main", str(local))
+    commit_file(local, "file.txt", "one\n")
+    install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(2))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    lines = _plain_lines(capsys)
+
+    assert _pr_elements(_line_for(lines, repository)) == ["pr live"]
+    assert _pr_elements(_line_for(lines, local)) == []
+    assert "no origin remote" in _line_for(lines, local)
+    assert _pr_elements(_line_for(lines, linked, "  ")) == []
+
+
+@posix_only
+def test_the_child_process_environment_drops_every_github_variable(tmp_path, monkeypatch):
+    config = tmp_path / "outer-gh"
+    config.mkdir()
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.setenv(name, "outer-value")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    home = tmp_path / "account"
+    home.mkdir(mode=0o755)
+
+    child = _subprocess_environment(home)
+
+    assert [name for name in GITHUB_SCRUBBED if name in child] == []
+    assert all(name in os.environ for name in GITHUB_SCRUBBED), "control: the parent holds them"
+
+
+@pytest.fixture
+def outer_github(monkeypatch, tmp_path):
+    config = tmp_path / "outer-gh"
+    config.mkdir()
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.setenv(name, "outer-value")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+
+
+@posix_only
+def test_the_account_fixture_leaves_no_github_variable_for_the_collection_or_its_children(
+    outer_github, account, tmp_path, capsys, monkeypatch
+):
+    assert [name for name in GITHUB_SCRUBBED if name in os.environ] == []
+    folder, _repository = _github_clone(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(1))
+    _configure(tmp_path, [folder], github_lookup=True)
+
+    _plain_lines(capsys)
+    # A child process built from the guarded parent environment sees none of them either.
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "set-in-body"))
+    result = _module_run(account, "checkouts")
+
+    assert result.returncode == 0
+    first, second = fake.calls()
+    assert [name for name in GITHUB_SCRUBBED if name in first.environment] == []
+    assert [name for name in GITHUB_SCRUBBED if name in second.environment] == []
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("url", "replay", "flags"),
+    [
+        (GITHUB_URL, {"stdout": github_answer(1)}, ("--no-network",)),
+        (GITHUB_URL, {"code": 4}, ()),
+        (None, {"stdout": github_answer(1)}, ()),
+    ],
+    ids=["no-network", "not-authenticated", "not-github"],
+)
+def test_a_lookup_that_is_off_or_unavailable_leaves_the_configuration_record_unchanged(
+    tmp_path, account, capsys, monkeypatch, url, replay, flags
+):
+    folder, _repository = _github_clone(tmp_path, url)
+    install_fake_gh(tmp_path, monkeypatch, **replay)
+    record = _configure(tmp_path, [folder], github_lookup=True)
+    before = record.read_bytes()
+
+    _plain_lines(capsys, *flags)
+    _json_run(capsys, *flags)
+
+    assert record.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts: the recorded forms of the plain lines
+# ---------------------------------------------------------------------------
+
+
+def _elements_of(line: str) -> list[str]:
+    return line.split("  ")[1:]
+
+
+def _document_line(group: dict, item: dict, lines: list[str]) -> list[str]:
+    line = _line_for(lines, item["path"])
+    _assert_line_matches_document(line, group, item)
+    return _elements_of(line)
+
+
+@pytest.fixture
+def saved_checks(tmp_path, account, capsys, monkeypatch):
+    """A workspace whose first networked run saved the checks of a GitHub-identity
+    clone with a local-only branch, a file-remote clone and an empty-remote clone."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    hub_remote = make_remote(served, "hub.git")
+    hub = clone(hub_remote, folder / "a-hub")
+    point_origin_at(hub, hub_remote, GITHUB_URL)
+    git(hub, "branch", "wip", "trunk")
+    plain = clone(make_remote(served, "plain.git"), folder / "b-plain")
+    empty_remote = served / "empty.git"
+    git(served, "init", "-q", "--bare", str(empty_remote))
+    empty = clone(empty_remote, folder / "c-empty")
+    commit_file(empty, "file.txt", "one\n")
+    fake = install_fake_gh(
+        tmp_path, monkeypatch, stdout=pr_answer(local_names(hub), {})
+    )
+    _configure(tmp_path, [folder], github_lookup=True)
+    first = _plain_lines(capsys)
+    return {
+        "folder": folder,
+        "served": served,
+        "hub": hub,
+        "hub_remote": hub_remote,
+        "plain": plain,
+        "empty": empty,
+        "fake": fake,
+        "first": first,
+        "cache": account / ".nyx" / "cache" / "checkouts.json",
+    }
+
+
+def _group_and_item(document: dict, path: Path) -> tuple[dict, dict]:
+    wanted = real(path)
+    for group in document["repositories"]:
+        for item in group["clones"]:
+            if item["path"] == wanted:
+                return group, item
+    raise AssertionError(wanted)
+
+
+@posix_only
+def test_no_network_prints_each_saved_check_on_its_own_line_and_matches_the_document(
+    saved_checks, capsys
+):
+    scenario = saved_checks
+    hub, plain, empty = scenario["hub"], scenario["plain"], scenario["empty"]
+    # Control: the networked run printed live elements, unchanged.
+    assert _elements_of(_line_for(scenario["first"], hub))[-5] == "remote live"
+    calls = len(scenario["fake"].calls())
+
+    lines = _plain_lines(capsys, "--no-network")
+    document = _json_run(capsys, "--no-network")
+
+    assert len(scenario["fake"].calls()) == calls
+    hub_group, hub_item = _group_and_item(document, hub)
+    check, lookup = hub_group["remote"]["check"], hub_group["pr_lookup"]
+    assert check["status"] == lookup["status"] == "recorded"
+    assert re.fullmatch(TIME, check["checked_at"])
+    assert re.fullmatch(TIME, lookup["checked_at"])
+    elements = _document_line(hub_group, hub_item, lines)
+    assert elements[-5] == f"remote recorded remote_checks_off {check['checked_at']}"
+    assert elements[-4] == "branches recorded local-only 1"
+    assert re.fullmatch(
+        r"default trunk recorded equal cached equal tracking recorded equal " + FRESHNESS,
+        elements[-3],
+    )
+    assert elements[-2] == f"pr recorded remote_checks_off {lookup['checked_at']}"
+
+    plain_group, plain_item = _group_and_item(document, plain)
+    plain_elements = _document_line(plain_group, plain_item, lines)
+    assert plain_elements[-5].startswith("remote recorded remote_checks_off ")
+    assert plain_elements[-4] == "branches recorded local-only 0"
+    assert plain_elements[-2] == "pr off not_github"
+
+    empty_group, empty_item = _group_and_item(document, empty)
+    empty_elements = _document_line(empty_group, empty_item, lines)
+    assert empty_elements[-5].startswith("remote recorded remote_checks_off ")
+    assert empty_elements[-3] == "no recorded default"
+    assert empty_item["local_default"] is None
+
+
+@posix_only
+def test_a_networked_run_with_a_moved_remote_prints_the_saved_check_with_its_failure_reason(
+    saved_checks, capsys
+):
+    scenario = saved_checks
+    hub = scenario["hub"]
+    move_away(scenario["hub_remote"])
+    scenario["fake"].replay(code=4)
+
+    lines = _plain_lines(capsys)
+    document = _json_run(capsys)
+
+    group, item = _group_and_item(document, hub)
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["pr_lookup"]["status"] == "recorded"
+    elements = _document_line(group, item, lines)
+    assert elements[-5] == f"remote recorded not_found {group['remote']['check']['checked_at']}"
+    assert elements[-4] == "branches recorded local-only 1"
+    assert elements[-2] == f"pr recorded not_authenticated {group['pr_lookup']['checked_at']}"
+    # The file remote kept answering, so its line is live.
+    plain_group, plain_item = _group_and_item(document, scenario["plain"])
+    assert _document_line(plain_group, plain_item, lines)[-5] == "remote live"
+
+
+@posix_only
+def test_a_group_with_no_saved_check_keeps_the_forms_of_an_unchecked_run(
+    saved_checks, tmp_path, capsys
+):
+    scenario = saved_checks
+    # A clone added after the saved run, whose remote is gone, has no record.
+    gone_remote = make_remote(scenario["served"], "gone.git")
+    gone = clone(gone_remote, scenario["folder"] / "d-gone")
+    point_origin_at(gone, gone_remote, "https://github.com/acme/gone.git")
+    move_away(gone_remote)
+    scenario["fake"].replay(code=4)
+    _plain_lines(capsys)
+
+    lines = _plain_lines(capsys, "--no-network")
+    document = _json_run(capsys, "--no-network")
+
+    group, item = _group_and_item(document, gone)
+    assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
+    elements = _document_line(group, item, lines)
+    assert elements[-5] == "remote off"
+    assert elements[-4] == "branches cached local-only 0"
+    assert re.fullmatch(r"default trunk cached equal " + FRESHNESS, elements[-3])
+    assert elements[-2] == "pr off remote_checks_off"
+
+
+def _clone_document(status: str, basis: str, tracking_basis: str) -> tuple[dict, dict]:
+    """A minimal group and clone whose default comparisons carry the given bases."""
+
+    def comparison(relation: str, on: str) -> dict:
+        return {"basis": on, "relation": relation, "ahead": None, "behind": None, "objects_from": None}
+
+    check = {"status": status, "reason": "remote_checks_off"}
+    if status == "recorded":
+        check["checked_at"] = "2026-01-02T03:04:05Z"
+    remote = {"key": "example.org/a/b", "display": "example.org/a/b", "check": check}
+    clone_document = {
+        "branches": [{"vs_remote": comparison("equal", basis)}],
+        "local_default": {
+            "name": "trunk",
+            "vs_remote": comparison("differs", basis),
+            "vs_cached": comparison("equal", "cached"),
+        },
+        "cached_default": {"last_fetched_at": None},
+        "cached_vs_remote": comparison("unknown", tracking_basis),
+    }
+    return clone_document, remote
+
+
+def test_the_default_element_labels_each_comparison_with_its_own_basis():
+    item, remote = _clone_document("recorded", "cached", "recorded")
+
+    elements = cli._remote_and_default_elements(item, remote)
+
+    assert elements == [
+        "remote recorded remote_checks_off 2026-01-02T03:04:05Z",
+        "branches recorded local-only 0",
+        "default trunk cached differs cached equal tracking recorded unknown never fetched",
+    ]
+    item, remote = _clone_document("recorded", "recorded", "cached")
+    assert cli._remote_and_default_elements(item, remote)[-1] == (
+        "default trunk recorded differs cached equal tracking cached unknown never fetched"
+    )
+    live, live_remote = _clone_document("live", "live", "live")
+    assert cli._remote_and_default_elements(live, live_remote)[-1] == (
+        "default trunk live differs cached equal tracking live unknown never fetched"
+    )

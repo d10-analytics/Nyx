@@ -53,6 +53,31 @@ GLOBAL_CONFIG = """\
 """
 
 
+GITHUB_SCRUBBED = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_CONFIG_DIR",
+)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def outer_github_environment(tmp_path_factory):
+    """Hold every GitHub variable in the process environment, as an outer shell
+    would, before the per-test guard builds each test's environment."""
+    config = tmp_path_factory.mktemp("outer-gh-config")
+    (config / "hosts.yml").write_text("github.com:\n    user: outer-user\n")
+    values = {name: f"outer-{name.lower()}" for name in GITHUB_SCRUBBED}
+    values["GH_CONFIG_DIR"] = str(config)
+    with pytest.MonkeyPatch.context() as outer:
+        for name, value in values.items():
+            outer.setenv(name, value)
+        yield values
+
+
 @pytest.fixture(autouse=True)
 def isolated_git(tmp_path_factory, monkeypatch):
     """Point every git child at an empty home that owns the only global config."""
@@ -65,6 +90,10 @@ def isolated_git(tmp_path_factory, monkeypatch):
     for name in list(os.environ):
         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
             monkeypatch.delenv(name)
+    # No test may reach the network through the user's GitHub credentials; a test
+    # that needs one of these variables sets it in its own body.
+    for name in GITHUB_SCRUBBED:
+        monkeypatch.delenv(name, raising=False)
     return home
 
 
@@ -126,10 +155,17 @@ def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
     assert pack_names(remote) != []
 
 
+# The whole second in which the last helper-run git command finished. A saved remote
+# check only yields to a tracking ref that moved at or after its own whole second, so a
+# networked collection waits for the next second before it takes its time.
+LAST_GIT_SECOND = [0]
+
+
 def git(cwd: Path | str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["git", *arguments], cwd=cwd, capture_output=True, text=True, check=False
     )
+    LAST_GIT_SECOND[0] = int(time.time())
     if check and result.returncode != 0:
         raise AssertionError(f"git {arguments} failed: {result.stderr}")
     return result
@@ -159,6 +195,8 @@ def add_packed_refs(repository: Path, refs: dict[str, str]) -> None:
     """
     git(repository, "pack-refs", "--all")
     packed_file = repository / ".git" / "packed-refs"
+    if not packed_file.parent.exists():  # a bare repository
+        packed_file = repository / "packed-refs"
     entries = {
         line.split(" ", 1)[1]: line.split(" ", 1)[0]
         for line in packed_file.read_bytes().decode("ascii").split("\n")
@@ -202,6 +240,8 @@ def collect(
     **options: Any,
 ) -> dict[str, Any]:
     """Run the real collector and return the parsed (strictly validated) document."""
+    if options.get("remote_checks"):
+        time.sleep(max(0.0, LAST_GIT_SECOND[0] + 1 - time.time()))
     text = checkouts.collect_checkouts(
         [str(folder) for folder in folders],
         deadline_ns=time.monotonic_ns() + int(seconds * 1e9),
@@ -926,7 +966,7 @@ def test_clone_git_refuses_for_ownership_is_marked_and_siblings_complete(
     assert item["status"] == "unsafe_ownership"
     for fact in (
         "bare", "partial_clone", "shallow", "cached_default", "local_default",
-        "cached_vs_live", "stash_count", "worktrees", "branches",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
     ):
         assert item[fact] is None
     for sibling in trusted:
@@ -986,14 +1026,14 @@ def assert_cached_everywhere(document: dict[str, Any]) -> None:
             assert repository["remote"]["check"] == {
                 "status": "off", "reason": "remote_checks_off"
             }
-            assert repository["default_branch"]["live_sha"] is None
+            assert repository["default_branch"]["sha"] is None
         for item in repository["clones"]:
             if item["status"] != "ok":
                 continue
-            assert item["cached_vs_live"] is None
+            assert item["cached_vs_remote"] is None
             comparisons = [branch["vs_remote"] for branch in item["branches"]]
             if item["local_default"] is not None:
-                assert item["local_default"]["vs_live"] is None
+                assert item["local_default"]["vs_remote"] is None
                 comparisons.append(item["local_default"]["vs_cached"])
             for comparison in filter(None, comparisons):
                 assert comparison["basis"] == "cached"
@@ -1018,7 +1058,7 @@ def test_cached_default_and_local_default_for_a_fresh_clone(tmp_path):
     assert item["local_default"]["vs_cached"] == {
         "basis": "cached", "relation": "equal", "ahead": 0, "behind": 0, "objects_from": None
     }
-    assert document["repositories"][0]["default_branch"] == {"name": "trunk", "live_sha": None}
+    assert document["repositories"][0]["default_branch"] == {"name": "trunk", "sha": None}
     assert_cached_everywhere(document)
 
 
@@ -1115,7 +1155,7 @@ def test_clones_with_different_origin_heads_leave_the_group_default_null(tmp_pat
 
     document = collect([folder])
 
-    assert document["repositories"][0]["default_branch"] == {"name": None, "live_sha": None}
+    assert document["repositories"][0]["default_branch"] == {"name": None, "sha": None}
     assert find_clone(document, first)["cached_default"]["name"] == "trunk"
     assert find_clone(document, second)["cached_default"]["name"] == "dev"
 
@@ -1235,7 +1275,7 @@ def test_origin_urls_group_by_normalized_key_and_hide_credentials(tmp_path):
     [orphan] = last["clones"]
     assert orphan["path"] == real(bare)
     assert orphan["cached_default"] is None and orphan["local_default"] is None
-    assert orphan["cached_vs_live"] is None
+    assert orphan["cached_vs_remote"] is None
     assert all(
         branch["vs_remote"] is None and branch["upstream_mismatch"] is False
         for branch in orphan["branches"]
@@ -1347,7 +1387,7 @@ def mutate_clone_repeated(document):
     duplicate = doc_copy(first_clone(document))
     duplicate.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
-        local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        local_default=None, cached_vs_remote=None, stash_count=None, worktrees=None, branches=None,
         verdict_base=None,
     )
     document["repositories"].append(
@@ -1434,7 +1474,8 @@ def mutate_prunable_ok(document):
         mutate_counts_contradict,
         mutate_schema(1),
         mutate_schema(2),
-        mutate_schema(4),
+        mutate_schema(3),
+        mutate_schema(5),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1462,6 +1503,41 @@ def test_parser_rejects_a_contract_violation(sample, mutation):
     broken = doc_copy(document)
     mutation(broken)
     assert "removable" not in refusal_of(rederive(broken))
+
+
+def rename_default_branch_sha(document):
+    default_branch = document["repositories"][0]["default_branch"]
+    default_branch["live_sha"] = default_branch.pop("sha")
+
+
+def rename_local_default_vs_remote(document):
+    local = first_clone(document)["local_default"]
+    local["vs_live"] = local.pop("vs_remote")
+
+
+def rename_cached_vs_remote(document):
+    item = first_clone(document)
+    item["cached_vs_live"] = item.pop("cached_vs_remote")
+
+
+@pytest.mark.parametrize(
+    "rename",
+    [rename_default_branch_sha, rename_local_default_vs_remote, rename_cached_vs_remote],
+    ids=lambda rename: rename.__name__,
+)
+def test_parser_refuses_a_schema_4_document_with_an_old_field_name(sample, rename):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    rename(broken)
+    assert "invalid shape" in refusal_of(broken)
+
+
+def test_parser_refuses_a_schema_3_document_under_a_valid_digest(sample):
+    document, _folder = sample
+    previous = doc_copy(document)
+    previous["schema_version"] = 3
+    assert "schema" in refusal_of(previous)
 
 
 def test_parser_rejects_a_changed_field_with_the_old_digest(sample):
@@ -1500,8 +1576,8 @@ def test_unchanged_state_gives_a_new_observation_time_and_the_same_digest(repo):
     assert first["checkouts_digest"] == second["checkouts_digest"]
 
 
-def verdict_of(state, rung=None, reason=None):
-    return {"state": state, "rung": rung, "reason": reason}
+def verdict_of(state, rung=None, reason=None, pull_request=None):
+    return {"state": state, "rung": rung, "reason": reason, "pull_request": pull_request}
 
 
 def merged_verdict():
@@ -1535,9 +1611,9 @@ def without_remote(document):
     """Reduce the first clone to a repository with no remote and so no base."""
     clone_document = first_clone(document)
     document["repositories"] = [
-        {"remote": None, "default_branch": None, "clones": [clone_document]}
+        {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone_document]}
     ]
-    clone_document.update(cached_default=None, local_default=None, cached_vs_live=None)
+    clone_document.update(cached_default=None, local_default=None, cached_vs_remote=None)
     for branch in clone_document["branches"]:
         branch.update(vs_remote=None, upstream_mismatch=False)
     undecided_without_a_base(document)
@@ -1679,7 +1755,7 @@ def mutate_missing_verdict_key(document):
 REJECTED_VERDICT_DOCUMENTS = {
     "merged_without_rung": mutate_verdict("merged", None, None),
     "merged_with_rung_none": mutate_verdict("merged", "none", None),
-    "merged_with_foreign_rung": mutate_verdict("merged", "pull_request", None),
+    "merged_with_foreign_rung": mutate_verdict("merged", "history", None),
     "not_merged_with_rung_ancestor": mutate_verdict("not_merged", "ancestor", None),
     "not_merged_without_rung": mutate_verdict("not_merged", None, None),
     "unknown_with_rung": mutate_verdict("unknown", "ancestor", "failed"),
@@ -1741,7 +1817,7 @@ def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
 
 def test_parser_accepts_a_live_base_with_a_lender_and_a_clone_without_the_base_branch(sample):
     document, _folder = sample
-    accepted = doc_copy(document)
+    accepted = with_check(document, {"status": "live", "reason": None})
     clone_document = first_clone(accepted)
     clone_document["verdict_base"].update(basis="live", objects_from=clone_document["path"])
     clone_document["branches"] = [
@@ -1825,7 +1901,7 @@ NULLABLE_CLONE_FACTS = {
     "shallow": (False, 0, "", []),
     "cached_default": ({}, "", [], False),
     "local_default": ({}, "", [], False),
-    "cached_vs_live": ({}, "", [], False),
+    "cached_vs_remote": ({}, "", [], False),
     "stash_count": (0, False, "", []),
     "worktrees": ([], "", 0, False),
     "branches": ([], "", 0, False),
@@ -1846,7 +1922,7 @@ def refused_clone(document: dict[str, Any]) -> dict[str, Any]:
     clone_document = first_clone(document)
     clone_document.update(
         status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
-        local_default=None, cached_vs_live=None, stash_count=None, worktrees=None, branches=None,
+        local_default=None, cached_vs_remote=None, stash_count=None, worktrees=None, branches=None,
         verdict_base=None, containment=None, removable_count=None,
     )
     return clone_document
@@ -2365,7 +2441,7 @@ def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tm
     assert failed["status"] == "failed"
     for fact in (
         "bare", "partial_clone", "shallow", "cached_default", "local_default",
-        "cached_vs_live", "stash_count", "worktrees", "branches",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
     ):
         assert failed[fact] is None
     assert groups[real(long_origin)]["remote"] is None
@@ -2376,7 +2452,7 @@ def test_origin_beyond_the_text_bound_fails_its_clone_and_the_document_parses(tm
     kept = find_clone(document, orphan)
     assert kept["status"] == "ok" and groups[real(orphan)]["remote"] is None
     assert kept["cached_default"] is None and kept["local_default"] is None
-    assert kept["cached_vs_live"] is None
+    assert kept["cached_vs_remote"] is None
     assert kept["branches"] and all(
         branch["vs_remote"] is None and branch["upstream_mismatch"] is False
         for branch in kept["branches"]
@@ -2557,21 +2633,21 @@ def group_of(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
 
 def comparisons_of(item: dict[str, Any]) -> list[dict[str, Any]]:
     found = [branch["vs_remote"] for branch in item["branches"]]
-    found.append(item["cached_vs_live"])
+    found.append(item["cached_vs_remote"])
     if item["local_default"] is not None:
-        found += [item["local_default"]["vs_live"], item["local_default"]["vs_cached"]]
+        found += [item["local_default"]["vs_remote"], item["local_default"]["vs_cached"]]
     return [comparison for comparison in found if comparison is not None]
 
 
 def assert_fell_back_to_cached(group: dict[str, Any], reason: str) -> None:
     assert group["remote"]["check"] == {"status": "failed", "reason": reason}
-    assert group["default_branch"]["live_sha"] is None
+    assert group["default_branch"]["sha"] is None
     for item in group["clones"]:
         if item["status"] != "ok":
             continue
-        assert item["cached_vs_live"] is None
+        assert item["cached_vs_remote"] is None
         if item["local_default"] is not None:
-            assert item["local_default"]["vs_live"] is None
+            assert item["local_default"]["vs_remote"] is None
         assert {c["basis"] for c in comparisons_of(item)} <= {"cached"}
 
 
@@ -2694,36 +2770,40 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
+    assert document["schema_version"] == 4
     assert group["remote"]["check"] == {"status": "live", "reason": None}
-    assert group["default_branch"] == {"name": "trunk", "live_sha": pushed}
+    assert group["default_branch"] == {"name": "trunk", "sha": pushed}
+    assert set(group["default_branch"]) == {"name", "sha"}
     item = find_clone(document, main)
     default = item["local_default"]
+    assert set(default) == {"name", "sha", "vs_remote", "vs_cached"}
+    assert "cached_vs_remote" in item
     assert default["name"] == "trunk"
-    assert default["vs_live"] == {
+    assert default["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
     }
     assert default["vs_cached"]["basis"] == "cached"
     assert default["vs_cached"]["relation"] == "equal"
-    assert item["cached_vs_live"]["relation"] == "behind"
-    assert (item["cached_vs_live"]["behind"], item["cached_vs_live"]["basis"]) == (1, "live")
+    assert item["cached_vs_remote"]["relation"] == "behind"
+    assert (item["cached_vs_remote"]["behind"], item["cached_vs_remote"]["basis"]) == (1, "live")
     assert branch_of(item, "pushed")["vs_remote"]["relation"] == "equal"
     assert branch_of(item, "pushed")["vs_remote"]["basis"] == "live"
     assert branch_of(item, "private")["vs_remote"]["relation"] == "absent"
     assert branch_of(item, "private")["vs_remote"]["basis"] == "live"
 
-    stale = find_clone(document, lagging)["local_default"]["vs_live"]
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == outside_head
+    stale = find_clone(document, lagging)["local_default"]["vs_remote"]
+    assert group_of(document, lagging)["default_branch"]["sha"] == outside_head
     assert stale == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
 
     no_name = group_of(document, detached_clone)
-    assert no_name["default_branch"] == {"name": None, "live_sha": head}
+    assert no_name["default_branch"] == {"name": None, "sha": head}
     assert find_clone(document, detached_clone)["local_default"] is None
     nothing = group_of(document, empty_clone)
     assert nothing["remote"]["check"] == {"status": "live", "reason": None}
-    assert nothing["default_branch"]["live_sha"] is None
+    assert nothing["default_branch"]["sha"] is None
 
 
 def test_presence_probe_reads_a_present_id_beside_a_missing_one(tmp_path):
@@ -2754,7 +2834,7 @@ def test_presence_probe_reads_a_present_id_beside_a_missing_one(tmp_path):
     assert branch_of(item, "feature")["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 1, "objects_from": None
     }
-    assert item["local_default"]["vs_live"] == {
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -2828,8 +2908,8 @@ def test_partial_clone_that_fetched_the_live_head_still_differs_without_counts(t
 
     item = find_clone(document, partial)
     assert item["partial_clone"] is True
-    assert group_of(document, partial)["default_branch"]["live_sha"] == pushed
-    assert item["local_default"]["vs_live"] == {
+    assert group_of(document, partial)["default_branch"]["sha"] == pushed
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -2857,10 +2937,10 @@ def test_query_runs_in_the_first_partial_clone_and_adds_no_pack(tmp_path, record
     assert pack_listing(partial) == packs
     group = group_of(document, partial)
     assert group["remote"]["check"] == {"status": "live", "reason": None}
-    assert group["default_branch"]["live_sha"] == pushed
-    assert find_clone(document, partial)["local_default"]["vs_live"]["relation"] == "differs"
-    assert find_clone(document, partial)["local_default"]["vs_live"]["ahead"] is None
-    assert find_clone(document, full)["local_default"]["vs_live"]["relation"] == "equal"
+    assert group["default_branch"]["sha"] == pushed
+    assert find_clone(document, partial)["local_default"]["vs_remote"]["relation"] == "differs"
+    assert find_clone(document, partial)["local_default"]["vs_remote"]["ahead"] is None
+    assert find_clone(document, full)["local_default"]["vs_remote"]["relation"] == "equal"
 
 
 def test_shallow_clone_never_counts_a_live_comparison(tmp_path):
@@ -2878,7 +2958,7 @@ def test_shallow_clone_never_counts_a_live_comparison(tmp_path):
     item = find_clone(live([folder]), shallow)
 
     assert item["shallow"] is True
-    assert item["local_default"]["vs_live"]["relation"] == "differs"
+    assert item["local_default"]["vs_remote"]["relation"] == "differs"
     assert {c["relation"] for c in comparisons_of(item) if c["basis"] == "live"} <= {
         "equal", "differs"
     }
@@ -2966,8 +3046,8 @@ def test_blocked_query_keeps_a_later_comparison_from_starting(tmp_path, recorder
 
     group = group_of(document, lagging)
     assert group["remote"]["check"]["status"] == "live"
-    assert group["default_branch"]["live_sha"] == pushed
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert group["default_branch"]["sha"] == pushed
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3173,12 +3253,12 @@ def test_lagging_clone_counts_with_objects_borrowed_from_a_sibling(tmp_path):
     document = live([folder])
 
     item = find_clone(document, lagging)
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
-    assert item["local_default"]["vs_live"] == {
+    assert group_of(document, lagging)["default_branch"]["sha"] == head
+    assert item["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
         "objects_from": real(holder),
     }
-    assert item["cached_vs_live"]["objects_from"] == real(holder)
+    assert item["cached_vs_remote"]["objects_from"] == real(holder)
     assert (object_files(lagging), git(lagging, "count-objects", "-v").stdout) == before
     assert not (lagging / ".git" / "objects" / "info" / "alternates").exists()
     assert git(lagging, "cat-file", "-e", head, check=False).returncode != 0
@@ -3191,15 +3271,15 @@ def test_first_sibling_in_natural_order_that_holds_the_head_lends(tmp_path):
 
     item = find_clone(live([folder]), lagging)
 
-    assert item["local_default"]["vs_live"]["objects_from"] == real(folder / "holder 2")
-    assert item["local_default"]["vs_live"]["behind"] == 2
+    assert item["local_default"]["vs_remote"]["objects_from"] == real(folder / "holder 2")
+    assert item["local_default"]["vs_remote"]["behind"] == 2
 
 
 def test_removed_holder_leaves_the_lagging_clone_with_differs(tmp_path):
     folder, _remote, lagging, (holder,), _head = borrowed_world(tmp_path)
     remove_tree(holder)
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
@@ -3215,7 +3295,7 @@ def test_inherited_alternates_value_never_makes_an_unborrowed_count(tmp_path, mo
         "GIT_ALTERNATE_OBJECT_DIRECTORIES", str(kept / ".git" / "objects")
     )
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison["relation"] == "differs"
     assert comparison["behind"] is None and comparison["objects_from"] is None
@@ -3238,7 +3318,7 @@ def test_sibling_probe_cut_by_the_budget_is_unknown(tmp_path, monkeypatch):
 
     comparison = find_clone(
         live([folder], call_cap_seconds=1.0), lagging
-    )["local_default"]["vs_live"]
+    )["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "unknown", "ahead": None, "behind": None,
@@ -3265,8 +3345,8 @@ def test_partial_and_shallow_holders_never_lend_and_gain_no_pack(tmp_path):
 
     document = live([folder])
 
-    assert group_of(document, lagging)["default_branch"]["live_sha"] == head
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert group_of(document, lagging)["default_branch"]["sha"] == head
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3283,11 +3363,16 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 3
-    borrowed = find_clone(first, lagging)["local_default"]["vs_live"]
+    assert first["schema_version"] == 4
+    borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
     assert off["remote_checks"] == "off"
+    assert_cached_everywhere(off)
+    off_lagging = find_clone(off, lagging)
+    assert group_of(off, lagging)["default_branch"]["sha"] is None
+    assert off_lagging["local_default"]["vs_remote"] is None
+    assert off_lagging["cached_vs_remote"] is None
     assert first["observed_at"] != second["observed_at"]
     assert first["checkouts_digest"] == second["checkouts_digest"]
     assert {k: v for k, v in first.items() if k != "observed_at"} == {
@@ -3325,7 +3410,7 @@ def test_sibling_probe_that_fails_gives_differs_not_unknown(tmp_path, monkeypatc
     )
     monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
@@ -3342,7 +3427,7 @@ def test_a_holder_of_another_remote_never_lends(tmp_path):
     document = live([folder])
 
     assert group_of(document, holder) is not group_of(document, lagging)
-    assert find_clone(document, lagging)["local_default"]["vs_live"] == {
+    assert find_clone(document, lagging)["local_default"]["vs_remote"] == {
         "basis": "live", "relation": "differs", "ahead": None, "behind": None,
         "objects_from": None,
     }
@@ -3357,7 +3442,7 @@ def test_no_sibling_is_probed_when_the_clone_holds_the_head(tmp_path, monkeypatc
     shim = git_stand_in(tmp_path, f'printf "%s\\n" "$*" >> "{log}"')
     monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
 
-    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_live"]
+    comparison = find_clone(live([folder]), lagging)["local_default"]["vs_remote"]
 
     assert comparison == {
         "basis": "live", "relation": "behind", "ahead": 0, "behind": 2,
@@ -3942,8 +4027,9 @@ def test_the_landing_check_touches_no_lender_store_not_even_a_timestamp(tmp_path
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the version stand-in is a shell script")
-def test_a_cached_verdict_from_the_retired_schema_is_never_served(
-    tmp_path, monkeypatch, isolated_git
+@pytest.mark.parametrize("version", [1, 2])
+def test_a_cached_verdict_from_a_retired_schema_is_never_served_and_the_next_write_replaces_it(
+    tmp_path, monkeypatch, isolated_git, version
 ):
     cache = nyx_home(isolated_git)
     folder, work = lookalike_world(
@@ -3953,19 +4039,36 @@ def test_a_cached_verdict_from_the_retired_schema_is_never_served(
     old = stand_in(
         tmp_path, "old", 'case "$*" in *" --version") echo "git version 2.38.0"; exit 0;; esac'
     )
-    document = {"schema_version": 1, "verdicts": {key: {"rung": "patch_equivalent", "at": 5}}}
+    document = {"schema_version": version, "verdicts": {key: {"rung": "patch_equivalent", "at": 5}}}
     cache.parent.mkdir(exist_ok=True)
-    cache.write_text(json.dumps(document))
+    retired = json.dumps(document).encode()
+    cache.write_bytes(retired)
 
     with path_with(monkeypatch, old):
-        retired = collect([folder])
-    assert verdicts_of(find_clone(retired, work))["feature"] == unknown("git_too_old")
-    assert retired["diagnostics"] == []
+        offline = collect([folder])
+    # The old git cannot decide the branch, and the retired file serves nothing.
+    assert verdicts_of(find_clone(offline, work))["feature"] == unknown("git_too_old")
+    assert offline["diagnostics"] == []
+    # A run that decides nothing and checks nothing leaves the retired file as it was.
+    assert cache.read_bytes() == retired
 
-    cache.write_text(json.dumps({**document, "schema_version": 2}))
+    # The branch is decided again, and by the real answer: the change only looks alike.
+    current = collect([folder], remote_checks=True)
+    assert verdicts_of(find_clone(current, work))["feature"] == NOT_MERGED
+    assert current["diagnostics"] == []
+    replaced = json.loads(cache.read_text())
+    assert set(replaced) == {"schema_version", "verdicts", "remote_checks"}
+    assert replaced["schema_version"] == 3
+    assert {k: v["rung"] for k, v in replaced["verdicts"].items()} == {key: "none"}
+    assert replaced["verdicts"][key]["at"] > 5
+    [saved_remote] = replaced["remote_checks"].values()
+    assert saved_remote["heads"]["default"] == "trunk"
+
+    # The same entry in a schema 3 file is served: only the form was retired.
+    cache.write_text(json.dumps({**document, "schema_version": 3, "remote_checks": {}}))
     with path_with(monkeypatch, old):
-        current = collect([folder])
-    assert verdicts_of(find_clone(current, work))["feature"] == MERGED_PATCH
+        served = collect([folder])
+    assert verdicts_of(find_clone(served, work))["feature"] == MERGED_PATCH
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="needs a SHA-256 repository the lane may lack")
@@ -4724,7 +4827,7 @@ def test_a_branch_merged_on_the_remote_is_merged_against_the_borrowed_live_head(
     assert item["verdict_base"] == {
         "name": "trunk", "sha": head, "basis": "live", "objects_from": real(holder),
     }
-    assert item["verdict_base"]["objects_from"] == item["cached_vs_live"]["objects_from"]
+    assert item["verdict_base"]["objects_from"] == item["cached_vs_remote"]["objects_from"]
     assert verdicts_of(item)["feat"] == MERGED_ANCESTOR
     assert find_clone(document, holder)["verdict_base"]["objects_from"] is None
     assert (snapshot(other), snapshot(holder)) == before
@@ -5155,7 +5258,8 @@ def nyx_home(home: Path) -> Path:
 
 def cache_entries(cache: Path) -> dict[str, str]:
     document = json.loads(cache.read_text())
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 3
+    assert set(document) == {"schema_version", "verdicts", "remote_checks"}
     return {key: entry["rung"] for key, entry in document["verdicts"].items()}
 
 
@@ -5294,14 +5398,19 @@ def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
     return {
         "garbage": b"not json {",
         "extra_key": json.dumps({**document, "extra": 1}).encode(),
-        "foreign_schema": json.dumps({**document, "schema_version": 3}).encode(),
+        "foreign_schema": json.dumps({**document, "schema_version": 4}).encode(),
         "ancestor_rung": json.dumps(
-            {"schema_version": 2, "verdicts": {good_key: {"rung": "ancestor", "at": 1}}}
+            {
+                "schema_version": 3,
+                "verdicts": {good_key: {"rung": "ancestor", "at": 1}},
+                "remote_checks": {},
+            }
         ).encode(),
         "key_lengths": json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "verdicts": {"a" * 40 + "." + "b" * 64: {"rung": "none", "at": 1}},
+                "remote_checks": {},
             }
         ).encode(),
         "oversized": b" " * (5 * 1024 * 1024),
@@ -5417,7 +5526,11 @@ def test_incomplete_clones_leave_an_existing_cache_file_untouched(tmp_path, isol
     cache = nyx_home(isolated_git)
     cache.parent.mkdir()
     stored = json.dumps(
-        {"schema_version": 2, "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}}}
+        {
+            "schema_version": 3,
+            "verdicts": {"1" * 40 + "." + "2" * 40: {"rung": "none", "at": 5}},
+            "remote_checks": {},
+        }
     ).encode()
     cache.write_bytes(stored)
     folder, incomplete = incomplete_world(tmp_path, option)
@@ -5628,17 +5741,21 @@ def branch_cache_world(tmp_path: Path, names: list[str]):
 
 
 def write_cache(
-    cache: Path, entries: dict[str, int], rungs: dict[str, str] | None = None
+    cache: Path,
+    entries: dict[str, int],
+    rungs: dict[str, str] | None = None,
+    remote_checks: dict[str, Any] | None = None,
 ) -> None:
     cache.parent.mkdir(exist_ok=True)
     cache.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "verdicts": {
                     key: {"rung": (rungs or {}).get(key, "none"), "at": at}
                     for key, at in entries.items()
                 },
+                "remote_checks": remote_checks or {},
             }
         )
     )
@@ -6161,7 +6278,7 @@ def count_tip_equality(monkeypatch) -> list[int]:
 
 
 CLONE_FACTS = (
-    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_live",
+    "bare", "partial_clone", "shallow", "cached_default", "local_default", "cached_vs_remote",
     "stash_count", "worktrees", "branches", "verdict_base", "containment", "removable_count",
 )
 
@@ -6798,8 +6915,8 @@ def test_a_late_containment_pass_reports_deadline_for_its_clone_alone_and_keeps_
     assert containment_of(on_time) == NESTED_FOLDS
     assert second["diagnostics"] == []
     saved = json.loads(cache.read_text())
-    assert set(saved) == {"schema_version", "verdicts"}
-    assert saved["schema_version"] == 2
+    assert set(saved) == {"schema_version", "verdicts", "remote_checks"}
+    assert saved["schema_version"] == 3
     assert all(cache_times(cache)[key] > stamps[key] for key in stamps)
 
     # The control: a pass on the full deadline leaves the write no time.
@@ -7047,9 +7164,9 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
     assert "removable" not in refusal_of(rederive(broken))
 
 
-def test_parser_refuses_a_schema_2_document_and_reads_only_schema_3(sample):
+def test_parser_refuses_a_schema_2_document_and_reads_only_schema_4(sample):
     document, _folder = sample
-    assert document["schema_version"] == 3 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 4 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
@@ -7925,4 +8042,4318 @@ def test_a_branch_held_by_two_worktrees_is_blocked_by_either_of_them(tmp_path):
         {"alder": ["worktree_not_clean"], "birch": ["worktree_locked"], "trunk": None},
         {first: [], second: ["not_clean"], open_one: [], held_one: ["locked"]},
         count=(0, 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub pull-request lookup: the one gh request per repository
+# ---------------------------------------------------------------------------
+
+GITHUB_URL = "https://github.com/acme/widget.git"
+GITHUB_KEY = "github.com/acme/widget"
+PR_NODE = {
+    "number": 7,
+    "state": "MERGED",
+    "headRefOid": "a" * 40,
+    "baseRefName": "trunk",
+    "isCrossRepository": False,
+}
+
+
+def github_answer(count: int, node: dict[str, Any] | None = PR_NODE) -> dict[str, Any]:
+    """A valid ``gh`` answer for ``count`` branch aliases."""
+    repository: dict[str, Any] = {"__typename": "Repository"}
+    for index in range(count):
+        repository[f"b{index}"] = {"nodes": [] if node is None else [dict(node)]}
+    return {"data": {"repository": repository}}
+
+
+class GhCall:
+    """One logged start of the fake ``gh``."""
+
+    def __init__(self, directory: Path) -> None:
+        self.args = (directory / "args").read_text().split("\n")[:-1]
+        self.environment = dict(
+            line.split("=", 1)
+            for line in (directory / "env").read_text().split("\n")
+            if "=" in line
+        )
+        body = directory / "body"
+        self.body = body.read_bytes() if body.exists() else None
+        input_file = directory / "input"
+        self.input_path = input_file.read_text() if input_file.exists() else None
+        self.started = int((directory / "started").read_text())
+
+
+class FakeGh:
+    """A POSIX shell script standing in for ``gh``: it logs the arguments, the
+    environment, the request body and the start time of each call and replays a
+    chosen stdout, stderr, exit code and delay."""
+
+    def __init__(self, root: Path) -> None:
+        self.bin = root / "fake-gh-bin"
+        self.state = root / "fake-gh-state"
+        self.bin.mkdir(parents=True, exist_ok=True)
+        self.state.mkdir(parents=True, exist_ok=True)
+        script = self.bin / "gh"
+        script.write_text(
+            f"""#!/bin/sh
+state="{self.state}"
+call=$(mktemp -d "$state/call.XXXXXX")
+printf '%s\\n' "$@" > "$call/args"
+env > "$call/env"
+date +%s > "$call/started"
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "--input" ]; then
+    printf '%s' "$argument" > "$call/input"
+    cp "$argument" "$call/body"
+  fi
+  previous=$argument
+done
+if [ -f "$state/delay" ]; then sleep "$(cat "$state/delay")"; fi
+if [ -f "$state/stderr" ]; then cat "$state/stderr" >&2; fi
+if [ -f "$state/stdout" ]; then cat "$state/stdout"; fi
+exit "$(cat "$state/code")"
+"""
+        )
+        script.chmod(0o755)
+        self.replay()
+
+    def replay(
+        self, stdout: str | dict[str, Any] = "", stderr: str = "", code: int = 0, delay: float = 0
+    ) -> None:
+        text = stdout if isinstance(stdout, str) else json.dumps(stdout)
+        (self.state / "stdout").write_text(text)
+        (self.state / "stderr").write_text(stderr)
+        (self.state / "code").write_text(str(code))
+        (self.state / "delay").write_text(str(delay))
+
+    def calls(self) -> list[GhCall]:
+        return [GhCall(path) for path in sorted(self.state.glob("call.*"))]
+
+
+def install_fake_gh(tmp_path: Path, monkeypatch, **replay: Any) -> FakeGh:
+    """Put a fake ``gh`` first on ``PATH``."""
+    fake = FakeGh(tmp_path)
+    fake.replay(**replay)
+    monkeypatch.setenv("PATH", f"{fake.bin}{os.pathsep}{os.environ['PATH']}")
+    return fake
+
+
+def git_only_path(tmp_path: Path) -> str:
+    """A ``PATH`` that provides git and no ``gh``: ``gh`` may sit beside the real git."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    directory = tmp_path / "only-git"
+    directory.mkdir(exist_ok=True)
+    if ON_WINDOWS:
+        if (Path(real_git).parent / "gh.exe").exists():
+            pytest.skip("gh.exe sits beside git.exe on this host")
+        return str(Path(real_git).parent)
+    wrapper = directory / "git"
+    wrapper.write_text(f'#!/bin/sh\nexec "{real_git}" "$@"\n')
+    wrapper.chmod(0o755)
+    return str(directory)
+
+
+def point_origin_at(repository: Path, remote: Path, url: str) -> None:
+    """Configure ``url`` as origin while git reaches ``remote`` through ``insteadOf``."""
+    git(repository, "config", "remote.origin.url", url)
+    git(repository, "config", f"url.{remote.as_uri()}.insteadOf", url)
+
+
+def github_collect(folder: Path, **options: Any) -> dict[str, Any]:
+    options.setdefault("remote_checks", True)
+    options.setdefault("github_lookup", True)
+    return collect([folder], **options)
+
+
+def lookup_of(document: dict[str, Any]) -> dict[str, Any]:
+    [repository] = document["repositories"]
+    return repository["pr_lookup"]
+
+
+def lookup(status: str, reason: str | None) -> dict[str, Any]:
+    return {"status": status, "reason": reason, "checked_at": None}
+
+
+def two_clone_world(tmp_path: Path, url: str | None = GITHUB_URL) -> tuple[Path, Path, Path, Path]:
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    first = clone(remote, folder / "a")
+    second = clone(remote, folder / "b")
+    for repository, names in ((first, ["feature/x-1"]), (second, ["feature/x-1", "other"])):
+        for name in names:
+            git(repository, "branch", name)
+        if url is not None:
+            point_origin_at(repository, remote, url)
+    return folder, remote, first, second
+
+
+def branchless_world(tmp_path: Path) -> Path:
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    repository = clone(remote, folder / "empty")
+    git(repository, "checkout", "-q", "--detach")
+    git(repository, "update-ref", "-d", "refs/heads/trunk")
+    point_origin_at(repository, remote, GITHUB_URL)
+    return folder
+
+
+def merged_world(tmp_path: Path) -> Path:
+    """A GitHub-configured clone whose branch ``done`` was squash-merged into ``trunk``."""
+    folder, remote, work = small_world(tmp_path)
+    land(work, "done")
+    point_origin_at(work, remote, GITHUB_URL)
+    return folder
+
+
+@posix_only
+def test_one_gh_call_per_repository_carries_every_distinct_branch_name_in_a_body_file(
+    tmp_path, monkeypatch
+):
+    folder, _remote, _first, _second = two_clone_world(tmp_path)
+    names = ["feature/x-1", "other", "trunk"]
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(len(names)))
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setenv("GH_HOST", "elsewhere.example.invalid")
+    monkeypatch.setenv("GH_REPO", "other/repository")
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    assert call.args[:5] == ["api", "graphql", "--hostname", "github.com", "--input"]
+    assert len(call.args) == 6
+    assert call.input_path == call.args[5]
+    assert not any(name in argument for argument in call.args for name in names)
+    request = json.loads(call.body)
+    assert set(request) == {"query", "variables"}
+    assert request["variables"] == {
+        "owner": "acme", "name": "widget", "h0": names[0], "h1": names[1], "h2": names[2],
+    }
+    query = request["query"]
+    assert "repository(owner: $owner, name: $name)" in query
+    assert "__typename" in query
+    assert query.count("pullRequests(") == len(names)
+    for index in range(len(names)):
+        assert (
+            f"b{index}: pullRequests(headRefName: $h{index}, first: 10, "
+            "orderBy: {field: CREATED_AT, direction: DESC}) "
+            "{ nodes { number state headRefOid baseRefName isCrossRepository } }"
+        ) in query
+    assert not Path(call.input_path).exists()
+    assert not Path(call.input_path).parent.exists()
+    environment = call.environment
+    assert {name: environment.get(name) for name in (
+        "GH_PROMPT_DISABLED", "GH_NO_UPDATE_NOTIFIER", "GH_SPINNER_DISABLED", "NO_COLOR",
+    )} == {
+        "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_SPINNER_DISABLED": "1", "NO_COLOR": "1",
+    }
+    assert "GH_REPO" not in environment and "GH_HOST" not in environment
+    assert environment["GH_TOKEN"] == "test-token"
+    assert document["github_lookup"] == "on"
+    [repository] = document["repositories"]
+    assert repository["remote"]["key"] == GITHUB_KEY
+    assert repository["remote"]["check"] == {"status": "live", "reason": None}
+    assert repository["pr_lookup"] == lookup("live", None)
+
+
+@posix_only
+def test_a_gh_started_by_the_collector_receives_the_github_configuration_a_test_set(
+    tmp_path, monkeypatch
+):
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+    config = tmp_path / "gh-config"
+    config.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    monkeypatch.setenv("GITHUB_TOKEN", "body-token")
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    assert call.environment["GH_CONFIG_DIR"] == str(config)
+    assert call.environment["GITHUB_TOKEN"] == "body-token"
+
+
+@posix_only
+def test_the_guard_removes_every_github_variable_before_the_test_body(
+    tmp_path, monkeypatch, outer_github_environment
+):
+    # The outer environment did hold all seven, and a config directory with a hosts file.
+    assert set(outer_github_environment) == set(GITHUB_SCRUBBED)
+    assert (Path(outer_github_environment["GH_CONFIG_DIR"]) / "hosts.yml").is_file()
+    assert [name for name in GITHUB_SCRUBBED if name in os.environ] == []
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    assert [name for name in GITHUB_SCRUBBED if name in call.environment] == []
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"data": {"repository": {"__typename": "Repository"}}}, lookup("live", None)),
+        ({"data": {"repository": {}}}, lookup("unavailable", "failed")),
+    ],
+    ids=["typename", "no-typename"],
+)
+def test_a_repository_with_no_local_branch_still_makes_its_one_call(
+    tmp_path, monkeypatch, answer, expected
+):
+    folder = branchless_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=answer)
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    request = json.loads(call.body)
+    assert request["variables"] == {"owner": "acme", "name": "widget"}
+    assert "__typename" in request["query"]
+    assert "pullRequests" not in request["query"]
+    assert lookup_of(document) == expected
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://acme.ghe.com/acme/widget.git", "acme.ghe.com"),
+        ("https://gitlab.example.com/acme/widget.git", None),
+        ("https://github.com/acme/widget/extra.git", None),
+        (None, None),
+    ],
+    ids=["enterprise", "gitlab", "extra-path", "file-url"],
+)
+def test_only_a_github_host_with_an_owner_and_repository_path_is_called(
+    tmp_path, monkeypatch, url, host
+):
+    # With no URL the clones keep the plain file remote they were cloned from.
+    folder, *_ = two_clone_world(tmp_path, url)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    document = github_collect(folder)
+
+    if host is None:
+        assert fake.calls() == []
+        assert lookup_of(document) == lookup("off", "not_github")
+    else:
+        [call] = fake.calls()
+        assert call.args[2:4] == ["--hostname", host]
+        assert lookup_of(document) == lookup("live", None)
+
+
+@posix_only
+def test_a_gh_reachable_only_through_a_relative_path_entry_never_runs(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    fake = FakeGh(tmp_path)
+    fake.replay(stdout=github_answer(3))
+    only_git = git_only_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake.bin.name}{os.pathsep}{only_git}")
+
+    document = github_collect(folder)
+
+    assert fake.calls() == []
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="Windows resolution rules")
+def test_windows_runs_only_a_gh_exe_found_on_an_absolute_path_entry(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    marker = tmp_path / "cmd-marker"
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "gh.cmd").write_text(f'@echo ran> "{marker}"\r\n')
+    working = tmp_path / "working"
+    working.mkdir()
+    shutil.copy(os.environ["COMSPEC"], working / "gh.exe")
+    monkeypatch.chdir(working)
+    monkeypatch.setenv("PATH", f"{only_git}{os.pathsep}{shim}")
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(not ON_WINDOWS, reason="Windows resolution rules")
+def test_windows_finds_and_runs_a_gh_exe_first_on_the_path(tmp_path, monkeypatch):
+    folder, *_ = two_clone_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    program = tmp_path / "program"
+    program.mkdir()
+    shutil.copy(os.environ["COMSPEC"], program / "gh.exe")
+    monkeypatch.setenv("PATH", f"{program}{os.pathsep}{only_git}")
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "failed")
+
+
+def valid_for_merged_world() -> dict[str, Any]:
+    return github_answer(2)
+
+
+@posix_only
+def test_lookup_off_makes_no_call_and_reports_the_setting(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    baseline = github_collect(folder, github_lookup=False)
+
+    assert fake.calls() == []
+    assert baseline["github_lookup"] == "off"
+    assert lookup_of(baseline) == lookup("off", "setting_off")
+    assert baseline["repositories"][0]["remote"]["check"]["status"] == "live"
+
+
+@posix_only
+def test_remote_checks_off_makes_no_call_and_reports_it(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+
+    document = github_collect(folder, remote_checks=False)
+
+    assert fake.calls() == []
+    assert lookup_of(document) == lookup("off", "remote_checks_off")
+    assert document["repositories"][0]["remote"]["check"] == {
+        "status": "off", "reason": "remote_checks_off",
+    }
+
+
+@posix_only
+def test_a_path_with_git_and_no_gh_reports_gh_missing(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    only_git = git_only_path(tmp_path)
+    monkeypatch.setenv("PATH", only_git)
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("unavailable", "gh_missing")
+
+
+def merged_answer_with(node_change: dict[str, Any]) -> dict[str, Any]:
+    answer = github_answer(2)
+    answer["data"]["repository"]["b0"]["nodes"][0].update(node_change)
+    return answer
+
+
+def oversized_answer() -> str:
+    return json.dumps(github_answer(2)) + " " * (8 << 20)
+
+
+HTTP_401 = "HTTP 401: Bad credentials (https://api.github.com/graphql)"
+RATE_LIMITED_BODY = {"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]}
+NOT_FOUND_BODY = {
+    "data": {"repository": None},
+    "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a Repository"}],
+}
+MISSING_NODES = github_answer(2)
+del MISSING_NODES["data"]["repository"]["b1"]["nodes"]
+NULL_REPOSITORY = {"data": {"repository": None}}
+
+
+def answer_with_repository_field(name: str, value: Any) -> dict[str, Any]:
+    answer = github_answer(2)
+    answer["data"]["repository"][name] = value
+    return answer
+
+
+# Values of the wrong JSON type at each place the answer is read: each must make
+# the lookup fail rather than raise while it is hashed, compared or indexed.
+ODD_SHAPE_CASES = [
+    ("state-list", merged_answer_with({"state": ["MERGED"]})),
+    ("state-dict", merged_answer_with({"state": {"MERGED": True}})),
+    ("number-list", merged_answer_with({"number": [7]})),
+    ("head-object-list", merged_answer_with({"headRefOid": ["a" * 40]})),
+    ("base-name-dict", merged_answer_with({"baseRefName": {"trunk": 1}})),
+    ("data-list", {"data": [{"repository": None}]}),
+    ("repository-list", {"data": {"repository": [{"__typename": "Repository"}]}}),
+    ("typename-list", answer_with_repository_field("__typename", ["Repository"])),
+    ("alias-list", answer_with_repository_field("b0", [{"nodes": []}])),
+    ("nodes-object", answer_with_repository_field("b0", {"nodes": {}})),
+    ("node-list", answer_with_repository_field("b0", {"nodes": [[7, "MERGED"]]})),
+]
+
+CATEGORY_CASES = [
+    ("exit-4", {"code": 4}, "not_authenticated"),
+    ("http-401", {"code": 1, "stderr": HTTP_401}, "not_authenticated"),
+    ("auth-login", {"code": 1, "stderr": "To authenticate, run: gh auth login"}, "not_authenticated"),
+    ("rate-limit-text", {"code": 1, "stderr": "API rate limit exceeded"}, "rate_limited"),
+    (
+        "rate-limited-type",
+        {"code": 1, "stdout": RATE_LIMITED_BODY, "stderr": "something unrelated"},
+        "rate_limited",
+    ),
+    ("not-found-type", {"code": 1, "stdout": NOT_FOUND_BODY}, "not_found"),
+    ("null-repository", {"code": 0, "stdout": NULL_REPOSITORY}, "not_found"),
+    ("null-repository-exit-1", {"code": 1, "stdout": NULL_REPOSITORY}, "not_found"),
+    ("exit-4-beats-rate-limit", {"code": 4, "stderr": "rate limit"}, "not_authenticated"),
+    (
+        "rate-limit-beats-credentials",
+        {"code": 1, "stderr": f"rate limit and {HTTP_401}"},
+        "rate_limited",
+    ),
+    ("not-json", {"code": 0, "stdout": "this is not json"}, "failed"),
+    ("missing-nodes", {"code": 0, "stdout": MISSING_NODES}, "failed"),
+    ("draft-state", {"code": 0, "stdout": merged_answer_with({"state": "DRAFT"})}, "failed"),
+    ("zero-number", {"code": 0, "stdout": merged_answer_with({"number": 0})}, "failed"),
+    (
+        "bad-head-object",
+        {"code": 0, "stdout": merged_answer_with({"headRefOid": "not-an-object"})},
+        "failed",
+    ),
+    (
+        "cross-not-boolean",
+        {"code": 0, "stdout": merged_answer_with({"isCrossRepository": "no"})},
+        "failed",
+    ),
+    ("over-8-mib", {"code": 0, "stdout": oversized_answer()}, "failed"),
+    ("exit-2", {"code": 2}, "failed"),
+    (
+        "error-type-list",
+        {"code": 1, "stdout": {"errors": [{"type": ["RATE_LIMITED"]}]}},
+        "failed",
+    ),
+    (
+        "error-type-dict",
+        {"code": 1, "stdout": {"errors": [{"type": {"RATE_LIMITED": 1}}]}},
+        "failed",
+    ),
+    ("huge-integer-exit-0", {"code": 0, "stdout": "1" * 5000}, "failed"),
+    ("huge-integer-exit-1", {"code": 1, "stdout": "1" * 5000}, "failed"),
+    *((name, {"code": 0, "stdout": answer}, "failed") for name, answer in ODD_SHAPE_CASES),
+]
+
+
+@posix_only
+def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
+    tmp_path, monkeypatch
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    off = github_collect(folder, github_lookup=False)
+
+    document = github_collect(folder)
+
+    assert len(fake.calls()) == 1
+    assert lookup_of(document) == lookup("live", None)
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("replay", "reason"),
+    [case[1:] for case in CATEGORY_CASES],
+    ids=[case[0] for case in CATEGORY_CASES],
+)
+def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladder_alone(
+    tmp_path, monkeypatch, replay, reason
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, **replay)
+    off = github_collect(folder, github_lookup=False)
+
+    document = github_collect(folder)
+
+    assert len(fake.calls()) == 1
+    assert lookup_of(document) == lookup("unavailable", reason)
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+def test_a_gh_that_outlasts_the_call_cap_times_out_while_the_remote_check_stays_live(
+    tmp_path, monkeypatch
+):
+    folder = merged_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world(), delay=30)
+
+    started = time.monotonic()
+    document = github_collect(folder, call_cap_seconds=2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert lookup_of(document) == lookup("unavailable", "timed_out")
+    assert document["repositories"][0]["remote"]["check"] == {"status": "live", "reason": None}
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@pytest.mark.parametrize(
+    ("key", "identity"),
+    [
+        ("github.com/acme/widget", ("github.com", "acme", "widget")),
+        ("acme.ghe.com/acme/widget", ("acme.ghe.com", "acme", "widget")),
+        ("gitlab.example.com/acme/widget", None),
+        ("github.com/acme/widget/extra", None),
+        ("github.com/acme", None),
+        ("github.com:8443/acme/widget", None),
+        (".ghe.com/acme/widget", None),
+        ("github.com//widget", None),
+        ("ghe.com/acme/widget", None),
+    ],
+)
+def test_github_identity_accepts_only_a_github_host_with_an_owner_and_repository(key, identity):
+    assert models.github_identity(key) == identity
+
+
+def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lookup):
+    # With remote checks on the group's check is a live one; off, the sample's own.
+    check = {"status": "live", "reason": None}
+    document = (
+        with_check(sample_document, check) if remote_checks == "on" else doc_copy(sample_document)
+    )
+    document["github_lookup"] = github_lookup
+    document["remote_checks"] = remote_checks
+    document["repositories"][0]["remote"]["key"] = key
+    document["repositories"][0]["pr_lookup"] = pr_lookup
+    return redigest(document)
+
+
+def recorded_lookup(reason: str | None, checked_at: str | None = "2026-10-24T00:00:00Z"):
+    return {"status": "recorded", "reason": reason, "checked_at": checked_at}
+
+
+LOOKUP_ACCEPTED = [
+    ("off", "on", GITHUB_KEY, lookup("off", "setting_off")),
+    ("off", "off", GITHUB_KEY, lookup("off", "setting_off")),
+    ("on", "on", "example.com/acme/widget", lookup("off", "not_github")),
+    ("on", "off", "example.com/acme/widget", lookup("off", "not_github")),
+    ("on", "off", GITHUB_KEY, lookup("off", "remote_checks_off")),
+    ("on", "off", GITHUB_KEY, recorded_lookup("remote_checks_off")),
+    ("on", "on", GITHUB_KEY, lookup("live", None)),
+    *[
+        ("on", "on", GITHUB_KEY, recorded_lookup(reason))
+        for reason in (
+            "gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed",
+        )
+    ],
+    *[
+        ("on", "on", GITHUB_KEY, lookup("unavailable", reason))
+        for reason in (
+            "gh_missing", "not_authenticated", "not_found", "rate_limited", "timed_out", "failed",
+        )
+    ],
+]
+LOOKUP_REFUSED = [
+    ("off", "on", GITHUB_KEY, lookup("off", "not_github")),
+    ("off", "on", GITHUB_KEY, lookup("live", None)),
+    ("on", "on", "example.com/acme/widget", lookup("live", None)),
+    ("on", "on", GITHUB_KEY, lookup("off", "not_github")),
+    ("on", "on", GITHUB_KEY, lookup("off", "setting_off")),
+    ("on", "on", GITHUB_KEY, lookup("off", "remote_checks_off")),
+    ("on", "on", GITHUB_KEY, lookup("live", "failed")),
+    ("on", "on", GITHUB_KEY, lookup("unavailable", None)),
+    ("on", "on", GITHUB_KEY, lookup("unavailable", "setting_off")),
+    ("on", "off", GITHUB_KEY, lookup("live", None)),
+    ("on", "off", GITHUB_KEY, lookup("unavailable", "failed")),
+    ("on", "on", GITHUB_KEY, {**lookup("live", None), "checked_at": "2026-10-24T00:00:00Z"}),
+    ("on", "on", GITHUB_KEY, recorded_lookup("remote_checks_off")),
+    ("on", "on", GITHUB_KEY, None),
+]
+
+
+@pytest.mark.parametrize(("github", "checks", "key", "pr_lookup"), LOOKUP_ACCEPTED)
+def test_parser_accepts_each_lookup_status_and_reason_combination(
+    sample, github, checks, key, pr_lookup
+):
+    document, _folder = sample
+    broken = lookup_document(
+        document, github_lookup=github, remote_checks=checks, key=key, pr_lookup=pr_lookup
+    )
+    assert models.parse_checkouts(broken)["repositories"][0]["pr_lookup"] == pr_lookup
+
+
+@pytest.mark.parametrize(("github", "checks", "key", "pr_lookup"), LOOKUP_REFUSED)
+def test_parser_refuses_a_lookup_status_that_contradicts_the_setting_or_the_remote(
+    sample, github, checks, key, pr_lookup
+):
+    document, _folder = sample
+    accepted = lookup_document(
+        document, github_lookup="off", remote_checks=checks, key=GITHUB_KEY,
+        pr_lookup=lookup("off", "setting_off"),
+    )
+    assert models.parse_checkouts(accepted)
+    broken = lookup_document(
+        document, github_lookup=github, remote_checks=checks, key=key, pr_lookup=pr_lookup
+    )
+    assert "pr_lookup" in refusal_of(broken)
+
+
+def test_parser_refuses_a_lookup_on_a_repository_with_no_remote_and_a_missing_one_with_a_remote(
+    sample,
+):
+    document, _folder = sample
+    remoteless = doc_copy(document)
+    without_remote(remoteless)
+    remoteless["repositories"][0]["pr_lookup"] = lookup("off", "setting_off")
+    assert "without a remote" in refusal_of(remoteless)
+    for key in ("github_lookup",):
+        missing = doc_copy(document)
+        del missing[key]
+        assert "invalid shape" in refusal_of(missing)
+    absent = doc_copy(document)
+    del absent["repositories"][0]["pr_lookup"]
+    assert "invalid shape" in refusal_of(absent)
+
+
+@posix_only
+def test_the_request_declares_every_variable_its_aliases_use(tmp_path, monkeypatch):
+    # GitHub refuses a query that uses an undeclared variable, so every real lookup
+    # would fail even though the fake accepts any body.
+    folder, *_ = two_clone_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=github_answer(3))
+
+    github_collect(folder)
+
+    [call] = fake.calls()
+    query = json.loads(call.body)["query"]
+    header = re.match(r"query\((?P<declarations>[^)]*)\)", query)
+    assert header is not None
+    declared = dict(
+        item.strip().split(": ", 1) for item in header["declarations"].split(",")
+    )
+    assert declared == {
+        "$owner": "String!", "$name": "String!",
+        "$h0": "String!", "$h1": "String!", "$h2": "String!",
+    }
+    assert set(re.findall(r"\$\w+", query[header.end():])) == set(declared)
+
+
+@posix_only
+@pytest.mark.parametrize("case", ["setting-off", "remote-checks-off", "gh-missing"])
+def test_a_lookup_that_makes_no_call_leaves_the_remote_check_and_the_git_ladder_alone(
+    tmp_path, monkeypatch, case
+):
+    folder = merged_world(tmp_path)
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world())
+    remote_checks = case != "remote-checks-off"
+    off = github_collect(folder, github_lookup=False, remote_checks=remote_checks)
+    if case == "gh-missing":
+        monkeypatch.setenv("PATH", git_only_path(tmp_path))
+
+    document = github_collect(
+        folder, github_lookup=case != "setting-off", remote_checks=remote_checks
+    )
+
+    assert fake.calls() == []
+    assert lookup_of(document) == {
+        "setting-off": lookup("off", "setting_off"),
+        "remote-checks-off": lookup("off", "remote_checks_off"),
+        "gh-missing": lookup("unavailable", "gh_missing"),
+    }[case]
+    assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
+    [work] = all_clones(document)
+    assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+
+
+@posix_only
+def test_a_gh_call_is_cut_at_the_collection_deadline_before_its_call_cap(tmp_path, monkeypatch):
+    folder = merged_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=valid_for_merged_world(), delay=30)
+
+    started = time.monotonic()
+    document = github_collect(folder, seconds=4, call_cap_seconds=20)
+    elapsed = time.monotonic() - started
+
+    assert lookup_of(document) == lookup("unavailable", "timed_out")
+    assert elapsed < 12
+
+
+# ---------------------------------------------------------------------------
+# GitHub pull requests: the facts of each branch and the pull-request rung
+# ---------------------------------------------------------------------------
+
+UNRELATED_HEAD = "b" * 40
+MISSING_HEAD = "c" * 40
+
+
+def pr_node(
+    number: int, state: str, head: str, base: str = "trunk", cross: bool = False
+) -> dict[str, Any]:
+    return {
+        "number": number,
+        "state": state.upper(),
+        "headRefOid": head,
+        "baseRefName": base,
+        "isCrossRepository": cross,
+    }
+
+
+def local_names(*repositories: Path) -> list[str]:
+    """The distinct local branch names of the clones, sorted as the request sorts them."""
+    names: set[str] = set()
+    for repository in repositories:
+        listing = git(repository, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+        names.update(listing.stdout.split())
+    return sorted(names)
+
+
+def pr_answer(names: list[str], pulls: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """A valid ``gh`` answer: ``pulls`` by branch name, one alias per sorted name."""
+    repository: dict[str, Any] = {"__typename": "Repository"}
+    for index, name in enumerate(names):
+        repository[f"b{index}"] = {"nodes": [dict(node) for node in pulls.get(name, [])]}
+    return {"data": {"repository": repository}}
+
+
+def verdict_facts(branch_or_worktree: dict[str, Any]):
+    verdict = branch_or_worktree["verdict"]
+    return None if verdict is None else (
+        verdict["state"], verdict["rung"], verdict["reason"], verdict["pull_request"]
+    )
+
+
+def pr_verdict(number: int) -> tuple[str, str, None, int]:
+    return ("merged", "pull_request", None, number)
+
+
+NOT_MERGED_FACTS = ("not_merged", "none", None, None)
+
+
+def listed(branch: dict[str, Any]) -> list[tuple[int, str, bool]]:
+    return [(pull["number"], pull["state"], pull["head_matches"]) for pull in branch["pull_requests"]]
+
+
+@posix_only
+def test_each_branch_lists_the_same_repository_pull_requests_that_name_it(tmp_path, monkeypatch):
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(work, "topic.txt", "topic\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "branch", "plain", "trunk")
+    git(work, "branch", "many", "trunk")
+    names = local_names(work)
+    many = [pr_node(number, "closed", UNRELATED_HEAD) for number in range(40, 29, -1)]
+    pulls = {
+        "topic": [
+            pr_node(9, "closed", UNRELATED_HEAD),
+            pr_node(7, "open", tip),
+            pr_node(5, "merged", UNRELATED_HEAD),
+            pr_node(6, "merged", tip, base="release"),
+            pr_node(8, "merged", tip, cross=True),
+        ],
+        "many": many,
+    }
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, pulls))
+
+    document = github_collect(folder)
+
+    assert lookup_of(document) == lookup("live", None)
+    [item] = all_clones(document)
+    assert [pull["number"] for pull in many_of(item)] == list(range(31, 41))
+    assert branch_of(item, "topic")["pull_requests"] == [
+        {"number": 5, "state": "merged", "head_matches": False},
+        {"number": 6, "state": "merged", "head_matches": True},
+        {"number": 7, "state": "open", "head_matches": True},
+        {"number": 9, "state": "closed", "head_matches": False},
+    ]
+    # An open request, one into another base and a cross-repository one never decide.
+    assert verdict_facts(branch_of(item, "topic")) == NOT_MERGED_FACTS
+    # Every branch carries the list, the verdict base's and a branch with no node included.
+    assert branch_of(item, "trunk")["pull_requests"] == []
+    assert branch_of(item, "plain")["pull_requests"] == []
+    assert all("pull_requests" in branch for branch in item["branches"])
+
+    # Nothing is listed when the lookup is off, cannot answer, or the clone has no origin.
+    off = github_collect(folder, github_lookup=False)
+    assert all(b["pull_requests"] == [] for b in find_clone(off, work)["branches"])
+    unchecked = github_collect(folder, remote_checks=False)
+    assert lookup_of(unchecked) == lookup("off", "remote_checks_off")
+    assert all(b["pull_requests"] == [] for b in find_clone(unchecked, work)["branches"])
+    fake.replay(code=4)
+    refused = github_collect(folder)
+    assert lookup_of(refused) == lookup("unavailable", "not_authenticated")
+    assert all(b["pull_requests"] == [] for b in find_clone(refused, work)["branches"])
+    git(work, "remote", "remove", "origin")
+    fake.replay(stdout=pr_answer(names, pulls))
+    remoteless = github_collect(folder)
+    [repository] = remoteless["repositories"]
+    assert repository["pr_lookup"] is None
+    assert all(b["pull_requests"] == [] for b in all_clones(remoteless)[0]["branches"])
+
+
+def many_of(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return branch_of(item, "many")["pull_requests"]
+
+
+def landed_world(tmp_path: Path):
+    """A clone with ``done`` and ``sq`` squash-merged, ``open`` unmerged, all on GitHub."""
+    folder, remote, work = small_world(tmp_path)
+    land(work, "done")
+    land(work, "sq")
+    git(work, "checkout", "-q", "-b", "open", "trunk")
+    commit_file(work, "open.txt", "open\n")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    return folder, remote, work
+
+
+@posix_only
+def test_a_merged_pull_request_whose_head_is_the_tip_proves_the_branch_merged_uncached(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = landed_world(tmp_path)
+    tip = rev(work, "done")
+    detached = linked(work, tmp_path, "at-done", "--detach", "done")
+    names = local_names(work)
+    pulls = {"done": [pr_node(4, "merged", tip), pr_node(3, "merged", tip)]}
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, pulls))
+
+    document = github_collect(folder)
+
+    item = find_clone(document, work)
+    assert branch_of(item, "done")["verdict"] == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 3,
+    }
+    assert "not_merged" not in branch_of(item, "done")["removable"]["blockers"]
+    assert branch_of(item, "done")["removable"] == {"removable": True, "blockers": []}
+    # Every other verdict has no pull request, and the git ladder decided them.
+    assert verdict_facts(branch_of(item, "sq")) == ("merged", "squash_equivalent", None, None)
+    assert verdict_facts(branch_of(item, "open")) == NOT_MERGED_FACTS
+    assert branch_of(item, "trunk")["verdict"] is None
+    # A linked detached worktree at the tip takes the commit's one verdict.
+    linked_at_tip = find_worktree(item, detached)
+    assert verdict_facts(linked_at_tip) == pr_verdict(3)
+    assert "not_merged" not in linked_at_tip["removable"]["blockers"]
+    # No pull-request verdict is remembered, while a git-ladder verdict is.
+    base = rev(work, "origin/trunk")
+    stored = cache_entries(cache)
+    assert f"{tip}.{base}" not in stored
+    assert stored[f"{rev(work, 'sq')}.{base}"] == "squash_equivalent"
+    assert stored[f"{rev(work, 'open')}.{base}"] == "none"
+
+    # With the lookup unable to answer and no saved listing to stand in for it, the
+    # same branches have their git verdicts.
+    saved = saved_file(cache)
+    for record in saved["remote_checks"].values():
+        record["pull_requests"] = None
+    cache.write_text(json.dumps(saved))
+    fake.replay(code=4)
+    plain = github_collect(folder)
+    plain_item = find_clone(plain, work)
+    assert verdict_facts(branch_of(plain_item, "done")) == ("merged", "squash_equivalent", None, None)
+    assert verdict_facts(find_worktree(plain_item, detached)) == (
+        "merged", "squash_equivalent", None, None,
+    )
+    assert all(
+        (b["verdict"] or {"pull_request": None})["pull_request"] is None
+        for b in plain_item["branches"]
+    )
+
+
+@posix_only
+def test_a_branch_the_base_already_contains_stays_ancestor_beside_a_merged_request(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "joined", "trunk")
+    tip = commit_file(work, "joined.txt", "joined\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge joined", "joined")
+    git(work, "push", "-q", "origin", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"joined": [pr_node(2, "merged", tip)]}),
+    )
+
+    joined = branch_of(find_clone(github_collect(folder), work), "joined")
+
+    assert verdict_facts(joined) == ("merged", "ancestor", None, None)
+    assert listed(joined) == [(2, "merged", True)]
+
+
+@posix_only
+def test_branches_at_one_commit_share_the_verdict_of_the_pull_request_that_names_one(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "x", "trunk")
+    tip = commit_file(work, "x.txt", "x\n")
+    git(work, "branch", "y", "x")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"x": [pr_node(15, "merged", tip)]}),
+    )
+
+    item = find_clone(github_collect(folder), work)
+
+    assert verdict_facts(branch_of(item, "x")) == pr_verdict(15)
+    assert verdict_facts(branch_of(item, "y")) == pr_verdict(15)
+    assert listed(branch_of(item, "x")) == [(15, "merged", True)]
+    assert listed(branch_of(item, "y")) == []
+
+
+@posix_only
+def test_a_detached_worktree_at_a_commit_no_local_branch_holds_never_takes_the_rung(
+    tmp_path, monkeypatch
+):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    first = clone(remote, folder / "a")
+    second = clone(remote, folder / "b")
+    git(second, "checkout", "-q", "-b", "elsewhere", "trunk")
+    head = commit_file(second, "elsewhere.txt", "elsewhere\n")
+    git(first, "fetch", "-q", str(second), "elsewhere")
+    detached = linked(first, tmp_path, "at-head", "--detach", head)
+    for repository in (first, second):
+        point_origin_at(repository, remote, GITHUB_URL)
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(first, second), {"elsewhere": [pr_node(31, "merged", head)]}),
+    )
+
+    document = github_collect(folder)
+
+    assert verdict_facts(find_worktree(find_clone(document, first), detached)) == NOT_MERGED_FACTS
+    # The clone that holds the named branch is decided by the same request.
+    assert verdict_facts(branch_of(find_clone(document, second), "elsewhere")) == pr_verdict(31)
+
+
+@posix_only
+def test_a_shallow_clone_takes_the_rung_before_its_incomplete_clone_verdict(
+    tmp_path, monkeypatch
+):
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    author = clone(remote, tmp_path / "author")
+    git(author, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(author, "topic.txt", "topic\n")
+    git(author, "push", "-q", "origin", "topic")
+    shallow = clone(remote.as_uri(), folder / "shallow", "--depth=1", "--no-single-branch")
+    git(shallow, "branch", "topic", "origin/topic")
+    point_origin_at(shallow, remote, GITHUB_URL)
+    names = local_names(shallow)
+    fake = install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(names, {"topic": [pr_node(21, "merged", tip)]}),
+    )
+
+    item = find_clone(github_collect(folder), shallow)
+
+    assert item["shallow"] is True
+    assert verdict_facts(branch_of(item, "topic")) == pr_verdict(21)
+    fake.replay(code=4)
+    undecided = find_clone(github_collect(folder), shallow)
+    assert verdict_facts(branch_of(undecided, "topic")) == (
+        "unknown", None, "incomplete_clone", None,
+    )
+
+
+def squash_world(
+    tmp_path: Path, *, first_inside: bool = True, filtered: bool = False, trunk_fetched: bool = False
+):
+    """Clones ``a`` and ``b`` share ``topic`` at ``tip``; ``a`` then adds two commits,
+    pushes ``topic`` and squash-merges it into ``trunk``, and ``b`` fetches nothing
+    (only ``trunk``, when ``trunk_fetched``: the head of ``topic`` stays missing).
+
+    Returns the folder, the clones and the commits ``tip`` and ``head``."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    if filtered:
+        allow_filters(remote)
+    first = clone(remote, (folder if first_inside else tmp_path / "outside") / "a")
+    git(first, "checkout", "-q", "-b", "topic", "trunk")
+    tip = commit_file(first, "topic.txt", "topic\n")
+    git(first, "push", "-q", "origin", "topic")
+    if filtered:
+        second = clone(remote.as_uri(), folder / "b", "--filter=blob:none")
+    else:
+        second = clone(remote, folder / "b")
+    git(second, "branch", "topic", "origin/topic")
+    commit_file(first, "topic-2.txt", "two\n")
+    head = commit_file(first, "topic-3.txt", "three\n")
+    git(first, "push", "-q", "origin", "topic")
+    git(first, "checkout", "-q", "trunk")
+    git(first, "merge", "--squash", "topic")
+    git(first, "commit", "-q", "-m", "land topic")
+    git(first, "push", "-q", "origin", "trunk")
+    for repository in (first, second):
+        point_origin_at(repository, remote, GITHUB_URL)
+    if trunk_fetched:
+        git(second, "fetch", "-q", "origin", "trunk")
+    return folder, remote, first, second, tip, head
+
+
+def squash_answer(
+    clones: tuple[Path, ...], head: str, *, number: int = 12, **node: Any
+) -> dict[str, Any]:
+    pulls = [pr_node(number, node.pop("state", "merged"), head, **node)]
+    return pr_answer(local_names(*clones), {"topic": pulls})
+
+
+@posix_only
+def test_a_tip_that_is_an_ancestor_of_a_merged_head_found_in_a_sibling_is_merged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    assert git(second, "cat-file", "-e", head, check=False).returncode != 0
+    before = object_files(second)
+
+    document = github_collect(folder)
+
+    item = find_clone(document, second)
+    topic = branch_of(item, "topic")
+    assert topic["sha"] == tip
+    assert verdict_facts(topic) == pr_verdict(12)
+    assert listed(topic) == [(12, "merged", False)]
+    assert listed(branch_of(find_clone(document, first), "topic")) == [(12, "merged", True)]
+    assert verdict_facts(branch_of(find_clone(document, first), "topic")) == pr_verdict(12)
+    # Nothing was fetched into the lagging clone: the head was read from the sibling.
+    assert object_files(second) == before
+    assert git(second, "cat-file", "-e", head, check=False).returncode != 0
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"base": "release"}, {"state": "open"}, {"state": "closed"}, {"cross": True}],
+    ids=["other-base", "open", "closed", "cross-repository"],
+)
+@posix_only
+def test_a_request_that_is_not_a_merged_same_repository_one_into_the_base_never_decides(
+    tmp_path, monkeypatch, change
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head, **change))
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert len(topic["pull_requests"]) == (0 if change.get("cross") else 1)
+
+
+@posix_only
+def test_unavailable_and_non_ancestor_heads_are_skipped_in_number_order(tmp_path, monkeypatch):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    seed = rev(second, "origin/trunk")
+    nodes = [
+        pr_node(12, "merged", head),
+        pr_node(11, "merged", MISSING_HEAD),
+        pr_node(9, "merged", seed),
+    ]
+    stdout = pr_answer(local_names(first, second), {"topic": nodes})
+    install_fake_gh(tmp_path, monkeypatch, stdout=stdout)
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    # #9 has the tip as no ancestor, #11 is held by no clone, and #12 decides.
+    assert verdict_facts(topic) == pr_verdict(12)
+    assert listed(topic) == [(9, "merged", False), (11, "merged", False), (12, "merged", False)]
+
+
+@posix_only
+def test_commits_after_the_merge_and_a_branch_name_reused_afterwards_are_not_merged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path)
+    git(second, "checkout", "-q", "topic")
+    commit_file(second, "later.txt", "later\n")
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+
+    document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+    assert "not_merged" in topic["removable"]["blockers"]
+
+    # A clone fetched after the merge that starts a new topic from the merged trunk.
+    third = clone(_remote, folder / "c")
+    point_origin_at(third, _remote, GITHUB_URL)
+    git(third, "checkout", "-q", "-b", "topic", "trunk")
+    commit_file(third, "fresh.txt", "fresh\n")
+    install_fake_gh(tmp_path / "again", monkeypatch, stdout=squash_answer((first, second, third), head))
+    reused = branch_of(find_clone(github_collect(folder), third), "topic")
+    assert git(third, "cat-file", "-e", head, check=False).returncode == 0
+    assert verdict_facts(reused) == NOT_MERGED_FACTS
+    assert listed(reused) == [(12, "merged", False)]
+
+
+@posix_only
+def test_a_reused_branch_name_after_a_merge_commit_is_not_merged_whichever_way_ancestry_runs(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    earlier = commit_file(work, "earlier.txt", "earlier\n")
+    git(work, "checkout", "-q", "trunk")
+    git(work, "merge", "-q", "--no-ff", "-m", "merge topic", "topic")
+    git(work, "push", "-q", "origin", "trunk")
+    git(work, "branch", "-q", "-D", "topic")
+    git(work, "checkout", "-q", "-b", "topic", "trunk")
+    commit_file(work, "again.txt", "again\n")
+    git(work, "checkout", "-q", "trunk")
+    point_origin_at(work, remote, GITHUB_URL)
+    # The earlier head is in the history of the base and of the new topic.
+    assert git(work, "merge-base", "--is-ancestor", earlier, "topic", check=False).returncode == 0
+    install_fake_gh(
+        tmp_path, monkeypatch,
+        stdout=pr_answer(local_names(work), {"topic": [pr_node(20, "merged", earlier)]}),
+    )
+
+    topic = branch_of(find_clone(github_collect(folder), work), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(20, "merged", False)]
+
+
+@posix_only
+def test_a_head_held_only_by_a_clone_outside_the_folders_leaves_the_git_ladder_to_decide(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, first_inside=False)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+
+    topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+def objects_snapshot(repository: Path) -> list[tuple[str, bytes]]:
+    root = repository / ".git" / "objects"
+    return sorted(
+        (item.relative_to(root).as_posix(), item.read_bytes())
+        for item in root.rglob("*")
+        if item.is_file()
+    )
+
+
+def ladder_probe_log(tmp_path: Path, head: str) -> tuple[Path, Path]:
+    """A git stand-in that logs the lazy-fetch and alternates variables of every
+    verdict call that names ``head``."""
+    log = tmp_path / "head-calls.log"
+    body = (
+        f'case "$*" in *"--no-replace-objects"*{head}*) '
+        f'printf "%s|%s|%s\\n" "$GIT_NO_LAZY_FETCH" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" "$*" '
+        f'>> "{log}";; esac'
+    )
+    return stand_in(tmp_path, "probe", body), log
+
+
+@pytest.mark.parametrize("trunk_fetched", [False, True], ids=["base-lent", "head-lent"])
+@posix_only
+def test_every_call_that_looks_for_a_head_runs_without_a_lazy_fetch(
+    tmp_path, monkeypatch, trunk_fetched
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=trunk_fetched)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim, log = ladder_probe_log(tmp_path, head)
+
+    with path_with(monkeypatch, shim):
+        topic = branch_of(find_clone(github_collect(folder), second), "topic")
+
+    assert verdict_facts(topic) == pr_verdict(12)
+    calls = [line.split("|", 2) for line in log.read_text().splitlines()]
+    probes = [call for call in calls if "rev-list --no-walk" in call[2]]
+    ancestry = [call for call in calls if "merge-base --is-ancestor" in call[2]]
+    # The clone alone reads the head through the sibling that lent the base; when
+    # the clone holds the base, the first sibling that holds the head is asked and
+    # lends its objects to the ancestry test.
+    assert len(ancestry) == 1
+    assert len(probes) == (2 if trunk_fetched else 1)
+    assert {call[0] for call in calls} == {"1"}
+    assert ancestry[0][1] == os.path.join(real(first), ".git", "objects")
+    assert probes[0][1] == ("" if trunk_fetched else ancestry[0][1])
+
+
+@posix_only
+def test_a_blobless_clone_lacking_the_head_is_left_byte_for_byte_unchanged(
+    tmp_path, monkeypatch
+):
+    folder, _remote, first, second, _tip, head = squash_world(
+        tmp_path, first_inside=False, filtered=True
+    )
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim, log = ladder_probe_log(tmp_path, head)
+    before = objects_snapshot(second)
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert find_clone(document, second)["partial_clone"] is True
+    assert verdict_facts(topic) == ("unknown", None, "incomplete_clone", None)
+    assert listed(topic) == [(12, "merged", False)]
+    assert objects_snapshot(second) == before
+    calls = [line.split("|", 2) for line in log.read_text().splitlines()]
+    assert calls and {call[0] for call in calls} == {"1"}
+
+
+ANCESTRY_FAILURES = {
+    "failed": ("exit 128", "failed"),
+    "late": ("exec sleep 30", "deadline"),
+}
+
+
+@pytest.mark.parametrize("case", list(ANCESTRY_FAILURES))
+@posix_only
+def test_a_failed_or_late_ancestry_test_fails_the_tip_and_stores_nothing(
+    tmp_path, monkeypatch, isolated_git, case
+):
+    cache = nyx_home(isolated_git)
+    action, reason = ANCESTRY_FAILURES[case]
+    folder, _remote, first, second, tip, head = squash_world(tmp_path)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(
+        tmp_path, "ancestry", f'case "$*" in *"merge-base --is-ancestor {tip} {head}"*) {action};; esac'
+    )
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder, call_cap_seconds=1.0)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == ("unknown", None, reason, None)
+    assert listed(topic) == [(12, "merged", False)]
+    base = rev(second, "origin/trunk")
+    assert f"{tip}.{base}" not in (cache_entries(cache) if cache.exists() else {})
+
+
+PROBE_FAILURES = {
+    "in-the-clone": lambda first, second, head: (
+        f'case "$*" in *"-C {real(second)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exit 128;; esac'
+    ),
+    "in-the-sibling": lambda first, second, head: (
+        f'case "$*" in *"-C {real(first)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exit 128;; esac'
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(PROBE_FAILURES))
+@posix_only
+def test_a_probe_for_the_head_that_cannot_say_counts_as_an_unavailable_head(
+    tmp_path, monkeypatch, case
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=True)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(tmp_path, "probe-fails", PROBE_FAILURES[case](first, second, head))
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+# -- the parser ---------------------------------------------------------------
+
+
+def lookup_live(document: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``document`` whose one repository is a GitHub one with a live lookup."""
+    return rederive(
+        lookup_document(
+            document, github_lookup="on", remote_checks="on", key=GITHUB_KEY,
+            pr_lookup=lookup("live", None),
+        )
+    )
+
+
+def merged_by_request(branch: dict[str, Any], number: int = 12, listed_on=None) -> None:
+    branch["verdict"] = verdict_of("merged", "pull_request", pull_request=number)
+    (listed_on or branch)["pull_requests"] = [
+        {"number": number, "state": "merged", "head_matches": False}
+    ]
+
+
+def mutate_request_without_a_lookup(document):
+    merged_by_request(branch_of(first_clone(document), "never-pushed"))
+
+
+def mutate_list_without_a_lookup(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": 3, "state": "open", "head_matches": True}
+    ]
+
+
+def mutate_rung_names_an_unlisted_request(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch, 12)
+    branch["pull_requests"] = []
+
+
+def mutate_rung_names_an_open_request(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch, 12)
+    branch["pull_requests"][0]["state"] = "open"
+
+
+def mutate_rung_names_another_commits_request(document):
+    clone_document = first_clone(document)
+    assert branch_of(clone_document, "trunk")["sha"] != branch_of(clone_document, "never-pushed")["sha"]
+    merged_by_request(
+        branch_of(clone_document, "never-pushed"), 12, listed_on=branch_of(clone_document, "trunk")
+    )
+    branch_of(clone_document, "never-pushed")["pull_requests"] = []
+
+
+def mutate_number_with_another_rung(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch)
+    branch["verdict"]["rung"] = "ancestor"
+
+
+def mutate_rung_without_a_number(document):
+    branch = branch_of(first_clone(document), "never-pushed")
+    merged_by_request(branch)
+    branch["verdict"]["pull_request"] = None
+
+
+def mutate_number_on_an_undecided_verdict(document):
+    branch_of(first_clone(document), "never-pushed")["verdict"] = verdict_of(
+        "unknown", reason="failed", pull_request=12
+    )
+
+
+def mutate_number_that_is_not_positive(value):
+    def mutate(document):
+        branch = branch_of(first_clone(document), "never-pushed")
+        merged_by_request(branch)
+        branch["verdict"]["pull_request"] = value
+
+    return mutate
+
+
+def mutate_detached_rung_at_an_unheld_commit(document):
+    clone_document = first_clone(document)
+    worktree = detach(document, verdict_of("merged", "pull_request", pull_request=12))
+    worktree["head"]["sha"] = "d" * 40
+    branch_of(clone_document, "never-pushed")["pull_requests"] = [
+        {"number": 12, "state": "merged", "head_matches": False}
+    ]
+
+
+def mutate_list_entry(change):
+    def mutate(document):
+        branch_of(first_clone(document), "never-pushed")["pull_requests"] = [change]
+
+    return mutate
+
+
+def mutate_unsorted_list(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "open", "head_matches": False} for number in (2, 1)
+    ]
+
+
+def mutate_repeated_number(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": 1, "state": "open", "head_matches": False},
+        {"number": 1, "state": "closed", "head_matches": False},
+    ]
+
+
+def mutate_eleven_requests(document):
+    branch_of(first_clone(document), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "open", "head_matches": False} for number in range(1, 12)
+    ]
+
+
+def mutate_list_missing(document):
+    del branch_of(first_clone(document), "never-pushed")["pull_requests"]
+
+
+GOOD_ENTRY = {"number": 3, "state": "open", "head_matches": True}
+REJECTED_PULL_REQUEST_DOCUMENTS = {
+    "rung_without_a_lookup": (False, mutate_request_without_a_lookup),
+    "list_without_a_lookup": (False, mutate_list_without_a_lookup),
+    "rung_names_an_unlisted_request": (True, mutate_rung_names_an_unlisted_request),
+    "rung_names_an_open_request": (True, mutate_rung_names_an_open_request),
+    "rung_names_another_commits_request": (True, mutate_rung_names_another_commits_request),
+    "number_with_another_rung": (True, mutate_number_with_another_rung),
+    "rung_without_a_number": (True, mutate_rung_without_a_number),
+    "number_on_an_undecided_verdict": (True, mutate_number_on_an_undecided_verdict),
+    "zero_number": (True, mutate_number_that_is_not_positive(0)),
+    "boolean_number": (True, mutate_number_that_is_not_positive(True)),
+    "text_number": (True, mutate_number_that_is_not_positive("12")),
+    "detached_rung_at_an_unheld_commit": (True, mutate_detached_rung_at_an_unheld_commit),
+    "unsorted_list": (True, mutate_unsorted_list),
+    "repeated_number": (True, mutate_repeated_number),
+    "eleven_requests": (True, mutate_eleven_requests),
+    "list_missing": (True, mutate_list_missing),
+    "foreign_state": (True, mutate_list_entry({**GOOD_ENTRY, "state": "draft"})),
+    "text_head_matches": (True, mutate_list_entry({**GOOD_ENTRY, "head_matches": "yes"})),
+    "boolean_entry_number": (True, mutate_list_entry({**GOOD_ENTRY, "number": True})),
+    "zero_entry_number": (True, mutate_list_entry({**GOOD_ENTRY, "number": 0})),
+    "extra_entry_key": (True, mutate_list_entry({**GOOD_ENTRY, "title": "x"})),
+    "missing_entry_key": (True, mutate_list_entry({"number": 3, "state": "open"})),
+}
+
+
+@pytest.mark.parametrize("name", list(REJECTED_PULL_REQUEST_DOCUMENTS))
+def test_parser_rejects_a_pull_request_violation_under_a_valid_digest(sample, name):
+    document, _folder = sample
+    lookup_used, mutation = REJECTED_PULL_REQUEST_DOCUMENTS[name]
+    base = lookup_live(document) if lookup_used else doc_copy(document)
+    assert models.parse_checkouts(redigest(rederive(doc_copy(base))))
+    broken = doc_copy(base)
+    mutation(broken)
+    assert "removable" not in refusal_of(rederive(broken))
+
+
+def test_parser_accepts_a_pull_request_rung_where_a_branch_at_the_commit_lists_it(sample):
+    document, _folder = sample
+    own = lookup_live(document)
+    merged_by_request(branch_of(first_clone(own), "never-pushed"))
+    assert models.parse_checkouts(redigest(rederive(own)))["repositories"][0]["pr_lookup"] == lookup(
+        "live", None
+    )
+    # A detached worktree takes the verdict through a branch at its commit.
+    shared = lookup_live(document)
+    clone_document = first_clone(shared)
+    branch = branch_of(clone_document, "outside")
+    branch["pull_requests"] = [{"number": 12, "state": "merged", "head_matches": False}]
+    # Every branch at the commit carries the one verdict the worktree shares.
+    holders = [item for item in clone_document["branches"] if item["sha"] == branch["sha"]]
+    assert [item["name"] for item in holders] == ["never-pushed", "outside"]
+    for holder in holders:
+        holder["verdict"] = verdict_of("merged", "pull_request", pull_request=12)
+    detach(shared, verdict_of("merged", "pull_request", pull_request=12))
+    assert models.parse_checkouts(redigest(rederive(shared)))
+    # A list of ten is the bound.
+    full = lookup_live(document)
+    branch_of(first_clone(full), "never-pushed")["pull_requests"] = [
+        {"number": number, "state": "closed", "head_matches": False} for number in range(1, 11)
+    ]
+    assert models.parse_checkouts(redigest(rederive(full)))
+
+
+@posix_only
+def test_the_first_ten_requests_in_answer_order_are_listed_and_the_base_lists_its_own(
+    tmp_path, monkeypatch
+):
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "branch", "many", "trunk")
+    trunk_tip = rev(work, "trunk")
+    # The answer order is not the number order: the eleventh node has the highest
+    # number, so keeping the ten highest numbers would differ from the first ten.
+    answered = [5, 40, 3, 22, 17, 9, 31, 12, 2, 28, 50]
+    pulls = {
+        "many": [pr_node(number, "closed", UNRELATED_HEAD) for number in answered],
+        "trunk": [pr_node(1, "merged", trunk_tip, base="release")],
+    }
+    install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(local_names(work), pulls))
+
+    item = find_clone(github_collect(folder), work)
+
+    assert [pull["number"] for pull in many_of(item)] == sorted(answered[:10])
+    # The verdict base branch lists the requests that name it like any other branch.
+    trunk = branch_of(item, "trunk")
+    assert trunk["verdict"] is None
+    assert listed(trunk) == [(1, "merged", True)]
+
+
+LATE_PROBES = {
+    "in-the-clone": lambda first, second, head: (
+        f'case "$*" in *"-C {real(second)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exec sleep 30;; esac'
+    ),
+    "in-the-sibling": lambda first, second, head: (
+        f'case "$*" in *"-C {real(first)} "*"--no-replace-objects"*"rev-list --no-walk"*{head}*) exec sleep 30;; esac'
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(LATE_PROBES))
+@posix_only
+def test_a_probe_for_the_head_that_times_out_counts_as_an_unavailable_head(
+    tmp_path, monkeypatch, case
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=True)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    shim = stand_in(tmp_path, "probe-late", LATE_PROBES[case](first, second, head))
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder, call_cap_seconds=1.0)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert verdict_facts(topic) == NOT_MERGED_FACTS
+    assert listed(topic) == [(12, "merged", False)]
+
+
+@pytest.mark.parametrize("value", [True, 1.0], ids=["boolean", "float"])
+def test_parser_rejects_a_rung_number_equal_to_a_listed_one_but_not_an_integer(sample, value):
+    document, _folder = sample
+    base = lookup_live(document)
+    branch = branch_of(first_clone(base), "never-pushed")
+    merged_by_request(branch, 1)
+    assert models.parse_checkouts(redigest(rederive(doc_copy(base))))
+    broken = doc_copy(base)
+    branch_of(first_clone(broken), "never-pushed")["verdict"]["pull_request"] = value
+    assert "pull_request" in refusal_of(rederive(broken))
+
+
+@posix_only
+def test_the_request_limit_and_the_list_cap_both_come_from_the_parser_constant(
+    tmp_path, monkeypatch
+):
+    cap = models.PULL_REQUEST_LIST_CAP
+    folder, remote, work = small_world(tmp_path)
+    point_origin_at(work, remote, GITHUB_URL)
+    git(work, "branch", "many", "trunk")
+    names = local_names(work)
+    nodes = [pr_node(number, "closed", UNRELATED_HEAD) for number in range(cap + 5, 0, -1)]
+    fake = install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(names, {"many": nodes}))
+
+    document = github_collect(folder)
+
+    [call] = fake.calls()
+    query = json.loads(call.body)["query"]
+    assert query.count(f"first: {cap},") == len(names)
+    assert query.count("first:") == len(names)
+    many = branch_of(find_clone(document, work), "many")["pull_requests"]
+    assert [pull["number"] for pull in many] == list(range(6, cap + 6))
+
+
+def refuse_lending(monkeypatch, *repositories: Path) -> None:
+    """Make the lender rule refuse the clones at ``repositories``."""
+    refused = {os.path.join(real(repository), ".git") for repository in repositories}
+    original = checkouts._lendable
+    monkeypatch.setattr(
+        checkouts,
+        "_lendable",
+        lambda context: os.path.realpath(context.common) not in refused and original(context),
+    )
+
+
+@pytest.mark.parametrize("trunk_fetched", [False, True], ids=["base-lent", "head-lent"])
+@posix_only
+def test_a_clone_the_lender_rule_refuses_lends_to_neither_the_live_apply_nor_the_rung(
+    tmp_path, monkeypatch, trunk_fetched
+):
+    folder, _remote, first, second, _tip, head = squash_world(tmp_path, trunk_fetched=trunk_fetched)
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((first, second), head))
+    lent = find_clone(github_collect(folder), second)
+    assert verdict_facts(branch_of(lent, "topic")) == pr_verdict(12)
+
+    refuse_lending(monkeypatch, first)
+    refused = find_clone(github_collect(folder), second)
+
+    assert verdict_facts(branch_of(refused, "topic")) == NOT_MERGED_FACTS
+    assert listed(branch_of(refused, "topic")) == [(12, "merged", False)]
+    if not trunk_fetched:
+        # The live apply borrows from the same candidates: without one it cannot count.
+        assert lent["local_default"]["vs_remote"]["objects_from"] == real(first)
+        assert refused["local_default"]["vs_remote"]["objects_from"] is None
+        assert refused["local_default"]["vs_remote"]["relation"] == "differs"
+
+
+@posix_only
+def test_the_first_sibling_in_natural_order_lends_to_both_the_live_apply_and_the_rung(
+    tmp_path, monkeypatch
+):
+    folder, remote, _first, second, tip, head = squash_world(
+        tmp_path, first_inside=False, trunk_fetched=True
+    )
+    holders = []
+    for name in ("holder 10", "holder 2"):
+        holder = clone(remote, folder / name)
+        point_origin_at(holder, remote, GITHUB_URL)
+        assert git(holder, "cat-file", "-e", head, check=False).returncode == 0
+        holders.append(holder)
+    later, earlier = holders
+    install_fake_gh(tmp_path, monkeypatch, stdout=squash_answer((second, *holders), head))
+    log = tmp_path / "head-calls.log"
+    shim = stand_in(
+        tmp_path,
+        "alternates",
+        f'case "$*" in *{head}*) '
+        f'printf "%s|%s\\n" "$GIT_ALTERNATE_OBJECT_DIRECTORIES" "$*" >> "{log}";; esac',
+    )
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    topic = branch_of(find_clone(document, second), "topic")
+    assert topic["sha"] == tip
+    # Both siblings hold the head; the one first in natural order lends it, to the
+    # live comparison of the branch and to the ancestry test of the rung alike.
+    assert topic["vs_remote"]["relation"] == "behind"
+    assert topic["vs_remote"]["objects_from"] == real(earlier)
+    assert verdict_facts(topic) == pr_verdict(12)
+    calls = [line.split("|", 1) for line in log.read_text().splitlines()]
+    [ancestry] = [call for call in calls if "merge-base --is-ancestor" in call[1]]
+    assert ancestry[0] == os.path.join(real(earlier), ".git", "objects")
+    # The search stops at the first holder: the later sibling is never asked.
+    assert not [call for call in calls if real(later) in call[1]]
+    # Each phase asks the clone itself once, then only its siblings: the clone is
+    # never among its own lender candidates.
+    places = {real(path): path.name for path in (second, earlier, later)}
+
+    def asked(ladder: bool) -> list[str]:
+        return [
+            name
+            for _alternates, arguments in calls
+            if "rev-list --no-walk" in arguments
+            and ("--no-replace-objects" in arguments) == ladder
+            for path, name in places.items()
+            if f"-C {path} " in arguments
+        ]
+
+    assert asked(ladder=False) == [second.name, earlier.name]
+    assert asked(ladder=True) == [second.name, earlier.name]
+
+
+# ---------------------------------------------------------------------------
+# Saved remote checks in the cache file
+# ---------------------------------------------------------------------------
+
+
+def records_world(tmp_path: Path):
+    """A GitHub-identity remote (``hub``, configured as ``GITHUB_URL``) and a
+    ``file://`` remote (``other``), each with one clone whose only extra
+    branches sit at an ancestor of ``trunk``, so no run decides a verdict the
+    cache could store."""
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    hub = make_remote(served, "hub.git")
+    other = make_remote(served, "other.git")
+    push_commit(hub, "trunk", tmp_path)
+    push_commit(other, "trunk", tmp_path)
+    first = clone(hub, folder / "a")
+    second = clone(other, folder / "b")
+    git(first, "branch", "feature/x-1")
+    for repository in (first, second):
+        git(repository, "branch", "older", "origin/trunk~1")
+    point_origin_at(first, hub, GITHUB_URL)
+    return folder, hub, other, first, second
+
+
+def remote_key_of(document: dict[str, Any], path: Path) -> str:
+    wanted = real(path)
+    [key] = [
+        repository["remote"]["key"]
+        for repository in document["repositories"]
+        if any(item["path"] == wanted for item in repository["clones"])
+    ]
+    return key
+
+
+def ls_remote_log(tmp_path: Path, name: str = "heads") -> tuple[Path, Path]:
+    """A git stand-in that logs the Unix second and arguments of each ``ls-remote`` start."""
+    log = tmp_path / f"{name}.log"
+    body = f'case "$*" in *" ls-remote "*) printf "%s %s\\n" "$(date +%s)" "$*" >> "{log}";; esac'
+    return stand_in(tmp_path, name, body), log
+
+
+def ls_remote_start(log: Path, repository: Path) -> int:
+    [line] = [
+        line for line in log.read_text().splitlines() if f"-C {real(repository)} " in line
+    ]
+    return int(line.split()[0])
+
+
+def saved_file(cache: Path) -> dict[str, Any]:
+    return json.loads(cache.read_text())
+
+
+def hub_pulls(first: Path) -> dict[str, list[dict[str, Any]]]:
+    return {"feature/x-1": [pr_node(7, "merged", rev(first, "feature/x-1"))]}
+
+
+def hub_gh(tmp_path: Path, monkeypatch, first: Path, **replay: Any) -> FakeGh:
+    stdout = replay.pop("stdout", pr_answer(local_names(first), hub_pulls(first)))
+    return install_fake_gh(tmp_path, monkeypatch, stdout=stdout, **replay)
+
+
+def move_away(remote: Path) -> Path:
+    target = remote.with_name(remote.name + ".away")
+    remote.rename(target)
+    return target
+
+
+@posix_only
+def test_a_networked_collection_saves_each_remotes_answer_under_its_group_key(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    push_commit(hub, "remote-only", tmp_path)
+    many = [pr_node(number, "closed", UNRELATED_HEAD) for number in range(100, 87, -1)]
+    pulls = {**hub_pulls(first), "older": many}
+    fake = hub_gh(tmp_path, monkeypatch, first, stdout=pr_answer(local_names(first), pulls))
+    shim, log = ls_remote_log(tmp_path)
+    started = int(time.time())
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    saved = saved_file(cache)
+    assert set(saved) == {"schema_version", "verdicts", "remote_checks"}
+    assert saved["schema_version"] == 3
+    other_key = remote_key_of(document, second)
+    assert remote_key_of(document, first) == GITHUB_KEY
+    assert other_key.startswith("file:")
+    # Keyed by the configured URL's key, never by the file URL it is redirected to.
+    assert set(saved["remote_checks"]) == {GITHUB_KEY, other_key}
+    expected_branches = {
+        line.split()[0]: line.split()[1]
+        for line in git(
+            hub, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"
+        ).stdout.splitlines()
+    }
+    assert set(expected_branches) == {"trunk", "remote-only"}
+    hub_record = saved["remote_checks"][GITHUB_KEY]
+    assert hub_record["heads"] == {
+        "at": hub_record["heads"]["at"],
+        "default": "trunk",
+        "head": rev(hub, "trunk"),
+        "branches": expected_branches,
+    }
+    [call] = fake.calls()
+    assert hub_record["heads"]["at"] >= started
+    assert hub_record["heads"]["at"] <= ls_remote_start(log, first)
+    pull_requests = hub_record["pull_requests"]
+    assert started <= pull_requests["at"] <= call.started
+    assert set(pull_requests["by_head"]) == set(local_names(first))
+    assert pull_requests["by_head"]["feature/x-1"] == [
+        {"number": 7, "state": "merged", "head": rev(first, "feature/x-1"), "base": "trunk"}
+    ]
+    assert pull_requests["by_head"]["trunk"] == []
+    # At most ten are kept, the first ten the answer lists, by number.
+    assert [pull["number"] for pull in pull_requests["by_head"]["older"]] == list(range(91, 101))
+    other_record = saved["remote_checks"][other_key]
+    assert other_record["pull_requests"] is None
+    assert other_record["heads"]["default"] == "trunk"
+    assert other_record["heads"]["head"] == rev(other, "trunk")
+    assert other_record["heads"]["branches"] == {"trunk": rev(other, "trunk")}
+    assert started <= other_record["heads"]["at"] <= ls_remote_start(log, second)
+    assert saved["verdicts"] == {}
+
+
+@posix_only
+def test_a_pull_request_verdict_is_never_stored_though_its_facts_are(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    land(work, "done")
+    point_origin_at(work, remote, GITHUB_URL)
+    pulls = {"done": [pr_node(7, "merged", rev(work, "done"))]}
+    install_fake_gh(tmp_path, monkeypatch, stdout=pr_answer(local_names(work), pulls))
+
+    document = github_collect(folder)
+
+    assert verdict_facts(branch_of(find_clone(document, work), "done")) == pr_verdict(7)
+    saved = saved_file(cache)
+    assert saved["verdicts"] == {}
+    assert saved["remote_checks"][GITHUB_KEY]["pull_requests"]["by_head"]["done"] == [
+        {"number": 7, "state": "merged", "head": rev(work, "done"), "base": "trunk"}
+    ]
+
+
+@posix_only
+def test_a_failed_check_leaves_that_members_saved_record_as_it_was(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fake = hub_gh(tmp_path, monkeypatch, first, code=1)
+    hub_path = hub
+
+    # First run: neither the hub's ls-remote nor gh answers, so the hub has no record.
+    away = move_away(hub_path)
+    document = github_collect(folder)
+    other_key = remote_key_of(document, second)
+    assert set(saved_file(cache)["remote_checks"]) == {other_key}
+    assert {r["remote"]["check"]["status"] for r in document["repositories"]} == {
+        "failed",
+        "live",
+    }
+
+    away.rename(hub_path)
+    fake.replay(stdout=pr_answer(local_names(first), hub_pulls(first)))
+    github_collect(folder)
+    full = saved_file(cache)["remote_checks"]
+    assert set(full) == {GITHUB_KEY, other_key}
+
+    # Only the ls-remote fails: the saved heads stay, the pull requests are renewed.
+    time.sleep(1.1)
+    away = move_away(hub_path)
+    github_collect(folder)
+    renewed = saved_file(cache)["remote_checks"]
+    assert renewed[GITHUB_KEY]["heads"] == full[GITHUB_KEY]["heads"]
+    assert renewed[GITHUB_KEY]["pull_requests"]["at"] > full[GITHUB_KEY]["pull_requests"]["at"]
+    assert renewed[other_key]["heads"]["at"] > full[other_key]["heads"]["at"]
+
+    # Only gh fails: the saved pull requests stay, the heads are renewed.
+    time.sleep(1.1)
+    away.rename(hub_path)
+    fake.replay(code=1)
+    github_collect(folder)
+    last = saved_file(cache)["remote_checks"]
+    assert last[GITHUB_KEY]["pull_requests"] == renewed[GITHUB_KEY]["pull_requests"]
+    assert last[GITHUB_KEY]["heads"]["at"] > renewed[GITHUB_KEY]["heads"]["at"]
+
+
+@posix_only
+def test_a_networked_run_that_decides_no_verdict_still_rewrites_the_file_with_the_new_checks(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    before = saved_file(cache)
+    assert before["verdicts"] == {}
+    pushed = push_commit(hub, "trunk", tmp_path)
+    time.sleep(1.1)
+
+    github_collect(folder)
+
+    after = saved_file(cache)
+    assert after["verdicts"] == {}
+    old, new = before["remote_checks"][GITHUB_KEY], after["remote_checks"][GITHUB_KEY]
+    assert new["heads"]["head"] == pushed != old["heads"]["head"]
+    assert new["heads"]["branches"]["trunk"] == pushed
+    assert new["heads"]["at"] > old["heads"]["at"]
+    assert new["pull_requests"]["at"] > old["pull_requests"]["at"]
+
+
+@posix_only
+def test_an_offline_run_that_decides_no_verdict_leaves_the_file_untouched(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fake = hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    time.sleep(1.1)
+
+    document = github_collect(folder, remote_checks=False)
+
+    assert document["remote_checks"] == "off"
+    assert len(fake.calls()) == 1
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
+
+
+@posix_only
+def test_a_networked_run_whose_every_check_fails_and_decides_no_verdict_leaves_the_file_untouched(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fake = hub_gh(tmp_path, monkeypatch, first)
+    shim, log = ls_remote_log(tmp_path)
+    with path_with(monkeypatch, shim):
+        github_collect(folder)
+    before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    time.sleep(1.1)
+    move_away(hub)
+    move_away(other)
+    fake.replay(code=1)
+
+    with path_with(monkeypatch, shim):
+        document = github_collect(folder)
+
+    # Every check was made and failed; nothing was written, not even a time.
+    assert len(log.read_text().splitlines()) == 4
+    assert len(fake.calls()) == 2
+    assert {r["remote"]["check"]["status"] for r in document["repositories"]} == {"recorded"}
+    [hub_group] = [r for r in document["repositories"] if r["remote"]["key"] == GITHUB_KEY]
+    assert hub_group["pr_lookup"]["status"] == "recorded"
+    assert hub_group["pr_lookup"]["reason"] == "failed"
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before
+
+
+@posix_only
+def test_a_new_verdict_is_written_whatever_the_checks_did_and_keeps_the_saved_records(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fake = hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    saved = saved_file(cache)
+    assert saved["verdicts"] == {}
+    git(first, "checkout", "-q", "-b", "unmerged", "trunk")
+    commit_file(first, "unmerged.txt", "unmerged\n")
+    git(first, "checkout", "-q", "trunk")
+    key = f"{rev(first, 'unmerged')}.{rev(first, 'origin/trunk')}"
+
+    # Offline: the verdict is written and every saved member keeps its time.
+    offline = collect([folder])
+    assert verdicts_of(find_clone(offline, first))["unmerged"] == NOT_MERGED
+    offline_saved = saved_file(cache)
+    assert {k: v["rung"] for k, v in offline_saved["verdicts"].items()} == {key: "none"}
+    assert offline_saved["remote_checks"] == saved["remote_checks"]
+
+    # Networked with every check failing: nothing refreshes, the records stay.
+    time.sleep(1.1)
+    git(first, "checkout", "-q", "-b", "second", "trunk")
+    commit_file(first, "second.txt", "second\n")
+    git(first, "checkout", "-q", "trunk")
+    move_away(hub)
+    move_away(other)
+    fake.replay(code=1)
+    failing = github_collect(folder)
+    assert {r["remote"]["check"]["status"] for r in failing["repositories"]} == {"recorded"}
+    failed_saved = saved_file(cache)
+    assert len(failed_saved["verdicts"]) == 2
+    assert failed_saved["remote_checks"] == saved["remote_checks"]
+
+
+@posix_only
+def test_a_file_replaced_during_the_run_keeps_the_newer_member_and_takes_the_runs_other_members(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fake = hub_gh(tmp_path, monkeypatch, first)
+    document = github_collect(folder)
+    other_key = remote_key_of(document, second)
+    replacement = saved_file(cache)
+    # Another collection's heads, a little newer than this run's own check but
+    # within the tolerance for concurrent runs.
+    future = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
+    record = replacement["remote_checks"][GITHUB_KEY]
+    record["heads"]["at"] = future
+    record["heads"]["head"] = "d" * 40
+    record["pull_requests"] = {
+        "at": record["pull_requests"]["at"] - 100,
+        "by_head": {
+            "feature/x-1": [
+                {"number": 99, "state": "merged", "head": "f" * 40, "base": "trunk"}
+            ]
+        },
+    }
+    del replacement["remote_checks"][other_key]
+    source = tmp_path / "replacement.json"
+    source.write_text(json.dumps(replacement))
+    staged = cache.with_name("race.tmp")
+    shim = stand_in(
+        tmp_path,
+        "race",
+        f'case "$*" in *"-C {real(first)} ls-remote"*) '
+        f'cp "{source}" "{staged}" && mv "{staged}" "{cache}";; esac',
+    )
+    started = int(time.time())
+
+    with path_with(monkeypatch, shim):
+        github_collect(folder)
+
+    merged = saved_file(cache)["remote_checks"]
+    # The newer heads survive, though the run's own answer is older.
+    assert merged[GITHUB_KEY]["heads"] == record["heads"]
+    assert merged[GITHUB_KEY]["heads"]["at"] > started
+    # The pull requests are the run's own, not the replaced file's older record.
+    own = merged[GITHUB_KEY]["pull_requests"]
+    assert own["at"] >= started
+    assert own["by_head"]["feature/x-1"] == [
+        {"number": 7, "state": "merged", "head": rev(first, "feature/x-1"), "base": "trunk"}
+    ]
+    # The other remote was absent from the replacement, so the run's heads are written.
+    assert merged[other_key]["heads"]["at"] >= started
+    assert merged[other_key]["heads"]["head"] == rev(other, "trunk")
+    assert len(fake.calls()) == 2
+
+
+@posix_only
+def test_a_file_replaced_after_the_cache_was_loaded_keeps_the_newer_member_and_takes_the_runs_members(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    document = github_collect(folder)
+    other_key = remote_key_of(document, second)
+    replacement = saved_file(cache)
+    future = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
+    replacement["remote_checks"][GITHUB_KEY]["heads"]["at"] = future
+    replacement["remote_checks"][GITHUB_KEY]["heads"]["head"] = "d" * 40
+    del replacement["remote_checks"][other_key]
+    source = tmp_path / "replacement.json"
+    source.write_text(json.dumps(replacement))
+    staged = cache.with_name("race.tmp")
+    log = tmp_path / "race.log"
+    # Calls that carry the verdict scratch directory belong to the verdict phase,
+    # which runs after the cache load.
+    shim = stand_in(
+        tmp_path,
+        "race",
+        f'case "$*" in *nyx-verdicts-*) echo "$*" >> "{log}"; '
+        f'cp "{source}" "{staged}" && mv "{staged}" "{cache}";; esac',
+    )
+    started = int(time.time())
+
+    with path_with(monkeypatch, shim):
+        github_collect(folder)
+
+    assert log.read_text().strip()
+    merged = saved_file(cache)["remote_checks"]
+    # The newer member written by the other collection survives this run's write.
+    assert merged[GITHUB_KEY]["heads"] == replacement["remote_checks"][GITHUB_KEY]["heads"]
+    assert merged[GITHUB_KEY]["pull_requests"]["at"] >= started
+    # The remote absent from the replacement gets this run's answer.
+    assert merged[other_key]["heads"]["at"] >= started
+    assert merged[other_key]["heads"]["head"] == rev(other, "trunk")
+
+
+def set_saved_time(cache: Path, key: str, member: str, at: int) -> bytes:
+    """Rewrite the ``at`` of one saved member and return the bytes now on disk."""
+    saved = saved_file(cache)
+    saved["remote_checks"][key][member]["at"] = at
+    # The canonical form, so that a run which writes nothing leaves these bytes.
+    cache.write_bytes((checkouts._dump(saved) + "\n").encode("utf-8"))
+    return cache.read_bytes()
+
+
+def other_member(member: str) -> str:
+    return "pull_requests" if member == "heads" else "heads"
+
+
+def recorded_basis_in(item: dict[str, Any]) -> bool:
+    """Whether any comparison or the verdict base of a clone rests on a saved check."""
+    return '"basis": "recorded"' in json.dumps(item)
+
+
+UNREPRESENTABLE_OR_AHEAD = [
+    pytest.param(253402300800, id="year-10000"),
+    pytest.param(10**30, id="huge"),
+    pytest.param(None, id="an-hour-ahead"),
+]
+
+
+@posix_only
+@pytest.mark.parametrize("member", ["heads", "pull_requests"])
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_a_saved_member_dated_beyond_reach_is_missing_offline_and_nothing_is_rewritten(
+    tmp_path, monkeypatch, isolated_git, member, bad
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    at = int(time.time()) + 3600 if bad is None else bad
+    before = set_saved_time(world.cache, GITHUB_KEY, member, at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    heads_check, pulls_check = group["remote"]["check"], group["pr_lookup"]
+    if member == "heads":
+        # No record to answer from: nothing is labelled recorded.
+        assert heads_check["status"] != "recorded"
+        for path in (world.work, world.second):
+            assert not recorded_basis_in(find_clone(offline, path))
+        assert pulls_check["status"] == "recorded"
+        assert pulls_check["checked_at"] == utc_text(world.saved["pull_requests"]["at"])
+    else:
+        assert pulls_check["status"] != "recorded"
+        assert heads_check["status"] == "recorded"
+        assert heads_check["checked_at"] == utc_text(world.saved["heads"]["at"])
+    # The run decided a verdict, so it rewrites the file: the good member is
+    # kept as it was and the ignored one is not carried forward.
+    kept = other_member(member)
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert stored[kept] == world.saved[kept]
+    assert stored[member] is None
+    assert world.cache.read_bytes() != before
+
+
+@posix_only
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_a_remote_whose_saved_members_are_all_beyond_reach_is_treated_as_never_checked(
+    tmp_path, monkeypatch, isolated_git, bad
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    at = int(time.time()) + 3600 if bad is None else bad
+    set_saved_time(world.cache, GITHUB_KEY, "heads", at)
+    before = set_saved_time(world.cache, GITHUB_KEY, "pull_requests", at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert group["pr_lookup"]["status"] != "recorded"
+    assert GITHUB_KEY not in saved_file(world.cache)["remote_checks"]
+    assert world.cache.read_bytes() != before
+
+
+@posix_only
+@pytest.mark.parametrize("bad", UNREPRESENTABLE_OR_AHEAD)
+def test_an_offline_run_that_verifies_nothing_does_not_rewrite_a_file_with_an_ignored_member(
+    tmp_path, monkeypatch, isolated_git, bad
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    at = int(time.time()) + 3600 if bad is None else bad
+    before = set_saved_time(cache, GITHUB_KEY, "heads", at)
+
+    offline = collect([folder], github_lookup=True)
+
+    # The ignored heads are not shown, the pull requests are, and the file is untouched.
+    group = group_with_key(offline, GITHUB_KEY)
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert group["pr_lookup"]["status"] == "recorded"
+    assert cache.read_bytes() == before
+
+
+@posix_only
+def test_a_saved_member_within_the_tolerance_is_still_used(tmp_path, monkeypatch, isolated_git):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    near = int(time.time()) + checkouts.SAVED_CHECK_FUTURE_TOLERANCE_SECONDS // 2
+    set_saved_time(world.cache, GITHUB_KEY, "heads", near)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["remote"]["check"]["checked_at"] == utc_text(near)
+
+
+@posix_only
+@pytest.mark.parametrize("member", ["heads", "pull_requests"])
+def test_a_successful_check_replaces_a_member_dated_in_the_future(
+    tmp_path, monkeypatch, isolated_git, member
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    other = other_member(member)
+    ahead = int(time.time()) + 3600
+    set_saved_time(world.cache, GITHUB_KEY, member, ahead)
+    started = int(time.time())
+
+    github_collect(world.folder)
+
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert started <= stored[member]["at"] < ahead
+    assert stored[other]["at"] >= started
+    # The later offline run reports the time of the real check.
+    offline = collect([world.folder], github_lookup=True)
+    [group] = offline["repositories"]
+    shown = group["remote"]["check"] if member == "heads" else group["pr_lookup"]
+    assert shown["status"] == "recorded"
+    assert shown["checked_at"] == utc_text(stored[member]["at"])
+
+
+@posix_only
+def test_a_member_dated_in_the_future_is_dropped_when_another_member_alone_is_checked(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    ahead = int(time.time()) + 3600
+    set_saved_time(world.cache, GITHUB_KEY, "pull_requests", ahead)
+    started = int(time.time())
+
+    # Remote checks on, lookup off: only the heads are verified.
+    collect([world.folder], remote_checks=True)
+
+    stored = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert stored["heads"]["at"] >= started
+    assert stored["pull_requests"] is None
+
+
+@posix_only
+def test_a_saved_check_dated_in_the_future_does_not_defeat_the_clones_newer_tracking_ref(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    tip = world.pushed()
+    moved = world.reflog_time(world.a, "topic")
+    # Control: a good saved check older than the push gives way to the clone's ref.
+    control = collect([world.folder])
+    assert branch_of(find_clone(control, world.a), "topic")["vs_remote"] == vs("cached", "equal")
+    assert rev(world.a, "topic") == tip
+
+    # A check dated after the push would hide it; dated in the future it is not believed.
+    world.set_record_time(max(moved, int(time.time())) + 3600)
+    future = collect([world.folder])
+
+    [group] = future["repositories"]
+    assert group["remote"]["check"]["status"] != "recorded"
+    assert not recorded_basis_in(find_clone(future, world.a))
+
+
+def fill_file(cache: Path, count: int, remotes: int, branches: int) -> dict[str, Any]:
+    """Write a maximal file: ``count`` verdicts with SHA-256 key pairs, 10-digit
+    times and the longest rung name, and ``remotes`` saved remotes of distinct times."""
+    keys = {f"{index:064x}.{index + 1:064x}": 1_700_000_000 + index for index in range(count)}
+    records = {
+        f"example.org/filler/repo-{index:03d}": {
+            "heads": {
+                "at": 1_600_000_000 + index,
+                "default": "main",
+                "head": "1" * 40,
+                "branches": {f"branch-{index}-{n:04d}": f"{n + 1:040x}" for n in range(branches)},
+            },
+            "pull_requests": None,
+        }
+        for index in range(remotes)
+    }
+    write_cache(cache, keys, rungs=dict.fromkeys(keys, "squash_equivalent"), remote_checks=records)
+    return records
+
+
+def dumped(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def test_a_maximal_file_is_trimmed_to_its_bounds_dropping_the_oldest_records(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    fillers = fill_file(cache, checkouts.CACHE_ENTRY_CAP, remotes=95, branches=400)
+    assert len(dumped(fillers)) > 2 * 1024 * 1024
+    assert cache.stat().st_size < 4 * 1024 * 1024
+    started = int(time.time())
+
+    document = collect([folder], remote_checks=True)
+
+    assert document["diagnostics"] == []
+    assert cache.stat().st_size <= 4 * 1024 * 1024
+    saved = saved_file(cache)
+    assert len(saved["verdicts"]) == checkouts.CACHE_ENTRY_CAP
+    remote_checks = saved["remote_checks"]
+    assert len(dumped(remote_checks)) <= 2 * 1024 * 1024
+    # The run's own records are the newest, so they are kept.
+    own = set(remote_checks) - set(fillers)
+    assert own == {remote_key_of(document, first), remote_key_of(document, second)}
+    assert all(remote_checks[key]["heads"]["at"] >= started for key in own)
+    kept = {key for key in fillers if key in remote_checks}
+    dropped = set(fillers) - kept
+    assert kept and dropped
+    # Only the oldest were left out, and the file is as full as the bound allows.
+    assert max(fillers[key]["heads"]["at"] for key in dropped) < min(
+        fillers[key]["heads"]["at"] for key in kept
+    )
+    newest = max(dropped, key=lambda key: fillers[key]["heads"]["at"])
+    assert len(dumped({**remote_checks, newest: fillers[newest]})) > 2 * 1024 * 1024
+    again = collect([folder])
+    assert again["diagnostics"] == []
+
+
+def test_the_budget_orders_ties_and_skips_an_oversized_member_without_evicting_older_ones(
+    monkeypatch,
+):
+    def heads(at: int, tag: str) -> dict[str, Any]:
+        return {"at": at, "default": "main", "head": tag * 40, "branches": {"main": tag * 40}}
+
+    def pulls(at: int) -> dict[str, Any]:
+        return {"at": at, "by_head": {f"topic-{n:03d}": [] for n in range(30)}}
+
+    records = {
+        "b": {"heads": {**heads(5, "2"), "branches": {}}, "pull_requests": None},
+        "a": {"heads": heads(5, "1"), "pull_requests": pulls(5)},
+        "huge": {"heads": {**heads(9, "3"), "branches": {f"n{n}": "3" * 40 for n in range(500)}},
+                 "pull_requests": None},
+        "old": {"heads": heads(1, "4"), "pull_requests": None},
+    }
+    none = None
+
+    def only(**kept: Any) -> dict[str, Any]:
+        return {
+            key: {"heads": members.get("heads", none), "pull_requests": members.get("pull_requests", none)}
+            for key, members in kept.items()
+        }
+
+    # Room for exactly one tied member: key "a" before "b", heads before pull_requests.
+    # (The records of "a" are the larger, so the order also decides what fits.)
+    fits_one = len(dumped(only(a={"heads": records["a"]["heads"]})))
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", fits_one)
+    assert checkouts._within_budget(records) == only(a={"heads": records["a"]["heads"]})
+
+    # Room for both of "a" and one more: the third tied member is next, never the older one.
+    two = len(dumped(only(a=records["a"])))
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", two)
+    assert checkouts._within_budget(records) == only(a=records["a"])
+    three = len(dumped(only(a=records["a"], b={"heads": records["b"]["heads"]})))
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", three)
+    assert checkouts._within_budget(records) == only(
+        a=records["a"], b={"heads": records["b"]["heads"]}
+    )
+    # The oversized, newest member is left out; older members after it are still kept.
+    four = len(dumped(only(a=records["a"], b={"heads": records["b"]["heads"]},
+                           old={"heads": records["old"]["heads"]})))
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", four)
+    assert checkouts._within_budget(records) == only(
+        a=records["a"], b={"heads": records["b"]["heads"]}, old={"heads": records["old"]["heads"]}
+    )
+
+
+def test_the_budget_prefers_heads_to_a_smaller_pull_requests_record_of_the_same_second(
+    monkeypatch,
+):
+    heads = {
+        "at": 7,
+        "default": "main",
+        "head": "1" * 40,
+        "branches": {f"branch-{n:02d}": "1" * 40 for n in range(8)},
+    }
+    pulls = {"at": 7, "by_head": {"topic": []}}
+    assert len(dumped(pulls)) < len(dumped(heads))
+    records = {"a": {"heads": heads, "pull_requests": pulls}}
+    alone_heads = len(dumped({"a": {"heads": heads, "pull_requests": None}}))
+    alone_pulls = len(dumped({"a": {"heads": None, "pull_requests": pulls}}))
+    both = len(dumped(records))
+    # Each member fits alone, the two do not fit together.
+    assert max(alone_heads, alone_pulls) < both
+    monkeypatch.setattr(checkouts, "REMOTE_CHECKS_BUDGET", alone_heads)
+
+    assert checkouts._within_budget(records) == {"a": {"heads": heads, "pull_requests": None}}
+
+
+def test_the_budget_keeps_the_first_remote_key_of_equal_tied_members(monkeypatch):
+    def heads(tag: str) -> dict[str, Any]:
+        return {"at": 7, "default": "main", "head": tag * 40, "branches": {"main": tag * 40}}
+
+    records = {
+        "b": {"heads": heads("2"), "pull_requests": None},
+        "a": {"heads": heads("1"), "pull_requests": None},
+    }
+    monkeypatch.setattr(
+        checkouts, "REMOTE_CHECKS_BUDGET", len(dumped({"a": records["a"]}))
+    )
+
+    assert checkouts._within_budget(records) == {"a": records["a"]}
+
+
+@posix_only
+def test_a_remote_whose_answer_alone_exceeds_the_budget_keeps_no_heads_record(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    work = clone(remote, folder / "work")
+    head = rev(work, "HEAD")
+    names = {
+        f"refs/heads/{index:05d}-" + "x" * 200: head for index in range(11_000)
+    }
+    add_packed_refs(remote, names)
+    offline_before = collect([folder])
+    assert not cache.exists()
+
+    networked = collect([folder], remote_checks=True)
+
+    assert networked["repositories"][0]["remote"]["check"]["status"] == "live"
+    assert networked["diagnostics"] == []
+    # The answer was successful, so the file is written, but it holds no heads.
+    assert saved_file(cache)["remote_checks"] == {}
+    offline_after = collect([folder])
+    assert offline_after["diagnostics"] == []
+    assert stable(offline_after) == stable(offline_before)
+
+
+def without_group(document: dict[str, Any], key: str) -> dict[str, Any]:
+    return {
+        **document,
+        "repositories": [
+            group
+            for group in document["repositories"]
+            if group["remote"] is None or group["remote"]["key"] != key
+        ],
+    }
+
+
+def valid_saved_file() -> dict[str, Any]:
+    head = "a" * 40
+    return {
+        "schema_version": 3,
+        "verdicts": {},
+        "remote_checks": {
+            GITHUB_KEY: {
+                "heads": {"at": 5, "default": "trunk", "head": head, "branches": {"trunk": head}},
+                "pull_requests": {
+                    "at": 6,
+                    "by_head": {
+                        "topic": [{"number": 1, "state": "merged", "head": head, "base": "trunk"}]
+                    },
+                },
+            }
+        },
+    }
+
+
+def _mutated(change):
+    document = valid_saved_file()
+    change(document)
+    return document
+
+
+def _entry(document: dict[str, Any]) -> dict[str, Any]:
+    return document["remote_checks"][GITHUB_KEY]
+
+
+SAVED_FILE_VARIANTS = {
+    "extra_top_level_key": lambda d: d.update(extra=1),
+    "no_remote_checks": lambda d: d.pop("remote_checks"),
+    "schema_4": lambda d: d.update(schema_version=4),
+    "negative_time": lambda d: _entry(d)["heads"].update(at=-1),
+    "negative_pull_request_time": lambda d: _entry(d)["pull_requests"].update(at=-1),
+    "unsafe_branch_name": lambda d: _entry(d)["heads"]["branches"].update({"bad\nname": "a" * 40}),
+    "unsafe_by_head_name": lambda d: _entry(d)["pull_requests"]["by_head"].update({"": []}),
+    "eleven_pull_requests": lambda d: _entry(d)["pull_requests"]["by_head"].update(
+        topic=[
+            {"number": n, "state": "open", "head": "a" * 40, "base": "trunk"}
+            for n in range(1, 12)
+        ]
+    ),
+    "draft_state": lambda d: _entry(d)["pull_requests"]["by_head"]["topic"][0].update(
+        state="draft"
+    ),
+    "no_member": lambda d: _entry(d).update(heads=None, pull_requests=None),
+    "retired_keys_at_schema_3": lambda d: d.pop("remote_checks"),
+}
+
+
+@pytest.mark.parametrize("kind", ["valid", *SAVED_FILE_VARIANTS])
+def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
+    tmp_path, isolated_git, kind
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    cold = collect([folder])
+    document = valid_saved_file()
+    if kind != "valid":
+        SAVED_FILE_VARIANTS[kind](document)
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_text(json.dumps(document))
+
+    result = collect([folder])
+
+    if kind == "valid":
+        assert result["diagnostics"] == cold["diagnostics"] == []
+        # The file is read; its saved checks stand in for the checks an offline run
+        # does not make, for the one remote it holds, and for no other.
+        [saved_group] = [r for r in result["repositories"] if r["remote"]["key"] == GITHUB_KEY]
+        assert saved_group["remote"]["check"] == {
+            "status": "recorded",
+            "reason": "remote_checks_off",
+            "checked_at": "1970-01-01T00:00:05Z",
+        }
+        assert stable(without_group(result, GITHUB_KEY)) == stable(
+            without_group(cold, GITHUB_KEY)
+        )
+        return
+    assert stable(result) == stable(cold)
+    assert result["diagnostics"] == [
+        *cold["diagnostics"],
+        {"code": "checkout_cache_unreadable", "path": str(cache)},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Using the saved remote checks
+# ---------------------------------------------------------------------------
+
+
+def utc_text(seconds: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def as_recorded(value: Any) -> Any:
+    """A document fragment with every ``live`` basis named ``recorded``."""
+    if isinstance(value, dict):
+        return {
+            key: "recorded" if key == "basis" and item == "live" else as_recorded(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [as_recorded(item) for item in value]
+    return value
+
+
+def remote_bases(item: dict[str, Any]) -> set[str]:
+    """The basis of every remote-derived comparison and of the verdict base of a clone."""
+    found = {branch["vs_remote"]["basis"] for branch in item["branches"]}
+    found.add(item["cached_vs_remote"]["basis"])
+    found.add(item["local_default"]["vs_remote"]["basis"])
+    found.add(item["verdict_base"]["basis"])
+    return found
+
+
+def group_with_key(document: dict[str, Any], key: str) -> dict[str, Any]:
+    [group] = [item for item in document["repositories"] if item["remote"]["key"] == key]
+    return group
+
+
+class SavedWorld:
+    """A GitHub-identity remote with two clones, a local-only branch, a merged pull
+    request, a remote that moved ahead of one clone, and the networked run that
+    saved its checks."""
+
+    def __init__(self, tmp_path: Path, monkeypatch, isolated_git: Path) -> None:
+        self.tmp_path = tmp_path
+        self.cache = nyx_home(isolated_git)
+        self.folder, self.remote, self.work = landed_world(tmp_path)
+        git(self.work, "branch", "wip", "trunk")
+        self.second = clone(self.remote, self.folder / "second")
+        point_origin_at(self.second, self.remote, GITHUB_URL)
+        self.head = push_commit(self.remote, "trunk", tmp_path)
+        git(self.second, "fetch", "-q", "origin")
+        self.names = local_names(self.work, self.second)
+        self.answer = pr_answer(
+            self.names, {"done": [pr_node(7, "merged", rev(self.work, "done"))]}
+        )
+        self.fake = install_fake_gh(tmp_path, monkeypatch, stdout=self.answer)
+        self.markers = [guard_remote(path, tmp_path) for path in (self.work, self.second)]
+        self.shim, self.log = ls_remote_log(tmp_path)
+        with path_with(monkeypatch, self.shim):
+            self.live = github_collect(self.folder)
+        self.saved = saved_file(self.cache)["remote_checks"][GITHUB_KEY]
+
+    def contacts(self) -> bool:
+        """Whether any upload-pack of the remote ran since the markers were last cleared."""
+        found = any(marker.exists() for marker in self.markers)
+        for marker in self.markers:
+            marker.unlink(missing_ok=True)
+        return found
+
+    def ls_remotes(self) -> int:
+        return len(self.log.read_text().splitlines()) if self.log.exists() else 0
+
+
+@posix_only
+def test_an_offline_collection_answers_from_the_saved_checks_as_the_networked_run_did(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    live_group = world.live["repositories"][0]
+    live_work = find_clone(world.live, world.work)
+    # Control: the networked run contacted the remote and compared on live objects.
+    assert world.contacts()
+    assert live_work["local_default"]["vs_remote"] == {
+        "basis": "live",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(world.second),
+    }
+    assert verdict_facts(branch_of(live_work, "done")) == pr_verdict(7)
+    contacts, gh_calls = world.ls_remotes(), len(world.fake.calls())
+
+    with path_with(monkeypatch, world.shim):
+        offline = collect([world.folder], github_lookup=True)
+
+    assert offline["remote_checks"] == "off"
+    [group] = offline["repositories"]
+    assert group["remote"]["check"] == {
+        "status": "recorded",
+        "reason": "remote_checks_off",
+        "checked_at": utc_text(world.saved["heads"]["at"]),
+    }
+    assert TIMESTAMP.fullmatch(group["remote"]["check"]["checked_at"])
+    assert group["default_branch"] == {"name": "trunk", "sha": world.head}
+    assert group["default_branch"] == live_group["default_branch"]
+    assert group["pr_lookup"] == {
+        "status": "recorded",
+        "reason": "remote_checks_off",
+        "checked_at": utc_text(world.saved["pull_requests"]["at"]),
+    }
+    # The remote saw nothing and no tool was started.
+    assert not world.contacts()
+    assert world.ls_remotes() == contacts
+    assert len(world.fake.calls()) == gh_calls
+    for path in (world.work, world.second):
+        item = find_clone(offline, path)
+        assert remote_bases(item) == {"recorded"}
+        assert item["local_default"]["vs_cached"]["basis"] == "cached"
+        # The same relations, counts, lenders, pull requests, verdicts and base.
+        assert item == as_recorded(find_clone(world.live, path))
+    # A verdict decided from saved pull-request facts is not remembered.
+    stored = cache_entries(world.cache)
+    assert f"{rev(world.work, 'done')}.{world.head}" not in stored
+    assert set(stored.values()) <= checkouts.CACHE_RUNGS
+    work = find_clone(offline, world.work)
+    assert branch_of(work, "wip")["vs_remote"]["relation"] == "absent"
+    assert verdict_facts(branch_of(work, "done")) == pr_verdict(7)
+    assert [pull["number"] for pull in branch_of(work, "done")["pull_requests"]] == [7]
+    assert work["verdict_base"]["objects_from"] == real(world.second)
+
+
+@posix_only
+def test_equal_collections_have_equal_digests_and_a_live_check_carries_no_time(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    first = collect([world.folder], github_lookup=True)
+    time.sleep(1.1)
+    second = collect([world.folder], github_lookup=True)
+    assert first["checkouts_digest"] == second["checkouts_digest"]
+
+    time.sleep(1.1)
+    again = github_collect(world.folder)
+
+    assert again["checkouts_digest"] == world.live["checkouts_digest"]
+    [group] = again["repositories"]
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    assert group["pr_lookup"] == {"status": "live", "reason": None, "checked_at": None}
+    # The networked run renewed both saved checks, so the next offline run reads newer times.
+    renewed = saved_file(world.cache)["remote_checks"][GITHUB_KEY]
+    assert renewed["heads"]["at"] > world.saved["heads"]["at"]
+    later = collect([world.folder], github_lookup=True)
+    assert later["repositories"][0]["remote"]["check"]["checked_at"] == utc_text(
+        renewed["heads"]["at"]
+    )
+    assert later["checkouts_digest"] != first["checkouts_digest"]
+
+
+@posix_only
+def test_a_networked_collection_whose_remote_moved_away_reports_the_saved_check(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    move_away(world.remote)
+
+    document = github_collect(world.folder)
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"] == {
+        "status": "recorded",
+        "reason": "not_found",
+        "checked_at": utc_text(world.saved["heads"]["at"]),
+    }
+    assert group["default_branch"] == {"name": "trunk", "sha": world.head}
+    # The pull-request lookup was live in the same run.
+    assert group["pr_lookup"] == {"status": "live", "reason": None, "checked_at": None}
+    for path in (world.work, world.second):
+        assert find_clone(document, path) == as_recorded(find_clone(world.live, path))
+    # A failed check wrote no time of its own.
+    assert saved_file(world.cache)["remote_checks"][GITHUB_KEY]["heads"] == world.saved["heads"]
+
+
+GH_FAILURES = [
+    ("not_authenticated", {"code": 4}),
+    ("rate_limited", {"code": 1, "stderr": "API rate limit exceeded"}),
+    ("not_found", {"code": 0, "stdout": NULL_REPOSITORY}),
+    ("failed", {"code": 0, "stdout": "this is not json"}),
+    ("timed_out", {"code": 0, "delay": 30}),
+    ("gh_missing", None),
+]
+
+
+@posix_only
+@pytest.mark.parametrize(("reason", "replay"), GH_FAILURES, ids=[case[0] for case in GH_FAILURES])
+def test_a_failed_pull_request_lookup_is_answered_from_the_saved_facts(
+    tmp_path, monkeypatch, isolated_git, reason, replay
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    options: dict[str, Any] = {}
+    if replay is None:
+        monkeypatch.setenv("PATH", git_only_path(tmp_path))
+    else:
+        world.fake.replay(**replay)
+    if reason == "timed_out":
+        options["call_cap_seconds"] = 2
+    calls = len(world.fake.calls())
+
+    document = github_collect(world.folder, **options)
+
+    assert len(world.fake.calls()) == calls + (0 if replay is None else 1)
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {
+        "status": "recorded",
+        "reason": reason,
+        "checked_at": utc_text(world.saved["pull_requests"]["at"]),
+    }
+    assert group["remote"]["check"] == {"status": "live", "reason": None}
+    work = find_clone(document, world.work)
+    assert verdict_facts(branch_of(work, "done")) == pr_verdict(7)
+    assert find_clone(document, world.work) == find_clone(world.live, world.work)
+    assert saved_file(world.cache)["remote_checks"][GITHUB_KEY]["pull_requests"] == (
+        world.saved["pull_requests"]
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("options", [{}, {"remote_checks": True}], ids=["offline", "networked"])
+def test_a_collection_with_the_lookup_off_never_uses_the_saved_pull_requests(
+    tmp_path, monkeypatch, isolated_git, options
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    assert verdict_facts(branch_of(find_clone(world.live, world.work), "done")) == pr_verdict(7)
+
+    document = collect([world.folder], github_lookup=False, **options)
+
+    [group] = document["repositories"]
+    assert group["pr_lookup"] == {"status": "off", "reason": "setting_off", "checked_at": None}
+    for item in all_clones(document):
+        assert all(branch["pull_requests"] == [] for branch in item["branches"])
+        rungs = [branch["verdict"]["pull_request"] for branch in item["branches"] if branch["verdict"]]
+        assert rungs == [None] * len(rungs)
+    work = find_clone(document, world.work)
+    assert verdict_facts(branch_of(work, "done")) == ("merged", "squash_equivalent", None, None)
+
+
+@posix_only
+def test_a_saved_pull_request_listing_is_never_used_for_a_remote_that_is_not_github(
+    tmp_path, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, _remote, work = small_world(tmp_path)
+    land(work, "done")
+    collect([folder], remote_checks=True, github_lookup=True)
+    saved = saved_file(cache)
+    [key] = saved["remote_checks"]
+    saved["remote_checks"][key]["pull_requests"] = {
+        "at": 5,
+        "by_head": {
+            "done": [{"number": 7, "state": "merged", "head": rev(work, "done"), "base": "trunk"}]
+        },
+    }
+    cache.write_text(json.dumps(saved))
+
+    document = collect([folder], github_lookup=True)
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["pr_lookup"] == {"status": "off", "reason": "not_github", "checked_at": None}
+    item = find_clone(document, work)
+    assert branch_of(item, "done")["pull_requests"] == []
+    assert verdict_facts(branch_of(item, "done")) == ("merged", "squash_equivalent", None, None)
+
+
+@posix_only
+def test_a_branch_created_after_the_saved_check_is_absent_with_no_pull_requests(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    git(world.work, "branch", "late", "trunk")
+
+    document = collect([world.folder], github_lookup=True)
+
+    late = branch_of(find_clone(document, world.work), "late")
+    assert late["vs_remote"] == {
+        "basis": "recorded",
+        "relation": "absent",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+    assert late["pull_requests"] == []
+    # The saved listing still serves the branches it names.
+    done = branch_of(find_clone(document, world.work), "done")
+    assert [pull["number"] for pull in done["pull_requests"]] == [7]
+
+
+@posix_only
+def test_the_saved_check_of_an_empty_remote_leaves_no_default_and_every_branch_absent(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    empty = served / "empty.git"
+    git(served, "init", "-q", "--bare", str(empty))
+    work = clone(empty, folder / "work")
+    commit_file(work, "file.txt", "one\n")
+    git(work, "branch", "other")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    assert group["default_branch"] == {"name": None, "sha": None}
+    item = find_clone(document, work)
+    assert item["local_default"] is None
+    assert item["cached_vs_remote"]["relation"] == "absent"
+    assert item["cached_vs_remote"]["basis"] == "recorded"
+    assert [
+        (branch["vs_remote"]["relation"], branch["vs_remote"]["basis"])
+        for branch in item["branches"]
+    ] == [("absent", "recorded")] * 2
+
+
+@posix_only
+@pytest.mark.parametrize("kind", ["no-home", "empty-file"])
+def test_with_no_saved_check_an_offline_collection_reports_the_cached_state(
+    tmp_path, isolated_git, kind
+):
+    folder, _remote, work = landed_world(tmp_path)
+    if kind == "empty-file":
+        write_cache(nyx_home(isolated_git), {})
+    else:
+        assert not (isolated_git / ".nyx").exists()
+
+    document = collect([folder], github_lookup=True)
+
+    assert document["diagnostics"] == []
+    [group] = document["repositories"]
+    assert group["remote"]["check"] == {"status": "off", "reason": "remote_checks_off"}
+    assert group["pr_lookup"] == {"status": "off", "reason": "remote_checks_off", "checked_at": None}
+    assert group["default_branch"] == {"name": "trunk", "sha": None}
+    item = find_clone(document, work)
+    assert {comparison["basis"] for comparison in comparisons_of(item)} == {"cached"}
+    assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_recorded_comparison_borrows_the_saved_head_from_a_sibling_clone_and_names_it(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, lagging = small_world(tmp_path)
+    lender = clone(remote, folder / "a-lender")
+    head = push_commit(remote, "trunk", tmp_path)
+    git(lender, "fetch", "-q", "origin")
+    markers = [guard_remote(path, tmp_path) for path in (lagging, lender)]
+    collect([folder], remote_checks=True)
+    assert any(marker.exists() for marker in markers), "control: the networked run made contact"
+    for marker in markers:
+        marker.unlink(missing_ok=True)
+
+    document = collect([folder])
+
+    item = find_clone(document, lagging)
+    assert item["local_default"]["vs_remote"] == {
+        "basis": "recorded",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(lender),
+    }
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": head,
+        "basis": "recorded",
+        "objects_from": real(lender),
+    }
+    assert not any(marker.exists() for marker in markers)
+
+
+@posix_only
+def test_a_recorded_check_leaves_shallow_and_partial_clones_to_differ_without_object_calls(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    push_commit(remote, "trunk", tmp_path)
+    full = clone(remote.as_uri(), folder / "a-full")
+    partial = clone(remote.as_uri(), folder / "b-partial", "--filter=blob:none")
+    shallow = clone(remote.as_uri(), folder / "c-shallow", "--depth=1")
+    push_commit(remote, "trunk", tmp_path)
+    collect([folder], remote_checks=True)
+    shim, log = recording(tmp_path, "object-calls")
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder])
+
+    def object_calls(path: Path) -> list[str]:
+        return [
+            line
+            for line in log.read_text().splitlines()
+            if f"-C {real(path)} " in line and ("--ignore-missing" in line or "--left-right" in line)
+        ]
+
+    # Control: a complete clone does look for the saved head.
+    assert object_calls(full)
+    for path in (partial, shallow):
+        assert object_calls(path) == []
+        item = find_clone(document, path)
+        for comparison in (
+            item["cached_vs_remote"],
+            item["local_default"]["vs_remote"],
+            branch_of(item, "trunk")["vs_remote"],
+        ):
+            assert comparison == {
+                "basis": "recorded",
+                "relation": "differs",
+                "ahead": None,
+                "behind": None,
+                "objects_from": None,
+            }
+
+
+@posix_only
+def test_a_recorded_count_call_that_times_out_is_unknown_not_a_difference(
+    tmp_path, monkeypatch, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    git(work, "checkout", "-q", "-b", "feature", "trunk")
+    commit_file(work, "feature.txt", "local\n")
+    git(work, "checkout", "-q", "trunk")
+    push_commit(remote, "feature", tmp_path)
+    # The clone holds the saved commit but has no remote-tracking ref for it, so the
+    # recorded comparison is the only count in the run.
+    git(work, "fetch", "-q", "origin", "feature")
+    git(work, "update-ref", "-d", "refs/remotes/origin/feature")
+    collect([folder], remote_checks=True)
+    control = branch_of(find_clone(collect([folder]), work), "feature")["vs_remote"]
+    assert (control["basis"], control["relation"]) == ("recorded", "diverged")
+    shim = stand_in(tmp_path, "slow-count", 'case "$*" in *"--left-right --count"*) sleep 30;; esac')
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=2)
+
+    comparison = branch_of(find_clone(document, work), "feature")["vs_remote"]
+    assert comparison == {
+        "basis": "recorded",
+        "relation": "unknown",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+
+
+@pytest.mark.parametrize("basis", ["live", "recorded"])
+def test_a_count_call_that_never_ran_is_unknown_on_every_remote_basis(basis):
+    never = checkouts._Outcome(None)
+
+    assert checkouts._counted_comparison(never, basis) == {
+        "basis": basis,
+        "relation": "unknown",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+    assert checkouts._counted_comparison(never, "cached")["relation"] == "differs"
+
+
+@posix_only
+def test_a_networked_run_that_decides_no_verdict_moves_the_head_an_offline_run_reports(
+    tmp_path, monkeypatch, isolated_git
+):
+    cache = nyx_home(isolated_git)
+    folder, hub, other, first, second = records_world(tmp_path)
+    hub_gh(tmp_path, monkeypatch, first)
+    github_collect(folder)
+    first_time = utc_text(saved_file(cache)["remote_checks"][GITHUB_KEY]["heads"]["at"])
+    time.sleep(1.1)
+    # A clone outside the folders moves the remote's trunk.
+    pushed = push_commit(hub, "trunk", tmp_path)
+    github_collect(folder)
+    after = saved_file(cache)
+    assert after["verdicts"] == {}, "control: the run decided no verdict to store"
+    saved_bytes = cache.read_bytes()
+
+    document = collect([folder], github_lookup=True)
+
+    group = group_with_key(document, GITHUB_KEY)
+    assert group["default_branch"] == {"name": "trunk", "sha": pushed}
+    checked_at = group["remote"]["check"]["checked_at"]
+    assert checked_at == utc_text(after["remote_checks"][GITHUB_KEY]["heads"]["at"])
+    assert checked_at > first_time
+    assert cache.read_bytes() == saved_bytes
+
+
+@posix_only
+def test_each_saved_check_reports_the_time_of_its_own_record(tmp_path, monkeypatch, isolated_git):
+    world = SavedWorld(tmp_path, monkeypatch, isolated_git)
+    saved = saved_file(world.cache)
+    heads_at = saved["remote_checks"][GITHUB_KEY]["heads"]["at"]
+    pulls_at = heads_at - 7200
+    saved["remote_checks"][GITHUB_KEY]["pull_requests"]["at"] = pulls_at
+    world.cache.write_text(json.dumps(saved))
+    assert utc_text(pulls_at) != utc_text(heads_at)
+
+    offline = collect([world.folder], github_lookup=True)
+
+    [group] = offline["repositories"]
+    assert group["remote"]["check"]["checked_at"] == utc_text(heads_at)
+    assert group["pr_lookup"]["checked_at"] == utc_text(pulls_at)
+
+
+def recorded_comparison(relation: str) -> dict[str, Any]:
+    return {
+        "basis": "recorded",
+        "relation": relation,
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
+
+
+def cached_base(path: Path) -> dict[str, Any]:
+    """The verdict base a clone keeps when the saved head cannot be reached: its own
+    cached default, on the cached basis."""
+    return {
+        "name": "trunk",
+        "sha": rev(path, "refs/remotes/origin/trunk"),
+        "basis": "cached",
+        "objects_from": None,
+    }
+
+
+@posix_only
+def test_a_recorded_head_that_no_sibling_holds_differs_on_the_recorded_basis(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    other = clone(remote, folder / "other")
+    push_commit(remote, "trunk", tmp_path)
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    for path in (work, other):
+        item = find_clone(document, path)
+        assert item["cached_vs_remote"] == recorded_comparison("differs")
+        assert item["local_default"]["vs_remote"] == recorded_comparison("differs")
+        assert branch_of(item, "trunk")["vs_remote"] == recorded_comparison("differs")
+        assert item["verdict_base"] == cached_base(path)
+
+
+RECORDED_PROBE_FAILURES = [
+    ("own", "differs", "exit 3"),
+    ("own", "unknown", "sleep 30"),
+    ("lender", "differs", "exit 3"),
+    ("lender", "unknown", "sleep 30"),
+]
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("whose", "state", "action"), RECORDED_PROBE_FAILURES, ids=[f"{w}-{s}" for w, s, _ in RECORDED_PROBE_FAILURES]
+)
+def test_a_recorded_comparison_whose_object_probe_cannot_say_keeps_that_state_on_the_recorded_basis(
+    tmp_path, monkeypatch, isolated_git, whose, state, action
+):
+    nyx_home(isolated_git)
+    folder, remote, lagging = small_world(tmp_path)
+    lender = clone(remote, folder / "a-lender")
+    push_commit(remote, "trunk", tmp_path)
+    git(lender, "fetch", "-q", "origin")
+    collect([folder], remote_checks=True)
+    probed = lagging if whose == "own" else lender
+    shim = stand_in(
+        tmp_path,
+        "failing-probe",
+        f'case "$*" in *"-C {real(probed)} "*"--ignore-missing"*) {action};; esac',
+    )
+
+    with path_with(monkeypatch, shim):
+        document = collect([folder], call_cap_seconds=2)
+
+    item = find_clone(document, lagging)
+    assert item["cached_vs_remote"] == recorded_comparison(state)
+    assert item["local_default"]["vs_remote"] == recorded_comparison(state)
+    assert branch_of(item, "trunk")["vs_remote"] == recorded_comparison(state)
+    assert item["verdict_base"] == cached_base(lagging)
+
+
+@posix_only
+def test_a_guarded_clone_takes_the_recorded_basis_for_its_base_only_when_its_cached_ref_is_the_saved_head(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    allow_filters(remote)
+    push_commit(remote, "trunk", tmp_path)
+    stale = clone(remote.as_uri(), folder / "a-stale", "--depth=1")
+    head = push_commit(remote, "trunk", tmp_path)
+    shallow = clone(remote.as_uri(), folder / "b-shallow", "--depth=1")
+    partial = clone(remote.as_uri(), folder / "c-partial", "--filter=blob:none")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    for path in (shallow, partial):
+        assert find_clone(document, path)["verdict_base"] == {
+            "name": "trunk",
+            "sha": head,
+            "basis": "recorded",
+            "objects_from": None,
+        }
+    # A guarded clone behind the saved head keeps its cached base.
+    item = find_clone(document, stale)
+    assert item["verdict_base"] == cached_base(stale)
+    assert item["verdict_base"]["sha"] != head
+
+
+@posix_only
+def test_the_verdict_base_is_named_by_the_saved_default_not_by_the_clones_cached_one(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    folder, remote, work = small_world(tmp_path)
+    push_commit(remote, "other", tmp_path)
+    git(work, "fetch", "-q", "origin")
+    git(work, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other")
+    collect([folder], remote_checks=True)
+
+    document = collect([folder])
+
+    item = find_clone(document, work)
+    assert item["cached_default"]["name"] == "other", "control: the clone caches another default"
+    [group] = document["repositories"]
+    assert group["default_branch"]["name"] == "trunk"
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": group["default_branch"]["sha"],
+        "basis": "recorded",
+        "objects_from": None,
+    }
+
+
+RECORDED_TIME = "2026-10-24T00:00:00Z"
+CHECK_FAILURE_REASONS = ["unreachable", "not_found", "authentication_failed", "timed_out", "failed"]
+
+
+def with_check(document: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
+    """A copy whose one repository carries ``check``, with the setting and the branch
+    bases that check implies (remote checks are off exactly for a check that names that)."""
+    broken = doc_copy(document)
+    broken["remote_checks"] = "off" if check["reason"] == "remote_checks_off" else "on"
+    broken["repositories"][0]["remote"]["check"] = check
+    if check["status"] == "live":
+        for item in broken["repositories"][0]["clones"]:
+            for branch in item["branches"]:
+                branch["vs_remote"]["basis"] = "live"
+    return broken
+
+
+@pytest.mark.parametrize("reason", ["remote_checks_off", *CHECK_FAILURE_REASONS])
+def test_parser_accepts_a_recorded_remote_check_with_a_time_and_either_kind_of_reason(
+    sample, reason
+):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": reason, "checked_at": RECORDED_TIME}
+
+    parsed = models.parse_checkouts(redigest(with_check(document, check)))
+
+    assert parsed["repositories"][0]["remote"]["check"] == check
+
+
+@pytest.mark.parametrize(
+    "checked_at", [None, "", "yesterday", "2026-13-45T25:61:61Z", "2026-10-24T00:00:00", 5]
+)
+def test_parser_refuses_a_recorded_remote_check_without_a_valid_time(sample, checked_at):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": "remote_checks_off", "checked_at": checked_at}
+
+    message = refusal_of(with_check(document, check))
+
+    assert message == "repositories[0].remote.check.checked_at must be a UTC timestamp"
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        {"status": "live", "reason": None},
+        {"status": "off", "reason": "remote_checks_off"},
+        {"status": "failed", "reason": "unreachable"},
+    ],
+    ids=["live", "off", "failed"],
+)
+def test_parser_refuses_a_time_on_a_remote_check_that_is_not_a_saved_one(sample, check):
+    document, _folder = sample
+    assert models.parse_checkouts(redigest(with_check(document, dict(check))))
+
+    message = refusal_of(with_check(document, {**check, "checked_at": RECORDED_TIME}))
+
+    assert message == "repositories[0].remote.check has an invalid shape"
+
+
+@pytest.mark.parametrize(
+    "reason", [None, "", "setting_off", "not_github", "bogus", "live", 7, ["failed"]]
+)
+def test_parser_refuses_a_recorded_remote_check_whose_reason_is_none_of_the_allowed_ones(
+    sample, reason
+):
+    document, _folder = sample
+    check = {"status": "recorded", "reason": reason, "checked_at": RECORDED_TIME}
+
+    message = refusal_of(with_check(document, check))
+
+    assert message == "repositories[0].remote.check.reason does not match its status"
+
+
+@pytest.mark.parametrize("checked_at", [None, "", "yesterday", "2026-13-45T25:61:61Z", 5])
+@pytest.mark.parametrize("reason", ["remote_checks_off", "failed"])
+def test_parser_refuses_a_recorded_lookup_without_a_valid_time(sample, reason, checked_at):
+    document, _folder = sample
+    accepted = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks="off" if reason == "remote_checks_off" else "on",
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup(reason),
+    )
+    assert models.parse_checkouts(accepted)
+    broken = doc_copy(accepted)
+    broken["repositories"][0]["pr_lookup"]["checked_at"] = checked_at
+
+    message = refusal_of(broken)
+
+    assert message == "repositories[0].pr_lookup.checked_at must be a UTC timestamp"
+
+
+@pytest.mark.parametrize("reason", ["bogus", "setting_off", None])
+def test_parser_refuses_a_recorded_lookup_with_a_reason_that_contradicts_the_checks(
+    sample, reason
+):
+    document, _folder = sample
+    broken = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks="on",
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup(reason),
+    )
+
+    message = refusal_of(broken)
+
+    assert message == "repositories[0].pr_lookup does not match the lookup setting and the remote"
+
+
+@pytest.mark.parametrize("remote_checks", ["on", "off"])
+def test_parser_refuses_a_recorded_not_github_lookup_on_a_github_group(sample, remote_checks):
+    document, _folder = sample
+    broken = lookup_document(
+        document,
+        github_lookup="on",
+        remote_checks=remote_checks,
+        key=GITHUB_KEY,
+        pr_lookup=recorded_lookup("not_github"),
+    )
+
+    message = refusal_of(broken)
+
+    assert message == (
+        "repositories[0].pr_lookup.reason is not_github exactly when the remote is not GitHub's"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A newer remote-tracking ref beats the saved check
+# ---------------------------------------------------------------------------
+
+
+def vs(basis: str, relation: str, ahead: int | None = None, behind: int | None = None):
+    """A comparison with no lender; an ``equal`` one carries zero counts."""
+    if relation == "equal":
+        ahead, behind = 0, 0
+    return {
+        "basis": basis,
+        "relation": relation,
+        "ahead": ahead,
+        "behind": behind,
+        "objects_from": None,
+    }
+
+
+def push_from(work: Path, branch: str, name: str) -> str:
+    """Commit once on ``branch`` of ``work`` and push it with the branch's own upstream."""
+    git(work, "checkout", "-q", branch)
+    sha = commit_file(work, name, "x\n")
+    git(work, "push", "-q")
+    return sha
+
+
+class PushedWorld:
+    """Two fetched clones of one ``file://`` remote, each holding ``topic`` (pushed from
+    ``a``), and the networked collection that saved the remote's branches. Everything
+    done afterwards happens at least a whole second after the saved check."""
+
+    def __init__(self, tmp_path: Path, isolated_git: Path, *, reflogs: bool = True) -> None:
+        self.cache = nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        self.remote = make_remote(served)
+        self.a = clone(self.remote.as_uri(), self.folder / "a")
+        self.b = clone(self.remote.as_uri(), self.folder / "b")
+        if not reflogs:
+            git(self.a, "config", "core.logAllRefUpdates", "false")
+        git(self.a, "checkout", "-q", "-b", "topic")
+        commit_file(self.a, "topic.txt", "one\n")
+        git(self.a, "push", "-q", "-u", "origin", "topic")
+        git(self.a, "checkout", "-q", "trunk")
+        git(self.b, "fetch", "-q", "origin")
+        git(self.b, "branch", "topic", "origin/topic")
+        git(self.a, "fetch", "-q", "origin")
+        self.trunk = rev(self.remote, "trunk")
+        self.topic = rev(self.remote, "topic")
+        collect([self.folder], remote_checks=True)
+        self.saved = saved_file(self.cache)
+        [self.key] = self.saved["remote_checks"]
+        self.at = self.saved["remote_checks"][self.key]["heads"]["at"]
+        time.sleep(1.1)
+
+    def pushed(self) -> str:
+        """``a`` pushes a new ``topic`` commit and ``b`` pushes a new branch ``fresh``."""
+        tip = push_from(self.a, "topic", "topic-two.txt")
+        git(self.b, "checkout", "-q", "-b", "fresh", "trunk")
+        commit_file(self.b, "fresh.txt", "x\n")
+        git(self.b, "push", "-q", "-u", "origin", "fresh")
+        return tip
+
+    def set_record_time(self, at: int) -> None:
+        saved = saved_file(self.cache)
+        saved["remote_checks"][self.key]["heads"]["at"] = at
+        self.cache.write_text(json.dumps(saved))
+
+    def reflog_time(self, work: Path, name: str) -> int:
+        shown = git(
+            work, "reflog", "show", "-n", "1", "--date=unix", "--format=%gd",
+            f"refs/remotes/origin/{name}",
+        ).stdout.strip()
+        match = re.search(r"@\{([0-9]+)\}", shown)
+        assert match, f"no reflog time for {name}: {shown!r}"
+        return int(match.group(1))
+
+
+@posix_only
+def test_a_branch_pushed_after_the_saved_check_reads_equal_on_the_cached_basis(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    # Control: before any push every comparison is the saved check's.
+    before = collect([world.folder])
+    assert branch_of(find_clone(before, world.a), "topic")["vs_remote"] == vs("recorded", "equal")
+    tip = world.pushed()
+    assert rev(world.a, "topic") == tip != world.topic
+
+    document = collect([world.folder])
+
+    assert document["remote_checks"] == "off"
+    [group] = document["repositories"]
+    assert group["remote"]["check"]["status"] == "recorded"
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    # The pushed branch: not ``ahead`` 1 on the saved tip.
+    assert branch_of(a_item, "topic")["vs_remote"] == vs("cached", "equal")
+    # A branch the saved check never saw: not ``absent``.
+    assert branch_of(b_item, "fresh")["vs_remote"] == vs("cached", "equal")
+    # Refs that did not move keep the saved check's answer.
+    assert branch_of(b_item, "topic")["vs_remote"] == vs("recorded", "equal")
+    assert branch_of(a_item, "trunk")["vs_remote"] == vs("recorded", "equal")
+    assert a_item["local_default"]["vs_remote"] == vs("recorded", "equal")
+    assert a_item["verdict_base"]["basis"] == "recorded"
+    assert b_item["verdict_base"]["basis"] == "recorded"
+
+
+@posix_only
+def test_a_trunk_pushed_after_the_saved_check_moves_the_default_and_base_but_not_the_saved_head(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    tip = push_from(world.a, "trunk", "trunk-two.txt")
+    assert rev(world.a, "refs/remotes/origin/trunk") == tip != world.trunk
+
+    document = collect([world.folder])
+
+    [group] = document["repositories"]
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    # The group's default is the saved check's, and the clone's own tracking ref
+    # is compared with it truthfully.
+    assert group["default_branch"] == {"name": "trunk", "sha": world.trunk}
+    assert a_item["cached_vs_remote"] == vs("recorded", "ahead", 1, 0)
+    assert a_item["local_default"]["vs_remote"] == vs("cached", "equal")
+    assert branch_of(a_item, "trunk")["vs_remote"] == vs("cached", "equal")
+    assert a_item["verdict_base"] == {
+        "name": "trunk",
+        "sha": tip,
+        "basis": "cached",
+        "objects_from": None,
+    }
+    # The clone whose ref did not move keeps the saved head.
+    assert b_item["cached_vs_remote"] == vs("recorded", "equal")
+    assert b_item["local_default"]["vs_remote"] == vs("recorded", "equal")
+    assert b_item["verdict_base"] == {
+        "name": "trunk",
+        "sha": world.trunk,
+        "basis": "recorded",
+        "objects_from": None,
+    }
+    line = next(
+        item
+        for item in cli.format_checkouts(document)
+        if item.startswith(cli._json_literal(real(world.a)))
+    )
+    [default] = [element for element in line.split("  ") if element.startswith("default ")]
+    assert re.fullmatch(
+        r"default trunk cached equal cached equal tracking recorded ahead "
+        r"fetched [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z",
+        default,
+    ), default
+
+
+@posix_only
+def test_a_push_with_reflogs_disabled_leaves_the_saved_check_standing(tmp_path, isolated_git):
+    world = PushedWorld(tmp_path, isolated_git, reflogs=False)
+    world.pushed()
+    # The push moved the ref but wrote no reflog entry, so the clone cannot say when.
+    assert rev(world.a, "refs/remotes/origin/topic") == rev(world.a, "topic")
+    assert git(world.a, "reflog", "show", "refs/remotes/origin/topic").stdout.strip() == ""
+
+    document = collect([world.folder])
+
+    a_topic = branch_of(find_clone(document, world.a), "topic")
+    assert a_topic["vs_remote"] == vs("recorded", "ahead", 1, 0)
+    # Another clone, whose reflogs are on, is not affected by that known limit.
+    assert branch_of(find_clone(document, world.b), "fresh")["vs_remote"] == vs("cached", "equal")
+
+
+@posix_only
+def test_the_reflog_is_asked_once_for_each_name_whose_tracking_ref_differs_from_the_saved_one(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    shim, log = recording(tmp_path, "reflog-offline")
+
+    with path_with(monkeypatch, shim):
+        collect([world.folder])
+
+    asked = re.compile(
+        r"-C (\S+) reflog show -n 1 --date=unix --format=%gd refs/remotes/origin/(\S+)"
+    )
+    calls = sorted(
+        match.groups()
+        for line in log.read_text().splitlines()
+        if (match := asked.search(line))
+    )
+    assert calls == sorted([(real(world.a), "topic"), (real(world.b), "fresh")])
+
+    # A live check answers for the remote itself and asks no clone's reflog.
+    shim, log = recording(tmp_path, "reflog-networked")
+    with path_with(monkeypatch, shim):
+        live = collect([world.folder], remote_checks=True)
+    assert not [line for line in log.read_text().splitlines() if " reflog show " in line]
+    assert branch_of(find_clone(live, world.a), "topic")["vs_remote"] == vs("live", "equal")
+    assert branch_of(find_clone(live, world.b), "fresh")["vs_remote"] == vs("live", "equal")
+
+
+REFLOG_FAILURES = {
+    "fails": 'case "$*" in *" reflog show "*) echo "fatal: cannot show" >&2; exit 128;; esac',
+    "times-out": 'case "$*" in *" reflog show "*) sleep 30;; esac',
+}
+
+
+@posix_only
+@pytest.mark.parametrize("kind", list(REFLOG_FAILURES))
+def test_a_reflog_call_that_fails_or_times_out_leaves_the_saved_check_standing(
+    tmp_path, monkeypatch, isolated_git, kind
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    # Control: without the stand-in the same pushes read ``cached``.
+    control = collect([world.folder])
+    assert branch_of(find_clone(control, world.a), "topic")["vs_remote"] == vs("cached", "equal")
+    shim = stand_in(tmp_path, "reflog-" + kind, REFLOG_FAILURES[kind])
+
+    with path_with(monkeypatch, shim):
+        document = collect([world.folder], call_cap_seconds=2)
+
+    a_item, b_item = find_clone(document, world.a), find_clone(document, world.b)
+    assert branch_of(a_item, "topic")["vs_remote"] == vs("recorded", "ahead", 1, 0)
+    assert branch_of(b_item, "fresh")["vs_remote"] == vs("recorded", "absent")
+    assert branch_of(b_item, "topic")["vs_remote"] == vs("recorded", "equal")
+
+
+@posix_only
+def test_a_tracking_ref_older_than_the_saved_check_keeps_the_recorded_value(
+    tmp_path, isolated_git
+):
+    nyx_home(isolated_git)
+    served = tmp_path / "served"
+    served.mkdir()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    remote = make_remote(served)
+    a = clone(remote.as_uri(), folder / "a")
+    b = clone(remote.as_uri(), folder / "b")
+    git(a, "checkout", "-q", "-b", "topic")
+    commit_file(a, "topic.txt", "one\n")
+    git(a, "push", "-q", "-u", "origin", "topic")
+    git(b, "fetch", "-q", "origin")
+    git(b, "branch", "topic", "origin/topic")
+    time.sleep(1.1)
+    # Another clone pushes after B's fetch, and a networked run saves that tip.
+    newer = push_from(a, "topic", "topic-two.txt")
+    collect([folder], remote_checks=True)
+    assert rev(b, "refs/remotes/origin/topic") != newer
+
+    document = collect([folder])
+
+    comparison = branch_of(find_clone(document, b), "topic")["vs_remote"]
+    assert comparison == {
+        "basis": "recorded",
+        "relation": "behind",
+        "ahead": 0,
+        "behind": 1,
+        "objects_from": real(a),
+    }
+
+
+@posix_only
+def test_a_tracking_ref_moved_in_the_second_of_the_saved_check_is_the_newer_one(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    moved = world.reflog_time(world.a, "topic")
+    assert moved > world.at
+
+    world.set_record_time(moved)
+    same_second = collect([world.folder])
+    world.set_record_time(moved + 1)
+    later_record = collect([world.folder])
+
+    assert branch_of(find_clone(same_second, world.a), "topic")["vs_remote"] == vs(
+        "cached", "equal"
+    )
+    assert branch_of(find_clone(later_record, world.a), "topic")["vs_remote"] == vs(
+        "recorded", "ahead", 1, 0
+    )
+
+
+@posix_only
+def test_the_reflog_time_test_answers_no_for_a_cut_a_missing_and_a_passed_deadline(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    context = checkouts._CloneContext(
+        cwd=real(world.a),
+        ceiling=real(world.folder),
+        partial=False,
+        shallow=False,
+        local={},
+        cached={},
+        ssh_configured=False,
+    )
+    executable = checkouts._resolve_program("git")
+    assert executable is not None
+    open_runner = checkouts._GitRunner(executable, time.monotonic_ns() + 60 * 10**9, 10)
+    expired = checkouts._GitRunner(executable, time.monotonic_ns() - 1, 10)
+
+    assert checkouts._ref_moved_since(open_runner, context, "topic", world.at) is True
+    assert checkouts._ref_moved_since(open_runner, context, "topic", 2**40) is False
+    assert checkouts._ref_moved_since(open_runner, context, "no-such-branch", 0) is False
+    assert checkouts._ref_moved_since(expired, context, "topic", world.at) is False
+
+
+@posix_only
+def test_a_clone_behind_its_own_newer_tracking_ref_counts_against_that_ref(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    for branch in ("topic", "trunk"):
+        push_from(world.a, branch, f"{branch}-two.txt")
+        git(world.a, "reset", "-q", "--hard", "HEAD~1")
+
+    item = find_clone(collect([world.folder]), world.a)
+
+    behind_one = vs("cached", "behind", 0, 1)
+    assert branch_of(item, "topic")["vs_remote"] == behind_one
+    assert branch_of(item, "trunk")["vs_remote"] == behind_one
+    assert item["local_default"]["vs_remote"] == behind_one
+    assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_partial_clone_behind_its_own_newer_tracking_ref_reads_the_same_comparison_twice(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    partial = clone(world.remote.as_uri(), world.folder / "partial", "--filter=blob:none")
+    push_from(partial, "trunk", "partial-two.txt")
+    git(partial, "reset", "-q", "--hard", "HEAD~1")
+
+    item = find_clone(collect([world.folder]), partial)
+
+    behind_one = vs("cached", "behind", 0, 1)
+    assert item["local_default"]["vs_cached"] == behind_one
+    assert item["local_default"]["vs_remote"] == behind_one
+    assert branch_of(item, "trunk")["vs_remote"] == behind_one
+    assert item["verdict_base"]["basis"] == "cached"
+
+
+@posix_only
+def test_a_clone_without_the_default_branch_takes_its_own_newer_tip_as_the_base(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    headless = clone(world.remote.as_uri(), world.folder / "headless-of-trunk")
+    git(headless, "checkout", "-q", "-b", "elsewhere")
+    git(headless, "branch", "-q", "-D", "trunk")
+    assert "trunk" not in git(headless, "branch", "--format=%(refname:short)").stdout.split()
+    tip = push_from(world.a, "trunk", "trunk-two.txt")
+    git(headless, "fetch", "-q", "origin")
+    assert rev(headless, "refs/remotes/origin/trunk") == tip != world.trunk
+
+    item = find_clone(collect([world.folder]), headless)
+
+    assert item["verdict_base"] == {
+        "name": "trunk",
+        "sha": tip,
+        "basis": "cached",
+        "objects_from": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The cross-field rules of the document: one mutation of a collector document each
+# ---------------------------------------------------------------------------
+
+
+def refusal_after(document: dict[str, Any], mutate) -> str:
+    """The refusal of ``document`` after one ``mutate`` and a fresh digest and Removable.
+
+    The unmutated document must parse again first, so the refusal is the mutation's.
+    """
+    assert models.parse_checkouts(redigest(rederive(doc_copy(document))))
+    broken = doc_copy(document)
+    mutate(broken)
+    return refusal_of(rederive(broken))
+
+
+def group_label(document: dict[str, Any]) -> str:
+    assert len(document["repositories"]) == 1
+    return "repositories[0]"
+
+
+def clone_label(document: dict[str, Any], path: Path | str) -> str:
+    paths = [item["path"] for item in document["repositories"][0]["clones"]]
+    return f"{group_label(document)}.clones[{paths.index(real(path))}]"
+
+
+def branch_label(document: dict[str, Any], path: Path | str, name: str) -> str:
+    item = find_clone(document, path)
+    names = [branch["name"] for branch in item["branches"]]
+    return f"{clone_label(document, path)}.branches[{names.index(name)}]"
+
+
+def worktree_label(document: dict[str, Any], path: Path | str, worktree: Path | str) -> str:
+    item = find_clone(document, path)
+    paths = [entry["path"] for entry in item["worktrees"]]
+    return f"{clone_label(document, path)}.worktrees[{paths.index(real(worktree))}]"
+
+
+def group_of_document(document: dict[str, Any]) -> dict[str, Any]:
+    return document["repositories"][0]
+
+
+class PullRequestWorld:
+    """One GitHub repository of two clones whose lookup answered: ``x`` and ``y`` sit
+    at one commit that request 15 names on ``x`` alone, ``a`` holds a detached worktree
+    at a commit only ``b`` has a branch for, and request 31 names that branch. ``live``
+    is the networked collection and ``recorded`` the offline one that follows it."""
+
+    def __init__(self, tmp_path: Path, monkeypatch, isolated_git: Path) -> None:
+        nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        remote = make_remote(served)
+        self.a = clone(remote, self.folder / "a")
+        self.b = clone(remote, self.folder / "b")
+        git(self.a, "checkout", "-q", "-b", "x", "trunk")
+        self.tip = commit_file(self.a, "x.txt", "x\n")
+        git(self.a, "branch", "y", "x")
+        git(self.a, "checkout", "-q", "trunk")
+        git(self.b, "checkout", "-q", "-b", "elsewhere", "trunk")
+        self.head = commit_file(self.b, "elsewhere.txt", "elsewhere\n")
+        git(self.a, "fetch", "-q", str(self.b), "elsewhere")
+        self.detached = linked(self.a, tmp_path, "at-head", "--detach", self.head)
+        for repository in (self.a, self.b):
+            point_origin_at(repository, remote, GITHUB_URL)
+        install_fake_gh(
+            tmp_path,
+            monkeypatch,
+            stdout=pr_answer(
+                local_names(self.a, self.b),
+                {
+                    "x": [pr_node(15, "merged", self.tip)],
+                    "elsewhere": [pr_node(31, "merged", self.head)],
+                },
+            ),
+        )
+        self.live = github_collect(self.folder)
+        self.recorded = github_collect(self.folder, remote_checks=False)
+        a_item = find_clone(self.live, self.a)
+        assert verdict_facts(branch_of(a_item, "x")) == pr_verdict(15)
+        assert verdict_facts(branch_of(a_item, "y")) == pr_verdict(15)
+        assert listed(branch_of(a_item, "x")) == [(15, "merged", True)]
+        assert listed(branch_of(a_item, "y")) == []
+        assert verdict_facts(find_worktree(a_item, self.detached)) == NOT_MERGED_FACTS
+        assert verdict_facts(branch_of(find_clone(self.live, self.b), "elsewhere")) == (
+            pr_verdict(31)
+        )
+
+
+@pytest.fixture
+def pull_requests(tmp_path, monkeypatch, isolated_git):
+    return PullRequestWorld(tmp_path, monkeypatch, isolated_git)
+
+
+class OfflineWorld:
+    """One remote with a ``topic`` branch, collected without remote checks as a file
+    remote with the lookup off and on, and as a GitHub one with the lookup on."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        root = tmp_path / "offline"
+        root.mkdir()
+        self.folder, remote, self.work = small_world(root)
+        git(self.work, "branch", "topic")
+        self.setting_off = collect([self.folder])
+        self.not_github = collect([self.folder], github_lookup=True)
+        point_origin_at(self.work, remote, GITHUB_URL)
+        self.github = collect([self.folder], github_lookup=True)
+        self.github_off = collect([self.folder])
+
+
+@pytest.fixture
+def offline(tmp_path):
+    return OfflineWorld(tmp_path)
+
+
+def test_the_collector_documents_of_every_kind_parse_through_the_collect_helper(offline):
+    # Each document below went through ``parse_checkouts`` inside ``collect``.
+    assert group_of_document(offline.setting_off)["pr_lookup"] == lookup("off", "setting_off")
+    assert group_of_document(offline.not_github)["pr_lookup"] == lookup("off", "not_github")
+    assert group_of_document(offline.github)["pr_lookup"] == lookup("off", "remote_checks_off")
+    assert group_of_document(offline.github_off)["pr_lookup"] == lookup("off", "setting_off")
+    assert group_of_document(offline.github)["remote"]["check"] == {
+        "status": "off", "reason": "remote_checks_off",
+    }
+
+
+@posix_only
+def test_the_collector_documents_with_a_lookup_parse_live_and_recorded(pull_requests):
+    live, recorded = pull_requests.live, pull_requests.recorded
+    assert group_of_document(live)["remote"]["check"] == {"status": "live", "reason": None}
+    assert group_of_document(live)["pr_lookup"] == lookup("live", None)
+    assert group_of_document(recorded)["remote"]["check"]["status"] == "recorded"
+    assert group_of_document(recorded)["remote"]["check"]["reason"] == "remote_checks_off"
+    assert group_of_document(recorded)["pr_lookup"]["status"] == "recorded"
+    assert group_of_document(recorded)["pr_lookup"]["reason"] == "remote_checks_off"
+    # The recorded document keeps the pull-request rung the live one found.
+    recorded_a = find_clone(recorded, pull_requests.a)
+    assert verdict_facts(branch_of(recorded_a, "y")) == pr_verdict(15)
+
+
+@posix_only
+def test_the_collector_document_of_a_failed_check_and_of_cached_comparisons_parse(
+    tmp_path, isolated_git
+):
+    gone_served = tmp_path / "gone"
+    gone_served.mkdir()
+    folder = tmp_path / "failed-folder"
+    folder.mkdir()
+    gone = make_remote(gone_served)
+    survivor = clone(gone, folder / "survivor")
+    remove_tree(gone)
+    failed = collect([folder], remote_checks=True)
+    assert group_of_document(failed)["remote"]["check"] == {
+        "status": "failed", "reason": "not_found",
+    }
+    assert find_clone(failed, survivor)["cached_vs_remote"] is None
+
+    pushed_root = tmp_path / "pushed"
+    pushed_root.mkdir()
+    world = PushedWorld(pushed_root, isolated_git)
+    world.pushed()
+    push_from(world.a, "trunk", "trunk-two.txt")
+    cached = collect([world.folder])
+    a_item = find_clone(cached, world.a)
+    assert branch_of(a_item, "topic")["vs_remote"]["basis"] == "cached"
+    assert a_item["verdict_base"]["basis"] == "cached"
+    assert group_of_document(cached)["remote"]["check"]["status"] == "recorded"
+
+
+def test_a_lookup_setting_off_refuses_a_lookup_that_is_not_off(offline):
+    document = offline.github
+    group = group_label(document)
+
+    def lookup_live_under_the_setting_off(broken):
+        broken["github_lookup"] = "off"
+        group_of_document(broken)["pr_lookup"] = lookup("live", None)
+
+    assert refusal_after(document, lookup_live_under_the_setting_off) == (
+        f"{group}.pr_lookup must be off when the lookup setting is off"
+    )
+
+
+def test_the_reason_precedence_names_the_setting_before_the_remote(offline):
+    document = offline.setting_off
+    assert group_of_document(document)["remote"]["key"].startswith("file:")
+
+    def not_github_with_the_setting_off(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "not_github"
+
+    assert refusal_after(document, not_github_with_the_setting_off) == (
+        f"{group_label(document)}.pr_lookup.reason must be setting_off when the setting is off"
+    )
+
+
+def test_not_github_holds_exactly_when_the_remote_key_is_not_a_github_identity(offline):
+    github = offline.github
+    assert group_of_document(github)["remote"]["key"] == GITHUB_KEY
+    message = f"{group_label(github)}.pr_lookup.reason is not_github exactly when the remote is not GitHub's"
+
+    def not_github_on_a_github_group(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "not_github"
+
+    assert refusal_after(github, not_github_on_a_github_group) == message
+
+    plain = offline.not_github
+    assert group_of_document(plain)["remote"]["key"].startswith("file:")
+
+    def checks_off_on_a_file_group(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "remote_checks_off"
+
+    assert refusal_after(plain, checks_off_on_a_file_group) == message
+
+
+@posix_only
+def test_remote_checks_off_refuses_a_failed_check_and_an_unavailable_or_failed_lookup(
+    offline, pull_requests
+):
+    document = offline.github
+    group = group_label(document)
+
+    def failed_check(broken):
+        group_of_document(broken)["remote"]["check"] = {"status": "failed", "reason": "unreachable"}
+
+    assert refusal_after(document, failed_check) == (
+        f"{group}.remote.check must be off or recorded with remote checks off"
+    )
+
+    def unavailable_lookup(broken):
+        group_of_document(broken)["pr_lookup"] = lookup("unavailable", "failed")
+
+    assert refusal_after(document, unavailable_lookup) == (
+        f"{group}.pr_lookup must be off or recorded with remote checks off"
+    )
+
+    # A saved check or lookup with the failure that was current when it was taken is a
+    # lookup of the networked run, not of one with the checks off.
+    recorded = pull_requests.recorded
+    assert recorded["remote_checks"] == "off"
+
+    def recorded_check_with_a_failure(broken):
+        group_of_document(broken)["remote"]["check"]["reason"] = "failed"
+
+    assert refusal_after(recorded, recorded_check_with_a_failure) == (
+        f"{group_label(recorded)}.remote.check.reason cannot be a failure with remote checks off"
+    )
+
+    def recorded_lookup_with_a_failure(broken):
+        group_of_document(broken)["pr_lookup"]["reason"] = "failed"
+
+    assert refusal_after(recorded, recorded_lookup_with_a_failure) == (
+        f"{group_label(recorded)}.pr_lookup.reason cannot be a failure with remote checks off"
+    )
+
+
+@posix_only
+def test_remote_checks_on_refuses_a_remote_checks_off_reason_anywhere(pull_requests):
+    document = pull_requests.live
+    assert document["remote_checks"] == "on"
+    group = group_label(document)
+
+    def check_off(broken):
+        group_of_document(broken)["remote"]["check"] = {
+            "status": "off", "reason": "remote_checks_off",
+        }
+
+    assert refusal_after(document, check_off) == (
+        f"{group}.remote.check.reason cannot be remote_checks_off with remote checks on"
+    )
+
+    def lookup_off(broken):
+        group_of_document(broken)["pr_lookup"] = lookup("off", "remote_checks_off")
+
+    assert refusal_after(document, lookup_off) == (
+        f"{group}.pr_lookup.reason cannot be remote_checks_off with remote checks on"
+    )
+
+
+@posix_only
+def test_a_basis_names_a_check_of_its_own_kind(pull_requests):
+    live, recorded = pull_requests.live, pull_requests.recorded
+    path = pull_requests.a
+
+    def recorded_basis_under_live(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "recorded"
+
+    assert refusal_after(live, recorded_basis_under_live) == (
+        f"{branch_label(live, path, 'x')}.vs_remote.basis is recorded without a recorded remote check"
+    )
+
+    def live_basis_under_recorded(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "live"
+
+    assert refusal_after(recorded, live_basis_under_recorded) == (
+        f"{branch_label(recorded, path, 'x')}.vs_remote.basis is live without a live remote check"
+    )
+
+
+def test_an_unanswered_check_refuses_a_default_head_and_a_comparison_with_the_remote(
+    tmp_path, offline
+):
+    off = offline.github
+    assert group_of_document(off)["remote"]["check"]["status"] == "off"
+
+    def head_under_off(broken):
+        group_of_document(broken)["default_branch"]["sha"] = "a" * 40
+
+    assert refusal_after(off, head_under_off) == (
+        f"{group_label(off)}.default_branch.sha requires a live or recorded remote check"
+    )
+
+    gone_served = tmp_path / "gone"
+    gone_served.mkdir()
+    folder = tmp_path / "failed-folder"
+    folder.mkdir()
+    gone = make_remote(gone_served)
+    survivor = clone(gone, folder / "survivor")
+    remove_tree(gone)
+    failed = collect([folder], remote_checks=True)
+    assert group_of_document(failed)["remote"]["check"]["status"] == "failed"
+    label = clone_label(failed, survivor)
+
+    def cached_comparison_under_failed(broken):
+        find_clone(broken, survivor)["cached_vs_remote"] = vs("cached", "equal")
+
+    assert refusal_after(failed, cached_comparison_under_failed) == (
+        f"{label}.cached_vs_remote requires a live or recorded remote check"
+    )
+
+    def local_default_comparison_under_failed(broken):
+        find_clone(broken, survivor)["local_default"]["vs_remote"] = vs("cached", "equal")
+
+    assert refusal_after(failed, local_default_comparison_under_failed) == (
+        f"{label}.local_default.vs_remote requires a live or recorded remote check"
+    )
+
+
+@posix_only
+def test_a_live_check_refuses_a_cached_branch_comparison(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+
+    def cached_under_live(broken):
+        branch_of(find_clone(broken, path), "x")["vs_remote"]["basis"] = "cached"
+
+    assert refusal_after(document, cached_under_live) == (
+        f"{branch_label(document, path, 'x')}.vs_remote.basis does not fit the live remote check"
+    )
+
+
+@posix_only
+def test_only_a_live_or_recorded_basis_may_name_the_clone_that_lent_the_objects(
+    tmp_path, isolated_git
+):
+    world = PushedWorld(tmp_path, isolated_git)
+    world.pushed()
+    push_from(world.a, "trunk", "trunk-two.txt")
+    document = collect([world.folder])
+    a_item = find_clone(document, world.a)
+    assert a_item["verdict_base"]["basis"] == "cached"
+    assert branch_of(a_item, "topic")["vs_remote"]["basis"] == "cached"
+    lender = real(world.b)
+
+    def comparison_lender(broken):
+        branch_of(find_clone(broken, world.a), "topic")["vs_remote"]["objects_from"] = lender
+
+    assert refusal_after(document, comparison_lender) == (
+        f"{branch_label(document, world.a, 'topic')}.vs_remote.objects_from "
+        "requires the live or recorded basis"
+    )
+
+    def base_lender(broken):
+        find_clone(broken, world.a)["verdict_base"]["objects_from"] = lender
+
+    assert refusal_after(document, base_lender) == (
+        f"{clone_label(document, world.a)}.verdict_base.objects_from "
+        "requires the live or recorded basis"
+    )
+
+
+@posix_only
+def test_the_pull_request_number_and_rung_are_set_together_and_only_for_a_merged_verdict(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    message = f"{branch_label(document, path, 'x')}.verdict.pull_request must be set exactly for the pull_request rung"
+
+    def number_with_another_rung(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of(
+            "merged", "tree_equal", pull_request=15
+        )
+
+    assert refusal_after(document, number_with_another_rung) == message
+
+    def rung_without_a_number(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"]["pull_request"] = None
+
+    assert refusal_after(document, rung_without_a_number) == message
+
+
+def test_the_pull_request_rung_needs_a_lookup(offline):
+    document = offline.github
+    assert group_of_document(document)["pr_lookup"]["status"] == "off"
+    path = offline.work
+
+    def rung_with_the_lookup_off(broken):
+        branch_of(find_clone(broken, path), "topic")["verdict"] = verdict_of(
+            "merged", "pull_request", pull_request=15
+        )
+
+    assert refusal_after(document, rung_with_the_lookup_off) == (
+        f"{branch_label(document, path, 'topic')}.verdict "
+        "names a pull request without a pull-request lookup"
+    )
+
+
+@posix_only
+def test_a_detached_worktree_takes_the_rung_only_at_a_commit_a_local_branch_holds(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    held = find_clone(document, path)
+    assert pull_requests.head not in {branch["sha"] for branch in held["branches"]}
+
+    def rung_at_an_unheld_commit(broken):
+        clone_document = find_clone(broken, path)
+        find_worktree(clone_document, pull_requests.detached)["verdict"] = verdict_of(
+            "merged", "pull_request", pull_request=31
+        )
+        # Request 31 is listed as merged by a branch of this clone, at another commit.
+        branch_of(clone_document, "x")["pull_requests"].append(
+            {"number": 31, "state": "merged", "head_matches": False}
+        )
+
+    assert refusal_after(document, rung_at_an_unheld_commit) == (
+        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
+        "names a pull request at a commit no branch holds"
+    )
+
+
+@posix_only
+def test_a_detached_worktree_takes_the_rung_only_as_the_verdict_of_a_branch_at_its_commit(
+    pull_requests,
+):
+    document = pull_requests.live
+    path = pull_requests.a
+    clone_document = find_clone(document, path)
+    assert branch_of(clone_document, "x")["sha"] == branch_of(clone_document, "y")["sha"]
+    assert verdict_facts(branch_of(clone_document, "x")) == pr_verdict(15)
+
+    def detached_at_the_shared_commit(broken):
+        item = find_clone(broken, path)
+        worktree = find_worktree(item, pull_requests.detached)
+        worktree["head"]["sha"] = branch_of(item, "x")["sha"]
+        worktree["verdict"] = verdict_of("merged", "pull_request", pull_request=15)
+
+    shared = doc_copy(document)
+    detached_at_the_shared_commit(shared)
+    assert models.parse_checkouts(redigest(rederive(shared)))
+
+    message = (
+        f"{worktree_label(document, path, pull_requests.detached)}.verdict "
+        "differs from the verdict of a branch at its commit"
+    )
+
+    def branches_hold_another_verdict(broken):
+        detached_at_the_shared_commit(broken)
+        item = find_clone(broken, path)
+        for name in ("x", "y"):
+            branch_of(item, name)["verdict"] = verdict_of("not_merged", "none")
+
+    assert refusal_after(document, branches_hold_another_verdict) == message
+
+    # One branch at the commit agreeing is not enough: the commit has one verdict.
+    def one_branch_holds_another_verdict(broken):
+        detached_at_the_shared_commit(broken)
+        branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of("not_merged", "none")
+
+    assert refusal_after(document, one_branch_holds_another_verdict) == message
+
+
+class BaseAheadWorld:
+    """One GitHub clone whose local ``trunk``, the verdict base's name, is one commit
+    ahead of ``origin/trunk`` with a detached worktree at that commit. Merged request 7
+    names ``trunk`` with its head at that commit, or, for ``descendant``, at a child of
+    it that branch ``later`` holds. With ``beside``, branch ``x`` also sits at the
+    commit. ``live`` is the networked collection and ``recorded`` the offline one."""
+
+    def __init__(
+        self, tmp_path: Path, monkeypatch, isolated_git: Path, *, descendant: bool, beside: bool
+    ) -> None:
+        nyx_home(isolated_git)
+        served = tmp_path / "served"
+        served.mkdir()
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        remote = make_remote(served)
+        self.work = clone(remote, folder / "work")
+        self.tip = commit_file(self.work, "ahead.txt", "ahead\n")
+        head = self.tip
+        if descendant:
+            git(self.work, "checkout", "-q", "-b", "later")
+            head = commit_file(self.work, "later.txt", "later\n")
+            git(self.work, "checkout", "-q", "trunk")
+        if beside:
+            git(self.work, "branch", "x", "trunk")
+        self.detached = linked(self.work, tmp_path, "ahead", "--detach", self.tip)
+        point_origin_at(self.work, remote, GITHUB_URL)
+        install_fake_gh(
+            tmp_path,
+            monkeypatch,
+            stdout=pr_answer(local_names(self.work), {"trunk": [pr_node(7, "merged", head)]}),
+        )
+        self.live = github_collect(folder)
+        self.recorded = github_collect(folder, remote_checks=False)
+        for document in (self.live, self.recorded):
+            item = find_clone(document, self.work)
+            assert item["verdict_base"]["name"] == "trunk"
+            assert item["verdict_base"]["sha"] != self.tip
+            trunk = branch_of(item, "trunk")
+            assert trunk["sha"] == self.tip and trunk["verdict"] is None
+            assert listed(trunk) == [(7, "merged", not descendant)]
+            assert verdict_facts(find_worktree(item, self.detached)) == pr_verdict(7)
+        assert group_of_document(self.recorded)["pr_lookup"]["status"] == "recorded"
+
+
+@posix_only
+@pytest.mark.parametrize("descendant", [False, True], ids=["head", "descendant"])
+def test_a_detached_worktree_the_base_branch_alone_shares_a_commit_with_keeps_the_rung(
+    tmp_path, monkeypatch, isolated_git, descendant
+):
+    # The candidate names of a commit include the verdict base branch, which itself
+    # takes no verdict, so the detached worktree's verdict has no branch verdict to
+    # match. Each document already parsed strictly inside ``collect``.
+    world = BaseAheadWorld(
+        tmp_path, monkeypatch, isolated_git, descendant=descendant, beside=False
+    )
+    for document in (world.live, world.recorded):
+        item = find_clone(document, world.work)
+        assert [b["name"] for b in item["branches"] if b["sha"] == world.tip] == ["trunk"]
+        assert models.parse_checkouts(redigest(rederive(doc_copy(document))))
+
+
+@posix_only
+def test_a_branch_beside_the_base_branch_at_a_commit_holds_the_detached_worktree_to_its_verdict(
+    tmp_path, monkeypatch, isolated_git
+):
+    world = BaseAheadWorld(tmp_path, monkeypatch, isolated_git, descendant=False, beside=True)
+    path = world.work
+    for document in (world.live, world.recorded):
+        item = find_clone(document, path)
+        # ``x`` takes request 7 through the base branch's name at the same commit.
+        assert verdict_facts(branch_of(item, "x")) == pr_verdict(7)
+        assert listed(branch_of(item, "x")) == []
+
+        def beside_holds_another_verdict(broken):
+            branch_of(find_clone(broken, path), "x")["verdict"] = verdict_of(
+                "not_merged", "none"
+            )
+
+        assert refusal_after(document, beside_holds_another_verdict) == (
+            f"{worktree_label(document, path, world.detached)}.verdict "
+            "differs from the verdict of a branch at its commit"
+        )
+
+
+@posix_only
+def test_the_rung_number_must_be_listed_as_merged_by_a_branch_at_the_commit(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+    label = f"{branch_label(document, path, 'x')}.verdict"
+    message = f"{label} names a pull request no branch at its commit lists as merged"
+
+    def number_nobody_lists(broken):
+        branch_of(find_clone(broken, path), "x")["verdict"]["pull_request"] = 16
+
+    assert refusal_after(document, number_nobody_lists) == message
+
+    def listed_as_open(broken):
+        branch_of(find_clone(broken, path), "x")["pull_requests"][0]["state"] = "open"
+
+    assert refusal_after(document, listed_as_open) == message
+
+    def listed_by_no_branch(broken):
+        branch_of(find_clone(broken, path), "x")["pull_requests"] = []
+
+    assert refusal_after(document, listed_by_no_branch) == message
+
+
+def test_a_branch_lists_no_pull_request_while_the_lookup_is_off(offline):
+    document = offline.github
+    path = offline.work
+
+    def listed_request(broken):
+        branch_of(find_clone(broken, path), "topic")["pull_requests"] = [
+            {"number": 3, "state": "open", "head_matches": True}
+        ]
+
+    assert refusal_after(document, listed_request) == (
+        f"{branch_label(document, path, 'topic')}.pull_requests requires a pull-request lookup"
+    )
+
+
+@posix_only
+def test_a_pull_request_list_is_sorted_unique_and_capped(pull_requests):
+    document = pull_requests.live
+    path = pull_requests.a
+    label = f"{branch_label(document, path, 'x')}.pull_requests"
+    entry = {"number": 15, "state": "merged", "head_matches": True}
+
+    def other(number):
+        return {"number": number, "state": "open", "head_matches": False}
+
+    def listing(*entries):
+        def mutate(broken):
+            branch_of(find_clone(broken, path), "x")["pull_requests"] = list(entries)
+
+        return mutate
+
+    unsorted = refusal_after(document, listing(entry, other(3)))
+    repeated = refusal_after(document, listing(entry, dict(entry)))
+    assert unsorted == repeated == f"{label} must be unique and sorted by number"
+    cap = models.PULL_REQUEST_LIST_CAP
+    assert cap == 10
+    crowd = [other(number) for number in range(1, cap + 1)]
+    assert refusal_after(document, listing(*crowd, entry)) == (
+        f"{label} lists more than {cap} pull requests"
     )
