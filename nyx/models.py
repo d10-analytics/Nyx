@@ -1022,7 +1022,7 @@ def code_status_text(fields: Mapping[str, Any]) -> str:
         listed = f"{text} \u00b7 in {', '.join(names)}"
         if _text_units(listed) <= MAX_TEXT_UNITS:
             return listed
-        return f"{text} \u00b7 in {len(paths)} other worktrees"
+        return f"{text} \u00b7 in {_plural(len(paths), 'other worktree')}"
     return text
 
 
