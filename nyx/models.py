@@ -972,6 +972,59 @@ def natural_key(text: str) -> tuple[Any, ...]:
     return (tuple(parts), text)
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _path_name(path: str) -> str:
+    """The last component of a path, splitting on both separators on every host."""
+    parts = [part for part in re.split(r"[/\\]", path) if part]
+    return parts[-1] if parts else path
+
+
+def code_status_text(fields: Mapping[str, Any]) -> str:
+    """The one text of a package's Code Status, built from the stored fields.
+
+    ``fields`` carries ``state``, ``pull_request``, ``push``, ``unpushed``,
+    ``cleanup`` and ``checked_out_elsewhere``. The text lists the other
+    worktrees' names, or only their count when the names would not fit.
+    """
+    state = fields["state"]
+    push = fields["push"]
+    if state == "merged":
+        text = "merged"
+        cleanup = fields["cleanup"]
+        if cleanup is not None and cleanup["worktrees"]:
+            text += f" \u00b7 cleanup pending ({_plural(cleanup['worktrees'], 'worktree')})"
+        elif cleanup is not None and cleanup["branches"]:
+            text += f" \u00b7 cleanup pending ({_plural(cleanup['branches'], 'branch')})"
+    elif state == "pr_open":
+        text = f"PR #{fields['pull_request']} open"
+        if push == "unpushed":
+            text += f" \u00b7 {fields['unpushed']} unpushed"
+    elif state == "awaiting_merge":
+        text = "awaiting merge (no PR)"
+    elif state == "superseded":
+        text = "superseded \u00b7 branch retained"
+    elif state == "in_progress":
+        fragment = {
+            "pushed": "pushed",
+            "not_pushed": "not pushed",
+            "unpushed": f"{fields['unpushed']} unpushed",
+        }.get(push, "push state unknown")
+        text = f"in progress \u00b7 {fragment}"
+    else:
+        text = "merge state unknown"
+    paths = fields["checked_out_elsewhere"]
+    if paths:
+        names = sorted((_path_name(path) for path in paths), key=natural_key)
+        listed = f"{text} \u00b7 in {', '.join(names)}"
+        if _text_units(listed) <= MAX_TEXT_UNITS:
+            return listed
+        return f"{text} \u00b7 in {len(paths)} other worktrees"
+    return text
+
+
 def folder_sort_key(folder: Mapping[str, Any]) -> tuple[Any, ...]:
     return natural_key(folder["path"])
 
