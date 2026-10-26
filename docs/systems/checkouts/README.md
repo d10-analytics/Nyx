@@ -14,6 +14,18 @@ README is narrative only.
   requests) in the verdict cache file, and answers from them, labelled
   `recorded`, when a run is offline or a check fails; a clone's own newer
   remote-tracking ref takes precedence.
+- Matches each specification package's `Target repo:` to the checkout at that
+  path: a clone, a linked worktree (resolved to its clone), or a discovered
+  checkout whose clone could not be read. Paths compare by `os.stat` identity
+  (device and inode, which follows symbolic links and letter case), never as
+  strings. A target that matches nothing is classified from the filesystem
+  alone as missing, not a git checkout, or outside the checkout folders, so
+  git never runs in a directory discovery did not admit; with git unavailable a
+  usable target is unchecked. A path inside a clone that is not its top level
+  is not a git checkout.
+- `nyx/checkout_join.py` holds the matching rules over plain facts and makes no
+  git call and reads no file; `nyx/checkouts.py` owns every git call and
+  filesystem read and builds the path identities it is given.
 - Never writes or locks a repository.
 
 ## Outside this boundary

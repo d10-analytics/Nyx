@@ -38,6 +38,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
+from .checkout_join import PathKey, TargetIndex, resolve_target
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -3393,7 +3394,65 @@ def _scan_packages(package_scan: PackageScan | None) -> PackageHeads | None:
         return None
 
 
-def _package_entries(scan: PackageHeads | None) -> list[dict[str, Any]]:
+def _path_key(path: str) -> PathKey | None:
+    """The identity of ``path``: device and inode, which follow symbolic links.
+
+    A file system that reports no inode falls back to the case-normalized real
+    path. A path that cannot be examined has no identity.
+    """
+    try:
+        details = os.stat(path)
+        if details.st_ino:
+            return ("id", details.st_dev, details.st_ino)
+        return ("path", os.path.normcase(os.path.realpath(path)))
+    except (OSError, ValueError):
+        return None
+
+
+def _unmatched_target_status(path: str) -> str:
+    """Classify a target that matches no checkout, from the filesystem alone."""
+    try:
+        os.stat(path)
+        details = _lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except (OSError, ValueError):
+        return "not_git"
+    if details is None:
+        return "missing"
+    return "outside_folders" if _has_git_entry(path) else "not_git"
+
+
+def _target_index(
+    repositories: Sequence[Mapping[str, Any]],
+    candidate_clones: Mapping[str, str],
+    not_git_candidates: Iterable[str],
+) -> TargetIndex:
+    """Collect the path keys of every clone, candidate and listed linked worktree."""
+    clones: dict[PathKey, str] = {}
+    worktrees: dict[PathKey, tuple[str, str]] = {}
+    for repository in repositories:
+        for clone in repository["clones"]:
+            key = _path_key(clone["path"])
+            if key is not None:
+                clones.setdefault(key, clone["path"])
+            for item in clone["worktrees"] or ():
+                if item["main"]:
+                    continue
+                worktree_key = _path_key(item["path"])
+                if worktree_key is not None:
+                    worktrees.setdefault(worktree_key, (clone["path"], item["path"]))
+    for candidate, clone_path in candidate_clones.items():
+        key = _path_key(candidate)
+        if key is not None:
+            clones.setdefault(key, clone_path)
+    not_git = {key for key in map(_path_key, not_git_candidates) if key is not None}
+    return TargetIndex(clones, worktrees, frozenset(not_git))
+
+
+def _package_entries(
+    scan: PackageHeads | None, index: TargetIndex | None
+) -> list[dict[str, Any]]:
     """The packages that name a target repository or a branch, in catalog order."""
     if scan is None:
         return []
@@ -3401,19 +3460,19 @@ def _package_entries(scan: PackageHeads | None) -> list[dict[str, Any]]:
     for head in scan.heads:
         if head.target_repo.status == "absent" and head.branch.status == "absent":
             continue
+        path = head.target_repo.path
         entries.append(
             {
                 "package_path": head.package_path,
                 "package_id": head.package_id,
                 "finished": head.finished,
                 "superseded": head.superseded,
-                "target": {
-                    "status": "unchecked"
-                    if head.target_repo.status == "usable"
-                    else head.target_repo.status,
-                    "clone": None,
-                    "worktree": None,
-                },
+                "target": resolve_target(
+                    head.target_repo.status,
+                    _path_key(path) if path is not None and index is not None else None,
+                    index,
+                    lambda path=path: _unmatched_target_status(path or ""),
+                ),
                 "branch": {"status": head.branch.status, "name": head.branch.name},
                 "code_status": None,
             }
@@ -3450,6 +3509,7 @@ def collect_checkouts(
     discovery = _discover(os.fspath(folder) for folder in folders)
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
+    target_index: TargetIndex | None = None
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -3469,12 +3529,16 @@ def collect_checkouts(
             identities = list(pool.map(lambda c: _identify(runner, c), discovery.candidates))
             clones: dict[str, list[_Identity]] = {}
             outcomes: list[_CloneOutcome] = []
+            candidate_clones: dict[str, str] = {}
+            not_git_candidates: list[str] = []
             for identity in identities:
                 if identity.status == "not_a_repository":
+                    not_git_candidates.append(identity.candidate.path)
                     diagnostics.append(
                         {"code": "not_a_repository", "path": identity.candidate.path}
                     )
                 elif identity.status != "ok":
+                    candidate_clones[identity.candidate.path] = identity.candidate.path
                     outcomes.append(
                         _CloneOutcome(
                             _unavailable_clone(identity.candidate.path, identity.status)
@@ -3482,9 +3546,13 @@ def collect_checkouts(
                     )
                 else:
                     clones.setdefault(identity.common, []).append(identity)
-            outcomes.extend(
-                pool.map(lambda members: _collect_clone(runner, members), clones.values())
-            )
+            groups = list(clones.values())
+            collected = list(pool.map(lambda members: _collect_clone(runner, members), groups))
+            for members, outcome in zip(groups, collected):
+                if outcome.clone is not None:
+                    for member in members:
+                        candidate_clones[member.candidate.path] = outcome.clone["path"]
+            outcomes.extend(collected)
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
         repositories = _assemble_repositories(
@@ -3532,6 +3600,7 @@ def collect_checkouts(
         _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
+        target_index = _target_index(repositories, candidate_clones, not_git_candidates)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
@@ -3552,7 +3621,7 @@ def collect_checkouts(
                 package_scan.completed_stage_names if package_scan is not None else None
             ),
         },
-        "packages": _package_entries(package_heads),
+        "packages": _package_entries(package_heads, target_index),
     }
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
     return _render(document)

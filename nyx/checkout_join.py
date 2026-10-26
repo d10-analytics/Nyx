@@ -1,0 +1,80 @@
+"""Join of specification packages to the checkouts the collector read.
+
+This module makes no git call and reads no file. It decides, from plain facts
+the collector hands it, which checkout a package's ``Target repo:`` names. A
+path is represented by an opaque, hashable *key*; two paths name the same
+directory exactly when their keys are equal, so a symbolic link or a path
+written in another letter case resolves without a string comparison.
+
+A target is looked up in three key sets: the listed linked worktrees of readable
+clones, then every clone (its document path and every discovery candidate that
+belongs to it), then the discovery candidates that turned out not to be a
+repository. A target that matches none of them is classified by ``fallback``,
+which looks only at the filesystem: the join never causes a git call in a
+directory that discovery did not admit.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+PathKey = tuple[Any, ...]
+
+# Statuses a target takes without being matched against any checkout.
+UNMATCHED_STATUSES = frozenset({"missing", "not_git", "outside_folders"})
+
+
+@dataclass(frozen=True)
+class TargetIndex:
+    """The path keys of the checkouts of one collection.
+
+    ``clones`` maps the key of a clone's document path, and of every discovery
+    candidate that belongs to the clone, to that document path. ``worktrees``
+    maps the key of each linked worktree listed under a readable clone to the
+    pair (clone path, worktree path). ``not_git`` holds the keys of candidates
+    that discovery found but git did not report as a repository top level.
+    """
+
+    clones: Mapping[PathKey, str]
+    worktrees: Mapping[PathKey, tuple[str, str]]
+    not_git: frozenset[PathKey]
+
+
+def resolve_target(
+    head_status: str,
+    key: PathKey | None,
+    index: TargetIndex | None,
+    fallback: Callable[[], str],
+) -> dict[str, Any]:
+    """Return the ``target`` of one package.
+
+    ``head_status`` is the ``Target repo:`` header status (``usable``,
+    ``invalid`` or ``absent``) and ``key`` the identity of its path, ``None``
+    when the path cannot be read. ``index`` is ``None`` when git is not
+    available, which leaves a usable target ``unchecked``. ``fallback`` returns
+    ``missing``, ``not_git`` or ``outside_folders`` for a path that matches no
+    key.
+    """
+    if head_status != "usable":
+        return _target(head_status)
+    if index is None:
+        return _target("unchecked")
+    if key is not None:
+        listed = index.worktrees.get(key)
+        if listed is not None:
+            return _target("worktree", listed[0], listed[1])
+        clone = index.clones.get(key)
+        if clone is not None:
+            return _target("clone", clone)
+        if key in index.not_git:
+            return _target("not_git")
+    status = fallback()
+    if status not in UNMATCHED_STATUSES:
+        raise ValueError(f"unexpected unmatched target status {status!r}")
+    return _target(status)
+
+
+def _target(status: str, clone: str | None = None, worktree: str | None = None) -> dict[str, Any]:
+    return {"status": status, "clone": clone, "worktree": worktree}

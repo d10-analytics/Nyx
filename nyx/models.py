@@ -1936,8 +1936,27 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     packages = _list(document["packages"], "packages")
     if scan_status == "unavailable" and packages:
         raise ProtocolError("packages must be empty when the package scan is unavailable")
+    listed_worktrees: dict[str, set[str] | None] = {}
+    for repository in parsed:
+        for listed_clone in repository["clones"]:
+            listed_worktrees[listed_clone["path"]] = (
+                None
+                if listed_clone["worktrees"] is None
+                else {
+                    item["path"] for item in listed_clone["worktrees"] if not item["main"]
+                }
+            )
     for index, raw_package in enumerate(packages):
         package = _package(raw_package, f"packages[{index}]")
+        target = package["target"]
+        if target["clone"] is not None and target["clone"] not in listed_worktrees:
+            raise ProtocolError(f"packages[{index}].target.clone names no clone")
+        if target["worktree"] is not None:
+            linked = listed_worktrees[target["clone"]]
+            if linked is None or target["worktree"] not in linked:
+                raise ProtocolError(
+                    f"packages[{index}].target.worktree is not listed under its clone"
+                )
         if git_status != "available" and package["target"]["status"] in (
             "clone",
             "worktree",
