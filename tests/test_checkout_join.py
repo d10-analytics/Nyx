@@ -1578,3 +1578,118 @@ def test_the_parser_refuses_a_present_remote_copy_whose_sha_is_not_an_object_id(
         assert "remote.sha must be an object ID" in reference_mutation(live, change), (
             change.__name__
         )
+
+
+DOT = "\u00b7"
+
+
+def status_fields(state, **given):
+    fields = {
+        "state": state,
+        "pull_request": None,
+        "push": None,
+        "unpushed": None,
+        "cleanup": None,
+        "checked_out_elsewhere": [],
+    }
+    fields.update(given)
+    return fields
+
+
+@pytest.mark.parametrize(
+    ("fields", "text"),
+    [
+        (status_fields("merged", cleanup={"worktrees": 0, "branches": 0}), "merged"),
+        (
+            status_fields("merged", cleanup={"worktrees": 1, "branches": 1}),
+            f"merged {DOT} cleanup pending (1 worktree)",
+        ),
+        (
+            status_fields("merged", cleanup={"worktrees": 2, "branches": 2}),
+            f"merged {DOT} cleanup pending (2 worktrees)",
+        ),
+        (
+            status_fields("merged", cleanup={"worktrees": 0, "branches": 1}),
+            f"merged {DOT} cleanup pending (1 branch)",
+        ),
+        (
+            status_fields("merged", cleanup={"worktrees": 0, "branches": 2}),
+            f"merged {DOT} cleanup pending (2 branches)",
+        ),
+        (
+            status_fields("pr_open", pull_request=7, push="unpushed", unpushed=1),
+            f"PR #7 open {DOT} 1 unpushed",
+        ),
+        (
+            status_fields("pr_open", pull_request=7, push="unpushed", unpushed=12),
+            f"PR #7 open {DOT} 12 unpushed",
+        ),
+        (status_fields("pr_open", pull_request=7, push="pushed"), "PR #7 open"),
+        (status_fields("pr_open", pull_request=7, push="unknown"), "PR #7 open"),
+        (status_fields("pr_open", pull_request=7, push="not_pushed"), "PR #7 open"),
+        (status_fields("awaiting_merge"), "awaiting merge (no PR)"),
+        (status_fields("superseded"), f"superseded {DOT} branch retained"),
+        (status_fields("in_progress", push="pushed"), f"in progress {DOT} pushed"),
+        (
+            status_fields("in_progress", push="unpushed", unpushed=2),
+            f"in progress {DOT} 2 unpushed",
+        ),
+        (status_fields("in_progress", push="not_pushed"), f"in progress {DOT} not pushed"),
+        (
+            status_fields("in_progress", push="unknown"),
+            f"in progress {DOT} push state unknown",
+        ),
+        (status_fields("unknown"), "merge state unknown"),
+    ],
+)
+def test_code_status_text_for_every_state(fields, text):
+    assert models.code_status_text(fields) == text
+
+
+def test_code_status_text_names_other_worktrees_the_same_on_every_host():
+    suffix = f" {DOT} in Repo Clone 9, Repo Clone 10"
+    for paths in (
+        ["/w/Repo Clone 10", "C:\\w\\Repo Clone 9"],
+        ["C:\\w\\Repo Clone 9", "/w/Repo Clone 10"],
+        ["/w/Repo Clone 10/", "C:\\w\\Repo Clone 9\\"],
+    ):
+        fields = status_fields("unknown", checked_out_elsewhere=paths)
+        assert models.code_status_text(fields) == "merge state unknown" + suffix
+    one = status_fields("awaiting_merge", checked_out_elsewhere=["/w/Solo"])
+    assert models.code_status_text(one) == f"awaiting merge (no PR) {DOT} in Solo"
+    pr = status_fields(
+        "pr_open",
+        pull_request=3,
+        push="unpushed",
+        unpushed=2,
+        checked_out_elsewhere=["/a/b"],
+    )
+    assert models.code_status_text(pr) == f"PR #3 open {DOT} 2 unpushed {DOT} in b"
+    merged = status_fields(
+        "merged",
+        cleanup={"worktrees": 2, "branches": 2},
+        checked_out_elsewhere=["/a/x", "/a/y"],
+    )
+    assert (
+        models.code_status_text(merged)
+        == f"merged {DOT} cleanup pending (2 worktrees) {DOT} in x, y"
+    )
+
+
+def test_code_status_text_counts_worktrees_when_the_names_do_not_fit():
+    paths = [f"/w/{letter}{'x' * 399}" for letter in "abc"]
+    fields = status_fields("unknown", checked_out_elsewhere=paths)
+    text = models.code_status_text(fields)
+    assert text == f"merge state unknown {DOT} in 3 other worktrees"
+    # Two such names still fit within 1,024 UTF-16 units, so they are listed.
+    two = models.code_status_text(
+        status_fields("unknown", checked_out_elsewhere=paths[:2])
+    )
+    assert two == f"merge state unknown {DOT} in {'a' + 'x' * 399}, {'b' + 'x' * 399}"
+    assert len(two.encode("utf-16-le")) // 2 <= models.MAX_TEXT_UNITS
+    # The count form is chosen on UTF-16 units, so astral characters count twice.
+    astral = ["/w/" + "\U0001f600" * 260, "/w/" + "\U0001f600" * 260]
+    counted = models.code_status_text(
+        status_fields("unknown", checked_out_elsewhere=astral)
+    )
+    assert counted == f"merge state unknown {DOT} in 2 other worktrees"
