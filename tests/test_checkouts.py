@@ -1611,7 +1611,13 @@ def without_remote(document):
     """Reduce the first clone to a repository with no remote and so no base."""
     clone_document = first_clone(document)
     document["repositories"] = [
-        {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone_document]}
+        {
+            "remote": None,
+            "default_branch": None,
+            "pr_lookup": None,
+            "clones": [clone_document],
+            "package_branches": [],
+        }
     ]
     clone_document.update(cached_default=None, local_default=None, cached_vs_remote=None)
     for branch in clone_document["branches"]:

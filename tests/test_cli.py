@@ -2224,6 +2224,11 @@ def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
         "finished_policy": "configured",
     }
     assert document["packages"] == []
+    for repository_before in before["repositories"]:
+        repository_before["package_branches"] = []
+        for member in repository_before["clones"]:
+            for branch in member["branches"]:
+                branch["packages"] = []
     assert document["repositories"] == before["repositories"]
     assert [c["path"] for r in document["repositories"] for c in r["clones"]] == [
         real(repository)
