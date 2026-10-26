@@ -39,7 +39,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
-from .checkout_join import PathKey, TargetIndex, resolve_target
+from .checkout_join import PathKey, TargetIndex, join_branches, resolve_target
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -1096,6 +1096,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                 "pull_requests": [],
                 "verdict": None,
                 "contained_in": None,
+                "packages": [],
                 "removable": None,
             }
         )
@@ -1240,7 +1241,13 @@ def _assemble_repositories(
         remote = outcome.remote
         if remote is None:
             repositories.append(
-                {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone]}
+                {
+                    "remote": None,
+                    "default_branch": None,
+                    "pr_lookup": None,
+                    "clones": [clone],
+                    "package_branches": [],
+                }
             )
             continue
         key, display = remote
@@ -1255,6 +1262,7 @@ def _assemble_repositories(
                 "default_branch": {"name": None, "sha": None},
                 "pr_lookup": _pr_lookup_off(key, github_lookup, remote_checks),
                 "clones": [],
+                "package_branches": [],
             }
             grouped[key] = group
             repositories.append(group)
@@ -3617,6 +3625,8 @@ def collect_checkouts(
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
     }.values()
+    packages = _package_entries(package_heads, target_index)
+    join_branches(repositories, packages)
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
@@ -3633,7 +3643,7 @@ def collect_checkouts(
                 package_scan.completed_stage_names if package_scan is not None else None
             ),
         },
-        "packages": _package_entries(package_heads, target_index),
+        "packages": packages,
     }
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
     return _render(document)

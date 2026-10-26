@@ -856,7 +856,9 @@ CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
         "checkout_cache_write_failed",
     }
 )
-_REPOSITORY_KEYS = frozenset({"remote", "default_branch", "pr_lookup", "clones"})
+_REPOSITORY_KEYS = frozenset(
+    {"remote", "default_branch", "pr_lookup", "clones", "package_branches"}
+)
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
 _CHECK_STATUSES = frozenset({"live", "recorded", "failed", "off"})
@@ -923,9 +925,14 @@ _BRANCH_KEYS = frozenset(
         "pull_requests",
         "verdict",
         "contained_in",
+        "packages",
         "removable",
     }
 )
+# How a local branch serves a package.
+_BRANCH_PACKAGE_KEYS = frozenset({"package_path", "basis"})
+_BRANCH_PACKAGE_BASES = frozenset({"target_clone", "sibling_clone", "contained"})
+_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "packages"})
 _PULL_REQUEST_KEYS = frozenset({"number", "state", "head_matches"})
 _PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
 # At most this many pull requests are listed for one branch; the collector's
@@ -1226,6 +1233,13 @@ def _branch(
     _pull_requests(item["pull_requests"], f"{name}.pull_requests")
     _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     _nullable(item["contained_in"], _text, f"{name}.contained_in")
+    references = _list(item["packages"], f"{name}.packages")
+    for index, raw in enumerate(references):
+        reference = _object(raw, f"{name}.packages[{index}]")
+        _keys(reference, _BRANCH_PACKAGE_KEYS, f"{name}.packages[{index}]")
+        _package_path(reference["package_path"])
+        _choice(reference["basis"], _BRANCH_PACKAGE_BASES, f"{name}.packages[{index}].basis")
+    _ordered(references, package_sort_key, f"{name}.packages")
     return item
 
 
@@ -1802,6 +1816,19 @@ def _repository(
         for clone_index, raw in enumerate(clones)
     ]
     _ordered(parsed, clone_sort_key, f"{name}.clones")
+    entries = _list(item["package_branches"], f"{name}.package_branches")
+    for entry_index, raw_entry in enumerate(entries):
+        label = f"{name}.package_branches[{entry_index}]"
+        entry = _object(raw_entry, label)
+        _keys(entry, _PACKAGE_BRANCH_ENTRY_KEYS, label)
+        _text(entry["name"], f"{label}.name")
+        listed = _list(entry["packages"], f"{label}.packages")
+        if not listed:
+            raise ProtocolError(f"{label}.packages must not be empty")
+        for path in listed:
+            _package_path(path)
+        _ordered(listed, lambda path: (path,), f"{label}.packages")
+    _ordered(entries, branch_sort_key, f"{name}.package_branches")
     for clone in parsed:
         if clone["path"] in clone_paths:
             raise ProtocolError("clone paths must be unique across the document")
@@ -1845,6 +1872,63 @@ def _package(value: Any, name: str) -> dict[str, Any]:
     if item["code_status"] is not None:
         raise ProtocolError(f"{name}.code_status must be null")
     return item
+
+
+def _check_package_references(
+    repositories: list[dict[str, Any]], packages: list[dict[str, Any]]
+) -> None:
+    """Refuse a branch reference or package-branch entry no listed package backs."""
+    by_path = {package["package_path"]: package for package in packages}
+
+    def package_named(path: str, label: str) -> dict[str, Any]:
+        package = by_path.get(path)
+        if package is None:
+            raise ProtocolError(f"{label} names a package the document does not list")
+        return package
+
+    for repo_index, repository in enumerate(repositories):
+        name = f"repositories[{repo_index}]"
+        paths = {clone["path"] for clone in repository["clones"]}
+        for entry_index, entry in enumerate(repository["package_branches"]):
+            label = f"{name}.package_branches[{entry_index}]"
+            for path in entry["packages"]:
+                package = package_named(path, f"{label}.packages")
+                if package["branch"]["name"] != entry["name"]:
+                    raise ProtocolError(f"{label} lists a package that names another branch")
+                if package["target"]["clone"] not in paths:
+                    raise ProtocolError(f"{label} lists a package of another repository")
+        for clone_index, clone in enumerate(repository["clones"]):
+            if clone["branches"] is None:
+                continue
+            containers = {branch["name"]: branch["contained_in"] for branch in clone["branches"]}
+            for branch_index, branch in enumerate(clone["branches"]):
+                label = f"{name}.clones[{clone_index}].branches[{branch_index}].packages"
+                chain = _contained_names(containers, branch["name"])
+                for reference in branch["packages"]:
+                    package = package_named(reference["package_path"], label)
+                    target_clone = package["target"]["clone"]
+                    named = package["branch"]["name"]
+                    basis = reference["basis"]
+                    if target_clone not in paths:
+                        valid = False
+                    elif basis == "target_clone":
+                        valid = named == branch["name"] and target_clone == clone["path"]
+                    elif basis == "sibling_clone":
+                        valid = named == branch["name"] and target_clone != clone["path"]
+                    else:
+                        valid = named in chain
+                    if not valid:
+                        raise ProtocolError(f"{label} has a {basis} reference its package does not back")
+
+
+def _contained_names(containers: Mapping[str, str | None], start: str) -> set[str]:
+    """The branch names reached from ``start`` by following ``contained_in``."""
+    reached: set[str] = set()
+    name = containers.get(start)
+    while name is not None and name not in reached and name != start:
+        reached.add(name)
+        name = containers.get(name)
+    return reached
 
 
 def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
@@ -1968,6 +2052,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
                 f"packages[{index}].target.status requires git to be available"
             )
     _ordered(packages, package_sort_key, "packages")
+    _check_package_references(parsed, packages)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     return dict(document)
