@@ -1475,7 +1475,7 @@ def mutate_prunable_ok(document):
         mutate_schema(1),
         mutate_schema(2),
         mutate_schema(3),
-        mutate_schema(5),
+        mutate_schema(4),
         mutate_schema("1"),
         mutate_schema(True),
         mutate_zero_head,
@@ -1525,7 +1525,7 @@ def rename_cached_vs_remote(document):
     [rename_default_branch_sha, rename_local_default_vs_remote, rename_cached_vs_remote],
     ids=lambda rename: rename.__name__,
 )
-def test_parser_refuses_a_schema_4_document_with_an_old_field_name(sample, rename):
+def test_parser_refuses_a_document_with_an_old_field_name(sample, rename):
     document, _folder = sample
     assert models.parse_checkouts(redigest(doc_copy(document)))
     broken = doc_copy(document)
@@ -2770,7 +2770,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 4
+    assert document["schema_version"] == 5
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3363,7 +3363,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 4
+    assert first["schema_version"] == 5
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7164,9 +7164,9 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
     assert "removable" not in refusal_of(rederive(broken))
 
 
-def test_parser_refuses_a_schema_2_document_and_reads_only_schema_4(sample):
+def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 4 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 5 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
