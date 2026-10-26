@@ -20,6 +20,7 @@ remote, and such a verdict is never remembered.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -3409,14 +3410,25 @@ def _path_key(path: str) -> PathKey | None:
         return None
 
 
+_UNNAMEABLE_PATH_ERRORS = frozenset(
+    {errno.ENAMETOOLONG, errno.EINVAL, errno.ELOOP}
+)
+
+
 def _unmatched_target_status(path: str) -> str:
     """Classify a target that matches no checkout, from the filesystem alone."""
     try:
         os.stat(path)
         details = _lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
+    except ValueError:
         return "missing"
-    except (OSError, ValueError):
+    except OSError as error:
+        # A path that cannot name anything is missing; one that exists but
+        # cannot be examined (for example, denied) cannot show a ``.git`` entry.
+        if error.errno in _UNNAMEABLE_PATH_ERRORS or isinstance(
+            error, (FileNotFoundError, NotADirectoryError)
+        ):
+            return "missing"
         return "not_git"
     if details is None:
         return "missing"
