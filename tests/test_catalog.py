@@ -2493,3 +2493,16 @@ def test_target_repo_head_requires_an_absolute_path() -> None:
     assert catalog._target_repo_head("Minotaur").status == "invalid"
     assert catalog._target_repo_head("  ").status == "absent"
     assert catalog._target_repo_head(None).status == "absent"
+
+
+def test_package_heads_judge_target_repo_by_the_host_absolute_form(tmp_path) -> None:
+    root = tmp_path / "specs"
+    native = tmp_path / "checkouts" / "repo"
+    package(root, "Drafts", "native", f"# Native\nTarget repo: `{native}`\n")
+    package(root, "Drafts", "drive", "# Drive\nTarget repo: C:\\work\\repo\n")
+    by_name = _heads_by_name(catalog.scan_package_heads(root))
+    assert by_name["native"].target_repo == catalog.TargetRepoHead("usable", str(native))
+    if sys.platform != "win32":
+        assert by_name["drive"].target_repo == catalog.TargetRepoHead("invalid", None)
+    else:
+        assert by_name["drive"].target_repo == catalog.TargetRepoHead("usable", "C:\\work\\repo")
