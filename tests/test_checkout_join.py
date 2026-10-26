@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHub state)
+    LAST_GIT_SECOND,
     clone,
     commit_file,
     doc_copy,
@@ -25,6 +26,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     real,
     redigest,
     refusal_of,
+    rev,
     stand_in,
 )
 
@@ -64,6 +66,10 @@ def collect_packages(
     **options: Any,
 ) -> dict[str, Any]:
     """Run the real collector with a package scan and return the parsed document."""
+    if options.get("remote_checks"):
+        # A networked check is taken in a whole second after the last git command of the
+        # test, so a tracking ref that moved earlier is older than the check.
+        time.sleep(max(0.0, LAST_GIT_SECOND[0] + 1 - time.time()))
     text = checkouts.collect_checkouts(
         [str(folder) for folder in folders],
         deadline_ns=time.monotonic_ns() + 60 * 10**9,
@@ -1055,3 +1061,365 @@ def test_the_parser_refuses_misplaced_or_misordered_package_references(matching,
         (swapped_references, ".packages must be unique and in canonical order"),
     ):
         assert message in reference_mutation(stack, change), change.__name__
+
+
+# ---------------------------------------------------------------------------
+# The remote copy of a package branch
+# ---------------------------------------------------------------------------
+
+
+def tree_fingerprint(repository: Path) -> dict[str, bytes]:
+    """The bytes of every file in the repository's git directory: refs, reflogs,
+    configuration and object files alike."""
+    top = repository if (repository / "HEAD").is_file() else repository / ".git"
+    return {
+        os.path.relpath(member, top): member.read_bytes()
+        for member in sorted(top.rglob("*"))
+        if member.is_file()
+    }
+
+
+def remote_of(document: dict[str, Any], member: Path, name: str = "topic") -> dict[str, Any]:
+    """The remote copy of one package branch, with its shape checked."""
+    (entry,) = [e for e in repository_of(document, member)["package_branches"] if e["name"] == name]
+    assert set(entry) == models._PACKAGE_BRANCH_ENTRY_KEYS
+    remote = entry["remote"]
+    if remote is not None:
+        assert set(remote) == models._REMOTE_COPY_KEYS
+    return remote
+
+
+def assert_remote(
+    remote: dict[str, Any], state: str, sha: str | None = None, basis: str | None = None
+) -> None:
+    assert remote["state"] == state
+    assert remote["sha"] == sha
+    assert remote["basis"] == basis
+
+
+class RemoteWorld:
+    """Clones A (the package target) and B of one remote, each holding ``topic``, a clone
+    outside the checkout folders that can move the remote, and a package for ``topic``."""
+
+    def __init__(self, tmp_path: Path, home: Path, *, fetched: bool = True) -> None:
+        self.home = home
+        (home / ".nyx").mkdir(exist_ok=True)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.remote = make_remote(served)
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        self.a = clone(self.remote.as_uri(), self.folder / "a")
+        self.b = clone(self.remote.as_uri(), self.folder / "b")
+        self.outside = clone(self.remote.as_uri(), tmp_path / "outside")
+        git(self.a, "checkout", "-q", "-b", "topic")
+        commit_file(self.a, "topic.txt", "one\n")
+        git(self.a, "push", "-q", "-u", "origin", "topic")
+        git(self.a, "checkout", "-q", "trunk")
+        if fetched:
+            git(self.b, "fetch", "-q", "origin")
+            git(self.b, "branch", "topic", "origin/topic")
+        self.root = tmp_path / "spec"
+        make_package(self.root, "Drafts", "topic", f"Target repo: {self.a}\nBranch: topic\n")
+
+    def tracking(self, member: Path) -> str:
+        return rev(member, "refs/remotes/origin/topic")
+
+    def advance_remote(self, name: str) -> str:
+        """Push a new ``topic`` commit from the clone outside the folders."""
+        git(self.outside, "fetch", "-q", "origin")
+        git(self.outside, "checkout", "-q", "-B", "topic", "origin/topic")
+        sha = commit_file(self.outside, name, "x\n")
+        git(self.outside, "push", "-q", "origin", "topic")
+        return sha
+
+    def push_from(self, member: Path, name: str) -> str:
+        """Bring ``member``'s ``topic`` up to the remote's, commit once and push."""
+        git(member, "fetch", "-q", "origin")
+        git(member, "checkout", "-q", "topic")
+        git(member, "merge", "-q", "--ff-only", "origin/topic")
+        sha = commit_file(member, name, "x\n")
+        git(member, "push", "-q", "origin", "topic")
+        git(member, "checkout", "-q", "trunk")
+        return sha
+
+    def collect(self, **options: Any) -> dict[str, Any]:
+        """Collect with the folder's packages and prove no repository changed."""
+        members = [m for m in (self.a, self.b, self.outside, self.remote) if m.exists()]
+        before = {m: tree_fingerprint(m) for m in members}
+        document = collect_packages([self.folder], self.root, **options)
+        assert {m: tree_fingerprint(m) for m in members} == before
+        return document
+
+
+@pytest.fixture
+def remote_world(tmp_path):
+    # The autouse fixture has already pointed HOME at the isolated account home.
+    return RemoteWorld(tmp_path, Path(os.environ["HOME"]))
+
+
+def test_a_networked_collection_gives_the_remote_tip_and_then_absent(remote_world):
+    world = remote_world
+    live_tip = world.advance_remote("live.txt")
+    assert world.tracking(world.a) != live_tip != world.tracking(world.b)
+
+    present = world.collect(remote_checks=True)
+
+    assert_remote(remote_of(present, world.a), "present", live_tip, "live")
+    git(world.remote, "branch", "-q", "-D", "topic")
+
+    deleted = world.collect(remote_checks=True)
+
+    assert_remote(remote_of(deleted, world.a), "absent")
+    assert world.tracking(world.a) != live_tip, "control: the clones still hold the old tip"
+
+
+def test_without_network_the_record_answers_unless_a_clone_pushed_after_the_check(remote_world):
+    world = remote_world
+    saved = world.advance_remote("saved.txt")
+    networked = world.collect(remote_checks=True)
+    assert_remote(remote_of(networked, world.a), "present", saved, "live")
+    # Control: both clones' tracking refs are older than the record.
+    assert saved not in (world.tracking(world.a), world.tracking(world.b))
+
+    older = world.collect()
+
+    assert older["remote_checks"] == "off"
+    assert repository_of(older, world.a)["remote"]["check"]["status"] == "recorded"
+    assert_remote(remote_of(older, world.a), "present", saved, "recorded")
+
+    from_a = world.push_from(world.a, "from-a.txt")
+    after_a = world.collect()
+
+    assert world.tracking(world.b) != from_a, "control: B still holds the old tip"
+    assert_remote(remote_of(after_a, world.a), "present", from_a, "cached")
+
+    time.sleep(1.1)
+    from_b = world.push_from(world.b, "from-b.txt")
+    after_b = world.collect()
+
+    assert from_b != from_a
+    assert_remote(remote_of(after_b, world.a), "present", from_b, "cached")
+
+
+def test_a_clone_that_moved_its_ref_to_the_saved_tip_does_not_override_the_record(remote_world):
+    world = remote_world
+    saved = world.advance_remote("saved.txt")
+    world.collect(remote_checks=True)
+    git(world.a, "fetch", "-q", "origin")
+    assert world.tracking(world.a) == saved
+
+    document = world.collect()
+
+    assert_remote(remote_of(document, world.a), "present", saved, "recorded")
+
+
+def test_a_saved_absence_yields_to_a_clone_that_pushed_the_branch_later(remote_world):
+    world = remote_world
+    git(world.remote, "branch", "-q", "-D", "topic")
+    absent = world.collect(remote_checks=True)
+    assert_remote(remote_of(absent, world.a), "absent")
+
+    assert_remote(remote_of(world.collect(), world.a), "absent")
+    git(world.a, "checkout", "-q", "topic")
+    pushed = commit_file(world.a, "again.txt", "x\n")
+    git(world.a, "push", "-q", "origin", "topic")
+    git(world.a, "checkout", "-q", "trunk")
+
+    assert_remote(remote_of(world.collect(), world.a), "present", pushed, "cached")
+
+
+def use_fresh_home(tmp_path: Path, monkeypatch, home: Path) -> Path:
+    fresh = tmp_path / "fresh-home"
+    fresh.mkdir()
+    shutil.copy(home / ".gitconfig", fresh / ".gitconfig")
+    for name in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(name, str(fresh))
+    return fresh
+
+
+def test_with_no_record_the_clone_fetched_most_recently_answers(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    git(world.a, "fetch", "-q", "origin")
+    time.sleep(1.1)
+    newest = world.advance_remote("newest.txt")
+    git(world.b, "fetch", "-q", "origin")
+    assert world.tracking(world.a) != newest == world.tracking(world.b)
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+
+    offline = world.collect()
+
+    assert offline["remote_checks"] == "off"
+    check = repository_of(offline, world.a)["remote"]["check"]
+    assert (check["status"], check["reason"]) == ("off", "remote_checks_off")
+    fetched = [
+        clone_at(offline, member)["cached_default"]["last_fetched_at"]
+        for member in (world.a, world.b)
+    ]
+    assert fetched[0] < fetched[1], "control: B fetched after A"
+    assert_remote(remote_of(offline, world.a), "present", newest, "cached")
+
+    # A failed networked check with nothing saved answers the same way.
+    elsewhere = world.remote.rename(tmp_path / "moved.git")
+    try:
+        failed = world.collect(remote_checks=True)
+    finally:
+        elsewhere.rename(world.remote)
+    assert repository_of(failed, world.a)["remote"]["check"]["status"] == "failed"
+    assert_remote(remote_of(failed, world.a), "present", newest, "cached")
+
+
+def test_with_no_record_and_no_clone_ever_fetched_the_remote_copy_is_unknown(
+    tmp_path, monkeypatch
+):
+    world = RemoteWorld(tmp_path, Path(os.environ["HOME"]), fetched=False)
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+
+    document = world.collect()
+
+    for member in (world.a, world.b):
+        assert clone_at(document, member)["cached_default"]["last_fetched_at"] is None
+    assert_remote(remote_of(document, world.a), "unknown")
+
+
+def test_an_already_expired_deadline_still_yields_a_document_that_parses(remote_world):
+    world = remote_world
+    world.collect(remote_checks=True)
+
+    text = checkouts.collect_checkouts(
+        [str(world.folder)],
+        deadline_ns=time.monotonic_ns() - 1,
+        remote_checks=True,
+        package_scan=checkouts.PackageScan(world.root, ()),
+    )
+
+    document = models.parse_checkouts(text)
+    # Not even the version call could start, so no repository was read and the package
+    # is listed with its target unchecked.
+    assert document["git"]["status"] == "too_old"
+    assert document["repositories"] == []
+    (package,) = document["packages"]
+    assert package["package_path"] == "Fictional/Drafts/topic"
+    assert package["target"]["status"] == "unchecked"
+    assert package["branch"] == {"status": "declared", "name": "topic"}
+
+
+def test_a_package_branch_in_a_clone_without_origin_has_no_remote_copy(matching):
+    document = collect_packages([matching["folder"]], matching["root"], remote_checks=False)
+
+    repository = repository_of(document, matching["d"])
+    assert repository["remote"] is None
+    assert [(e["name"], e["packages"], e["remote"]) for e in repository["package_branches"]] == [
+        ("topic", [path_of("on_d")], None)
+    ]
+    # The group of A and B has a remote and so a remote copy.
+    assert remote_of(document, matching["a"])["state"] == "unknown"
+
+
+def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(remote_world):
+    world = remote_world
+    live = world.collect(remote_checks=True)
+    recorded = world.collect()
+
+    def entry_of(document: dict[str, Any]) -> dict[str, Any]:
+        (found,) = repository_of(document, world.a)["package_branches"]
+        return found
+
+    def sha_without_state(doc):
+        entry_of(doc)["remote"].update(state="absent")
+
+    def present_without_basis(doc):
+        entry_of(doc)["remote"]["basis"] = None
+
+    def present_without_sha(doc):
+        entry_of(doc)["remote"]["sha"] = None
+
+    def unknown_under_a_live_check(doc):
+        entry_of(doc)["remote"].update(state="unknown", sha=None, basis=None)
+
+    def cached_under_a_live_check(doc):
+        entry_of(doc)["remote"]["basis"] = "cached"
+
+    def live_under_a_recorded_check(doc):
+        entry_of(doc)["remote"]["basis"] = "live"
+
+    def missing_remote(doc):
+        entry_of(doc)["remote"] = None
+
+    def unknown_state(doc):
+        entry_of(doc)["remote"]["state"] = "gone"
+
+    def extra_key(doc):
+        entry_of(doc)["remote"]["checked_at"] = None
+
+    for document, change, message in (
+        (live, sha_without_state, "sets sha and basis exactly for present"),
+        (live, present_without_basis, "sets sha and basis exactly for present"),
+        (live, present_without_sha, "sets sha and basis exactly for present"),
+        (live, unknown_under_a_live_check, "cannot be unknown under a live remote check"),
+        (live, cached_under_a_live_check, "basis does not match the remote check"),
+        (recorded, unknown_under_a_live_check, "cannot be unknown under a recorded remote check"),
+        (recorded, live_under_a_recorded_check, "basis does not match the remote check"),
+        (live, missing_remote, "must be an object"),
+        (live, unknown_state, "state is invalid"),
+        (live, extra_key, "remote has an invalid shape"),
+    ):
+        assert message in reference_mutation(document, change), change.__name__
+
+
+def test_the_parser_refuses_a_remote_copy_on_a_repository_without_a_remote(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    def copy_without_origin(doc):
+        (entry,) = repository_of(doc, matching["d"])["package_branches"]
+        entry["remote"] = {"state": "unknown", "sha": None, "basis": None}
+
+    assert "must be null without a remote" in reference_mutation(document, copy_without_origin)
+
+
+def logged_calls(log: Path) -> list[list[str]]:
+    return [line.split("\x1f")[:-1] for line in log.read_text().splitlines()]
+
+
+def move_reads(log: Path, name: str = "topic") -> list[str]:
+    """The ``-C`` directory of every reflog read of ``refs/remotes/origin/<name>``."""
+    return [
+        real(call[call.index("-C") + 1])
+        for call in logged_calls(log)
+        if "-C" in call and "reflog" in call and f"refs/remotes/origin/{name}" in call
+    ]
+
+
+def listings(log: Path) -> int:
+    return sum(1 for call in logged_calls(log) if "for-each-ref" in call)
+
+
+@posix_only
+def test_a_move_time_is_read_once_per_clone_and_name_and_no_listing_is_added(
+    remote_world, tmp_path, monkeypatch
+):
+    world = remote_world
+    world.advance_remote("saved.txt")
+    world.collect(remote_checks=True)
+    from_a = world.push_from(world.a, "from-a.txt")
+    # A holds no local branch of the name: only the package asks for its move time.
+    git(world.a, "branch", "-q", "-D", "topic")
+    shim, with_packages = argument_recorder(tmp_path)
+
+    with path_with(monkeypatch, shim):
+        document = collect_packages([world.folder], world.root)
+
+    assert_remote(remote_of(document, world.a), "present", from_a, "cached")
+    reads = move_reads(with_packages)
+    assert sorted(reads) == sorted([real(world.a), real(world.b)]), "one read per clone"
+
+    (tmp_path / "plain").mkdir()
+    shim, without_packages = argument_recorder(tmp_path / "plain")
+    with path_with(monkeypatch, shim):
+        checkouts.collect_checkouts(
+            [str(world.folder)], deadline_ns=time.monotonic_ns() + 60 * 10**9
+        )
+    assert listings(without_packages) > 0, "control: the log names the listings"
+    assert listings(with_packages) == listings(without_packages)
