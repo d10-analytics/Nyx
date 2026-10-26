@@ -2553,3 +2553,60 @@ def test_the_parser_accepts_a_status_for_every_state_the_text_function_renders(s
             models._path_name(path) for path in status["checked_out_elsewhere"]
         ) if status["checked_out_elsewhere"] else ""
         assert models.parse_checkouts(redigest(document))["packages"] == document["packages"], state
+
+
+def test_one_copy_whose_comparison_is_undecided_leaves_the_push_state_unknown(status_world):
+    # `pushed` needs every local copy `equal` or `behind`; one is not enough.
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    shallow = clone(w.remote.as_uri(), w.folder / "shallow", "--depth", "1", "--no-single-branch")
+    git(shallow, "checkout", "-q", "-b", "topic", "origin/topic")
+    git(shallow, "checkout", "-q", "trunk")
+    w.push_from_outside("topic")
+    git(w.a, "fetch", "-q", "origin")
+    git(w.a, "checkout", "-q", "topic")
+    git(w.a, "merge", "-q", "--ff-only", "origin/topic")
+    git(w.a, "checkout", "-q", "trunk")
+    w.package("topic", "topic")
+
+    document = w.collect()
+
+    assert repository_of(document, shallow) is repository_of(document, w.a), "control"
+    assert relation_of(document, w.a, "topic")[0] == "equal", "control"
+    assert relation_of(document, shallow, "topic")[0] == "differs", "control"
+    assert_status(
+        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+    )
+
+
+@posix_only
+def test_a_merged_pull_request_is_not_an_open_one(status_world, tmp_path, monkeypatch):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    pull_world(w, tmp_path, monkeypatch, {"topic": [pr_node(4, "merged", UNKNOWN_HEAD)]})
+    w.package("topic", "topic")
+
+    document = w.collect(github_lookup=True)
+
+    (branch,) = [b for b in clone_at(document, w.a)["branches"] if b["name"] == "topic"]
+    assert [(p["number"], p["state"]) for p in branch["pull_requests"]] == [(4, "merged")], (
+        "control"
+    )
+    assert branch["verdict"]["state"] == "not_merged", "control"
+    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+def test_a_pushed_branch_reads_pushed_from_its_tracking_ref_without_a_remote_answer(
+    status_world,
+):
+    # With no remote answer and no fetch, the remote copy is unknown, but the clone's own
+    # tracking ref equals its branch, which is what the push state reads.
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.package("topic", "topic")
+
+    document = w.collect(remote_checks=False)
+
+    assert remote_of(document, w.a, "topic")["state"] == "unknown", "control"
+    assert relation_of(document, w.a, "topic")[0] == "equal", "control"
+    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
