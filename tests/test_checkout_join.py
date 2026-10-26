@@ -12,17 +12,25 @@ from typing import Any
 
 import pytest
 from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHub state)
+    GITHUB_URL,
     LAST_GIT_SECOND,
     clone,
     commit_file,
     doc_copy,
     git,
     import_branches,
+    install_fake_gh,
     isolated_git,
+    land,
+    linked,
+    local_names,
     make_remote,
     outer_github_environment,
     path_with,
+    point_origin_at,
     posix_only,
+    pr_answer,
+    pr_node,
     real,
     redigest,
     refusal_of,
@@ -107,7 +115,9 @@ def test_packages_with_a_target_or_branch_are_listed_in_path_order(world):
     assert second["branch"] == {"status": "declared", "name": "spec/beta"}
     assert_target(first["target"], "clone", real(repository))
     assert second["target"]["status"] == "absent"
-    assert {p["code_status"] for p in document["packages"]} == {None}
+    # `spec/alpha` was created at the default head with no commit of its own.
+    assert first["code_status"]["text"] == f"merged {DOT} cleanup pending (1 branch)"
+    assert second["code_status"] is None
     assert [r["clones"][0]["path"] for r in document["repositories"]] == [real(repository)]
 
 
@@ -414,6 +424,7 @@ def assert_unchecked(document: dict[str, Any], git_status: str) -> None:
     assert document["git"]["status"] == git_status
     assert document["repositories"] == []
     assert document["package_scan"]["status"] == "complete"
+    assert [p["code_status"] for p in document["packages"]] == [None] * 4
     found = resolve(document)
     for name, status in {
         "exists": "unchecked",
@@ -1698,3 +1709,847 @@ def test_code_status_text_counts_worktrees_when_the_names_do_not_fit():
 def test_code_status_text_count_form_is_singular_for_one_oversized_name():
     fields = status_fields("unknown", checked_out_elsewhere=["/w/" + "x" * 1010])
     assert models.code_status_text(fields) == f"merge state unknown {DOT} in 1 other worktree"
+
+
+# ---------------------------------------------------------------------------
+# Code Status from real branches, remotes, pull requests and worktrees
+# ---------------------------------------------------------------------------
+
+FINISHED_STAGES = ("Shipped", "Shelf")
+UNKNOWN_HEAD = "a" * 40
+
+
+def write_package(root: Path, stage: str, name: str, header: str) -> None:
+    directory = root / "Fictional" / stage / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "spec.md").write_text(f"# {name}\n{header}", encoding="utf-8")
+
+
+def status_of(document: dict[str, Any], package_path: str) -> dict[str, Any] | None:
+    """The Code Status of one package, its shape and its text checked against its fields."""
+    (package,) = [p for p in document["packages"] if p["package_path"] == package_path]
+    status = package["code_status"]
+    if status is not None:
+        assert set(status) == models._CODE_STATUS_KEYS
+        assert status["text"] == models.code_status_text(status)
+    return status
+
+
+def assert_status(
+    document: dict[str, Any],
+    name: str,
+    text: str,
+    state: str,
+    *,
+    stage: str = "Drafts",
+    push: str | None = None,
+    unpushed: int | None = None,
+    pull_request: int | None = None,
+    cleanup: dict[str, int] | None = None,
+    elsewhere: tuple[Path, ...] = (),
+) -> None:
+    status = status_of(document, f"Fictional/{stage}/{name}")
+    assert status is not None, f"{name} has no Code Status"
+    assert status["text"] == text
+    assert status["state"] == state
+    assert status["push"] == push
+    assert status["unpushed"] == unpushed
+    assert status["pull_request"] == pull_request
+    assert status["cleanup"] == cleanup
+    assert status["checked_out_elsewhere"] == [real(path) for path in elsewhere]
+
+
+def relation_of(document: dict[str, Any], member: Path, name: str) -> tuple[str, int, int]:
+    (branch,) = [b for b in clone_at(document, member)["branches"] if b["name"] == name]
+    comparison = branch["vs_remote"]
+    return comparison["relation"], comparison["ahead"], comparison["behind"]
+
+
+def relation_of_or_none(document: dict[str, Any], member: Path, name: str) -> str | None:
+    (branch,) = [b for b in clone_at(document, member)["branches"] if b["name"] == name]
+    return branch["vs_remote"]["relation"]
+
+
+class StatusWorld:
+    """Clones ``Repo Clone A`` (the target of every package) and ``Repo Clone B`` of one
+    remote whose default branch is ``trunk``, a clone outside the checkout folders that can
+    move the remote, and a specification root whose ``Shipped`` and ``Shelf`` stages are
+    finished."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        # The account home that holds the saved remote checks.
+        (Path(os.environ["HOME"]) / ".nyx").mkdir(exist_ok=True)
+        served = tmp_path / "served"
+        served.mkdir()
+        self.remote = make_remote(served)
+        self.folder = tmp_path / "folder"
+        self.folder.mkdir()
+        self.a = clone(self.remote, self.folder / "Repo Clone A")
+        self.b = clone(self.remote, self.folder / "Repo Clone B")
+        self.outside = clone(self.remote, tmp_path / "outside")
+        self.root = tmp_path / "spec"
+        self.counter = 0
+
+    def package(
+        self,
+        name: str,
+        branch: str,
+        *,
+        stage: str = "Drafts",
+        target: Path | None = None,
+        extra: str = "",
+    ) -> None:
+        write_package(
+            self.root,
+            stage,
+            name,
+            f"Target repo: {target or self.a}\nBranch: {branch}\n{extra}",
+        )
+
+    def commit(self, member: Path, count: int = 1) -> str:
+        sha = ""
+        for _ in range(count):
+            self.counter += 1
+            sha = commit_file(member, f"change-{self.counter}.txt", f"{self.counter}\n")
+        return sha
+
+    def branch(self, member: Path, name: str, commits: int = 1, *, push: bool = False) -> None:
+        """Create ``name`` from ``trunk`` with ``commits`` commits and leave ``member`` on
+        ``trunk``."""
+        git(member, "checkout", "-q", "-b", name, "trunk")
+        self.commit(member, commits)
+        if push:
+            git(member, "push", "-q", "origin", name)
+        git(member, "checkout", "-q", "trunk")
+
+    def take(self, member: Path, name: str, *, commits: int = 0) -> None:
+        """Fetch ``name`` into ``member`` as a local branch, add commits and leave ``trunk``."""
+        git(member, "fetch", "-q", "origin")
+        git(member, "checkout", "-q", "-b", name, f"origin/{name}")
+        self.commit(member, commits)
+        git(member, "checkout", "-q", "trunk")
+
+    def push_from_outside(self, name: str) -> str:
+        """Push one more commit on ``name`` from the clone no configured folder holds."""
+        git(self.outside, "fetch", "-q", "origin")
+        git(self.outside, "checkout", "-q", "-B", name, f"origin/{name}")
+        sha = self.commit(self.outside)
+        git(self.outside, "push", "-q", "origin", name)
+        return sha
+
+    def github(self) -> None:
+        for member in (self.a, self.b, self.outside):
+            point_origin_at(member, self.remote, GITHUB_URL)
+
+    def collect(self, **options: Any) -> dict[str, Any]:
+        options.setdefault("remote_checks", True)
+        return collect_packages([self.folder], self.root, FINISHED_STAGES, **options)
+
+
+@pytest.fixture
+def status_world(tmp_path):
+    return StatusWorld(tmp_path)
+
+
+def test_each_push_state_and_package_state_reads_its_own_text(status_world):
+    w = status_world
+    w.branch(w.a, "pushed", push=True)
+    w.branch(w.a, "ahead", push=True)
+    git(w.a, "checkout", "-q", "ahead")
+    w.commit(w.a, 2)
+    git(w.a, "checkout", "-q", "trunk")
+    w.branch(w.a, "never")
+    w.branch(w.a, "waiting")
+    w.branch(w.a, "retired")
+    w.branch(w.a, "both")
+    for name in ("pushed", "ahead", "never"):
+        w.package(name, name)
+    w.package("waiting", "waiting", stage="Shipped")
+    w.package("retired", "retired", extra=f"Superseded By: {ID_OLD}\n")
+    w.package("both", "both", stage="Shipped", extra=f"Superseded By: {ID_OLD}\n")
+
+    document = w.collect()
+
+    assert_status(document, "pushed", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(
+        document, "ahead", f"in progress {DOT} 2 unpushed", "in_progress",
+        push="unpushed", unpushed=2,
+    )
+    assert_status(
+        document, "never", f"in progress {DOT} not pushed", "in_progress", push="not_pushed"
+    )
+    assert_status(
+        document, "waiting", "awaiting merge (no PR)", "awaiting_merge", stage="Shipped"
+    )
+    assert_status(
+        document, "retired", f"superseded {DOT} branch retained", "superseded"
+    )
+    # A finished package that names a successor is still awaiting its merge.
+    assert_status(document, "both", "awaiting merge (no PR)", "awaiting_merge", stage="Shipped")
+
+
+def test_a_local_copy_behind_the_remote_copy_reads_pushed(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.take(w.b, "topic", commits=1)
+    git(w.b, "push", "-q", "origin", "topic")
+    git(w.a, "fetch", "-q", "origin")
+    w.package("topic", "topic")
+
+    document = w.collect()
+
+    assert relation_of(document, w.a, "topic") == ("behind", 0, 1), "control"
+    assert relation_of(document, w.b, "topic") == ("equal", 0, 0), "control"
+    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+def test_a_diverged_local_copy_counts_its_own_commits_as_unpushed(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.push_from_outside("topic")
+    git(w.a, "fetch", "-q", "origin")
+    git(w.a, "checkout", "-q", "topic")
+    w.commit(w.a, 2)
+    git(w.a, "checkout", "-q", "trunk")
+    w.package("topic", "topic")
+
+    document = w.collect()
+
+    assert relation_of(document, w.a, "topic") == ("diverged", 2, 1), "control"
+    assert_status(
+        document, "topic", f"in progress {DOT} 2 unpushed", "in_progress",
+        push="unpushed", unpushed=2,
+    )
+
+
+def test_the_largest_unpushed_count_of_the_local_copies_is_shown(status_world):
+    w = status_world
+    for name, in_a, in_b in (("first-small", 1, 3), ("first-large", 3, 1)):
+        w.branch(w.a, name, push=True)
+        w.take(w.b, name)
+        for member, extra in ((w.a, in_a), (w.b, in_b)):
+            git(member, "checkout", "-q", name)
+            w.commit(member, extra)
+            git(member, "checkout", "-q", "trunk")
+        w.package(name, name)
+
+    document = w.collect()
+
+    assert relation_of(document, w.a, "first-small") == ("ahead", 1, 0), "control"
+    assert relation_of(document, w.b, "first-small") == ("ahead", 3, 0), "control"
+    for name in ("first-small", "first-large"):
+        assert_status(
+            document, name, f"in progress {DOT} 3 unpushed", "in_progress",
+            push="unpushed", unpushed=3,
+        )
+
+
+def test_a_commit_no_configured_clone_has_fetched_leaves_the_push_state_unknown(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.push_from_outside("topic")
+    w.package("topic", "topic")
+
+    document = w.collect()
+
+    assert relation_of(document, w.a, "topic")[0] == "differs", "control"
+    assert_status(
+        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+    )
+
+
+def test_a_branch_checked_out_in_another_checkout_names_it(status_world, tmp_path):
+    w = status_world
+    for name in ("here", "there", "linked", "both"):
+        w.branch(w.a, name, push=True)
+    w.take(w.b, "there")
+    w.take(w.b, "both")
+    git(w.b, "checkout", "-q", "there")
+    first = linked(w.a, tmp_path, "linked", "linked")
+    second = linked(w.a, tmp_path, "both-a", "both")
+    third = linked(w.b, tmp_path, "both-b", "both")
+    git(w.a, "checkout", "-q", "here")
+    for name in ("here", "there", "linked", "both"):
+        w.package(name, name)
+    w.package("inside", "linked", target=first)
+
+    document = w.collect()
+
+    pushed = f"in progress {DOT} pushed"
+    assert_status(document, "here", pushed, "in_progress", push="pushed")
+    assert_status(
+        document, "there", f"{pushed} {DOT} in Repo Clone B", "in_progress",
+        push="pushed", elsewhere=(w.b,),
+    )
+    assert_status(
+        document, "linked", f"{pushed} {DOT} in wt-linked", "in_progress",
+        push="pushed", elsewhere=(first,),
+    )
+    # The checkout the package targets is never named, however it is reached.
+    assert_status(document, "inside", pushed, "in_progress", push="pushed")
+    assert_status(
+        document, "both", f"{pushed} {DOT} in wt-both-a, wt-both-b", "in_progress",
+        push="pushed", elsewhere=(second, third),
+    )
+
+
+def pull_world(w: StatusWorld, tmp_path: Path, monkeypatch, pulls: dict[str, list[dict[str, Any]]]):
+    w.github()
+    return install_fake_gh(
+        tmp_path, monkeypatch, stdout=pr_answer(local_names(w.a, w.b), pulls)
+    )
+
+
+@posix_only
+def test_an_open_pull_request_shows_its_number_and_only_unpushed_commits(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "equal", push=True)
+    w.branch(w.a, "one", push=True)
+    w.branch(w.a, "split", push=True)
+    w.branch(w.a, "behind", push=True)
+    w.branch(w.a, "unsent")
+    land(w.a, "landed")
+    git(w.a, "checkout", "-q", "one")
+    w.commit(w.a)
+    git(w.a, "checkout", "-q", "trunk")
+    w.push_from_outside("split")
+    w.push_from_outside("behind")
+    git(w.a, "fetch", "-q", "origin")
+    git(w.a, "checkout", "-q", "split")
+    w.commit(w.a, 2)
+    git(w.a, "checkout", "-q", "trunk")
+    pulls = {
+        "equal": [
+            pr_node(5, "closed", UNKNOWN_HEAD),
+            pr_node(6, "open", UNKNOWN_HEAD),
+            pr_node(7, "open", UNKNOWN_HEAD),
+            pr_node(8, "closed", UNKNOWN_HEAD),
+        ],
+        "one": [pr_node(3, "open", UNKNOWN_HEAD)],
+        "split": [pr_node(11, "open", UNKNOWN_HEAD)],
+        "behind": [pr_node(13, "open", UNKNOWN_HEAD)],
+        "unsent": [pr_node(12, "open", UNKNOWN_HEAD)],
+        "landed": [pr_node(14, "open", UNKNOWN_HEAD)],
+    }
+    pull_world(w, tmp_path, monkeypatch, pulls)
+    for name in pulls:
+        w.package(name, name)
+
+    document = w.collect(github_lookup=True)
+
+    assert document["repositories"][0]["pr_lookup"]["status"] == "live", "control"
+    assert relation_of(document, w.a, "split") == ("diverged", 2, 1), "control"
+    assert relation_of(document, w.a, "behind") == ("behind", 0, 1), "control"
+    assert_status(document, "equal", "PR #7 open", "pr_open", push="pushed", pull_request=7)
+    assert_status(
+        document, "one", f"PR #3 open {DOT} 1 unpushed", "pr_open",
+        push="unpushed", unpushed=1, pull_request=3,
+    )
+    assert_status(
+        document, "split", f"PR #11 open {DOT} 2 unpushed", "pr_open",
+        push="unpushed", unpushed=2, pull_request=11,
+    )
+    assert_status(document, "behind", "PR #13 open", "pr_open", push="pushed", pull_request=13)
+    assert_status(document, "unsent", "PR #12 open", "pr_open", push="not_pushed", pull_request=12)
+    # Work that has already landed is merged, whatever pull request is still open.
+    assert_status(
+        document, "landed", f"merged {DOT} cleanup pending (1 branch)", "merged",
+        cleanup={"worktrees": 0, "branches": 1},
+    )
+
+
+@posix_only
+def test_a_recorded_pull_request_answers_when_no_network_is_used(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    fake = pull_world(w, tmp_path, monkeypatch, {"topic": [pr_node(9, "open", UNKNOWN_HEAD)]})
+    w.package("topic", "topic")
+    networked = w.collect(github_lookup=True)
+    assert_status(networked, "topic", "PR #9 open", "pr_open", push="pushed", pull_request=9)
+    calls = len(fake.calls())
+
+    offline = w.collect(remote_checks=False, github_lookup=True)
+
+    assert offline["remote_checks"] == "off"
+    assert offline["repositories"][0]["pr_lookup"]["status"] == "recorded"
+    assert len(fake.calls()) == calls, "control: no new gh call"
+    assert_status(offline, "topic", "PR #9 open", "pr_open", push="pushed", pull_request=9)
+
+
+def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
+    status_world, tmp_path
+):
+    w = status_world
+    land(w.a, "done")
+    git(w.a, "push", "-q", "origin", "done")
+    w.package("clone", "done")
+    pending = f"merged {DOT} cleanup pending"
+
+    kept = w.collect()
+
+    assert_status(
+        kept, "clone", f"{pending} (1 branch)", "merged", cleanup={"worktrees": 0, "branches": 1}
+    )
+
+    worktree = linked(w.a, tmp_path, "done", "done")
+    w.package("inside", "done", target=worktree)
+    held = w.collect()
+
+    one_worktree = {"worktrees": 1, "branches": 0}
+    assert_status(
+        held, "clone", f"{pending} (1 worktree) {DOT} in wt-done", "merged",
+        cleanup=one_worktree, elsewhere=(worktree,),
+    )
+    assert_status(held, "inside", f"{pending} (1 worktree)", "merged", cleanup=one_worktree)
+
+    shutil.rmtree(worktree)
+    stale = w.collect()
+
+    assert "prunable" in git(w.a, "worktree", "list", "--porcelain").stdout, "control"
+    assert_status(
+        stale, "clone", f"{pending} (1 worktree) {DOT} in wt-done", "merged",
+        cleanup=one_worktree, elsewhere=(worktree,),
+    )
+
+    git(w.a, "worktree", "prune")
+    pruned = w.collect()
+
+    assert_status(
+        pruned, "clone", f"{pending} (1 branch)", "merged", cleanup={"worktrees": 0, "branches": 1}
+    )
+
+    git(w.a, "branch", "-q", "-D", "done")
+    remote_only = w.collect()
+
+    assert remote_of(remote_only, w.a, "done")["state"] == "present", "control"
+    assert_status(remote_only, "clone", "merge state unknown", "unknown")
+
+    git(w.a, "push", "-q", "origin", "--delete", "done")
+    gone = w.collect()
+
+    assert remote_of(gone, w.a, "done")["state"] == "absent", "control"
+    assert status_of(gone, "Fictional/Drafts/clone") is None
+
+
+def test_cleanup_counts_every_clone_and_worktree_and_uses_plurals(status_world, tmp_path):
+    w = status_world
+    land(w.a, "done")
+    git(w.a, "push", "-q", "origin", "done")
+    w.take(w.b, "done")
+    w.package("clone", "done")
+    pending = f"merged {DOT} cleanup pending"
+
+    twice = w.collect()
+
+    assert_status(
+        twice, "clone", f"{pending} (2 branches)", "merged",
+        cleanup={"worktrees": 0, "branches": 2},
+    )
+
+    first = linked(w.a, tmp_path, "done-a", "done")
+    git(w.b, "checkout", "-q", "done")
+    both = w.collect()
+
+    assert_status(
+        both, "clone", f"{pending} (2 worktrees) {DOT} in Repo Clone B, wt-done-a", "merged",
+        cleanup={"worktrees": 2, "branches": 0}, elsewhere=(w.b, first),
+    )
+
+
+def test_work_squash_merged_in_one_clone_and_extended_in_another_is_in_progress(status_world):
+    w = status_world
+    land(w.a, "done")
+    git(w.a, "push", "-q", "origin", "done")
+    w.take(w.b, "done", commits=1)
+    w.package("done", "done")
+
+    document = w.collect()
+
+    verdicts = {
+        member: next(b for b in clone_at(document, member)["branches"] if b["name"] == "done")[
+            "verdict"
+        ]["state"]
+        for member in (w.a, w.b)
+    }
+    assert verdicts == {w.a: "merged", w.b: "not_merged"}, "control"
+    assert_status(
+        document, "done", f"in progress {DOT} 1 unpushed", "in_progress",
+        push="unpushed", unpushed=1,
+    )
+
+
+def test_a_branch_at_the_default_head_with_no_commit_reads_merged_cleanup_pending(status_world):
+    w = status_world
+    git(w.a, "branch", "zero", "trunk")
+    w.package("zero", "zero")
+
+    document = w.collect()
+
+    assert_status(
+        document, "zero", f"merged {DOT} cleanup pending (1 branch)", "merged",
+        cleanup={"worktrees": 0, "branches": 1},
+    )
+
+
+def test_the_only_copy_in_a_shallow_clone_has_an_unknown_merge_state(status_world):
+    w = status_world
+    git(w.outside, "checkout", "-q", "-b", "topic", "trunk")
+    w.commit(w.outside, 2)
+    git(w.outside, "push", "-q", "origin", "topic")
+    shallow = clone(w.remote.as_uri(), w.folder / "shallow", "--depth", "1", "--no-single-branch")
+    git(shallow, "checkout", "-q", "-b", "topic", "origin/topic")
+    git(shallow, "checkout", "-q", "trunk")
+    w.package("topic", "topic", target=shallow)
+
+    document = w.collect()
+
+    member = clone_at(document, shallow)
+    assert member["shallow"] is True and member["status"] == "ok", "control"
+    (branch,) = [b for b in member["branches"] if b["name"] == "topic"]
+    assert (branch["verdict"]["state"], branch["verdict"]["reason"]) == (
+        "unknown",
+        "incomplete_clone",
+    ), "control"
+    assert remote_of(document, shallow, "topic")["state"] == "present"
+    assert_status(document, "topic", "merge state unknown", "unknown")
+
+
+def test_a_remote_only_branch_and_a_clone_without_origin_read_merge_state_unknown(
+    status_world,
+):
+    w = status_world
+    solo = w.folder / "Repo Clone D"
+    git(w.folder, "init", "-q", "-b", "trunk", str(solo))
+    commit_file(solo, "file.txt", "one\n", "seed")
+    git(solo, "checkout", "-q", "-b", "topic")
+    w.commit(solo)
+    git(solo, "checkout", "-q", "trunk")
+    git(w.outside, "checkout", "-q", "-b", "elsewhere", "trunk")
+    w.commit(w.outside)
+    git(w.outside, "push", "-q", "origin", "elsewhere")
+    w.package("local", "topic", target=solo)
+    w.package("remote-only", "elsewhere")
+
+    document = w.collect()
+
+    assert repository_of(document, solo)["remote"] is None, "control"
+    assert_status(document, "local", "merge state unknown", "unknown")
+    assert remote_of(document, w.a, "elsewhere")["state"] == "present", "control"
+    assert_status(document, "remote-only", "merge state unknown", "unknown")
+
+
+def test_packages_without_a_found_declared_branch_have_no_code_status(matching):
+    make_package(matching["root"], "Drafts", "invalid", f"Target repo: {matching['a']}\nBranch: spec/x (proposed)\n")
+    make_package(matching["root"], "Drafts", "nowhere", f"Target repo: {matching['a']}\nBranch: absent-branch\n")
+
+    document = collect_packages([matching["folder"]], matching["root"])
+
+    assert status_of(document, path_of("target")) is not None, "control"
+    for name in ("proposed", "inapplicable", "default", "missing", "invalid", "nowhere"):
+        assert status_of(document, path_of(name)) is None, name
+    by_name = {p["package_path"]: p["branch"]["status"] for p in document["packages"]}
+    assert by_name[path_of("default")] == "default_branch"
+    assert by_name[path_of("invalid")] == "invalid"
+
+
+def test_a_sibling_with_too_many_branches_changes_no_code_status(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.package("topic", "topic")
+    baseline = w.collect()
+
+    sibling = clone(w.remote, w.folder / "sibling")
+    w.take(sibling, "topic", commits=1)
+    counted = w.collect()
+
+    assert clone_at(counted, sibling)["status"] == "ok", "control"
+    assert_status(
+        counted, "topic", f"in progress {DOT} 1 unpushed", "in_progress", push="unpushed",
+        unpushed=1,
+    ), "control: the sibling's extra commit is seen while its branches are readable"
+
+    import_branches(sibling, models.CHECKOUT_BRANCH_CAP + 1)
+    capped = w.collect()
+
+    assert clone_at(capped, sibling)["status"] == "too_many_branches"
+    assert [p["code_status"] for p in capped["packages"]] == [
+        p["code_status"] for p in baseline["packages"]
+    ]
+    assert {b["name"]: b["packages"] for b in clone_at(capped, w.a)["branches"]} == {
+        b["name"]: b["packages"] for b in clone_at(baseline, w.a)["branches"]
+    }
+    assert repository_of(capped, w.a)["package_branches"] == repository_of(baseline, w.a)[
+        "package_branches"
+    ]
+
+
+def test_a_remote_tip_no_local_copy_holds_has_no_verdict_even_beside_a_merged_copy(
+    status_world,
+):
+    w = status_world
+    land(w.a, "done")
+    git(w.a, "push", "-q", "origin", "done")
+    w.push_from_outside("done")
+    w.package("done", "done")
+
+    document = w.collect()
+
+    assert relation_of(document, w.a, "done")[0] == "differs", "control"
+    assert_status(document, "done", "merge state unknown", "unknown")
+
+
+def test_without_any_remote_answer_the_push_state_is_unknown_and_not_not_pushed(status_world):
+    w = status_world
+    w.branch(w.a, "topic")
+    w.package("topic", "topic")
+
+    document = w.collect(remote_checks=False)
+
+    assert remote_of(document, w.a, "topic")["state"] == "unknown", "control"
+    assert relation_of_or_none(document, w.a, "topic") == "absent", "control"
+    assert_status(
+        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+    )
+
+
+def test_packages_sharing_a_branch_each_read_the_branch_facts(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.package("old", "topic", stage="Shelf")
+    w.package("new", "topic")
+
+    pushed = f"in progress {DOT} pushed"
+    document = w.collect()
+
+    assert_status(document, "old", pushed, "in_progress", stage="Shelf", push="pushed")
+    assert_status(document, "new", pushed, "in_progress", push="pushed")
+    assert entries_of(repository_of(document, w.a)) == [
+        ("topic", ["Fictional/Drafts/new", "Fictional/Shelf/old"])
+    ]
+
+    (w.root / "Fictional" / "Shipped").mkdir()
+    shutil.move(w.root / "Fictional" / "Drafts" / "new", w.root / "Fictional" / "Shipped" / "new")
+    finished = w.collect()
+
+    awaiting = "awaiting merge (no PR)"
+    assert_status(finished, "old", awaiting, "awaiting_merge", stage="Shelf")
+    assert_status(finished, "new", awaiting, "awaiting_merge", stage="Shipped")
+    assert entries_of(repository_of(finished, w.a)) == [
+        ("topic", ["Fictional/Shelf/old", "Fictional/Shipped/new"])
+    ]
+
+    shutil.move(w.root / "Fictional" / "Shipped" / "new", w.root / "Fictional" / "Drafts" / "new")
+    w.package("old", "topic", stage="Shelf", extra=f"Superseded By: {ID_OLD}\n")
+    retired = w.collect()
+
+    assert_status(retired, "old", f"superseded {DOT} branch retained", "superseded", stage="Shelf")
+    assert_status(retired, "new", pushed, "in_progress", push="pushed")
+
+
+def test_work_pushed_since_a_networked_check_is_pushed_for_every_package(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.push_from_outside("topic")
+    git(w.b, "fetch", "-q", "origin")
+    w.push_from_outside("topic")
+    w.package("topic", "topic")
+    w.package("topic-2", "topic-2")
+    recorded = w.collect()
+    assert remote_of(recorded, w.a, "topic")["basis"] == "live", "control"
+
+    git(w.a, "fetch", "-q", "origin")
+    git(w.a, "checkout", "-q", "topic")
+    git(w.a, "merge", "-q", "--ff-only", "origin/topic")
+    w.commit(w.a)
+    git(w.a, "push", "-q", "origin", "topic")
+    git(w.a, "checkout", "-q", "-b", "topic-2", "trunk")
+    w.commit(w.a)
+    git(w.a, "push", "-q", "origin", "topic-2")
+    git(w.a, "checkout", "-q", "trunk")
+
+    document = w.collect(remote_checks=False)
+
+    assert document["remote_checks"] == "off"
+    older = rev(w.b, "refs/remotes/origin/topic")
+    assert older != rev(w.a, "refs/remotes/origin/topic"), "control: B holds an older tip"
+    for name in ("topic", "topic-2"):
+        copy = remote_of(document, w.a, name)
+        assert_remote(copy, "present", rev(w.a, f"refs/remotes/origin/{name}"), "cached")
+        assert_status(
+            document, name, f"in progress {DOT} pushed", "in_progress", push="pushed"
+        )
+
+
+@pytest.fixture
+def status_document(status_world, tmp_path):
+    w = status_world
+    w.branch(w.a, "ahead", push=True)
+    git(w.a, "checkout", "-q", "ahead")
+    w.commit(w.a)
+    git(w.a, "checkout", "-q", "trunk")
+    git(w.a, "branch", "zero", "trunk")
+    w.branch(w.a, "both", push=True)
+    w.take(w.b, "both")
+    linked(w.a, tmp_path, "both-a", "both")
+    linked(w.b, tmp_path, "both-b", "both")
+    for name in ("ahead", "zero", "both"):
+        w.package(name, name)
+    w.package("default", "trunk")
+    w.package("missing", "ahead", target=tmp_path / "nowhere")
+    return w.collect()
+
+
+def code_status_of(document: dict[str, Any], name: str) -> dict[str, Any]:
+    (package,) = [p for p in document["packages"] if p["package_path"] == f"Fictional/Drafts/{name}"]
+    return package["code_status"]
+
+
+def package_of(document: dict[str, Any], name: str) -> dict[str, Any]:
+    (package,) = [p for p in document["packages"] if p["package_path"] == f"Fictional/Drafts/{name}"]
+    return package
+
+
+def test_the_collected_code_statuses_are_accepted_and_come_back_unchanged(status_document):
+    parsed = models.parse_checkouts(json.dumps(status_document))
+
+    assert parsed["packages"] == status_document["packages"]
+    assert code_status_of(status_document, "ahead")["unpushed"] == 1
+    assert code_status_of(status_document, "zero")["cleanup"] == {"worktrees": 0, "branches": 1}
+    assert len(code_status_of(status_document, "both")["checked_out_elsewhere"]) == 2
+    assert code_status_of(status_document, "default") is None
+    assert code_status_of(status_document, "missing") is None
+
+
+def set_status(name: str, **changes: Any):
+    def change(document: dict[str, Any]) -> None:
+        code_status_of(document, name).update(changes)
+
+    return change
+
+
+def drop_status_key(name: str, key: str):
+    def change(document: dict[str, Any]) -> None:
+        del code_status_of(document, name)[key]
+
+    return change
+
+
+def give_status(name: str):
+    def change(document: dict[str, Any]) -> None:
+        package_of(document, name)["code_status"] = doc_copy(code_status_of(document, "ahead"))
+
+    return change
+
+
+def reverse_elsewhere(document: dict[str, Any]) -> None:
+    code_status_of(document, "both")["checked_out_elsewhere"].reverse()
+
+
+CODE_STATUS_REFUSALS = {
+    "a text its fields do not give": (set_status("ahead", text="in progress"), "does not match"),
+    "a text for another unpushed count": (
+        set_status("ahead", unpushed=2),
+        "does not match",
+    ),
+    "an unknown state": (set_status("ahead", state="done"), "state is invalid"),
+    "an unknown push state": (set_status("ahead", push="sent"), "push is invalid"),
+    "a push state on a merged status": (
+        set_status("zero", push="pushed"),
+        "push is set exactly for",
+    ),
+    "no push state on an in-progress status": (
+        set_status("ahead", push=None, unpushed=None),
+        "push is set exactly for",
+    ),
+    "a pull request on an in-progress status": (
+        set_status("ahead", pull_request=4),
+        "pull_request is set exactly",
+    ),
+    "a pull request that is not a positive integer": (
+        set_status("ahead", pull_request=0),
+        "positive integer",
+    ),
+    "a boolean unpushed count": (set_status("ahead", unpushed=True), "positive integer"),
+    "an unpushed count without the unpushed push state": (
+        set_status("ahead", push="pushed"),
+        "unpushed is a count exactly",
+    ),
+    "a missing unpushed count": (
+        set_status("ahead", unpushed=None),
+        "unpushed is a count exactly",
+    ),
+    "cleanup on an in-progress status": (
+        set_status("ahead", cleanup={"worktrees": 0, "branches": 1}),
+        "cleanup is set exactly",
+    ),
+    "no cleanup on a merged status": (
+        set_status("zero", cleanup=None),
+        "cleanup is set exactly",
+    ),
+    "a negative cleanup count": (
+        set_status("zero", cleanup={"worktrees": -1, "branches": 1}),
+        "non-negative integer",
+    ),
+    "cleanup that is not an object": (set_status("zero", cleanup=[1]), "must be an object"),
+    "a cleanup key missing": (
+        set_status("zero", cleanup={"worktrees": 0}),
+        "invalid shape",
+    ),
+    "other worktrees out of order": (reverse_elsewhere, "canonical order"),
+    "other worktrees that are not a list": (
+        set_status("both", checked_out_elsewhere="x"),
+        "must be a list",
+    ),
+    "an other worktree that is not text": (
+        set_status("both", checked_out_elsewhere=[3]),
+        "safe text",
+    ),
+    "a text that is not a string": (set_status("ahead", text=7), "string"),
+    "a missing key": (drop_status_key("ahead", "pull_request"), "invalid shape"),
+    "an extra key": (set_status("ahead", extra=1), "invalid shape"),
+    "a status that is not an object": (
+        lambda d: package_of(d, "ahead").update(code_status="x"),
+        "must be an object",
+    ),
+    "a status on a default-branch package": (give_status("default"), "requires a declared"),
+    "a status on a package with a missing target": (give_status("missing"), "requires a declared"),
+}
+
+
+@pytest.mark.parametrize("case", list(CODE_STATUS_REFUSALS))
+def test_the_parser_refuses_a_code_status_that_breaks_its_contract(status_document, case):
+    change, message = CODE_STATUS_REFUSALS[case]
+    broken = doc_copy(status_document)
+    change(broken)
+
+    assert message in refusal_of(broken)
+
+
+def test_the_parser_accepts_a_status_for_every_state_the_text_function_renders(status_document):
+    for state, changes in {
+        "awaiting_merge": {"push": None, "unpushed": None, "text": "awaiting merge (no PR)"},
+        "superseded": {
+            "push": None,
+            "unpushed": None,
+            "text": f"superseded {DOT} branch retained",
+        },
+        "unknown": {"push": None, "unpushed": None, "text": "merge state unknown"},
+        "pr_open": {
+            "pull_request": 12,
+            "push": "pushed",
+            "unpushed": None,
+            "text": "PR #12 open",
+        },
+    }.items():
+        document = doc_copy(status_document)
+        status = code_status_of(document, "ahead")
+        status.update(state=state, **changes)
+        status["text"] += f" {DOT} in " + ", ".join(
+            models._path_name(path) for path in status["checked_out_elsewhere"]
+        ) if status["checked_out_elsewhere"] else ""
+        assert models.parse_checkouts(redigest(document))["packages"] == document["packages"], state
