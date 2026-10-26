@@ -447,11 +447,13 @@ def test_with_an_old_git_a_usable_target_is_unchecked(tmp_path, monkeypatch):
 
 
 def argument_recorder(tmp_path: Path) -> tuple[Path, Path]:
-    """A ``git`` stand-in that logs each call's arguments, separated by U+001F."""
+    """A ``git`` stand-in that logs each call's arguments on one line, separated by U+001F."""
     log = tmp_path / "arguments.log"
+    # The whole line is built first and appended with one write, so calls that run
+    # concurrently cannot tear each other's lines.
     body = (
-        f'for argument in "$@"; do printf "%s\\037" "$argument" >> "{log}"; done; '
-        f'printf "\\n" >> "{log}"'
+        'sep=$(printf "\\037"); line=""; for argument in "$@"; do line="$line$argument$sep"; done; '
+        f'printf "%s\\n" "$line" >> "{log}"'
     )
     return stand_in(tmp_path, "argument-recorder", body), log
 
