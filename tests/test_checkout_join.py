@@ -24,7 +24,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     stand_in,
 )
 
-from nyx import checkout_join, checkouts, models
+from nyx import checkout_join, checkouts, cli, models
 
 ID_A = "11111111-1111-4111-8111-111111111111"
 ID_B = "22222222-2222-4222-8222-222222222222"
@@ -486,3 +486,161 @@ def test_with_an_old_git_a_usable_target_is_unchecked(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{old}{os.pathsep}{os.environ['PATH']}")
 
     assert_unchecked(collect_packages([folder], root), "too_old")
+
+
+def argument_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A ``git`` stand-in that logs each call's arguments, separated by U+001F."""
+    log = tmp_path / "arguments.log"
+    body = (
+        f'for argument in "$@"; do printf "%s\\037" "$argument" >> "{log}"; done; '
+        f'printf "\\n" >> "{log}"'
+    )
+    return stand_in(tmp_path, "argument-recorder", body), log
+
+
+def directories_of(log: Path) -> list[str]:
+    """The ``-C`` directory of every logged call that names one, as a real path."""
+    directories = []
+    for line in log.read_text().splitlines():
+        arguments = line.split("\x1f")
+        if "-C" in arguments:
+            directories.append(real(arguments[arguments.index("-C") + 1]))
+    return directories
+
+
+@posix_only
+def test_git_runs_in_no_target_directory_that_discovery_did_not_admit(
+    targets, tmp_path, monkeypatch
+):
+    # The runner names each directory with ``-C``, never through its own working
+    # directory, so the log must record the arguments to see where git ran.
+    folder = targets["folder"]
+    (targets["main"] / "src").mkdir()
+    unadmitted = {
+        "outside": targets["elsewhere"],
+        "inside": targets["main"] / "src",
+        "plain": folder / "Plain",
+    }
+    root = package_root(tmp_path, {**unadmitted, "clone": targets["main"]})
+    shim, log = argument_recorder(tmp_path)
+
+    with path_with(monkeypatch, shim):
+        document = collect_packages([folder], root)
+
+    found = resolve(document)
+    assert found["outside"]["status"] == "outside_folders"
+    assert found["inside"]["status"] == "not_git"
+    assert found["plain"]["status"] == "not_git"
+    assert found["clone"] == clone_target(targets["main"])
+    directories = directories_of(log)
+    assert real(targets["main"]) in directories, "control: the log names each directory"
+    for name, path in unadmitted.items():
+        prefix = real(path)
+        assert not [d for d in directories if d == prefix or d.startswith(prefix + os.sep)], name
+
+
+def test_a_candidate_git_does_not_accept_as_a_repository_is_not_a_git_checkout(tmp_path):
+    folder = tmp_path / "folder"
+    fake = folder / "Fake"
+    (fake / ".git" / "info").mkdir(parents=True)
+    redirected = folder / "Redirected"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git(folder, "init", "-q", "-b", "trunk", str(redirected))
+    git(redirected, "config", "core.worktree", str(elsewhere))
+    root = package_root(tmp_path, {"fake": fake, "redirected": redirected})
+
+    document = collect_packages([folder], root)
+
+    assert {"code": "not_a_repository", "path": str(fake)} in document["diagnostics"]
+    assert {"code": "not_a_repository", "path": str(redirected)} in document["diagnostics"]
+    found = resolve(document)
+    assert found["fake"] == {"status": "not_git", "clone": None, "worktree": None}
+    assert found["redirected"] == {"status": "not_git", "clone": None, "worktree": None}
+
+
+def test_the_parser_refuses_a_worktree_its_readable_clone_does_not_list(targets, tmp_path):
+    document = json.loads(
+        checkouts.collect_checkouts(
+            [str(targets["folder"])],
+            deadline_ns=time.monotonic_ns() + 60 * 10**9,
+            package_scan=checkouts.PackageScan(
+                package_root(tmp_path, {"w": targets["linked"]})
+            ),
+        )
+    )
+    target = document["packages"][0]["target"]
+    assert target["status"] == "worktree"
+    clones = {c["path"]: c for r in document["repositories"] for c in r["clones"]}
+    assert clones[target["clone"]]["status"] == "ok"
+
+    def refusal(worktree: str) -> str:
+        target["worktree"] = worktree
+        document["checkouts_digest"] = models.canonical_digest(
+            document, omit=models.CHECKOUTS_DIGEST_OMITTED
+        )
+        with pytest.raises(models.ProtocolError) as refused:
+            models.parse_checkouts(document)
+        return str(refused.value)
+
+    # The clone's own main working tree, and a worktree listed under another clone.
+    assert "not listed" in refusal(target["clone"])
+    assert "not listed" in refusal(real(targets["bare_work"]))
+
+
+def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
+    folder = targets["folder"]
+    (targets["main"] / "src").mkdir()
+    wanted: dict[str, Path | str | None] = {
+        "clone": targets["main"],
+        "linked": targets["linked"],
+        "bare": targets["bare"],
+        "barework": targets["bare_work"],
+        "holder": targets["holder"],
+        "busy": targets["busy"],
+        "busywork": targets["busy_work"],
+        "inside": targets["main"] / "src",
+        "missing": folder / "No Such Folder",
+        "plain": folder / "Plain",
+        "outside": targets["elsewhere"],
+        "gone": targets["gone"],
+    }
+    if "alias" in targets:
+        wanted["alias"] = targets["alias"]
+
+    document = collect_packages([folder], package_root(tmp_path, wanted))
+
+    found = resolve(document)
+    named = {
+        "clone": ("main", None),
+        "alias": ("main", None),
+        "linked": ("main", "linked"),
+        "bare": ("bare", None),
+        "barework": ("bare", "bare_work"),
+        "holder": ("holder", None),
+        "busy": ("busy", None),
+        "busywork": ("busy", None),
+    }
+    for name, (clone_name, worktree_name) in named.items():
+        if name not in found:
+            continue
+        target = found[name]
+        assert target["status"] == ("clone" if worktree_name is None else "worktree"), name
+        assert os.path.samefile(target["clone"], targets[clone_name]), name
+        if worktree_name is None:
+            assert target["worktree"] is None, name
+        else:
+            assert os.path.samefile(target["worktree"], targets[worktree_name]), name
+    unmatched = {
+        "inside": "not_git",
+        "missing": "missing",
+        "plain": "not_git",
+        "outside": "outside_folders",
+        "gone": "missing",
+    }
+    for name, status in unmatched.items():
+        assert found[name] == {"status": status, "clone": None, "worktree": None}, name
+    lines = cli.format_checkouts(document)
+    busy = found["busy"]["clone"]
+    assert f"{json.dumps(busy)}  too_many_branches" in lines
+    assert any(line.startswith(json.dumps(found["bare"]["clone"]) + "  ") for line in lines)
