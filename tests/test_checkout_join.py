@@ -1423,3 +1423,156 @@ def test_a_move_time_is_read_once_per_clone_and_name_and_no_listing_is_added(
         )
     assert listings(without_packages) > 0, "control: the log names the listings"
     assert listings(with_packages) == listings(without_packages)
+
+
+def move_second(member: Path) -> str:
+    """The Unix second of the newest reflog entry of ``member``'s ``origin/topic``."""
+    shown = git(
+        member, "reflog", "show", "-n", "1", "--date=unix", "--format=%gd",
+        "refs/remotes/origin/topic",
+    ).stdout.strip()
+    return shown[shown.index("@{") + 2 : -1]
+
+
+def test_moves_in_the_same_second_go_to_the_first_clone_in_natural_order(
+    remote_world, monkeypatch
+):
+    world = remote_world
+    saved = world.advance_remote("saved.txt")
+    world.collect(remote_checks=True)
+    # Both clones move their tracking ref after the check, in one and the same second.
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(time.time()) + 3600} +0000")
+    from_a = world.push_from(world.a, "from-a.txt")
+    git(world.b, "fetch", "-q", "origin")
+    git(world.b, "checkout", "-q", "-B", "topic", saved)
+    from_b = commit_file(world.b, "from-b.txt", "x\n")
+    git(world.b, "push", "-q", "-f", "origin", "topic")
+    git(world.b, "checkout", "-q", "trunk")
+    monkeypatch.delenv("GIT_COMMITTER_DATE")
+    assert (world.tracking(world.a), world.tracking(world.b)) == (from_a, from_b)
+    assert move_second(world.a) == move_second(world.b), "control: the moves tie"
+
+    document = world.collect()
+
+    assert_remote(remote_of(document, world.a), "present", from_a, "cached")
+
+
+def test_fetches_in_the_same_second_go_to_the_first_clone_in_natural_order(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    git(world.a, "fetch", "-q", "origin")
+    held_by_a = world.tracking(world.a)
+    newest = world.advance_remote("newest.txt")
+    git(world.b, "fetch", "-q", "origin")
+    # The record this check saves in the old account home is not seen from the fresh one.
+    recorded_elsewhere = world.collect(remote_checks=True)
+    assert_remote(remote_of(recorded_elsewhere, world.a), "present", newest, "live")
+    same = time.time()
+    for member in (world.a, world.b):
+        os.utime(member / ".git" / "FETCH_HEAD", (same, same))
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert held_by_a != newest == world.tracking(world.b)
+
+    document = world.collect()
+
+    fetched = {
+        clone_at(document, member)["cached_default"]["last_fetched_at"]
+        for member in (world.a, world.b)
+    }
+    assert len(fetched) == 1, "control: the fetches tie"
+    assert_remote(remote_of(document, world.a), "present", held_by_a, "cached")
+
+
+def test_with_no_record_a_branch_the_newest_fetch_pruned_is_absent(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    git(world.a, "fetch", "-q", "origin")
+    time.sleep(1.1)
+    git(world.remote, "branch", "-q", "-D", "topic")
+    git(world.b, "fetch", "-q", "--prune", "origin")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert world.tracking(world.a)
+    pruned = git(world.b, "rev-parse", "-q", "--verify", "refs/remotes/origin/topic", check=False)
+    assert pruned.returncode != 0, "control: B's newest fetch pruned the ref"
+
+    document = world.collect()
+
+    a_fetched, b_fetched = (
+        clone_at(document, member)["cached_default"]["last_fetched_at"]
+        for member in (world.a, world.b)
+    )
+    assert a_fetched < b_fetched
+    assert_remote(remote_of(document, world.a), "absent")
+
+
+def reflog_reads(log: Path) -> list[str]:
+    """The ``-C`` directory of every ``reflog`` call, one logged line per call."""
+    return [
+        real(call[call.index("-C") + 1])
+        for call in logged_calls(log)
+        if "reflog" in call and "-C" in call
+    ]
+
+
+@posix_only
+def test_a_move_time_is_read_only_under_a_saved_answer_and_for_a_ref_that_differs(
+    remote_world, tmp_path, monkeypatch
+):
+    world = remote_world
+    saved = world.advance_remote("saved.txt")
+    # One worker, so each logged call is written whole before the next starts.
+    (tmp_path / "live").mkdir()
+    shim, live_log = argument_recorder(tmp_path / "live")
+    with path_with(monkeypatch, shim):
+        live = collect_packages([world.folder], world.root, remote_checks=True, max_parallel=1)
+    assert_remote(remote_of(live, world.a), "present", saved, "live")
+    assert reflog_reads(live_log) == [], "a live answer needs no move time"
+
+    git(world.a, "fetch", "-q", "origin")
+    assert world.tracking(world.a) == saved != world.tracking(world.b)
+    (tmp_path / "recorded").mkdir()
+    shim, recorded_log = argument_recorder(tmp_path / "recorded")
+    with path_with(monkeypatch, shim):
+        recorded = collect_packages([world.folder], world.root, max_parallel=1)
+
+    assert_remote(remote_of(recorded, world.a), "present", saved, "recorded")
+    assert reflog_reads(recorded_log) == [real(world.b)], "only the ref that differs is read"
+
+
+@posix_only
+def test_a_move_time_read_that_cannot_finish_counts_as_not_moved(
+    remote_world, tmp_path, monkeypatch
+):
+    world = remote_world
+    saved = world.advance_remote("saved.txt")
+    world.collect(remote_checks=True)
+    from_a = world.push_from(world.a, "from-a.txt")
+    # Control: a read that finishes sees A's push.
+    assert_remote(remote_of(world.collect(), world.a), "present", from_a, "cached")
+    slow = stand_in(tmp_path, "slow-reflog", 'case "$*" in *" reflog "*) exec sleep 5;; esac')
+
+    with path_with(monkeypatch, slow):
+        document = world.collect(call_cap_seconds=1.0)
+
+    assert repository_of(document, world.a)["remote"]["check"]["status"] == "recorded"
+    assert_remote(remote_of(document, world.a), "present", saved, "recorded")
+
+
+def test_the_parser_refuses_a_present_remote_copy_whose_sha_is_not_an_object_id(remote_world):
+    world = remote_world
+    live = world.collect(remote_checks=True)
+
+    def short_sha(doc):
+        (entry,) = repository_of(doc, world.a)["package_branches"]
+        entry["remote"]["sha"] = entry["remote"]["sha"][:7]
+
+    def zero_sha(doc):
+        (entry,) = repository_of(doc, world.a)["package_branches"]
+        entry["remote"]["sha"] = "0" * 40
+
+    for change in (short_sha, zero_sha):
+        assert "remote.sha must be an object ID" in reference_mutation(live, change), (
+            change.__name__
+        )
