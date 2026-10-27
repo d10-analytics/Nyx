@@ -27,3 +27,9 @@ README is narrative only.
   `parse_checkouts` recomputes it from the document's own facts, so a document
   whose verdicts disagree with its facts is refused. No other module computes a
   blocker.
+- `code_status_text` is the single text of a package's Code Status.
+  `checkouts` calls it when it builds the document and `parse_checkouts`
+  recomputes it from the stored fields, so a document whose text disagrees with
+  its fields is refused. The same parser refuses every field combination a
+  state does not use, so no consumer needs its own rendering or consistency
+  rules.

@@ -46,3 +46,5 @@ README is narrative only.
   [catalog invariants](../catalog/README.md#cross-system-invariants).
 - Calls `derive_removable`; see
   [protocols invariants](../protocols/README.md#cross-system-invariants).
+- Calls `code_status_text`; see
+  [protocols invariants](../protocols/README.md#cross-system-invariants).
