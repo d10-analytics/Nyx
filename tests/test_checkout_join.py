@@ -2610,3 +2610,225 @@ def test_a_pushed_branch_reads_pushed_from_its_tracking_ref_without_a_remote_ans
     assert remote_of(document, w.a, "topic")["state"] == "unknown", "control"
     assert relation_of(document, w.a, "topic")[0] == "equal", "control"
     assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+# ---------------------------------------------------------------------------
+# Parser invariants: one mutation of a collected document per refusal
+# ---------------------------------------------------------------------------
+
+
+def package_index(document: dict[str, Any], name: str) -> int:
+    (found,) = [i for i, p in enumerate(document["packages"]) if p["package_path"] == path_of(name)]
+    return found
+
+
+def retexted(status: dict[str, Any]) -> None:
+    """Give a changed Code Status the text its fields now produce, so only the changed
+    invariant is violated."""
+    status["text"] = models.code_status_text(status)
+
+
+def repository_index(document: dict[str, Any], member: Path) -> int:
+    return document["repositories"].index(repository_of(document, member))
+
+
+@pytest.fixture
+def collected(matching):
+    document = collect_packages([matching["folder"]], matching["root"])
+    # The unmutated document is accepted, so each refusal below comes from its mutation.
+    assert models.parse_checkouts(json.dumps(redigest(doc_copy(document))))
+    return document
+
+
+def test_a_code_status_on_a_not_applicable_branch_is_refused(collected):
+    index = package_index(collected, "inapplicable")
+    assert collected["packages"][index]["branch"] == {"status": "not_applicable", "name": None}
+    assert collected["packages"][index]["code_status"] is None
+
+    def give(document):
+        document["packages"][index]["code_status"] = doc_copy(
+            document["packages"][package_index(document, "target")]["code_status"]
+        )
+
+    assert (
+        f"packages[{index}].code_status requires a declared branch and a resolved target"
+        in reference_mutation(collected, give)
+    )
+
+
+def test_a_branch_name_on_a_branch_that_is_not_declared_is_refused(collected):
+    index = package_index(collected, "inapplicable")
+
+    def name(document):
+        document["packages"][index]["branch"]["name"] = "topic"
+
+    assert f"packages[{index}].branch.name is set exactly for declared" in reference_mutation(
+        collected, name
+    )
+
+
+def test_a_clone_for_a_missing_target_is_refused(collected, matching):
+    index = package_index(collected, "missing")
+    assert_target(collected["packages"][index]["target"], "missing")
+
+    def clone_of_a_missing_target(document):
+        document["packages"][index]["target"]["clone"] = real(matching["a"])
+
+    assert f"packages[{index}].target.clone must be null without a clone" in reference_mutation(
+        collected, clone_of_a_missing_target
+    )
+
+
+def test_a_clone_target_without_its_clone_is_refused(collected):
+    index = package_index(collected, "inapplicable")
+    assert collected["packages"][index]["target"]["status"] == "clone"
+
+    def no_clone(document):
+        document["packages"][index]["target"]["clone"] = None
+
+    assert f"packages[{index}].target.clone is required for clone" in reference_mutation(
+        collected, no_clone
+    )
+
+
+def test_a_package_branch_entry_naming_an_unlisted_package_is_refused(collected, matching):
+    index = repository_index(collected, matching["a"])
+
+    def unlisted(document):
+        document["repositories"][index]["package_branches"][0]["packages"] = [path_of("zz")]
+
+    assert (
+        f"repositories[{index}].package_branches[0].packages names a package the document "
+        "does not list"
+    ) in reference_mutation(collected, unlisted)
+
+
+def test_two_package_branch_entries_with_one_name_are_refused(collected, matching):
+    index = repository_index(collected, matching["a"])
+
+    def twice(document):
+        entries = document["repositories"][index]["package_branches"]
+        entries.append(doc_copy(entries[0]))
+
+    assert (
+        f"repositories[{index}].package_branches must be unique and in canonical order"
+        in reference_mutation(collected, twice)
+    )
+
+
+def pull_request_open(fields: dict[str, Any], **changes: Any):
+    def change(document: dict[str, Any]) -> None:
+        status = document["packages"][package_index(document, "target")]["code_status"]
+        status.update(state="pr_open", **fields)
+        status.update(changes)
+        retexted(status)
+
+    return change
+
+
+def test_an_open_pull_request_status_without_its_number_is_refused(collected):
+    index = package_index(collected, "target")
+    status = collected["packages"][index]["code_status"]
+    assert (status["state"], status["push"]) == ("in_progress", "unknown")
+
+    message = reference_mutation(collected, pull_request_open({"pull_request": None}))
+
+    assert f"packages[{index}].code_status.pull_request is set exactly for pr_open" in message
+
+
+def test_an_open_pull_request_status_without_a_push_state_is_refused(collected):
+    index = package_index(collected, "target")
+
+    message = reference_mutation(collected, pull_request_open({"pull_request": 5}, push=None))
+
+    assert f"packages[{index}].code_status.push is set exactly for in_progress and pr_open" in message
+
+
+def test_an_unpushed_count_that_is_text_is_refused(collected):
+    index = package_index(collected, "target")
+
+    def text_count(document):
+        status = document["packages"][index]["code_status"]
+        status.update(push="unpushed", unpushed="3")
+
+    assert (
+        f"packages[{index}].code_status.unpushed must be a positive integer or null"
+        in reference_mutation(collected, text_count)
+    )
+
+
+@pytest.fixture
+def worktrees(targets, tmp_path):
+    document = collect_packages(
+        [targets["folder"]],
+        package_root(tmp_path, {"clone": targets["main"], "linked": targets["linked"]}),
+    )
+    by_name = resolve(document)
+    assert_target(by_name["clone"], "clone", real(targets["main"]))
+    assert_target(by_name["linked"], "worktree", real(targets["main"]), real(targets["linked"]))
+    return document, targets
+
+
+def target_index(document: dict[str, Any], name: str) -> int:
+    (found,) = [i for i, p in enumerate(document["packages"]) if p["package_path"].endswith(f"/{name}")]
+    return found
+
+
+def test_a_worktree_for_a_clone_target_is_refused(worktrees):
+    document, layout = worktrees
+    index = target_index(document, "clone")
+
+    def with_worktree(doc):
+        doc["packages"][index]["target"]["worktree"] = real(layout["linked"])
+
+    assert f"packages[{index}].target.worktree must be null without a worktree" in (
+        reference_mutation(document, with_worktree)
+    )
+
+
+def test_a_worktree_target_without_its_worktree_is_refused(worktrees):
+    document, _layout = worktrees
+    index = target_index(document, "linked")
+
+    def without_worktree(doc):
+        doc["packages"][index]["target"]["worktree"] = None
+
+    assert f"packages[{index}].target.worktree is required for worktree" in (
+        reference_mutation(document, without_worktree)
+    )
+
+
+def documents_with_and_without_git(tmp_path: Path, monkeypatch) -> tuple[dict, dict]:
+    """The same folder and packages collected with git and, then, with no git on the path."""
+    folder, root = unchecked_world(tmp_path)
+    with_git = collect_packages([folder], root)
+    assert with_git["repositories"] and with_git["git"]["status"] == "available"
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    without_git = collect_packages([folder], root)
+    assert_unchecked(without_git, "missing")
+    return with_git, without_git
+
+
+def test_a_checked_target_in_a_document_without_git_is_refused(tmp_path, monkeypatch):
+    _with_git, without_git = documents_with_and_without_git(tmp_path, monkeypatch)
+    index = target_index(without_git, "exists")
+
+    def checked_missing(doc):
+        doc["packages"][index]["target"]["status"] = "missing"
+
+    assert f"packages[{index}].target.status requires git to be available" in (
+        reference_mutation(without_git, checked_missing)
+    )
+
+
+def test_a_repository_in_a_document_without_git_is_refused(tmp_path, monkeypatch):
+    with_git, without_git = documents_with_and_without_git(tmp_path, monkeypatch)
+
+    def with_repositories(doc):
+        doc["repositories"] = doc_copy(with_git["repositories"])
+
+    assert "repositories must be empty when git is unavailable" in (
+        reference_mutation(without_git, with_repositories)
+    )
