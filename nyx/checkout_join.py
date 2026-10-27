@@ -22,7 +22,9 @@ The remote copy of a package branch is decided here from plain facts the collect
 read, under the same moved-ref rule the clones' own comparisons use
 (``moved_at_or_after``): the group's remote answer when the check was live, the saved
 answer unless a clone holds a tracking ref that differs from it and moved at or after
-the check, and otherwise the tracking ref of the clone fetched most recently.
+the check, and otherwise the tracking ref of the clone that fetched and whose newer of
+last fetch and last tracking-ref move is latest (a push moves the pusher's ref but not
+its fetch time).
 
 Each such package also gets its Code Status. The facts are the branch's local copies (the
 branches of that name in the readable clones of the repository) and its remote copy. A
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import code_status_text, natural_key
@@ -218,15 +221,29 @@ def _remote_copy(repository: Mapping[str, Any], name: str, facts: RemoteFacts | 
         if saved is None:
             return _copy("absent")
         return _copy("present", saved, REMOTE_RECORDED)
-    fetched: tuple[str, CloneRefs] | None = None
+    # No answer at all: a clone that has fetched is judged by the newer of its last fetch
+    # and the last move of its own tracking ref, since a push moves the pusher's ref but
+    # not its fetch time. A clone that never fetched is not evidence of the remote.
+    freshest: tuple[int, CloneRefs] | None = None
     for clone, refs in ready:
-        last = (clone["cached_default"] or {}).get("last_fetched_at")
-        if last is not None and (fetched is None or last > fetched[0]):
-            fetched = (last, refs)
-    if fetched is None:
+        fetched = _epoch((clone["cached_default"] or {}).get("last_fetched_at"))
+        if fetched is None:
+            continue
+        moved = refs.moved.get(name) if name in refs.cached else None
+        latest = fetched if moved is None else max(fetched, moved)
+        if freshest is None or latest > freshest[0]:
+            freshest = (latest, refs)
+    if freshest is None:
         return _copy("unknown")
-    tip = fetched[1].cached.get(name)
+    tip = freshest[1].cached.get(name)
     return _copy("absent") if tip is None else _copy("present", tip, REMOTE_CACHED)
+
+
+def _epoch(text: str | None) -> int | None:
+    """Unix seconds of a document timestamp (``None`` when there is none)."""
+    if text is None:
+        return None
+    return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
 
 
 def _default_names(repository: Mapping[str, Any]) -> frozenset[str]:
@@ -359,6 +376,8 @@ def join_branches(
     repositories: Sequence[dict[str, Any]],
     packages: Sequence[dict[str, Any]],
     remotes: Mapping[str, RemoteFacts],
+    *,
+    scan_complete: bool,
 ) -> None:
     """Match declared package branches to the branches of their repository.
 
@@ -370,6 +389,11 @@ def join_branches(
     without a remote), and on each local branch of that repository's readable clones that
     carries its branch name or is folded under it, and every package whose branch has a
     copy gets its Code Status. All three are rewritten in place.
+
+    ``scan_complete`` says whether the package scan read every package. When it did not,
+    a package that is not listed may still name the branch, so no branch is concluded to be
+    named only by finished packages: the cross-package conclusion is withheld and the
+    package reads by the remaining rules.
     """
     named: dict[int, dict[str, list[dict[str, Any]]]] = {}
     for repository, package in _declared(repositories, packages):
@@ -397,7 +421,9 @@ def join_branches(
         copies = {entry["name"]: entry["remote"] for entry in repository["package_branches"]}
         for name, named_packages in by_name.items():
             local = _local_copies(repository, name)
-            every_finished = all(package["finished"] for package in named_packages)
+            every_finished = scan_complete and all(
+                package["finished"] for package in named_packages
+            )
             for package in named_packages:
                 package["code_status"] = _code_status(
                     package, local, copies[name], every_package_finished=every_finished

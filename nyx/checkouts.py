@@ -2023,7 +2023,8 @@ def _check_remotes(
     for the group. For each such group the last result carries the facts the remote
     copy of those branches is decided from: the group's answer and its basis (none when
     the check failed or is off with no saved answer), and per usable clone its own
-    remote-tracking tips and the move times read once under a saved answer."""
+    remote-tracking tips and the move times read once, under a saved answer or when the
+    group has no answer at all."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -2158,6 +2159,29 @@ def _check_remotes(
         for path, base, moved in pool.map(apply, work):
             bases[path] = base
             moves[path] = moved
+
+        # A group with no answer at all is judged by its clones' own refs, so the
+        # move time of each held package-branch ref is read here, once.
+        unanswered = [
+            (clone["path"], context, names)
+            for group in groups
+            if group["remote"]["key"] not in remote_answers
+            and (names := package_names.get(group["remote"]["key"], ()))
+            for clone, context in _usable_clones(group["clones"], contexts)
+        ]
+
+        def read_moves(
+            item: tuple[str, _CloneContext, Collection[str]],
+        ) -> tuple[str, dict[str, int | None]]:
+            path, context, names = item
+            return path, {
+                name: _ref_moved_at(runner, context, name)
+                for name in sorted(names)
+                if name in context.cached
+            }
+
+        for path, found in pool.map(read_moves, unanswered):
+            moves[path] = found
     facts: dict[str, RemoteFacts] = {}
     for group in groups:
         key = group["remote"]["key"]
@@ -3686,7 +3710,12 @@ def collect_checkouts(
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
     }.values()
-    join_branches(repositories, packages, remote_facts)
+    join_branches(
+        repositories,
+        packages,
+        remote_facts,
+        scan_complete=package_heads is not None and package_heads.status == "complete",
+    )
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
