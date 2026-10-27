@@ -375,18 +375,22 @@ def test_the_join_compares_keys_not_strings():
 
 
 def test_a_worktree_of_an_unreadable_clone_is_refused_by_the_parser(targets, tmp_path):
+    root = package_root(tmp_path, {"w": targets["busy_work"]})
+    # No branch is declared, so neither package has a reference or a package-branch entry.
+    make_package(root, "Drafts", "n", f"Target repo: {targets['busy']}\nBranch: not applicable \u2014 x\n")
     document = json.loads(
         checkouts.collect_checkouts(
             [str(targets["folder"])],
             deadline_ns=time.monotonic_ns() + 60 * 10**9,
-            package_scan=checkouts.PackageScan(
-                package_root(tmp_path, {"w": targets["busy_work"]})
-            ),
+            package_scan=checkouts.PackageScan(root),
         )
     )
-    package = document["packages"][0]
     busy = real(targets["busy"])
+    package = document["packages"][target_index(document, "w")]
     assert_target(package["target"], "clone", busy)
+    unreferenced = document["packages"][target_index(document, "n")]
+    assert_target(unreferenced["target"], "clone", busy)
+    assert unreferenced["branch"]["status"] == "not_applicable"
     package["target"] = {"status": "worktree", "clone": busy, "worktree": real(targets["busy_work"])}
     document["checkouts_digest"] = models.canonical_digest(
         document, omit=models.CHECKOUTS_DIGEST_OMITTED
@@ -395,7 +399,8 @@ def test_a_worktree_of_an_unreadable_clone_is_refused_by_the_parser(targets, tmp
     with pytest.raises(models.ProtocolError, match="not listed"):
         models.parse_checkouts(document)
 
-    package["target"] = {"status": "clone", "clone": "/fictional/nowhere", "worktree": None}
+    package["target"] = {"status": "clone", "clone": busy, "worktree": None}
+    unreferenced["target"] = {"status": "clone", "clone": "/fictional/nowhere", "worktree": None}
     document["checkouts_digest"] = models.canonical_digest(
         document, omit=models.CHECKOUTS_DIGEST_OMITTED
     )
@@ -2432,6 +2437,17 @@ def set_status(name: str, **changes: Any):
     return change
 
 
+def set_status_retexted(name: str, **changes: Any):
+    """Change fields and give the status the text they now produce, so the text agrees."""
+
+    def change(document: dict[str, Any]) -> None:
+        status = code_status_of(document, name)
+        status.update(changes)
+        retexted(status)
+
+    return change
+
+
 def drop_status_key(name: str, key: str):
     def change(document: dict[str, Any]) -> None:
         del code_status_of(document, name)[key]
@@ -2463,7 +2479,7 @@ CODE_STATUS_REFUSALS = {
         "push is set exactly for",
     ),
     "no push state on an in-progress status": (
-        set_status("ahead", push=None, unpushed=None),
+        set_status_retexted("ahead", push=None, unpushed=None),
         "push is set exactly for",
     ),
     "a pull request on an in-progress status": (
@@ -2476,11 +2492,11 @@ CODE_STATUS_REFUSALS = {
     ),
     "a boolean unpushed count": (set_status("ahead", unpushed=True), "positive integer"),
     "an unpushed count without the unpushed push state": (
-        set_status("ahead", push="pushed"),
+        set_status_retexted("ahead", push="pushed"),
         "unpushed is a count exactly",
     ),
     "a missing unpushed count": (
-        set_status("ahead", unpushed=None),
+        set_status_retexted("ahead", unpushed=None),
         "unpushed is a count exactly",
     ),
     "cleanup on an in-progress status": (
@@ -2488,7 +2504,7 @@ CODE_STATUS_REFUSALS = {
         "cleanup is set exactly",
     ),
     "no cleanup on a merged status": (
-        set_status("zero", cleanup=None),
+        set_status_retexted("zero", cleanup=None),
         "cleanup is set exactly",
     ),
     "a negative cleanup count": (
@@ -2831,4 +2847,19 @@ def test_a_repository_in_a_document_without_git_is_refused(tmp_path, monkeypatch
 
     assert "repositories must be empty when git is unavailable" in (
         reference_mutation(without_git, with_repositories)
+    )
+
+
+@pytest.mark.parametrize(
+    "cleanup", [{"worktrees": 0, "branches": 0}, {"worktrees": 1, "branches": 1}]
+)
+def test_a_merged_status_needs_exactly_one_positive_cleanup_count(status_document, cleanup):
+    index = package_index(status_document, "zero")
+    assert code_status_of(status_document, "zero")["cleanup"] == {"worktrees": 0, "branches": 1}
+
+    message = reference_mutation(status_document, set_status_retexted("zero", cleanup=cleanup))
+
+    assert (
+        f"packages[{index}].code_status.cleanup must have exactly one positive count for merged"
+        in message
     )
