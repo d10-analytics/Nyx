@@ -15,12 +15,33 @@ Put metadata in that header, one field per line.
 | `# Title` | The first top-level heading supplies the card title. |
 | `Package ID: UUID` | A stable, unique identity for the specification. |
 | `Status: text` | Optional reported text retained for search; it does not change the stage and is not shown on cards. |
-| `Target repo: path` | The final path component supplies the displayed target project. |
+| `Target repo: path` | The final path component supplies the displayed target project. `nyx checkouts` uses the whole absolute path. |
+| `Branch: name` | Optional. The git branch the work is done on, or a value starting with `not applicable` (then a reason) for work that has no branch. Only `nyx checkouts` reads it. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
 | `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
 | `Completion Prerequisite: UUID` | A whole-item requirement satisfied only when the target's literal stage is in this workspace's explicit completed-stage policy. |
 | `Superseded By: UUID` | Optional reference to a replacement specification. |
+
+## Branch and target repository
+
+`nyx checkouts` joins a package to the git checkouts on this machine through two
+header fields. It uses `Target repo` whole, as the absolute path of a clone or of
+a linked worktree of a clone; the browser still shows only its final path
+component. A value that is not an absolute path, such as a relative path or the
+text `TBD`, matches no checkout. `Branch` is optional and names the package's branch exactly as git spells it.
+A value is accepted as a branch name when it passes these checks, which are a
+subset of git's own rules: it has no space, no control character, none of
+`~ ^ : ? * [ \`, backtick, `<` or `>`, no `..`, `@{` or `//`, does not start
+with `-` or `/` or end with `/` or `.`, has no component that starts with `.` or
+ends with `.lock`, and is no longer than 1,024 UTF-16 code units. A value
+starting with `not applicable`, in any ASCII letter case, says the package has no
+branch. Any other value, such as `spec/fictional-project (proposed)`, is not a
+branch name and matches nothing. A bold label or one pair of backticks around the
+value is tolerated for both fields. The core labels themselves stay plain, as
+described below. How a branch
+becomes a Code Status is described under
+[Inspect checkouts](running-nyx.md#inspect-checkouts).
 
 ## File syntax and displayed terms
 
