@@ -130,6 +130,16 @@ def test_without_a_completion_setting_no_package_is_finished(world):
     assert [p["finished"] for p in document["packages"]] == [False, False]
 
 
+@pytest.mark.parametrize("completed", [(), ("Shipped", "Shipped"), ("bad/stage",)])
+def test_an_invalid_or_empty_completion_setting_finishes_no_package(world, completed):
+    folder, _repository, root = world
+
+    document = collect_packages([folder], root, completed)
+
+    assert document["package_scan"]["finished_policy"] == "not_configured"
+    assert [p["finished"] for p in document["packages"]] == [False, False]
+
+
 @posix_only
 def test_an_unreadable_specification_file_makes_the_scan_incomplete(world):
     folder, _repository, root = world
@@ -635,6 +645,46 @@ def test_a_path_that_cannot_name_anything_is_missing(tmp_path):
 
 
 @posix_only
+def test_without_inode_numbers_a_target_still_resolves_by_its_real_path(targets, monkeypatch):
+    real_os = checkouts.os
+
+    class NoInodes:
+        """The ``os`` module as a file system that reports no inode numbers."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_os, name)
+
+        @staticmethod
+        def stat(*args: Any, **kwargs: Any) -> Any:
+            details = real_os.stat(*args, **kwargs)
+            return real_os.stat_result((details.st_mode, 0, *tuple(details)[2:10]))
+
+    monkeypatch.setattr(checkouts, "os", NoInodes())
+    assert checkouts._path_key(str(targets["main"]))[0] == "path", "control: the fallback runs"
+    named = {
+        "main": targets["main"],
+        "busy": targets["busy"],
+        "linked": targets["linked"],
+        "plain": targets["folder"] / "Plain",
+        "elsewhere": targets["elsewhere"],
+    }
+    if "alias" in targets:
+        named["alias"] = targets["alias"]
+
+    document = collect_packages(
+        [targets["folder"]], package_root(targets["folder"].parent, named)
+    )
+
+    found = resolve(document)
+    assert_target(found["main"], "clone", real(targets["main"]))
+    assert_target(found["busy"], "clone", real(targets["busy"]))
+    assert_target(found["linked"], "worktree", real(targets["main"]), real(targets["linked"]))
+    assert_target(found["plain"], "not_git")
+    assert_target(found["elsewhere"], "outside_folders")
+    if "alias" in named:
+        assert_target(found["alias"], "clone", real(targets["main"]))
+
+
 def test_a_symbolic_link_loop_is_missing(tmp_path):
     first = tmp_path / "loop-a"
     second = tmp_path / "loop-b"
@@ -1287,6 +1337,35 @@ def test_with_no_record_the_clone_fetched_most_recently_answers(
         elsewhere.rename(world.remote)
     assert repository_of(failed, world.a)["remote"]["check"]["status"] == "failed"
     assert_remote(remote_of(failed, world.a), "present", newest, "cached")
+
+
+def test_with_no_record_a_clone_that_pushed_after_the_latest_fetch_answers(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    git(world.a, "fetch", "-q", "origin")
+    time.sleep(1.1)
+    git(world.b, "fetch", "-q", "origin")
+    time.sleep(1.1)
+    git(world.a, "checkout", "-q", "-b", "x", "trunk")
+    pushed = commit_file(world.a, "x.txt", "x\n")
+    git(world.a, "push", "-q", "-u", "origin", "x")
+    git(world.a, "checkout", "-q", "trunk")
+    make_package(world.root, "Drafts", "x", f"Target repo: {world.a}\nBranch: x\n")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+
+    document = world.collect(remote_checks=False)
+
+    fetched = [
+        clone_at(document, member)["cached_default"]["last_fetched_at"]
+        for member in (world.a, world.b)
+    ]
+    assert fetched[0] < fetched[1], "control: B fetched after A"
+    assert not (world.b / ".git" / "refs" / "remotes" / "origin" / "x").exists(), (
+        "control: B never saw the branch"
+    )
+    assert_remote(remote_of(document, world.a, "x"), "present", pushed, "cached")
+    assert_status(document, "x", f"in progress {DOT} pushed", "in_progress", push="pushed")
 
 
 def test_with_no_record_and_no_clone_ever_fetched_the_remote_copy_is_unknown(
@@ -2610,6 +2689,46 @@ def test_a_merged_pull_request_is_not_an_open_one(status_world, tmp_path, monkey
     )
     assert branch["verdict"]["state"] == "not_merged", "control"
     assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+@posix_only
+def test_an_unreadable_package_keeps_a_finished_package_from_awaiting_its_merge(status_world):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    w.package("old", "topic", stage="Shipped")
+    w.package("new", "topic")
+    unreadable = w.root / "Fictional" / "Drafts" / "new" / "spec.md"
+    unreadable.chmod(0o000)
+    if os.access(unreadable, os.R_OK):  # pragma: no cover - a user that ignores modes
+        unreadable.chmod(0o644)
+        pytest.skip("file permissions are not enforced for this user")
+    try:
+        document = w.collect()
+    finally:
+        unreadable.chmod(0o644)
+
+    assert document["package_scan"]["status"] == "incomplete"
+    assert [p["package_path"] for p in document["packages"]] == ["Fictional/Shipped/old"], (
+        "control: the active package is not listed"
+    )
+    (old,) = document["packages"]
+    assert old["finished"] is True, "control"
+    assert old["code_status"]["state"] != "awaiting_merge"
+    assert_status(
+        document, "old", f"in progress {DOT} pushed", "in_progress", stage="Shipped", push="pushed"
+    )
+
+    complete = w.collect()
+
+    assert complete["package_scan"]["status"] == "complete"
+    assert_status(
+        complete, "old", f"in progress {DOT} pushed", "in_progress", stage="Shipped", push="pushed"
+    )
+    (w.root / "Fictional" / "Drafts" / "new" / "spec.md").unlink()
+    (w.root / "Fictional" / "Drafts" / "new").rmdir()
+    alone = w.collect()
+    assert alone["package_scan"]["status"] == "complete"
+    assert_status(alone, "old", "awaiting merge (no PR)", "awaiting_merge", stage="Shipped")
 
 
 def test_a_pushed_branch_reads_pushed_from_its_tracking_ref_without_a_remote_answer(
