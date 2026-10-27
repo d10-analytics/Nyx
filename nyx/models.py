@@ -1996,6 +1996,10 @@ def _code_status(value: Any, name: str, *, allowed: bool) -> None:
         _keys(cleanup, _CLEANUP_KEYS, f"{name}.cleanup")
         for key in ("worktrees", "branches"):
             _count(cleanup[key], f"{name}.cleanup.{key}")
+        if state == "merged" and (cleanup["worktrees"] > 0) == (cleanup["branches"] > 0):
+            raise ProtocolError(
+                f"{name}.cleanup must have exactly one positive count for merged"
+            )
     paths = _list(item["checked_out_elsewhere"], f"{name}.checked_out_elsewhere")
     for index, path in enumerate(paths):
         _text(path, f"{name}.checked_out_elsewhere[{index}]")

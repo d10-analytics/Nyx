@@ -30,6 +30,7 @@ README is narrative only.
 - `code_status_text` is the single text of a package's Code Status.
   `checkouts` calls it when it builds the document and `parse_checkouts`
   recomputes it from the stored fields, so a document whose text disagrees with
-  its fields is refused. The same parser refuses every field combination a
-  state does not use, so no consumer needs its own rendering or consistency
-  rules.
+  its fields is refused. The same parser refuses a field set in a state that
+  does not use it, a field missing from a state that does, and a merged cleanup
+  without exactly one positive count, so no consumer needs its own rendering or
+  consistency rules.
