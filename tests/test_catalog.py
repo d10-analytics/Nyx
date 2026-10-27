@@ -2383,13 +2383,13 @@ def test_package_head_branch_limit_is_utf16_units(tmp_path) -> None:
 def test_package_heads_finish_only_the_configured_stages(tmp_path) -> None:
     root = _head_root(tmp_path)
     configured = catalog.scan_package_heads(root, completed_stage_names=["Shipped"])
-    assert configured.finished_policy == "configured"
+    assert catalog.finished_policy(["Shipped"]) == "configured"
     assert {
         head.package_path for head in configured.heads if head.finished
     } == {"Fictional/Shipped/done"}
     for policy in (None, [], "Shipped", ["Shipped", "Shipped"], ["bad/stage"]):
         heads = catalog.scan_package_heads(root, completed_stage_names=policy)
-        assert heads.finished_policy == "not_configured", policy
+        assert catalog.finished_policy(policy) == "not_configured", policy
         assert not any(head.finished for head in heads.heads), policy
 
 

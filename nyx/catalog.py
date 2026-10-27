@@ -1374,7 +1374,6 @@ class PackageHeads:
     """Package heads of one scan; ``status`` is the scan's identity coverage."""
 
     status: Literal["complete", "incomplete"]
-    finished_policy: Literal["configured", "not_configured"]
     heads: tuple[PackageHead, ...]
 
 
@@ -1398,12 +1397,17 @@ def _branch_head(raw: str | None) -> BranchHead:
     return BranchHead("invalid", None)
 
 
+def _finished_stages(completed_stage_names: Iterable[str] | None) -> frozenset[str]:
+    """The stages that finish a package: empty unless the policy is valid and non-empty."""
+    value = _completion_policy(completed_stage_names)
+    return frozenset(value) if value is not _INVALID_POLICY and value else frozenset()
+
+
 def finished_policy(
     completed_stage_names: Iterable[str] | None,
 ) -> Literal["configured", "not_configured"]:
     """Say whether ``completed_stage_names`` is a valid, non-empty completion policy."""
-    value = _completion_policy(completed_stage_names)
-    return "configured" if value is not _INVALID_POLICY and value else "not_configured"
+    return "configured" if _finished_stages(completed_stage_names) else "not_configured"
 
 
 def scan_package_heads(
@@ -1416,14 +1420,9 @@ def scan_package_heads(
     Uses the scan the catalog renders from.  An unreadable root raises the
     catalog's ``ValueError``.  A package is finished only when its stage is in
     a valid, non-empty ``completed_stage_names``; otherwise no package is
-    finished and ``finished_policy`` is ``not_configured``.
+    finished (see ``finished_policy``).
     """
-    policy_value = _completion_policy(completed_stage_names)
-    finished_stages = (
-        frozenset(policy_value)
-        if policy_value is not _INVALID_POLICY and policy_value
-        else frozenset()
-    )
+    finished_stages = _finished_stages(completed_stage_names)
     scan = _scan_specification_root(Path(spec_root))
     heads = []
     for record in sorted(scan.records, key=lambda item: str(item["package_path"])):
@@ -1444,6 +1443,5 @@ def scan_package_heads(
         )
     return PackageHeads(
         status="incomplete" if scan.identity_diagnostics else "complete",
-        finished_policy="configured" if finished_stages else "not_configured",
         heads=tuple(heads),
     )
