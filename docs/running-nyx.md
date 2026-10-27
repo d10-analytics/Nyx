@@ -537,7 +537,11 @@ record is edited by hand.
 The `--json` document also lists, under `packages`, every specification package
 whose `spec.md` header has a `Target repo:` or a `Branch:`, and gives a package
 that declares a branch a Code Status: one line saying where its branch work
-stands. The plain lines show none of this. `package_scan.status` is
+stands. A package has a Code Status only when its target is a `clone` or a
+`worktree` and its branch is found in a readable clone or on the remote. A
+relative, missing or invalid target, a target outside the checkout folders, git
+missing or too old, a branch that is the repository's default branch, and a
+branch found nowhere all leave it empty. The plain lines show none of this. `package_scan.status` is
 `unavailable` when the workspace has no specification root or Nyx cannot read it,
 and then no package is listed. `package_scan.finished_policy` is `configured` or
 `not_configured`, as described below.
@@ -545,9 +549,10 @@ and then no package is listed. `package_scan.finished_policy` is `configured` or
 **Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
 checkout, not only its last path component (the browser still shows just the last
 component). The path must be absolute. It names a clone, or a linked worktree of
-a clone, when it is the same directory as that checkout, which a symbolic link
-or a different letter case on a case-insensitive filesystem does not change; the
-two are never compared as text. The package's `target` says what it found:
+a clone, when it is the same directory as that checkout, judged by the
+directory's device and inode, which a symbolic link or a different letter case on
+a case-insensitive filesystem does not change. A filesystem that reports no inode
+compares the real path instead, with the host's case normalization. The package's `target` says what it found:
 `clone`, `worktree`, `missing` (no such path), `not_git` (a path that exists but
 is not the top level of a git checkout), `outside_folders` (a git checkout that
 is not in any configured checkout folder), `invalid` (a value that is not an
@@ -558,9 +563,10 @@ readable clones of its target's repository, meaning the clones that share one
 `origin` remote; a clone with no `origin` remote is a repository of its own. The
 same name in another repository is never matched, so seven repositories may each
 use `spec/fictional-lantern-festival` without confusing one another. Only
-clones that were read are searched. A clone git could not read, and so has no
-branches in the document, is not seen: work on the branch inside it changes
-neither the other clones' matches nor any package's Code Status. A branch that is
+clones whose status is ok are searched. Any other clone, whether git could not
+read it or refused it, as for a clone with too many branches, contributes no
+branch and is not seen: work on the branch inside it changes neither the other
+clones' matches nor any package's Code Status. A branch that is
 the repository's default branch is never a package branch: the package's `branch`
 status is `default_branch` and it has no Code Status. The default branch is the
 repository's known default branch name or, when that is unknown, the base a
@@ -622,8 +628,8 @@ equals or is behind its remote copy; and `push state unknown` otherwise.
 
 When the branch is also checked out in a working tree other than the one the
 package's `Target repo:` names, the text ends with ` · in <name>, <name>`: the last path
-component of each such checkout, in natural order. Written out in full, the names
-could not exceed 1,024 UTF-16 code units; if they would, it says ` · in N other
+component of each such checkout, in natural order. If the whole text with every
+name written out would be longer than 1,024 UTF-16 code units, it says ` · in N other
 worktrees` instead. The `--json` document keeps every path.
 
 **Limits.** These follow from what Nyx computes today.
@@ -636,7 +642,7 @@ worktrees` instead. The `--json` document keeps every path.
   like a branch that was merged.
 - Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
   branch that exists only on the remote, which Nyx does not compute.
-- A clone git could not read is not seen (see matching above).
+- A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
 
 ## Choose board row order
 

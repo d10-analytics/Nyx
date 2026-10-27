@@ -16,7 +16,7 @@ Put metadata in that header, one field per line.
 | `Package ID: UUID` | A stable, unique identity for the specification. |
 | `Status: text` | Optional reported text retained for search; it does not change the stage and is not shown on cards. |
 | `Target repo: path` | The final path component supplies the displayed target project. `nyx checkouts` uses the whole absolute path. |
-| `Branch: name` | Optional. The git branch the work is done on, or a value starting with `not applicable` (then a reason) for work that has no branch. Only `nyx checkouts` reads it. |
+| `Branch: name` | Optional. The git branch the work is done on, or a value starting with `not applicable` (then a reason) for work that has no branch. `nyx checkouts` reads it, and its value also stays searchable reported text. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
 | `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
@@ -37,8 +37,9 @@ with `-` or `/` or end with `/` or `.`, has no component that starts with `.` or
 ends with `.lock`, and is no longer than 1,024 UTF-16 code units. A value
 starting with `not applicable`, in any ASCII letter case, says the package has no
 branch. Any other value, such as `spec/fictional-project (proposed)`, is not a
-branch name and matches nothing. A bold label or one pair of backticks around the
-value is tolerated for both fields. The core labels themselves stay plain, as
+branch name and matches nothing. For `nyx checkouts`, a bold label or one pair of
+backticks around the value is tolerated for both fields; the browser's display of
+`Target repo` is unchanged and keeps a backtick. The core labels themselves stay plain, as
 described below. How a branch
 becomes a Code Status is described under
 [Inspect checkouts](running-nyx.md#inspect-checkouts).
@@ -82,7 +83,10 @@ capital letter (`A`–`Z`), be at most 64 characters long, and contain no `:`,
 `*`, `` ` ``, `<`, `>`, `|`, `[`, `]`, or control characters. The field names in
 the table above (`Package ID`, `Status`, `Target repo`, `Program Membership`,
 `Claim`, `Prerequisite`, `Completion Prerequisite`, and `Superseded By`) never
-become additional reported text, in any capitalization. Nyx ignores a line whose
+become additional reported text, in any capitalization. `Branch` is not in that
+list: although it has a row in the table, its value also stays searchable
+reported text, retained under the same rules as any other reported field.
+Nyx ignores a line whose
 name breaks these rules; it does not shorten a long name. Names are compared
 case-insensitively for `A`–`Z`; the first occurrence with a nonempty value wins.
 Nyx keeps at most the first 64 distinct fields in header order and shortens long
