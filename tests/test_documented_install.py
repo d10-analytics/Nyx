@@ -840,8 +840,14 @@ CORE_LABELS = (
 CORE_BOLD = re.compile(r"\*\*(" + "|".join(CORE_LABELS) + r")\*{0,2}:")
 BRANCH_HEADER_MARKERS = (
     "| `Branch: name` | Optional. The git branch the work is done on, or a value "
-    "starting with `not applicable` (then a reason) for work that has no branch.",
-    "A bold label or one pair of backticks around the value is tolerated for both fields.",
+    "starting with `not applicable` (then a reason) for work that has no branch. "
+    "`nyx checkouts` reads it, and its value also stays searchable reported text. |",
+    "`Branch` is not in that list: although it has a row in the table, its value also "
+    "stays searchable reported text, retained under the same rules as any other "
+    "reported field.",
+    "For `nyx checkouts`, a bold label or one pair of backticks around the value is "
+    "tolerated for both fields; the browser's display of `Target repo` is unchanged "
+    "and keeps a backtick.",
     "It uses `Target repo` whole, as the absolute path of a clone or of a linked "
     "worktree of a clone",
     "`nyx checkouts` uses the whole absolute path.",
@@ -873,7 +879,22 @@ CODE_STATUS_MARKERS = (
     "like a branch that was merged.",
     "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
     "branch that exists only on the remote, which Nyx does not compute.",
-    "A clone git could not read is not seen",
+    "A clone whose status is not ok, such as one git could not read or one with too "
+    "many branches, is not seen (see matching above).",
+    "clones whose status is ok are searched. Any other clone, whether git could not "
+    "read it or refused it, as for a clone with too many branches, contributes no "
+    "branch and is not seen",
+    "A package has a Code Status only when its target is a `clone` or a `worktree` and "
+    "its branch is found in a readable clone or on the remote. A relative, missing or "
+    "invalid target, a target outside the checkout folders, git missing or too old, a "
+    "branch that is the repository's default branch, and a branch found nowhere all "
+    "leave it empty.",
+    "judged by the directory's device and inode, which a symbolic link or a different "
+    "letter case on a case-insensitive filesystem does not change. A filesystem that "
+    "reports no inode compares the real path instead, with the host's case "
+    "normalization.",
+    "If the whole text with every name written out would be longer than 1,024 UTF-16 "
+    "code units, it says",
     "Several packages can name the same branch of the same repository",
     "An archived package therefore reads `in progress`, not `awaiting merge`, while a "
     "package that names the same branch is still unfinished.",
@@ -1471,6 +1492,7 @@ def test_reference_documents_the_branch_header_and_whole_path_target():
     reference = _normalized("docs/specification-reference.md")
     _assert_unique_markers(reference, BRANCH_HEADER_MARKERS, "docs/specification-reference.md")
     assert "**Branch" not in reference
+    assert "Only `nyx checkouts` reads it" not in reference
 
 
 def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limits():
