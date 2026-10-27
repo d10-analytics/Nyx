@@ -17,8 +17,10 @@ README is narrative only.
 - Matches each specification package's `Target repo:` to the checkout at that
   path: a clone, a linked worktree (resolved to its clone), or a discovered
   checkout whose clone could not be read. Paths compare by `os.stat` identity
-  (device and inode, which follows symbolic links and letter case), never as
-  strings. A target that matches nothing is classified from the filesystem
+  (device and inode, which a symbolic link or a different letter case on a
+  case-insensitive volume does not change), never as strings; a filesystem that
+  reports no inode compares the real path instead, with the host's case
+  normalization. A target that matches nothing is classified from the filesystem
   alone as missing, not a git checkout, or outside the checkout folders, so
   git never runs in a directory discovery did not admit; with git unavailable a
   usable target is unchecked. A path inside a clone that is not its top level
