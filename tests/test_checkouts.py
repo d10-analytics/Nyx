@@ -11667,10 +11667,13 @@ def test_the_reflog_time_test_answers_no_for_a_cut_a_missing_and_a_passed_deadli
     open_runner = checkouts._GitRunner(executable, time.monotonic_ns() + 60 * 10**9, 10)
     expired = checkouts._GitRunner(executable, time.monotonic_ns() - 1, 10)
 
-    assert checkouts._ref_moved_since(open_runner, context, "topic", world.at) is True
-    assert checkouts._ref_moved_since(open_runner, context, "topic", 2**40) is False
-    assert checkouts._ref_moved_since(open_runner, context, "no-such-branch", 0) is False
-    assert checkouts._ref_moved_since(expired, context, "topic", world.at) is False
+    moved = checkouts._ref_moved_at(open_runner, context, "topic")
+    assert moved is not None and moved >= world.at
+    assert checkouts.moved_at_or_after(moved, world.at) is True
+    assert checkouts.moved_at_or_after(moved, 2**40) is False
+    assert checkouts._ref_moved_at(open_runner, context, "no-such-branch") is None
+    assert checkouts._ref_moved_at(expired, context, "topic") is None
+    assert checkouts.moved_at_or_after(None, 0) is False
 
 
 @posix_only

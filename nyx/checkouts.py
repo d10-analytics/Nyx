@@ -1729,11 +1729,6 @@ def _ref_moved_at(runner: _GitRunner, context: _CloneContext, name: str) -> int 
     return int(match.group(1)) if match is not None else None
 
 
-def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
-    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``."""
-    return moved_at_or_after(_ref_moved_at(runner, context, name), at)
-
-
 def _apply_live(
     runner: _GitRunner,
     context: _CloneContext,
