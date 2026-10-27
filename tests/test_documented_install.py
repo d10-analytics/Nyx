@@ -864,6 +864,12 @@ CODE_STATUS_MARKERS = (
     "3. Some copy is not merged, and then:",
     "every package that names the branch in this repository is finished: "
     "`awaiting merge (no PR)`;",
+    "Nyx concludes this only when it read every package, so when a specification could "
+    "not be read (`package_scan.status` is `incomplete`) a package that may share the "
+    "branch is unseen and this rule never matches;",
+    "the clone that fetched and whose newer of last fetch and last move of that "
+    "remote-tracking branch is latest (a push moves the pusher's remote-tracking "
+    "branch but not its fetch time)",
     "the package has a well-formed `Superseded By:` header, whether or not its "
     "successor exists: `superseded · branch retained`;",
     "`in progress · ` followed by the push state.",

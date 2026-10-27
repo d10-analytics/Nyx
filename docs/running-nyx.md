@@ -591,7 +591,9 @@ it is the saved answer, unless a clone of the repository holds its own
 remote-tracking branch that differs from the saved one and moved at or after the
 saved check (see recorded values above); the newest such clone answers. When
 there is no answer at all, the copy is read from the remote-tracking branch of
-the clone fetched most recently, and is `unknown` when no clone ever fetched. The
+the clone that fetched and whose newer of last fetch and last move of that
+remote-tracking branch is latest (a push moves the pusher's remote-tracking
+branch but not its fetch time), and is `unknown` when no clone ever fetched. The
 copy is `present`, `absent` or `unknown`. A repository with no `origin` remote
 has no remote copy.
 
@@ -612,7 +614,10 @@ decides the text, and the order matters:
    ` · N unpushed` after it only when the push state below is unpushed.
 3. Some copy is not merged, and then:
    - every package that names the branch in this repository is finished:
-     `awaiting merge (no PR)`;
+     `awaiting merge (no PR)`; Nyx concludes this only when it read every
+     package, so when a specification could not be read (`package_scan.status` is
+     `incomplete`) a package that may share the branch is unseen and this rule
+     never matches;
    - otherwise, the package has a well-formed `Superseded By:` header, whether or
      not its successor exists: `superseded · branch retained`;
    - otherwise: `in progress · ` followed by the push state.
