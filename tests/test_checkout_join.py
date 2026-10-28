@@ -1306,15 +1306,36 @@ def use_fresh_home(tmp_path: Path, monkeypatch, home: Path) -> Path:
     return fresh
 
 
-def test_with_no_record_the_clone_fetched_most_recently_answers(
-    tmp_path, remote_world, monkeypatch
-):
+def last_fetched(document: dict[str, Any], member: Path) -> str | None:
+    return clone_at(document, member)["cached_default"]["last_fetched_at"]
+
+
+def moved_after(member: Path, other: Path) -> bool:
+    """Whether ``member``'s ``origin/topic`` moved in a later second than ``other``'s."""
+    return int(move_second(member)) > int(move_second(other))
+
+
+def reflog_off_clone(world: RemoteWorld, name: str) -> Path:
+    """A clone of the remote in the checkout folder that writes no reflog at all."""
+    return clone(
+        world.remote.as_uri(), world.folder / name, "-c", "core.logAllRefUpdates=false"
+    )
+
+
+def assert_undated(member: Path, name: str = "topic") -> None:
+    """The clone holds ``origin/<name>`` but no reflog says when it moved."""
+    assert git(member, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{name}").stdout.strip()
+    shown = git(member, "reflog", "show", f"refs/remotes/origin/{name}").stdout.strip()
+    assert shown == "", "control: the ref has no move time"
+
+
+def test_with_no_record_the_ref_that_moved_last_answers(tmp_path, remote_world, monkeypatch):
     world = remote_world
-    git(world.a, "fetch", "-q", "origin")
     time.sleep(1.1)
     newest = world.advance_remote("newest.txt")
     git(world.b, "fetch", "-q", "origin")
     assert world.tracking(world.a) != newest == world.tracking(world.b)
+    assert moved_after(world.b, world.a), "control: B's ref moved after A's"
     use_fresh_home(tmp_path, monkeypatch, world.home)
 
     offline = world.collect()
@@ -1322,11 +1343,6 @@ def test_with_no_record_the_clone_fetched_most_recently_answers(
     assert offline["remote_checks"] == "off"
     check = repository_of(offline, world.a)["remote"]["check"]
     assert (check["status"], check["reason"]) == ("off", "remote_checks_off")
-    fetched = [
-        clone_at(offline, member)["cached_default"]["last_fetched_at"]
-        for member in (world.a, world.b)
-    ]
-    assert fetched[0] < fetched[1], "control: B fetched after A"
     assert_remote(remote_of(offline, world.a), "present", newest, "cached")
 
     # A failed networked check with nothing saved answers the same way.
@@ -1339,12 +1355,10 @@ def test_with_no_record_the_clone_fetched_most_recently_answers(
     assert_remote(remote_of(failed, world.a), "present", newest, "cached")
 
 
-def test_with_no_record_a_clone_that_pushed_after_the_latest_fetch_answers(
+def test_with_no_record_a_clone_that_pushed_without_ever_fetching_answers(
     tmp_path, remote_world, monkeypatch
 ):
     world = remote_world
-    git(world.a, "fetch", "-q", "origin")
-    time.sleep(1.1)
     git(world.b, "fetch", "-q", "origin")
     time.sleep(1.1)
     git(world.a, "checkout", "-q", "-b", "x", "trunk")
@@ -1356,19 +1370,126 @@ def test_with_no_record_a_clone_that_pushed_after_the_latest_fetch_answers(
 
     document = world.collect(remote_checks=False)
 
-    fetched = [
-        clone_at(document, member)["cached_default"]["last_fetched_at"]
-        for member in (world.a, world.b)
-    ]
-    assert fetched[0] < fetched[1], "control: B fetched after A"
+    assert last_fetched(document, world.a) is None, "control: A never fetched"
+    assert last_fetched(document, world.b) is not None, "control: B fetched"
     assert not (world.b / ".git" / "refs" / "remotes" / "origin" / "x").exists(), (
-        "control: B never saw the branch"
+        "control: B holds no origin/x"
     )
     assert_remote(remote_of(document, world.a, "x"), "present", pushed, "cached")
     assert_status(document, "x", f"in progress {DOT} pushed", "in_progress", push="pushed")
 
 
-def test_with_no_record_and_no_clone_ever_fetched_the_remote_copy_is_unknown(
+def test_with_no_record_a_narrow_fetch_does_not_make_its_clone_the_answer(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    time.sleep(1.1)
+    newest = world.advance_remote("newest.txt")
+    git(world.a, "fetch", "-q", "origin")
+    time.sleep(1.1)
+    git(world.b, "fetch", "-q", "origin", "trunk")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert world.tracking(world.a) == newest != world.tracking(world.b)
+
+    document = world.collect()
+
+    assert last_fetched(document, world.a) < last_fetched(document, world.b), (
+        "control: B's narrow fetch is the later one"
+    )
+    assert moved_after(world.a, world.b), "control: A's ref moved after B's"
+    assert_remote(remote_of(document, world.a), "present", newest, "cached")
+
+
+def test_with_no_record_a_clone_that_keeps_no_reflog_pushes_and_its_ref_answers(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    pusher = reflog_off_clone(world, "reflog-off")
+    git(pusher, "checkout", "-q", "-b", "x", "trunk")
+    pushed = commit_file(pusher, "x.txt", "x\n")
+    git(pusher, "push", "-q", "-u", "origin", "x")
+    git(pusher, "checkout", "-q", "trunk")
+    make_package(world.root, "Drafts", "x", f"Target repo: {pusher}\nBranch: x\n")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert_undated(pusher, "x")
+
+    document = world.collect(remote_checks=False)
+
+    assert last_fetched(document, pusher) is None, "control: it never fetched"
+    assert last_fetched(document, world.b) is not None, "control: B fetched"
+    assert_remote(remote_of(document, world.a, "x"), "present", pushed, "cached")
+    assert_status(document, "x", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+def test_with_no_record_an_undated_ref_ranks_below_a_dated_one(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    # It sorts before A and B in natural order, and holds the newest tip.
+    pusher = reflog_off_clone(world, "0-reflog-off")
+    git(pusher, "checkout", "-q", "-B", "topic", "origin/topic")
+    newer = commit_file(pusher, "newer.txt", "x\n")
+    git(pusher, "push", "-q", "origin", "topic")
+    git(pusher, "checkout", "-q", "trunk")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert_undated(pusher)
+    older = world.tracking(world.a)
+    assert newer != older == world.tracking(world.b)
+    assert world.tracking(pusher) == newer
+    assert sorted([real(pusher), real(world.a), real(world.b)])[0] == real(pusher)
+
+    document = world.collect(remote_checks=False)
+
+    assert_remote(remote_of(document, world.a), "present", older, "cached")
+
+
+def test_with_no_record_moves_in_the_same_second_go_to_the_first_clone_in_natural_order(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    old = world.tracking(world.b)
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(time.time()) + 3600} +0000")
+    from_a = world.push_from(world.a, "from-a.txt")
+    git(world.b, "fetch", "-q", "origin")
+    git(world.b, "checkout", "-q", "-B", "topic", old)
+    from_b = commit_file(world.b, "from-b.txt", "x\n")
+    git(world.b, "push", "-q", "-f", "origin", "topic")
+    git(world.b, "checkout", "-q", "trunk")
+    monkeypatch.delenv("GIT_COMMITTER_DATE")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    assert (world.tracking(world.a), world.tracking(world.b)) == (from_a, from_b)
+    assert move_second(world.a) == move_second(world.b), "control: the moves tie"
+
+    document = world.collect()
+
+    assert_remote(remote_of(document, world.a), "present", from_a, "cached")
+
+
+def test_with_no_record_a_branch_one_clone_pruned_and_another_holds_is_present(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    time.sleep(1.1)
+    git(world.remote, "branch", "-q", "-D", "topic")
+    git(world.b, "fetch", "-q", "--prune", "origin")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    held = world.tracking(world.a)
+    assert held
+    pruned = git(world.b, "rev-parse", "-q", "--verify", "refs/remotes/origin/topic", check=False)
+    assert pruned.returncode != 0, "control: B's newest fetch pruned the ref"
+
+    document = world.collect()
+
+    assert last_fetched(document, world.a) is None or (
+        last_fetched(document, world.a) < last_fetched(document, world.b)
+    ), "control: the pruning clone fetched later"
+    assert_remote(remote_of(document, world.a), "present", held, "cached")
+    assert_status(
+        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+    )
+
+
+def test_with_no_record_and_no_clone_ever_fetched_the_pusher_ref_answers(
     tmp_path, monkeypatch
 ):
     world = RemoteWorld(tmp_path, Path(os.environ["HOME"]), fetched=False)
@@ -1377,8 +1498,51 @@ def test_with_no_record_and_no_clone_ever_fetched_the_remote_copy_is_unknown(
     document = world.collect()
 
     for member in (world.a, world.b):
-        assert clone_at(document, member)["cached_default"]["last_fetched_at"] is None
-    assert_remote(remote_of(document, world.a), "unknown")
+        assert last_fetched(document, member) is None, "control: no clone ever fetched"
+    assert_remote(remote_of(document, world.a), "present", world.tracking(world.a), "cached")
+    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+
+
+def test_with_no_record_a_branch_no_clone_holds_is_unknown_never_absent(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    git(world.a, "checkout", "-q", "-b", "solo", "trunk")
+    commit_file(world.a, "solo.txt", "x\n")
+    git(world.a, "checkout", "-q", "trunk")
+    make_package(world.root, "Drafts", "solo", f"Target repo: {world.a}\nBranch: solo\n")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+
+    document = world.collect()
+
+    assert last_fetched(document, world.b) is not None, "control: B has fetched"
+    for member in (world.a, world.b):
+        assert not (member / ".git" / "refs" / "remotes" / "origin" / "solo").exists()
+    assert_remote(remote_of(document, world.a, "solo"), "unknown")
+    assert_status(
+        document, "solo", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+    )
+
+
+@posix_only
+def test_with_no_record_a_move_time_is_read_only_for_a_ref_a_clone_holds(
+    tmp_path, monkeypatch
+):
+    world = RemoteWorld(tmp_path, Path(os.environ["HOME"]), fetched=False)
+    git(world.a, "checkout", "-q", "-b", "solo", "trunk")
+    commit_file(world.a, "solo.txt", "x\n")
+    git(world.a, "checkout", "-q", "trunk")
+    make_package(world.root, "Drafts", "solo", f"Target repo: {world.a}\nBranch: solo\n")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    shim, log = argument_recorder(tmp_path)
+
+    with path_with(monkeypatch, shim):
+        document = world.collect(remote_checks=False)
+
+    assert_remote(remote_of(document, world.a), "present", world.tracking(world.a), "cached")
+    assert_remote(remote_of(document, world.a, "solo"), "unknown")
+    assert move_reads(log) == [real(world.a)], "one read, for the clone that holds the ref"
+    assert move_reads(log, "solo") == [], "no read for a name no clone holds"
 
 
 def test_an_already_expired_deadline_still_yields_a_document_that_parses(remote_world):
@@ -1415,10 +1579,22 @@ def test_a_package_branch_in_a_clone_without_origin_has_no_remote_copy(matching)
     assert remote_of(document, matching["a"])["state"] == "unknown"
 
 
-def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(remote_world):
+def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(
+    tmp_path, remote_world, monkeypatch
+):
     world = remote_world
     live = world.collect(remote_checks=True)
     recorded = world.collect()
+    # With no record in the fresh account home, the check is off, or failed when networked.
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    off = world.collect()
+    elsewhere = world.remote.rename(tmp_path / "moved.git")
+    try:
+        failed = world.collect(remote_checks=True)
+    finally:
+        elsewhere.rename(world.remote)
+    assert repository_of(off, world.a)["remote"]["check"]["status"] == "off"
+    assert repository_of(failed, world.a)["remote"]["check"]["status"] == "failed"
 
     def entry_of(document: dict[str, Any]) -> dict[str, Any]:
         (found,) = repository_of(document, world.a)["package_branches"]
@@ -1435,6 +1611,9 @@ def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(rem
 
     def unknown_under_a_live_check(doc):
         entry_of(doc)["remote"].update(state="unknown", sha=None, basis=None)
+
+    def absent_without_an_answer(doc):
+        entry_of(doc)["remote"].update(state="absent", sha=None, basis=None)
 
     def cached_under_a_live_check(doc):
         entry_of(doc)["remote"]["basis"] = "cached"
@@ -1457,6 +1636,8 @@ def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(rem
         (live, present_without_sha, "sets sha and basis exactly for present"),
         (live, unknown_under_a_live_check, "cannot be unknown under a live remote check"),
         (live, cached_under_a_live_check, "basis does not match the remote check"),
+        (off, absent_without_an_answer, "cannot be absent when the remote check is off"),
+        (failed, absent_without_an_answer, "cannot be absent when the remote check is failed"),
         (recorded, unknown_under_a_live_check, "cannot be unknown under a recorded remote check"),
         (recorded, live_under_a_recorded_check, "basis does not match the remote check"),
         (live, missing_remote, "must be an object"),
@@ -1552,56 +1733,6 @@ def test_moves_in_the_same_second_go_to_the_first_clone_in_natural_order(
     document = world.collect()
 
     assert_remote(remote_of(document, world.a), "present", from_a, "cached")
-
-
-def test_fetches_in_the_same_second_go_to_the_first_clone_in_natural_order(
-    tmp_path, remote_world, monkeypatch
-):
-    world = remote_world
-    git(world.a, "fetch", "-q", "origin")
-    held_by_a = world.tracking(world.a)
-    newest = world.advance_remote("newest.txt")
-    git(world.b, "fetch", "-q", "origin")
-    # The record this check saves in the old account home is not seen from the fresh one.
-    recorded_elsewhere = world.collect(remote_checks=True)
-    assert_remote(remote_of(recorded_elsewhere, world.a), "present", newest, "live")
-    same = time.time()
-    for member in (world.a, world.b):
-        os.utime(member / ".git" / "FETCH_HEAD", (same, same))
-    use_fresh_home(tmp_path, monkeypatch, world.home)
-    assert held_by_a != newest == world.tracking(world.b)
-
-    document = world.collect()
-
-    fetched = {
-        clone_at(document, member)["cached_default"]["last_fetched_at"]
-        for member in (world.a, world.b)
-    }
-    assert len(fetched) == 1, "control: the fetches tie"
-    assert_remote(remote_of(document, world.a), "present", held_by_a, "cached")
-
-
-def test_with_no_record_a_branch_the_newest_fetch_pruned_is_absent(
-    tmp_path, remote_world, monkeypatch
-):
-    world = remote_world
-    git(world.a, "fetch", "-q", "origin")
-    time.sleep(1.1)
-    git(world.remote, "branch", "-q", "-D", "topic")
-    git(world.b, "fetch", "-q", "--prune", "origin")
-    use_fresh_home(tmp_path, monkeypatch, world.home)
-    assert world.tracking(world.a)
-    pruned = git(world.b, "rev-parse", "-q", "--verify", "refs/remotes/origin/topic", check=False)
-    assert pruned.returncode != 0, "control: B's newest fetch pruned the ref"
-
-    document = world.collect()
-
-    a_fetched, b_fetched = (
-        clone_at(document, member)["cached_default"]["last_fetched_at"]
-        for member in (world.a, world.b)
-    )
-    assert a_fetched < b_fetched
-    assert_remote(remote_of(document, world.a), "absent")
 
 
 def reflog_reads(log: Path) -> list[str]:
@@ -2734,15 +2865,17 @@ def test_an_unreadable_package_keeps_a_finished_package_from_awaiting_its_merge(
 def test_a_pushed_branch_reads_pushed_from_its_tracking_ref_without_a_remote_answer(
     status_world,
 ):
-    # With no remote answer and no fetch, the remote copy is unknown, but the clone's own
-    # tracking ref equals its branch, which is what the push state reads.
+    # With no remote answer and no fetch, the clone's own tracking ref is the remote copy:
+    # present at the tip it pushed, which its branch equals.
     w = status_world
     w.branch(w.a, "topic", push=True)
     w.package("topic", "topic")
 
     document = w.collect(remote_checks=False)
 
-    assert remote_of(document, w.a, "topic")["state"] == "unknown", "control"
+    tip = rev(w.a, "topic")
+    assert rev(w.a, "refs/remotes/origin/topic") == tip, "control"
+    assert_remote(remote_of(document, w.a, "topic"), "present", tip, "cached")
     assert relation_of(document, w.a, "topic")[0] == "equal", "control"
     assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
 
