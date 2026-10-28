@@ -15,9 +15,11 @@ README is narrative only.
   `recorded`, when a run is offline or a check fails; a clone's own newer
   remote-tracking ref takes precedence.
 - Decides the remote copy of a package branch from the live answer, else the
-  saved answer, else, with neither, the remote-tracking ref of the clone that
-  fetched and whose newer of last fetch and last ref move is latest, since a
-  push moves the pusher's ref but not its fetch time.
+  saved answer, else, with neither, the remote-tracking ref that moved last among
+  the readable clones that hold it (a ref whose move time cannot be read ranks
+  below the others; fetch times play no part). When no readable clone holds it
+  the copy is `unknown`, never `absent`: only a live or saved answer says
+  `absent`.
 - Concludes that every package naming a branch is finished only from a complete
   package scan; on an incomplete one a package that may share the branch is
   unseen, so no package reads `awaiting_merge`.

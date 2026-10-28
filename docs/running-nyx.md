@@ -543,8 +543,12 @@ relative, missing or invalid target, a target outside the checkout folders, git
 missing or too old, a branch that is the repository's default branch, and a
 branch found nowhere all leave it empty. The plain lines show none of this. `package_scan.status` is
 `unavailable` when the workspace has no specification root or Nyx cannot read it,
-and then no package is listed. `package_scan.finished_policy` is `configured` or
-`not_configured`, as described below.
+and then no package is listed. It is `complete` when Nyx read every specification
+whole, and `incomplete` when some specification could not be read whole. A package
+whose `spec.md` cannot be read is not listed in `packages`, so an `incomplete` scan
+means a package may exist that the list does not show; rule 3 below never concludes
+`awaiting merge (no PR)` on an `incomplete` scan. `package_scan.finished_policy` is
+`configured` or `not_configured`, as described below.
 
 **Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
 checkout, not only its last path component (the browser still shows just the last
@@ -590,11 +594,13 @@ remote. Under a live check it is the remote's own answer. Under a recorded check
 it is the saved answer, unless a clone of the repository holds its own
 remote-tracking branch that differs from the saved one and moved at or after the
 saved check (see recorded values above); the newest such clone answers. When
-there is no answer at all, the copy is read from the remote-tracking branch of
-the clone that fetched and whose newer of last fetch and last move of that
-remote-tracking branch is latest (a push moves the pusher's remote-tracking
-branch but not its fetch time), and is `unknown` when no clone ever fetched. The
-copy is `present`, `absent` or `unknown`. A repository with no `origin` remote
+there is no answer at all, the copy is read from the remote-tracking branches that
+the readable clones hold: the one that moved last supplies the commit, and a
+remote-tracking branch whose move time cannot be read ranks below every one that
+has a move time. Fetch times play no part. When no readable clone holds the
+remote-tracking branch, the copy is `unknown`, never `absent`: without an answer
+Nyx cannot tell a branch that was never pushed from one that no clone recorded.
+Only a live or saved answer says `absent`. The copy is `present`, `absent` or `unknown`. A repository with no `origin` remote
 has no remote copy.
 
 **Reading a Code Status.** Each copy has a verdict (see the verdicts above): a
@@ -648,6 +654,11 @@ worktrees` instead. The `--json` document keeps every path.
 - Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
   branch that exists only on the remote, which Nyx does not compute.
 - A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
+- With no live or saved remote answer, a branch deleted on the remote stays
+  present at the tip of any clone that has not pruned it, so a merged and deleted
+  branch can read `merge state unknown`; until a networked run answers.
+- With no live or saved remote answer, a branch that was never pushed reads
+  `in progress · push state unknown`; until a networked run answers.
 
 ## Choose board row order
 
