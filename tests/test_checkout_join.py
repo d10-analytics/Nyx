@@ -1443,6 +1443,39 @@ def test_with_no_record_an_undated_ref_ranks_below_a_dated_one(
     assert_remote(remote_of(document, world.a), "present", older, "cached")
 
 
+def test_with_no_record_undated_refs_tie_to_the_first_clone_in_natural_order(
+    tmp_path, remote_world, monkeypatch
+):
+    world = remote_world
+    # Two clones that keep no reflog hold different tips of ``y``; the later push is not
+    # preferred, since neither ref has a move time. A and B hold no ``origin/y``.
+    first = reflog_off_clone(world, "0-first")
+    second = reflog_off_clone(world, "1-second")
+    git(first, "checkout", "-q", "-b", "y", "trunk")
+    from_first = commit_file(first, "y-first.txt", "x\n")
+    git(first, "push", "-q", "-u", "origin", "y")
+    git(first, "checkout", "-q", "trunk")
+    time.sleep(1.1)
+    git(second, "checkout", "-q", "-b", "y", "trunk")
+    from_second = commit_file(second, "y-second.txt", "x\n")
+    git(second, "push", "-q", "-f", "-u", "origin", "y")
+    git(second, "checkout", "-q", "trunk")
+    make_package(world.root, "Drafts", "y", f"Target repo: {first}\nBranch: y\n")
+    use_fresh_home(tmp_path, monkeypatch, world.home)
+    for member in (first, second):
+        assert_undated(member, "y")
+    assert rev(first, "refs/remotes/origin/y") == from_first != from_second
+    assert rev(second, "refs/remotes/origin/y") == from_second
+    for member in (world.a, world.b):
+        assert not (member / ".git" / "refs" / "remotes" / "origin" / "y").exists()
+    order = [real(m) for m in (first, second, world.a, world.b)]
+    assert sorted(order) == order, "control: the first clone sorts first"
+
+    document = world.collect(remote_checks=False)
+
+    assert_remote(remote_of(document, world.a, "y"), "present", from_first, "cached")
+
+
 def test_with_no_record_moves_in_the_same_second_go_to_the_first_clone_in_natural_order(
     tmp_path, remote_world, monkeypatch
 ):
