@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 4)
+# Checkout facts document (schema 5)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 4
+CHECKOUTS_SCHEMA_VERSION = 5
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -806,7 +806,56 @@ _CHECKOUTS_KEYS = frozenset(
         "folders",
         "repositories",
         "diagnostics",
+        "package_scan",
+        "packages",
     }
+)
+_PACKAGE_SCAN_KEYS = frozenset({"status", "finished_policy"})
+_PACKAGE_SCAN_STATUSES = frozenset({"complete", "incomplete", "unavailable"})
+_FINISHED_POLICIES = frozenset({"configured", "not_configured"})
+_PACKAGE_KEYS = frozenset(
+    {
+        "package_path",
+        "package_id",
+        "finished",
+        "superseded",
+        "target",
+        "branch",
+        "code_status",
+    }
+)
+_CODE_STATUS_KEYS = frozenset(
+    {
+        "state",
+        "text",
+        "pull_request",
+        "push",
+        "unpushed",
+        "cleanup",
+        "checked_out_elsewhere",
+    }
+)
+_CODE_STATUS_STATES = frozenset(
+    {"merged", "pr_open", "awaiting_merge", "superseded", "in_progress", "unknown"}
+)
+_CODE_STATUS_PUSHES = frozenset({"pushed", "unpushed", "not_pushed", "unknown"})
+_CLEANUP_KEYS = frozenset({"worktrees", "branches"})
+_PACKAGE_TARGET_KEYS = frozenset({"status", "clone", "worktree"})
+_PACKAGE_TARGET_STATUSES = frozenset(
+    {
+        "clone",
+        "worktree",
+        "missing",
+        "not_git",
+        "outside_folders",
+        "invalid",
+        "absent",
+        "unchecked",
+    }
+)
+_PACKAGE_BRANCH_KEYS = frozenset({"status", "name"})
+_PACKAGE_BRANCH_STATUSES = frozenset(
+    {"declared", "default_branch", "not_applicable", "invalid", "absent"}
 )
 _GIT_KEYS = frozenset({"status", "version"})
 _GIT_STATUSES = frozenset({"available", "missing", "too_old"})
@@ -823,7 +872,9 @@ CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
         "checkout_cache_write_failed",
     }
 )
-_REPOSITORY_KEYS = frozenset({"remote", "default_branch", "pr_lookup", "clones"})
+_REPOSITORY_KEYS = frozenset(
+    {"remote", "default_branch", "pr_lookup", "clones", "package_branches"}
+)
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
 _CHECK_STATUSES = frozenset({"live", "recorded", "failed", "off"})
@@ -890,9 +941,18 @@ _BRANCH_KEYS = frozenset(
         "pull_requests",
         "verdict",
         "contained_in",
+        "packages",
         "removable",
     }
 )
+# How a local branch serves a package.
+_BRANCH_PACKAGE_KEYS = frozenset({"package_path", "basis"})
+_BRANCH_PACKAGE_BASES = frozenset({"target_clone", "sibling_clone", "contained"})
+_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "packages"})
+# A package branch's remote copy: what the group's remote answered, or the clones' own
+# remote-tracking refs when it did not.
+_REMOTE_COPY_KEYS = frozenset({"state", "sha", "basis"})
+_REMOTE_COPY_STATES = frozenset({"present", "absent", "unknown"})
 _PULL_REQUEST_KEYS = frozenset({"number", "state", "head_matches"})
 _PULL_REQUEST_STATES = frozenset({"open", "merged", "closed"})
 # At most this many pull requests are listed for one branch; the collector's
@@ -926,6 +986,60 @@ def natural_key(text: str) -> tuple[Any, ...]:
         else:
             parts.append(part)
     return (tuple(parts), text)
+
+
+def _plural(count: int, noun: str) -> str:
+    suffix = "" if count == 1 else "es" if noun.endswith("ch") else "s"
+    return f"{count} {noun}{suffix}"
+
+
+def _path_name(path: str) -> str:
+    """The last component of a path, splitting on both separators on every host."""
+    parts = [part for part in re.split(r"[/\\]", path) if part]
+    return parts[-1] if parts else path
+
+
+def code_status_text(fields: Mapping[str, Any]) -> str:
+    """The one text of a package's Code Status, built from the stored fields.
+
+    ``fields`` carries ``state``, ``pull_request``, ``push``, ``unpushed``,
+    ``cleanup`` and ``checked_out_elsewhere``. The text lists the other
+    worktrees' names, or only their count when the names would not fit.
+    """
+    state = fields["state"]
+    push = fields["push"]
+    if state == "merged":
+        text = "merged"
+        cleanup = fields["cleanup"]
+        if cleanup is not None and cleanup["worktrees"]:
+            text += f" \u00b7 cleanup pending ({_plural(cleanup['worktrees'], 'worktree')})"
+        elif cleanup is not None and cleanup["branches"]:
+            text += f" \u00b7 cleanup pending ({_plural(cleanup['branches'], 'branch')})"
+    elif state == "pr_open":
+        text = f"PR #{fields['pull_request']} open"
+        if push == "unpushed":
+            text += f" \u00b7 {fields['unpushed']} unpushed"
+    elif state == "awaiting_merge":
+        text = "awaiting merge (no PR)"
+    elif state == "superseded":
+        text = "superseded \u00b7 branch retained"
+    elif state == "in_progress":
+        fragment = {
+            "pushed": "pushed",
+            "not_pushed": "not pushed",
+            "unpushed": f"{fields['unpushed']} unpushed",
+        }.get(push, "push state unknown")
+        text = f"in progress \u00b7 {fragment}"
+    else:
+        text = "merge state unknown"
+    paths = fields["checked_out_elsewhere"]
+    if paths:
+        names = sorted((_path_name(path) for path in paths), key=natural_key)
+        listed = f"{text} \u00b7 in {', '.join(names)}"
+        if _text_units(listed) <= MAX_TEXT_UNITS:
+            return listed
+        return f"{text} \u00b7 in {_plural(len(paths), 'other worktree')}"
+    return text
 
 
 def folder_sort_key(folder: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1193,6 +1307,13 @@ def _branch(
     _pull_requests(item["pull_requests"], f"{name}.pull_requests")
     _verdict(item["verdict"], f"{name}.verdict", nullable=True)
     _nullable(item["contained_in"], _text, f"{name}.contained_in")
+    references = _list(item["packages"], f"{name}.packages")
+    for index, raw in enumerate(references):
+        reference = _object(raw, f"{name}.packages[{index}]")
+        _keys(reference, _BRANCH_PACKAGE_KEYS, f"{name}.packages[{index}]")
+        _package_path(reference["package_path"])
+        _choice(reference["basis"], _BRANCH_PACKAGE_BASES, f"{name}.packages[{index}].basis")
+    _ordered(references, package_sort_key, f"{name}.packages")
     return item
 
 
@@ -1500,6 +1621,28 @@ def _clone_removable(
         raise ProtocolError(f"{name}.removable_count contradicts the facts of the clone")
 
 
+def _remote_copy(value: Any, name: str, *, has_remote: bool, check: str | None) -> None:
+    """Validate a package branch's remote copy against its repository's remote check."""
+    if not has_remote:
+        if value is not None:
+            raise ProtocolError(f"{name} must be null without a remote")
+        return
+    copy = _object(value, name)
+    _keys(copy, _REMOTE_COPY_KEYS, name)
+    state = _choice(copy["state"], _REMOTE_COPY_STATES, f"{name}.state")
+    present = state == "present"
+    if (copy["sha"] is not None) != present or (copy["basis"] is not None) != present:
+        raise ProtocolError(f"{name} sets sha and basis exactly for present")
+    if present:
+        _object_id(copy["sha"], f"{name}.sha")
+        if _choice(copy["basis"], _COMPARISON_BASES, f"{name}.basis") not in _BRANCH_BASES[check]:
+            raise ProtocolError(f"{name}.basis does not match the remote check")
+    elif state == "unknown" and check in ("live", "recorded"):
+        raise ProtocolError(f"{name} cannot be unknown under a {check} remote check")
+    elif state == "absent" and check in ("off", "failed"):
+        raise ProtocolError(f"{name} cannot be absent when the remote check is {check}")
+
+
 def _clone(
     value: Any,
     name: str,
@@ -1769,11 +1912,167 @@ def _repository(
         for clone_index, raw in enumerate(clones)
     ]
     _ordered(parsed, clone_sort_key, f"{name}.clones")
+    entries = _list(item["package_branches"], f"{name}.package_branches")
+    for entry_index, raw_entry in enumerate(entries):
+        label = f"{name}.package_branches[{entry_index}]"
+        entry = _object(raw_entry, label)
+        _keys(entry, _PACKAGE_BRANCH_ENTRY_KEYS, label)
+        _text(entry["name"], f"{label}.name")
+        _remote_copy(
+            entry["remote"], f"{label}.remote", has_remote=remote is not None, check=check_status
+        )
+        listed = _list(entry["packages"], f"{label}.packages")
+        if not listed:
+            raise ProtocolError(f"{label}.packages must not be empty")
+        for path in listed:
+            _package_path(path)
+        _ordered(listed, lambda path: (path,), f"{label}.packages")
+    _ordered(entries, branch_sort_key, f"{name}.package_branches")
     for clone in parsed:
         if clone["path"] in clone_paths:
             raise ProtocolError("clone paths must be unique across the document")
         clone_paths.add(clone["path"])
     return item
+
+
+def package_sort_key(package: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Order package entries by ``package_path`` in code-point order."""
+    return (package["package_path"],)
+
+
+def _package(value: Any, name: str) -> dict[str, Any]:
+    item = _object(value, name)
+    _keys(item, _PACKAGE_KEYS, name)
+    _package_path(item["package_path"])
+    _uuid4(item["package_id"], f"{name}.package_id", nullable=True)
+    _bool(item["finished"], f"{name}.finished")
+    _bool(item["superseded"], f"{name}.superseded")
+    target = _object(item["target"], f"{name}.target")
+    _keys(target, _PACKAGE_TARGET_KEYS, f"{name}.target")
+    status = _choice(target["status"], _PACKAGE_TARGET_STATUSES, f"{name}.target.status")
+    for key in ("clone", "worktree"):
+        _nullable(target[key], _text, f"{name}.target.{key}")
+    if status not in ("clone", "worktree") and target["clone"] is not None:
+        raise ProtocolError(f"{name}.target.clone must be null without a clone")
+    if status != "worktree" and target["worktree"] is not None:
+        raise ProtocolError(f"{name}.target.worktree must be null without a worktree")
+    if status in ("clone", "worktree") and target["clone"] is None:
+        raise ProtocolError(f"{name}.target.clone is required for {status}")
+    if status == "worktree" and target["worktree"] is None:
+        raise ProtocolError(f"{name}.target.worktree is required for worktree")
+    branch = _object(item["branch"], f"{name}.branch")
+    _keys(branch, _PACKAGE_BRANCH_KEYS, f"{name}.branch")
+    branch_status = _choice(
+        branch["status"], _PACKAGE_BRANCH_STATUSES, f"{name}.branch.status"
+    )
+    _nullable(branch["name"], _text, f"{name}.branch.name")
+    if (branch["name"] is not None) != (branch_status == "declared"):
+        raise ProtocolError(f"{name}.branch.name is set exactly for declared")
+    _code_status(
+        item["code_status"],
+        f"{name}.code_status",
+        allowed=branch_status == "declared" and status in ("clone", "worktree"),
+    )
+    return item
+
+
+def _code_status(value: Any, name: str, *, allowed: bool) -> None:
+    """Check one package's Code Status: every field's type, the fields' agreement with the
+    state, and the text against the one text function."""
+    if value is None:
+        return
+    if not allowed:
+        raise ProtocolError(f"{name} requires a declared branch and a resolved target")
+    item = _object(value, name)
+    _keys(item, _CODE_STATUS_KEYS, name)
+    state = _choice(item["state"], _CODE_STATUS_STATES, f"{name}.state")
+    _string(item["text"], f"{name}.text")
+    _nullable(item["push"], lambda raw, label: _choice(raw, _CODE_STATUS_PUSHES, label), f"{name}.push")
+    for key in ("pull_request", "unpushed"):
+        number = item[key]
+        if number is not None and (type(number) is not int or number < 1):
+            raise ProtocolError(f"{name}.{key} must be a positive integer or null")
+    cleanup = item["cleanup"]
+    if cleanup is not None:
+        cleanup = _object(cleanup, f"{name}.cleanup")
+        _keys(cleanup, _CLEANUP_KEYS, f"{name}.cleanup")
+        for key in ("worktrees", "branches"):
+            _count(cleanup[key], f"{name}.cleanup.{key}")
+        if state == "merged" and (cleanup["worktrees"] > 0) == (cleanup["branches"] > 0):
+            raise ProtocolError(
+                f"{name}.cleanup must have exactly one positive count for merged"
+            )
+    paths = _list(item["checked_out_elsewhere"], f"{name}.checked_out_elsewhere")
+    for index, path in enumerate(paths):
+        _text(path, f"{name}.checked_out_elsewhere[{index}]")
+    _ordered(paths, natural_key, f"{name}.checked_out_elsewhere")
+    if (item["push"] is not None) != (state in ("in_progress", "pr_open")):
+        raise ProtocolError(f"{name}.push is set exactly for in_progress and pr_open")
+    if (item["pull_request"] is not None) != (state == "pr_open"):
+        raise ProtocolError(f"{name}.pull_request is set exactly for pr_open")
+    if (cleanup is not None) != (state == "merged"):
+        raise ProtocolError(f"{name}.cleanup is set exactly for merged")
+    if (item["unpushed"] is not None) != (item["push"] == "unpushed"):
+        raise ProtocolError(f"{name}.unpushed is a count exactly when push is unpushed")
+    if item["text"] != code_status_text(item):
+        raise ProtocolError(f"{name}.text does not match its fields")
+
+
+def _check_package_references(
+    repositories: list[dict[str, Any]], packages: list[dict[str, Any]]
+) -> None:
+    """Refuse a branch reference or package-branch entry no listed package backs."""
+    by_path = {package["package_path"]: package for package in packages}
+
+    def package_named(path: str, label: str) -> dict[str, Any]:
+        package = by_path.get(path)
+        if package is None:
+            raise ProtocolError(f"{label} names a package the document does not list")
+        return package
+
+    for repo_index, repository in enumerate(repositories):
+        name = f"repositories[{repo_index}]"
+        paths = {clone["path"] for clone in repository["clones"]}
+        for entry_index, entry in enumerate(repository["package_branches"]):
+            label = f"{name}.package_branches[{entry_index}]"
+            for path in entry["packages"]:
+                package = package_named(path, f"{label}.packages")
+                if package["branch"]["name"] != entry["name"]:
+                    raise ProtocolError(f"{label} lists a package that names another branch")
+                if package["target"]["clone"] not in paths:
+                    raise ProtocolError(f"{label} lists a package of another repository")
+        for clone_index, clone in enumerate(repository["clones"]):
+            if clone["branches"] is None:
+                continue
+            containers = {branch["name"]: branch["contained_in"] for branch in clone["branches"]}
+            for branch_index, branch in enumerate(clone["branches"]):
+                label = f"{name}.clones[{clone_index}].branches[{branch_index}].packages"
+                chain = _contained_names(containers, branch["name"])
+                for reference in branch["packages"]:
+                    package = package_named(reference["package_path"], label)
+                    target_clone = package["target"]["clone"]
+                    named = package["branch"]["name"]
+                    basis = reference["basis"]
+                    if target_clone not in paths:
+                        valid = False
+                    elif basis == "target_clone":
+                        valid = named == branch["name"] and target_clone == clone["path"]
+                    elif basis == "sibling_clone":
+                        valid = named == branch["name"] and target_clone != clone["path"]
+                    else:
+                        valid = named in chain
+                    if not valid:
+                        raise ProtocolError(f"{label} has a {basis} reference its package does not back")
+
+
+def _contained_names(containers: Mapping[str, str | None], start: str) -> set[str]:
+    """The branch names reached from ``start`` by following ``contained_in``."""
+    reached: set[str] = set()
+    name = containers.get(start)
+    while name is not None and name not in reached and name != start:
+        reached.add(name)
+        name = containers.get(name)
+    return reached
 
 
 def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
@@ -1853,6 +2152,51 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
                 raise ProtocolError("remote keys must be unique across the document")
             remote_keys.add(key)
     _ordered(parsed, repository_sort_key, "repositories")
+
+    package_scan = _object(document["package_scan"], "package_scan")
+    _keys(package_scan, _PACKAGE_SCAN_KEYS, "package_scan")
+    scan_status = _choice(
+        package_scan["status"], _PACKAGE_SCAN_STATUSES, "package_scan.status"
+    )
+    _choice(
+        package_scan["finished_policy"], _FINISHED_POLICIES, "package_scan.finished_policy"
+    )
+    packages = _list(document["packages"], "packages")
+    if scan_status == "unavailable" and packages:
+        raise ProtocolError("packages must be empty when the package scan is unavailable")
+    listed_worktrees: dict[str, set[str] | None] = {}
+    for repository in parsed:
+        for listed_clone in repository["clones"]:
+            listed_worktrees[listed_clone["path"]] = (
+                None
+                if listed_clone["worktrees"] is None
+                else {
+                    item["path"] for item in listed_clone["worktrees"] if not item["main"]
+                }
+            )
+    for index, raw_package in enumerate(packages):
+        package = _package(raw_package, f"packages[{index}]")
+        target = package["target"]
+        if target["clone"] is not None and target["clone"] not in listed_worktrees:
+            raise ProtocolError(f"packages[{index}].target.clone names no clone")
+        if target["worktree"] is not None:
+            linked = listed_worktrees[target["clone"]]
+            if linked is None or target["worktree"] not in linked:
+                raise ProtocolError(
+                    f"packages[{index}].target.worktree is not listed under its clone"
+                )
+        if git_status != "available" and package["target"]["status"] in (
+            "clone",
+            "worktree",
+            "missing",
+            "not_git",
+            "outside_folders",
+        ):
+            raise ProtocolError(
+                f"packages[{index}].target.status requires git to be available"
+            )
+    _ordered(packages, package_sort_key, "packages")
+    _check_package_references(parsed, packages)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     return dict(document)

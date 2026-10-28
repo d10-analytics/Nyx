@@ -2312,3 +2312,197 @@ def test_completion_policy_and_stage_names_match_case_sensitively(tmp_path):
             "reason": "completion_unsatisfied",
         },
     }
+
+
+ID_SHIPPED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+ID_SUCCESSOR = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+ABSOLUTE_MARKER = "/fictional/absolute-marker"
+TARGET = f"{ABSOLUTE_MARKER}/repo"
+
+
+def _head_root(base: Path) -> Path:
+    """A real specification root whose packages exercise every header form."""
+    root = base / "specs"
+    package(root, "Drafts", "bold", f"# Bold\n**Branch:** topic\nTarget repo: `{TARGET}`\n")
+    package(root, "Drafts", "ticked", f"# Ticked\nBranch: `topic`\nTarget repo: {TARGET}\n")
+    package(
+        root, "Drafts", "none",
+        "# None\nBranch: not applicable — no repository\nTarget repo: relative/repo\n",
+    )
+    package(root, "Drafts", "proposed", "# Proposed\nBranch: spec/x (proposed)\n")
+    package(root, "Drafts", "long", f"# Long\nBranch: {'b' * 1025}\n")
+    package(root, "Drafts", "legacy", "# Legacy\nProposed branch: legacy\n")
+    package(
+        root, "Shipped", "done",
+        f"# Done\nPackage ID: {ID_SHIPPED}\nSuperseded By: {ID_SUCCESSOR}\nBranch: spec/done\n",
+    )
+    package(root, "Shelf", "idle", "# Idle\nTarget repo: nowhere\n")
+    return root
+
+
+def _heads_by_name(heads: catalog.PackageHeads) -> dict[str, catalog.PackageHead]:
+    return {head.package_path.rsplit("/", 1)[1]: head for head in heads.heads}
+
+
+def test_package_heads_report_header_values_from_a_real_root(tmp_path) -> None:
+    root = _head_root(tmp_path)
+    heads = catalog.scan_package_heads(root, completed_stage_names=["Shipped"])
+    assert heads.status == "complete"
+    by_name = _heads_by_name(heads)
+    assert [head.package_path for head in heads.heads] == sorted(
+        head.package_path for head in heads.heads
+    )
+    assert by_name["bold"].branch == catalog.BranchHead("declared", "topic")
+    assert by_name["ticked"].branch == catalog.BranchHead("declared", "topic")
+    assert by_name["none"].branch == catalog.BranchHead("not_applicable", None)
+    assert by_name["proposed"].branch == catalog.BranchHead("invalid", None)
+    assert by_name["long"].branch == catalog.BranchHead("invalid", None)
+    assert by_name["legacy"].branch == catalog.BranchHead("absent", None)
+    assert by_name["bold"].target_repo == catalog.TargetRepoHead("usable", TARGET)
+    assert by_name["ticked"].target_repo == catalog.TargetRepoHead("usable", TARGET)
+    assert by_name["none"].target_repo == catalog.TargetRepoHead("invalid", None)
+    assert by_name["legacy"].target_repo == catalog.TargetRepoHead("absent", None)
+    assert by_name["done"].package_id == ID_SHIPPED
+    assert by_name["done"].superseded is True
+    assert by_name["done"].branch == catalog.BranchHead("declared", "spec/done")
+    assert all(not head.superseded for name, head in by_name.items() if name != "done")
+    assert by_name["bold"].package_id is None
+
+
+def test_package_head_branch_limit_is_utf16_units(tmp_path) -> None:
+    root = tmp_path / "specs"
+    astral = "\U0001F600"
+    package(root, "Drafts", "at", f"# At\nBranch: {'b' * 1022}{astral}\n")
+    package(root, "Drafts", "over", f"# Over\nBranch: {'b' * 1023}{astral}\n")
+    by_name = _heads_by_name(catalog.scan_package_heads(root))
+    assert _text_units(by_name["at"].branch.name) == MAX_TEXT_UNITS
+    assert by_name["at"].branch.status == "declared"
+    assert by_name["over"].branch == catalog.BranchHead("invalid", None)
+
+
+def test_package_heads_finish_only_the_configured_stages(tmp_path) -> None:
+    root = _head_root(tmp_path)
+    configured = catalog.scan_package_heads(root, completed_stage_names=["Shipped"])
+    assert catalog.finished_policy(["Shipped"]) == "configured"
+    assert {
+        head.package_path for head in configured.heads if head.finished
+    } == {"Fictional/Shipped/done"}
+    for policy in (None, [], "Shipped", ["Shipped", "Shipped"], ["bad/stage"]):
+        heads = catalog.scan_package_heads(root, completed_stage_names=policy)
+        assert catalog.finished_policy(policy) == "not_configured", policy
+        assert not any(head.finished for head in heads.heads), policy
+
+
+def test_package_heads_are_incomplete_when_a_spec_is_unreadable(tmp_path) -> None:
+    if sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("permission bits do not deny reads here")
+    root = _head_root(tmp_path)
+    blocked = root / "Fictional" / "Drafts" / "bold" / "spec.md"
+    blocked.chmod(0)
+    try:
+        heads = catalog.scan_package_heads(root, completed_stage_names=["Shipped"])
+    finally:
+        blocked.chmod(0o600)
+    assert heads.status == "incomplete"
+    unreadable = _heads_by_name(heads)["bold"]
+    assert unreadable.branch.status == "absent"
+    assert unreadable.target_repo.status == "absent"
+
+
+def test_package_heads_refuse_a_missing_root(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        catalog.scan_package_heads(tmp_path / "missing")
+
+
+def test_scan_catalog_wire_is_unchanged_by_the_package_heads(tmp_path) -> None:
+    root = _head_root(tmp_path)
+    rendered = catalog.scan_catalog(root, completed_stage_names=["Shipped"])
+    assert ABSOLUTE_MARKER not in rendered
+    assert "Target repo" not in rendered
+    value = json.loads(rendered)
+    assert "join" not in rendered
+    entries = {entry["package_path"]: entry for entry in value["entries"]}
+    bold = entries["Fictional/Drafts/bold"]
+    # The displayed basename keeps the baseline rule: a backticked value is not
+    # normalized here, only in the package heads.
+    assert bold["declared"]["target_project"] == "repo`"
+    assert entries["Fictional/Drafts/ticked"]["declared"]["target_project"] == "repo"
+    assert bold["reported_fields"] == [{"name": "Branch", "value": "topic"}]
+    assert entries["Fictional/Drafts/ticked"]["reported_fields"] == [
+        {"name": "Branch", "value": "`topic`"}
+    ]
+    assert entries["Fictional/Drafts/proposed"]["reported_fields"] == [
+        {"name": "Branch", "value": "spec/x (proposed)"},
+    ]
+    assert entries["Fictional/Drafts/legacy"]["reported_fields"] == [
+        {"name": "Proposed branch", "value": "legacy"},
+    ]
+    assert value["terminal_stages"] == ["Shipped"]
+    # The same bytes whether or not the heads were read from the same root.
+    catalog.scan_package_heads(root, completed_stage_names=["Shipped"])
+    assert catalog.scan_catalog(root, completed_stage_names=["Shipped"]) == rendered
+    assert catalog.build_catalog(root, completed_stage_names=["Shipped"]) == rendered
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("topic", "topic"),
+        ("** topic", "topic"),
+        ("**topic", "topic"),
+        ("  `topic`  ", "topic"),
+        ("** `topic`", "topic"),
+        ("`a`", "a"),
+        ("``", "``"),
+        ("`", "`"),
+        ("``x``", "`x`"),
+        ("`topic", "`topic"),
+        ("", ""),
+    ],
+)
+def test_normalize_header_value_strips_bold_residue_and_one_backtick_pair(raw, expected) -> None:
+    assert catalog.normalize_header_value(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a`b", "a<b", "a>b",
+        "a..b", "a@{b", "a//b", "@", "-a", "/a", "a/", "a.", "a/.b", "a.lock",
+        "a/b.lock/c", "a\x07b", "a\x7fb",
+    ],
+)
+def test_branch_head_rejects_names_git_would_refuse(name) -> None:
+    assert catalog._branch_head(name) == catalog.BranchHead("invalid", None)
+
+
+@pytest.mark.parametrize("name", ["topic", "spec/x", "a@b", "v1.2", "feature/é", "a-b_c"])
+def test_branch_head_accepts_ordinary_names(name) -> None:
+    assert catalog._branch_head(name) == catalog.BranchHead("declared", name)
+
+
+def test_branch_head_not_applicable_is_ascii_case_insensitive() -> None:
+    assert catalog._branch_head("Not Applicable — x").status == "not_applicable"
+    assert catalog._branch_head("not applicable").status == "not_applicable"
+    assert catalog._branch_head("not applic").status == "invalid"
+
+
+def test_target_repo_head_requires_an_absolute_path() -> None:
+    assert catalog._target_repo_head(f"** `{TARGET}`") == catalog.TargetRepoHead("usable", TARGET)
+    assert catalog._target_repo_head("TBD — later").status == "invalid"
+    assert catalog._target_repo_head("Minotaur").status == "invalid"
+    assert catalog._target_repo_head("  ").status == "absent"
+    assert catalog._target_repo_head(None).status == "absent"
+
+
+def test_package_heads_judge_target_repo_by_the_host_absolute_form(tmp_path) -> None:
+    root = tmp_path / "specs"
+    native = tmp_path / "checkouts" / "repo"
+    package(root, "Drafts", "native", f"# Native\nTarget repo: `{native}`\n")
+    package(root, "Drafts", "drive", "# Drive\nTarget repo: C:\\work\\repo\n")
+    by_name = _heads_by_name(catalog.scan_package_heads(root))
+    assert by_name["native"].target_repo == catalog.TargetRepoHead("usable", str(native))
+    if sys.platform != "win32":
+        assert by_name["drive"].target_repo == catalog.TargetRepoHead("invalid", None)
+    else:
+        assert by_name["drive"].target_repo == catalog.TargetRepoHead("usable", "C:\\work\\repo")

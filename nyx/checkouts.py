@@ -1,7 +1,8 @@
 """Read-only collector for the git state of the configured checkout folders.
 
-Every fact comes from a git command run through one runner, or from a direct
-look at the files git keeps inside a repository's own directories. Nothing here
+Every repository fact comes from a git command run through one runner, or from
+a direct look at the files git keeps inside a repository's own directories; the
+package list comes from the specification scan of the catalog. Nothing here
 fetches, writes or locks anything. Local commands run with every transport
 denied. The one exception is the optional remote check: a single
 ``git ls-remote`` per distinct remote, the only call that lifts the transport
@@ -19,6 +20,7 @@ remote, and such a verdict is never remembered.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -28,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -36,7 +38,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from .catalog import MAX_OUTPUT_BYTES
+from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
+from .checkout_join import (
+    CloneRefs,
+    PathKey,
+    RemoteAnswer,
+    RemoteFacts,
+    TargetIndex,
+    declared_branch_names,
+    join_branches,
+    moved_at_or_after,
+    resolve_target,
+)
 from .models import (
     CHECKOUT_BRANCH_CAP,
     CHECKOUTS_DIGEST_OMITTED,
@@ -1093,6 +1106,7 @@ def _collect_clone(runner: _GitRunner, members: list[_Identity]) -> _CloneOutcom
                 "pull_requests": [],
                 "verdict": None,
                 "contained_in": None,
+                "packages": [],
                 "removable": None,
             }
         )
@@ -1237,7 +1251,13 @@ def _assemble_repositories(
         remote = outcome.remote
         if remote is None:
             repositories.append(
-                {"remote": None, "default_branch": None, "pr_lookup": None, "clones": [clone]}
+                {
+                    "remote": None,
+                    "default_branch": None,
+                    "pr_lookup": None,
+                    "clones": [clone],
+                    "package_branches": [],
+                }
             )
             continue
         key, display = remote
@@ -1252,6 +1272,7 @@ def _assemble_repositories(
                 "default_branch": {"name": None, "sha": None},
                 "pr_lookup": _pr_lookup_off(key, github_lookup, remote_checks),
                 "clones": [],
+                "package_branches": [],
             }
             grouped[key] = group
             repositories.append(group)
@@ -1683,11 +1704,11 @@ class _LenderSearch:
 _REFLOG_TIME = re.compile(r"@\{([0-9]+)\}")
 
 
-def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: int) -> bool:
-    """Whether the clone's own ``refs/remotes/origin/<name>`` last moved at or after ``at``.
+def _ref_moved_at(runner: _GitRunner, context: _CloneContext, name: str) -> int | None:
+    """When the clone's own ``refs/remotes/origin/<name>`` last moved, in Unix seconds.
 
     A ref that is missing, a reflog that is empty or switched off, a failed or cut
-    call and a time that does not read as Unix seconds all answer no.
+    call and a time that does not read as Unix seconds all answer ``None``.
     """
     outcome = runner.run(
         [
@@ -1703,9 +1724,9 @@ def _ref_moved_since(runner: _GitRunner, context: _CloneContext, name: str, at: 
         ceiling=context.ceiling,
     )
     if not outcome.ok or outcome.timed_out:
-        return False
+        return None
     match = _REFLOG_TIME.search(_decode(outcome.out).strip())
-    return match is not None and int(match.group(1)) >= at
+    return int(match.group(1)) if match is not None else None
 
 
 def _apply_live(
@@ -1716,7 +1737,8 @@ def _apply_live(
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = (),
     base_name: str | None = None,
     basis: str = "live",
-) -> _Base | None:
+    package_names: Collection[str] = (),
+) -> tuple[_Base | None, dict[str, int | None]]:
     """Replace one clone's cached comparisons with the remote's, in place.
 
     ``answer`` is a live ``ls-remote`` answer (``basis`` ``live``) or a saved one
@@ -1730,7 +1752,11 @@ def _apply_live(
     the saved head.
 
     Returns the clone's verdict base for ``base_name``, chosen from the same
-    presence pass and lender as the comparisons.
+    presence pass and lender as the comparisons, and the move time of each remote-tracking
+    ref read under a saved answer (``None`` for a read that could not finish). A ref is
+    read at most once, for the clone's own branch names, the default and base names and
+    ``package_names``, and only when the clone's tip differs from the saved one; the clone's
+    comparisons and the remote copy of a package branch both use that one value.
     """
     name, remote_sha = answer.name, answer.sha
     cached_sha = context.cached.get(name) if name is not None else None
@@ -1739,20 +1765,20 @@ def _apply_live(
     if base_head is None and base_name is not None and base_name == name:
         base_head = remote_sha
     newer: set[str] = set()
+    moved: dict[str, int | None] = {}
     if basis == "recorded":
         asked = {branch["name"] for branch in clone["branches"]}
         asked.update(item for item in (name, base_name) if item is not None)
+        asked.update(package_names)
         for item in sorted(asked):
             held_tip = context.cached.get(item)
             saved_tip = answer.branches.get(item)
             if saved_tip is None and item == name:
                 saved_tip = remote_sha
-            if (
-                held_tip is not None
-                and held_tip != saved_tip
-                and _ref_moved_since(runner, context, item, answer.at)
-            ):
-                newer.add(item)
+            if held_tip is not None and held_tip != saved_tip:
+                moved[item] = _ref_moved_at(runner, context, item)
+                if moved_at_or_after(moved[item], answer.at):
+                    newer.add(item)
     if base_name in newer:
         # The clone's own base stands: it is the cached fallback below.
         base_head = None
@@ -1862,29 +1888,34 @@ def _apply_live(
             branch["vs_remote"] = live(branch["sha"], answer.branches.get(branch["name"]))
 
     if base_name is None:
-        return None
+        return None, moved
     cached_base = context.cached.get(base_name)
     fallback = (
         _Base(base_name, cached_base, "cached", None, None) if cached_base is not None else None
     )
     if base_head is None:
-        return fallback
+        return fallback, moved
     if guarded:
-        return _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
+        return (
+            _Base(base_name, base_head, basis, None, None) if base_head == cached_base else fallback
+        ), moved
     if base_head in held or presence.get(base_head) == "present":
-        return _Base(base_name, base_head, basis, None, None)
+        return _Base(base_name, base_head, basis, None, None), moved
     if presence.get(base_head) == "missing":
         source = lender(base_head)
         if isinstance(source, tuple):
             sibling, sibling_context = source
-            return _Base(
-                base_name,
-                base_head,
-                basis,
-                sibling["path"],
-                os.path.join(sibling_context.common, "objects"),
+            return (
+                _Base(
+                    base_name,
+                    base_head,
+                    basis,
+                    sibling["path"],
+                    os.path.join(sibling_context.common, "objects"),
+                ),
+                moved,
             )
-    return fallback
+    return fallback, moved
 
 
 def _list_pull_requests(
@@ -1970,10 +2001,12 @@ def _check_remotes(
     github_lookup: bool,
     remote_checks: bool,
     saved: Mapping[str, Mapping[str, dict[str, Any] | None]],
+    package_names: Mapping[str, Collection[str]],
 ) -> tuple[
     dict[str, _Base | None],
     dict[str, dict[str, tuple[_PullRequest, ...]]],
     dict[str, dict[str, dict[str, Any]]],
+    dict[str, RemoteFacts],
 ]:
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
     lookup is on; none when ``remote_checks`` is off) then phase 3 (per-clone
@@ -1984,7 +2017,14 @@ def _check_remotes(
     requests per head branch name for each remote key whose lookup answered or
     whose saved listing applies, and the records of this run's successful
     checks: per remote key, ``heads`` and ``pull_requests`` for the calls that
-    answered. ``saved`` holds the cache file's records per remote key."""
+    answered. ``saved`` holds the cache file's records per remote key.
+
+    ``package_names`` holds, per remote key, the branch names that packages declare
+    for the group. For each such group the last result carries the facts the remote
+    copy of those branches is decided from: the group's answer and its basis (none when
+    the check failed or is off with no saved answer), and per usable clone its own
+    remote-tracking tips and the move times read once, under a saved answer or when the
+    group has no answer at all."""
     groups = [item for item in repositories if item["remote"] is not None]
     chosen: list[_CloneContext | None] = []
     for group in groups:
@@ -2066,6 +2106,7 @@ def _check_remotes(
             tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str]
         ] = []
         bases: dict[str, _Base | None] = {}
+        remote_answers: dict[str, RemoteAnswer] = {}
         for group, answer in zip(groups, answers):
             key = group["remote"]["key"]
             if answer is not None and answer.reason is None:
@@ -2086,13 +2127,14 @@ def _check_remotes(
                 }
                 answer = _recorded_answer(heads)
             group["default_branch"] = {"name": answer.name, "sha": answer.sha}
+            remote_answers[key] = RemoteAnswer(basis, answer.at, dict(answer.branches))
             for clone, context in _usable_clones(group["clones"], contexts):
                 work.append((context, clone, answer, group, basis))
         # The pool is drained between the phases, so a blocked query keeps a
         # later comparison from starting.
         def apply(
             item: tuple[_CloneContext, dict[str, Any], _LiveAnswer, dict[str, Any], str],
-        ) -> tuple[str, _Base | None]:
+        ) -> tuple[str, _Base | None, dict[str, int | None]]:
             context, clone, answer, group, basis = item
             siblings = _siblings(clone, group["clones"], contexts)
             cached_default = clone["cached_default"]
@@ -2101,12 +2143,61 @@ def _check_remotes(
                 or (cached_default["name"] if cached_default is not None else None)
                 or _group_default_name(group["clones"])
             )
-            return clone["path"], _apply_live(
-                runner, context, clone, answer, siblings, base_name, basis
+            base, moved = _apply_live(
+                runner,
+                context,
+                clone,
+                answer,
+                siblings,
+                base_name,
+                basis,
+                package_names.get(group["remote"]["key"], ()),
             )
+            return clone["path"], base, moved
 
-        bases.update(pool.map(apply, work))
-    return bases, pulls, checked
+        moves: dict[str, dict[str, int | None]] = {}
+        for path, base, moved in pool.map(apply, work):
+            bases[path] = base
+            moves[path] = moved
+
+        # A group with no answer at all is judged by its clones' own refs, so the
+        # move time of each held package-branch ref is read here, once.
+        unanswered = [
+            (clone["path"], context, names)
+            for group in groups
+            if group["remote"]["key"] not in remote_answers
+            and (names := package_names.get(group["remote"]["key"], ()))
+            for clone, context in _usable_clones(group["clones"], contexts)
+        ]
+
+        def read_moves(
+            item: tuple[str, _CloneContext, Collection[str]],
+        ) -> tuple[str, dict[str, int | None]]:
+            path, context, names = item
+            return path, {
+                name: _ref_moved_at(runner, context, name)
+                for name in sorted(names)
+                if name in context.cached
+            }
+
+        for path, found in pool.map(read_moves, unanswered):
+            moves[path] = found
+    facts: dict[str, RemoteFacts] = {}
+    for group in groups:
+        key = group["remote"]["key"]
+        names = package_names.get(key, ())
+        if names:
+            facts[key] = RemoteFacts(
+                remote_answers.get(key),
+                {
+                    clone["path"]: CloneRefs(
+                        {name: context.cached[name] for name in names if name in context.cached},
+                        moves.get(clone["path"], {}),
+                    )
+                    for clone, context in _usable_clones(group["clones"], contexts)
+                },
+            )
+    return bases, pulls, checked, facts
 
 
 # ---------------------------------------------------------------------------
@@ -3371,6 +3462,124 @@ def _render(document: dict[str, Any]) -> str:
     return rendered
 
 
+@dataclass(frozen=True)
+class PackageScan:
+    """The specification inputs of the package list: its root and finished stages."""
+
+    spec_root: Path | None
+    completed_stage_names: tuple[str, ...] = ()
+
+
+def _scan_packages(package_scan: PackageScan | None) -> PackageHeads | None:
+    """Scan the specification root; ``None`` when there is no readable root."""
+    if package_scan is None or package_scan.spec_root is None:
+        return None
+    try:
+        return scan_package_heads(
+            package_scan.spec_root,
+            completed_stage_names=package_scan.completed_stage_names,
+        )
+    except ValueError:
+        return None
+
+
+def _path_key(path: str) -> PathKey | None:
+    """The identity of ``path``: device and inode, which follow symbolic links.
+
+    A file system that reports no inode falls back to the case-normalized real
+    path. A path that cannot be examined has no identity.
+    """
+    try:
+        details = os.stat(path)
+        if details.st_ino:
+            return ("id", details.st_dev, details.st_ino)
+        return ("path", os.path.normcase(os.path.realpath(path)))
+    except (OSError, ValueError):
+        return None
+
+
+_UNNAMEABLE_PATH_ERRORS = frozenset(
+    {errno.ENAMETOOLONG, errno.EINVAL, errno.ELOOP}
+)
+
+
+def _unmatched_target_status(path: str) -> str:
+    """Classify a target that matches no checkout, from the filesystem alone."""
+    try:
+        os.stat(path)
+        details = _lstat(path)
+    except ValueError:
+        return "missing"
+    except OSError as error:
+        # A path that cannot name anything is missing; one that exists but
+        # cannot be examined (for example, denied) cannot show a ``.git`` entry.
+        if error.errno in _UNNAMEABLE_PATH_ERRORS or isinstance(
+            error, (FileNotFoundError, NotADirectoryError)
+        ):
+            return "missing"
+        return "not_git"
+    if details is None:
+        return "missing"
+    return "outside_folders" if _has_git_entry(path) else "not_git"
+
+
+def _target_index(
+    repositories: Sequence[Mapping[str, Any]],
+    candidate_clones: Mapping[str, str],
+    not_git_candidates: Iterable[str],
+) -> TargetIndex:
+    """Collect the path keys of every clone, candidate and listed linked worktree."""
+    clones: dict[PathKey, str] = {}
+    worktrees: dict[PathKey, tuple[str, str]] = {}
+    for repository in repositories:
+        for clone in repository["clones"]:
+            key = _path_key(clone["path"])
+            if key is not None:
+                clones.setdefault(key, clone["path"])
+            for item in clone["worktrees"] or ():
+                if item["main"]:
+                    continue
+                worktree_key = _path_key(item["path"])
+                if worktree_key is not None:
+                    worktrees.setdefault(worktree_key, (clone["path"], item["path"]))
+    for candidate, clone_path in candidate_clones.items():
+        key = _path_key(candidate)
+        if key is not None:
+            clones.setdefault(key, clone_path)
+    not_git = {key for key in map(_path_key, not_git_candidates) if key is not None}
+    return TargetIndex(clones, worktrees, frozenset(not_git))
+
+
+def _package_entries(
+    scan: PackageHeads | None, index: TargetIndex | None
+) -> list[dict[str, Any]]:
+    """The packages that name a target repository or a branch, in catalog order."""
+    if scan is None:
+        return []
+    entries = []
+    for head in scan.heads:
+        if head.target_repo.status == "absent" and head.branch.status == "absent":
+            continue
+        path = head.target_repo.path
+        entries.append(
+            {
+                "package_path": head.package_path,
+                "package_id": head.package_id,
+                "finished": head.finished,
+                "superseded": head.superseded,
+                "target": resolve_target(
+                    head.target_repo.status,
+                    _path_key(path) if path is not None and index is not None else None,
+                    index,
+                    lambda path=path: _unmatched_target_status(path or ""),
+                ),
+                "branch": {"status": head.branch.status, "name": head.branch.name},
+                "code_status": None,
+            }
+        )
+    return entries
+
+
 def collect_checkouts(
     folders: Iterable[str | os.PathLike[str]],
     *,
@@ -3379,6 +3588,7 @@ def collect_checkouts(
     max_parallel: int = MAX_PARALLEL_CLONES,
     remote_checks: bool = False,
     github_lookup: bool = False,
+    package_scan: PackageScan | None = None,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
@@ -3390,12 +3600,17 @@ def collect_checkouts(
     check saved in the cache file, labelled ``recorded``, when there is one.
     ``github_lookup`` adds one ``gh`` call per GitHub repository, and only while
     ``remote_checks`` is on; a saved pull-request listing answers for a call that
-    is not made or fails.
+    is not made or fails. ``package_scan`` names the specification root whose
+    packages are listed; without it, or when the root cannot be read, the
+    document says the package scan is ``unavailable`` and lists no package.
     """
     observed_at = _utc_text(int(time.time()))
+    package_heads = _scan_packages(package_scan)
     discovery = _discover(os.fspath(folder) for folder in folders)
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
+    packages: list[dict[str, Any]]
+    remote_facts: dict[str, RemoteFacts] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -3415,12 +3630,16 @@ def collect_checkouts(
             identities = list(pool.map(lambda c: _identify(runner, c), discovery.candidates))
             clones: dict[str, list[_Identity]] = {}
             outcomes: list[_CloneOutcome] = []
+            candidate_clones: dict[str, str] = {}
+            not_git_candidates: list[str] = []
             for identity in identities:
                 if identity.status == "not_a_repository":
+                    not_git_candidates.append(identity.candidate.path)
                     diagnostics.append(
                         {"code": "not_a_repository", "path": identity.candidate.path}
                     )
                 elif identity.status != "ok":
+                    candidate_clones[identity.candidate.path] = identity.candidate.path
                     outcomes.append(
                         _CloneOutcome(
                             _unavailable_clone(identity.candidate.path, identity.status)
@@ -3428,9 +3647,13 @@ def collect_checkouts(
                     )
                 else:
                     clones.setdefault(identity.common, []).append(identity)
-            outcomes.extend(
-                pool.map(lambda members: _collect_clone(runner, members), clones.values())
-            )
+            groups = list(clones.values())
+            collected = list(pool.map(lambda members: _collect_clone(runner, members), groups))
+            for members, outcome in zip(groups, collected):
+                if outcome.clone is not None:
+                    for member in members:
+                        candidate_clones[member.candidate.path] = outcome.clone["path"]
+            outcomes.extend(collected)
         for outcome in outcomes:
             diagnostics.extend(outcome.diagnostics)
         repositories = _assemble_repositories(
@@ -3453,7 +3676,9 @@ def collect_checkouts(
         if cache_path is not None and not _representable(cache_path):
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
-        bases, pulls, checked = _check_remotes(
+        target_index = _target_index(repositories, candidate_clones, not_git_candidates)
+        packages = _package_entries(package_heads, target_index)
+        bases, pulls, checked, remote_facts = _check_remotes(
             runner,
             repositories,
             contexts,
@@ -3461,6 +3686,7 @@ def collect_checkouts(
             github_lookup,
             remote_checks,
             cache.remote_checks,
+            declared_branch_names(repositories, packages),
         )
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
@@ -3478,10 +3704,18 @@ def collect_checkouts(
         _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
+    else:
+        packages = _package_entries(package_heads, None)
 
     unique_diagnostics = {
         (item["code"], item["path"]): item for item in diagnostics
     }.values()
+    join_branches(
+        repositories,
+        packages,
+        remote_facts,
+        scan_complete=package_heads is not None and package_heads.status == "complete",
+    )
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
@@ -3492,6 +3726,13 @@ def collect_checkouts(
         "folders": sorted(discovery.folders, key=folder_sort_key),
         "repositories": repositories,
         "diagnostics": sorted(unique_diagnostics, key=diagnostic_sort_key),
+        "package_scan": {
+            "status": package_heads.status if package_heads is not None else "unavailable",
+            "finished_policy": finished_policy(
+                package_scan.completed_stage_names if package_scan is not None else None
+            ),
+        },
+        "packages": packages,
     }
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
     return _render(document)

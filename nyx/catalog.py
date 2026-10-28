@@ -7,8 +7,10 @@ import re
 import stat
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal, NamedTuple
 
 from .models import (
     DECLARED_FIELDS,
@@ -72,6 +74,9 @@ _HEADER_LABELS = (
 _HEADER_FIELD = re.compile(
     r"^\s*\*{0,2}(" + "|".join(_HEADER_LABELS) + r")\*{0,2}\s*:\s?(.*)"
 )
+# Raw header values the scan keeps for ``scan_package_heads``; the rendered
+# catalog never reads them.
+_JOIN_LABELS = {"target_repo": "Target repo", "branch": "Branch"}
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _REPORTED_EXCLUSIONS = {label.translate(_ASCII_LOWER) for label in (*_HEADER_LABELS, "Status", "Target repo")}
 _REPORTED_FIELD = re.compile(r"^\s*(?:\*\*)?([A-Z][^:*`<>|\[\]\x00-\x1f\x7f]{0,63}?)(?:\*\*:|:\*\*|:)(.*)$")
@@ -709,11 +714,16 @@ def _scan_stage(
             relationship = None
             candidates: set[str] = set()
             reported_fields = []
+            join: dict[str, str | None] = dict.fromkeys(_JOIN_LABELS)
             decode_diagnostic: str | None = None
             if data is not None:
                 lines, decode_diagnostic = _header(data)
                 if lines:
                     declared = _catalog_declared(lines)
+                    join = {
+                        key: _metadata_value(lines, label)
+                        for key, label in _JOIN_LABELS.items()
+                    }
                     relationship, candidates = _parse_header(lines)
                     reported_fields = _reported_fields(lines)
             package_id = (
@@ -739,6 +749,7 @@ def _scan_stage(
                     "candidate_ids": candidates,
                     "package_id": package_id,
                     "reported_fields": reported_fields,
+                    "join": join,
                 }
             )
             continue
@@ -982,35 +993,20 @@ def _render_entry(
     }
 
 
-def _build_catalog(
-    spec_root: Path,
-    *,
-    completed_stage_names: Iterable[str] | None = None,
-    configuration_revision: str | None = None,
-) -> str:
-    """Build the relationship catalog from one captured scan."""
-    completion_policy_value = _completion_policy(completed_stage_names)
-    completion_policy_valid = completion_policy_value is not _INVALID_POLICY
-    completion_policy = (
-        completion_policy_value
-        if completion_policy_valid and completion_policy_value is not None
-        else None
-    )
-    # Terminal stages are the literal stages the account marks as "counts as
-    # finished" (the completion policy).  Nyx exposes them to the browser as a
-    # display grouping only: the board keeps finished rows on the page and the
-    # "Hide terminal rows" control decides whether they are shown.
-    #
-    # Marking a stage finished is a workflow assertion that satisfies whole-item
-    # completion dependencies.  The policy is saved per workspace root; the
-    # browser-local row control changes only the displayed board.
-    #
-    # The completion policy is already canonical (sorted and unique) because it
-    # comes from ``_validate_completed_stage_names``.  An invalid or absent
-    # policy yields no terminal stages rather than surfacing a partial set.
-    terminal_stages = tuple(completion_policy) if completion_policy else ()
-    if configuration_revision is not None and not isinstance(configuration_revision, str):
-        raise ValueError("configuration revision must be text or null")
+class _CatalogScan(NamedTuple):
+    """One captured scan of a specification root, before any rendering."""
+
+    records: list[dict[str, object]]
+    discovery_diagnostics: list[dict[str, str]]
+    identity_diagnostics: list[dict[str, str]]
+    program_descriptors: list[dict[str, object]]
+    program_diagnostics: list[dict[str, str]]
+    inventory_projects: list[dict[str, str]]
+    inventory_stages: list[dict[str, str]]
+
+
+def _scan_specification_root(spec_root: Path) -> _CatalogScan:
+    """Capture every package record, inventory and diagnostic of one root."""
     records: list[dict[str, object]] = []
     discovery_diagnostics: list[dict[str, str]] = []
     program_descriptors: list[dict[str, object]] = []
@@ -1114,10 +1110,6 @@ def _build_catalog(
                     stage_inventory["availability"] = "incomplete"
                     project_inventory["availability"] = "incomplete"
 
-    index: dict[str, list[dict[str, object]]] = {}
-    for record in records:
-        for candidate in record["candidate_ids"]:
-            index.setdefault(candidate, []).append(record)
     discovery_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
     identity_diagnostics = list(discovery_diagnostics)
     for record in records:
@@ -1131,6 +1123,58 @@ def _build_catalog(
                 _diagnostic(record["read_diagnostic"], record["package_path"])
             )
     identity_diagnostics.sort(key=lambda item: (item["code"], item["message"]))
+    return _CatalogScan(
+        records,
+        discovery_diagnostics,
+        identity_diagnostics,
+        program_descriptors,
+        program_diagnostics,
+        inventory_projects,
+        inventory_stages,
+    )
+
+
+def _build_catalog(
+    spec_root: Path,
+    *,
+    completed_stage_names: Iterable[str] | None = None,
+    configuration_revision: str | None = None,
+) -> str:
+    """Build the relationship catalog from one captured scan."""
+    completion_policy_value = _completion_policy(completed_stage_names)
+    completion_policy_valid = completion_policy_value is not _INVALID_POLICY
+    completion_policy = (
+        completion_policy_value
+        if completion_policy_valid and completion_policy_value is not None
+        else None
+    )
+    # Terminal stages are the literal stages the account marks as "counts as
+    # finished" (the completion policy).  Nyx exposes them to the browser as a
+    # display grouping only: the board keeps finished rows on the page and the
+    # "Hide terminal rows" control decides whether they are shown.
+    #
+    # Marking a stage finished is a workflow assertion that satisfies whole-item
+    # completion dependencies.  The policy is saved per workspace root; the
+    # browser-local row control changes only the displayed board.
+    #
+    # The completion policy is already canonical (sorted and unique) because it
+    # comes from ``_validate_completed_stage_names``.  An invalid or absent
+    # policy yields no terminal stages rather than surfacing a partial set.
+    terminal_stages = tuple(completion_policy) if completion_policy else ()
+    if configuration_revision is not None and not isinstance(configuration_revision, str):
+        raise ValueError("configuration revision must be text or null")
+    scan = _scan_specification_root(Path(spec_root))
+    records = scan.records
+    discovery_diagnostics = scan.discovery_diagnostics
+    identity_diagnostics = scan.identity_diagnostics
+    program_descriptors = scan.program_descriptors
+    program_diagnostics = scan.program_diagnostics
+    inventory_projects = scan.inventory_projects
+    inventory_stages = scan.inventory_stages
+    index: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        for candidate in record["candidate_ids"]:
+            index.setdefault(candidate, []).append(record)
     identity_complete = not identity_diagnostics
 
     program_index = _program_index(program_descriptors)
@@ -1250,4 +1294,154 @@ def scan_catalog(
         spec_root,
         completed_stage_names=completed_stage_names,
         configuration_revision=configuration_revision,
+    )
+
+
+_BRANCH_FORBIDDEN = frozenset(" ~^:?*[\\`<>")
+_BRANCH_FORBIDDEN_SEQUENCES = ("..", "@{", "//")
+_NOT_APPLICABLE = "not applicable"
+
+
+def normalize_header_value(raw: str) -> str:
+    """Return one raw header value without its bold-label residue or backticks.
+
+    Removes a leading ``**`` and the spaces after it (the value of
+    ``**Label:** text`` arrives as ``** text``), trims, and drops exactly one
+    pair of enclosing backticks from a value longer than two characters.
+    """
+    value = raw
+    if value.startswith("**"):
+        value = value[2:].lstrip(" ")
+    value = value.strip()
+    if len(value) > 2 and value.startswith("`") and value.endswith("`"):
+        value = value[1:-1]
+    return value
+
+
+def _is_branch_name(value: str) -> bool:
+    """Lexical subset of ``git check-ref-format --branch`` plus the text bound."""
+    if _text_units(value) > MAX_TEXT_UNITS:
+        return False
+    if any(
+        ord(character) < 32 or ord(character) == 127 or character in _BRANCH_FORBIDDEN
+        for character in value
+    ):
+        return False
+    if any(sequence in value for sequence in _BRANCH_FORBIDDEN_SEQUENCES):
+        return False
+    if value == "@" or value.startswith(("-", "/")) or value.endswith(("/", ".")):
+        return False
+    return not any(
+        component.startswith(".") or component.endswith(".lock")
+        for component in value.split("/")
+    )
+
+
+@dataclass(frozen=True)
+class TargetRepoHead:
+    """A package's ``Target repo:`` header: ``usable``, ``invalid`` or ``absent``."""
+
+    status: Literal["usable", "invalid", "absent"]
+    path: str | None
+
+
+@dataclass(frozen=True)
+class BranchHead:
+    """A package's ``Branch:`` header.
+
+    ``declared`` carries the branch name; ``not_applicable`` is the documented
+    form for a package with no branch; any other present value is ``invalid``.
+    """
+
+    status: Literal["declared", "not_applicable", "invalid", "absent"]
+    name: str | None
+
+
+@dataclass(frozen=True)
+class PackageHead:
+    """The header facts of one package that a checkout can be joined to."""
+
+    package_path: str
+    package_id: str | None
+    finished: bool
+    superseded: bool
+    target_repo: TargetRepoHead
+    branch: BranchHead
+
+
+@dataclass(frozen=True)
+class PackageHeads:
+    """Package heads of one scan; ``status`` is the scan's identity coverage."""
+
+    status: Literal["complete", "incomplete"]
+    heads: tuple[PackageHead, ...]
+
+
+def _target_repo_head(raw: str | None) -> TargetRepoHead:
+    value = normalize_header_value(raw) if raw is not None else ""
+    if not value:
+        return TargetRepoHead("absent", None)
+    if os.path.isabs(value):
+        return TargetRepoHead("usable", value)
+    return TargetRepoHead("invalid", None)
+
+
+def _branch_head(raw: str | None) -> BranchHead:
+    value = normalize_header_value(raw) if raw is not None else ""
+    if not value:
+        return BranchHead("absent", None)
+    if value[: len(_NOT_APPLICABLE)].translate(_ASCII_LOWER) == _NOT_APPLICABLE:
+        return BranchHead("not_applicable", None)
+    if _is_branch_name(value):
+        return BranchHead("declared", value)
+    return BranchHead("invalid", None)
+
+
+def _finished_stages(completed_stage_names: Iterable[str] | None) -> frozenset[str]:
+    """The stages that finish a package: empty unless the policy is valid and non-empty."""
+    value = _completion_policy(completed_stage_names)
+    return frozenset(value) if value is not _INVALID_POLICY and value else frozenset()
+
+
+def finished_policy(
+    completed_stage_names: Iterable[str] | None,
+) -> Literal["configured", "not_configured"]:
+    """Say whether ``completed_stage_names`` is a valid, non-empty completion policy."""
+    return "configured" if _finished_stages(completed_stage_names) else "not_configured"
+
+
+def scan_package_heads(
+    spec_root: Path,
+    *,
+    completed_stage_names: Iterable[str] | None = None,
+) -> PackageHeads:
+    """Return the header facts of every package under one specification root.
+
+    Uses the scan the catalog renders from.  An unreadable root raises the
+    catalog's ``ValueError``.  A package is finished only when its stage is in
+    a valid, non-empty ``completed_stage_names``; otherwise no package is
+    finished (see ``finished_policy``).
+    """
+    finished_stages = _finished_stages(completed_stage_names)
+    scan = _scan_specification_root(Path(spec_root))
+    heads = []
+    for record in sorted(scan.records, key=lambda item: str(item["package_path"])):
+        relationship = record["relationship"]
+        join = record["join"]
+        heads.append(
+            PackageHead(
+                package_path=str(record["package_path"]),
+                package_id=record["package_id"],
+                finished=record["stage"] in finished_stages,
+                superseded=bool(
+                    relationship
+                    and relationship["superseded_by"]["package_id"] is not None
+                ),
+                target_repo=_target_repo_head(join["target_repo"]),
+                branch=_branch_head(join["branch"]),
+            )
+        )
+    return PackageHeads(
+        status="incomplete" if scan.identity_diagnostics else "complete",
+        heads=tuple(heads),
     )

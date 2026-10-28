@@ -22,6 +22,7 @@ EXPECTED_MODULES = {
     "nyx/__init__.py",
     "nyx/app_runtime.py",
     "nyx/catalog.py",
+    "nyx/checkout_join.py",
     "nyx/checkouts.py",
     "nyx/cli.py",
     "nyx/models.py",

@@ -532,6 +532,134 @@ see [Your specification workspace](workspaces.md#checkout-folders) for the
 exact edit. A settings editor arrives with the Checkouts view; until then the
 record is edited by hand.
 
+### Code Status of specification packages
+
+The `--json` document also lists, under `packages`, every specification package
+whose `spec.md` header has a `Target repo:` or a `Branch:`, and gives a package
+that declares a branch a Code Status: one line saying where its branch work
+stands. A package has a Code Status only when its target is a `clone` or a
+`worktree` and its branch is found in a readable clone or on the remote. A
+relative, missing or invalid target, a target outside the checkout folders, git
+missing or too old, a branch that is the repository's default branch, and a
+branch found nowhere all leave it empty. The plain lines show none of this. `package_scan.status` is
+`unavailable` when the workspace has no specification root or Nyx cannot read it,
+and then no package is listed. It is `complete` when Nyx read every specification
+whole, and `incomplete` when some specification could not be read whole. A package
+whose `spec.md` cannot be read is not listed in `packages`, so an `incomplete` scan
+means a package may exist that the list does not show; rule 3 below never concludes
+`awaiting merge (no PR)` on an `incomplete` scan. `package_scan.finished_policy` is
+`configured` or `not_configured`, as described below.
+
+**Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
+checkout, not only its last path component (the browser still shows just the last
+component). The path must be absolute. It names a clone, or a linked worktree of
+a clone, when it is the same directory as that checkout, judged by the
+directory's device and inode, which a symbolic link or a different letter case on
+a case-insensitive filesystem does not change. A filesystem that reports no inode
+compares the real path instead, with the host's case normalization. The package's `target` says what it found:
+`clone`, `worktree`, `missing` (no such path), `not_git` (a path that exists but
+is not the top level of a git checkout), `outside_folders` (a git checkout that
+is not in any configured checkout folder), `invalid` (a value that is not an
+absolute path), `absent` (no `Target repo:`), or `unchecked` (git is missing or
+too old). A package that declares
+`Branch: name` is matched to the local branches named exactly `name` in the
+readable clones of its target's repository, meaning the clones that share one
+`origin` remote; a clone with no `origin` remote is a repository of its own. The
+same name in another repository is never matched, so seven repositories may each
+use `spec/fictional-lantern-festival` without confusing one another. Only
+clones whose status is ok are searched. Any other clone, whether git could not
+read it or refused it, as for a clone with too many branches, contributes no
+branch and is not seen: work on the branch inside it changes neither the other
+clones' matches nor any package's Code Status. A branch that is
+the repository's default branch is never a package branch: the package's `branch`
+status is `default_branch` and it has no Code Status. The default branch is the
+repository's known default branch name or, when that is unknown, the base a
+readable clone judges its verdicts against; Nyx assumes no name. A package that
+declares a branch found in no readable clone and not on the remote has no Code
+Status either. In the `--json` document each local branch lists the packages it
+serves: those that name it and those that name a branch it is folded under (see
+the grouping above).
+
+Several packages can name the same branch of the same repository, for example an
+archived package beside the one still active. They share the branch, and each has
+its own Code Status. A package counts as finished only when its stage folder is
+one of the stages selected under **Counts as finished** for the workspace (see
+[Your specification workspace](workspaces.md#define-whole-item-completion)). The
+stage's name, the `Status:` header and the package's other fields play no part. With no stage
+selected, `package_scan.finished_policy` is `not_configured` and no package is
+finished.
+
+**Remote copy.** Besides the local branches, the branch may have a copy on the
+remote. Under a live check it is the remote's own answer. Under a recorded check
+it is the saved answer, unless a clone of the repository holds its own
+remote-tracking branch that differs from the saved one and moved at or after the
+saved check (see recorded values above); the newest such clone answers. When
+there is no answer at all, the copy is read from the remote-tracking branches that
+the readable clones hold: the one that moved last supplies the commit, and a
+remote-tracking branch whose move time cannot be read ranks below every one that
+has a move time. Fetch times play no part. When no readable clone holds the
+remote-tracking branch, the copy is `unknown`, never `absent`: without an answer
+Nyx cannot tell a branch that was never pushed from one that no clone recorded.
+Only a live or saved answer says `absent`. The copy is `present`, `absent` or `unknown`. A repository with no `origin` remote
+has no remote copy.
+
+**Reading a Code Status.** Each copy has a verdict (see the verdicts above): a
+local copy has its own, and the remote copy has the verdict of a local copy at the
+same commit, or else `unknown`. Nyx computes no verdict for a tip that exists only
+on the remote. A copy whose verdict is `unknown`, such as a branch in a clone with no
+base, counts as neither merged nor not merged. The first of these rules that matches
+decides the text, and the order matters:
+
+1. Every copy is merged: `merged · cleanup pending (N worktrees)`, where N counts
+   the distinct checkouts that have the branch checked out, the package's own
+   target included. When none does, it reads `merged · cleanup pending (N
+   branches)`, with N the number of local copies. A single one reads `1 worktree`
+   or `1 branch`.
+2. A pull request for the branch is open in the lookup's listing (live or saved;
+   it needs the GitHub lookup): `PR #N open`, with the highest open number, and
+   ` · N unpushed` after it only when the push state below is unpushed.
+3. Some copy is not merged, and then:
+   - every package that names the branch in this repository is finished:
+     `awaiting merge (no PR)`; Nyx concludes this only when it read every
+     package, so when a specification could not be read (`package_scan.status` is
+     `incomplete`) a package that may share the branch is unseen and this rule
+     never matches;
+   - otherwise, the package has a well-formed `Superseded By:` header, whether or
+     not its successor exists: `superseded · branch retained`;
+   - otherwise: `in progress · ` followed by the push state.
+4. Any other case, because a copy could not be judged: `merge state unknown`.
+
+An archived package therefore reads `in progress`, not `awaiting merge`, while a
+package that names the same branch is still unfinished.
+
+The push state is `not pushed` when the remote copy is absent; `N unpushed`, with
+N the largest number of commits any local copy is ahead of its remote copy, when
+a local copy is ahead of or has diverged from it; `pushed` when every local copy
+equals or is behind its remote copy; and `push state unknown` otherwise.
+
+When the branch is also checked out in a working tree other than the one the
+package's `Target repo:` names, the text ends with ` · in <name>, <name>`: the last path
+component of each such checkout, in natural order. If the whole text with every
+name written out would be longer than 1,024 UTF-16 code units, it says ` · in N other
+worktrees` instead. The `--json` document keeps every path.
+
+**Limits.** These follow from what Nyx computes today.
+
+- A branch that exists only on the remote reads `merge state unknown`. A remote
+  copy at a commit that no local copy holds counts as unknown too, so it keeps a
+  merged local branch from reading as merged.
+- A branch created at the default branch's head with no commit of its own is
+  already part of the default branch, so it reads `merged · cleanup pending ...`
+  like a branch that was merged.
+- Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
+  branch that exists only on the remote, which Nyx does not compute.
+- A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
+- With no live or saved remote answer, a branch deleted on the remote stays
+  present at the tip of any clone that has not pruned it, so a merged and deleted
+  branch can read `merge state unknown`; until a networked run answers.
+- With no live or saved remote answer, a branch that was never pushed reads
+  `in progress · push state unknown`; until a networked run answers.
+
 ## Choose board row order
 
 When account settings are available, the toolbar includes a collapsed **Board settings**

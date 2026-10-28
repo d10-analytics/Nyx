@@ -692,8 +692,16 @@ def _write_record(tmp_path: Path, payload: dict | bytes) -> Path:
     return paths.config_file
 
 
-def _configure(tmp_path: Path, folders: list[Path | str], github_lookup: bool = False) -> Path:
-    """Write a schema 4 record for a workspace whose settings name ``folders``."""
+def _configure(
+    tmp_path: Path,
+    folders: list[Path | str],
+    github_lookup: bool = False,
+    completed: list[str] | None = None,
+) -> Path:
+    """Write a schema 4 record for a workspace whose settings name ``folders``.
+
+    ``completed`` names the stages the workspace counts as finished.
+    """
 
     specification = tmp_path / "spec"
     specification.mkdir(exist_ok=True)
@@ -702,14 +710,14 @@ def _configure(tmp_path: Path, folders: list[Path | str], github_lookup: bool = 
         "folders": sorted(str(folder) for folder in folders),
         "github_lookup": github_lookup,
     }
-    return _write_record(
-        tmp_path,
-        {
-            "schema_version": 4,
-            "specification_root": key,
-            "checkout_settings": {key: entry},
-        },
-    )
+    record = {
+        "schema_version": 4,
+        "specification_root": key,
+        "checkout_settings": {key: entry},
+    }
+    if completed:
+        record["completed_stages"] = {key: completed}
+    return _write_record(tmp_path, record)
 
 
 def _run_checkouts(capsys, *arguments: str) -> tuple[int, str, str]:
@@ -2098,3 +2106,192 @@ def test_the_default_element_labels_each_comparison_with_its_own_basis():
     assert cli._remote_and_default_elements(live, live_remote)[-1] == (
         "default trunk live differs cached equal tracking live unknown never fetched"
     )
+
+
+# ---------------------------------------------------------------------------
+# nyx checkouts: the package list
+# ---------------------------------------------------------------------------
+
+
+def _write_package(root: Path, stage: str, name: str, header: str) -> Path:
+    directory = root / "Fictional" / stage / name
+    directory.mkdir(parents=True)
+    (directory / "spec.md").write_text(f"# {name}\n{header}", encoding="utf-8")
+    return directory
+
+
+def _package_world(tmp_path: Path, completed: list[str] | None):
+    """A configured workspace: one clone and packages in stages without workflow meaning."""
+
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    repository = clone(remote, folder / "listed")
+    record = _configure(tmp_path, [folder], completed=completed)
+    root = tmp_path / "spec"
+    _write_package(
+        root,
+        "Drafts",
+        "a",
+        f"Package ID: 11111111-1111-4111-8111-111111111111\nTarget repo: {repository}\n"
+        "Branch: spec/alpha\n",
+    )
+    _write_package(
+        root,
+        "Shipped",
+        "b",
+        "Package ID: 22222222-2222-4222-8222-222222222222\nBranch: spec/beta\n",
+    )
+    _write_package(root, "Drafts", "c", "Package ID: 33333333-3333-4333-8333-333333333333\n")
+    return folder, repository, root, record
+
+
+def _checkouts_subprocess(account: Path, *arguments: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "nyx.cli", "checkouts", *arguments],
+        cwd=REPOSITORY_ROOT,
+        env=_subprocess_environment(account),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path, account):
+    _folder, repository, _root, _record = _package_world(tmp_path, ["Shipped"])
+
+    completed = _checkouts_subprocess(account, "--json", "--no-network")
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 5
+    assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
+    assert [
+        (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])
+        for p in document["packages"]
+    ] == [
+        ("Fictional/Drafts/a", False, "11111111-1111-4111-8111-111111111111", False, "spec/alpha"),
+        ("Fictional/Shipped/b", True, "22222222-2222-4222-8222-222222222222", False, "spec/beta"),
+    ]
+    assert [c["path"] for r in document["repositories"] for c in r["clones"]] == [
+        real(repository)
+    ]
+
+
+def test_subprocess_without_the_setting_finishes_no_package(tmp_path, account):
+    _package_world(tmp_path, None)
+
+    completed = _checkouts_subprocess(account, "--json", "--no-network")
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"]["finished_policy"] == "not_configured"
+    assert [p["finished"] for p in document["packages"]] == [False, False]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX permission bits")
+def test_subprocess_reports_an_incomplete_scan_for_an_unreadable_specification(
+    tmp_path, account
+):
+    _folder, _repository, root, _record = _package_world(tmp_path, ["Shipped"])
+    unreadable = root / "Fictional" / "Drafts" / "c" / "spec.md"
+    unreadable.chmod(0o000)
+    try:
+        if os.access(unreadable, os.R_OK):  # a user that ignores permission bits
+            pytest.skip("file permissions are not enforced for this user")
+        completed = _checkouts_subprocess(account, "--json", "--no-network")
+    finally:
+        unreadable.chmod(0o644)
+
+    assert completed.returncode == 0, completed.stderr
+    assert models.parse_checkouts(completed.stdout)["package_scan"]["status"] == "incomplete"
+
+
+def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
+    _folder, repository, root, _record = _package_world(tmp_path, ["Shipped"])
+    before = models.parse_checkouts(
+        _checkouts_subprocess(account, "--json", "--no-network").stdout
+    )
+    shutil.rmtree(root)
+
+    completed = _checkouts_subprocess(account, "--json", "--no-network")
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "configured",
+    }
+    assert document["packages"] == []
+    for repository_before in before["repositories"]:
+        repository_before["package_branches"] = []
+        for member in repository_before["clones"]:
+            for branch in member["branches"]:
+                branch["packages"] = []
+    assert document["repositories"] == before["repositories"]
+    assert [c["path"] for r in document["repositories"] for c in r["clones"]] == [
+        real(repository)
+    ]
+
+
+def test_subprocess_unavailable_scan_without_the_setting_is_not_configured(tmp_path, account):
+    _folder, _repository, root, _record = _package_world(tmp_path, None)
+    shutil.rmtree(root)
+
+    completed = _checkouts_subprocess(account, "--json", "--no-network")
+
+    assert completed.returncode == 0, completed.stderr
+    assert models.parse_checkouts(completed.stdout)["package_scan"] == {
+        "status": "unavailable",
+        "finished_policy": "not_configured",
+    }
+
+
+def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):
+    _folder, _repository, _root, _record = _package_world(tmp_path, ["Shipped"])
+    other = tmp_path / "other"
+    other.mkdir()
+    _write_record(
+        tmp_path,
+        {
+            "schema_version": 4,
+            "specification_root": str((tmp_path / "spec").resolve()),
+            "checkout_settings": {
+                str(other.resolve()): {"folders": [str(tmp_path)], "github_lookup": False}
+            },
+        },
+    )
+
+    completed = _checkouts_subprocess(account, "--json")
+
+    assert (completed.returncode, completed.stdout.strip()) == (0, NO_FOLDERS)
+
+
+def test_plain_output_ignores_the_package_list(tmp_path, account, capsys):
+    folder, _repository, _root, _record = _package_world(tmp_path, ["Shipped"])
+
+    plain = _plain_lines(capsys, "--no-network")
+
+    bare = checkouts.collect_checkouts(
+        [str(folder)],
+        deadline_ns=time.monotonic_ns() + 60 * 10**9,
+        remote_checks=False,
+    )
+    assert plain == cli.format_checkouts(models.parse_checkouts(bare))
+
+
+def test_the_parser_refuses_a_schema_4_document(tmp_path, account):
+    folder, _repository, _root, _record = _package_world(tmp_path, None)
+    document = json.loads(
+        checkouts.collect_checkouts(
+            [str(folder)], deadline_ns=time.monotonic_ns() + 60 * 10**9
+        )
+    )
+    document["schema_version"] = 4
+    document["checkouts_digest"] = models.canonical_digest(
+        document, omit=models.CHECKOUTS_DIGEST_OMITTED
+    )
+
+    with pytest.raises(models.ProtocolError, match="unsupported schema version"):
+        models.parse_checkouts(document)

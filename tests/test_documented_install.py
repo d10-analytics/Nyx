@@ -178,6 +178,10 @@ COMPLETION_GUIDANCE_MARKERS = {
     ),
 }
 CHECKOUT_RETIRED_WORDING = (
+    "the clone that fetched and whose newer of last fetch and last move of that "
+    "remote-tracking branch is latest",
+    "a push moves the pusher's remote-tracking branch but not its fetch time",
+    "and is `unknown` when no clone ever fetched",
     "cached-only labels",
     "makes no network connection:",
     "never fetches or contacts a remote",
@@ -832,6 +836,113 @@ UNRESOLVED_MARKERS = (
 )
 
 
+CORE_LABELS = (
+    "Package ID", "Status", "Target repo", "Branch", "Program ID", "Program Title",
+    "Program Membership", "Claim", "Prerequisite", "Completion Prerequisite",
+    "Superseded By",
+)
+CORE_BOLD = re.compile(r"\*\*(" + "|".join(CORE_LABELS) + r")\*{0,2}:")
+BRANCH_HEADER_MARKERS = (
+    "| `Branch: name` | Optional. The git branch the work is done on, or a value "
+    "starting with `not applicable` (then a reason) for work that has no branch. "
+    "`nyx checkouts` reads it, and its value also stays searchable reported text. |",
+    "`Branch` is not in that list: although it has a row in the table, its value also "
+    "stays searchable reported text, retained under the same rules as any other "
+    "reported field.",
+    "For `nyx checkouts`, a bold label or one pair of backticks around the value is "
+    "tolerated for both fields; the browser's display of `Target repo` is unchanged "
+    "and keeps a backtick.",
+    "It uses `Target repo` whole, as the absolute path of a clone or of a linked "
+    "worktree of a clone",
+    "`nyx checkouts` uses the whole absolute path.",
+)
+CODE_STATUS_MARKERS = (
+    "A copy whose verdict is `unknown`, such as a branch in a clone with no base, "
+    "counts as neither merged nor not merged. The first of these rules that matches "
+    "decides the text, and the order matters:",
+    "1. Every copy is merged: `merged · cleanup pending (N worktrees)`",
+    "`merged · cleanup pending (N branches)`",
+    "2. A pull request for the branch is open in the lookup's listing",
+    "`PR #N open`, with the highest open number, and ` · N unpushed` after it only "
+    "when the push state below is unpushed.",
+    "3. Some copy is not merged, and then:",
+    "every package that names the branch in this repository is finished: "
+    "`awaiting merge (no PR)`;",
+    "Nyx concludes this only when it read every package, so when a specification could "
+    "not be read (`package_scan.status` is `incomplete`) a package that may share the "
+    "branch is unseen and this rule never matches;",
+    "there is no answer at all, the copy is read from the remote-tracking branches "
+    "that the readable clones hold: the one that moved last supplies the commit",
+    "a remote-tracking branch whose move time cannot be read ranks below every one "
+    "that has a move time. Fetch times play no part.",
+    "When no readable clone holds the remote-tracking branch, the copy is `unknown`, "
+    "never `absent`",
+    "Only a live or saved answer says `absent`.",
+    "It is `complete` when Nyx read every specification whole, and `incomplete` when "
+    "some specification could not be read whole.",
+    "A package whose `spec.md` cannot be read is not listed in `packages`",
+    "rule 3 below never concludes `awaiting merge (no PR)` on an `incomplete` scan.",
+    "a branch deleted on the remote stays present at the tip of any clone that has "
+    "not pruned it, so a merged and deleted branch can read `merge state unknown`; "
+    "until a networked run answers.",
+    "a branch that was never pushed reads `in progress · push state unknown`; until "
+    "a networked run answers.",
+    "the package has a well-formed `Superseded By:` header, whether or not its "
+    "successor exists: `superseded · branch retained`;",
+    "`in progress · ` followed by the push state.",
+    "4. Any other case, because a copy could not be judged: `merge state unknown`.",
+    "The push state is `not pushed` when the remote copy is absent; `N unpushed`",
+    "`pushed` when every local copy equals or is behind its remote copy; and "
+    "`push state unknown` otherwise.",
+    "` · in <name>, <name>`",
+    "` · in N other worktrees` instead",
+    "A branch that exists only on the remote reads `merge state unknown`.",
+    "A branch created at the default branch's head with no commit of its own is "
+    "already part of the default branch, so it reads `merged · cleanup pending ...` "
+    "like a branch that was merged.",
+    "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
+    "branch that exists only on the remote, which Nyx does not compute.",
+    "A clone whose status is not ok, such as one git could not read or one with too "
+    "many branches, is not seen (see matching above).",
+    "clones whose status is ok are searched. Any other clone, whether git could not "
+    "read it or refused it, as for a clone with too many branches, contributes no "
+    "branch and is not seen",
+    "A package has a Code Status only when its target is a `clone` or a `worktree` and "
+    "its branch is found in a readable clone or on the remote. A relative, missing or "
+    "invalid target, a target outside the checkout folders, git missing or too old, a "
+    "branch that is the repository's default branch, and a branch found nowhere all "
+    "leave it empty.",
+    "judged by the directory's device and inode, which a symbolic link or a different "
+    "letter case on a case-insensitive filesystem does not change. A filesystem that "
+    "reports no inode compares the real path instead, with the host's case "
+    "normalization.",
+    "If the whole text with every name written out would be longer than 1,024 UTF-16 "
+    "code units, it says",
+    "Several packages can name the same branch of the same repository",
+    "An archived package therefore reads `in progress`, not `awaiting merge`, while a "
+    "package that names the same branch is still unfinished.",
+    "A package counts as finished only when its stage folder is one of the stages "
+    "selected under **Counts as finished** for the workspace",
+    "With no stage selected, `package_scan.finished_policy` is `not_configured` and "
+    "no package is finished.",
+    "never a package branch: the package's `branch` status is `default_branch` and it "
+    "has no Code Status",
+    "Nyx assumes no name.",
+)
+# The rule texts, in the order the section states them.
+CODE_STATUS_RULE_ORDER = (
+    "1. Every copy is merged:",
+    "2. A pull request for the branch is open",
+    "3. Some copy is not merged, and then:",
+    "4. Any other case,",
+)
+WORKSPACE_FINISHED_MARKERS = (
+    "The same selection also decides which packages `nyx checkouts` treats as "
+    "finished when it reads a package's Code Status",
+    "with no stage selected, it treats no package as finished.",
+)
+
+
 def _normalized(name: str) -> str:
     return re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
 
@@ -919,13 +1030,22 @@ def test_reference_scopes_bold_names_to_reported_text_and_core_labels_are_plain(
     reference = _normalized("docs/specification-reference.md")
     assert ("Bold names are documented for reported-text fields only. The core "
             "field labels in the table above are written plain") in reference
-    core_bold = re.compile(
-        r"\*\*(Package ID|Status|Target repo|Program ID|Program Title|"
-        r"Program Membership|Claim|Prerequisite|Completion Prerequisite|"
-        r"Superseded By)\*{0,2}:"
-    )
     for name in _ALL_DOCUMENTS:
-        assert not core_bold.search(_normalized(name)), name
+        assert not CORE_BOLD.search(_normalized(name)), name
+
+
+@pytest.mark.parametrize("label", CORE_LABELS)
+@pytest.mark.parametrize("form", ("**{label}:** value", "**{label}**: value", "**{label}: value"))
+def test_core_bold_pattern_finds_every_core_label_in_every_bold_form(label, form):
+    assert CORE_BOLD.search(form.format(label=label))
+    assert not CORE_BOLD.search(f"{label}: value")
+
+
+@pytest.mark.parametrize(
+    "text", ("**Branch:** spec/x", "**Branch**: spec/x", "**Branch: spec/x", "**Target repo:** /x")
+)
+def test_core_bold_pattern_finds_a_bold_branch_and_target_label(text):
+    assert CORE_BOLD.search(text)
 
 
 @pytest.mark.parametrize("name,section_heading,old_phrase", [
@@ -1383,3 +1503,93 @@ def test_documented_native_installation_and_lifecycle(tmp_path):
         _exercise_documented_desktop_actions(tmp_path)
     else:
         _exercise_documented_linux_installation(tmp_path)
+
+
+def _assert_unique_markers(document: str, markers, name: str) -> None:
+    # A marker that occurs twice would survive deleting one copy of the phrase.
+    for marker in markers:
+        assert document.count(marker) == 1, (name, marker)
+
+
+def test_reference_documents_the_branch_header_and_whole_path_target():
+    reference = _normalized("docs/specification-reference.md")
+    _assert_unique_markers(reference, BRANCH_HEADER_MARKERS, "docs/specification-reference.md")
+    assert "**Branch" not in reference
+    assert "Only `nyx checkouts` reads it" not in reference
+
+
+def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limits():
+    section = _section("docs/running-nyx.md", "## Inspect checkouts")
+    heading = "### Code Status of specification packages"
+    assert heading in section
+    code_status = section.split(heading, 1)[1]
+    _assert_unique_markers(code_status, CODE_STATUS_MARKERS, "docs/running-nyx.md")
+    positions = [code_status.index(rule) for rule in CODE_STATUS_RULE_ORDER]
+    assert positions == sorted(positions)
+
+
+def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
+    readme = _normalized("docs/systems/checkouts/README.md")
+    markers = (
+        "the remote-tracking ref that moved last among the readable clones that hold it",
+        "a ref whose move time cannot be read ranks below the others; fetch times play "
+        "no part",
+        "the copy is `unknown`, never `absent`: only a live or saved answer says `absent`.",
+    )
+    _assert_unique_markers(readme, markers, "docs/systems/checkouts/README.md")
+    assert "newer of last fetch" not in readme
+
+
+def test_checkout_guide_texts_equal_the_texts_the_code_builds():
+    from nyx.models import code_status_text
+
+    fields = dict(
+        pull_request=None, push=None, unpushed=None, cleanup=None, checked_out_elsewhere=[]
+    )
+    section = _section("docs/running-nyx.md", "## Inspect checkouts")
+    documented = section.split("### Code Status of specification packages", 1)[1]
+
+    def build(state, **changes):
+        return code_status_text({**fields, "state": state, **changes})
+
+    pull_request = build("pr_open", pull_request="N")
+    unpushed_pull_request = build("pr_open", pull_request="N", push="unpushed", unpushed="N")
+    texts = (
+        build("awaiting_merge"),
+        build("superseded"),
+        build("unknown"),
+        pull_request,
+        unpushed_pull_request[len(pull_request):],
+        build("in_progress", push="pushed")[: -len("pushed")],
+        build("in_progress", push="not_pushed")[len("in progress \u00b7 "):],
+        build("in_progress", push="pushed")[len("in progress \u00b7 "):],
+        build("in_progress", push="unknown")[len("in progress \u00b7 "):],
+        build("in_progress", push="unpushed", unpushed="N")[len("in progress \u00b7 "):],
+        build("merged", cleanup={"worktrees": 2, "branches": 0}).replace(
+            "2 worktrees", "N worktrees"
+        ),
+        build("merged", cleanup={"worktrees": 0, "branches": 2}).replace(
+            "2 branches", "N branches"
+        ),
+    )
+    for text in texts:
+        assert text in documented, text
+    assert build("merged", cleanup={"worktrees": 1, "branches": 0}).endswith("(1 worktree)")
+    assert build("merged", cleanup={"worktrees": 0, "branches": 1}).endswith("(1 branch)")
+    assert "A single one reads `1 worktree` or `1 branch`." in documented
+
+
+def test_checkout_guide_promises_plain_merged_nowhere_else():
+    section = _section("docs/running-nyx.md", "## Inspect checkouts")
+    code_status = section.split("### Code Status of specification packages", 1)[1]
+    sentence = (
+        "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
+        "branch that exists only on the remote, which Nyx does not compute."
+    )
+    assert sentence in code_status
+    assert "`merged`" not in code_status.replace(sentence, "")
+
+
+def test_workspace_guide_says_counts_as_finished_decides_checkout_packages():
+    workspaces = _normalized("docs/workspaces.md")
+    _assert_unique_markers(workspaces, WORKSPACE_FINISHED_MARKERS, "docs/workspaces.md")

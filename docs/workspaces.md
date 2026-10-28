@@ -235,6 +235,11 @@ finished row does not change its dependency results. This assertion records
 workflow completion; it does not verify evidence, approve work, or satisfy a
 named outcome.
 
+The same selection also decides which packages `nyx checkouts` treats as
+finished when it reads a package's Code Status (see
+[Inspect checkouts](running-nyx.md#inspect-checkouts)); with no stage selected, it
+treats no package as finished.
+
 The same selection groups finished rows on the board. The **Hide terminal rows**
 checkbox in the top bar starts checked, so rows for the selected stages are hidden
 until you reveal them, and the choice is stored in the browser. This is
