@@ -685,6 +685,7 @@ def test_without_inode_numbers_a_target_still_resolves_by_its_real_path(targets,
         assert_target(found["alias"], "clone", real(targets["main"]))
 
 
+@posix_only
 def test_a_symbolic_link_loop_is_missing(tmp_path):
     first = tmp_path / "loop-a"
     second = tmp_path / "loop-b"
