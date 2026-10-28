@@ -1639,6 +1639,8 @@ def _remote_copy(value: Any, name: str, *, has_remote: bool, check: str | None) 
             raise ProtocolError(f"{name}.basis does not match the remote check")
     elif state == "unknown" and check in ("live", "recorded"):
         raise ProtocolError(f"{name} cannot be unknown under a {check} remote check")
+    elif state == "absent" and check in ("off", "failed"):
+        raise ProtocolError(f"{name} cannot be absent when the remote check is {check}")
 
 
 def _clone(

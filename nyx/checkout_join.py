@@ -22,9 +22,11 @@ The remote copy of a package branch is decided here from plain facts the collect
 read, under the same moved-ref rule the clones' own comparisons use
 (``moved_at_or_after``): the group's remote answer when the check was live, the saved
 answer unless a clone holds a tracking ref that differs from it and moved at or after
-the check, and otherwise the tracking ref of the clone that fetched and whose newer of
-last fetch and last tracking-ref move is latest (a push moves the pusher's ref but not
-its fetch time).
+the check, and otherwise, with no answer, the tracking ref that moved last among the
+readable clones that hold it. One ranking key orders both choices: a ref with a move
+time before one without, then the later move, then the first clone in natural path
+order. With no answer and no clone holding the ref the state is ``unknown``, never
+``absent``; fetch times play no part.
 
 Each such package also gets its Code Status. The facts are the branch's local copies (the
 branches of that name in the readable clones of the repository) and its remote copy. A
@@ -37,7 +39,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from .models import code_status_text, natural_key
@@ -207,43 +208,42 @@ def _remote_copy(repository: Mapping[str, Any], name: str, facts: RemoteFacts | 
     ]
     if answer is not None:
         saved = answer.tips.get(name)
-        newest: tuple[int, str] | None = None
-        for _clone, refs in ready:
-            held = refs.cached.get(name)
-            moved = refs.moved.get(name)
-            if held is None or held == saved or not moved_at_or_after(moved, answer.at):
-                continue
-            assert moved is not None
-            if newest is None or moved > newest[0]:
-                newest = (moved, held)
-        if newest is not None:
-            return _copy("present", newest[1], REMOTE_CACHED)
+        moved_later = _newest_held(
+            [
+                (clone, refs)
+                for clone, refs in ready
+                if refs.cached.get(name) not in (None, saved)
+                and moved_at_or_after(refs.moved.get(name), answer.at)
+            ],
+            name,
+        )
+        if moved_later is not None:
+            return _copy("present", moved_later, REMOTE_CACHED)
         if saved is None:
             return _copy("absent")
         return _copy("present", saved, REMOTE_RECORDED)
-    # No answer at all: a clone that has fetched is judged by the newer of its last fetch
-    # and the last move of its own tracking ref, since a push moves the pusher's ref but
-    # not its fetch time. A clone that never fetched is not evidence of the remote.
-    freshest: tuple[int, CloneRefs] | None = None
-    for clone, refs in ready:
-        fetched = _epoch((clone["cached_default"] or {}).get("last_fetched_at"))
-        if fetched is None:
-            continue
-        moved = refs.moved.get(name) if name in refs.cached else None
-        latest = fetched if moved is None else max(fetched, moved)
-        if freshest is None or latest > freshest[0]:
-            freshest = (latest, refs)
-    if freshest is None:
-        return _copy("unknown")
-    tip = freshest[1].cached.get(name)
-    return _copy("absent") if tip is None else _copy("present", tip, REMOTE_CACHED)
+    # No answer at all: the clones' own tracking refs are the only evidence of the remote,
+    # and a missing ref proves nothing (a single-branch or shallow clone need not create
+    # one on push, and a pruned ref leaves no move time), so only a held ref answers.
+    held = _newest_held([(clone, refs) for clone, refs in ready if name in refs.cached], name)
+    return _copy("unknown") if held is None else _copy("present", held, REMOTE_CACHED)
 
 
-def _epoch(text: str | None) -> int | None:
-    """Unix seconds of a document timestamp (``None`` when there is none)."""
-    if text is None:
+def _newest_held(candidates: Sequence[tuple[Mapping[str, Any], CloneRefs]], name: str) -> str | None:
+    """The tip of ``origin/<name>`` in the clone whose ref ranks first, or ``None``.
+
+    The ranking key is shared by the saved-answer override and the no-answer choice: a
+    ref with a move time ranks before one without, then the later move, then the first
+    clone in natural path order.
+    """
+    if not candidates:
         return None
-    return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+
+    def rank(candidate: tuple[Mapping[str, Any], CloneRefs]) -> tuple[Any, ...]:
+        moved = candidate[1].moved.get(name)
+        return (moved is None, 0 if moved is None else -moved, natural_key(candidate[0]["path"]))
+
+    return min(candidates, key=rank)[1].cached[name]
 
 
 def _default_names(repository: Mapping[str, Any]) -> frozenset[str]:
