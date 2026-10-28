@@ -178,6 +178,10 @@ COMPLETION_GUIDANCE_MARKERS = {
     ),
 }
 CHECKOUT_RETIRED_WORDING = (
+    "the clone that fetched and whose newer of last fetch and last move of that "
+    "remote-tracking branch is latest",
+    "a push moves the pusher's remote-tracking branch but not its fetch time",
+    "and is `unknown` when no clone ever fetched",
     "cached-only labels",
     "makes no network connection:",
     "never fetches or contacts a remote",
@@ -867,9 +871,22 @@ CODE_STATUS_MARKERS = (
     "Nyx concludes this only when it read every package, so when a specification could "
     "not be read (`package_scan.status` is `incomplete`) a package that may share the "
     "branch is unseen and this rule never matches;",
-    "the clone that fetched and whose newer of last fetch and last move of that "
-    "remote-tracking branch is latest (a push moves the pusher's remote-tracking "
-    "branch but not its fetch time)",
+    "there is no answer at all, the copy is read from the remote-tracking branches "
+    "that the readable clones hold: the one that moved last supplies the commit",
+    "a remote-tracking branch whose move time cannot be read ranks below every one "
+    "that has a move time. Fetch times play no part.",
+    "When no readable clone holds the remote-tracking branch, the copy is `unknown`, "
+    "never `absent`",
+    "Only a live or saved answer says `absent`.",
+    "It is `complete` when Nyx read every specification whole, and `incomplete` when "
+    "some specification could not be read whole.",
+    "A package whose `spec.md` cannot be read is not listed in `packages`",
+    "rule 3 below never concludes `awaiting merge (no PR)` on an `incomplete` scan.",
+    "a branch deleted on the remote stays present at the tip of any clone that has "
+    "not pruned it, so a merged and deleted branch can read `merge state unknown`; "
+    "until a networked run answers.",
+    "a branch that was never pushed reads `in progress · push state unknown`; until "
+    "a networked run answers.",
     "the package has a well-formed `Superseded By:` header, whether or not its "
     "successor exists: `superseded · branch retained`;",
     "`in progress · ` followed by the push state.",
@@ -1509,6 +1526,18 @@ def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limit
     _assert_unique_markers(code_status, CODE_STATUS_MARKERS, "docs/running-nyx.md")
     positions = [code_status.index(rule) for rule in CODE_STATUS_RULE_ORDER]
     assert positions == sorted(positions)
+
+
+def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
+    readme = _normalized("docs/systems/checkouts/README.md")
+    markers = (
+        "the remote-tracking ref that moved last among the readable clones that hold it",
+        "a ref whose move time cannot be read ranks below the others; fetch times play "
+        "no part",
+        "the copy is `unknown`, never `absent`: only a live or saved answer says `absent`.",
+    )
+    _assert_unique_markers(readme, markers, "docs/systems/checkouts/README.md")
+    assert "newer of last fetch" not in readme
 
 
 def test_checkout_guide_texts_equal_the_texts_the_code_builds():
