@@ -1382,7 +1382,7 @@ def raw_request(port, first_line, *, host=None, body=b"", content_length=None, h
 
 
 def send_and_drain(port, payload):
-    """Send raw bytes and collect every response byte until close or reset."""
+    """Send raw bytes and collect every response byte until close, reset, or abort."""
     chunks = []
     with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
         connection.settimeout(5)
@@ -1398,8 +1398,8 @@ def send_and_drain(port, payload):
                 if not piece:
                     break
                 chunks.append(piece)
-        except ConnectionResetError:
-            pass  # a reset after the complete response is accepted
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass  # a reset or abort after the response is accepted
     return b"".join(chunks)
 
 
