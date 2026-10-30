@@ -75,7 +75,9 @@ INSTALLED_WHEEL_COMMAND = "{python} -m pytest tests/test_wheel_install.py -v"
 DOCUMENTED_INSTALL_COMMAND = "python -m pytest tests/test_documented_install.py -v"
 DESKTOP_SOURCE_COMMAND = "python -m pytest tests/test_desktop.py -v -s"
 DESKTOP_ARTIFACT_COMMAND = "python -m pytest tests/test_desktop_artifact.py -v -s"
-DOCUMENTED_BUILD_COMMAND = "python -m pytest tests/test_documented_install.py -v -s"
+DOCUMENTED_BUILD_COMMAND = (
+    "python -m pytest tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally -v -s"
+)
 # The published build commands live only in the guide.  The workflow holds no
 # copy and no other build command, so any of these tokens in a desktop job is a
 # copied or direct build (the guide's blocks all create or use ``.venv``).

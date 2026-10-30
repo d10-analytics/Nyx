@@ -194,7 +194,7 @@ jobs:
           NYX_VERIFY_DOCUMENTED_BUILD: '1'
         run: |
           $ErrorActionPreference = 'Stop'
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build and verify the native desktop artifact
@@ -258,7 +258,7 @@ jobs:
           NYX_VERIFY_DOCUMENTED_BUILD: '1'
         run: |
           set -euo pipefail
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally -v -s
 
       - name: Build and verify the native desktop artifact
         shell: bash
