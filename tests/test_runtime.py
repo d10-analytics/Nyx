@@ -2023,6 +2023,7 @@ def test_resistant_failed_child_defers_claim_release_without_additive_wait():
 def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
     cleanup_entered = threading.Event()
     allow_cleanup = threading.Event()
+    publication_failed = threading.Event()
 
     class Server:
         def serve_forever(self):
@@ -2051,7 +2052,18 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
         assert lease.acquire(blocking=False)
         assert lease.fd is not None
         with patch.object(runtime, "_paths", return_value=paths):
-            daemon = runtime._Daemon(lease.fd, time.monotonic_ns() + 50_000_000)
+            daemon = runtime._Daemon(
+                lease.fd,
+                time.monotonic_ns() + int(runtime.STARTUP_TIMEOUT * 1_000_000_000),
+            )
+
+        def fail_publication(*args, **kwargs):
+            # The deadline expires exactly at publication, so start-up never
+            # times out before the server exists and cleanup always outlives it.
+            publication_failed.set()
+            daemon.deadline_ns = time.monotonic_ns()
+            raise runtime.StartupError("publication failed")
+
         with patch.object(runtime, "_paths", return_value=paths), patch.object(
             daemon.application, "_server_factory", return_value=Server()
         ), patch.object(daemon, "_static_ready", return_value=True), patch.object(
@@ -2061,17 +2073,25 @@ def test_resistant_startup_cleanup_retains_claim_then_finishes_asynchronously():
             "_send_control",
             return_value={"status": "ready", "url": runtime.URL},
         ), patch.object(
-            runtime, "_write_instance", side_effect=runtime.StartupError("publication failed")
+            runtime, "_write_instance", side_effect=fail_publication
         ), managed_daemon_run(daemon) as run:
             try:
                 assert cleanup_entered.wait(timeout=1)
+                assert publication_failed.is_set()
                 deadline = time.monotonic() + 1
                 while daemon.shutdown_result != "timeout" and time.monotonic() < deadline:
                     time.sleep(0.005)
                 assert daemon.shutdown_result == "timeout"
-                contender = runtime._lease_lock(paths, timeout=0.0)
-                assert not contender.acquire(blocking=False)
-                contender.close()
+                refusal_deadline = time.monotonic() + 0.2
+                while time.monotonic() < refusal_deadline:
+                    contender = runtime._lease_lock(paths, timeout=0.0)
+                    try:
+                        assert not contender.acquire(
+                            blocking=False
+                        ), "startup cleanup released its lifetime claim while blocked"
+                    finally:
+                        contender.close()
+                    time.sleep(0.01)
             finally:
                 allow_cleanup.set()
             run.join(timeout=2)
