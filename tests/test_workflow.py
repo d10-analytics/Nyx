@@ -1441,6 +1441,24 @@ def _mutate_drop_artifact_step_documented_install_gate(workflow: dict[str, Any])
     step["env"] = env
 
 
+def _mutate_move_documented_install_above_artifact_export(
+    workflow: dict[str, Any],
+) -> None:
+    step = _step(workflow, "nyx-desktop-macos", BUILD_ARTIFACT_STEP)
+    export = DESKTOP_JOBS["nyx-desktop-macos"]["artifact_export"]
+    physical = _run_text(step).splitlines()
+    install = [
+        index
+        for index, line in enumerate(physical)
+        if line.strip() == DOCUMENTED_ARTIFACT_INSTALL_COMMAND
+    ]
+    exported = [index for index, line in enumerate(physical) if export in line]
+    assert install and exported and install[0] > exported[0]
+    line = physical.pop(install[0])
+    physical.insert(exported[0], line)
+    step["run"] = "\n".join(physical) + "\n"
+
+
 def _mutate_ignore_installed_service_failure(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -1776,6 +1794,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "drop artifact-step documented install gate": (
         check_documented_install_lane,
         _mutate_drop_artifact_step_documented_install_gate,
+    ),
+    "move documented install above artifact export": (
+        check_native_stage_ordering,
+        _mutate_move_documented_install_above_artifact_export,
     ),
     "ignore installed-service failure": (
         check_linux_service_lane,
