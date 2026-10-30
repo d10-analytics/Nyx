@@ -1436,6 +1436,23 @@ def _mutate_comment_out_documented_install(workflow: dict[str, Any]) -> None:
     )
 
 
+def _mutate_remove_artifact_step_documented_install(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-windows",
+        BUILD_ARTIFACT_STEP,
+        DOCUMENTED_ARTIFACT_INSTALL_COMMAND,
+        _comment_out,
+    )
+
+
+def _mutate_drop_artifact_step_documented_install_gate(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-macos", BUILD_ARTIFACT_STEP)
+    env = dict(_step_env(step))
+    assert env.pop(DOCUMENTED_INSTALL_ENV, None) == "1"
+    step["env"] = env
+
+
 def _mutate_ignore_installed_service_failure(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -1767,6 +1784,14 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "comment out documented install command": (
         check_documented_install_lane,
         _mutate_comment_out_documented_install,
+    ),
+    "remove artifact-step documented install command": (
+        check_documented_install_lane,
+        _mutate_remove_artifact_step_documented_install,
+    ),
+    "drop artifact-step documented install gate": (
+        check_documented_install_lane,
+        _mutate_drop_artifact_step_documented_install_gate,
     ),
     "ignore installed-service failure": (
         check_linux_service_lane,
