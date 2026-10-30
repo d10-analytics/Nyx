@@ -169,6 +169,20 @@ def _wait_for_process_exit(pid: int, deadline: float) -> None:
             time.sleep(0.01)
 
 
+def _wait_for_recorded_child_exit(pid_file: Path, timeout: float = 10.0) -> None:
+    """Wait for the daemon child whose pid a launcher recorded in ``pid_file``.
+
+    The child uses the temporary directory as its working directory, and
+    Windows refuses to remove that tree while it lives. An absent or
+    unparsable record means no child was spawned, so there is nothing to wait for.
+    """
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    _wait_for_process_exit(pid, time.monotonic() + timeout)
+
+
 def test_runtime_tests_collect_without_test_owned_posix_primitives():
     """Model Windows' absent fcntl/getuid boundary during real pytest collection."""
 
@@ -6413,7 +6427,8 @@ def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_ex
         "process=runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
         "ack_fd=write_fd,claim_path=paths.runtime_directory/'lease.lock',"
         "working_directory=paths.state_directory); "
-        "Path(sys.argv[1]).write_text(str(process.pid),encoding='utf-8'); time.sleep(30)"
+        "record=Path(sys.argv[1]); pending=record.with_name(record.name+'.pending'); "
+        "pending.write_text(str(process.pid),encoding='utf-8'); os.replace(pending,record); time.sleep(30)"
     )
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -6459,12 +6474,7 @@ def test_external_launcher_death_before_ack_keeps_inherited_claim_until_child_ex
             # The child exits just after releasing its inherited claim fd;
             # teardown must wait for the process itself or Windows refuses
             # to remove the state directory it uses as its cwd.
-            try:
-                child_pid = int(marker.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                child_pid = None
-            if child_pid is not None:
-                _wait_for_process_exit(child_pid, time.monotonic() + 10)
+            _wait_for_recorded_child_exit(marker)
 
 
 def test_actual_launcher_death_before_spawn_releases_lease():
@@ -6532,16 +6542,31 @@ def test_launcher_loss_after_spawn_leaves_transferred_lease_until_child_exit():
             "import os,sys,time; from pathlib import Path; from nyx import runtime; "
             "lease=runtime._FileLock(Path(sys.argv[1]),timeout=0); assert lease.acquire(blocking=False); "
             f"runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r}]; "
-            "runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
-            "working_directory=Path(sys.argv[1]).parent); lease.close(); os._exit(0)"
+            "process=runtime._spawn_daemon(lease.fd,time.monotonic_ns()+5*10**9,"
+            "working_directory=Path(sys.argv[1]).parent); "
+            "record=Path(sys.argv[2]); pending=record.with_name(record.name+'.pending'); "
+            "pending.write_text(str(process.pid),encoding='utf-8'); os.replace(pending,record); "
+            "lease.close(); os._exit(0)"
         )
-        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path)])
-        assert launcher.wait(timeout=2) == 0
+        pid_file = Path(temporary) / "child.pid"
+        launcher = subprocess.Popen([sys.executable, "-c", script, str(lock_path), str(pid_file)])
         probe = runtime._FileLock(lock_path, timeout=0.0)
-        assert not probe.acquire(blocking=False)
-        time.sleep(1)
-        assert probe.acquire(blocking=False)
-        probe.close()
+        try:
+            assert launcher.wait(timeout=2) == 0
+            assert not probe.acquire(blocking=False)
+            deadline = time.monotonic() + 5
+            while not probe.acquire(blocking=False):
+                if time.monotonic() >= deadline:
+                    raise AssertionError("transferred lease did not release after the child closed it")
+                time.sleep(0.01)
+        finally:
+            probe.close()
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.wait(timeout=2)
+            # The child uses the temporary directory as its working directory,
+            # so it must be gone before Windows can remove that tree.
+            _wait_for_recorded_child_exit(pid_file)
 
 
 def test_launcher_loss_before_spawn_releases_untransferred_lease():
@@ -6594,7 +6619,7 @@ def test_continuous_external_contender_covers_launcher_loss_phase(phase):
         "import os,sys,time\n"
         "from pathlib import Path\n"
         "from nyx import runtime\n"
-        "lock_path,phase,marker,release=sys.argv[1:5]\n"
+        "lock_path,phase,marker,release,pid_path=sys.argv[1:6]\n"
         "lease=runtime._FileLock(Path(lock_path),timeout=0)\n"
         "assert lease.acquire(blocking=False)\n"
         "if phase == 'before_spawn':\n"
@@ -6603,8 +6628,12 @@ def test_continuous_external_contender_covers_launcher_loss_phase(phase):
         "else:\n"
         " read_fd,write_fd=os.pipe()\n"
         f" runtime._daemon_command=lambda deadline:[sys.executable,'-c',{child!r},phase,marker,release]\n"
-        " runtime._spawn_daemon(lease.fd,time.monotonic_ns()+10**10,ack_fd=write_fd,"
+        " process=runtime._spawn_daemon(lease.fd,time.monotonic_ns()+10**10,ack_fd=write_fd,"
         "claim_path=Path(lock_path),working_directory=Path(lock_path).parent)\n"
+        " record=Path(pid_path)\n"
+        " pending=record.with_name(record.name+'.pending')\n"
+        " pending.write_text(str(process.pid),encoding='utf-8')\n"
+        " os.replace(pending,record)\n"
         " os.close(write_fd)\n"
         " if phase == 'after_ack':\n"
         "  os.read(read_fd,1)\n"
@@ -6635,16 +6664,22 @@ def test_continuous_external_contender_covers_launcher_loss_phase(phase):
         release = root / "release"
         acquired = root / "acquired"
         stop = root / "stop"
+        pid_file = root / "child.pid"
         launcher_process = subprocess.Popen(
-            [sys.executable, "-c", launcher, str(lock_path), phase, str(marker), str(release)],
+            [sys.executable, "-c", launcher, str(lock_path), phase, str(marker), str(release), str(pid_file)],
             cwd=Path(__file__).parents[1],
         )
         contender_process = None
         try:
             deadline = time.monotonic() + 3
-            while not marker.exists() and launcher_process.poll() is None and time.monotonic() < deadline:
+            while (
+                not (marker.exists() and (phase == "before_spawn" or pid_file.exists()))
+                and launcher_process.poll() is None
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.01)
             assert marker.exists(), phase
+            assert phase == "before_spawn" or pid_file.exists(), phase
             contender_process = subprocess.Popen(
                 [sys.executable, "-c", contender, str(lock_path), str(acquired), str(stop)],
                 cwd=Path(__file__).parents[1],
@@ -6673,6 +6708,9 @@ def test_continuous_external_contender_covers_launcher_loss_phase(phase):
             if launcher_process.poll() is None:
                 launcher_process.kill()
                 launcher_process.wait(timeout=2)
+            # The spawned child uses the temporary directory as its working
+            # directory; Windows cannot remove that tree while it lives.
+            _wait_for_recorded_child_exit(pid_file)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX path replacement is required")
