@@ -1502,6 +1502,13 @@ def _mutate_late_powershell_error_preference(workflow: dict[str, Any]) -> None:
     step["run"] = "\n".join([*lines[1:], lines[0]]) + "\n"
 
 
+def _mutate_drop_powershell_error_preference(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)
+    lines = _run_text(step).splitlines()
+    assert lines[0] == PWSH_ERROR_PREFERENCE
+    step["run"] = "\n".join(lines[1:]) + "\n"
+
+
 def _mutate_reassign_powershell_error_preference(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -1571,6 +1578,14 @@ def _mutate_change_desktop_windows_time_limit_within_range(workflow: dict[str, A
 def _mutate_add_job_without_time_limit(workflow: dict[str, Any]) -> None:
     _jobs(workflow)["nyx-extra"] = {
         "runs-on": "ubuntu-latest",
+        "steps": [{"uses": "actions/checkout@v4"}],
+    }
+
+
+def _mutate_add_job_with_out_of_range_time_limit(workflow: dict[str, Any]) -> None:
+    _jobs(workflow)["nyx-extra"] = {
+        "runs-on": "ubuntu-latest",
+        TIMEOUT_KEY: 360,
         "steps": [{"uses": "actions/checkout@v4"}],
     }
 
@@ -1819,6 +1834,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_powershell_failure_propagation,
         _mutate_late_powershell_error_preference,
     ),
+    "drop powershell error preference": (
+        check_powershell_failure_propagation,
+        _mutate_drop_powershell_error_preference,
+    ),
     "reassign powershell error preference": (
         check_powershell_failure_propagation,
         _mutate_reassign_powershell_error_preference,
@@ -1854,6 +1873,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "add job without time limit": (
         check_job_time_limits,
         _mutate_add_job_without_time_limit,
+    ),
+    "add job with out-of-range time limit": (
+        check_job_time_limits,
+        _mutate_add_job_with_out_of_range_time_limit,
     ),
     "add workflow concurrency cancellation": (
         check_no_concurrency_cancellation,
