@@ -1305,7 +1305,10 @@ def test_session_native_failure_record_reaches_stderr(tmp_path):
 def test_documented_desktop_build_blocks_run_literally():
     language = _lane_build_language()
     if language is None:
-        pytest.skip("the documented build runs only on the Windows and macOS desktop lanes")
+        pytest.fail(
+            "NYX_VERIFY_DOCUMENTED_BUILD=1 is set but this host has no documented "
+            "build language; the documented build runs only on Windows and macOS"
+        )
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     block = _published_build_block(guide, language)
     bound = _BUILD_TIMEOUT_MINUTES[language] * 60
@@ -1412,8 +1415,10 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
 def _documented_desktop_artifact() -> ArtifactLayout:
     staged = os.environ.get("NYX_DESKTOP_ARTIFACT")
     if not staged:
-        pytest.skip(
-            "the private desktop artifact is staged only in the desktop artifact lane"
+        pytest.fail(
+            "NYX_VERIFY_DOCUMENTED_INSTALL=1 is set but NYX_DESKTOP_ARTIFACT is unset "
+            "or empty; the private desktop artifact must be staged before the "
+            "documented installation runs"
         )
     artifact = ArtifactLayout(Path(staged).resolve())
     assert artifact.executable.is_file(), f"staged application is missing: {artifact.executable}"
@@ -1503,6 +1508,86 @@ def test_documented_native_installation_and_lifecycle(tmp_path):
         _exercise_documented_desktop_actions(tmp_path)
     else:
         _exercise_documented_linux_installation(tmp_path)
+
+
+_GATE_VARIABLES = (
+    "NYX_VERIFY_DOCUMENTED_INSTALL",
+    "NYX_VERIFY_DOCUMENTED_BUILD",
+    "NYX_EXPECTED_NATIVE_HOST",
+    "NYX_REQUIRE_NATIVE_DESKTOP",
+    "NYX_DESKTOP_ARTIFACT",
+)
+
+
+@pytest.mark.skipif(
+    _lane_build_language() is not None,
+    reason="the gate would start the real documented build on this host",
+)
+def test_documented_build_gate_fails_on_a_host_without_a_desktop_build():
+    node = "tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally"
+    message = (
+        "NYX_VERIFY_DOCUMENTED_BUILD=1 is set but this host has no documented "
+        "build language; the documented build runs only on Windows and macOS"
+    )
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _GATE_VARIABLES
+    }
+    environment["NYX_VERIFY_DOCUMENTED_BUILD"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rA", node],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    lines = completed.stdout.strip().splitlines()
+    assert completed.returncode == 1, output[-4000:]
+    assert lines and "1 failed" in lines[-1], output[-4000:]
+    # The summary line carries the message only on some terminals, so it pins
+    # the node there and the message is pinned in the failure section.
+    assert any(line.startswith(f"FAILED {node}") for line in lines), output[-4000:]
+    assert f"Failed: {message}" in output, output[-4000:]
+
+
+@pytest.mark.skipif(
+    not (os.name == "nt" or sys.platform == "darwin"),
+    reason="the gate would start the real Linux installation on this host",
+)
+def test_documented_install_gate_fails_without_a_staged_artifact():
+    node = "tests/test_documented_install.py::test_documented_native_installation_and_lifecycle"
+    message = (
+        "NYX_VERIFY_DOCUMENTED_INSTALL=1 is set but NYX_DESKTOP_ARTIFACT is unset "
+        "or empty; the private desktop artifact must be staged before the "
+        "documented installation runs"
+    )
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in _GATE_VARIABLES
+    }
+    environment["NYX_VERIFY_DOCUMENTED_INSTALL"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rA", node],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    lines = completed.stdout.strip().splitlines()
+    assert completed.returncode == 1, output[-4000:]
+    assert lines and "1 failed" in lines[-1], output[-4000:]
+    # The summary line carries the message only on some terminals, so it pins
+    # the node there and the message is pinned in the failure section.
+    assert any(line.startswith(f"FAILED {node}") for line in lines), output[-4000:]
+    assert f"Failed: {message}" in output, output[-4000:]
 
 
 def _assert_unique_markers(document: str, markers, name: str) -> None:
