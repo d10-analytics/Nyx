@@ -198,18 +198,11 @@ PWSH_ERROR_PREFERENCE = "$ErrorActionPreference = 'Stop'"
 CONTINUE_ON_ERROR_KEY = "continue-on-error"
 
 # Every job caps its wall-clock duration so a hung run fails instead of holding
-# a hosted runner for hours.  Each cap is twice the job's longest recent
-# successful duration, rounded up to the next five minutes.
+# a hosted runner for hours.  Each cap keeps headroom above the job's longest
+# recent successful duration and is re-derived when that duration grows.
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
-# Each desktop cap follows the rule above from its longest recent successful
-# duration: 15m26s (926 s) for nyx-desktop-windows and 6m34s (394 s) for
-# nyx-desktop-macos, so twice each rounds up to 35 and 15 minutes.
-# nyx-windows and nyx-macos run the whole suite: nyx-windows took 28m52s at
-# ba9b5d8 with 1,723 collected tests, and the tests added since grow both
-# jobs (nyx-windows 41m11s, nyx-macos over 30 minutes), so their caps are 60
-# and 45 minutes to keep headroom rather than twice the earlier duration.
 JOB_TIMEOUT_MINUTES = {
     "nyx": 30,
     "nyx-windows": 60,
