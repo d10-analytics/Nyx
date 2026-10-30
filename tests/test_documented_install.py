@@ -1305,7 +1305,10 @@ def test_session_native_failure_record_reaches_stderr(tmp_path):
 def test_documented_desktop_build_blocks_run_literally():
     language = _lane_build_language()
     if language is None:
-        pytest.skip("the documented build runs only on the Windows and macOS desktop lanes")
+        pytest.fail(
+            "NYX_VERIFY_DOCUMENTED_BUILD=1 is set but this host has no documented "
+            "build language; the documented build runs only on Windows and macOS"
+        )
     guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
     block = _published_build_block(guide, language)
     bound = _BUILD_TIMEOUT_MINUTES[language] * 60
@@ -1412,8 +1415,10 @@ def _exercise_documented_linux_installation(tmp_path: Path) -> None:
 def _documented_desktop_artifact() -> ArtifactLayout:
     staged = os.environ.get("NYX_DESKTOP_ARTIFACT")
     if not staged:
-        pytest.skip(
-            "the private desktop artifact is staged only in the desktop artifact lane"
+        pytest.fail(
+            "NYX_VERIFY_DOCUMENTED_INSTALL=1 is set but NYX_DESKTOP_ARTIFACT is unset "
+            "or empty; the private desktop artifact must be staged before the "
+            "documented installation runs"
         )
     artifact = ArtifactLayout(Path(staged).resolve())
     assert artifact.executable.is_file(), f"staged application is missing: {artifact.executable}"
