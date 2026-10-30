@@ -114,6 +114,12 @@ DOCUMENTED_INSTALL_STEPS = {
     "nyx-desktop-macos": (BUILD_ARTIFACT_STEP, DOCUMENTED_ARTIFACT_INSTALL_COMMAND),
 }
 
+# Any effective line naming one of these files runs a once-only proof.  Each
+# job's designated (step, command) pairs are the only places such a line may
+# appear, each exactly once.
+DESKTOP_SOURCE_TARGET = "tests/test_desktop.py"
+DOCUMENTED_INSTALL_TARGET = "tests/test_documented_install.py"
+
 # Gating commands are matched by exact equality against effective lines.  A
 # gate is a tuple of effective lines: a one-line gate is a single command, and
 # a command that continues over several physical lines is matched as a
@@ -567,6 +573,51 @@ def check_documented_install_lane(workflow: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _once_proof_designations(job_name: str) -> dict[str, list[tuple[str, str]]]:
+    """Return the (step, command) pairs designated to run each once-only proof."""
+
+    desktop: list[tuple[str, str]] = []
+    documented: list[tuple[str, str]] = []
+    if job_name in DESKTOP_JOBS:
+        desktop.append((SOURCE_SESSION_STEP, DESKTOP_SOURCE_COMMAND))
+        documented.append((DOCUMENTED_BUILD_STEP, DOCUMENTED_BUILD_COMMAND))
+    if job_name in DOCUMENTED_INSTALL_STEPS:
+        documented.append(DOCUMENTED_INSTALL_STEPS[job_name])
+    return {DESKTOP_SOURCE_TARGET: desktop, DOCUMENTED_INSTALL_TARGET: documented}
+
+
+def check_once_only_proofs(workflow: dict[str, Any]) -> list[str]:
+    """Require each desktop and documented-install proof to run once, in place.
+
+    In every job, an effective line naming either test file must be exactly a
+    designated command sitting in its designated step, and each designated
+    command must appear once there.
+    """
+
+    problems: list[str] = []
+    for name, job in _jobs(workflow).items():
+        for target, designated in _once_proof_designations(name).items():
+            counts = {pair: 0 for pair in designated}
+            for step in _steps(job):
+                step_name = step.get("name")
+                for line in _effective_lines(step):
+                    if target not in line:
+                        continue
+                    if (step_name, line) in counts:
+                        counts[(step_name, line)] += 1
+                    else:
+                        problems.append(
+                            f"{name}: {step_name!r} runs {line!r}, which is not a "
+                            f"designated {target} command for that step"
+                        )
+            problems.extend(
+                f"{name}: {step_name!r} runs {command!r} {count} times; expected once"
+                for (step_name, command), count in counts.items()
+                if count > 1
+            )
+    return problems
+
+
 def _unguarded_pwsh_commands(name: str, step: dict[str, Any]) -> list[str]:
     lines = _effective_lines(step)
     problems: list[str] = []
@@ -966,6 +1017,7 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "baseline_browser_prerequisites": check_baseline_browser_prerequisites,
     "linux_service_lane": check_linux_service_lane,
     "documented_install_lane": check_documented_install_lane,
+    "once_only_proofs": check_once_only_proofs,
     "powershell_failure_propagation": check_powershell_failure_propagation,
     "posix_failure_propagation": check_posix_failure_propagation,
     "no_continue_on_error": check_no_continue_on_error,
@@ -1448,6 +1500,36 @@ def _mutate_duplicate_installed_wheel_after_service_proof(workflow: dict[str, An
     )
 
 
+def _mutate_re_add_desktop_pass_to_artifact_step(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-windows",
+        BUILD_ARTIFACT_STEP,
+        DESKTOP_ARTIFACT_COMMAND,
+        _insert_before(DESKTOP_SOURCE_COMMAND),
+    )
+
+
+def _mutate_add_whole_file_documented_install_run(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        BUILD_ARTIFACT_STEP,
+        DOCUMENTED_ARTIFACT_INSTALL_COMMAND,
+        _insert_before("python -m pytest tests/test_documented_install.py -v -s"),
+    )
+
+
+def _mutate_duplicate_desktop_source_command(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-desktop-macos",
+        SOURCE_SESSION_STEP,
+        DESKTOP_SOURCE_COMMAND,
+        _append(f"\n{DESKTOP_SOURCE_COMMAND}"),
+    )
+
+
 def _mutate_move_installed_wheel_before_build(workflow: dict[str, Any]) -> None:
     command = INSTALLED_WHEEL_COMMAND.format(python=BASELINE_JOBS["nyx-macos"]["python"])
     build = WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-macos"]["python"])
@@ -1725,6 +1807,18 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "duplicate installed-wheel test after service proof": (
         check_baseline_installed_wheel,
         _mutate_duplicate_installed_wheel_after_service_proof,
+    ),
+    "re-add desktop pass to artifact step": (
+        check_once_only_proofs,
+        _mutate_re_add_desktop_pass_to_artifact_step,
+    ),
+    "add whole-file documented-install run": (
+        check_once_only_proofs,
+        _mutate_add_whole_file_documented_install_run,
+    ),
+    "duplicate desktop source command": (
+        check_once_only_proofs,
+        _mutate_duplicate_desktop_source_command,
     ),
     "move installed-wheel test before wheel build": (
         check_baseline_installed_wheel,
