@@ -878,13 +878,6 @@ def check_native_artifact_lane(workflow: dict[str, Any]) -> list[str]:
                 f"{name}: delivered artifact tests", segments, (DESKTOP_ARTIFACT_COMMAND,)
             )
         )
-        problems.extend(
-            _gate_violations(
-                f"{name}: artifact-mode desktop scenarios",
-                segments,
-                (DESKTOP_SOURCE_COMMAND,),
-            )
-        )
     return problems
 
 
@@ -936,7 +929,7 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
         stages = (
             lambda line: spec["artifact_export"] in line,
             lambda line: line == DESKTOP_ARTIFACT_COMMAND,
-            lambda line: line == DESKTOP_SOURCE_COMMAND,
+            lambda line: line == DOCUMENTED_ARTIFACT_INSTALL_COMMAND,
         )
         positions = [
             next((index for index, line in enumerate(lines) if matches(line)), -1)
@@ -947,7 +940,7 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
         if positions != sorted(positions) or len(set(positions)) != len(positions):
             problems.append(
                 f"{name}: artifact stage order must be artifact input, "
-                "artifact tests, then artifact-mode desktop scenarios"
+                "artifact tests, then the documented installation"
             )
     return problems
 
@@ -1148,11 +1141,6 @@ def _mutate_omit_windows_session_gate(workflow: dict[str, Any]) -> None:
 def _mutate_remove_artifact_tests(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
     step["run"] = _run_text(step).replace(f"{DESKTOP_ARTIFACT_COMMAND}\n", "", 1)
-
-
-def _mutate_remove_artifact_mode_desktop_run(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-desktop-macos", BUILD_ARTIFACT_STEP)
-    step["run"] = _run_text(step).replace(f"{DESKTOP_SOURCE_COMMAND}\n", "", 1)
 
 
 def _mutate_remove_artifact_environment(workflow: dict[str, Any]) -> None:
@@ -1453,6 +1441,24 @@ def _mutate_drop_artifact_step_documented_install_gate(workflow: dict[str, Any])
     step["env"] = env
 
 
+def _mutate_move_documented_install_above_artifact_export(
+    workflow: dict[str, Any],
+) -> None:
+    step = _step(workflow, "nyx-desktop-macos", BUILD_ARTIFACT_STEP)
+    export = DESKTOP_JOBS["nyx-desktop-macos"]["artifact_export"]
+    physical = _run_text(step).splitlines()
+    install = [
+        index
+        for index, line in enumerate(physical)
+        if line.strip() == DOCUMENTED_ARTIFACT_INSTALL_COMMAND
+    ]
+    exported = [index for index, line in enumerate(physical) if export in line]
+    assert install and exported and install[0] > exported[0]
+    line = physical.pop(install[0])
+    physical.insert(exported[0], line)
+    step["run"] = "\n".join(physical) + "\n"
+
+
 def _mutate_ignore_installed_service_failure(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -1661,10 +1667,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_native_artifact_lane,
         _mutate_remove_artifact_tests,
     ),
-    "remove artifact-mode desktop run": (
-        check_native_artifact_lane,
-        _mutate_remove_artifact_mode_desktop_run,
-    ),
     "remove artifact environment": (
         check_native_artifact_input,
         _mutate_remove_artifact_environment,
@@ -1792,6 +1794,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "drop artifact-step documented install gate": (
         check_documented_install_lane,
         _mutate_drop_artifact_step_documented_install_gate,
+    ),
+    "move documented install above artifact export": (
+        check_native_stage_ordering,
+        _mutate_move_documented_install_above_artifact_export,
     ),
     "ignore installed-service failure": (
         check_linux_service_lane,

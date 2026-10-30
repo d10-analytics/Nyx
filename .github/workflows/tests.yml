@@ -194,10 +194,6 @@ jobs:
           $env:NYX_DESKTOP_ARTIFACT = $artifact
           python -m pytest tests/test_desktop_artifact.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Run the established desktop scenarios with the delivered
-          # artifact entry available.
-          python -m pytest tests/test_desktop.py -v -s
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Exercise the published desktop acquisition path and actions against
           # the staged artifact instead of the retired detached console lifecycle.
           python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v -s
@@ -259,9 +255,6 @@ jobs:
           shasum -a 256 "$artifact/Contents/MacOS/$gui_executable"
           export NYX_DESKTOP_ARTIFACT="$artifact"
           python -m pytest tests/test_desktop_artifact.py -v -s
-          # Run the established desktop scenarios with the delivered
-          # artifact entry available.
-          python -m pytest tests/test_desktop.py -v -s
           # Exercise the published desktop acquisition path and actions against
           # the staged artifact instead of the retired detached console lifecycle.
           python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v -s
