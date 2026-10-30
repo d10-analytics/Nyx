@@ -63,6 +63,9 @@ DESKTOP_ARTIFACT_ENV = "NYX_DESKTOP_ARTIFACT"
 DOCUMENTED_INSTALL_ENV = "NYX_VERIFY_DOCUMENTED_INSTALL"
 DOCUMENTED_BUILD_ENV = "NYX_VERIFY_DOCUMENTED_BUILD"
 
+LINUX_SERVICE_STEP = "Verify package and installed service"
+BASELINE_LIFECYCLE_STEP = "Verify package and installed lifecycle"
+DOCUMENTED_INSTALL_STEP = "Verify documented installation commands"
 SOURCE_SESSION_STEP = "Verify native desktop source and session"
 DOCUMENTED_BUILD_STEP = "Build the documented desktop artifact"
 BUILD_ARTIFACT_STEP = "Build and verify the native desktop artifact"
@@ -72,7 +75,12 @@ SOURCE_SUITE_COMMAND = "{python} -m pytest tests/ -v"
 RUFF_COMMAND = "ruff check ."
 WHEEL_BUILD_COMMAND = "{python} -m build --wheel"
 INSTALLED_WHEEL_COMMAND = "{python} -m pytest tests/test_wheel_install.py -v"
-DOCUMENTED_INSTALL_COMMAND = "python -m pytest tests/test_documented_install.py -v"
+DOCUMENTED_INSTALL_COMMAND = (
+    "python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v"
+)
+DOCUMENTED_ARTIFACT_INSTALL_COMMAND = (
+    "python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v -s"
+)
 DESKTOP_SOURCE_COMMAND = "python -m pytest tests/test_desktop.py -v -s"
 DESKTOP_ARTIFACT_COMMAND = "python -m pytest tests/test_desktop_artifact.py -v -s"
 DOCUMENTED_BUILD_COMMAND = (
@@ -96,6 +104,14 @@ BROWSER_INSTALL_COMMANDS = {
     "nyx": '"$runner_python" -m playwright install --with-deps chromium',
     "nyx-windows": "python -m playwright install chromium",
     "nyx-macos": '"$runner_python" -m playwright install chromium',
+}
+
+# The one run of the gated documented-install proof in each job that has it:
+# the Linux package lane, and the artifact step of each desktop lane.
+DOCUMENTED_INSTALL_STEPS = {
+    "nyx": (DOCUMENTED_INSTALL_STEP, DOCUMENTED_INSTALL_COMMAND),
+    "nyx-desktop-windows": (BUILD_ARTIFACT_STEP, DOCUMENTED_ARTIFACT_INSTALL_COMMAND),
+    "nyx-desktop-macos": (BUILD_ARTIFACT_STEP, DOCUMENTED_ARTIFACT_INSTALL_COMMAND),
 }
 
 # Gating commands are matched by exact equality against effective lines.  A
@@ -534,25 +550,25 @@ def check_linux_service_lane(workflow: dict[str, Any]) -> list[str]:
 
 def check_documented_install_lane(workflow: dict[str, Any]) -> list[str]:
     problems: list[str] = []
-    for name in BASELINE_JOBS:
+    for name, (step_name, command) in DOCUMENTED_INSTALL_STEPS.items():
         job = _job(workflow, name)
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        step = _step_named(job, "Verify documented installation commands")
+        step = _step_named(job, step_name)
         if step is None:
-            problems.append(f"{name}: documented installation step is missing")
+            problems.append(f"{name}: {step_name!r} step is missing")
             continue
         env = _step_env(step)
         if env.get(DOCUMENTED_INSTALL_ENV) != "1":
             problems.append(
-                f"{name}: documented installation step does not set {DOCUMENTED_INSTALL_ENV}=1"
+                f"{name}: {step_name!r} does not set {DOCUMENTED_INSTALL_ENV}=1"
             )
         problems.extend(
             _gate_violations(
                 f"{name}: documented installation command",
                 [_effective_lines(step)],
-                (DOCUMENTED_INSTALL_COMMAND,),
+                (command,),
             )
         )
     return problems
@@ -1279,11 +1295,6 @@ def _mutate_remove_pwsh_shell_declaration(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-windows", "Verify package and installed lifecycle")
     assert step.get("shell") == "pwsh"
     step.pop("shell")
-
-
-LINUX_SERVICE_STEP = "Verify package and installed service"
-BASELINE_LIFECYCLE_STEP = "Verify package and installed lifecycle"
-DOCUMENTED_INSTALL_STEP = "Verify documented installation commands"
 
 
 def _indent(line: str) -> str:
