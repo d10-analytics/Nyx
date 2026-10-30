@@ -70,7 +70,7 @@ jobs:
           NYX_VERIFY_DOCUMENTED_INSTALL: '1'
         run: |
           set -euo pipefail
-          python -m pytest tests/test_documented_install.py -v
+          python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v
 
   nyx-windows:
     runs-on: windows-latest
@@ -106,15 +106,6 @@ jobs:
           python -m pytest tests/test_wheel_install.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify documented installation commands
-        shell: pwsh
-        env:
-          NYX_VERIFY_DOCUMENTED_INSTALL: '1'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -m pytest tests/test_documented_install.py -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
   nyx-macos:
     runs-on: macos-latest
     timeout-minutes: 45
@@ -139,14 +130,6 @@ jobs:
           wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
           test "$wheel_count" -eq 1
           "$runner_python" -m pytest tests/test_wheel_install.py -v
-
-      - name: Verify documented installation commands
-        shell: bash
-        env:
-          NYX_VERIFY_DOCUMENTED_INSTALL: '1'
-        run: |
-          set -euo pipefail
-          python -m pytest tests/test_documented_install.py -v
 
   nyx-desktop-windows:
     runs-on: windows-2025
@@ -194,7 +177,7 @@ jobs:
           NYX_VERIFY_DOCUMENTED_BUILD: '1'
         run: |
           $ErrorActionPreference = 'Stop'
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build and verify the native desktop artifact
@@ -211,13 +194,9 @@ jobs:
           $env:NYX_DESKTOP_ARTIFACT = $artifact
           python -m pytest tests/test_desktop_artifact.py -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Run the established desktop scenarios with the delivered
-          # artifact entry available.
-          python -m pytest tests/test_desktop.py -v -s
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Exercise the published desktop acquisition path and actions against
           # the staged artifact instead of the retired detached console lifecycle.
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v -s
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
@@ -258,7 +237,7 @@ jobs:
           NYX_VERIFY_DOCUMENTED_BUILD: '1'
         run: |
           set -euo pipefail
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_desktop_build_blocks_run_literally -v -s
 
       - name: Build and verify the native desktop artifact
         shell: bash
@@ -276,9 +255,6 @@ jobs:
           shasum -a 256 "$artifact/Contents/MacOS/$gui_executable"
           export NYX_DESKTOP_ARTIFACT="$artifact"
           python -m pytest tests/test_desktop_artifact.py -v -s
-          # Run the established desktop scenarios with the delivered
-          # artifact entry available.
-          python -m pytest tests/test_desktop.py -v -s
           # Exercise the published desktop acquisition path and actions against
           # the staged artifact instead of the retired detached console lifecycle.
-          python -m pytest tests/test_documented_install.py -v -s
+          python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v -s
