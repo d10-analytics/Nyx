@@ -878,13 +878,6 @@ def check_native_artifact_lane(workflow: dict[str, Any]) -> list[str]:
                 f"{name}: delivered artifact tests", segments, (DESKTOP_ARTIFACT_COMMAND,)
             )
         )
-        problems.extend(
-            _gate_violations(
-                f"{name}: artifact-mode desktop scenarios",
-                segments,
-                (DESKTOP_SOURCE_COMMAND,),
-            )
-        )
     return problems
 
 
@@ -936,7 +929,7 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
         stages = (
             lambda line: spec["artifact_export"] in line,
             lambda line: line == DESKTOP_ARTIFACT_COMMAND,
-            lambda line: line == DESKTOP_SOURCE_COMMAND,
+            lambda line: line == DOCUMENTED_ARTIFACT_INSTALL_COMMAND,
         )
         positions = [
             next((index for index, line in enumerate(lines) if matches(line)), -1)
@@ -947,7 +940,7 @@ def check_native_stage_ordering(workflow: dict[str, Any]) -> list[str]:
         if positions != sorted(positions) or len(set(positions)) != len(positions):
             problems.append(
                 f"{name}: artifact stage order must be artifact input, "
-                "artifact tests, then artifact-mode desktop scenarios"
+                "artifact tests, then the documented installation"
             )
     return problems
 
@@ -1148,11 +1141,6 @@ def _mutate_omit_windows_session_gate(workflow: dict[str, Any]) -> None:
 def _mutate_remove_artifact_tests(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-desktop-windows", BUILD_ARTIFACT_STEP)
     step["run"] = _run_text(step).replace(f"{DESKTOP_ARTIFACT_COMMAND}\n", "", 1)
-
-
-def _mutate_remove_artifact_mode_desktop_run(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-desktop-macos", BUILD_ARTIFACT_STEP)
-    step["run"] = _run_text(step).replace(f"{DESKTOP_SOURCE_COMMAND}\n", "", 1)
 
 
 def _mutate_remove_artifact_environment(workflow: dict[str, Any]) -> None:
@@ -1660,10 +1648,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "remove artifact tests": (
         check_native_artifact_lane,
         _mutate_remove_artifact_tests,
-    ),
-    "remove artifact-mode desktop run": (
-        check_native_artifact_lane,
-        _mutate_remove_artifact_mode_desktop_run,
     ),
     "remove artifact environment": (
         check_native_artifact_input,
