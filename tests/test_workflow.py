@@ -1071,7 +1071,7 @@ def _mutate_omit_linux_service_cleanup(workflow: dict[str, Any]) -> None:
 
 
 def _mutate_remove_documented_install_gate(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-windows", "Verify documented installation commands")
+    step = _step(workflow, "nyx", DOCUMENTED_INSTALL_STEP)
     env = dict(_step_env(step))
     env.pop(DOCUMENTED_INSTALL_ENV, None)
     step["env"] = env
@@ -1419,7 +1419,7 @@ def _mutate_comment_out_desktop_extras_install(workflow: dict[str, Any]) -> None
 
 def _mutate_comment_out_documented_install(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
-        workflow, "nyx-macos", DOCUMENTED_INSTALL_STEP, DOCUMENTED_INSTALL_COMMAND, _comment_out
+        workflow, "nyx", DOCUMENTED_INSTALL_STEP, DOCUMENTED_INSTALL_COMMAND, _comment_out
     )
 
 
@@ -1460,7 +1460,7 @@ def _mutate_comment_out_aqua_gate(workflow: dict[str, Any]) -> None:
 
 
 def _mutate_late_powershell_error_preference(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-windows", DOCUMENTED_INSTALL_STEP)
+    step = _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)
     lines = _run_text(step).splitlines()
     assert lines[0] == PWSH_ERROR_PREFERENCE
     step["run"] = "\n".join([*lines[1:], lines[0]]) + "\n"
