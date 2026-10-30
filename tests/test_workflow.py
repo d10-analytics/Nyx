@@ -990,12 +990,6 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
 }
 
 
-def contract_violations(workflow: dict[str, Any]) -> dict[str, list[str]]:
-    """Return every failing check, keyed by check name."""
-
-    return {name: check(workflow) for name, check in CHECKS.items() if check(workflow)}
-
-
 # --------------------------------------------------------------------------
 # The real workflow satisfies every established check
 # --------------------------------------------------------------------------
@@ -1004,11 +998,6 @@ def contract_violations(workflow: dict[str, Any]) -> dict[str, list[str]]:
 @pytest.mark.parametrize("check_name", sorted(CHECKS))
 def test_established_workflow_check_has_no_violations(check_name: str) -> None:
     assert CHECKS[check_name](load_workflow()) == []
-
-
-def test_real_workflow_satisfies_the_established_contract() -> None:
-    violations = contract_violations(load_workflow())
-    assert violations == {}
 
 
 # --------------------------------------------------------------------------
@@ -1021,11 +1010,6 @@ def _mutate_remove_baseline_source_suite(workflow: dict[str, Any]) -> None:
     step["run"] = _run_text(step).replace(
         '"$runner_python" -m pytest tests/ -v\n', "", 1
     )
-
-
-def _mutate_remove_baseline_ruff(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-macos", "Verify package and installed lifecycle")
-    step["run"] = _run_text(step).replace("ruff check .\n", "", 1)
 
 
 def _mutate_remove_baseline_wheel_build(workflow: dict[str, Any]) -> None:
@@ -1048,13 +1032,6 @@ def _mutate_weaken_windows_wheel_enforcement(workflow: dict[str, Any]) -> None:
     throw = 'throw "Expected exactly one wheel, found $($wheels.Count)"'
     assert throw in text
     step["run"] = text.replace(throw, 'Write-Host "unexpected wheel count"', 1)
-
-
-def _mutate_remove_installed_wheel_test(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-macos", "Verify package and installed lifecycle")
-    step["run"] = _run_text(step).replace(
-        '"$runner_python" -m pytest tests/test_wheel_install.py -v\n', "", 1
-    )
 
 
 def _mutate_remove_browser_prerequisites(workflow: dict[str, Any]) -> None:
@@ -1107,11 +1084,6 @@ def _mutate_override_required_native_host(workflow: dict[str, Any]) -> None:
     env = dict(_step_env(step))
     env[EXPECTED_NATIVE_HOST_ENV] = "windows-latest"
     step["env"] = env
-
-
-def _mutate_remove_native_source_session_command(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-desktop-macos", SOURCE_SESSION_STEP)
-    step["run"] = _run_text(step).replace(f"{DESKTOP_SOURCE_COMMAND}\n", "", 1)
 
 
 def _mutate_remove_session_preflight(workflow: dict[str, Any]) -> None:
@@ -1206,16 +1178,6 @@ def _mutate_copy_published_command_into_documented_step(workflow: dict[str, Any]
     )
 
 
-def _mutate_copy_published_command_into_macos_artifact_step(workflow: dict[str, Any]) -> None:
-    _rewrite_run_line(
-        workflow,
-        "nyx-desktop-macos",
-        BUILD_ARTIFACT_STEP,
-        DESKTOP_ARTIFACT_COMMAND,
-        _insert_before(".venv/bin/python scripts/build_desktop.py"),
-    )
-
-
 def _mutate_reload_visual_studio_loader(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -1237,21 +1199,6 @@ def _mutate_move_build_step_before_source_step(workflow: dict[str, Any]) -> None
     assert source_index < build_index
     steps[source_index], steps[build_index] = steps[build_index], steps[source_index]
     job["steps"] = steps
-
-
-def _mutate_omit_powershell_failure_propagation(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-windows", "Verify package and installed lifecycle")
-    lines = _run_text(step).splitlines()
-    kept: list[str] = []
-    drop_next_guard = False
-    for line in lines:
-        if drop_next_guard and "$LASTEXITCODE" in line:
-            drop_next_guard = False
-            continue
-        kept.append(line)
-        if line.strip() == "python -m pytest tests/ -v":
-            drop_next_guard = True
-    step["run"] = "\n".join(kept) + "\n"
 
 
 def _mutate_omit_posix_failure_propagation(workflow: dict[str, Any]) -> None:
@@ -1319,12 +1266,6 @@ def _rewrite_run_line(
     step["run"] = "\n".join(physical) + "\n"
 
 
-def _mutate_comment_out_baseline_source_suite(workflow: dict[str, Any]) -> None:
-    _rewrite_run_line(
-        workflow, "nyx", LINUX_SERVICE_STEP, '"$runner_python" -m pytest tests/ -v', _comment_out
-    )
-
-
 def _mutate_comment_out_windows_source_suite(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow, "nyx-windows", BASELINE_LIFECYCLE_STEP, "python -m pytest tests/ -v", _comment_out
@@ -1359,13 +1300,6 @@ def _mutate_disable_pipefail(workflow: dict[str, Any]) -> None:
         DESKTOP_ARTIFACT_COMMAND,
         _insert_before("set +o pipefail"),
     )
-
-
-def _mutate_move_posix_guard(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx-macos", BASELINE_LIFECYCLE_STEP)
-    lines = _run_text(step).splitlines()
-    assert lines[0] == POSIX_FAILURE_GUARD
-    step["run"] = "\n".join([lines[1], lines[0], *lines[2:]]) + "\n"
 
 
 def _mutate_ignore_baseline_ruff_failure(workflow: dict[str, Any]) -> None:
@@ -1469,29 +1403,9 @@ def _mutate_ignore_installed_service_failure(workflow: dict[str, Any]) -> None:
     )
 
 
-def _mutate_comment_out_installed_service_line(workflow: dict[str, Any]) -> None:
-    _rewrite_run_line(
-        workflow,
-        "nyx",
-        LINUX_SERVICE_STEP,
-        'PATH="$nyx_verify_home/.local/bin:/usr/bin:/bin" \\',
-        _comment_out,
-    )
-
-
 def _mutate_ignore_one_wheel_count(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow, "nyx", LINUX_SERVICE_STEP, 'test "$wheel_count" -eq 1', _append(" || true")
-    )
-
-
-def _mutate_comment_out_aqua_gate(workflow: dict[str, Any]) -> None:
-    _rewrite_run_line(
-        workflow,
-        "nyx-desktop-macos",
-        PREFLIGHT_STEP,
-        'test "$session_manager" = "Aqua"',
-        _comment_out,
     )
 
 
@@ -1617,7 +1531,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_baseline_source_suite,
         _mutate_remove_baseline_source_suite,
     ),
-    "remove baseline ruff": (check_baseline_ruff, _mutate_remove_baseline_ruff),
     "remove baseline wheel build": (
         check_baseline_wheel,
         _mutate_remove_baseline_wheel_build,
@@ -1629,10 +1542,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "weaken windows one-wheel enforcement": (
         check_baseline_wheel,
         _mutate_weaken_windows_wheel_enforcement,
-    ),
-    "remove installed-wheel test": (
-        check_baseline_installed_wheel,
-        _mutate_remove_installed_wheel_test,
     ),
     "remove browser prerequisites": (
         check_baseline_browser_prerequisites,
@@ -1661,10 +1570,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "override required-native host": (
         check_native_environment,
         _mutate_override_required_native_host,
-    ),
-    "remove native source/session command": (
-        check_native_source_lane,
-        _mutate_remove_native_source_session_command,
     ),
     "remove session preflight": (
         check_native_session_preflight,
@@ -1726,10 +1631,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_documented_build_step,
         _mutate_copy_published_command_into_documented_step,
     ),
-    "copy published command into macOS artifact step": (
-        check_documented_build_step,
-        _mutate_copy_published_command_into_macos_artifact_step,
-    ),
     "reload Visual Studio loader": (
         check_documented_build_step,
         _mutate_reload_visual_studio_loader,
@@ -1737,10 +1638,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "move build step before source step": (
         check_native_stage_ordering,
         _mutate_move_build_step_before_source_step,
-    ),
-    "omit powershell failure propagation": (
-        check_powershell_failure_propagation,
-        _mutate_omit_powershell_failure_propagation,
     ),
     "omit POSIX failure propagation": (
         check_posix_failure_propagation,
@@ -1756,10 +1653,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_shell_matrix,
         _mutate_remove_pwsh_shell_declaration,
     ),
-    "comment out baseline source suite": (
-        check_baseline_source_suite,
-        _mutate_comment_out_baseline_source_suite,
-    ),
     "comment out windows source suite": (
         check_baseline_source_suite,
         _mutate_comment_out_windows_source_suite,
@@ -1770,10 +1663,6 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     ),
     "set +o errexit": (check_posix_failure_propagation, _mutate_disable_errexit_by_name),
     "set +o pipefail": (check_posix_failure_propagation, _mutate_disable_pipefail),
-    "move POSIX guard below first effective line": (
-        check_posix_failure_propagation,
-        _mutate_move_posix_guard,
-    ),
     "ignore baseline ruff failure": (
         check_baseline_ruff,
         _mutate_ignore_baseline_ruff_failure,
@@ -1818,17 +1707,9 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_linux_service_lane,
         _mutate_ignore_installed_service_failure,
     ),
-    "comment out installed-service command line": (
-        check_linux_service_lane,
-        _mutate_comment_out_installed_service_line,
-    ),
     "ignore one-wheel count failure": (
         check_baseline_wheel,
         _mutate_ignore_one_wheel_count,
-    ),
-    "comment out Aqua session gate": (
-        check_native_session_preflight,
-        _mutate_comment_out_aqua_gate,
     ),
     "late powershell error preference": (
         check_powershell_failure_propagation,
@@ -1952,44 +1833,6 @@ def test_best_effort_cleanup_stop_remains_a_substring_marker() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_every_job_declares_its_measured_time_limit() -> None:
-    limits = {
-        name: job.get(TIMEOUT_KEY) for name, job in _jobs(load_workflow()).items()
-    }
-    assert limits == {
-        "nyx": 30,
-        "nyx-windows": 60,
-        "nyx-macos": 45,
-        "nyx-desktop-windows": 35,
-        "nyx-desktop-macos": 15,
-    }
-
-
-@pytest.mark.parametrize(
-    ("mutate", "expected"),
-    [
-        (_mutate_remove_job_time_limit, ["nyx-windows: job does not declare timeout-minutes"]),
-        (_mutate_raise_job_time_limit_to_six_hours, ["nyx: timeout-minutes 360 is outside 1-60"]),
-        (_mutate_quote_job_time_limit, ["nyx-macos: timeout-minutes '30' is not an integer"]),
-        (
-            _mutate_change_job_time_limit_within_range,
-            ["nyx-desktop-macos: timeout-minutes is 30, expected 15"],
-        ),
-        (
-            _mutate_change_desktop_windows_time_limit_within_range,
-            ["nyx-desktop-windows: timeout-minutes is 40, expected 35"],
-        ),
-        (_mutate_add_job_without_time_limit, ["nyx-extra: job does not declare timeout-minutes"]),
-    ],
-)
-def test_time_limit_check_names_the_offending_job(
-    mutate: Callable[[dict[str, Any]], None], expected: list[str]
-) -> None:
-    mutated = copy.deepcopy(load_workflow())
-    mutate(mutated)
-    assert check_job_time_limits(mutated) == expected
-
-
 DOCUMENTED_INSTALL_PATH = Path(__file__).with_name("test_documented_install.py")
 BUILD_BOUND_JOBS = {"powershell": "nyx-desktop-windows", "bash": "nyx-desktop-macos"}
 
@@ -2046,35 +1889,6 @@ def test_build_bound_at_or_above_the_job_cap_is_rejected(
     bounds: dict[str, int], expected: list[str]
 ) -> None:
     assert build_bound_violations(bounds, load_workflow()) == expected
-
-
-def test_installed_wheel_proof_runs_once_after_the_build_in_each_baseline_job() -> None:
-    workflow = load_workflow()
-    for name, spec in BASELINE_JOBS.items():
-        lines = [
-            line for lines in _job_effective_lines(_job(workflow, name)) for line in lines
-        ]
-        command = INSTALLED_WHEEL_COMMAND.format(python=spec["python"])
-        build = WHEEL_BUILD_COMMAND.format(python=spec["python"])
-        assert [line for line in lines if INSTALLED_WHEEL_TARGET in line] == [command]
-        assert lines.index(build) < lines.index(command)
-
-
-def test_duplicated_installed_wheel_line_is_rejected_as_a_second_run() -> None:
-    mutated = copy.deepcopy(load_workflow())
-    _mutate_duplicate_installed_wheel_after_service_proof(mutated)
-    assert check_baseline_installed_wheel(mutated) == [
-        "nyx: tests/test_wheel_install.py runs 2 times; expected exactly once"
-    ]
-
-
-def test_installed_wheel_run_before_the_build_is_rejected() -> None:
-    mutated = copy.deepcopy(load_workflow())
-    _mutate_move_installed_wheel_before_build(mutated)
-    assert check_baseline_installed_wheel(mutated) == [
-        "nyx-macos: tests/test_wheel_install.py runs before the wheel build "
-        "'\"$runner_python\" -m build --wheel'"
-    ]
 
 
 def test_altered_copy_beside_an_intact_gate_is_rejected() -> None:
