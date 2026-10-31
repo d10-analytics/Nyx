@@ -178,6 +178,9 @@ COMPLETION_GUIDANCE_MARKERS = {
     ),
 }
 CHECKOUT_RETIRED_WORDING = (
+    "A branch created at the default branch's head with no commit of its own is "
+    "already part of the default branch, so it reads `merged · cleanup pending ...` "
+    "like a branch that was merged.",
     "the clone that fetched and whose newer of last fetch and last move of that "
     "remote-tracking branch is latest",
     "a push moves the pusher's remote-tracking branch but not its fetch time",
@@ -897,9 +900,26 @@ CODE_STATUS_MARKERS = (
     "` · in <name>, <name>`",
     "` · in N other worktrees` instead",
     "A branch that exists only on the remote reads `merge state unknown`.",
-    "A branch created at the default branch's head with no commit of its own is "
-    "already part of the default branch, so it reads `merged · cleanup pending ...` "
-    "like a branch that was merged.",
+    "0. At least one local copy exists, every local copy is a branch with no commit of "
+    "its own, and the remote copy, if there is one, is at the commit of one of them: "
+    "`in progress · no commits yet`.",
+    "its reflog holds exactly one entry, the branch's creation "
+    "(`branch: Created from ...`), and its tip is among the latest 5,000 commits of the "
+    "default branch's first-parent history.",
+    "so a finished or superseded package whose branch has no commit reads "
+    "`in progress · no commits yet` too. Rules 1 to 4 keep their numbers.",
+    "the copy counts as unknown in rules 1 to 4, so the package reads "
+    "`merge state unknown` rather than `merged · cleanup pending ...`.",
+    "A fresh branch whose reflog gained any other entry (renamed, reset with "
+    "`git branch -f`, or fast-forwarded to a newer default head) reads "
+    "`merged · cleanup pending ...`, like a branch that was merged.",
+    "A branch checked out from a remote branch that was fast-forward merged reads "
+    "`in progress · no commits yet`.",
+    "A clone with no branch reflog, such as a bare repository or one with "
+    "`core.logAllRefUpdates=false`, or whose reflog has expired, reads "
+    "`merged · cleanup pending ...` for such a branch.",
+    "A branch with no commit of its own that is more than 5,000 first-parent commits "
+    "behind the default branch reads `merged · cleanup pending ...`.",
     "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
     "branch that exists only on the remote, which Nyx does not compute.",
     "A clone whose status is not ok, such as one git could not read or one with too "
@@ -931,6 +951,7 @@ CODE_STATUS_MARKERS = (
 )
 # The rule texts, in the order the section states them.
 CODE_STATUS_RULE_ORDER = (
+    "0. At least one local copy exists,",
     "1. Every copy is merged:",
     "2. A pull request for the branch is open",
     "3. Some copy is not merged, and then:",
@@ -1643,6 +1664,7 @@ def test_checkout_guide_texts_equal_the_texts_the_code_builds():
         build("awaiting_merge"),
         build("superseded"),
         build("unknown"),
+        build("no_commits_yet"),
         pull_request,
         unpushed_pull_request[len(pull_request):],
         build("in_progress", push="pushed")[: -len("pushed")],
