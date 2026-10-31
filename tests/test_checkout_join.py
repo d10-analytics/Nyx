@@ -3314,6 +3314,67 @@ def test_a_branch_made_by_a_remote_branch_checkout_after_a_merge_commit_reads_me
     )
 
 
+def reflog_subjects(member: Path, name: str) -> list[str]:
+    shown = git(member, "reflog", "show", "--format=%gs", f"refs/heads/{name}").stdout
+    return [line for line in shown.split("\n") if line]
+
+
+def test_a_branch_whose_only_reflog_entry_is_not_a_creation_reads_merged(status_world):
+    w = status_world
+    git(w.a, "checkout", "-q", "-b", "feat", "trunk")
+    w.commit(w.a)
+    git(w.a, "push", "-q", "origin", "feat")
+    git(w.a, "checkout", "-q", "trunk")
+    git(w.a, "merge", "-q", "--ff-only", "feat")
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "branch", "-q", "-D", "feat")
+    git(w.b, "fetch", "-q", "origin")
+    git(w.b, "fetch", "-q", "origin", "feat:feat")
+    entries = reflog_subjects(w.b, "feat")
+    assert len(entries) == 1 and not entries[0].startswith("branch: Created from"), (
+        "control: one entry, and it is not a creation",
+        entries,
+    )
+    assert git(w.b, "rev-list", "--count", "feat..origin/trunk").stdout.strip() == "0", (
+        "control: the tip is the default branch head"
+    )
+    w.package("fetched", "feat", target=w.b)
+
+    document = w.collect(remote_checks=False)
+
+    assert_status(
+        document, "fetched", f"merged {DOT} cleanup pending (1 branch)", "merged",
+        cleanup={"worktrees": 0, "branches": 1},
+    )
+
+
+def test_a_branch_reads_no_commits_yet_only_within_the_first_parent_limit(
+    status_world, monkeypatch
+):
+    limit = 3
+    monkeypatch.setattr(checkouts, "FIRST_PARENT_LIMIT", limit)
+    w = status_world
+    w.commit(w.a, limit + 1)
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "branch", "inside", f"trunk~{limit - 1}")
+    git(w.a, "branch", "outside", f"trunk~{limit}")
+    for name, behind in (("inside", limit - 1), ("outside", limit)):
+        counted = git(w.a, "rev-list", "--first-parent", "--count", f"{name}..trunk")
+        assert counted.stdout.strip() == str(behind), (
+            f"control: {name} is {behind} first-parent commits behind"
+        )
+        assert len(reflog_subjects(w.a, name)) == 1, "control: one creation entry"
+        w.package(name, name)
+
+    document = w.collect(remote_checks=False)
+
+    assert_no_commits(document, "inside")
+    assert_status(
+        document, "outside", f"merged {DOT} cleanup pending (1 branch)", "merged",
+        cleanup={"worktrees": 0, "branches": 1},
+    )
+
+
 def test_pushing_a_branch_with_no_commit_keeps_it_and_a_pushed_commit_makes_it_unknown(
     status_world,
 ):
@@ -3420,13 +3481,15 @@ def test_a_no_commit_check_the_deadline_cuts_leaves_the_package_unknown_and_all_
         tmp_path, "slow-reflog", 'case "$*" in *"reflog show"*"refs/heads/"*) exec sleep 60;; esac'
     )
     # No saved verdict may stand in for one the deadline would cut.
-    nyx_home(use_fresh_home(tmp_path, monkeypatch, Path(os.environ["HOME"])))
+    cache = nyx_home(use_fresh_home(tmp_path, monkeypatch, Path(os.environ["HOME"])))
 
     with path_with(monkeypatch, slow):
         document = world.collect(seconds=3.0)
 
     assert_status(document, "fresh", "merge state unknown", "unknown")
     assert branch_facts(document) == undelayed
+    assert "checkout_cache_write_failed" not in [item["code"] for item in document["diagnostics"]]
+    assert cache_entries(cache), "the cut left the cache writable and holding verdicts"
     assert_no_commits(world.collect(), "fresh")
 
 

@@ -48,6 +48,7 @@ from test_wheel_install import (
 
 from nyx import catalog
 from nyx._native_claim import NativeClaim
+from nyx.checkouts import FIRST_PARENT_LIMIT
 
 REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 DOCUMENTS = ("README.md", "docs/running-nyx.md")
@@ -1637,6 +1638,9 @@ def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limit
     _assert_unique_markers(code_status, CODE_STATUS_MARKERS, "docs/running-nyx.md")
     positions = [code_status.index(rule) for rule in CODE_STATUS_RULE_ORDER]
     assert positions == sorted(positions)
+    limit = f"{FIRST_PARENT_LIMIT:,}"
+    assert f"among the latest {limit} commits of the default branch's first-parent" in code_status
+    assert f"that is {limit} or more first-parent commits behind" in code_status
 
 
 def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
