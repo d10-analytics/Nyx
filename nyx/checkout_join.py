@@ -31,7 +31,9 @@ order. With no answer and no clone holding the ref the state is ``unknown``, nev
 Each such package also gets its Code Status. The facts are the branch's local copies (the
 branches of that name in the readable clones of the repository) and its remote copy. A
 remote copy whose tip equals no local copy's tip has no verdict and counts as unknown,
-never merged. The fields are stored in ``code_status`` and ``models.code_status_text``
+never merged. A branch none of whose local copies has a commit of its own, with a remote
+copy (if any) at the tip of one, reads ``no_commits_yet`` ahead of every other rule; a copy
+whose no-commit check did not run counts as unknown. The fields are stored in ``code_status`` and ``models.code_status_text``
 renders them, so a reader recomputes the text from the fields.
 """
 
@@ -189,6 +191,21 @@ def declared_branch_names(
     return {key: frozenset(found) for key, found in names.items()}
 
 
+def declared_names_by_repository(
+    repositories: Sequence[dict[str, Any]], packages: Sequence[dict[str, Any]]
+) -> list[frozenset[str]]:
+    """The branch names packages declare, one set per repository, aligned with
+    ``repositories``.
+
+    The matching is ``_declared``'s, so groups without a remote are included. The default
+    branch is not excluded, since a group's default is known only after its remote check.
+    """
+    names: dict[int, set[str]] = {}
+    for repository, package in _declared(repositories, packages):
+        names.setdefault(id(repository), set()).add(package["branch"]["name"])
+    return [frozenset(names.get(id(repository), ())) for repository in repositories]
+
+
 def _copy(state: str, sha: str | None = None, basis: str | None = None) -> dict[str, Any]:
     return {"state": state, "sha": sha, "basis": basis}
 
@@ -274,15 +291,21 @@ def _contained_chain(branches: Mapping[str, str | None], start: str) -> list[str
     return reached
 
 
-def _local_copies(repository: Mapping[str, Any], name: str) -> list[dict[str, Any]]:
-    """The local branches named ``name`` in the readable clones of ``repository``."""
-    return [
-        branch
-        for clone in repository["clones"]
-        if clone["status"] == "ok"
-        for branch in clone["branches"]
-        if branch["name"] == name
-    ]
+def _local_copies(
+    repository: Mapping[str, Any], name: str, no_commits: Mapping[tuple[str, str], str]
+) -> tuple[list[dict[str, Any]], list[str | None]]:
+    """The local branches named ``name`` in the readable clones of ``repository``, and the
+    no-commit state of each (``None``: the branch was not a candidate)."""
+    local: list[dict[str, Any]] = []
+    states: list[str | None] = []
+    for clone in repository["clones"]:
+        if clone["status"] != "ok":
+            continue
+        for branch in clone["branches"]:
+            if branch["name"] == name:
+                local.append(branch)
+                states.append(no_commits.get((clone["path"], name)))
+    return local, states
 
 
 def _verdict_state(branch: Mapping[str, Any]) -> str:
@@ -314,18 +337,28 @@ def _push_fragment(local: Sequence[Mapping[str, Any]], remote: Mapping[str, Any]
 def _code_status(
     package: Mapping[str, Any],
     local: Sequence[Mapping[str, Any]],
+    states: Sequence[str | None],
     remote: Mapping[str, Any] | None,
     *,
     every_package_finished: bool,
 ) -> dict[str, Any] | None:
     """The Code Status of ``package`` from the copies of its branch, or ``None`` when the
-    branch is found nowhere."""
+    branch is found nowhere.
+
+    ``states`` holds each local copy's no-commit state (``yes``, ``no``, ``unrun`` or
+    ``None`` for a copy that was no candidate). A copy whose check did not run counts as
+    ``unknown``, as does a remote copy that takes its verdict.
+    """
     remote_present = remote is not None and remote["state"] == "present"
     if not local and not remote_present:
         return None
-    verdicts = [_verdict_state(copy) for copy in local]
+    copy_verdicts = [
+        "unknown" if state == "unrun" else _verdict_state(copy)
+        for copy, state in zip(local, states)
+    ]
+    verdicts = list(copy_verdicts)
     if remote_present:
-        tips = {copy["sha"]: _verdict_state(copy) for copy in reversed(local)}
+        tips = {copy["sha"]: verdict for copy, verdict in reversed(list(zip(local, copy_verdicts)))}
         verdicts.append(tips.get(remote["sha"], "unknown"))
 
     held = sorted(
@@ -349,7 +382,11 @@ def _code_status(
         for pull in copy["pull_requests"]
         if pull["state"] == "open"
     ]
-    if all(verdict == "merged" for verdict in verdicts):
+    if local and all(state == "yes" for state in states) and (
+        not remote_present or remote["sha"] in {copy["sha"] for copy in local}
+    ):
+        status["state"] = "no_commits_yet"
+    elif all(verdict == "merged" for verdict in verdicts):
         status["state"] = "merged"
         status["cleanup"] = (
             {"worktrees": len(held), "branches": 0}
@@ -378,6 +415,7 @@ def join_branches(
     remotes: Mapping[str, RemoteFacts],
     *,
     scan_complete: bool,
+    no_commits: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """Match declared package branches to the branches of their repository.
 
@@ -394,7 +432,11 @@ def join_branches(
     a package that is not listed may still name the branch, so no branch is concluded to be
     named only by finished packages: the cross-package conclusion is withheld and the
     package reads by the remaining rules.
+
+    ``no_commits`` maps (clone path, branch name) to the collection's no-commit state of
+    a local branch (``yes``, ``no`` or ``unrun``); a branch absent from it was not checked.
     """
+    no_commits = no_commits or {}
     named: dict[int, dict[str, list[dict[str, Any]]]] = {}
     for repository, package in _declared(repositories, packages):
         if package["branch"]["name"] in _default_names(repository):
@@ -420,13 +462,13 @@ def join_branches(
             continue
         copies = {entry["name"]: entry["remote"] for entry in repository["package_branches"]}
         for name, named_packages in by_name.items():
-            local = _local_copies(repository, name)
+            local, states = _local_copies(repository, name, no_commits)
             every_finished = scan_complete and all(
                 package["finished"] for package in named_packages
             )
             for package in named_packages:
                 package["code_status"] = _code_status(
-                    package, local, copies[name], every_package_finished=every_finished
+                    package, local, states, copies[name], every_package_finished=every_finished
                 )
         for clone in repository["clones"]:
             if clone["status"] != "ok":

@@ -46,6 +46,7 @@ from .checkout_join import (
     RemoteFacts,
     TargetIndex,
     declared_branch_names,
+    declared_names_by_repository,
     join_branches,
     moved_at_or_after,
     resolve_target,
@@ -105,6 +106,8 @@ MERGE_RETAIN_CAP = 8 << 20
 CACHE_ENTRY_CAP = 8192
 # Verdict git calls stop this long before the deadline so the cache write has time.
 VERDICT_RESERVE_NS = 500_000_000
+# How many first-parent commits of a verdict base the no-commit check reads.
+FIRST_PARENT_LIMIT = 5000
 
 _ON_WINDOWS = os.name == "nt"
 _VERSION_LINE = re.compile(r"git version (?P<version>[0-9]+(?:\.[0-9]+)+\S*)")
@@ -1729,6 +1732,37 @@ def _ref_moved_at(runner: _GitRunner, context: _CloneContext, name: str) -> int 
     return int(match.group(1)) if match is not None else None
 
 
+_CREATED_FROM = "branch: Created from"
+
+
+def _creation_entries(
+    runner: _GitRunner, context: _CloneContext, name: str
+) -> list[tuple[str, str]] | None:
+    """The newest two reflog entries of the clone's ``refs/heads/<name>`` as (commit, subject),
+    newest first; ``[]`` when the clone keeps no reflog for it.
+
+    A cut or failed call (a ref deleted meanwhile exits 128 included) and an unreadable
+    line answer ``None``. This is not ``_ref_moved_at``: another namespace and fields, and
+    a failure there means not moved, where here it means the check did not run.
+    """
+    outcome = runner.run(
+        ["reflog", "show", "-n", "2", "--format=%H%x00%gs", f"refs/heads/{name}"],
+        path=context.cwd,
+        ceiling=context.ceiling,
+    )
+    if not outcome.ok:
+        return None
+    entries: list[tuple[str, str]] = []
+    for line in _decode(outcome.out).split("\n"):
+        if not line:
+            continue
+        sha, separator, subject = line.partition("\x00")
+        if not separator:
+            return None
+        entries.append((sha, subject))
+    return entries
+
+
 def _apply_live(
     runner: _GitRunner,
     context: _CloneContext,
@@ -2493,6 +2527,16 @@ class _Ladder:
             result[sha] = tip.verdict
         return result
 
+    def first_parent_chain(self) -> frozenset[str] | None:
+        """The newest ``FIRST_PARENT_LIMIT`` commits on the base's first-parent chain, or
+        ``None`` when the listing was cut or failed."""
+        listing = self._git(
+            ["rev-list", "--first-parent", f"--max-count={FIRST_PARENT_LIMIT}", self._base.sha]
+        )
+        if not listing.ok:
+            return None
+        return frozenset(_decode(listing.out).split())
+
     def _priority(self, tip: _Tip) -> tuple[int, int, int]:
         """Tips with no saved answer first, then the oldest saved answer, then the newest.
 
@@ -3025,6 +3069,7 @@ class _CloneVerdicts:
 
     used: frozenset[str] = frozenset()
     fresh: Mapping[str, str] = field(default_factory=dict)
+    base: _Base | None = None
 
 
 def _assign_clone_verdicts(
@@ -3066,7 +3111,7 @@ def _assign_clone_verdicts(
     ladder = (
         _Ladder(runner, context, base, settings, cache, pulls) if subjects or detached else None
     )
-    result = _CloneVerdicts()
+    result = _CloneVerdicts(base=base)
     if ladder is not None:
         decided = ladder.decide(
             [(branch["name"], branch["sha"]) for branch in subjects],
@@ -3076,7 +3121,7 @@ def _assign_clone_verdicts(
             branch["verdict"] = dict(decided[branch["sha"]])
         for worktree in detached:
             worktree["verdict"] = dict(decided[worktree["head"]["sha"]])
-        result = _CloneVerdicts(frozenset(ladder.used), dict(ladder.fresh))
+        result = _CloneVerdicts(frozenset(ladder.used), dict(ladder.fresh), base)
     # Containment runs after the verdict rungs, on the same runner and so the
     # same deadline, so the cache write keeps its reserve.  Patch equivalence
     # cannot be proved in a shallow or partial clone or below the patch floor.
@@ -3166,6 +3211,95 @@ def _assign_verdicts(
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
         return dict(pool.map(decide, jobs))
+
+
+NO_COMMITS_YES = "yes"
+NO_COMMITS_NO = "no"
+NO_COMMITS_UNRUN = "unrun"
+
+
+def _no_commit_states(
+    runner: _GitRunner,
+    clone: dict[str, Any],
+    context: _CloneContext,
+    base: _Base,
+    candidates: Sequence[dict[str, Any]],
+    settings: _VerdictSettings,
+) -> dict[str, str]:
+    """The no-commit state of each candidate branch of one clone, by branch name.
+
+    ``unrun``: a call was cut or failed, or the branch moved since it was collected.
+    ``yes``: exactly one reflog entry, a creation, and the tip on the base's first-parent
+    chain. Otherwise ``no``.
+    """
+    ladder = _Ladder(runner, context, base, settings)
+    chain: frozenset[str] | None = None
+    listed = False
+    states: dict[str, str] = {}
+    for branch in candidates:
+        entries = _creation_entries(runner, context, branch["name"])
+        if entries is None or (entries and entries[0][0] != branch["sha"]):
+            states[branch["name"]] = NO_COMMITS_UNRUN
+        elif len(entries) != 1 or not entries[0][1].startswith(_CREATED_FROM):
+            states[branch["name"]] = NO_COMMITS_NO
+        else:
+            if not listed:
+                chain, listed = ladder.first_parent_chain(), True
+            if chain is None:
+                states[branch["name"]] = NO_COMMITS_UNRUN
+            else:
+                states[branch["name"]] = (
+                    NO_COMMITS_YES if branch["sha"] in chain else NO_COMMITS_NO
+                )
+    return states
+
+
+def _assign_no_commits(
+    runner: _GitRunner,
+    repositories: list[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    verdicts: Mapping[str, _CloneVerdicts],
+    declared: Sequence[frozenset[str]],
+    settings: _VerdictSettings,
+    max_parallel: int,
+) -> dict[tuple[str, str], str]:
+    """Decide, for every local copy of a package branch the first pass found merged by
+    ``ancestor``, whether the branch has no commit of its own.
+
+    Runs after every clone's first-pass job has finished, one job per clone with
+    candidates. Reads only; the result is handed to the join and stored nowhere else.
+    Returns each candidate's state by (clone path, branch name).
+    """
+    jobs = []
+    for repository, names in zip(repositories, declared):
+        if not names:
+            continue
+        for clone, context in _usable_clones(repository["clones"], contexts):
+            decided = verdicts.get(clone["path"])
+            if decided is None or decided.base is None:
+                continue
+            candidates = [
+                branch
+                for branch in clone["branches"]
+                if branch["name"] in names
+                and branch["verdict"] is not None
+                and branch["verdict"]["state"] == "merged"
+                and branch["verdict"]["rung"] == "ancestor"
+            ]
+            if candidates:
+                jobs.append((clone, context, decided.base, candidates))
+
+    def decide(job: Any) -> dict[tuple[str, str], str]:
+        clone, context, base, candidates = job
+        states = _no_commit_states(runner, clone, context, base, candidates, settings)
+        return {(clone["path"], name): state for name, state in states.items()}
+
+    result: dict[tuple[str, str], str] = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+            for states in pool.map(decide, jobs):
+                result.update(states)
+    return result
 
 
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
@@ -3611,6 +3745,7 @@ def collect_checkouts(
     repositories: list[dict[str, Any]] = []
     packages: list[dict[str, Any]]
     remote_facts: dict[str, RemoteFacts] = {}
+    no_commits: dict[tuple[str, str], str] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -3691,15 +3826,25 @@ def collect_checkouts(
         # Verdict calls stop early so the cache write still fits before the deadline.
         verdict_runner = runner.with_deadline(deadline_ns - VERDICT_RESERVE_NS)
         with tempfile.TemporaryDirectory(prefix="nyx-verdicts-") as scratch:
+            settings = _verdict_settings(scratch, git_state["version"])
             verdicts = _assign_verdicts(
                 verdict_runner,
                 repositories,
                 contexts,
                 bases,
-                _verdict_settings(scratch, git_state["version"]),
+                settings,
                 max_parallel,
                 cache.verdicts,
                 pulls,
+            )
+            no_commits = _assign_no_commits(
+                verdict_runner,
+                repositories,
+                contexts,
+                verdicts,
+                declared_names_by_repository(repositories, packages),
+                settings,
+                max_parallel,
             )
         _assign_removable(repositories)
         if cache_path is not None:
@@ -3715,6 +3860,7 @@ def collect_checkouts(
         packages,
         remote_facts,
         scan_complete=package_heads is not None and package_heads.status == "complete",
+        no_commits=no_commits,
     )
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
