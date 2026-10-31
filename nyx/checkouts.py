@@ -1745,8 +1745,19 @@ def _creation_entries(
     line answer ``None``. This is not ``_ref_moved_at``: another namespace and fields, and
     a failure there means not moved, where here it means the check did not run.
     """
+    # As in every other log call here, signature checks are off: with
+    # ``log.showSignature`` set, git would print verification lines between the
+    # entries and no candidate could be read.
     outcome = runner.run(
-        ["reflog", "show", "-n", "2", "--format=%H%x00%gs", f"refs/heads/{name}"],
+        [
+            "reflog",
+            "show",
+            "--no-show-signature",
+            "-n",
+            "2",
+            "--format=%H%x00%gs",
+            f"refs/heads/{name}",
+        ],
         path=context.cwd,
         ceiling=context.ceiling,
     )
