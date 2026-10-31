@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 5)
+# Checkout facts document (schema 6)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 5
+CHECKOUTS_SCHEMA_VERSION = 6
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -836,7 +836,15 @@ _CODE_STATUS_KEYS = frozenset(
     }
 )
 _CODE_STATUS_STATES = frozenset(
-    {"merged", "pr_open", "awaiting_merge", "superseded", "in_progress", "unknown"}
+    {
+        "merged",
+        "pr_open",
+        "awaiting_merge",
+        "superseded",
+        "in_progress",
+        "no_commits_yet",
+        "unknown",
+    }
 )
 _CODE_STATUS_PUSHES = frozenset({"pushed", "unpushed", "not_pushed", "unknown"})
 _CLEANUP_KEYS = frozenset({"worktrees", "branches"})
@@ -1030,6 +1038,8 @@ def code_status_text(fields: Mapping[str, Any]) -> str:
             "unpushed": f"{fields['unpushed']} unpushed",
         }.get(push, "push state unknown")
         text = f"in progress \u00b7 {fragment}"
+    elif state == "no_commits_yet":
+        text = "in progress \u00b7 no commits yet"
     else:
         text = "merge state unknown"
     paths = fields["checked_out_elsewhere"]

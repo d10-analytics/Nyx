@@ -2165,7 +2165,7 @@ def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 5
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 6
     assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
     assert [
         (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])

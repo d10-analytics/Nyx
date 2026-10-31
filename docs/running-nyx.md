@@ -610,6 +610,14 @@ on the remote. A copy whose verdict is `unknown`, such as a branch in a clone wi
 base, counts as neither merged nor not merged. The first of these rules that matches
 decides the text, and the order matters:
 
+0. At least one local copy exists, every local copy is a branch with no commit of its
+   own, and the remote copy, if there is one, is at the commit of one of them:
+   `in progress · no commits yet`. A local copy has no commit of its own when its
+   reflog holds exactly one entry, the branch's creation (`branch: Created from ...`),
+   and its tip is among the latest 5,000 commits of the default branch's first-parent
+   history. This rule comes before rule 3, so a finished or superseded package whose
+   branch has no commit reads `in progress · no commits yet` too. Rules 1 to 4 keep
+   their numbers.
 1. Every copy is merged: `merged · cleanup pending (N worktrees)`, where N counts
    the distinct checkouts that have the branch checked out, the package's own
    target included. When none does, it reads `merged · cleanup pending (N
@@ -648,9 +656,23 @@ worktrees` instead. The `--json` document keeps every path.
 - A branch that exists only on the remote reads `merge state unknown`. A remote
   copy at a commit that no local copy holds counts as unknown too, so it keeps a
   merged local branch from reading as merged.
-- A branch created at the default branch's head with no commit of its own is
-  already part of the default branch, so it reads `merged · cleanup pending ...`
-  like a branch that was merged.
+- When the check for a branch with no commit of its own did not run, because its
+  reflog read or its first-parent listing was cut by the time limit or failed, or
+  because the branch moved during the run, that copy counts as unknown in rules 1
+  to 4 and can never make the package read `merged · cleanup pending ...`. With no
+  other deciding copy the package reads `merge state unknown`; a copy of the same
+  branch that is not merged, or an open pull request, still decides by rules 2 and
+  3.
+- A fresh branch whose reflog gained any other entry (renamed, reset with
+  `git branch -f`, or fast-forwarded to a newer default head) reads
+  `merged · cleanup pending ...`, like a branch that was merged.
+- A branch checked out from a remote branch that was fast-forward merged reads
+  `in progress · no commits yet`.
+- A clone with no branch reflog, such as a bare repository or one with
+  `core.logAllRefUpdates=false`, or whose reflog has expired, reads
+  `merged · cleanup pending ...` for such a branch.
+- A branch with no commit of its own that is 5,000 or more first-parent commits
+  behind the default branch reads `merged · cleanup pending ...`.
 - Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
   branch that exists only on the remote, which Nyx does not compute.
 - A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
