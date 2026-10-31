@@ -8,6 +8,7 @@ changes any outcome.  Timeouts are lowered only through collector parameters.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import re
@@ -1358,9 +1359,9 @@ def redigest(document: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
-@pytest.fixture
-def sample(tmp_path):
-    """A document with two ordered clones, an outside worktree, a stash and freshness."""
+def build_sample(tmp_path: Path) -> tuple[str, Path]:
+    """The collector text and folder of two ordered clones, an outside worktree, a
+    stash and freshness."""
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
@@ -1376,7 +1377,22 @@ def sample(tmp_path):
     text = checkouts.collect_checkouts(
         [str(folder)], deadline_ns=time.monotonic_ns() + 60 * 10**9
     )
+    return text, folder
+
+
+@pytest.fixture(scope="module")
+def shared_sample(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "sample") as (directory, _home, _patch):
+        text, folder = build_sample(directory)
     return json.loads(text), folder
+
+
+@pytest.fixture
+def sample(shared_sample):
+    """A private copy of the document with two ordered clones, an outside worktree,
+    a stash and freshness."""
+    document, folder = shared_sample
+    return doc_copy(document), folder
 
 
 def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
@@ -11888,9 +11904,16 @@ class PullRequestWorld:
         )
 
 
+@pytest.fixture(scope="module")
+def shared_pull_requests(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "pull-requests") as (directory, home, patch):
+        return PullRequestWorld(directory, patch, home), home
+
+
 @pytest.fixture
-def pull_requests(tmp_path, monkeypatch, isolated_git):
-    return PullRequestWorld(tmp_path, monkeypatch, isolated_git)
+def pull_requests(shared_pull_requests):
+    world, _home = shared_pull_requests
+    return copy.deepcopy(world)
 
 
 class OfflineWorld:
@@ -11909,9 +11932,58 @@ class OfflineWorld:
         self.github_off = collect([self.folder])
 
 
+@pytest.fixture(scope="module")
+def shared_offline(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "offline") as (directory, _home, _patch):
+        return OfflineWorld(directory)
+
+
 @pytest.fixture
-def offline(tmp_path):
-    return OfflineWorld(tmp_path)
+def offline(shared_offline):
+    return copy.deepcopy(shared_offline)
+
+
+def last_author(repository: Path) -> str:
+    return git(repository, "log", "-1", "--format=%an <%ae>").stdout.strip()
+
+
+def test_the_shared_sample_and_offline_worlds_were_built_under_the_test_identity(
+    shared_sample, shared_offline
+):
+    _document, folder = shared_sample
+    assert last_author(folder / "Repo Clone 2") == "Test <test@example.com>"
+    assert last_author(shared_offline.work) == "Test <test@example.com>"
+
+
+@posix_only
+def test_the_shared_pull_request_world_was_built_under_its_own_isolated_home(
+    shared_pull_requests,
+):
+    world, home = shared_pull_requests
+    assert last_author(world.a) == "Test <test@example.com>"
+    assert (home / ".nyx" / "cache" / "checkouts.json").is_file()
+    state = world.folder.parent / "fake-gh-state"
+    calls = [GhCall(path) for path in sorted(state.glob("call.*"))]
+    assert calls
+    for call in calls:
+        assert not set(call.environment) & set(GITHUB_SCRUBBED)
+
+
+def test_a_sample_handout_is_a_private_copy(sample, shared_sample):
+    document, _folder = sample
+    document["repositories"].clear()
+    assert shared_sample[0]["repositories"]
+
+
+def test_an_offline_handout_is_a_private_copy(offline, shared_offline):
+    offline.setting_off["repositories"].clear()
+    assert shared_offline.setting_off["repositories"]
+
+
+@posix_only
+def test_a_pull_request_handout_is_a_private_copy(pull_requests, shared_pull_requests):
+    pull_requests.live["repositories"].clear()
+    assert shared_pull_requests[0].live["repositories"]
 
 
 def test_the_collector_documents_of_every_kind_parse_through_the_collect_helper(offline):
