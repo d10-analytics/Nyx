@@ -25,6 +25,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     install_fake_gh,
     isolated_git,
     land,
+    last_author,
     linked,
     local_names,
     make_remote,
@@ -39,6 +40,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     redigest,
     refusal_of,
     rev,
+    shared_world_build,
     stand_in,
 )
 
@@ -759,8 +761,7 @@ def push_branch(repository: Path, name: str) -> None:
     git(repository, "push", "-q", "origin", name)
 
 
-@pytest.fixture
-def matching(tmp_path):
+def build_matching(tmp_path: Path) -> dict[str, Path]:
     """Clones A and B of remote R, clone C of remote S, a clone D with no remote."""
     remote_r = make_remote(tmp_path, "r.git")
     remote_s = make_remote(tmp_path, "s.git")
@@ -793,42 +794,57 @@ def matching(tmp_path):
     return {"folder": folder, "root": root, "a": a, "b": b, "c": c, "d": d}
 
 
+@pytest.fixture
+def matching(tmp_path):
+    return build_matching(tmp_path)
+
+
+@pytest.fixture(scope="module")
+def shared_matching(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "matching") as (directory, _home, _patch):
+        layout = build_matching(directory)
+        document = collect_packages([layout["folder"]], layout["root"])
+    # The unmutated document is accepted, so each refusal below comes from its mutation.
+    assert models.parse_checkouts(json.dumps(redigest(doc_copy(document))))
+    return layout, document
+
+
 def path_of(name: str) -> str:
     return f"Fictional/Drafts/{name}"
 
 
-def test_a_branch_is_matched_by_repository_group_and_not_by_name(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_a_branch_is_matched_by_repository_group_and_not_by_name(collected, collected_layout):
+    document = collected
 
-    a = clone_at(document, matching["a"])
+    a = clone_at(document, collected_layout["a"])
     assert a["verdict_base"] is not None and a["containment"] == "complete"
     assert references_of(a, "topic") == [(path_of("target"), "target_clone")]
-    assert references_of(clone_at(document, matching["b"]), "topic") == [
+    assert references_of(clone_at(document, collected_layout["b"]), "topic") == [
         (path_of("target"), "sibling_clone")
     ]
     # Clone C shares the branch name with another repository's package, and the
     # package that targets C is the only one it serves.
-    assert references_of(clone_at(document, matching["c"]), "topic") == [
+    assert references_of(clone_at(document, collected_layout["c"]), "topic") == [
         (path_of("on_c"), "target_clone")
     ]
-    assert references_of(clone_at(document, matching["d"]), "topic") == [
+    assert references_of(clone_at(document, collected_layout["d"]), "topic") == [
         (path_of("on_d"), "target_clone")
     ]
-    assert entries_of(repository_of(document, matching["a"])) == [
+    assert entries_of(repository_of(document, collected_layout["a"])) == [
         ("topic", [path_of("target")])
     ]
-    assert entries_of(repository_of(document, matching["c"])) == [
+    assert entries_of(repository_of(document, collected_layout["c"])) == [
         ("topic", [path_of("on_c")])
     ]
-    assert entries_of(repository_of(document, matching["d"])) == [
+    assert entries_of(repository_of(document, collected_layout["d"])) == [
         ("topic", [path_of("on_d")])
     ]
 
 
-def test_a_helper_branch_contained_in_a_package_branch_is_folded_under_it(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_a_helper_branch_contained_in_a_package_branch_is_folded_under_it(collected, collected_layout):
+    document = collected
 
-    for member in (matching["a"], matching["b"]):
+    for member in (collected_layout["a"], collected_layout["b"]):
         helper = [b for b in clone_at(document, member)["branches"] if b["name"] == "helper"]
         assert [b["contained_in"] for b in helper] == ["topic"]
         assert references_of(clone_at(document, member), "helper") == [
@@ -836,14 +852,14 @@ def test_a_helper_branch_contained_in_a_package_branch_is_folded_under_it(matchi
         ]
     # The other repository's helper folds under its own topic and serves only
     # the package that targets that repository.
-    assert references_of(clone_at(document, matching["c"]), "helper") == [
+    assert references_of(clone_at(document, collected_layout["c"]), "helper") == [
         (path_of("on_c"), "contained")
     ]
-    assert references_of(clone_at(document, matching["a"]), "trunk") == []
+    assert references_of(clone_at(document, collected_layout["a"]), "trunk") == []
 
 
-def test_packages_that_name_no_declared_branch_match_nothing(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_packages_that_name_no_declared_branch_match_nothing(collected):
+    document = collected
 
     served = {
         reference["package_path"]
@@ -867,8 +883,8 @@ def test_packages_that_name_no_declared_branch_match_nothing(matching):
     assert listed == expected
 
 
-def test_a_package_naming_the_default_branch_is_not_matched(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_a_package_naming_the_default_branch_is_not_matched(collected, collected_layout):
+    document = collected
 
     package = {p["package_path"]: p for p in document["packages"]}[path_of("default")]
     assert set(package["branch"]) == models._PACKAGE_BRANCH_KEYS
@@ -876,10 +892,10 @@ def test_a_package_naming_the_default_branch_is_not_matched(matching):
     assert package["branch"]["name"] is None
     assert path_of("default") not in {
         path
-        for entry in repository_of(document, matching["a"])["package_branches"]
+        for entry in repository_of(document, collected_layout["a"])["package_branches"]
         for path in entry["packages"]
     }
-    for member in (matching["a"], matching["b"]):
+    for member in (collected_layout["a"], collected_layout["b"]):
         assert all(
             reference[0] != path_of("default")
             for branch in clone_at(document, member)["branches"]
@@ -957,9 +973,9 @@ def reference_mutation(document: dict[str, Any], change) -> str:
     return refusal_of(mutated)
 
 
-def test_the_parser_refuses_a_reference_its_package_does_not_back(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
-    a_index = document["repositories"].index(repository_of(document, matching["a"]))
+def test_the_parser_refuses_a_reference_its_package_does_not_back(collected, collected_layout):
+    document = collected
+    a_index = document["repositories"].index(repository_of(document, collected_layout["a"]))
 
     def topic(doc: dict[str, Any], member: Path) -> dict[str, Any]:
         (found,) = [b for b in clone_at(doc, member)["branches"] if b["name"] == "topic"]
@@ -970,20 +986,20 @@ def test_the_parser_refuses_a_reference_its_package_does_not_back(matching):
         return found
 
     def sibling_as_target(doc):
-        topic(doc, matching["b"])["packages"][0]["basis"] = "target_clone"
+        topic(doc, collected_layout["b"])["packages"][0]["basis"] = "target_clone"
 
     def target_as_sibling(doc):
-        topic(doc, matching["a"])["packages"][0]["basis"] = "sibling_clone"
+        topic(doc, collected_layout["a"])["packages"][0]["basis"] = "sibling_clone"
 
     def other_repository(doc):
-        topic(doc, matching["c"])["packages"][0]["package_path"] = path_of("target")
+        topic(doc, collected_layout["c"])["packages"][0]["package_path"] = path_of("target")
 
     def not_contained(doc):
-        helper(doc, matching["a"])["packages"][0]["basis"] = "contained"
-        helper(doc, matching["a"])["contained_in"] = None
+        helper(doc, collected_layout["a"])["packages"][0]["basis"] = "contained"
+        helper(doc, collected_layout["a"])["contained_in"] = None
 
     def unknown_package(doc):
-        topic(doc, matching["a"])["packages"][0]["package_path"] = "Fictional/Drafts/zz"
+        topic(doc, collected_layout["a"])["packages"][0]["package_path"] = "Fictional/Drafts/zz"
 
     def wrong_name(doc):
         doc["repositories"][a_index]["package_branches"][0]["name"] = "helper"
@@ -1082,8 +1098,8 @@ def test_a_package_on_a_refused_clone_is_served_by_its_readable_sibling(tmp_path
     }
 
 
-def test_the_parser_refuses_misplaced_or_misordered_package_references(matching, stacked):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_the_parser_refuses_misplaced_or_misordered_package_references(collected, collected_layout, stacked):
+    document = collected
     stack = collect_packages([stacked["folder"]], stacked["root"])
 
     def branch_of(doc: dict[str, Any], member: Path, name: str) -> dict[str, Any]:
@@ -1094,26 +1110,26 @@ def test_the_parser_refuses_misplaced_or_misordered_package_references(matching,
         return repository_of(doc, member)["package_branches"]
 
     def helper_as_target(doc):
-        branch_of(doc, matching["a"], "helper")["packages"][0]["basis"] = "target_clone"
+        branch_of(doc, collected_layout["a"], "helper")["packages"][0]["basis"] = "target_clone"
 
     def helper_as_sibling(doc):
-        branch_of(doc, matching["b"], "helper")["packages"][0]["basis"] = "sibling_clone"
+        branch_of(doc, collected_layout["b"], "helper")["packages"][0]["basis"] = "sibling_clone"
 
     def sibling_in_another_repository(doc):
-        branch_of(doc, matching["c"], "topic")["packages"] = [
+        branch_of(doc, collected_layout["c"], "topic")["packages"] = [
             {"package_path": path_of("target"), "basis": "sibling_clone"}
         ]
 
     def folded_into_another_repository(doc):
-        branch_of(doc, matching["c"], "helper")["packages"] = [
+        branch_of(doc, collected_layout["c"], "helper")["packages"] = [
             {"package_path": path_of("target"), "basis": "contained"}
         ]
 
     def empty_entry(doc):
-        entries(doc, matching["a"])[0]["packages"] = []
+        entries(doc, collected_layout["a"])[0]["packages"] = []
 
     def repeated_package(doc):
-        listed = entries(doc, matching["a"])[0]["packages"]
+        listed = entries(doc, collected_layout["a"])[0]["packages"]
         listed.append(listed[0])
 
     for change, message in (
@@ -1608,16 +1624,16 @@ def test_an_already_expired_deadline_still_yields_a_document_that_parses(remote_
     assert package["branch"] == {"status": "declared", "name": "topic"}
 
 
-def test_a_package_branch_in_a_clone_without_origin_has_no_remote_copy(matching):
-    document = collect_packages([matching["folder"]], matching["root"], remote_checks=False)
+def test_a_package_branch_in_a_clone_without_origin_has_no_remote_copy(collected, collected_layout):
+    document = collected
 
-    repository = repository_of(document, matching["d"])
+    repository = repository_of(document, collected_layout["d"])
     assert repository["remote"] is None
     assert [(e["name"], e["packages"], e["remote"]) for e in repository["package_branches"]] == [
         ("topic", [path_of("on_d")], None)
     ]
     # The group of A and B has a remote and so a remote copy.
-    assert remote_of(document, matching["a"])["state"] == "unknown"
+    assert remote_of(document, collected_layout["a"])["state"] == "unknown"
 
 
 def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(
@@ -1688,11 +1704,11 @@ def test_the_parser_refuses_a_remote_copy_its_remote_check_cannot_have_given(
         assert message in reference_mutation(document, change), change.__name__
 
 
-def test_the_parser_refuses_a_remote_copy_on_a_repository_without_a_remote(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
+def test_the_parser_refuses_a_remote_copy_on_a_repository_without_a_remote(collected, collected_layout):
+    document = collected
 
     def copy_without_origin(doc):
-        (entry,) = repository_of(doc, matching["d"])["package_branches"]
+        (entry,) = repository_of(doc, collected_layout["d"])["package_branches"]
         entry["remote"] = {"state": "unknown", "sha": None, "basis": None}
 
     assert "must be null without a remote" in reference_mutation(document, copy_without_origin)
@@ -2649,9 +2665,7 @@ def test_work_pushed_since_a_networked_check_is_pushed_for_every_package(status_
         )
 
 
-@pytest.fixture
-def status_document(status_world, tmp_path):
-    w = status_world
+def build_status_document(w: StatusWorld, tmp_path: Path) -> dict[str, Any]:
     w.branch(w.a, "ahead", push=True)
     git(w.a, "checkout", "-q", "ahead")
     w.commit(w.a)
@@ -2667,6 +2681,19 @@ def status_document(status_world, tmp_path):
     w.package("default", "trunk")
     w.package("missing", "ahead", target=tmp_path / "nowhere")
     return w.collect()
+
+
+@pytest.fixture(scope="module")
+def shared_status(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "status") as (directory, home, _patch):
+        world = StatusWorld(directory)
+        return world, build_status_document(world, directory), home
+
+
+@pytest.fixture
+def status_document(shared_status):
+    """A private copy of the networked collection of the status world."""
+    return doc_copy(shared_status[1])
 
 
 def code_status_of(document: dict[str, Any], name: str) -> dict[str, Any]:
@@ -2952,11 +2979,14 @@ def repository_index(document: dict[str, Any], member: Path) -> int:
 
 
 @pytest.fixture
-def collected(matching):
-    document = collect_packages([matching["folder"]], matching["root"])
-    # The unmutated document is accepted, so each refusal below comes from its mutation.
-    assert models.parse_checkouts(json.dumps(redigest(doc_copy(document))))
-    return document
+def collected(shared_matching):
+    """A private copy of the default collection of the ``matching`` world."""
+    return doc_copy(shared_matching[1])
+
+
+@pytest.fixture
+def collected_layout(shared_matching):
+    return dict(shared_matching[0])
 
 
 def test_a_code_status_on_a_not_applicable_branch_is_refused(collected):
@@ -2986,12 +3016,12 @@ def test_a_branch_name_on_a_branch_that_is_not_declared_is_refused(collected):
     )
 
 
-def test_a_clone_for_a_missing_target_is_refused(collected, matching):
+def test_a_clone_for_a_missing_target_is_refused(collected, collected_layout):
     index = package_index(collected, "missing")
     assert_target(collected["packages"][index]["target"], "missing")
 
     def clone_of_a_missing_target(document):
-        document["packages"][index]["target"]["clone"] = real(matching["a"])
+        document["packages"][index]["target"]["clone"] = real(collected_layout["a"])
 
     assert f"packages[{index}].target.clone must be null without a clone" in reference_mutation(
         collected, clone_of_a_missing_target
@@ -3010,8 +3040,8 @@ def test_a_clone_target_without_its_clone_is_refused(collected):
     )
 
 
-def test_a_package_branch_entry_naming_an_unlisted_package_is_refused(collected, matching):
-    index = repository_index(collected, matching["a"])
+def test_a_package_branch_entry_naming_an_unlisted_package_is_refused(collected, collected_layout):
+    index = repository_index(collected, collected_layout["a"])
 
     def unlisted(document):
         document["repositories"][index]["package_branches"][0]["packages"] = [path_of("zz")]
@@ -3022,8 +3052,8 @@ def test_a_package_branch_entry_naming_an_unlisted_package_is_refused(collected,
     ) in reference_mutation(collected, unlisted)
 
 
-def test_two_package_branch_entries_with_one_name_are_refused(collected, matching):
-    index = repository_index(collected, matching["a"])
+def test_two_package_branch_entries_with_one_name_are_refused(collected, collected_layout):
+    index = repository_index(collected, collected_layout["a"])
 
     def twice(document):
         entries = document["repositories"][index]["package_branches"]
@@ -3592,3 +3622,29 @@ def test_a_branch_with_no_commit_reads_no_commits_yet_against_a_base_borrowed_fr
     base = clone_at(document, w.a)["verdict_base"]
     assert (base["sha"], base["objects_from"]) == (newer, real(w.b)), "control"
     assert_no_commits(document, "fresh")
+
+
+def test_the_shared_matching_and_status_worlds_were_built_under_their_own_isolated_home(
+    shared_matching, shared_status
+):
+    layout, _document = shared_matching
+    world, _document, home = shared_status
+    assert last_author(layout["a"]) == "Test <test@example.com>"
+    assert last_author(world.a) == "Test <test@example.com>"
+    assert (home / ".nyx" / "cache" / "checkouts.json").is_file()
+
+
+def test_a_collected_handout_is_a_private_copy(collected, shared_matching):
+    _layout, document = shared_matching
+    collected["repositories"].clear()
+    collected["packages"].clear()
+    assert document["repositories"]
+    assert document["packages"]
+
+
+def test_a_status_document_handout_is_a_private_copy(status_document, shared_status):
+    _world, document, _home = shared_status
+    status_document["repositories"].clear()
+    status_document["packages"].clear()
+    assert document["repositories"]
+    assert document["packages"]
