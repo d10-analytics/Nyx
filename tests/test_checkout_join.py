@@ -3476,3 +3476,23 @@ def test_a_branch_that_moves_during_collection_is_unknown(status_world, tmp_path
     assert_status(
         document, "wb", f"merge state unknown {DOT} in A-wb", "unknown", elsewhere=(held,)
     )
+
+
+def test_a_branch_with_no_commit_reads_no_commits_yet_against_a_base_borrowed_from_a_sibling(
+    status_world,
+):
+    w = status_world
+    git(w.a, "branch", "fresh")
+    w.package("fresh", "fresh")
+    # The default branch moves on the remote and only clone B fetches it, so clone A
+    # judges against a base whose commits it reads from B.
+    git(w.outside, "checkout", "-q", "trunk")
+    newer = w.commit(w.outside)
+    git(w.outside, "push", "-q", "origin", "trunk")
+    git(w.b, "fetch", "-q", "origin")
+
+    document = w.collect()
+
+    base = clone_at(document, w.a)["verdict_base"]
+    assert (base["sha"], base["objects_from"]) == (newer, real(w.b)), "control"
+    assert_no_commits(document, "fresh")
