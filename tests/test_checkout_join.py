@@ -1900,6 +1900,17 @@ def status_fields(state, **given):
             f"in progress {DOT} push state unknown",
         ),
         (status_fields("unknown"), "merge state unknown"),
+        (status_fields("no_commits_yet"), f"in progress {DOT} no commits yet"),
+        (
+            status_fields("no_commits_yet", checked_out_elsewhere=["/w/Solo"]),
+            f"in progress {DOT} no commits yet {DOT} in Solo",
+        ),
+        (
+            status_fields(
+                "no_commits_yet", checked_out_elsewhere=["/w/Repo Clone 10", "C:\\w\\Repo Clone 9"]
+            ),
+            f"in progress {DOT} no commits yet {DOT} in Repo Clone 9, Repo Clone 10",
+        ),
     ],
 )
 def test_code_status_text_for_every_state(fields, text):
@@ -3148,4 +3159,68 @@ def test_a_merged_status_needs_exactly_one_positive_cleanup_count(status_documen
     assert (
         f"packages[{index}].code_status.cleanup must have exactly one positive count for merged"
         in message
+    )
+
+
+def test_a_schema_5_document_is_refused_and_the_collected_one_is_schema_6(status_document):
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 6
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 6
+
+    old = doc_copy(status_document)
+    old["schema_version"] = 5
+
+    assert refusal_of(old) == "unsupported schema version"
+
+
+def give_no_commits(name: str):
+    def change(document: dict[str, Any]) -> None:
+        status = code_status_of(document, name)
+        status.update(
+            state="no_commits_yet",
+            pull_request=None,
+            push=None,
+            unpushed=None,
+            cleanup=None,
+            checked_out_elsewhere=[],
+        )
+        status["text"] = f"in progress {DOT} no commits yet"
+
+    return change
+
+
+def test_a_no_commits_yet_status_with_its_fields_and_text_is_accepted(status_document):
+    document = doc_copy(status_document)
+    give_no_commits("ahead")(document)
+
+    parsed = models.parse_checkouts(json.dumps(redigest(document)))
+
+    assert code_status_of(parsed, "ahead")["text"] == f"in progress {DOT} no commits yet"
+    assert code_status_of(parsed, "ahead")["state"] == "no_commits_yet"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda s: s.update(push="pushed"), "push is set exactly for in_progress and pr_open"),
+        (lambda s: s.update(pull_request=4), "pull_request is set exactly for pr_open"),
+        (
+            lambda s: s.update(cleanup={"worktrees": 0, "branches": 1}),
+            "cleanup is set exactly for merged",
+        ),
+        (
+            lambda s: s.update(unpushed=3),
+            "unpushed is a count exactly when push is unpushed",
+        ),
+        (lambda s: s.update(text="in progress"), "text does not match its fields"),
+    ],
+)
+def test_a_no_commits_yet_status_refuses_each_contradicting_field(status_document, change, message):
+    def mutate(document: dict[str, Any]) -> None:
+        give_no_commits("ahead")(document)
+        change(code_status_of(document, "ahead"))
+
+    index = package_index(status_document, "ahead")
+
+    assert f"packages[{index}].code_status.{message}" in reference_mutation(
+        status_document, mutate
     )
