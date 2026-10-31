@@ -3207,12 +3207,20 @@ def test_schema_6_is_accepted_schema_5_refused_and_no_commits_yet_is_strict(stat
         ),
         "text": (lambda s: s.update(text="in progress"), "text does not match its fields"),
     }
+    failures: list[str] = []
     for case, (change, message) in cases.items():
 
         def mutate(doc: dict[str, Any], change=change) -> None:
             give_no_commits("ahead")(doc)
             change(code_status_of(doc, "ahead"))
 
-        assert f"packages[{index}].code_status.{message}" in reference_mutation(
-            status_document, mutate
-        ), case
+        try:
+            refused = reference_mutation(status_document, mutate)
+        except (Exception, pytest.fail.Exception) as error:  # an acceptance raises DID NOT RAISE
+            failures.append(f"{case}: not refused ({type(error).__name__}: {error})")
+            continue
+        if f"packages[{index}].code_status.{message}" not in refused:
+            failures.append(f"{case}: refused with a different message: {refused!r}")
+    assert not failures, "no_commits_yet contradictions not refused as expected:\n" + "\n".join(
+        failures
+    )
