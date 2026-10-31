@@ -908,8 +908,13 @@ CODE_STATUS_MARKERS = (
     "default branch's first-parent history.",
     "so a finished or superseded package whose branch has no commit reads "
     "`in progress · no commits yet` too. Rules 1 to 4 keep their numbers.",
-    "the copy counts as unknown in rules 1 to 4, so the package reads "
-    "`merge state unknown` rather than `merged · cleanup pending ...`.",
+    "did not run, because its reflog read or its first-parent listing was cut by the "
+    "time limit or failed, or because the branch moved during the run, that copy counts "
+    "as unknown in rules 1 to 4 and can never make the package read "
+    "`merged · cleanup pending ...`.",
+    "With no other deciding copy the package reads `merge state unknown`; a copy of the "
+    "same branch that is not merged, or an open pull request, still decides by rules 2 "
+    "and 3.",
     "A fresh branch whose reflog gained any other entry (renamed, reset with "
     "`git branch -f`, or fast-forwarded to a newer default head) reads "
     "`merged · cleanup pending ...`, like a branch that was merged.",
@@ -918,7 +923,7 @@ CODE_STATUS_MARKERS = (
     "A clone with no branch reflog, such as a bare repository or one with "
     "`core.logAllRefUpdates=false`, or whose reflog has expired, reads "
     "`merged · cleanup pending ...` for such a branch.",
-    "A branch with no commit of its own that is more than 5,000 first-parent commits "
+    "A branch with no commit of its own that is 5,000 or more first-parent commits "
     "behind the default branch reads `merged · cleanup pending ...`.",
     "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
     "branch that exists only on the remote, which Nyx does not compute.",
