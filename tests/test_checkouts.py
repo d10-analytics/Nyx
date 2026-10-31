@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -78,23 +79,83 @@ def outer_github_environment(tmp_path_factory):
         yield values
 
 
-@pytest.fixture(autouse=True)
-def isolated_git(tmp_path_factory, monkeypatch):
-    """Point every git child at an empty home that owns the only global config."""
-    home = tmp_path_factory.mktemp("home")
+def isolate_git(patch: pytest.MonkeyPatch, home: Path) -> Path:
+    """Point every git child at a home that owns the only global config."""
     (home / ".gitconfig").write_text(GLOBAL_CONFIG)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    patch.setenv("HOME", str(home))
+    patch.setenv("USERPROFILE", str(home))
+    patch.setenv("XDG_CONFIG_HOME", str(home))
+    patch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     for name in list(os.environ):
         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
-            monkeypatch.delenv(name)
+            patch.delenv(name)
     # No test may reach the network through the user's GitHub credentials; a test
     # that needs one of these variables sets it in its own body.
     for name in GITHUB_SCRUBBED:
-        monkeypatch.delenv(name, raising=False)
+        patch.delenv(name, raising=False)
     return home
+
+
+@pytest.fixture(autouse=True)
+def isolated_git(tmp_path_factory, monkeypatch):
+    """Point every git child at an empty home that owns the only global config."""
+    return isolate_git(monkeypatch, tmp_path_factory.mktemp("home"))
+
+
+@contextlib.contextmanager
+def shared_world_build(
+    tmp_path_factory: pytest.TempPathFactory, name: str
+) -> Iterator[tuple[Path, Path, pytest.MonkeyPatch]]:
+    """Build a world once per module under its own isolated home.
+
+    Module fixtures run before each test's own isolation, so the build applies
+    its own; every patch it makes, including any the body adds through the
+    yielded patch, is undone on exit, even when the body raises.  Yields the
+    build directory, the build home and the patch.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        home = isolate_git(patch, tmp_path_factory.mktemp(f"{name}-home"))
+        yield tmp_path_factory.mktemp(name), home, patch
+
+
+def test_a_shared_build_runs_isolated_and_leaves_no_environment_behind(
+    tmp_path_factory, monkeypatch
+):
+    monkeypatch.setenv("GH_TOKEN", "outer-token")
+    monkeypatch.setenv("GIT_DIR", "/nonexistent-git-dir")
+    before = dict(os.environ)
+
+    def global_email() -> str:
+        return subprocess.run(
+            ["git", "config", "--global", "--get", "user.email"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    with shared_world_build(tmp_path_factory, "context-proof") as (folder, home, patch):
+        assert folder.is_dir() and folder != home
+        assert os.environ["HOME"] == str(home)
+        assert "GH_TOKEN" not in os.environ and "GIT_DIR" not in os.environ
+        assert global_email() == "test@example.com"
+        assert sorted(entry.name for entry in home.iterdir()) == [".gitconfig"]
+        patch.setenv("PATH", str(folder))
+        assert os.environ["PATH"] == str(folder)
+    assert dict(os.environ) == before
+
+    with shared_world_build(tmp_path_factory, "context-proof") as (_, first, _patch):
+        assert sorted(entry.name for entry in first.iterdir()) == [".gitconfig"]
+    with shared_world_build(tmp_path_factory, "context-proof") as (_, second, _patch):
+        assert sorted(entry.name for entry in second.iterdir()) == [".gitconfig"]
+    assert first != second
+    assert dict(os.environ) == before
+
+    with pytest.raises(RuntimeError, match="build failed"):
+        with shared_world_build(tmp_path_factory, "context-proof") as (_, _home, patch):
+            patch.setenv("HOME", "/nonexistent-home")
+            patch.setenv("PATH", "/nonexistent-bin")
+            raise RuntimeError("build failed")
+    assert dict(os.environ) == before
 
 
 PINNED_HOUSEKEEPING = {

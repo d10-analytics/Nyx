@@ -633,7 +633,6 @@ import test_checkouts  # noqa: E402
 from test_checkouts import (  # noqa: E402
     GITHUB_SCRUBBED,
     GITHUB_URL,
-    GLOBAL_CONFIG,
     add_packed_refs,
     allow_filters,
     clone,
@@ -642,6 +641,7 @@ from test_checkouts import (  # noqa: E402
     git,
     github_answer,
     install_fake_gh,
+    isolate_git,
     local_names,
     make_remote,
     move_away,
@@ -667,19 +667,7 @@ def account(tmp_path, monkeypatch):
 
     home = tmp_path / "account"
     home.mkdir(mode=0o755)
-    (home / ".gitconfig").write_text(GLOBAL_CONFIG)
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    for name in list(os.environ):
-        if name.startswith("GIT_") and name != "GIT_CONFIG_NOSYSTEM":
-            monkeypatch.delenv(name)
-    # No test may reach the network through the user's GitHub credentials; a test
-    # that needs one of these variables sets it in its own body.
-    for name in GITHUB_SCRUBBED:
-        monkeypatch.delenv(name, raising=False)
-    return home
+    return isolate_git(monkeypatch, home)
 
 
 def _write_record(tmp_path: Path, payload: dict | bytes) -> Path:
