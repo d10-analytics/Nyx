@@ -656,10 +656,13 @@ worktrees` instead. The `--json` document keeps every path.
 - A branch that exists only on the remote reads `merge state unknown`. A remote
   copy at a commit that no local copy holds counts as unknown too, so it keeps a
   merged local branch from reading as merged.
-- When the check for a branch with no commit of its own could not run, because the
-  reflog could not be read in time or the branch moved during the run, the copy
-  counts as unknown in rules 1 to 4, so the package reads `merge state unknown`
-  rather than `merged · cleanup pending ...`.
+- When the check for a branch with no commit of its own did not run, because its
+  reflog read or its first-parent listing was cut by the time limit or failed, or
+  because the branch moved during the run, that copy counts as unknown in rules 1
+  to 4 and can never make the package read `merged · cleanup pending ...`. With no
+  other deciding copy the package reads `merge state unknown`; a copy of the same
+  branch that is not merged, or an open pull request, still decides by rules 2 and
+  3.
 - A fresh branch whose reflog gained any other entry (renamed, reset with
   `git branch -f`, or fast-forwarded to a newer default head) reads
   `merged · cleanup pending ...`, like a branch that was merged.
@@ -668,7 +671,7 @@ worktrees` instead. The `--json` document keeps every path.
 - A clone with no branch reflog, such as a bare repository or one with
   `core.logAllRefUpdates=false`, or whose reflog has expired, reads
   `merged · cleanup pending ...` for such a branch.
-- A branch with no commit of its own that is more than 5,000 first-parent commits
+- A branch with no commit of its own that is 5,000 or more first-parent commits
   behind the default branch reads `merged · cleanup pending ...`.
 - Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
   branch that exists only on the remote, which Nyx does not compute.
