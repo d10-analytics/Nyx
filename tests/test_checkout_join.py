@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -3418,9 +3419,11 @@ def test_a_no_commit_check_the_deadline_cuts_leaves_the_package_unknown_and_all_
     slow = stand_in(
         tmp_path, "slow-reflog", 'case "$*" in *"reflog show"*"refs/heads/"*) exec sleep 60;; esac'
     )
+    # No saved verdict may stand in for one the deadline would cut.
+    nyx_home(use_fresh_home(tmp_path, monkeypatch, Path(os.environ["HOME"])))
 
     with path_with(monkeypatch, slow):
-        document = world.collect(seconds=8.0)
+        document = world.collect(seconds=3.0)
 
     assert_status(document, "fresh", "merge state unknown", "unknown")
     assert branch_facts(document) == undelayed
@@ -3450,6 +3453,36 @@ def test_a_no_commit_check_that_fails_or_is_cut_leaves_the_package_unknown(
 
     assert_status(document, "fresh", "merge state unknown", "unknown")
     assert branch_facts(document) == undelayed
+
+
+def test_signature_output_does_not_hide_a_branch_with_no_commit(status_world, tmp_path):
+    w = status_world
+    keygen = shutil.which("ssh-keygen")
+    if keygen is None:
+        pytest.skip("needs ssh-keygen to make an SSH-signed commit offline")
+    key = tmp_path / "signing-key"
+    made = subprocess.run(
+        [keygen, "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+        capture_output=True, check=False,
+    )
+    signed = git(
+        w.a, "-c", "gpg.format=ssh", "-c", f"user.signingkey={key}",
+        "commit", "-q", "--allow-empty", "-S", "-m", "signed", check=False,
+    ) if made.returncode == 0 else None
+    if signed is None or signed.returncode != 0:
+        pytest.skip("this host's git or ssh-keygen cannot make an SSH-signed commit")
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "branch", "fresh")
+    git(w.a, "config", "log.showSignature", "true")
+    shown = git(w.a, "reflog", "show", "-n", "2", "--format=%H%x00%gs", "refs/heads/fresh")
+    assert any(
+        line and "\x00" not in line for line in shown.stdout.split("\n")
+    ), "control: the setting puts signature lines into the reflog output"
+    w.package("fresh", "fresh")
+
+    document = w.collect(remote_checks=False)
+
+    assert_no_commits(document, "fresh")
 
 
 @posix_only
