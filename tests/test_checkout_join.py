@@ -14,7 +14,9 @@ import pytest
 from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHub state)
     GITHUB_URL,
     LAST_GIT_SECOND,
+    cache_entries,
     clone,
+    collect,
     commit_file,
     doc_copy,
     git,
@@ -25,6 +27,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     linked,
     local_names,
     make_remote,
+    nyx_home,
     outer_github_environment,
     path_with,
     point_origin_at,
@@ -73,14 +76,17 @@ def collect_packages(
     completed: tuple[str, ...] = (),
     **options: Any,
 ) -> dict[str, Any]:
-    """Run the real collector with a package scan and return the parsed document."""
+    """Run the real collector with a package scan and return the parsed document.
+
+    ``seconds`` (default 60) is the collection deadline."""
+    seconds = options.pop("seconds", 60.0)
     if options.get("remote_checks"):
         # A networked check is taken in a whole second after the last git command of the
         # test, so a tracking ref that moved earlier is older than the check.
         time.sleep(max(0.0, LAST_GIT_SECOND[0] + 1 - time.time()))
     text = checkouts.collect_checkouts(
         [str(folder) for folder in folders],
-        deadline_ns=time.monotonic_ns() + 60 * 10**9,
+        deadline_ns=time.monotonic_ns() + int(seconds * 1e9),
         package_scan=checkouts.PackageScan(spec_root, completed),
         **options,
     )
@@ -116,7 +122,7 @@ def test_packages_with_a_target_or_branch_are_listed_in_path_order(world):
     assert_target(first["target"], "clone", real(repository))
     assert second["target"]["status"] == "absent"
     # `spec/alpha` was created at the default head with no commit of its own.
-    assert first["code_status"]["text"] == f"merged {DOT} cleanup pending (1 branch)"
+    assert first["code_status"]["text"] == f"in progress {DOT} no commits yet"
     assert second["code_status"] is None
     assert [r["clones"][0]["path"] for r in document["repositories"]] == [real(repository)]
 
@@ -2443,17 +2449,14 @@ def test_work_squash_merged_in_one_clone_and_extended_in_another_is_in_progress(
     )
 
 
-def test_a_branch_at_the_default_head_with_no_commit_reads_merged_cleanup_pending(status_world):
+def test_a_branch_at_the_default_head_with_no_commit_reads_no_commits_yet(status_world):
     w = status_world
     git(w.a, "branch", "zero", "trunk")
     w.package("zero", "zero")
 
     document = w.collect()
 
-    assert_status(
-        document, "zero", f"merged {DOT} cleanup pending (1 branch)", "merged",
-        cleanup={"worktrees": 0, "branches": 1},
-    )
+    assert_status(document, "zero", f"in progress {DOT} no commits yet", "no_commits_yet")
 
 
 def test_the_only_copy_in_a_shallow_clone_has_an_unknown_merge_state(status_world):
@@ -2653,11 +2656,12 @@ def status_document(status_world, tmp_path):
     w.commit(w.a)
     git(w.a, "checkout", "-q", "trunk")
     git(w.a, "branch", "zero", "trunk")
+    land(w.a, "landed")
     w.branch(w.a, "both", push=True)
     w.take(w.b, "both")
     linked(w.a, tmp_path, "both-a", "both")
     linked(w.b, tmp_path, "both-b", "both")
-    for name in ("ahead", "zero", "both"):
+    for name in ("ahead", "zero", "landed", "both"):
         w.package(name, name)
     w.package("default", "trunk")
     w.package("missing", "ahead", target=tmp_path / "nowhere")
@@ -2679,7 +2683,8 @@ def test_the_collected_code_statuses_are_accepted_and_come_back_unchanged(status
 
     assert parsed["packages"] == status_document["packages"]
     assert code_status_of(status_document, "ahead")["unpushed"] == 1
-    assert code_status_of(status_document, "zero")["cleanup"] == {"worktrees": 0, "branches": 1}
+    assert code_status_of(status_document, "landed")["cleanup"] == {"worktrees": 0, "branches": 1}
+    assert code_status_of(status_document, "zero")["state"] == "no_commits_yet"
     assert len(code_status_of(status_document, "both")["checked_out_elsewhere"]) == 2
     assert code_status_of(status_document, "default") is None
     assert code_status_of(status_document, "missing") is None
@@ -2730,7 +2735,7 @@ CODE_STATUS_REFUSALS = {
     "an unknown state": (set_status("ahead", state="done"), "state is invalid"),
     "an unknown push state": (set_status("ahead", push="sent"), "push is invalid"),
     "a push state on a merged status": (
-        set_status("zero", push="pushed"),
+        set_status("landed", push="pushed"),
         "push is set exactly for",
     ),
     "no push state on an in-progress status": (
@@ -2759,16 +2764,16 @@ CODE_STATUS_REFUSALS = {
         "cleanup is set exactly",
     ),
     "no cleanup on a merged status": (
-        set_status_retexted("zero", cleanup=None),
+        set_status_retexted("landed", cleanup=None),
         "cleanup is set exactly",
     ),
     "a negative cleanup count": (
-        set_status("zero", cleanup={"worktrees": -1, "branches": 1}),
+        set_status("landed", cleanup={"worktrees": -1, "branches": 1}),
         "non-negative integer",
     ),
-    "cleanup that is not an object": (set_status("zero", cleanup=[1]), "must be an object"),
+    "cleanup that is not an object": (set_status("landed", cleanup=[1]), "must be an object"),
     "a cleanup key missing": (
-        set_status("zero", cleanup={"worktrees": 0}),
+        set_status("landed", cleanup={"worktrees": 0}),
         "invalid shape",
     ),
     "other worktrees out of order": (reverse_elsewhere, "canonical order"),
@@ -3151,10 +3156,10 @@ def test_a_repository_in_a_document_without_git_is_refused(tmp_path, monkeypatch
     "cleanup", [{"worktrees": 0, "branches": 0}, {"worktrees": 1, "branches": 1}]
 )
 def test_a_merged_status_needs_exactly_one_positive_cleanup_count(status_document, cleanup):
-    index = package_index(status_document, "zero")
-    assert code_status_of(status_document, "zero")["cleanup"] == {"worktrees": 0, "branches": 1}
+    index = package_index(status_document, "landed")
+    assert code_status_of(status_document, "landed")["cleanup"] == {"worktrees": 0, "branches": 1}
 
-    message = reference_mutation(status_document, set_status_retexted("zero", cleanup=cleanup))
+    message = reference_mutation(status_document, set_status_retexted("landed", cleanup=cleanup))
 
     assert (
         f"packages[{index}].code_status.cleanup must have exactly one positive count for merged"
@@ -3223,4 +3228,251 @@ def test_schema_6_is_accepted_schema_5_refused_and_no_commits_yet_is_strict(stat
             failures.append(f"{case}: refused with a different message: {refused!r}")
     assert not failures, "no_commits_yet contradictions not refused as expected:\n" + "\n".join(
         failures
+    )
+
+
+# ---------------------------------------------------------------------------
+# Branches with no commit of their own
+# ---------------------------------------------------------------------------
+
+NO_COMMITS = f"in progress {DOT} no commits yet"
+
+
+def assert_no_commits(
+    document: dict[str, Any], name: str, *, stage: str = "Drafts", suffix: str = "",
+    elsewhere: tuple[Path, ...] = (),
+) -> None:
+    assert_status(
+        document, name, NO_COMMITS + suffix, "no_commits_yet", stage=stage, elsewhere=elsewhere
+    )
+
+
+def test_a_branch_with_no_commit_of_its_own_reads_no_commits_yet_however_it_was_made(
+    status_world, tmp_path
+):
+    w = status_world
+    git(w.a, "branch", "plain")
+    git(w.a, "branch", "shipped")
+    git(w.a, "branch", "retired")
+    # Documented limits: the reflog holds no creation entry, or more than one.
+    git(w.a, "-c", "core.logAllRefUpdates=false", "branch", "unlogged")
+    git(w.a, "branch", "before-rename")
+    git(w.a, "branch", "-m", "before-rename", "renamed")
+    held = tmp_path / "A-w3"
+    git(w.a, "worktree", "add", "-q", "-b", "in-worktree", str(held), "trunk")
+    # One commit, then back to the default branch and squash-merged: not fresh.
+    git(w.a, "switch", "-q", "-c", "landed", "trunk")
+    w.commit(w.a)
+    git(w.a, "switch", "-q", "trunk")
+    git(w.a, "merge", "-q", "--squash", "landed")
+    git(w.a, "commit", "-q", "-m", "land landed")
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "switch", "-q", "-c", "switched", "trunk")
+    for name in ("plain", "unlogged", "renamed", "in-worktree", "landed", "switched"):
+        w.package(name, name)
+    w.package("shipped", "shipped", stage="Shipped")
+    w.package("retired", "retired", extra=f"Superseded By: {ID_OLD}\n")
+
+    document = w.collect(remote_checks=False)
+
+    assert_no_commits(document, "plain")
+    assert_no_commits(document, "switched")  # the target's own worktree is not named
+    assert_no_commits(document, "in-worktree", suffix=f" {DOT} in A-w3", elsewhere=(held,))
+    assert_no_commits(document, "shipped", stage="Shipped")  # rule 0 precedes rule 3
+    assert_no_commits(document, "retired")
+    pending = f"merged {DOT} cleanup pending (1 branch)"
+    one_branch = {"worktrees": 0, "branches": 1}
+    for name in ("unlogged", "renamed", "landed"):
+        assert_status(document, name, pending, "merged", cleanup=one_branch)
+
+
+def test_a_branch_made_by_a_remote_branch_checkout_after_a_merge_commit_reads_merged(
+    status_world,
+):
+    w = status_world
+    git(w.a, "checkout", "-q", "-b", "b2", "trunk")
+    w.commit(w.a)
+    git(w.a, "push", "-q", "origin", "b2")
+    git(w.a, "checkout", "-q", "trunk")
+    git(w.a, "merge", "-q", "--no-ff", "-m", "merge b2", "b2")
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "branch", "-q", "-D", "b2")
+    git(w.b, "fetch", "-q", "origin")
+    git(w.b, "checkout", "-q", "b2")
+    reflog = git(w.b, "reflog", "show", "--format=%gs", "refs/heads/b2").stdout.split("\n")
+    assert [line for line in reflog if line] == [
+        "branch: Created from refs/remotes/origin/b2"
+    ], "control: one creation entry, as a fresh branch has"
+    w.package("dwim", "b2", target=w.b)
+
+    document = w.collect(remote_checks=False)
+
+    assert_status(
+        document, "dwim", f"merged {DOT} cleanup pending (1 worktree)", "merged",
+        cleanup={"worktrees": 1, "branches": 0},
+    )
+
+
+def test_pushing_a_branch_with_no_commit_keeps_it_and_a_pushed_commit_makes_it_unknown(
+    status_world,
+):
+    w = status_world
+    for name in ("pushed", "moved", "split"):
+        git(w.a, "branch", name)
+        w.package(name, name)
+    git(w.a, "push", "-q", "origin", "pushed", "moved")
+    w.push_from_outside("moved")
+    # B made a commit of its own on the same name; A's copy is still fresh.
+    git(w.b, "checkout", "-q", "-b", "split", "trunk")
+    w.commit(w.b)
+    git(w.b, "checkout", "-q", "trunk")
+
+    first = w.collect()
+
+    assert remote_of(first, w.a, "pushed")["state"] == "present", "control"
+    assert_no_commits(first, "pushed")
+    assert_status(first, "moved", "merge state unknown", "unknown")
+    assert_status(
+        first, "split", f"in progress {DOT} not pushed", "in_progress", push="not_pushed"
+    )
+
+    git(w.outside, "checkout", "-q", "trunk")
+    w.commit(w.outside)
+    git(w.outside, "push", "-q", "origin", "trunk")
+
+    second = w.collect()
+
+    assert_no_commits(second, "pushed")
+    assert_status(second, "moved", "merge state unknown", "unknown")
+
+
+def branch_facts(document: dict[str, Any]) -> dict[tuple[str, str], tuple[Any, ...]]:
+    return {
+        (clone["path"], branch["name"]): (
+            branch["verdict"], branch["contained_in"], branch["removable"]
+        )
+        for repository in document["repositories"]
+        for clone in repository["clones"]
+        for branch in clone["branches"]
+    }
+
+
+def test_the_no_commit_checks_change_no_repository_verdict_or_cache_entry(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    home = Path(os.environ["HOME"])
+    git(w.a, "branch", "plain")
+    git(w.a, "branch", "before-rename")
+    git(w.a, "branch", "-m", "before-rename", "renamed")
+    w.branch(w.a, "work", push=True)
+    land(w.a, "done")
+    w.take(w.b, "work", commits=1)
+    for name in ("plain", "renamed", "work", "done"):
+        w.package(name, name)
+    before = {member: tree_fingerprint(member) for member in (w.a, w.b)}
+    with_packages_cache = nyx_home(home)
+
+    with_packages = w.collect(remote_checks=False)
+
+    assert code_status_of(with_packages, "plain")["state"] == "no_commits_yet", "control"
+    assert {member: tree_fingerprint(member) for member in (w.a, w.b)} == before
+    fresh_cache = nyx_home(use_fresh_home(tmp_path, monkeypatch, home))
+    without_packages = collect([w.folder])
+
+    assert branch_facts(with_packages) == branch_facts(without_packages)
+    assert cache_entries(with_packages_cache) == cache_entries(fresh_cache)
+    assert cache_entries(with_packages_cache), "control: the cache holds verdicts"
+
+
+class DelayWorld:
+    """Clone A holds ``fresh`` made with ``git branch``; clone B, the second of the group
+    in natural order, holds the unmerged ``busy``."""
+
+    def __init__(self, w: StatusWorld) -> None:
+        self.w = w
+        git(w.a, "branch", "fresh")
+        w.branch(w.b, "busy")
+        w.package("fresh", "fresh")
+
+    def collect(self, **options: Any) -> dict[str, Any]:
+        options.setdefault("remote_checks", False)
+        options.setdefault("max_parallel", 1)
+        return self.w.collect(**options)
+
+    def baseline(self) -> dict[tuple[str, str], tuple[Any, ...]]:
+        document = self.collect()
+        assert_no_commits(document, "fresh")
+        facts = branch_facts(document)
+        assert facts[(real(self.w.a), "fresh")][0]["rung"] == "ancestor", "control"
+        assert facts[(real(self.w.b), "busy")][0]["state"] == "not_merged", "control"
+        return facts
+
+
+@posix_only
+def test_a_no_commit_check_the_deadline_cuts_leaves_the_package_unknown_and_all_verdicts(
+    status_world, tmp_path, monkeypatch
+):
+    world = DelayWorld(status_world)
+    undelayed = world.baseline()
+    slow = stand_in(
+        tmp_path, "slow-reflog", 'case "$*" in *"reflog show"*"refs/heads/"*) exec sleep 60;; esac'
+    )
+
+    with path_with(monkeypatch, slow):
+        document = world.collect(seconds=8.0)
+
+    assert_status(document, "fresh", "merge state unknown", "unknown")
+    assert branch_facts(document) == undelayed
+    assert_no_commits(world.collect(), "fresh")
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "body, options",
+    [
+        ('case "$*" in *"reflog show"*"refs/heads/fresh"*) exit 128;; esac', {}),
+        (
+            'case "$*" in *"rev-list --first-parent"*) exec sleep 60;; esac',
+            {"call_cap_seconds": 1.0},
+        ),
+    ],
+    ids=["reflog read fails", "first-parent listing cut"],
+)
+def test_a_no_commit_check_that_fails_or_is_cut_leaves_the_package_unknown(
+    status_world, tmp_path, monkeypatch, body, options
+):
+    world = DelayWorld(status_world)
+    undelayed = world.baseline()
+
+    with path_with(monkeypatch, stand_in(tmp_path, "broken", body)):
+        document = world.collect(**options)
+
+    assert_status(document, "fresh", "merge state unknown", "unknown")
+    assert branch_facts(document) == undelayed
+
+
+@posix_only
+def test_a_branch_that_moves_during_collection_is_unknown(status_world, tmp_path, monkeypatch):
+    w = status_world
+    held = tmp_path / "A-wb"
+    git(w.a, "worktree", "add", "-q", "-b", "wb", str(held), "trunk")
+    w.package("wb", "wb")
+    first = w.collect(remote_checks=False)
+    assert_no_commits(first, "wb", suffix=f" {DOT} in A-wb", elsewhere=(held,))
+    marker = tmp_path / "moved-once"
+    mover = stand_in(
+        tmp_path,
+        "mover",
+        f'case "$*" in *"reflog show"*"refs/heads/wb"*) if [ ! -e "{marker}" ]; then '
+        f': > "{marker}"; "{shutil.which("git")}" -C "{held}" commit -q --allow-empty -m moved; '
+        "fi;; esac",
+    )
+
+    with path_with(monkeypatch, mover):
+        document = w.collect(remote_checks=False)
+
+    assert marker.exists(), "control: the wrapper moved the branch"
+    assert_status(
+        document, "wb", f"merge state unknown {DOT} in A-wb", "unknown", elsewhere=(held,)
     )
