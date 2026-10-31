@@ -436,7 +436,9 @@ def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
     A job outside the routing map has no lane; a mapped job must carry its
     condition exactly (an absent ``if`` included in the rejection).  Routing
     stays a job-level decision, so no step declares a condition.  Missing jobs
-    stay owned by ``check_job_matrix``.
+    stay owned by ``check_job_matrix``.  Lanes are independent: a job may not
+    declare ``needs:``, because a dependency skips the lane precisely when its
+    own ``if`` would have fired.
     """
 
     problems: list[str] = []
@@ -456,6 +458,10 @@ def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
                     f"{name}: step {step.get('name') or step.get('uses')!r} "
                     f"declares if={step['if']!r}"
                 )
+        if isinstance(job, dict) and "needs" in job:
+            problems.append(
+                f"{name}: job declares needs={job['needs']!r}; lanes are independent"
+            )
     return problems
 
 
@@ -1370,6 +1376,10 @@ def _mutate_narrow_desktop_routing_to_main(workflow: dict[str, Any]) -> None:
     _job(workflow, "nyx-desktop-macos")["if"] = "github.ref == 'refs/heads/main'"
 
 
+def _mutate_sequence_desktop_lane_after_package_lane(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-windows")["needs"] = ["nyx-windows"]
+
+
 def _mutate_condition_the_documented_build_step(workflow: dict[str, Any]) -> None:
     _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)["if"] = (
         "github.ref == 'refs/heads/main'"
@@ -1862,6 +1872,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         _mutate_condition_the_documented_build_step,
     ),
     "add an unrouted job": (check_lane_routing, _mutate_add_unrouted_job),
+    "sequence a desktop lane after a package lane": (
+        check_lane_routing,
+        _mutate_sequence_desktop_lane_after_package_lane,
+    ),
     "change baseline runner": (check_job_matrix, _mutate_change_baseline_runner),
     "remove pwsh shell declaration": (
         check_shell_matrix,
