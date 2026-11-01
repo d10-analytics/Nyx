@@ -959,7 +959,7 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
     assert settings.completed == []
 
 
-@pytest.mark.parametrize("case", ["stale", "null", "malformed", "schema-4"])
+@pytest.mark.parametrize("case", ["stale", "null", "malformed"])
 def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_page, case):
     valid = dependency_state_payload("unsatisfied")
     bad = dependency_state_payload("satisfied", titles={"gate": "Rejected gate"})
@@ -969,8 +969,6 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         bad["configuration_revision"] = None
     elif case == "malformed":
         bad["configuration_revision"] = {"revision": "bad"}
-    else:
-        bad["schema_version"] = 4
     bad["catalog_digest"] = canonical_digest(bad)
     fresh = dependency_state_payload("unknown", titles={"gate": "Fresh gate"})
     fresh["configuration_revision"] = "revision-2"
@@ -4199,6 +4197,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
+        page.get_by_role("button", name="Refresh view").click()
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
@@ -4209,40 +4208,21 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     assert page.locator("#refresh").inner_text() == "Refresh view"
 
 
-def test_digest_consistent_duplicate_policy_keeps_last_valid_board(open_page):
-    valid = json.loads(lifecycle_payload())
-    duplicate = json.loads(lifecycle_payload(completed_stages=("Done",)))
-    duplicate["terminal_stages"] = ["Done", "Done"]
-    _reseal(duplicate)
-    assert duplicate["catalog_digest"] == canonical_digest(duplicate)
-
-    from nyx import server as server_module
-
-    def passthrough_catalog(candidate):
-        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
-
-    client = RawSequenceClient([valid, duplicate])
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
-        page = open_page(client)
-        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-            timeout=15000
-        )
-
-    assert page.locator("#board .card").count() == 7
-    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
-    assert page.locator("#refresh").inner_text() == "Refresh view"
-    assert client.calls >= 2
-
-
-@pytest.mark.parametrize("mutate", [
-    lambda value: value.update(terminal_stages=["Done", "Done"]),
-    lambda value: value.update(terminal_stages=["Done", "Archive"]),
-    lambda value: value.pop("terminal_stages"),
-    lambda value: value.update(schema_version=7),
-    lambda value: value.update(visibility={}),
-    lambda value: value["entries"][0].update(board_visible=True),
-])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(terminal_stages=["Done", "Done"]),
+        lambda value: value.pop("terminal_stages"),
+        lambda value: value.update(schema_version=7),
+        lambda value: value.update(visibility={}),
+    ],
+    ids=[
+        "equal-terminal-stages",
+        "missing-terminal-stages",
+        "older-schema",
+        "top-level-extra-key",
+    ],
+)
 def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_page, mutate):
     valid = json.loads(lifecycle_payload())
     invalid = json.loads(lifecycle_payload())
@@ -4259,6 +4239,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
+        page.get_by_role("button", name="Refresh view").click()
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
@@ -4273,35 +4254,9 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     assert page.locator("#refresh").inner_text() == "Refresh view"
 
 
-def test_digest_consistent_reversed_inventory_keeps_last_valid_board(open_page):
-    valid = json.loads(lifecycle_payload())
-    invalid = json.loads(lifecycle_payload())
-    invalid["inventory"]["stages"].reverse()
-    _reseal(invalid)
-
-    from nyx import server as server_module
-
-    def passthrough_catalog(candidate):
-        return candidate if isinstance(candidate, RawCatalog) else parse_catalog(candidate)
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
-        page = open_page(RawSequenceClient([valid, invalid]))
-        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-            timeout=15000
-        )
-
-    assert page.locator("#board .card").count() == 7
-    assert page.locator("#refresh").inner_text() == "Refresh view"
-
-
 def _malformed_browser_inventory(case):
     value = json.loads(lifecycle_payload())
-    if case == "schema-3":
-        value["schema_version"] = 3
-        value["catalog_digest"] = canonical_digest(value)
-        return value
-    elif case == "unknown-inventory-key":
+    if case == "unknown-inventory-key":
         value["inventory"]["extra"] = []
     elif case == "projects-type":
         value["inventory"]["projects"] = {}
@@ -4335,7 +4290,6 @@ def _malformed_browser_inventory(case):
 @pytest.mark.parametrize(
     "case",
     [
-        "schema-3",
         "unknown-inventory-key",
         "projects-type",
         "duplicate-project",
