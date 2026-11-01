@@ -1204,7 +1204,9 @@ def test_browser_admits_every_python_valid_typed_edge_reason(open_page):
     client = SequenceClient([board_payload()] + values)
     page = open_page(client, fake_clock=True)
     # Freeze the page timers so no poll can interleave with the refresh clicks.
-    page.clock.pause_at(page.evaluate("Date.now()") + 1_000)
+    # pause_at takes seconds, so one second ahead of the page's current time.
+    page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
+    assert client.calls == 1, "pausing the clock must not fire a poll"
     gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
     for kind, reason in reasons:
         page.locator("#refresh").click()
@@ -1591,20 +1593,19 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     second = board_payload(titles={"step_one": "Renamed foundation"})
     client = SequenceClient([first, second])
     page = open_page(client, fake_clock=True)
+    # Pause page time (pause_at takes seconds) so neither bound depends on
+    # real time; frames do not run while paused, so only fast_forward advances.
+    page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
     # The interval registers after the clock is installed and before the board
     # renders, so page time since registration is at most `elapsed`.
     elapsed = page.evaluate("performance.now()")
     assert elapsed < 9_000, f"launch took {elapsed} ms of page time; the bound needs < 9000"
     # No poll before the documented interval has elapsed.
     page.clock.fast_forward(9_000 - elapsed)
-    page.evaluate(
-        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
-    )
-    page.wait_for_timeout(250)
     assert client.calls == 1
     # A poll arrives by 10.5 s of page time past the registration offset.
     with page.expect_response("**/api/catalog", timeout=3000):
-        page.clock.fast_forward(1_500 + elapsed)
+        page.clock.fast_forward(1_500)
     page.wait_for_selector("#refresh.pending", timeout=5000)
     assert client.calls == 2
     assert page.locator("#refresh").inner_text() == "Apply update"
