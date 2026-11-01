@@ -21,10 +21,11 @@
   other than its `[tool.ruff]` settings, a file listed in
   `docs/systems/desktop/system.toml`, `nyx/desktop_worker.py`, the desktop
   build section of `docs/running-nyx.md`, `tests/test_desktop.py`,
-  `tests/test_desktop_artifact.py`, `tests/test_documented_install.py`, or
-  `.github/workflows/tests.yml`. A manual run is CI evidence only when both
-  desktop lanes ran and passed; a run whose desktop lanes show as skipped
-  proves nothing. Do not hand-run `main`: its push already runs every lane.
+  `tests/test_desktop_artifact.py`, `tests/native_ui.py`,
+  `tests/test_documented_install.py`, or `.github/workflows/tests.yml`. A
+  manual run is CI evidence only when both desktop lanes ran and passed; a
+  run whose desktop lanes show as skipped proves nothing. Do not hand-run
+  `main`: its push already runs every lane.
   Local runs are feedback, not CI evidence.
 - Some proofs run only on CI hosts or when CI sets
   `NYX_VERIFY_DOCUMENTED_INSTALL`, `NYX_VERIFY_DOCUMENTED_BUILD`, or
