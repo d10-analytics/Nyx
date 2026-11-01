@@ -572,7 +572,9 @@ def page_launcher(launch_timeout_ms=15000):
                 return True
             return application.shutdown(time.monotonic() + 2) is True
 
-        def launch(client, *, color_scheme="light", init_script=None, settings=None):
+        def launch(
+            client, *, color_scheme="light", init_script=None, settings=None, fake_clock=False
+        ):
             application = None
             server = None
             thread = None
@@ -605,6 +607,8 @@ def page_launcher(launch_timeout_ms=15000):
                     server = application.server
                     thread = application.http_thread
                 context = browser.new_context(color_scheme=color_scheme)
+                if fake_clock:
+                    context.clock.install()
                 # D-13: record CSP violations for every page and navigation in
                 # this context and assert none at teardown.
                 violations = []
@@ -677,6 +681,22 @@ def page_launcher(launch_timeout_ms=15000):
                 raise errors[0]
             assert unstopped == [], f"applications that did not stop: {unstopped}"
             assert violations == [], f"recorded CSP violations: {violations}"
+
+
+# Mirrors POLL_INTERVAL in nyx/static/app.js, the browser's poll interval.
+POLL_INTERVAL_MS = 10_000
+
+
+def fire_poll(page):
+    """Advance the fake clock one poll interval and wait for the poll's response.
+
+    One call fires the page's interval callback once. Call it only after the
+    previous request's effect is visible: a poll issued while a request is in
+    flight is dropped.
+    """
+    with page.expect_response("**/api/catalog", timeout=5000) as response:
+        page.clock.fast_forward(POLL_INTERVAL_MS)
+    response.value.finished()
 
 
 @pytest.fixture
@@ -1306,11 +1326,12 @@ def test_browser_accepts_explicit_blank_declared_metadata(open_page):
 
 def test_initial_fetch_failure_recovers_on_the_first_successful_poll(open_page):
     client = SequenceClient([CatalogError("producer_unavailable"), board_payload()])
-    page = open_page(client)
+    page = open_page(client, fake_clock=True)
     page.locator("#board").get_by_text("Latest refresh issue: producer_unavailable", exact=True).wait_for(
         timeout=15000
     )
-    page.locator("#board .card").first.wait_for(timeout=15000)
+    fire_poll(page)
+    page.locator("#board .card").first.wait_for(timeout=5000)
     assert page.locator("#board .card").count() == 4
     assert page.locator("#board-issues").count() == 0
     assert client.calls == 2
@@ -1541,8 +1562,24 @@ def test_filter_hides_non_matching_cards_and_their_rails(open_page):
 def test_poll_exposes_one_pending_update_until_applied(open_page):
     first = board_payload()
     second = board_payload(titles={"step_one": "Renamed foundation"})
-    page = open_page(SequenceClient([first, second]))
-    page.wait_for_selector("#refresh.pending", timeout=20000)
+    client = SequenceClient([first, second])
+    page = open_page(client, fake_clock=True)
+    # The interval registers after the clock is installed and before the board
+    # renders, so page time since registration is at most `elapsed`.
+    elapsed = page.evaluate("performance.now()")
+    assert elapsed < 9_000, f"launch took {elapsed} ms of page time; the bound needs < 9000"
+    # No poll before the documented interval has elapsed.
+    page.clock.fast_forward(9_000 - elapsed)
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
+    page.wait_for_timeout(250)
+    assert client.calls == 1
+    # A poll arrives by 10.5 s of page time past the registration offset.
+    with page.expect_response("**/api/catalog", timeout=3000):
+        page.clock.fast_forward(1_500 + elapsed)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
+    assert client.calls == 2
     assert page.locator("#refresh").inner_text() == "Apply update"
     assert "Foundation step" in page.locator("#board").inner_text()
     page.click("#refresh")
@@ -2269,13 +2306,15 @@ def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(o
     latest = board_payload(titles={"step_one": "A"})
     manual = board_payload(titles={"step_one": "C"})
     client = SequenceClient([first, middle, latest, manual])
-    page = open_page(client)
+    page = open_page(client, fake_clock=True)
 
     # The browser's periodic poll observes B and then the displayed A again.
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
+    fire_poll(page)
     page.wait_for_function(
-        "() => !document.querySelector('#refresh').classList.contains('pending')", timeout=15000
+        "() => !document.querySelector('#refresh').classList.contains('pending')", timeout=5000
     )
     assert page.locator("#refresh").inner_text() == "Refresh view"
     assert page.locator("#board").get_by_text("B", exact=True).count() == 0
@@ -2292,38 +2331,28 @@ def test_later_successful_poll_replaces_pending_candidate_before_apply(open_page
     middle = board_payload(titles={"step_one": "B"})
     latest = board_payload(titles={"step_one": "C"})
     client = SequenceClient([first, middle, latest])
-    page = open_page(client)
+    page = open_page(client, fake_clock=True)
 
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     # Let the second periodic response supersede B while A remains displayed.
-    page.wait_for_timeout(10500)
+    # The candidate changes no visible text, so watch the button for the
+    # rewrite that shows the second response was handled.
+    page.evaluate("""() => {
+      window.refreshChangeRecords = 0;
+      new MutationObserver((records) => {
+        window.refreshChangeRecords += records.length;
+      }).observe(document.querySelector('#refresh'), {
+        childList: true, characterData: true, subtree: true, attributes: true,
+      });
+    }""")
+    fire_poll(page)
+    page.wait_for_function("() => window.refreshChangeRecords > 0", timeout=5000)
     assert page.locator("#refresh").inner_text() == "Apply update"
     page.click("#refresh")
     page.locator("#board").get_by_text("C", exact=True).wait_for(timeout=15000)
     assert client.calls == 3
     assert page.locator("#board").get_by_text("B", exact=True).count() == 0
-
-
-def test_failed_poll_keeps_the_latest_successful_pending_snapshot(open_page):
-    first = board_payload(titles={"step_one": "A"})
-    pending = board_payload(titles={"step_one": "B"})
-    client = SequenceClient([first, pending, CatalogError("producer_protocol_error")])
-    page = open_page(client)
-
-    page.wait_for_selector("#refresh.pending", timeout=15000)
-    page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-        timeout=15000
-    )
-    assert page.locator("#board").get_by_text("A", exact=True).count() == 1
-    assert page.locator("#refresh").inner_text() == "Apply update"
-    assert "producer_protocol_error" in page.locator("#board-issues summary").inner_text()
-    assert page.locator("#board-issues").get_attribute("open") is None
-
-    # The failed response did not erase B, the most recent successful candidate.
-    page.click("#refresh")
-    page.locator("#board").get_by_text("B", exact=True).wait_for(timeout=15000)
-    assert client.calls == 3
-    assert page.locator("#board-issues").count() == 0
 
 
 def observe_removed_cards(page):
@@ -2354,7 +2383,9 @@ def observe_refresh_status(page):
 
 
 def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
-    page = open_page(SequenceClient([board_payload(), CatalogError("producer_unavailable")]))
+    page = open_page(
+        SequenceClient([board_payload(), CatalogError("producer_unavailable")]), fake_clock=True
+    )
     board = page.locator("#board")
     assert board.get_attribute("aria-live") is None
     assert board.get_attribute("role") is None
@@ -2372,7 +2403,8 @@ def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
     card.press("Enter")
     kept = card.element_handle()
     observe_removed_cards(page)
-    playwright.expect(status).to_have_text("Latest refresh issue: producer_unavailable", timeout=15000)
+    fire_poll(page)
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_unavailable", timeout=5000)
     assert kept.evaluate("node => node.isConnected && node === document.activeElement")
     assert kept.get_attribute("aria-pressed") == "true"
     assert page.evaluate("window.removedCards") == 0
@@ -2420,19 +2452,22 @@ def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
 
 
 def test_poll_recovery_removes_issues_in_place_and_announces_resolution(open_page):
-    page = open_page(SequenceClient([
-        board_payload(), CatalogError("producer_timeout"), board_payload(),
-    ]))
+    page = open_page(
+        SequenceClient([board_payload(), CatalogError("producer_timeout"), board_payload()]),
+        fake_clock=True,
+    )
     card = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     card.focus()
     card.press("Enter")
     kept = card.element_handle()
     observe_removed_cards(page)
+    fire_poll(page)
     page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(
-        timeout=15000
+        timeout=5000
     )
+    fire_poll(page)
     playwright.expect(page.locator("#refresh-status")).to_have_text(
-        "Refresh issue resolved.", timeout=15000
+        "Refresh issue resolved.", timeout=5000
     )
     assert page.locator("#board-issues").count() == 0
     assert page.locator("#refresh").inner_text() == "Refresh view"
@@ -2471,11 +2506,18 @@ def test_applying_pending_update_empties_refresh_status_silently(open_page):
         board_payload(titles={"step_one": "B"}),
         CatalogError("producer_protocol_error"),
     ])
-    page = open_page(client)
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    page = open_page(client, fake_clock=True)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
+    fire_poll(page)
     page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-        timeout=15000
+        timeout=5000
     )
+    # The failed poll does not erase the pending candidate B.
+    assert page.locator("#board").get_by_text("A", exact=True).count() == 1
+    assert page.locator("#refresh").inner_text() == "Apply update"
+    assert "producer_protocol_error" in page.locator("#board-issues summary").inner_text()
+    assert page.locator("#board-issues").get_attribute("open") is None
     status = page.locator("#refresh-status")
     assert status.inner_text() == "Latest refresh issue: producer_protocol_error"
     observe_refresh_status(page)
@@ -2485,7 +2527,8 @@ def test_applying_pending_update_empties_refresh_status_silently(open_page):
     assert status.inner_text() == ""
     assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
     cleared_records = page.evaluate("window.refreshStatusRecords")
-    playwright.expect(status).to_have_text("Latest refresh issue: producer_protocol_error", timeout=15000)
+    fire_poll(page)
+    playwright.expect(status).to_have_text("Latest refresh issue: producer_protocol_error", timeout=5000)
     assert page.evaluate("window.refreshStatusRecords") > cleared_records
     assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
 
@@ -2602,12 +2645,13 @@ def test_refresh_changing_only_incoming_edge_state_keeps_card_color(open_page):
         observed_state="unknown", resolved_state="unknown", reason="claim_unknown"
     )
     _reseal(second)
-    page = open_page(SequenceClient([first, second]))
+    page = open_page(SequenceClient([first, second]), fake_clock=True)
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
     card.click()
     refresh = page.locator("#refresh")
-    playwright.expect(refresh).to_have_text("Apply update", timeout=15000)
+    fire_poll(page)
+    playwright.expect(refresh).to_have_text("Apply update", timeout=5000)
     refresh.click()
     playwright.expect(refresh).to_have_text("Refresh view")
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
@@ -3686,9 +3730,11 @@ def test_successful_changed_poll_clears_previous_error_without_applying_update(o
         board_payload(), CatalogError("producer_timeout"),
         board_payload(titles={"step_one": "Recovered foundation"}),
     ])
-    page = open_page(client)
-    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=15000)
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    page = open_page(client, fake_clock=True)
+    fire_poll(page)
+    page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=5000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     assert page.locator("#board-issues").count() == 0
     assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
     assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 0
@@ -3866,9 +3912,11 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
         page = open_page(
             RawSequenceClient([valid, invalid]),
             init_script="localStorage.setItem('spec-tracker-compact-view', 'false');",
+            fake_clock=True,
         )
+        fire_poll(page)
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-            timeout=15000
+            timeout=5000
         )
 
     # The refresh issue is addressable on its own while workspace issues share the summary.
@@ -4047,7 +4095,7 @@ def test_finished_rows_hidden_precedes_incomplete_discovery(open_page):
 def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     first = compact_payload()
     second = compact_payload(extra_stage=True)
-    page = open_page(SequenceClient([first, second]))
+    page = open_page(SequenceClient([first, second]), fake_clock=True)
     assert row_labels(page) == ["Partial", "Queue", "Testing"]
     assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
     page.fill("#filter", "custom")
@@ -4061,7 +4109,8 @@ def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
         "before => document.querySelector('.rail').getAttribute('d') !== before", arg=before
     )
     assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
     assert page.locator('.board-row[data-lifecycle="Review"]').count() == 0
     page.click("#refresh")
@@ -4074,12 +4123,13 @@ def test_pending_removed_entry_snapshot_clears_selection_only_after_apply(open_p
     second = json.loads(lifecycle_payload())
     second["entries"] = [entry for entry in second["entries"] if entry["stage"] != "Done"]
     _reseal(second)
-    page = open_page(SequenceClient([first, second]))
+    page = open_page(SequenceClient([first, second]), fake_clock=True)
     done = page.locator('.card[data-package-path="Fictional/Done/package"]')
     done.click()
     assert done.get_attribute("aria-pressed") == "true"
 
-    page.wait_for_selector("#refresh.pending", timeout=15000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
     assert done.get_attribute("aria-pressed") == "true"
 
@@ -4418,7 +4468,7 @@ def test_real_unsafe_and_overlong_folders_keep_the_healthy_card_after_refresh(op
 
     _write_package(tmp_path, "Alpha", "Queue", "healthy", STEP_ONE,
                    f"# Healthy\nPackage ID: {STEP_ONE}\n")
-    page = open_page(ScanningClient(tmp_path))
+    page = open_page(ScanningClient(tmp_path), fake_clock=True)
     healthy = page.locator('[data-package-path="Alpha/Queue/healthy"]')
     assert healthy.count() == 1
     assert healthy.locator(".card-title").inner_text() == "Healthy"
@@ -4448,7 +4498,8 @@ def test_real_unsafe_and_overlong_folders_keep_the_healthy_card_after_refresh(op
     # Apply update, and choosing that button applies the new catalog.
     refresh = page.locator("#refresh")
     assert refresh.inner_text() == "Refresh view"
-    page.wait_for_selector("#refresh.pending", timeout=20000)
+    fire_poll(page)
+    page.wait_for_selector("#refresh.pending", timeout=5000)
     assert refresh.inner_text() == "Apply update"
     refresh.click()
     page.wait_for_function(
