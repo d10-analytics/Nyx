@@ -11,10 +11,22 @@
   configured.
 - Use focused pytest selections for development feedback, for example
   `python -m pytest tests/test_catalog.py -v`.
-- Full verification is the push-triggered GitHub Actions workflow
-  `.github/workflows/tests.yml`: Linux, Windows, and macOS package lanes plus
-  Windows and macOS native desktop lanes. Local runs are feedback, not CI
-  evidence.
+- Full verification is the GitHub Actions workflow
+  `.github/workflows/tests.yml`, run on every push and on manual dispatch.
+  Every push, to a branch or to a tag, runs the three package lanes; a push
+  to `main` also runs the two desktop lanes, and a manual dispatch runs
+  those two desktop lanes only, from that branch:
+  `gh workflow run tests.yml --ref <branch>`. Hand-run the desktop lanes on
+  a branch before merging it whenever the branch changes `pyproject.toml`
+  other than its `[tool.ruff]` settings, a file listed in
+  `docs/systems/desktop/system.toml`, `nyx/desktop_worker.py`, the desktop
+  build section of `docs/running-nyx.md`, `tests/test_desktop.py`,
+  `tests/test_desktop_artifact.py`, `tests/native_ui.py`,
+  `tests/test_documented_install.py`, or `.github/workflows/tests.yml`. A
+  manual run is CI evidence only when both desktop lanes ran and passed; a
+  run whose desktop lanes show as skipped proves nothing. Do not hand-run
+  `main`: its push already runs every lane.
+  Local runs are feedback, not CI evidence.
 - Some proofs run only on CI hosts or when CI sets
   `NYX_VERIFY_DOCUMENTED_INSTALL`, `NYX_VERIFY_DOCUMENTED_BUILD`, or
   `NYX_REQUIRE_NATIVE_DESKTOP`. Locally they skip; a skip is not a pass.

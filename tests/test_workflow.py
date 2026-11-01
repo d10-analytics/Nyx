@@ -4,7 +4,10 @@ These tests parse the real workflow document and assert the operational
 contract that the native source/session lane and the desktop build/artifact
 extension establish: exact commands, installer extras, artifact inputs,
 required-native environment, interactive-session preflight, stage ordering,
-job time limits and non-zero exit propagation.  Checks read each step's
+job time limits and non-zero exit propagation.  The trigger and the lane
+routing are pinned exactly too: the workflow triggers only on an unconfigured
+push and workflow_dispatch, every job triggers under exactly its lane
+condition, and no step carries a condition.  Checks read each step's
 effective lines (the stripped lines left after dropping blank lines and
 full-line comments) and match gating commands exactly, so a commented-out or
 failure-masked command does not satisfy them.  Each supported behavior is
@@ -62,6 +65,20 @@ EXPECTED_NATIVE_HOST_ENV = "NYX_EXPECTED_NATIVE_HOST"
 DESKTOP_ARTIFACT_ENV = "NYX_DESKTOP_ARTIFACT"
 DOCUMENTED_INSTALL_ENV = "NYX_VERIFY_DOCUMENTED_INSTALL"
 DOCUMENTED_BUILD_ENV = "NYX_VERIFY_DOCUMENTED_BUILD"
+
+# The trigger mapping is exact: both events carry no configuration, so there is
+# no branch, path or tag filter and no dispatch input.  Pushes build the
+# package lanes; the native desktop lanes wait for main pushes and dispatched
+# runs.
+TRIGGER_EVENTS = {"push": None, "workflow_dispatch": None}
+PACKAGE_LANE_CONDITION = "github.event_name == 'push'"
+DESKTOP_LANE_CONDITION = (
+    "github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+)
+LANE_ROUTING_CONDITIONS = {
+    **{name: PACKAGE_LANE_CONDITION for name in BASELINE_JOBS},
+    **{name: DESKTOP_LANE_CONDITION for name in DESKTOP_JOBS},
+}
 
 LINUX_SERVICE_STEP = "Verify package and installed service"
 BASELINE_LIFECYCLE_STEP = "Verify package and installed lifecycle"
@@ -359,10 +376,13 @@ def _step(workflow: dict[str, Any], job_name: str, step_name: str) -> dict[str, 
     return found
 
 
+_TRIGGER_KEYS = (True, "on", "true", "True")
+
+
 def _events(workflow: dict[str, Any]) -> list[str]:
     if not isinstance(workflow, dict):
         return []
-    for key in (True, "on", "true", "True"):
+    for key in _TRIGGER_KEYS:
         if key not in workflow:
             continue
         value = workflow[key]
@@ -375,6 +395,25 @@ def _events(workflow: dict[str, Any]) -> list[str]:
     return []
 
 
+def _trigger_value(workflow: dict[str, Any]) -> Any:
+    """Read the trigger value through the key spellings ``on`` parses to."""
+
+    if not isinstance(workflow, dict):
+        return None
+    for key in _TRIGGER_KEYS:
+        if key in workflow:
+            return workflow[key]
+    return None
+
+
+def _set_trigger(workflow: dict[str, Any], value: Any) -> None:
+    for key in _TRIGGER_KEYS:
+        if key in workflow:
+            workflow[key] = value
+            return
+    raise WorkflowContractViolation("workflow declares no trigger events")
+
+
 # --------------------------------------------------------------------------
 # Checks.  Each returns a list of human-readable violations and never raises
 # for a well-formed (possibly mutated) document.
@@ -382,9 +421,48 @@ def _events(workflow: dict[str, Any]) -> list[str]:
 
 
 def check_workflow_trigger(workflow: dict[str, Any]) -> list[str]:
-    if "push" not in _events(workflow):
-        return ["workflow does not trigger on push"]
+    """Require the trigger mapping to be exactly both events, unconfigured."""
+
+    if _trigger_value(workflow) != TRIGGER_EVENTS:
+        return [
+            "workflow does not declare exactly a plain push and workflow_dispatch trigger"
+        ]
     return []
+
+
+def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
+    """Require every job to trigger under exactly its lane condition.
+
+    A job outside the routing map has no lane; a mapped job must carry its
+    condition exactly (an absent ``if`` included in the rejection).  Routing
+    stays a job-level decision, so no step declares a condition.  Missing jobs
+    stay owned by ``check_job_matrix``.  Lanes are independent: a job may not
+    declare ``needs:``, because a dependency skips the lane precisely when its
+    own ``if`` would have fired.
+    """
+
+    problems: list[str] = []
+    for name, job in _jobs(workflow).items():
+        condition = LANE_ROUTING_CONDITIONS.get(name)
+        if condition is None:
+            problems.append(f"{name}: job is outside the lane routing map")
+            continue
+        if_value = job.get("if") if isinstance(job, dict) else None
+        if if_value != condition:
+            problems.append(
+                f"{name}: job condition is {if_value!r}, expected {condition!r}"
+            )
+        for step in _steps(job):
+            if "if" in step:
+                problems.append(
+                    f"{name}: step {step.get('name') or step.get('uses')!r} "
+                    f"declares if={step['if']!r}"
+                )
+        if isinstance(job, dict) and "needs" in job:
+            problems.append(
+                f"{name}: job declares needs={job['needs']!r}; lanes are independent"
+            )
+    return problems
 
 
 def check_job_matrix(workflow: dict[str, Any]) -> list[str]:
@@ -1008,6 +1086,7 @@ def check_no_offscreen_substitute(workflow: dict[str, Any]) -> list[str]:
 
 CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "workflow_trigger": check_workflow_trigger,
+    "lane_routing": check_lane_routing,
     "job_matrix": check_job_matrix,
     "shell_matrix": check_shell_matrix,
     "baseline_source_suite": check_baseline_source_suite,
@@ -1265,6 +1344,54 @@ def _mutate_remove_push_trigger(workflow: dict[str, Any]) -> None:
         if key is True or str(key).lower() in ("on", "true"):
             assert "push" in _events(workflow)
             del workflow[key]
+
+
+def _mutate_filter_push_trigger_to_main(workflow: dict[str, Any]) -> None:
+    _set_trigger(
+        workflow,
+        {"push": {"branches": ["main"]}, "workflow_dispatch": None},
+    )
+
+
+def _mutate_remove_workflow_dispatch_trigger(workflow: dict[str, Any]) -> None:
+    _set_trigger(workflow, {"push": None})
+
+
+def _mutate_add_scheduled_trigger(workflow: dict[str, Any]) -> None:
+    _set_trigger(
+        workflow,
+        {
+            "push": None,
+            "workflow_dispatch": None,
+            "schedule": [{"cron": "0 6 * * *"}],
+        },
+    )
+
+
+def _mutate_drop_package_job_condition(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-windows").pop("if")
+
+
+def _mutate_narrow_desktop_routing_to_main(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-macos")["if"] = "github.ref == 'refs/heads/main'"
+
+
+def _mutate_sequence_desktop_lane_after_package_lane(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-windows")["needs"] = ["nyx-windows"]
+
+
+def _mutate_condition_the_documented_build_step(workflow: dict[str, Any]) -> None:
+    _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)["if"] = (
+        "github.ref == 'refs/heads/main'"
+    )
+
+
+def _mutate_add_unrouted_job(workflow: dict[str, Any]) -> None:
+    _jobs(workflow)["nyx-extra"] = {
+        "runs-on": "ubuntu-latest",
+        TIMEOUT_KEY: 30,
+        "steps": [{"uses": "actions/checkout@v4"}],
+    }
 
 
 def _mutate_change_baseline_runner(workflow: dict[str, Any]) -> None:
@@ -1723,6 +1850,32 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         _mutate_substitute_offscreen_platform,
     ),
     "remove push trigger": (check_workflow_trigger, _mutate_remove_push_trigger),
+    "filter push trigger to main": (
+        check_workflow_trigger,
+        _mutate_filter_push_trigger_to_main,
+    ),
+    "remove workflow dispatch trigger": (
+        check_workflow_trigger,
+        _mutate_remove_workflow_dispatch_trigger,
+    ),
+    "add a scheduled trigger": (check_workflow_trigger, _mutate_add_scheduled_trigger),
+    "drop the package-job condition": (
+        check_lane_routing,
+        _mutate_drop_package_job_condition,
+    ),
+    "narrow the desktop routing condition to main": (
+        check_lane_routing,
+        _mutate_narrow_desktop_routing_to_main,
+    ),
+    "run the documented build step only on main": (
+        check_lane_routing,
+        _mutate_condition_the_documented_build_step,
+    ),
+    "add an unrouted job": (check_lane_routing, _mutate_add_unrouted_job),
+    "sequence a desktop lane after a package lane": (
+        check_lane_routing,
+        _mutate_sequence_desktop_lane_after_package_lane,
+    ),
     "change baseline runner": (check_job_matrix, _mutate_change_baseline_runner),
     "remove pwsh shell declaration": (
         check_shell_matrix,

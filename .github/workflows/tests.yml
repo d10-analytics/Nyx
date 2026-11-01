@@ -1,9 +1,12 @@
 name: tests
 
-on: [push]
+on:
+  push:
+  workflow_dispatch:
 
 jobs:
   nyx:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -73,6 +76,7 @@ jobs:
           python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v
 
   nyx-windows:
+    if: github.event_name == 'push'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -107,6 +111,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-macos:
+    if: github.event_name == 'push'
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -132,6 +137,7 @@ jobs:
           "$runner_python" -m pytest tests/test_wheel_install.py -v
 
   nyx-desktop-windows:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: windows-2025
     timeout-minutes: 35
     steps:
@@ -200,6 +206,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
