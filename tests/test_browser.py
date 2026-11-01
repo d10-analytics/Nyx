@@ -1617,7 +1617,7 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     page.clock.fast_forward(registered + 8_900 - now)
     page.wait_for_timeout(250)
     assert client.calls == 1
-    # A poll arrives by 10.5 s after registration.
+    # A poll arrives by 10.4 s after registration.
     with page.expect_response("**/api/catalog", timeout=3000):
         page.clock.fast_forward(1_500)
     page.wait_for_selector("#refresh.pending", timeout=5000)
