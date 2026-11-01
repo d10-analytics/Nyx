@@ -1592,18 +1592,32 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     first = board_payload()
     second = board_payload(titles={"step_one": "Renamed foundation"})
     client = SequenceClient([first, second])
-    page = open_page(client, fake_clock=True)
-    # Pause page time (pause_at takes seconds) so neither bound depends on
+    # The page's only interval is the poll; record the page time at which it
+    # is registered so both bounds are measured from registration, however
+    # long the launch took. The init script runs after the clock is installed,
+    # so the wrapped setInterval is the fake clock's.
+    record_registration = (
+        "(() => { const real = window.setInterval.bind(window);"
+        " window.setInterval = (...args) => {"
+        "   if (window.__pollRegisteredAt === undefined)"
+        "     window.__pollRegisteredAt = performance.now();"
+        "   return real(...args); }; })();"
+    )
+    page = open_page(client, fake_clock=True, init_script=record_registration)
+    # Pause page time (pause_at takes seconds) so the bounds do not depend on
     # real time; frames do not run while paused, so only fast_forward advances.
     page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
-    # The interval registers after the clock is installed and before the board
-    # renders, so page time since registration is at most `elapsed`.
-    elapsed = page.evaluate("performance.now()")
-    assert elapsed < 9_000, f"launch took {elapsed} ms of page time; the bound needs < 9000"
-    # No poll before the documented interval has elapsed.
-    page.clock.fast_forward(9_000 - elapsed)
+    registered = page.evaluate("window.__pollRegisteredAt")
+    assert registered is not None, "the page never registered its poll interval"
+    now = page.evaluate("performance.now()")
+    assert now - registered < 9_000, f"launch took {now - registered} ms past registration"
+    # No poll before the documented interval has elapsed since registration.
+    # Stop 100 ms short of 9 s so a poll due exactly at 9 s is not a race, and
+    # give any request a poll fired in that span real time to reach the server.
+    page.clock.fast_forward(registered + 8_900 - now)
+    page.wait_for_timeout(250)
     assert client.calls == 1
-    # A poll arrives by 10.5 s of page time past the registration offset.
+    # A poll arrives by 10.5 s after registration.
     with page.expect_response("**/api/catalog", timeout=3000):
         page.clock.fast_forward(1_500)
     page.wait_for_selector("#refresh.pending", timeout=5000)
