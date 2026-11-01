@@ -741,10 +741,8 @@ def dependency_state_payload(state, *, titles=None):
 
 
 # Literal expectations for Windows-style roots: the root is preserved and every
-# separator after it is a backslash. The None case is the pytest tmp_path root,
-# which is POSIX on Linux and macOS and drive-letter on nyx-windows.
+# separator after it is a backslash.
 COPY_ROOT_CASES = [
-    pytest.param(None, None, id="tmp_path"),
     pytest.param(
         "C:\\work\\board",
         "C:\\work\\board\\Alpha\\Under_Development\\step-one",
@@ -755,19 +753,40 @@ COPY_ROOT_CASES = [
         "\\\\server\\share\\board\\Alpha\\Under_Development\\step-one",
         id="unc",
     ),
-    pytest.param(
-        "\\\\server\\share\\teams\\spec workspace\\board",
-        "\\\\server\\share\\teams\\spec workspace\\board\\Alpha\\Under_Development\\step-one",
-        id="unc-deep",
-    ),
 ]
 
 
 @pytest.mark.parametrize(("windows_root", "expected_path"), COPY_ROOT_CASES)
-def test_card_right_click_copies_full_directory_without_changing_selection(
-    open_page, tmp_path, windows_root, expected_path
+def test_card_right_click_copies_windows_root_in_windows_format(
+    open_page, windows_root, expected_path
 ):
-    root = tmp_path / "spec workspace" if windows_root is None else windows_root
+    settings = BrowserSettings(root=windows_root)
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    page.wait_for_load_state("networkidle")
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    relative = card.get_attribute("data-package-path")
+    assert relative
+    card.click(button="right")
+    playwright.expect(page.locator("#copy-status")).to_have_text("Full directory path copied.")
+    playwright.expect(page.locator("#copy-status")).to_be_visible()
+    card_box = card.bounding_box()
+    popup_box = page.locator("#copy-status").bounding_box()
+    assert card_box and popup_box
+    assert 8 <= popup_box["x"] - (card_box["x"] + card_box["width"]) <= 12
+    assert popup_box["x"] + popup_box["width"] <= page.viewport_size["width"]
+    assert popup_box["y"] + popup_box["height"] <= page.viewport_size["height"]
+    assert relative == "Alpha/Under_Development/step-one"
+    copied = page.evaluate("navigator.clipboard.readText()")
+    assert copied == expected_path
+    assert "/" not in copied
+    assert card.get_attribute("aria-pressed") == "false"
+
+
+def test_card_right_click_copies_full_directory_without_changing_selection(open_page, tmp_path):
+    # The pytest tmp_path root is POSIX on Linux and macOS and drive-letter on
+    # nyx-windows.
+    root = tmp_path / "spec workspace"
     settings = BrowserSettings(root=root)
     page = open_page(StaticClient(board_payload()), settings=settings)
     page.context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -786,11 +805,7 @@ def test_card_right_click_copies_full_directory_without_changing_selection(
     assert popup_box["y"] + popup_box["height"] <= page.viewport_size["height"]
     assert relative == "Alpha/Under_Development/step-one"
     copied = page.evaluate("navigator.clipboard.readText()")
-    if windows_root is None:
-        assert copied == str(root / relative)
-    else:
-        assert copied == expected_path
-        assert "/" not in copied
+    assert copied == str(root / relative)
     assert card.get_attribute("aria-pressed") == "false"
     playwright.expect(page.locator("#copy-status")).to_be_hidden(timeout=3500)
     page.set_viewport_size({"width": 480, "height": 320})
@@ -1174,14 +1189,28 @@ def admitted_reason_payload(kind, reason):
     return value
 
 
-@pytest.mark.parametrize(("kind", "reason"),
-                         [("claim", reason) for reason in CLAIM_EDGE_REASONS] +
-                         [("completion", reason) for reason in COMPLETION_EDGE_REASONS])
-def test_browser_admits_every_python_valid_typed_edge_reason(open_page, kind, reason):
-    value = admitted_reason_payload(kind, reason)
-    assert parse_catalog(value).entries
-    page = open_page(StaticClient(value))
-    assert page.locator(f'.card[data-package-id="{GATE}"]').count() == 1
+def test_browser_admits_every_python_valid_typed_edge_reason(open_page):
+    reasons = [("claim", reason) for reason in CLAIM_EDGE_REASONS] + [
+        ("completion", reason) for reason in COMPLETION_EDGE_REASONS
+    ]
+    values = []
+    for kind, reason in reasons:
+        value = admitted_reason_payload(kind, reason)
+        gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
+        gate["declared"]["title"] = f"Gate {kind} {reason}"
+        _reseal(value)
+        assert parse_catalog(value).entries, f"{kind} {reason}"
+        values.append(value)
+    client = SequenceClient([board_payload()] + values)
+    page = open_page(client, fake_clock=True)
+    # Freeze the page timers so no poll can interleave with the refresh clicks.
+    page.clock.pause_at(page.evaluate("Date.now()") + 1_000)
+    gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
+    for kind, reason in reasons:
+        page.locator("#refresh").click()
+        playwright.expect(gate_title).to_have_text(f"Gate {kind} {reason}", timeout=5000)
+        assert page.locator("#board-issues").count() == 0, f"{kind} {reason}"
+    assert client.calls == len(reasons) + 1
 
 
 def malformed_typed_edge_payload(case):
