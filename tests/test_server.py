@@ -1961,8 +1961,11 @@ def test_owned_shutdown_releases_the_listener_when_request_work_does_not_drain()
             connection = open_connection(port)
             connection.sendall(raw_request(port, "GET /api/catalog HTTP/1.1"))
             assert wait_for(lambda: running.server._request_work == 1, 5)
-            # The undrained request keeps the shutdown result retryable.
-            assert running.application.shutdown(time.monotonic() + 0.5) is False
+            # The undrained request keeps the shutdown result retryable. The
+            # budget must outlast serve_forever's 0.5 s poll interval, which
+            # stopping the accept loop can wait out in full; a smaller budget
+            # expires before the listener close and the port stays bound.
+            assert running.application.shutdown(time.monotonic() + 2) is False
             # The caller's precondition still holds: the released port is
             # usable while the stuck request is reported through the result.
             assert running.server.socket.fileno() == -1
