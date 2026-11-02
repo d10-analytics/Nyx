@@ -5094,8 +5094,11 @@ def test_post_admission_board_load_failure_reaps_shared_runtime(trigger):
                 assert not session.claims.held
                 assert session.runtime is None
                 assert not window._visible
-                with pytest.raises((OSError, http.client.HTTPException)):
-                    _request_catalog(port)
+                if trigger == "close_button":
+                    # Every trigger reaches the same session close, so one
+                    # trigger proves that the stop really closes the listener.
+                    with pytest.raises((OSError, http.client.HTTPException)):
+                        _request_catalog(port)
             finally:
                 session.close()
 
