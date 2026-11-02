@@ -821,9 +821,12 @@ _PACKAGE_KEYS = frozenset(
         "superseded",
         "target",
         "branch",
+        "baseline",
         "code_status",
     }
 )
+_BASELINE_KEYS = frozenset({"status", "sha", "drift"})
+_BASELINE_STATUSES = frozenset({"declared", "invalid", "absent"})
 _CODE_STATUS_KEYS = frozenset(
     {
         "state",
@@ -1168,8 +1171,16 @@ _BRANCH_BASES: dict[str | None, frozenset[str]] = {
 
 
 def _comparison(
-    value: Any, name: str, *, check: str | None, nullable: bool = False
+    value: Any,
+    name: str,
+    *,
+    check: str | None,
+    nullable: bool = False,
+    lender_on_cached: bool = False,
 ) -> None:
+    """Check one comparison's shape. ``lender_on_cached`` lets ``objects_from``
+    stand under the cached basis, which only a package's base drift needs: a
+    cached base can still be compared with objects borrowed from a sibling."""
     if value is None and nullable:
         return
     item = _object(value, name)
@@ -1178,7 +1189,7 @@ def _comparison(
     relation = _choice(item["relation"], _COMPARISON_RELATIONS, f"{name}.relation")
     ahead, behind = item["ahead"], item["behind"]
     lender = _nullable(item["objects_from"], _text, f"{name}.objects_from")
-    if lender is not None and basis == "cached":
+    if lender is not None and basis == "cached" and not lender_on_cached:
         raise ProtocolError(f"{name}.objects_from requires the live or recorded basis")
     if relation in {"differs", "absent", "unknown"}:
         if ahead is not None or behind is not None or item["objects_from"] is not None:
@@ -1984,12 +1995,74 @@ def _package(value: Any, name: str) -> dict[str, Any]:
     _nullable(branch["name"], _text, f"{name}.branch.name")
     if (branch["name"] is not None) != (branch_status == "declared"):
         raise ProtocolError(f"{name}.branch.name is set exactly for declared")
+    baseline = _object(item["baseline"], f"{name}.baseline")
+    _keys(baseline, _BASELINE_KEYS, f"{name}.baseline")
+    baseline_status = _choice(
+        baseline["status"], _BASELINE_STATUSES, f"{name}.baseline.status"
+    )
+    if (baseline["sha"] is not None) != (baseline_status == "declared"):
+        raise ProtocolError(f"{name}.baseline.sha is set exactly for declared")
+    if baseline["sha"] is not None:
+        _object_id(baseline["sha"], f"{name}.baseline.sha")
+    drifts = (
+        baseline_status == "declared"
+        and not item["finished"]
+        and status in ("clone", "worktree")
+    )
+    if (baseline["drift"] is not None) != drifts:
+        raise ProtocolError(
+            f"{name}.baseline.drift is set exactly for an unfinished package with a "
+            "declared baseline and a clone or worktree target"
+        )
     _code_status(
         item["code_status"],
         f"{name}.code_status",
         allowed=branch_status == "declared" and status in ("clone", "worktree"),
     )
     return item
+
+
+def _check_drift(
+    package: Mapping[str, Any],
+    name: str,
+    clones: Mapping[str, tuple[Mapping[str, Any], int]],
+) -> None:
+    """Check a package's base drift against its target clone's verdict base.
+
+    The drift compares the Baseline with the verdict base, so its basis is the
+    base's (or ``cached`` with no base), it is ``absent`` exactly with no base,
+    ``equal`` exactly when both name one commit, and a lender is another ``ok``
+    clone of the target clone's repository.
+    """
+    drift = package["baseline"]["drift"]
+    if drift is None:
+        return
+    label = f"{name}.baseline.drift"
+    target_path = package["target"]["clone"]
+    target, repository = clones[target_path]
+    base = target["verdict_base"]
+    basis = base["basis"] if base is not None else "cached"
+    _comparison(drift, label, check=basis, lender_on_cached=True)
+    if drift["basis"] != basis:
+        raise ProtocolError(f"{label}.basis must equal the target clone's verdict base basis")
+    if (drift["relation"] == "absent") != (base is None):
+        raise ProtocolError(f"{label}.relation is absent exactly when the clone has no verdict base")
+    if base is not None and (drift["relation"] == "equal") != (
+        package["baseline"]["sha"] == base["sha"]
+    ):
+        raise ProtocolError(f"{label}.relation is equal exactly when the baseline is the base")
+    lender = drift["objects_from"]
+    if lender is not None:
+        source = clones.get(lender)
+        if (
+            lender == target_path
+            or source is None
+            or source[1] != repository
+            or source[0]["status"] != "ok"
+        ):
+            raise ProtocolError(
+                f"{label}.objects_from must name another ok clone of the repository"
+            )
 
 
 def _code_status(value: Any, name: str, *, allowed: bool) -> None:
@@ -2190,11 +2263,17 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
                     item["path"] for item in listed_clone["worktrees"] if not item["main"]
                 }
             )
+    listed_clones = {
+        listed_clone["path"]: (listed_clone, repository_index)
+        for repository_index, repository in enumerate(parsed)
+        for listed_clone in repository["clones"]
+    }
     for index, raw_package in enumerate(packages):
         package = _package(raw_package, f"packages[{index}]")
         target = package["target"]
         if target["clone"] is not None and target["clone"] not in listed_worktrees:
             raise ProtocolError(f"packages[{index}].target.clone names no clone")
+        _check_drift(package, f"packages[{index}]", listed_clones)
         if target["worktree"] is not None:
             linked = listed_worktrees[target["clone"]]
             if linked is None or target["worktree"] not in linked:

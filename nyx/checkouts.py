@@ -3313,6 +3313,137 @@ def _assign_no_commits(
     return result
 
 
+def _clone_drift(
+    runner: _GitRunner,
+    context: _CloneContext | None,
+    base: _Base | None,
+    baselines: Sequence[str],
+    siblings: Sequence[tuple[dict[str, Any], _CloneContext]],
+    settings: _VerdictSettings,
+) -> dict[str, dict[str, Any]]:
+    """Compare each Baseline with one clone's verdict base, as comparisons by Baseline.
+
+    ``equal``, ``absent`` and the guarded ``differs`` are decided without git. The
+    rest take one presence probe in the clone, a lender search over its siblings for
+    the Baselines it lacks, and one count per Baseline with the base's own lender and
+    the Baseline's lender as alternates. A call the budget cuts leaves ``unknown``.
+    """
+    if base is None or context is None:
+        return {sha: _comparison("absent") for sha in baselines}
+    basis = base.basis
+    result: dict[str, dict[str, Any]] = {}
+    pending: list[str] = []
+    for sha in baselines:
+        if sha == base.sha:
+            result[sha] = _comparison("equal", 0, 0, basis)
+        elif context.partial or context.shallow:
+            result[sha] = _comparison("differs", basis=basis)
+        else:
+            pending.append(sha)
+    if not pending:
+        return result
+    presence = _present_objects(
+        runner, context, pending, overlay=settings.overlay, pinned=settings.pinned
+    )
+    lacking = [sha for sha in pending if presence.get(sha) == "missing"]
+    lenders = _LenderSearch(runner, siblings, overlay=settings.overlay, pinned=settings.pinned)
+    for sha in pending:
+        state = presence.get(sha, "differs")
+        source: tuple[dict[str, Any], _CloneContext] | None = None
+        if state == "missing":
+            found = lenders.find(sha, lacking)
+            if found is None:
+                state = "differs"
+            elif isinstance(found, str):
+                state = found
+            else:
+                source, state = found, "present"
+        if state != "present":
+            result[sha] = _comparison(state, basis=basis)
+            continue
+        alternates = [base.alternate] if base.alternate else []
+        if source is not None:
+            lent = os.path.join(source[1].common, "objects")
+            if lent not in alternates:
+                alternates.append(lent)
+        overlay: dict[str, str | None] = dict(settings.overlay)
+        if alternates:
+            overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(alternates)
+        counted = _counted_comparison(
+            runner.run(
+                [*settings.pinned, "rev-list", "--left-right", "--count", f"{sha}...{base.sha}"],
+                path=context.cwd,
+                ceiling=context.ceiling,
+                overlay=overlay,
+            ),
+            basis,
+        )
+        if source is not None and counted["relation"] in ("ahead", "behind", "diverged"):
+            counted["objects_from"] = source[0]["path"]
+        result[sha] = counted
+    return result
+
+
+def _assign_drift(
+    runner: _GitRunner,
+    repositories: list[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    verdicts: Mapping[str, _CloneVerdicts],
+    packages: list[dict[str, Any]],
+    settings: _VerdictSettings,
+    max_parallel: int,
+) -> None:
+    """Write the base drift of every unfinished package with a declared Baseline and a
+    clone or worktree target.
+
+    One job per target clone memoizes by Baseline, so a Baseline shared by packages is
+    counted once; the results are written here, after the jobs, never by them.
+    """
+    wanted: dict[str, list[str]] = {}
+    for package in packages:
+        baseline = package["baseline"]
+        if (
+            baseline["status"] == "declared"
+            and not package["finished"]
+            and package["target"]["status"] in ("clone", "worktree")
+        ):
+            shas = wanted.setdefault(package["target"]["clone"], [])
+            if baseline["sha"] not in shas:
+                shas.append(baseline["sha"])
+    if not wanted:
+        return
+    owners = {
+        clone["path"]: (clone, repository)
+        for repository in repositories
+        for clone in repository["clones"]
+    }
+    jobs = []
+    for path, shas in wanted.items():
+        clone, repository = owners[path]
+        decided = verdicts.get(path)
+        jobs.append(
+            (
+                path,
+                contexts.get(path),
+                decided.base if decided is not None else None,
+                shas,
+                _siblings(clone, repository["clones"], contexts),
+            )
+        )
+
+    def decide(job: Any) -> tuple[str, dict[str, dict[str, Any]]]:
+        path, context, base, shas, siblings = job
+        return path, _clone_drift(runner, context, base, shas, siblings, settings)
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+        decided_drift = dict(pool.map(decide, jobs))
+    for package in packages:
+        baseline = package["baseline"]
+        found = decided_drift.get(package["target"]["clone"], {}).get(baseline["sha"])
+        if found is not None and baseline["status"] == "declared" and not package["finished"]:
+            baseline["drift"] = dict(found)
+
+
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
 _CACHE_KEYS = frozenset({"schema_version", "verdicts", "remote_checks"})
 _CACHE_SCHEMA = 3
@@ -3745,6 +3876,11 @@ def _package_entries(
                 "superseded": head.superseded,
                 "target": target,
                 "branch": {"status": head.branch.status, "name": head.branch.name},
+                "baseline": {
+                    "status": head.baseline.status,
+                    "sha": head.baseline.sha,
+                    "drift": None,
+                },
                 "code_status": None,
             }
         )
@@ -3884,6 +4020,15 @@ def collect_checkouts(
                 contexts,
                 verdicts,
                 declared_names_by_repository(repositories, packages),
+                settings,
+                max_parallel,
+            )
+            _assign_drift(
+                verdict_runner,
+                repositories,
+                contexts,
+                verdicts,
+                packages,
                 settings,
                 max_parallel,
             )
