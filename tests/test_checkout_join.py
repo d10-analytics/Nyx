@@ -3814,7 +3814,7 @@ def build_world_w(base: Path) -> WorldW:
     declare("baseline-invalid", target("A") + "Baseline: c3e197a\n")
     declare("branch-invalid", target("A") + "Branch: spec/x (proposed)\n")
     declare("default", target("A") + "Branch: trunk\n")
-    declare("on-worktree", f"Target repo: {c['wt']}\nBranch: wt\n")
+    declare("on-worktree", f"Target repo: {c['wt']}\n")
     declare("on-c", target("C"))
     declare("fresh", target("W") + "Branch: spec/fresh\n")
     for name, branch in (("done-a", "done"), ("done-b", "done"), ("shared-a", "shared"), ("shared-b", "shared")):
@@ -4258,3 +4258,26 @@ def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
             "GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"
         }
         assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U", "L")}
+
+
+def test_an_all_zero_baseline_is_declared_parses_and_differs(tmp_path):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = clone(remote, folder / "work")
+    root = tmp_path / "spec"
+    zero = "0" * 40
+    make_package(root, "Drafts", "zero", f"Target repo: {work}\nBaseline: {zero}\n")
+
+    document = collect_packages([folder], root)
+
+    (package,) = document["packages"]
+    assert package["baseline"]["status"] == "declared"
+    assert package["baseline"]["sha"] == zero
+    assert package["baseline"]["drift"] == {
+        "basis": "cached",
+        "relation": "differs",
+        "ahead": None,
+        "behind": None,
+        "objects_from": None,
+    }
