@@ -2003,7 +2003,10 @@ def _package(value: Any, name: str) -> dict[str, Any]:
     if (baseline["sha"] is not None) != (baseline_status == "declared"):
         raise ProtocolError(f"{name}.baseline.sha is set exactly for declared")
     if baseline["sha"] is not None:
-        _object_id(baseline["sha"], f"{name}.baseline.sha")
+        # The catalog declares a Baseline from the same 40 or 64 lowercase hex
+        # pattern, so an all-zero ID that only fails the object rule stays valid.
+        if type(baseline["sha"]) is not str or _OBJECT_ID.fullmatch(baseline["sha"]) is None:
+            raise ProtocolError(f"{name}.baseline.sha must be a commit ID")
     drifts = (
         baseline_status == "declared"
         and not item["finished"]
