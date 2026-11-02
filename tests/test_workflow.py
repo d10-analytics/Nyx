@@ -543,11 +543,47 @@ def _suite_command(name: str) -> str:
     return SHARDED_SUITE_COMMAND.replace("{python}", SUITE_JOBS[name]["python"])
 
 
+_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&"})
+_GLOB_CHARACTERS = frozenset("*?[")
+
+
+def _is_whole_directory_target(target: str) -> bool:
+    """Return whether a pytest path argument selects the whole test directory."""
+
+    target = target.strip("'\"")
+    while target.startswith("./"):
+        target = target[2:]
+    target = target.rstrip("/")
+    if target in ("", ".", "tests"):
+        return True
+    return target.startswith("tests/") and any(
+        character in _GLOB_CHARACTERS for character in target
+    )
+
+
 def _runs_whole_test_directory(line: str) -> bool:
-    """Return whether a line runs pytest on the whole ``tests/`` directory."""
+    """Return whether a line runs pytest on the whole ``tests/`` directory.
+
+    A pytest invocation with no path argument, ``.``, ``tests`` (quoted, with a
+    leading ``./`` or a trailing slash) and a glob under ``tests/`` all select
+    the whole suite; a run of one file or one node does not.
+    """
 
     tokens = line.split()
-    return "pytest" in tokens and any(token in ("tests", "tests/") for token in tokens)
+    for index, token in enumerate(tokens):
+        if token != "pytest" or (index and tokens[index - 1] != "-m"):
+            continue
+        arguments: list[str] = []
+        for argument in tokens[index + 1 :]:
+            if argument in _COMMAND_SEPARATORS:
+                break
+            if not argument.startswith("-"):
+                arguments.append(argument)
+        if not arguments or any(
+            _is_whole_directory_target(argument) for argument in arguments
+        ):
+            return True
+    return False
 
 
 def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
@@ -1919,6 +1955,19 @@ def _mutate_rerun_whole_suite_in_package_job(workflow: dict[str, Any]) -> None:
     )
 
 
+def _rerun_package_job_suite_as(command: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(workflow: dict[str, Any]) -> None:
+        _rewrite_run_line(
+            workflow,
+            "nyx-windows",
+            BASELINE_LIFECYCLE_STEP,
+            WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-windows"]["python"]),
+            _insert_before(command),
+        )
+
+    return mutate
+
+
 def _mutate_drop_suite_test_extras(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-suite", SUITE_STEP)
     install = SUITE_INSTALL_COMMAND.replace("{python}", SUITE_JOBS["nyx-suite"]["python"])
@@ -2309,6 +2358,26 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "rerun the whole suite in a package job": (
         check_baseline_source_suite,
         _mutate_rerun_whole_suite_in_package_job,
+    ),
+    "rerun the suite in a package job without a path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v"),
+    ),
+    "rerun the suite in a package job as ./tests/": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest ./tests/ -v"),
+    ),
+    "rerun the suite in a package job with a quoted directory": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('python -m pytest "tests/" -v'),
+    ),
+    "rerun the suite in a package job from the current directory": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest . -v"),
+    ),
+    "rerun the suite in a package job through a glob": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest tests/*.py -v"),
     ),
     "drop test extras from a suite install": (
         check_baseline_source_suite,
