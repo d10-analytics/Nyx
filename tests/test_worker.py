@@ -225,7 +225,7 @@ _RACE_PARK_SECONDS = 10.0
 
 @pytest.mark.skipif(
     os.name != "nt",
-    reason="handle inheritance toggling is the Windows spawn branch; run on nyx-windows",
+    reason="handle inheritance toggling is the Windows spawn branch; run on the Windows source-suite shards",
 )
 @pytest.mark.xfail(
     condition=os.name == "nt",
