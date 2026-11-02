@@ -1573,8 +1573,7 @@ def mutate_prunable_ok(document):
             )
         ],
     ],
-    ids=lambda mutation: getattr(mutation, "__name__", "mutation")
-    + str(abs(hash(mutation)) % 1000),
+    ids=lambda mutation: getattr(mutation, "__name__", "mutation"),
 )
 def test_parser_rejects_a_contract_violation(sample, mutation):
     document, _folder = sample
