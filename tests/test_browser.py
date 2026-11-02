@@ -643,7 +643,16 @@ def page_launcher(browser, launch_timeout_ms=15000):
                 "'#board .card, #board .board-empty, #board-issues')",
                 timeout=launch_timeout_ms,
             )
-            page.wait_for_timeout(150)
+            if application is None:
+                page.wait_for_function(
+                    "() => new Promise(resolve => requestAnimationFrame("
+                    "() => requestAnimationFrame(resolve)))",
+                    timeout=launch_timeout_ms,
+                )
+            else:
+                # Application pages load board settings concurrently with the
+                # first render; give that load time to finish.
+                page.wait_for_timeout(150)
         except BaseException as failure:
             # A launch that fails after its server started stops that
             # server (and closes its context) before the error propagates;
