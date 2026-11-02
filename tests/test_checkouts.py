@@ -1417,6 +1417,14 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
         for worktree, verdict in zip(item["worktrees"], derived["worktrees"]):
             worktree["removable"] = verdict
         item["removable_count"] = derived["removable_count"]
+    try:
+        derived = models.derive_attention(document)
+    except (KeyError, TypeError):
+        return document
+    for repository, free in zip(document["repositories"], derived["free_clones"]):
+        repository["free_clones"] = free
+        for item in repository["clones"]:
+            item["availability"] = derived["availability"][item["path"]]
     return document
 
 
@@ -1693,6 +1701,7 @@ def without_remote(document):
             "default_branch": None,
             "pr_lookup": None,
             "clones": [clone_document],
+            "free_clones": [],
             "package_branches": [],
         }
     ]

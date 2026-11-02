@@ -37,6 +37,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     pr_answer,
     pr_node,
     real,
+    rederive,
     redigest,
     refusal_of,
     rev,
@@ -180,7 +181,9 @@ def test_a_missing_specification_root_lists_no_package_and_keeps_repositories(wo
     unreferenced = doc_copy(present)
     for repository in unreferenced["repositories"]:
         repository["package_branches"] = []
+        repository["free_clones"] = []
         for member in repository["clones"]:
+            member["availability"] = {"state": "unknown", "reasons": [], "assigned_to": []}
             for branch in member["branches"]:
                 branch["packages"] = []
     assert document["repositories"] == unreferenced["repositories"]
@@ -4289,3 +4292,447 @@ def test_an_all_zero_baseline_is_declared_parses_and_differs(world_w):
         assert world_package(parsed, "drift-moved")["baseline"] == {
             "status": "declared", "sha": zero, "drift": differs
         }, document["remote_checks"]
+
+
+# ---------------------------------------------------------------------------
+# Availability and ranking
+# ---------------------------------------------------------------------------
+
+
+def availability_of(document: dict[str, Any], path: Path | str) -> dict[str, Any]:
+    return clone_at(document, path)["availability"]
+
+
+def free_names(document: dict[str, Any], key_path: Path | str) -> list[str]:
+    return [Path(p).name for p in repository_of(document, key_path)["free_clones"]]
+
+
+def world_availability(w: WorldW, document: dict[str, Any]) -> None:
+    state = {key: availability_of(document, w.c[key])["state"] for key in "ACWSUL"}
+    assert state == {
+        "A": "assigned", "C": "free", "W": "occupied", "S": "assigned", "U": "unknown",
+        "L": "unknown",
+    }
+    unfinished_a = sorted(
+        f"Fictional/Drafts/{name}"
+        for name in (
+            "drift-moved", "drift-twin", "drift-off", "drift-equal", "drift-unheld",
+            "baseline-invalid", "branch-invalid", "default",
+        )
+    )
+    assert availability_of(document, w.c["A"]) == {
+        "state": "assigned",
+        "reasons": [],
+        "assigned_to": [{"package_path": p, "basis": "target_repo"} for p in unfinished_a],
+    }
+    assert availability_of(document, w.c["C"]) == {
+        "state": "free", "reasons": [], "assigned_to": []
+    }
+    assert availability_of(document, w.c["W"]) == {
+        "state": "occupied",
+        "reasons": ["not_on_default_branch", "linked_worktrees"],
+        "assigned_to": [
+            {"package_path": "Fictional/Drafts/drift-held", "basis": "target_repo"},
+            {"package_path": "Fictional/Drafts/fresh", "basis": "target_repo"},
+            {"package_path": "Fictional/Drafts/on-worktree", "basis": "target_repo_worktree"},
+            {"package_path": "Fictional/Drafts/shared-b", "basis": "target_repo"},
+        ],
+    }
+    for key in "UL":
+        assert availability_of(document, w.c[key])["reasons"] == [], key
+    assert availability_of(document, w.c["S"])["state"] == "assigned"
+
+
+def test_world_w_live_clones_are_free_assigned_occupied_or_unknown(world_w):
+    w = world_w
+    world_availability(w, w.live)
+    # the finished package names C, and C is still free
+    assert world_package(w.live, "on-c")["target"]["clone"] == real(w.c["C"])
+
+
+def test_world_w_ranks_its_free_clones_by_the_distance_of_their_default_branch(world_w):
+    w = world_w
+    live = repository_of(w.live, w.c["A"])
+    assert [Path(p).name for p in live["free_clones"]] == [
+        "Repo Clone 3", "Repo Clone 10", "Repo Clone 2", "Repo Clone 4"
+    ]
+    expected = {
+        "Repo Clone 3": ("equal", 0, 0), "Repo Clone 10": ("equal", 0, 0),
+        "Repo Clone 2": ("behind", 0, 1), "Repo Clone 4": ("ahead", 1, 0),
+    }
+    for item in live["clones"]:
+        name = Path(item["path"]).name
+        if name in expected:
+            distance = item["local_default"]["vs_remote"]
+            assert (distance["relation"], distance["ahead"], distance["behind"]) == expected[name]
+    assert w.live["repositories"][-1]["free_clones"] == []
+
+    world_availability(w, w.offline)
+    offline = repository_of(w.offline, w.c["A"])
+    assert [Path(p).name for p in offline["free_clones"]] == [
+        "Repo Clone 2", "Repo Clone 3", "Repo Clone 10", "Repo Clone 4"
+    ]
+    cached = {
+        Path(item["path"]).name: item["local_default"]["vs_cached"]["relation"]
+        for item in offline["clones"]
+        if item["path"] in offline["free_clones"]
+    }
+    assert cached == {
+        "Repo Clone 2": "equal", "Repo Clone 3": "equal", "Repo Clone 10": "equal",
+        "Repo Clone 4": "ahead",
+    }
+    assert all(r["free_clones"] == [] for r in w.offline["repositories"] if r["remote"] is None)
+
+
+def test_the_target_collection_marks_a_bare_clone_with_a_worktree_occupied(targets, tmp_path):
+    document = collect_packages(
+        [targets["folder"]],
+        package_root(tmp_path, {"barework": targets["bare_work"], "holder": targets["holder"]}),
+    )
+
+    assert availability_of(document, targets["bare"]) == {
+        "state": "occupied", "reasons": ["linked_worktrees"], "assigned_to": [
+            {"package_path": path_of("barework"), "basis": "target_repo_worktree"}
+        ],
+    }
+    # git cannot read the holder's bare directory as a work tree, so the clone is not ok
+    assert clone_at(document, targets["holder"])["status"] == "failed"
+    assert availability_of(document, targets["holder"])["state"] == "unknown"
+    assert availability_of(document, targets["holder"])["reasons"] == []
+
+
+def main_of(clone_document: dict[str, Any]) -> dict[str, Any]:
+    (found,) = [item for item in clone_document["worktrees"] if item["main"]]
+    return found
+
+
+def off_branch(clone_document: dict[str, Any]) -> None:
+    main_of(clone_document)["head"]["branch"] = "elsewhere"
+
+
+def detach(clone_document: dict[str, Any]) -> None:
+    main = main_of(clone_document)
+    main["head"]["branch"] = None
+    main["verdict"] = {"state": "merged", "rung": "ancestor", "reason": None, "pull_request": None}
+
+
+def add_linked(clone_document: dict[str, Any]) -> None:
+    clone_document["worktrees"].append(
+        {
+            "path": clone_document["path"] + "-linked", "main": False, "head": None,
+            "locked": False, "prunable": True, "status": "failed", "changes": None,
+            "operations": None, "index_lock": None, "verdict": None, "removable": None,
+        }
+    )
+
+
+def dirty(clone_document: dict[str, Any]) -> None:
+    main_of(clone_document)["changes"]["untracked"] = 1
+
+
+def mid_operation(clone_document: dict[str, Any]) -> None:
+    main_of(clone_document)["operations"] = ["merge"]
+
+
+def unreadable_main(clone_document: dict[str, Any]) -> None:
+    main = main_of(clone_document)
+    main.update(status="failed", head=None, changes=None, operations=None, index_lock=None, verdict=None)
+
+
+def unreadable_clone(clone_document: dict[str, Any]) -> None:
+    clone_document.update(
+        status="failed", bare=None, partial_clone=None, shallow=None, cached_default=None,
+        local_default=None, cached_vs_remote=None, stash_count=None, worktrees=None,
+        branches=None, verdict_base=None, containment=None, removable_count=None,
+    )
+
+
+def no_default_name(clone_document: dict[str, Any]) -> None:
+    clone_document["verdict_base"] = None
+    clone_document["local_default"] = None
+
+
+def apply_all(*changes):
+    def change(clone_document: dict[str, Any]) -> None:
+        for each in changes:
+            each(clone_document)
+
+    return change
+
+
+ALL_REASONS = ["not_on_default_branch", "linked_worktrees", "uncommitted_changes", "operation_in_progress"]
+
+# (label, change to clone C, state, reasons, whether the changed document is otherwise valid)
+AVAILABILITY_ROWS = (
+    ("not on the default branch", off_branch, "occupied", ["not_on_default_branch"], True),
+    ("detached head", detach, "occupied", ["detached_head"], True),
+    ("linked worktree", add_linked, "occupied", ["linked_worktrees"], True),
+    ("uncommitted changes", dirty, "occupied", ["uncommitted_changes"], True),
+    ("operation in progress", mid_operation, "occupied", ["operation_in_progress"], True),
+    (
+        "every reason",
+        apply_all(off_branch, add_linked, dirty, mid_operation),
+        "occupied", ALL_REASONS, True,
+    ),
+    (
+        "every reason with a detached head",
+        apply_all(detach, add_linked, dirty, mid_operation),
+        "occupied",
+        ["detached_head", "linked_worktrees", "uncommitted_changes", "operation_in_progress"],
+        True,
+    ),
+    ("main worktree not ok", unreadable_main, "unknown", [], True),
+    ("clone not ok", unreadable_clone, "unknown", [], True),
+    (
+        "main worktree not ok beside a reason",
+        apply_all(add_linked, unreadable_main), "unknown", [], True,
+    ),
+    ("no default name on a non-bare clone", no_default_name, "unknown", [], False),
+    (
+        "no default name beside a dirty tree",
+        apply_all(no_default_name, dirty), "occupied", ["uncommitted_changes"], False,
+    ),
+    (
+        "no default name beside a linked worktree",
+        apply_all(no_default_name, add_linked), "occupied", ["linked_worktrees"], False,
+    ),
+)
+
+
+def clone_c(document: dict[str, Any], w: WorldW) -> dict[str, Any]:
+    return clone_at(document, w.c["C"])
+
+
+def test_each_reason_for_a_busy_clone_is_derived_alone_and_in_order(world_w):
+    w = world_w
+    for label, change, state, reasons, _valid in AVAILABILITY_ROWS:
+        document = doc_copy(w.live)
+        change(clone_c(document, w))
+        derived = models.derive_attention(document)["availability"][real(w.c["C"])]
+        assert (derived["state"], derived["reasons"]) == (state, reasons), label
+        assert derived["assigned_to"] == [], label
+
+
+def test_a_derived_availability_parses_and_an_underived_one_is_refused(world_w):
+    w = world_w
+    for label, change, _state, _reasons, valid in AVAILABILITY_ROWS:
+        if not valid:
+            continue
+        document = doc_copy(w.live)
+        change(clone_c(document, w))
+        assert "contradicts" in refusal_of(doc_copy(document)), label
+        assert models.parse_checkouts(json.dumps(redigest(rederive(document)))), label
+
+
+def test_a_bare_clone_is_decided_by_its_linked_worktrees_alone(world_w):
+    w = world_w
+    document = doc_copy(w.live)
+    bare = clone_c(document, w)
+    bare.update(bare=True, verdict_base=None, local_default=None)
+    bare["worktrees"] = []
+    assert models.derive_attention(document)["availability"][bare["path"]]["state"] == "free"
+    world_package(document, "default")["target"]["clone"] = bare["path"]
+    assigned = models.derive_attention(document)["availability"][bare["path"]]
+    assert (assigned["state"], assigned["reasons"]) == ("assigned", [])
+    add_linked(bare)
+    derived = models.derive_attention(document)["availability"][bare["path"]]
+    assert (derived["state"], derived["reasons"]) == ("occupied", ["linked_worktrees"])
+
+
+def test_an_unavailable_scan_makes_every_clone_unknown_and_an_incomplete_one_does_not(world_w):
+    w = world_w
+    document = doc_copy(w.live)
+    document["package_scan"]["status"] = "unavailable"
+    document["packages"] = []
+    derived = models.derive_attention(document)
+    assert {a["state"] for a in derived["availability"].values()} == {"unknown"}
+    assert {tuple(a["reasons"]) for a in derived["availability"].values()} == {()}
+    assert all(free == [] for free in derived["free_clones"])
+
+    incomplete = doc_copy(w.live)
+    incomplete["package_scan"]["status"] = "incomplete"
+    assert models.derive_attention(incomplete) == models.derive_attention(w.live)
+    assert models.parse_checkouts(json.dumps(redigest(incomplete)))
+
+
+def test_only_an_unfinished_package_assigns_a_clone(world_w):
+    w = world_w
+    document = doc_copy(w.live)
+    package = world_package(document, "on-c")
+    assert package["finished"] is True
+    assert availability_of(document, w.c["C"])["state"] == "free"
+
+    package["finished"] = False
+    derived = models.derive_attention(document)["availability"][real(w.c["C"])]
+    assert derived == {
+        "state": "assigned",
+        "reasons": [],
+        "assigned_to": [{"package_path": package["package_path"], "basis": "target_repo"}],
+    }
+    assert "contradicts" in refusal_of(doc_copy(document))
+    assert models.parse_checkouts(json.dumps(redigest(rederive(document))))
+
+    started = doc_copy(w.live)
+    world_package(started, "drift-finished")["finished"] = False
+    names = [
+        a["package_path"]
+        for a in models.derive_attention(started)["availability"][real(w.c["A"])]["assigned_to"]
+    ]
+    assert "Fictional/Shipped/drift-finished" in names
+
+
+def extra_free_clones(document: dict[str, Any], w: WorldW, count: int) -> list[str]:
+    group = repository_of(document, w.c["A"])
+    template = clone_c(document, w)
+    for number in range(1, count + 1):
+        copy = doc_copy(template)
+        copy["path"] = template["path"].replace("Repo Clone 3", f"Repo Extra {number}")
+        copy["worktrees"][0]["path"] = copy["path"]
+        group["clones"].append(copy)
+    return [real(w.folder / f"Repo Extra {number}") for number in range(1, count + 1)]
+
+
+def set_distance(clone_document: dict[str, Any], spec: Any) -> None:
+    local = clone_document["local_default"]
+    if spec == "no default":
+        clone_document["local_default"] = None
+        return
+    if spec[0] == "cached":
+        local["vs_remote"] = None
+        local["vs_cached"].update(
+            relation=spec[1], ahead=spec[2], behind=spec[3], objects_from=None
+        )
+        return
+    relation, ahead, behind = spec
+    local["vs_remote"] = {
+        "basis": "live", "relation": relation, "ahead": ahead, "behind": behind,
+        "objects_from": None,
+    }
+
+
+RANKING_ROWS = (
+    (
+        "every relation in turn",
+        {
+            "Repo Clone 2": ("absent", None, None), "Repo Clone 3": ("unknown", None, None),
+            "Repo Clone 4": ("differs", None, None), "Repo Clone 10": ("diverged", 1, 1),
+            "Repo Extra 1": ("ahead", 1, 0), "Repo Extra 2": ("behind", 0, 1),
+            "Repo Extra 3": ("equal", 0, 0),
+        },
+        ["Repo Extra 3", "Repo Extra 2", "Repo Extra 1", "Repo Clone 10", "Repo Clone 4",
+         "Repo Clone 3", "Repo Clone 2"],
+    ),
+    (
+        "commits apart add up, a missing count is last",
+        {
+            "Repo Clone 2": ("diverged", 3, 0), "Repo Clone 3": ("diverged", 2, 2),
+            "Repo Clone 4": ("diverged", 0, 3), "Repo Clone 10": ("diverged", None, None),
+        },
+        ["Repo Clone 2", "Repo Clone 4", "Repo Clone 3", "Repo Clone 10"],
+    ),
+    (
+        "a tie falls to natural path order",
+        {name: ("equal", 0, 0) for name in ("Repo Clone 2", "Repo Clone 3", "Repo Clone 4", "Repo Clone 10")},
+        ["Repo Clone 2", "Repo Clone 3", "Repo Clone 4", "Repo Clone 10"],
+    ),
+    (
+        "the cached comparison stands in for a missing remote one",
+        {
+            "Repo Clone 2": ("behind", 0, 1), "Repo Clone 3": ("cached", "equal", 0, 0),
+            "Repo Clone 4": ("cached", "absent", None, None), "Repo Clone 10": ("ahead", 1, 0),
+        },
+        ["Repo Clone 3", "Repo Clone 2", "Repo Clone 10", "Repo Clone 4"],
+    ),
+    (
+        "no local default branch counts as absent",
+        {
+            "Repo Clone 2": ("unknown", None, None), "Repo Clone 3": ("equal", 0, 0),
+            "Repo Clone 4": "no default", "Repo Clone 10": ("equal", 0, 0),
+        },
+        ["Repo Clone 3", "Repo Clone 10", "Repo Clone 2", "Repo Clone 4"],
+    ),
+)
+
+
+def test_free_clones_are_ranked_by_relation_distance_and_path(world_w):
+    w = world_w
+    for label, distances, expected in RANKING_ROWS:
+        document = doc_copy(w.live)
+        extra_free_clones(document, w, 3 if "Repo Extra 1" in distances else 0)
+        group = repository_of(document, w.c["A"])
+        by_name = {Path(item["path"]).name: item for item in group["clones"]}
+        for name, spec in distances.items():
+            set_distance(by_name[name], spec)
+        index = document["repositories"].index(group)
+        names = [Path(p).name for p in models.derive_attention(document)["free_clones"][index]]
+        assert names == expected, label
+
+
+def test_a_reranked_group_parses_only_when_its_free_clones_were_rederived(world_w):
+    w = world_w
+    document = doc_copy(w.live)
+    set_distance(clone_at(document, w.c["B"]), ("equal", 0, 0))
+    assert free_names(document, w.c["A"]) == [
+        "Repo Clone 3", "Repo Clone 10", "Repo Clone 2", "Repo Clone 4"
+    ]
+    assert "free_clones" in refusal_of(doc_copy(document))
+    parsed = models.parse_checkouts(json.dumps(redigest(rederive(document))))
+    assert free_names(parsed, w.c["A"]) == [
+        "Repo Clone 2", "Repo Clone 3", "Repo Clone 10", "Repo Clone 4"
+    ]
+
+
+def test_the_parser_refuses_availability_and_free_clones_the_facts_contradict(world_w):
+    w = world_w
+    assert models.parse_checkouts(json.dumps(redigest(doc_copy(w.live)))), "control"
+    c_path = real(w.c["C"])
+
+    def reasoned(document):
+        availability_of(document, w.c["C"])["reasons"] = ["linked_worktrees"]
+
+    def finished_assigned(document):
+        availability_of(document, w.c["C"])["assigned_to"] = [
+            {"package_path": world_package(document, "on-c")["package_path"], "basis": "target_repo"}
+        ]
+
+    def state_changed(document):
+        availability_of(document, w.c["C"])["state"] = "assigned"
+
+    def basis_changed(document):
+        availability_of(document, w.c["W"])["assigned_to"][2]["basis"] = "target_repo"
+
+    def missing_clone(document):
+        repository_of(document, w.c["A"])["free_clones"].remove(c_path)
+
+    def out_of_order(document):
+        repository_of(document, w.c["A"])["free_clones"].reverse()
+
+    def extra_clone(document):
+        repository_of(document, w.c["A"])["free_clones"].append(real(w.c["W"]))
+
+    def unknown_key(document):
+        availability_of(document, w.c["C"])["extra"] = 1
+
+    def missing_key(document):
+        del clone_c(document, w)["availability"]
+
+    def missing_free(document):
+        del repository_of(document, w.c["A"])["free_clones"]
+
+    refused = {
+        "a free clone with a reason": (reasoned, "availability"),
+        "assigned_to naming a finished package": (finished_assigned, "availability"),
+        "a state the facts do not give": (state_changed, "availability"),
+        "a basis the target does not give": (basis_changed, "availability"),
+        "free_clones missing a free clone": (missing_clone, "free_clones"),
+        "free_clones out of order": (out_of_order, "free_clones"),
+        "free_clones naming an occupied clone": (extra_clone, "free_clones"),
+        "an unknown availability key": (unknown_key, "availability"),
+        "a missing availability": (missing_key, "invalid shape"),
+        "a missing free_clones": (missing_free, "invalid shape"),
+    }
+    for label, (change, fragment) in refused.items():
+        document = doc_copy(w.live)
+        change(document)
+        message = refusal_of(document)
+        assert fragment in message, (label, message)

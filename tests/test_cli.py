@@ -2214,7 +2214,9 @@ def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
     assert document["packages"] == []
     for repository_before in before["repositories"]:
         repository_before["package_branches"] = []
+        repository_before["free_clones"] = []
         for member in repository_before["clones"]:
+            member["availability"] = {"state": "unknown", "reasons": [], "assigned_to": []}
             for branch in member["branches"]:
                 branch["packages"] = []
     assert document["repositories"] == before["repositories"]
