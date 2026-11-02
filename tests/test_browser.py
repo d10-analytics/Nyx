@@ -785,7 +785,7 @@ def test_card_right_click_copies_windows_root_in_windows_format(
 
 def test_card_right_click_copies_full_directory_without_changing_selection(open_page, tmp_path):
     # The pytest tmp_path root is POSIX on Linux and macOS and drive-letter on
-    # nyx-windows.
+    # Windows.
     root = tmp_path / "spec workspace"
     settings = BrowserSettings(root=root)
     page = open_page(StaticClient(board_payload()), settings=settings)

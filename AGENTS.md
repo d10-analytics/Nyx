@@ -13,10 +13,14 @@
   `python -m pytest tests/test_catalog.py -v`.
 - Full verification is the GitHub Actions workflow
   `.github/workflows/tests.yml`, run on every push and on manual dispatch.
-  Every push, to a branch or to a tag, runs the three package lanes; a push
-  to `main` also runs the two desktop lanes, and a manual dispatch runs
-  those two desktop lanes only, from that branch:
-  `gh workflow run tests.yml --ref <branch>`. Hand-run the desktop lanes on
+  Every push, to a branch or to a tag, runs the three package lanes and the
+  source-suite jobs `nyx-suite`, `nyx-windows-suite` and `nyx-macos-suite`,
+  each split into matrix shards; a push to `main` also runs the two desktop
+  lanes, and a manual dispatch runs those two desktop lanes only, from that
+  branch: `gh workflow run tests.yml --ref <branch>`. Reproduce one shard
+  locally with `python -m pytest tests/ -v --nyx-shard=I/N` (`I` the 0-based
+  shard index, `N` the shard count); without the option pytest runs every
+  test. Hand-run the desktop lanes on
   a branch before merging it whenever the branch changes `pyproject.toml`
   other than its `[tool.ruff]` settings, a file listed in
   `docs/systems/desktop/system.toml`, `nyx/desktop_worker.py`, the desktop

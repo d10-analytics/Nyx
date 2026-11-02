@@ -38,6 +38,31 @@ BASELINE_JOBS = {
     "nyx-windows": {"runs_on": "windows-latest", "python": "python"},
     "nyx-macos": {"runs_on": "macos-latest", "python": '"$runner_python"'},
 }
+# The source suite runs in sharded jobs, one per package lane: each must carry
+# the runner label and interpreter of its ``package_job`` entry in
+# ``BASELINE_JOBS`` (``suite_pairing_violations`` rejects a difference) and
+# splits the suite into ``shards`` matrix entries.  A shard-count change is an
+# edit of this table and of the job's matrix list.
+SUITE_JOBS = {
+    "nyx-suite": {
+        "runs_on": "ubuntu-latest",
+        "python": '"$runner_python"',
+        "package_job": "nyx",
+        "shards": 2,
+    },
+    "nyx-windows-suite": {
+        "runs_on": "windows-latest",
+        "python": "python",
+        "package_job": "nyx-windows",
+        "shards": 3,
+    },
+    "nyx-macos-suite": {
+        "runs_on": "macos-latest",
+        "python": '"$runner_python"',
+        "package_job": "nyx-macos",
+        "shards": 2,
+    },
+}
 DESKTOP_JOBS = {
     "nyx-desktop-windows": {
         "runs_on": "windows-2025",
@@ -57,8 +82,8 @@ DESKTOP_JOBS = {
     },
 }
 
-POWERSHELL_JOBS = ("nyx-windows", "nyx-desktop-windows")
-POSIX_JOBS = ("nyx", "nyx-macos", "nyx-desktop-macos")
+POWERSHELL_JOBS = ("nyx-windows", "nyx-windows-suite", "nyx-desktop-windows")
+POSIX_JOBS = ("nyx", "nyx-suite", "nyx-macos", "nyx-macos-suite", "nyx-desktop-macos")
 
 REQUIRED_NATIVE_ENV = "NYX_REQUIRE_NATIVE_DESKTOP"
 EXPECTED_NATIVE_HOST_ENV = "NYX_EXPECTED_NATIVE_HOST"
@@ -77,6 +102,7 @@ DESKTOP_LANE_CONDITION = (
 )
 LANE_ROUTING_CONDITIONS = {
     **{name: PACKAGE_LANE_CONDITION for name in BASELINE_JOBS},
+    **{name: PACKAGE_LANE_CONDITION for name in SUITE_JOBS},
     **{name: DESKTOP_LANE_CONDITION for name in DESKTOP_JOBS},
 }
 
@@ -89,6 +115,11 @@ BUILD_ARTIFACT_STEP = "Build and verify the native desktop artifact"
 PREFLIGHT_STEP = "Record native host and session preflight"
 
 SOURCE_SUITE_COMMAND = "{python} -m pytest tests/ -v"
+SHARD_OPTION = "--nyx-shard"
+SHARD_SUFFIX = " --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}"
+SHARDED_SUITE_COMMAND = SOURCE_SUITE_COMMAND + SHARD_SUFFIX
+SUITE_INSTALL_COMMAND = "{python} -m pip install -e '.[test]' build"
+SUITE_STEP = "Run the source suite shard"
 RUFF_COMMAND = "ruff check ."
 WHEEL_BUILD_COMMAND = "{python} -m build --wheel"
 INSTALLED_WHEEL_COMMAND = "{python} -m pytest tests/test_wheel_install.py -v"
@@ -119,8 +150,9 @@ POSIX_FAILURE_GUARD = "set -euo pipefail"
 
 BROWSER_INSTALL_COMMANDS = {
     "nyx": '"$runner_python" -m playwright install --with-deps chromium',
-    "nyx-windows": "python -m playwright install chromium",
-    "nyx-macos": '"$runner_python" -m playwright install chromium',
+    "nyx-suite": '"$runner_python" -m playwright install --with-deps chromium',
+    "nyx-windows-suite": "python -m playwright install chromium",
+    "nyx-macos-suite": '"$runner_python" -m playwright install chromium',
 }
 
 # The one run of the gated documented-install proof in each job that has it:
@@ -178,6 +210,9 @@ LINUX_SERVICE_GATES = (
 # The cleanup stop is deliberately best-effort (it ends in ``|| true``), so it
 # stays a substring marker rather than an exact gate.
 LINUX_SERVICE_MARKERS = ('"$nyx_verify_root/venv/bin/nyx" --stop',)
+# The continuation line that installs pytest, with the wheel, for the
+# installed-service proof.
+LINUX_SERVICE_PIP_CONTINUATION = '"$nyx_verify_wheel" pytest playwright'
 
 SESSION_PREFLIGHT_GATES = {
     "nyx-desktop-windows": (
@@ -221,15 +256,23 @@ PWSH_ERROR_PREFERENCE = "$ErrorActionPreference = 'Stop'"
 CONTINUE_ON_ERROR_KEY = "continue-on-error"
 
 # Every job caps its wall-clock duration so a hung run fails instead of holding
-# a hosted runner for hours.  Each cap keeps headroom above the job's longest
-# recent successful duration and is re-derived when that duration grows.
+# a hosted runner for hours, and every job has a pin below.  A package or suite
+# cap is twice the job's projected duration, rounded up to the next five
+# minutes, with a floor of 10 minutes.  Projected durations: nyx-suite about
+# 500 s, nyx-windows-suite about 765 s, nyx-macos-suite about 897 s (each the
+# largest shard of its split plus the shared-world rebuild per extra shard),
+# nyx about 116 s, nyx-windows about 66 s and nyx-macos about 52 s (the job
+# minus its suite session).  A cap is re-derived when its projection changes.
 TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
 JOB_TIMEOUT_MINUTES = {
-    "nyx": 30,
-    "nyx-windows": 60,
-    "nyx-macos": 45,
+    "nyx": 10,
+    "nyx-windows": 10,
+    "nyx-macos": 10,
+    "nyx-suite": 20,
+    "nyx-windows-suite": 30,
+    "nyx-macos-suite": 30,
     "nyx-desktop-windows": 35,
     "nyx-desktop-macos": 15,
 }
@@ -465,9 +508,27 @@ def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
     return problems
 
 
-def check_job_matrix(workflow: dict[str, Any]) -> list[str]:
+def suite_pairing_violations(
+    baseline_jobs: dict[str, dict[str, Any]], suite_jobs: dict[str, dict[str, Any]]
+) -> list[str]:
     problems: list[str] = []
-    for name, spec in {**BASELINE_JOBS, **DESKTOP_JOBS}.items():
+    for name, spec in suite_jobs.items():
+        package = baseline_jobs.get(spec["package_job"])
+        if package is None:
+            problems.append(f"{name}: package job {spec['package_job']!r} is not a baseline job")
+            continue
+        for key in ("runs_on", "python"):
+            if spec[key] != package[key]:
+                problems.append(
+                    f"{name}: {key} is {spec[key]!r}, but package job "
+                    f"{spec['package_job']} has {package[key]!r}"
+                )
+    return problems
+
+
+def check_job_matrix(workflow: dict[str, Any]) -> list[str]:
+    problems = suite_pairing_violations(BASELINE_JOBS, SUITE_JOBS)
+    for name, spec in {**BASELINE_JOBS, **SUITE_JOBS, **DESKTOP_JOBS}.items():
         job = _job(workflow, name)
         if job is None:
             problems.append(f"{name}: job is missing")
@@ -500,19 +561,126 @@ def check_shell_matrix(workflow: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _suite_command(name: str) -> str:
+    return SHARDED_SUITE_COMMAND.replace("{python}", SUITE_JOBS[name]["python"])
+
+
+# A run line names pytest when, with quotes, backticks and backslashes removed,
+# it contains ``pytest`` or ``py.test`` in any letter case.
+_PYTEST_NAME = re.compile(r"py\.?test", re.IGNORECASE)
+_PYTEST_NAME_MASK = str.maketrans("", "", "\"'`\\")
+
+
+def _names_pytest(line: str) -> bool:
+    return bool(_PYTEST_NAME.search(line.translate(_PYTEST_NAME_MASK)))
+
+
+# The only run lines naming pytest that each package job may hold, compared
+# exactly: the installed-wheel proof in every package job and, in the Linux
+# job, the documented-install proof, the installed-service lines that run
+# pytest and the continuation that installs it for that service.
+_LINUX_PACKAGE_PYTEST_LINES = frozenset(
+    {
+        DOCUMENTED_INSTALL_COMMAND,
+        LINUX_SERVICE_PIP_CONTINUATION,
+        *(line for gate in LINUX_SERVICE_GATES for line in gate if _names_pytest(line)),
+    }
+)
+PACKAGE_JOB_PYTEST_LINES = {
+    name: frozenset({INSTALLED_WHEEL_COMMAND.format(python=spec["python"])})
+    | (_LINUX_PACKAGE_PYTEST_LINES if name == "nyx" else frozenset())
+    for name, spec in BASELINE_JOBS.items()
+}
+
+
 def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
+    """Require the sharded source suite in each suite job and nowhere else.
+
+    Each suite job holds the exact sharded command and the exact install line
+    its suite needs.  A package job runs pytest only through its designated
+    lines: every effective line of every step that names pytest (case
+    insensitively, ignoring quotes, backticks and backslashes) must equal one
+    of that job's lines in ``PACKAGE_JOB_PYTEST_LINES``.  Any other such line
+    is reported, whatever it selects and whichever command wraps it, so a new
+    pytest run in a package job needs a matching edit of that table.  A name
+    built from variables or split across lines names pytest on no single line
+    and is left to review.
+    """
+
     problems: list[str] = []
-    for name, spec in BASELINE_JOBS.items():
+    for name, spec in SUITE_JOBS.items():
         job = _job(workflow, name)
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        command = SOURCE_SUITE_COMMAND.format(python=spec["python"])
+        segments = _job_effective_lines(job)
         problems.extend(
             _gate_violations(
-                f"{name}: source-suite command", _job_effective_lines(job), (command,)
+                f"{name}: sharded source-suite command", segments, (_suite_command(name),)
             )
         )
+        install = SUITE_INSTALL_COMMAND.replace("{python}", spec["python"])
+        problems.extend(
+            _gate_violations(f"{name}: source-suite install", segments, (install,))
+        )
+    for name in BASELINE_JOBS:
+        job = _job(workflow, name)
+        if job is None:
+            problems.append(f"{name}: job is missing")
+            continue
+        designated = PACKAGE_JOB_PYTEST_LINES[name]
+        for step in _steps(job):
+            problems.extend(
+                f"{name}: step {step.get('name')!r} runs an undesignated pytest line: {line!r}"
+                for line in _effective_lines(step)
+                if _names_pytest(line) and line not in designated
+            )
+    return problems
+
+
+def _mentions_shard_option(value: Any) -> bool:
+    return SHARD_OPTION in str(value)
+
+
+def check_source_suite_shards(workflow: dict[str, Any]) -> list[str]:
+    """Require each suite job's matrix and keep the shard option in one place.
+
+    The strategy of a suite job is exactly ``fail-fast: false`` and one
+    ``shard`` list of its table's length.  The shard option appears only in each
+    suite job's sharded command line, never in the workflow-level, a job-level
+    or a step ``env``, nor on any other line of any job.
+    """
+
+    problems: list[str] = []
+    if _mentions_shard_option(workflow.get("env")):
+        problems.append(f"workflow env carries {SHARD_OPTION}: {workflow.get('env')!r}")
+    for name, spec in SUITE_JOBS.items():
+        job = _job(workflow, name)
+        if job is None:
+            problems.append(f"{name}: job is missing")
+            continue
+        expected = {"fail-fast": False, "matrix": {"shard": list(range(spec["shards"]))}}
+        if job.get("strategy") != expected:
+            problems.append(
+                f"{name}: strategy is {job.get('strategy')!r}, expected {expected!r}"
+            )
+    for name, job in _jobs(workflow).items():
+        if not isinstance(job, dict):
+            continue
+        if _mentions_shard_option(job.get("env")):
+            problems.append(f"{name}: job env carries {SHARD_OPTION}: {job.get('env')!r}")
+        allowed = _suite_command(name) if name in SUITE_JOBS else None
+        for step in _steps(job):
+            if _mentions_shard_option(step.get("env")):
+                problems.append(
+                    f"{name}: step {step.get('name')!r} env carries {SHARD_OPTION}: "
+                    f"{step.get('env')!r}"
+                )
+            problems.extend(
+                f"{name}: step {step.get('name')!r} carries {SHARD_OPTION} on {line!r}"
+                for line in _effective_lines(step)
+                if SHARD_OPTION in line and line != allowed
+            )
     return problems
 
 
@@ -818,7 +986,9 @@ def check_job_time_limits(workflow: dict[str, Any]) -> list[str]:
             )
             continue
         expected = JOB_TIMEOUT_MINUTES.get(job_name)
-        if expected is not None and minutes != expected:
+        if expected is None:
+            problems.append(f"{job_name}: job has no pinned {TIMEOUT_KEY}")
+        elif minutes != expected:
             problems.append(
                 f"{job_name}: {TIMEOUT_KEY} is {minutes}, expected {expected}"
             )
@@ -1090,6 +1260,7 @@ CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "job_matrix": check_job_matrix,
     "shell_matrix": check_shell_matrix,
     "baseline_source_suite": check_baseline_source_suite,
+    "source_suite_shards": check_source_suite_shards,
     "baseline_ruff": check_baseline_ruff,
     "baseline_wheel": check_baseline_wheel,
     "baseline_installed_wheel": check_baseline_installed_wheel,
@@ -1130,10 +1301,10 @@ def test_established_workflow_check_has_no_violations(check_name: str) -> None:
 
 
 def _mutate_remove_baseline_source_suite(workflow: dict[str, Any]) -> None:
-    step = _step(workflow, "nyx", "Verify package and installed service")
-    step["run"] = _run_text(step).replace(
-        '"$runner_python" -m pytest tests/ -v\n', "", 1
-    )
+    step = _step(workflow, "nyx-suite", SUITE_STEP)
+    command = f"{_suite_command('nyx-suite')}\n"
+    assert command in _run_text(step)
+    step["run"] = _run_text(step).replace(command, "", 1)
 
 
 def _mutate_remove_baseline_wheel_build(workflow: dict[str, Any]) -> None:
@@ -1440,16 +1611,20 @@ def _rewrite_run_line(
 
 def _mutate_comment_out_windows_source_suite(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
-        workflow, "nyx-windows", BASELINE_LIFECYCLE_STEP, "python -m pytest tests/ -v", _comment_out
+        workflow,
+        "nyx-windows-suite",
+        SUITE_STEP,
+        _suite_command("nyx-windows-suite"),
+        _comment_out,
     )
 
 
 def _mutate_disable_errexit_before_source_suite(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
-        "nyx",
-        LINUX_SERVICE_STEP,
-        '"$runner_python" -m pytest tests/ -v',
+        "nyx-suite",
+        SUITE_STEP,
+        _suite_command("nyx-suite"),
         _insert_before("set +e"),
     )
 
@@ -1598,9 +1773,9 @@ def _mutate_drop_powershell_error_preference(workflow: dict[str, Any]) -> None:
 def _mutate_reassign_powershell_error_preference(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
-        "nyx-windows",
-        BASELINE_LIFECYCLE_STEP,
-        "python -m pytest tests/ -v",
+        "nyx-windows-suite",
+        SUITE_STEP,
+        _suite_command("nyx-windows-suite"),
         _insert_before("$ErrorActionPreference = 'Continue'"),
     )
 
@@ -1726,6 +1901,172 @@ def _mutate_continue_job_on_error(workflow: dict[str, Any]) -> None:
 
 def _mutate_continue_step_on_error(workflow: dict[str, Any]) -> None:
     _step(workflow, "nyx-desktop-windows", SOURCE_SESSION_STEP)[CONTINUE_ON_ERROR_KEY] = True
+
+
+def _mutate_drop_windows_suite_shards(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-windows-suite")["strategy"]["matrix"]["shard"] = [0]
+
+
+def _mutate_duplicate_macos_suite_shard(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-macos-suite")["strategy"]["matrix"]["shard"] = [0, 0]
+
+
+def _mutate_enable_suite_fail_fast(workflow: dict[str, Any]) -> None:
+    del _job(workflow, "nyx-suite")["strategy"]["fail-fast"]
+
+
+def _mutate_limit_suite_parallelism(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-windows-suite")["strategy"]["max-parallel"] = 1
+
+
+def _mutate_add_second_matrix_key(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-macos-suite")["strategy"]["matrix"]["python"] = ["3.12"]
+
+
+def _mutate_shard_option_in_job_env(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx")["env"] = {"PYTEST_ADDOPTS": "--nyx-shard=0/2"}
+
+
+def _mutate_shard_option_in_suite_step_env(workflow: dict[str, Any]) -> None:
+    _step(workflow, "nyx-suite", SUITE_STEP)["env"] = {
+        "PYTEST_ADDOPTS": "--nyx-shard=0/2"
+    }
+
+
+def _mutate_shard_option_in_workflow_env(workflow: dict[str, Any]) -> None:
+    workflow["env"] = {"PYTEST_ADDOPTS": "--nyx-shard=0/2"}
+
+
+def _mutate_shard_option_on_package_pytest_line(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-macos",
+        BASELINE_LIFECYCLE_STEP,
+        WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-macos"]["python"]),
+        _insert_before(
+            '"$runner_python" -m pytest tests/test_catalog.py -v --nyx-shard=0/2'
+        ),
+    )
+
+
+def _mutate_drop_shard_option(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-macos-suite",
+        SUITE_STEP,
+        _suite_command("nyx-macos-suite"),
+        lambda line: line.replace(SHARD_SUFFIX, ""),
+    )
+
+
+def _mutate_rerun_whole_suite_in_package_job(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-windows",
+        BASELINE_LIFECYCLE_STEP,
+        WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-windows"]["python"]),
+        _insert_before("python -m pytest tests/ -v"),
+    )
+
+
+def _rerun_package_job_suite_as(
+    command: str, job: str = "nyx-windows"
+) -> Callable[[dict[str, Any]], None]:
+    def mutate(workflow: dict[str, Any]) -> None:
+        _rewrite_run_line(
+            workflow,
+            job,
+            BASELINE_LIFECYCLE_STEP,
+            WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS[job]["python"]),
+            _insert_before(command),
+        )
+
+    return mutate
+
+
+# The one installed-service line that runs pytest, designated to the Linux
+# package job alone.
+(_LINUX_SERVICE_PYTEST_LINE,) = (
+    line for gate in LINUX_SERVICE_GATES for line in gate if _names_pytest(line)
+)
+
+
+def _mutate_add_undesignated_file_level_run(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx"]["python"]),
+        _insert_before('"$runner_python" -m pytest tests/test_catalog.py -v'),
+    )
+
+
+def _mutate_drop_suite_test_extras(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-suite", SUITE_STEP)
+    install = SUITE_INSTALL_COMMAND.replace("{python}", SUITE_JOBS["nyx-suite"]["python"])
+    assert install in _run_text(step)
+    step["run"] = _run_text(step).replace(
+        install, install.replace("'.[test]'", "'.'"), 1
+    )
+
+
+def _mutate_change_suite_runner(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-windows-suite")["runs-on"] = "windows-2025"
+
+
+def _mutate_suite_runs_on_dispatch(workflow: dict[str, Any]) -> None:
+    del _job(workflow, "nyx-macos-suite")["if"]
+
+
+def _mutate_remove_suite_pwsh_shell(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-windows-suite", SUITE_STEP)
+    assert step.get("shell") == "pwsh"
+    step.pop("shell")
+
+
+def _mutate_comment_out_suite_exit_guard(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-windows-suite", SUITE_STEP)
+    physical = _run_text(step).splitlines()
+    sharded = physical.index(_suite_command("nyx-windows-suite"))
+    assert physical[sharded + 1] == PWSH_FAILURE_GUARD
+    physical[sharded + 1] = _comment_out(physical[sharded + 1])
+    step["run"] = "\n".join(physical) + "\n"
+
+
+def _mutate_disable_errexit_before_macos_suite(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx-macos-suite",
+        SUITE_STEP,
+        _suite_command("nyx-macos-suite"),
+        _insert_before("set +e"),
+    )
+
+
+def _remove_suite_browser_prerequisite(workflow: dict[str, Any], name: str) -> None:
+    step = _step(workflow, name, SUITE_STEP)
+    command = BROWSER_INSTALL_COMMANDS[name]
+    assert command in _run_text(step)
+    step["run"] = "\n".join(
+        line for line in _run_text(step).splitlines() if line.strip() != command
+    ) + "\n"
+
+
+def _mutate_remove_suite_browser_prerequisite(workflow: dict[str, Any]) -> None:
+    _remove_suite_browser_prerequisite(workflow, "nyx-macos-suite")
+
+
+def _mutate_remove_linux_suite_browser_prerequisite(workflow: dict[str, Any]) -> None:
+    _remove_suite_browser_prerequisite(workflow, "nyx-suite")
+
+
+def _mutate_remove_windows_suite_browser_prerequisite(workflow: dict[str, Any]) -> None:
+    _remove_suite_browser_prerequisite(workflow, "nyx-windows-suite")
+
+
+def _mutate_change_suite_time_limit_within_range(workflow: dict[str, Any]) -> None:
+    job = _job(workflow, "nyx-windows-suite")
+    job[TIMEOUT_KEY] = JOB_TIMEOUT_MINUTES["nyx-windows-suite"] + 5
 
 
 MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict[str, Any]], None]]] = {
@@ -2007,6 +2348,212 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_no_concurrency_cancellation,
         _mutate_add_job_concurrency,
     ),
+    "drop windows suite shards": (
+        check_source_suite_shards,
+        _mutate_drop_windows_suite_shards,
+    ),
+    "duplicate a macOS suite shard": (
+        check_source_suite_shards,
+        _mutate_duplicate_macos_suite_shard,
+    ),
+    "enable fail-fast on a suite job": (
+        check_source_suite_shards,
+        _mutate_enable_suite_fail_fast,
+    ),
+    "limit suite parallelism": (
+        check_source_suite_shards,
+        _mutate_limit_suite_parallelism,
+    ),
+    "add a second matrix key": (
+        check_source_suite_shards,
+        _mutate_add_second_matrix_key,
+    ),
+    "shard option in job env": (
+        check_source_suite_shards,
+        _mutate_shard_option_in_job_env,
+    ),
+    "shard option in a suite step env": (
+        check_source_suite_shards,
+        _mutate_shard_option_in_suite_step_env,
+    ),
+    "shard option in workflow env": (
+        check_source_suite_shards,
+        _mutate_shard_option_in_workflow_env,
+    ),
+    "shard option on a package-job pytest line": (
+        check_source_suite_shards,
+        _mutate_shard_option_on_package_pytest_line,
+    ),
+    "drop the shard option": (
+        check_baseline_source_suite,
+        _mutate_drop_shard_option,
+    ),
+    "rerun the whole suite in a package job": (
+        check_baseline_source_suite,
+        _mutate_rerun_whole_suite_in_package_job,
+    ),
+    "rerun the suite in a package job without a path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v"),
+    ),
+    "rerun the suite in a package job as ./tests/": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest ./tests/ -v"),
+    ),
+    "rerun the suite in a package job with a quoted directory": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('python -m pytest "tests/" -v'),
+    ),
+    "rerun the suite in a package job from the current directory": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest . -v"),
+    ),
+    "rerun the suite in a package job through a glob": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest tests/*.py -v"),
+    ),
+    "rerun the suite in a package job under timeout": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("timeout 600 pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job through env": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("env FOO=1 pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job after a command separator": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("cd . && pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job after installing pytest": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pip install pytest; python -m pytest -v"),
+    ),
+    "rerun the suite in a package job with a plugin option": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v -p no:cacheprovider"),
+    ),
+    "rerun the suite in a package job ignoring one file": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v --ignore tests/test_desktop.py"),
+    ),
+    "rerun the suite in a package job with an unknown option value": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('"$runner_python" -m pytest -v --timeout 600', "nyx-macos"),
+    ),
+    "rerun the suite in a package job with redirected output": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest -v > build/pytest.log', "nyx-macos"
+        ),
+    ),
+    "rerun the suite in a package job across a continuation line": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('"$runner_python" -m pytest \\\ntests/ -v', "nyx-macos"),
+    ),
+    "rerun the suite in a package job across a pwsh continuation line": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest tests/test_catalog.py `\ntests/ -v"),
+    ),
+    "rerun the suite in a package job with a multi-line keyword": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest tests/ -v -k "not desktop\nand not native"', "nyx-macos"
+        ),
+    ),
+    "rerun the suite in a package job through bash -c": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("bash -c 'python -m pytest tests/ -v'", "nyx-macos"),
+    ),
+    "rerun the suite in a package job through a pytest executable": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(r".venv\Scripts\pytest.exe .\tests\ -v"),
+    ),
+    "rerun the suite in a package job through py.test": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("py.test -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job from the workspace path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest "$GITHUB_WORKSPACE/tests" -v', "nyx-macos"
+        ),
+    ),
+    "rerun a suite shard in a package job without a path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            "python -m pytest -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}"
+        ),
+    ),
+    "rerun the whole suite through a quoted command": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('eval "python -m pytest tests/ -v"', "nyx-macos"),
+    ),
+    "rerun the whole suite through a quote-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('python -m py"test" tests/ -v', "nyx-macos"),
+    ),
+    "rerun the whole suite through a single-quote-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m py'test' tests/ -v", "nyx-macos"),
+    ),
+    "rerun the whole suite through a backtick-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(".venv/Scripts/p`ytest.exe tests/ -v"),
+    ),
+    "rerun the whole suite through a backslash-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(r"python -m py\test tests/ -v", "nyx-macos"),
+    ),
+    "rerun the whole suite through an upper-case executable name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(r".venv\Scripts\PyTest.exe tests\ -v"),
+    ),
+    "copy the Linux service pytest line into another package job": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(_LINUX_SERVICE_PYTEST_LINE, "nyx-macos"),
+    ),
+    "add an undesignated file-level run": (
+        check_baseline_source_suite,
+        _mutate_add_undesignated_file_level_run,
+    ),
+    "drop test extras from a suite install": (
+        check_baseline_source_suite,
+        _mutate_drop_suite_test_extras,
+    ),
+    "change a suite job runner": (check_job_matrix, _mutate_change_suite_runner),
+    "suite job runs on dispatch": (check_lane_routing, _mutate_suite_runs_on_dispatch),
+    "remove pwsh from the windows suite step": (
+        check_shell_matrix,
+        _mutate_remove_suite_pwsh_shell,
+    ),
+    "comment out the exit guard after the windows suite": (
+        check_powershell_failure_propagation,
+        _mutate_comment_out_suite_exit_guard,
+    ),
+    "set +e before the macOS suite": (
+        check_posix_failure_propagation,
+        _mutate_disable_errexit_before_macos_suite,
+    ),
+    "remove browser prerequisite from a suite job": (
+        check_baseline_browser_prerequisites,
+        _mutate_remove_suite_browser_prerequisite,
+    ),
+    "remove browser prerequisite from the Linux suite job": (
+        check_baseline_browser_prerequisites,
+        _mutate_remove_linux_suite_browser_prerequisite,
+    ),
+    "remove browser prerequisite from the windows suite job": (
+        check_baseline_browser_prerequisites,
+        _mutate_remove_windows_suite_browser_prerequisite,
+    ),
+    "add job with an unpinned time limit": (
+        check_job_time_limits,
+        _mutate_add_unrouted_job,
+    ),
+    "change a suite job time limit within range": (
+        check_job_time_limits,
+        _mutate_change_suite_time_limit_within_range,
+    ),
 }
 
 
@@ -2049,9 +2596,9 @@ def test_tracing_toggle_after_posix_guard_is_not_a_failure_propagation_violation
     mutated = copy.deepcopy(load_workflow())
     _rewrite_run_line(
         mutated,
-        "nyx",
-        LINUX_SERVICE_STEP,
-        '"$runner_python" -m pytest tests/ -v',
+        "nyx-suite",
+        SUITE_STEP,
+        _suite_command("nyx-suite"),
         _insert_before("set +x"),
     )
     assert check_posix_failure_propagation(mutated) == []
@@ -2129,6 +2676,35 @@ def test_build_bound_at_or_above_the_job_cap_is_rejected(
     bounds: dict[str, int], expected: list[str]
 ) -> None:
     assert build_bound_violations(bounds, load_workflow()) == expected
+
+
+def test_suite_jobs_match_their_package_jobs() -> None:
+    assert suite_pairing_violations(BASELINE_JOBS, SUITE_JOBS) == []
+
+
+@pytest.mark.parametrize("key", ["runs_on", "python"])
+@pytest.mark.parametrize("package_job", sorted(BASELINE_JOBS))
+def test_package_job_change_without_its_suite_job_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, package_job: str, key: str
+) -> None:
+    drifted = {**BASELINE_JOBS[package_job], key: "drifted"}
+    monkeypatch.setitem(BASELINE_JOBS, package_job, drifted)
+    suite = next(n for n, s in SUITE_JOBS.items() if s["package_job"] == package_job)
+    assert (
+        f"{suite}: {key} is {SUITE_JOBS[suite][key]!r}, but package job "
+        f"{package_job} has 'drifted'"
+    ) in check_job_matrix(load_workflow())
+
+
+def test_suite_job_change_without_its_package_job_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        SUITE_JOBS, "nyx-macos-suite", {**SUITE_JOBS["nyx-macos-suite"], "runs_on": "macos-15"}
+    )
+    assert (
+        "nyx-macos-suite: runs_on is 'macos-15', but package job nyx-macos has 'macos-latest'"
+    ) in check_job_matrix(load_workflow())
 
 
 def test_altered_copy_beside_an_intact_gate_is_rejected() -> None:

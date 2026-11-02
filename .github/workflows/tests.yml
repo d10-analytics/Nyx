@@ -8,7 +8,7 @@ jobs:
   nyx:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +24,6 @@ jobs:
           "$runner_python" -m pip install -e '.[test]' build
           "$runner_python" -m playwright install --with-deps chromium
           ruff check .
-          "$runner_python" -m pytest tests/ -v
           "$runner_python" -m build --wheel
           wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
           test "$wheel_count" -eq 1
@@ -78,7 +77,7 @@ jobs:
   nyx-windows:
     if: github.event_name == 'push'
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -95,11 +94,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -e '.[test]' build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m playwright install chromium
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ruff check .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pytest tests/ -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m build --wheel
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -113,7 +108,7 @@ jobs:
   nyx-macos:
     if: github.event_name == 'push'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -128,13 +123,89 @@ jobs:
           "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
           "$runner_python" -m pip install --upgrade pip
           "$runner_python" -m pip install -e '.[test]' build
-          "$runner_python" -m playwright install chromium
           ruff check .
-          "$runner_python" -m pytest tests/ -v
           "$runner_python" -m build --wheel
           wheel_count="$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
           test "$wheel_count" -eq 1
           "$runner_python" -m pytest tests/test_wheel_install.py -v
+
+  nyx-suite:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Run the source suite shard
+        run: |
+          set -euo pipefail
+          runner_python="$(command -v python)"
+          "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+          "$runner_python" -m pip install --upgrade pip
+          "$runner_python" -m pip install -e '.[test]' build
+          "$runner_python" -m playwright install --with-deps chromium
+          "$runner_python" -m pytest tests/ -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}
+
+  nyx-windows-suite:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Run the source suite shard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e '.[test]' build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest tests/ -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  nyx-macos-suite:
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Run the source suite shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_python="$(command -v python)"
+          "$runner_python" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          "$runner_python" -m pip install --upgrade pip
+          "$runner_python" -m pip install -e '.[test]' build
+          "$runner_python" -m playwright install chromium
+          "$runner_python" -m pytest tests/ -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}
 
   nyx-desktop-windows:
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
