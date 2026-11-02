@@ -99,6 +99,7 @@ def test_a_malformed_option_on_the_command_line_stops_the_session_before_collect
     assert "--nyx-shard" in report
     assert repr(value) in report
     assert "::" not in completed.stdout
+    assert "collected" not in completed.stdout
 
 
 def test_the_selector_runs_after_deselect_and_reports_the_rest_as_deselected() -> None:
