@@ -4168,6 +4168,10 @@ def test_the_parser_refuses_a_baseline_or_drift_the_collected_facts_contradict(w
             mutate_baseline("baseline-invalid", sha=w.sha["X"]), "baseline.sha"),
         "null sha on a declared baseline": (
             mutate_baseline("drift-moved", sha=None), "baseline.sha"),
+        "an upper-case sha on a declared baseline": (
+            mutate_baseline("drift-moved", sha=w.sha["X"].upper()), "baseline.sha"),
+        "a short all-zero sha on a declared baseline": (
+            mutate_baseline("drift-moved", sha="0" * 39), "baseline.sha"),
         "drift on a finished package": (
             give_drift("drift-finished", "drift-moved"), "baseline.drift"),
         "null drift on an unfinished declared package": (
@@ -4260,24 +4264,28 @@ def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
         assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U", "L")}
 
 
-def test_an_all_zero_baseline_is_declared_parses_and_differs(tmp_path):
-    remote = make_remote(tmp_path)
-    folder = tmp_path / "folder"
-    folder.mkdir()
-    work = clone(remote, folder / "work")
-    root = tmp_path / "spec"
+def test_an_all_zero_baseline_is_declared_parses_and_differs(world_w):
+    """An all-zero Baseline is a declared commit ID that no clone holds: its drift is
+    the uncounted ``differs`` the collector gives an unheld Baseline, on the target
+    clone's base basis, and the parser accepts the document."""
+    w = world_w
     zero = "0" * 40
-    make_package(root, "Drafts", "zero", f"Target repo: {work}\nBaseline: {zero}\n")
+    for document in (w.offline, w.live):
+        copy = doc_copy(document)
+        package = world_package(copy, "drift-moved")
+        assert package["baseline"]["status"] == "declared", "control"
+        assert package["baseline"]["drift"]["relation"] != "differs", "control"
+        basis = clone_at(copy, w.c["A"])["verdict_base"]["basis"]
+        differs = {
+            "basis": basis, "relation": "differs", "ahead": None, "behind": None,
+            "objects_from": None,
+        }
+        assert drift_of(copy, "drift-unheld") == differs, "the collector's unheld shape"
 
-    document = collect_packages([folder], root)
+        package["baseline"]["sha"] = zero
+        package["baseline"]["drift"] = differs
+        parsed = models.parse_checkouts(json.dumps(redigest(copy)))
 
-    (package,) = document["packages"]
-    assert package["baseline"]["status"] == "declared"
-    assert package["baseline"]["sha"] == zero
-    assert package["baseline"]["drift"] == {
-        "basis": "cached",
-        "relation": "differs",
-        "ahead": None,
-        "behind": None,
-        "objects_from": None,
-    }
+        assert world_package(parsed, "drift-moved")["baseline"] == {
+            "status": "declared", "sha": zero, "drift": differs
+        }, document["remote_checks"]
