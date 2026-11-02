@@ -230,7 +230,7 @@ def test_an_unusable_target_and_branch_are_reported_without_the_path(tmp_path):
     relative, tabbed = document["packages"]
     assert relative["target"]["status"] == "invalid"
     assert relative["branch"] == {"status": "not_applicable", "name": None}
-    assert_target(tabbed["target"], "missing")
+    assert_target(tabbed["target"], "missing", within_folders=False)
     assert tabbed["branch"] == {"status": "invalid", "name": None}
 
 
@@ -281,13 +281,18 @@ def resolve(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def assert_target(
-    target: dict[str, Any], status: str, clone: str | None = None, worktree: str | None = None
+    target: dict[str, Any],
+    status: str,
+    clone: str | None = None,
+    worktree: str | None = None,
+    within_folders: bool | None = None,
 ) -> None:
     """Compare a target field by field, through the parser's own key set."""
     assert set(target) == models._PACKAGE_TARGET_KEYS
     assert target["status"] == status
     assert target["clone"] == clone
     assert target["worktree"] == worktree
+    assert target["within_folders"] is within_folders, target
 
 
 @pytest.fixture
@@ -375,9 +380,11 @@ def test_the_join_compares_keys_not_strings():
     resolved = checkout_join.resolve_target
     assert resolved("usable", ("id", 1, 10), index, fail) == {
         "status": "clone", "clone": "/fictional/clone", "worktree": None,
+        "within_folders": None,
     }
     assert resolved("usable", ("id", 1, 20), index, fail) == {
         "status": "worktree", "clone": "/fictional/clone", "worktree": "/fictional/work",
+        "within_folders": None,
     }
     assert resolved("usable", ("id", 1, 30), index, fail)["status"] == "not_git"
     assert resolved("usable", ("path", "/fictional/clone"), index, lambda: "missing")[
@@ -410,7 +417,12 @@ def test_a_worktree_of_an_unreadable_clone_is_refused_by_the_parser(targets, tmp
     unreferenced = document["packages"][target_index(document, "n")]
     assert_target(unreferenced["target"], "clone", busy)
     assert unreferenced["branch"]["status"] == "not_applicable"
-    package["target"] = {"status": "worktree", "clone": busy, "worktree": real(targets["busy_work"])}
+    package["target"] = {
+        "status": "worktree",
+        "clone": busy,
+        "worktree": real(targets["busy_work"]),
+        "within_folders": None,
+    }
     document["checkouts_digest"] = models.canonical_digest(
         document, omit=models.CHECKOUTS_DIGEST_OMITTED
     )
@@ -418,8 +430,13 @@ def test_a_worktree_of_an_unreadable_clone_is_refused_by_the_parser(targets, tmp
     with pytest.raises(models.ProtocolError, match="not listed"):
         models.parse_checkouts(document)
 
-    package["target"] = {"status": "clone", "clone": busy, "worktree": None}
-    unreferenced["target"] = {"status": "clone", "clone": "/fictional/nowhere", "worktree": None}
+    package["target"] = {"status": "clone", "clone": busy, "worktree": None, "within_folders": None}
+    unreferenced["target"] = {
+        "status": "clone",
+        "clone": "/fictional/nowhere",
+        "worktree": None,
+        "within_folders": None,
+    }
     document["checkouts_digest"] = models.canonical_digest(
         document, omit=models.CHECKOUTS_DIGEST_OMITTED
     )
@@ -550,8 +567,8 @@ def test_a_candidate_git_does_not_accept_as_a_repository_is_not_a_git_checkout(t
     assert {"code": "not_a_repository", "path": str(fake)} in document["diagnostics"]
     assert {"code": "not_a_repository", "path": str(redirected)} in document["diagnostics"]
     found = resolve(document)
-    assert_target(found["fake"], "not_git")
-    assert_target(found["redirected"], "not_git")
+    assert_target(found["fake"], "not_git", within_folders=True)
+    assert_target(found["redirected"], "not_git", within_folders=True)
 
 
 def test_the_parser_refuses_a_worktree_its_readable_clone_does_not_list(targets, tmp_path):
@@ -602,6 +619,17 @@ def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
     }
     if "alias" in targets:
         wanted["alias"] = targets["alias"]
+    # A missing path in a sibling directory whose name starts with the folder's name.
+    sibling = tmp_path / f"{folder.name}-other"
+    sibling.mkdir()
+    wanted["sibling"] = sibling / "x"
+    # A missing path named through a directory link to the folder, when the host makes one.
+    link = tmp_path / "folder-link"
+    try:
+        link.symlink_to(folder, target_is_directory=True)
+        wanted["linked_missing"] = link / "No Such Folder"
+    except (OSError, NotImplementedError):
+        pass
 
     document = collect_packages([folder], package_root(tmp_path, wanted))
 
@@ -626,15 +654,39 @@ def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
             assert target["worktree"] is None, name
         else:
             assert os.path.samefile(target["worktree"], targets[worktree_name]), name
-    unmatched = {
-        "inside": "not_git",
-        "missing": "missing",
-        "plain": "not_git",
-        "outside": "outside_folders",
-        "gone": "missing",
+    unmatched: dict[str, tuple[str, bool | None]] = {
+        "inside": ("not_git", True),
+        "missing": ("missing", True),
+        "plain": ("not_git", True),
+        "outside": ("outside_folders", None),
+        "gone": ("missing", False),
+        "sibling": ("missing", False),
     }
-    for name, status in unmatched.items():
-        assert_target(found[name], status)
+    if "linked_missing" in wanted:
+        unmatched["linked_missing"] = ("missing", True)
+    for name, (status, within) in unmatched.items():
+        assert_target(found[name], status, within_folders=within)
+    for name in named:
+        if name in found:
+            assert found[name]["within_folders"] is None, name
+
+    def refusal(mutate) -> str:
+        changed = doc_copy(document)
+        mutate(changed["packages"][package_index(changed, "missing")]["target"], changed)
+        return refusal_of(changed)
+
+    clone_index = package_index(document, "clone")
+
+    def value_on_clone(target, changed) -> None:
+        changed["packages"][clone_index]["target"]["within_folders"] = True
+
+    for name, mutate, message in (
+        ("null", lambda t, d: t.update(within_folders=None), "within_folders"),
+        ("clone value", value_on_clone, "within_folders"),
+        ("non-boolean", lambda t, d: t.update(within_folders="yes"), "within_folders"),
+        ("missing key", lambda t, d: t.pop("within_folders"), "target"),
+    ):
+        assert message in refusal(mutate), name
     lines = cli.format_checkouts(document)
     busy = found["busy"]["clone"]
     assert f"{json.dumps(busy)}  too_many_branches" in lines
@@ -649,7 +701,7 @@ def test_a_path_that_cannot_name_anything_is_missing(tmp_path):
 
     document = collect_packages([folder], root)
 
-    assert_target(resolve(document)["long"], "missing")
+    assert_target(resolve(document)["long"], "missing", within_folders=False)
     assert checkouts._unmatched_target_status("/fictional/nul\0byte") == "missing"
 
 
@@ -688,7 +740,7 @@ def test_without_inode_numbers_a_target_still_resolves_by_its_real_path(targets,
     assert_target(found["main"], "clone", real(targets["main"]))
     assert_target(found["busy"], "clone", real(targets["busy"]))
     assert_target(found["linked"], "worktree", real(targets["main"]), real(targets["linked"]))
-    assert_target(found["plain"], "not_git")
+    assert_target(found["plain"], "not_git", within_folders=True)
     assert_target(found["elsewhere"], "outside_folders")
     if "alias" in named:
         assert_target(found["alias"], "clone", real(targets["main"]))
@@ -3018,7 +3070,7 @@ def test_a_branch_name_on_a_branch_that_is_not_declared_is_refused(collected):
 
 def test_a_clone_for_a_missing_target_is_refused(collected, collected_layout):
     index = package_index(collected, "missing")
-    assert_target(collected["packages"][index]["target"], "missing")
+    assert_target(collected["packages"][index]["target"], "missing", within_folders=False)
 
     def clone_of_a_missing_target(document):
         document["packages"][index]["target"]["clone"] = real(collected_layout["a"])
@@ -3165,7 +3217,7 @@ def test_a_checked_target_in_a_document_without_git_is_refused(tmp_path, monkeyp
     index = target_index(without_git, "exists")
 
     def checked_missing(doc):
-        doc["packages"][index]["target"]["status"] = "missing"
+        doc["packages"][index]["target"].update(status="missing", within_folders=False)
 
     assert f"packages[{index}].target.status requires git to be available" in (
         reference_mutation(without_git, checked_missing)
@@ -3214,13 +3266,13 @@ def give_no_commits(name: str):
     return change
 
 
-def test_schema_6_is_accepted_schema_5_refused_and_no_commits_yet_is_strict(status_document):
+def test_schema_7_is_accepted_schema_6_refused_and_no_commits_yet_is_strict(status_document):
     """One collection serves every proof: each case mutates its own copy."""
-    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 6
-    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 6
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 7
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 7
 
     old = doc_copy(status_document)
-    old["schema_version"] = 5
+    old["schema_version"] = 6
     assert refusal_of(old) == "unsupported schema version"
 
     document = doc_copy(status_document)
