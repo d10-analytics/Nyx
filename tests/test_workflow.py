@@ -1965,6 +1965,13 @@ def _rerun_package_job_suite_as(
     return mutate
 
 
+# The one installed-service line that runs pytest, designated to the Linux
+# package job alone.
+(_LINUX_SERVICE_PYTEST_LINE,) = (
+    line for gate in LINUX_SERVICE_GATES for line in gate if _names_pytest(line)
+)
+
+
 def _mutate_add_undesignated_file_level_run(workflow: dict[str, Any]) -> None:
     _rewrite_run_line(
         workflow,
@@ -2461,6 +2468,18 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "rerun the whole suite through a quoted command": (
         check_baseline_source_suite,
         _rerun_package_job_suite_as('eval "python -m pytest tests/ -v"', "nyx-macos"),
+    ),
+    "rerun the whole suite through a quote-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('python -m py"test" tests/ -v', "nyx-macos"),
+    ),
+    "rerun the whole suite through an upper-case executable name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(r".venv\Scripts\PyTest.exe tests\ -v"),
+    ),
+    "copy the Linux service pytest line into another package job": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(_LINUX_SERVICE_PYTEST_LINE, "nyx-macos"),
     ),
     "add an undesignated file-level run": (
         check_baseline_source_suite,
