@@ -4218,3 +4218,43 @@ def test_the_lender_of_a_branch_comparison_still_needs_a_live_or_recorded_basis(
     branch["vs_remote"]["objects_from"] = real(w.c["B"])
 
     assert "objects_from requires the live or recorded basis" in refusal_of(document)
+
+
+def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
+    """The presence probe and the lender search of the drift phase carry the verdict
+    settings, ask each clone once, and no call runs where drift is decided without git."""
+    w = world_w
+    calls = w.calls
+    last_reflog = max(
+        index
+        for index, call in enumerate(calls)
+        if "reflog" in call["arguments"] and call["arguments"][-1].startswith("refs/heads/")
+    )
+    phase = calls[last_reflog + 1 :]
+    probes = [
+        call for call in phase
+        if "--no-walk" in call["arguments"] and "--ignore-missing" in call["arguments"]
+    ]
+    listed = {c["path"] for r in w.live["repositories"] for c in r["clones"]}
+
+    by_clone: dict[str, list[list[str]]] = {}
+    for call in probes:
+        asked = sorted(item for item in call["arguments"] if len(item) == 40 and "=" not in item)
+        by_clone.setdefault(real(call["path"]), []).append(asked)
+    a_baselines = sorted([w.sha["X"], w.sha["X2"], WORLD_ABSENT])
+    assert by_clone[real(w.c["A"])] == [a_baselines], "one probe for A's distinct Baselines"
+    assert by_clone[real(w.c["B"])] == [a_baselines], "one lender probe in B"
+    assert by_clone[real(w.c["C"])] == [a_baselines], "the unheld one reaches C once"
+    # W is probed for its own Baseline and, in A's search, as a lender; the jobs run
+    # in parallel, so the two probes come in either order.
+    assert sorted(by_clone[real(w.c["W"])]) == sorted([[w.sha["X"]], a_baselines])
+    for call in phase:
+        arguments = call["arguments"]
+        assert "rev-list" in arguments and real(call["path"]) in listed, arguments
+        assert arguments[0] == "--no-replace-objects", arguments
+        assert ("-c", "core.quotePath=true") in list(zip(arguments, arguments[1:]))
+        assert call["scratch_exists"] == [True]
+        assert set(call["overlay"]) - {"GIT_ALTERNATE_OBJECT_DIRECTORIES"} == {
+            "GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"
+        }
+        assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U", "L")}
