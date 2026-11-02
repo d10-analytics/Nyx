@@ -64,6 +64,7 @@ from .models import (
     branch_sort_key,
     canonical_digest,
     clone_sort_key,
+    derive_attention,
     derive_removable,
     diagnostic_sort_key,
     folder_sort_key,
@@ -3166,6 +3167,15 @@ def _assign_removable(repositories: list[dict[str, Any]]) -> None:
             clone["removable_count"] = derived["removable_count"]
 
 
+def _assign_attention(document: dict[str, Any]) -> None:
+    """Write every clone's availability and every repository's free clones."""
+    derived = derive_attention(document)
+    for repository, free in zip(document["repositories"], derived["free_clones"]):
+        repository["free_clones"] = free
+        for clone in repository["clones"]:
+            clone["availability"] = derived["availability"][clone["path"]]
+
+
 _VerdictJob = tuple[
     dict[str, Any],
     _CloneContext,
@@ -4066,5 +4076,6 @@ def collect_checkouts(
         },
         "packages": packages,
     }
+    _assign_attention(document)
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)
     return _render(document)

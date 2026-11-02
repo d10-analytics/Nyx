@@ -884,7 +884,7 @@ CHECKOUTS_DIAGNOSTIC_CODES = frozenset(
     }
 )
 _REPOSITORY_KEYS = frozenset(
-    {"remote", "default_branch", "pr_lookup", "clones", "package_branches"}
+    {"remote", "default_branch", "pr_lookup", "clones", "free_clones", "package_branches"}
 )
 _REMOTE_KEYS = frozenset({"key", "display", "check"})
 _CHECK_KEYS = frozenset({"status", "reason"})
@@ -916,6 +916,7 @@ _CLONE_KEYS = frozenset(
         "verdict_base",
         "containment",
         "removable_count",
+        "availability",
     }
 )
 _CONTAINMENT_OUTCOMES = frozenset({"complete", "deadline", "failed"})
@@ -1459,6 +1460,153 @@ def derive_removable(clone: Mapping[str, Any]) -> dict[str, Any]:
             "worktrees": sum(1 for r in worktree_results if r is not None and r["removable"]),
         },
     }
+
+
+_DISTANCE_ORDER = (
+    "equal",
+    "behind",
+    "ahead",
+    "diverged",
+    "differs",
+    "unknown",
+    "absent",
+)
+
+
+def _default_name(clone: Mapping[str, Any]) -> str | None:
+    """The default branch name a clone's facts hold: the verdict base's, else the local one."""
+    base = clone["verdict_base"]
+    if base is not None:
+        return base["name"]
+    local = clone["local_default"]
+    return None if local is None else local["name"]
+
+
+def _default_distance(clone: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The comparison of a clone's local default branch with the remote's default head.
+
+    The live or recorded answer when there is one, else the cached one; ``None``
+    when the clone has no local default branch.
+    """
+    local = clone["local_default"]
+    if local is None:
+        return None
+    return local["vs_remote"] if local["vs_remote"] is not None else local["vs_cached"]
+
+
+def _clone_availability(
+    clone: Mapping[str, Any],
+    assigned: list[dict[str, str]],
+    *,
+    scan_unavailable: bool,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    bare = clone["status"] == "ok" and clone["bare"]
+    main = None
+    if clone["status"] == "ok":
+        worktrees = clone["worktrees"]
+        main = next((item for item in worktrees if item["main"]), None)
+        default = _default_name(clone)
+        if main is not None and main["status"] == "ok":
+            branch = main["head"]["branch"]
+            if branch is None:
+                reasons.append("detached_head")
+            elif default is not None and branch != default:
+                reasons.append("not_on_default_branch")
+        if any(not item["main"] for item in worktrees):
+            reasons.append("linked_worktrees")
+        if main is not None and main["status"] == "ok":
+            if any(count > 0 for count in main["changes"].values()):
+                reasons.append("uncommitted_changes")
+            if main["operations"]:
+                reasons.append("operation_in_progress")
+    if (
+        clone["status"] != "ok"
+        or scan_unavailable
+        or (not bare and (main is None or main["status"] != "ok"))
+    ):
+        state = "unknown"
+    elif reasons:
+        state = "occupied"
+    elif not bare and _default_name(clone) is None:
+        state = "unknown"
+    elif assigned:
+        state = "assigned"
+    else:
+        state = "free"
+    return {
+        "state": state,
+        "reasons": [] if state == "unknown" else reasons,
+        "assigned_to": assigned,
+    }
+
+
+def _ranking_key(clone: Mapping[str, Any]) -> tuple[Any, ...]:
+    distance = _default_distance(clone)
+    if distance is None:
+        relation, counts = "absent", None
+    else:
+        relation = distance["relation"]
+        counts = (
+            None
+            if distance["ahead"] is None or distance["behind"] is None
+            else distance["ahead"] + distance["behind"]
+        )
+    return (
+        _DISTANCE_ORDER.index(relation),
+        counts is None,
+        0 if counts is None else counts,
+        natural_key(clone["path"]),
+    )
+
+
+def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive what a checkout document says about starting work, from its own facts.
+
+    Returns ``{"availability", "free_clones"}``. ``availability`` maps every
+    clone path to ``{"state", "reasons", "assigned_to"}`` and ``free_clones``
+    lists, per repository in document order, the paths of its free clones
+    nearest first.
+
+    A clone is ``unknown`` when its status or its main worktree's is not ``ok``,
+    when the package scan is unavailable, or when a non-bare clone has no
+    default branch name; else ``occupied`` when it has reasons (in order
+    ``not_on_default_branch``, ``detached_head``, ``linked_worktrees``,
+    ``uncommitted_changes``, ``operation_in_progress``; a branch is compared
+    only with a known default name); else ``assigned`` when an unfinished
+    package targets it; else ``free``. A package assigns its clone through
+    ``target_repo``, or through ``target_repo_worktree`` when it names a linked
+    worktree. Free clones order by the relation of the local default branch to
+    the remote's default head (``equal``, ``behind``, ``ahead``, ``diverged``,
+    ``differs``, ``unknown``, ``absent``), then by commits apart (unknown
+    last), then by natural path.
+    """
+    scan_unavailable = document["package_scan"]["status"] == "unavailable"
+    assignments: dict[str, list[dict[str, str]]] = {}
+    for package in sorted(document["packages"], key=package_sort_key):
+        target = package["target"]
+        if package["finished"] or target["status"] not in ("clone", "worktree"):
+            continue
+        assignments.setdefault(target["clone"], []).append(
+            {
+                "package_path": package["package_path"],
+                "basis": "target_repo" if target["status"] == "clone" else "target_repo_worktree",
+            }
+        )
+    availability: dict[str, dict[str, Any]] = {}
+    free_clones: list[list[str]] = []
+    for repository in document["repositories"]:
+        free = []
+        for clone in repository["clones"]:
+            result = _clone_availability(
+                clone, assignments.get(clone["path"], []), scan_unavailable=scan_unavailable
+            )
+            availability[clone["path"]] = result
+            if result["state"] == "free":
+                free.append(clone)
+        free.sort(key=_ranking_key)
+        free_clones.append([clone["path"] for clone in free])
+    return {"availability": availability, "free_clones": free_clones}
 
 
 def _clone_verdicts(
@@ -2297,4 +2445,16 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     _check_package_references(parsed, packages)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
+    derived = derive_attention(document)
+    for index, repository in enumerate(parsed):
+        if repository["free_clones"] != derived["free_clones"][index]:
+            raise ProtocolError(
+                f"repositories[{index}].free_clones contradicts the facts of its clones"
+            )
+        for clone_index, listed_clone in enumerate(repository["clones"]):
+            if listed_clone["availability"] != derived["availability"][listed_clone["path"]]:
+                raise ProtocolError(
+                    f"repositories[{index}].clones[{clone_index}].availability "
+                    "contradicts the facts of the document"
+                )
     return dict(document)
