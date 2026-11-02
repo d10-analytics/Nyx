@@ -556,7 +556,7 @@ class RootSwitchSettings(BrowserSettings):
 
 @pytest.fixture(scope="module")
 def shared_browser():
-    """Yield one Chromium for the module; the launcher closes only its contexts."""
+    """Yield one Chromium for the module; each launcher closes every context but leaves the browser open."""
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
         try:
