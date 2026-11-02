@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 6)
+# Checkout facts document (schema 7)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 6
+CHECKOUTS_SCHEMA_VERSION = 7
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -848,7 +848,7 @@ _CODE_STATUS_STATES = frozenset(
 )
 _CODE_STATUS_PUSHES = frozenset({"pushed", "unpushed", "not_pushed", "unknown"})
 _CLEANUP_KEYS = frozenset({"worktrees", "branches"})
-_PACKAGE_TARGET_KEYS = frozenset({"status", "clone", "worktree"})
+_PACKAGE_TARGET_KEYS = frozenset({"status", "clone", "worktree", "within_folders"})
 _PACKAGE_TARGET_STATUSES = frozenset(
     {
         "clone",
@@ -1970,6 +1970,12 @@ def _package(value: Any, name: str) -> dict[str, Any]:
         raise ProtocolError(f"{name}.target.clone is required for {status}")
     if status == "worktree" and target["worktree"] is None:
         raise ProtocolError(f"{name}.target.worktree is required for worktree")
+    if status in ("missing", "not_git"):
+        _bool(target["within_folders"], f"{name}.target.within_folders")
+    elif target["within_folders"] is not None:
+        raise ProtocolError(
+            f"{name}.target.within_folders is set exactly for missing and not_git"
+        )
     branch = _object(item["branch"], f"{name}.branch")
     _keys(branch, _PACKAGE_BRANCH_KEYS, f"{name}.branch")
     branch_status = _choice(

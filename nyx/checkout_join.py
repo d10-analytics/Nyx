@@ -80,7 +80,9 @@ def resolve_target(
     when the path cannot be read. ``index`` is ``None`` when git is not
     available, which leaves a usable target ``unchecked``. ``fallback`` returns
     ``missing``, ``not_git`` or ``outside_folders`` for a path that matches no
-    key.
+    key. Every record carries ``within_folders`` as ``None``: only the collector,
+    which knows the configured folders and the target path, sets it, and only for
+    ``missing`` and ``not_git`` targets.
     """
     if head_status != "usable":
         return _target(head_status)
@@ -102,7 +104,7 @@ def resolve_target(
 
 
 def _target(status: str, clone: str | None = None, worktree: str | None = None) -> dict[str, Any]:
-    return {"status": status, "clone": clone, "worktree": worktree}
+    return {"status": status, "clone": clone, "worktree": worktree, "within_folders": None}
 
 
 # How a local branch serves a package.

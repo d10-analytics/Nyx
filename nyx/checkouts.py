@@ -3695,8 +3695,31 @@ def _target_index(
     return TargetIndex(clones, worktrees, frozenset(not_git))
 
 
+def _within_folders(path: str, folder_keys: frozenset[PathKey]) -> bool:
+    """Whether ``path`` is a configured folder or lies under one.
+
+    Each ancestor of the path, taken after resolving links and ``..`` through the
+    part that exists, is compared by file identity (``_path_key``) with the
+    configured folders, so a link to a folder and a differently cased spelling
+    count while a sibling whose name merely starts with the folder's does not.
+    """
+    try:
+        current = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    while True:
+        if _path_key(current) in folder_keys:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
 def _package_entries(
-    scan: PackageHeads | None, index: TargetIndex | None
+    scan: PackageHeads | None,
+    index: TargetIndex | None,
+    folder_keys: frozenset[PathKey] = frozenset(),
 ) -> list[dict[str, Any]]:
     """The packages that name a target repository or a branch, in catalog order."""
     if scan is None:
@@ -3706,18 +3729,21 @@ def _package_entries(
         if head.target_repo.status == "absent" and head.branch.status == "absent":
             continue
         path = head.target_repo.path
+        target = resolve_target(
+            head.target_repo.status,
+            _path_key(path) if path is not None and index is not None else None,
+            index,
+            lambda path=path: _unmatched_target_status(path or ""),
+        )
+        if target["status"] in ("missing", "not_git") and path is not None:
+            target["within_folders"] = _within_folders(path, folder_keys)
         entries.append(
             {
                 "package_path": head.package_path,
                 "package_id": head.package_id,
                 "finished": head.finished,
                 "superseded": head.superseded,
-                "target": resolve_target(
-                    head.target_repo.status,
-                    _path_key(path) if path is not None and index is not None else None,
-                    index,
-                    lambda path=path: _unmatched_target_status(path or ""),
-                ),
+                "target": target,
                 "branch": {"status": head.branch.status, "name": head.branch.name},
                 "code_status": None,
             }
@@ -3751,7 +3777,8 @@ def collect_checkouts(
     """
     observed_at = _utc_text(int(time.time()))
     package_heads = _scan_packages(package_scan)
-    discovery = _discover(os.fspath(folder) for folder in folders)
+    folder_paths = [os.fspath(folder) for folder in folders]
+    discovery = _discover(folder_paths)
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
     packages: list[dict[str, Any]]
@@ -3823,7 +3850,10 @@ def collect_checkouts(
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
         target_index = _target_index(repositories, candidate_clones, not_git_candidates)
-        packages = _package_entries(package_heads, target_index)
+        folder_keys = frozenset(
+            key for key in map(_path_key, folder_paths) if key is not None
+        )
+        packages = _package_entries(package_heads, target_index, folder_keys)
         bases, pulls, checked, remote_facts = _check_remotes(
             runner,
             repositories,
