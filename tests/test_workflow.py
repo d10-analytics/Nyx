@@ -2473,6 +2473,10 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         check_baseline_source_suite,
         _rerun_package_job_suite_as('python -m py"test" tests/ -v', "nyx-macos"),
     ),
+    "rerun the whole suite through a single-quote-split name": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m py'test' tests/ -v", "nyx-macos"),
+    ),
     "rerun the whole suite through a backtick-split name": (
         check_baseline_source_suite,
         _rerun_package_job_suite_as(".venv/Scripts/p`ytest.exe tests/ -v"),
