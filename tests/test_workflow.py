@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import posixpath
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Callable
 
@@ -543,46 +545,187 @@ def _suite_command(name: str) -> str:
     return SHARDED_SUITE_COMMAND.replace("{python}", SUITE_JOBS[name]["python"])
 
 
-_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&"})
+# Words that end one shell command and start the next, in bash and pwsh.
+_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", ";;", "|", "|&", "&", "(", ")"})
+_PYTEST_COMMANDS = frozenset({"pytest", "py.test"})
+_PIP_COMMAND = re.compile(r"pip[0-9.]*")
+_SHELL_COMMANDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "pwsh", "powershell"})
+# A shell option word whose next word may be the command string: ``-c``, a
+# bundle such as ``-ec``, or pwsh's ``-Command``.  Each such next word is read.
+_SHELL_COMMAND_OPTION = re.compile(r"-[a-z]*c[a-z]*")
+# pytest's own options that read the next word as their value, and this
+# repository's shard option.
+_PYTEST_VALUE_OPTIONS = frozenset(
+    {
+        "-c", "-k", "-m", "-o", "-p", "-r", "-W",
+        "--assert", "--basetemp", "--cache-show", "--capture", "--code-highlight",
+        "--color", "--confcutdir", "--config-file", "--debug", "--deselect",
+        "--doctest-glob", "--doctest-report", "--durations", "--durations-min",
+        "--ignore", "--ignore-glob", "--import-mode", "--junit-prefix",
+        "--junit-xml", "--junitprefix", "--junitxml", "--last-failed-no-failures",
+        "--lfnf", "--log-auto-indent", "--log-cli-date-format", "--log-cli-format",
+        "--log-cli-level", "--log-date-format", "--log-disable", "--log-file",
+        "--log-file-date-format", "--log-file-format", "--log-file-level",
+        "--log-file-mode", "--log-format", "--log-level", "--max-warnings",
+        "--maxfail", "--override-ini", "--pastebin", "--pdbcls", "--pythonwarnings",
+        "--report-chars", "--rootdir", "--show-capture", "--tb", "--verbosity",
+        SHARD_OPTION,
+    }
+)
 _GLOB_CHARACTERS = frozenset("*?[")
+_GITHUB_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}")
+_FALLBACK_WORD = re.compile(r"[^\s;&|()<>]+|[;&|()<>]+")
 
 
-def _is_whole_directory_target(target: str) -> bool:
-    """Return whether a pytest path argument selects the whole test directory."""
+def _logical_lines(step: Any) -> list[str]:
+    """Return a step's effective lines with continuation lines joined.
 
-    target = target.strip("'\"")
-    while target.startswith("./"):
-        target = target[2:]
-    target = target.rstrip("/")
-    if target in ("", ".", "tests"):
-        return True
-    return target.startswith("tests/") and any(
-        character in _GLOB_CHARACTERS for character in target
+    A trailing backtick continues a pwsh line and a trailing backslash any
+    other shell's line.
+    """
+
+    continuation = "`" if step.get("shell") in ("pwsh", "powershell") else "\\"
+    logical: list[str] = []
+    pending = ""
+    for line in _effective_lines(step):
+        if line.endswith(continuation):
+            pending += line[:-1] + " "
+            continue
+        logical.append(pending + line)
+        pending = ""
+    if pending:
+        logical.append(pending.rstrip())
+    return logical
+
+
+def _shell_words(line: str) -> list[str]:
+    """Split a command line into unquoted words and operator words.
+
+    A GitHub expression stays one word, a backslash stays literal (it is a
+    Windows path separator) and a trailing ``#`` comment is dropped.  A line
+    with an unbalanced quote falls back to whitespace and operator splitting.
+    """
+
+    line = _GITHUB_EXPRESSION.sub(
+        lambda match: "${{" + "".join(match.group(1).split()) + "}}", line
+    )
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return [word.strip("'\"") for word in _FALLBACK_WORD.findall(line)]
+
+
+def _shell_commands(words: list[str]) -> list[list[str]]:
+    """Split words into the separate commands of a line."""
+
+    commands: list[list[str]] = [[]]
+    for word in words:
+        if word in _COMMAND_SEPARATORS:
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return commands
+
+
+def _command_name(word: str) -> str:
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name.removesuffix(".exe")
+
+
+def _is_redirection(word: str) -> bool:
+    return bool(word) and set(word) <= set("<>&|0123456789") and (
+        "<" in word or ">" in word
     )
 
 
-def _runs_whole_test_directory(line: str) -> bool:
-    """Return whether a line runs pytest on the whole ``tests/`` directory.
+def _is_path_argument(word: str) -> bool:
+    """Return whether a positional pytest word names a path or node."""
 
-    A pytest invocation with no path argument, ``.``, ``tests`` (quoted, with a
-    leading ``./`` or a trailing slash) and a glob under ``tests/`` all select
-    the whole suite; a run of one file or one node does not.
+    return (
+        word in (".", "tests")
+        or "/" in word
+        or "\\" in word
+        or "::" in word
+        or word.endswith(".py")
+        or any(character in _GLOB_CHARACTERS for character in word)
+    )
+
+
+def _pytest_targets(arguments: list[str]) -> list[str]:
+    """Return the path arguments of one pytest invocation.
+
+    A value option consumes its next word and a redirection its target; other
+    option words and words that name no path (such as an unknown option's
+    value) select nothing.
     """
 
-    tokens = line.split()
-    for index, token in enumerate(tokens):
-        if token != "pytest" or (index and tokens[index - 1] != "-m"):
-            continue
-        arguments: list[str] = []
-        for argument in tokens[index + 1 :]:
-            if argument in _COMMAND_SEPARATORS:
-                break
-            if not argument.startswith("-"):
-                arguments.append(argument)
-        if not arguments or any(
-            _is_whole_directory_target(argument) for argument in arguments
-        ):
+    targets: list[str] = []
+    words = iter(arguments)
+    for word in words:
+        if word in _PYTEST_VALUE_OPTIONS or _is_redirection(word):
+            next(words, None)
+        elif not word.startswith("-") and _is_path_argument(word):
+            targets.append(word)
+    return targets
+
+
+def _is_whole_directory_target(target: str) -> bool:
+    """Return whether a pytest path argument selects the whole test directory.
+
+    After normalisation (``\\`` as ``/``, ``./``, ``..`` and trailing slashes
+    resolved) that is ``.``, any path ending in ``tests``, or a glob at the top
+    level or under ``tests``.
+    """
+
+    parts = posixpath.normpath(target.replace("\\", "/")).split("/")
+    for index, part in enumerate(parts):
+        if any(character in _GLOB_CHARACTERS for character in part):
+            return not any(parts[:index]) or "tests" in parts[:index]
+    return parts == ["."] or parts[-1] == "tests"
+
+
+def _shell_command_strings(command: list[str]) -> list[str]:
+    """Return the command strings a shell word in a command runs (``bash -c``)."""
+
+    for index, word in enumerate(command):
+        if _command_name(word) in _SHELL_COMMANDS:
+            return [
+                command[position + 1]
+                for position in range(index + 1, len(command) - 1)
+                if _SHELL_COMMAND_OPTION.fullmatch(command[position].lower())
+            ]
+    return []
+
+
+def _runs_whole_test_directory(line: str) -> bool:
+    """Return whether a command line runs pytest on the whole ``tests/`` directory.
+
+    Every ``pytest`` (or ``py.test``) word starts an invocation, whether it follows ``-m``, a
+    command separator or a wrapper such as ``timeout`` or ``env``, unless an
+    earlier word of the same command is pip (where ``pytest`` is a package
+    name).  Only words that look like a path or node id are path arguments, so
+    an option's value never counts as one.  An invocation with no path
+    argument, or with one that selects the whole directory, runs the whole
+    suite; a run of files or nodes does not.  A shell's ``-c`` command string
+    is read the same way.
+    """
+
+    for command in _shell_commands(_shell_words(line)):
+        nested = _shell_command_strings(command)
+        if any(_runs_whole_test_directory(string) for string in nested):
             return True
+        for index, word in enumerate(command):
+            if _command_name(word) not in _PYTEST_COMMANDS or any(
+                _PIP_COMMAND.fullmatch(_command_name(earlier))
+                for earlier in command[:index]
+            ):
+                continue
+            targets = _pytest_targets(command[index + 1 :])
+            if not targets or any(_is_whole_directory_target(target) for target in targets):
+                return True
     return False
 
 
@@ -615,10 +758,10 @@ def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
-        for lines in _job_effective_lines(job):
+        for step in _steps(job):
             problems.extend(
                 f"{name}: package job runs the whole test directory: {line!r}"
-                for line in lines
+                for line in _logical_lines(step)
                 if _runs_whole_test_directory(line)
             )
     return problems
@@ -1955,13 +2098,15 @@ def _mutate_rerun_whole_suite_in_package_job(workflow: dict[str, Any]) -> None:
     )
 
 
-def _rerun_package_job_suite_as(command: str) -> Callable[[dict[str, Any]], None]:
+def _rerun_package_job_suite_as(
+    command: str, job: str = "nyx-windows"
+) -> Callable[[dict[str, Any]], None]:
     def mutate(workflow: dict[str, Any]) -> None:
         _rewrite_run_line(
             workflow,
-            "nyx-windows",
+            job,
             BASELINE_LIFECYCLE_STEP,
-            WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx-windows"]["python"]),
+            WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS[job]["python"]),
             _insert_before(command),
         )
 
@@ -2378,6 +2523,78 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
     "rerun the suite in a package job through a glob": (
         check_baseline_source_suite,
         _rerun_package_job_suite_as("python -m pytest tests/*.py -v"),
+    ),
+    "rerun the suite in a package job under timeout": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("timeout 600 pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job through env": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("env FOO=1 pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job after a command separator": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("cd . && pytest tests/ -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job after installing pytest": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pip install pytest; python -m pytest -v"),
+    ),
+    "rerun the suite in a package job with a plugin option": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v -p no:cacheprovider"),
+    ),
+    "rerun the suite in a package job ignoring one file": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest -v --ignore tests/test_desktop.py"),
+    ),
+    "rerun the suite in a package job with an unknown option value": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('"$runner_python" -m pytest -v --timeout 600', "nyx-macos"),
+    ),
+    "rerun the suite in a package job with redirected output": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest -v > build/pytest.log', "nyx-macos"
+        ),
+    ),
+    "rerun the suite in a package job across a continuation line": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('"$runner_python" -m pytest \\\ntests/ -v', "nyx-macos"),
+    ),
+    "rerun the suite in a package job across a pwsh continuation line": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("python -m pytest tests/test_catalog.py `\ntests/ -v"),
+    ),
+    "rerun the suite in a package job with a multi-line keyword": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest tests/ -v -k "not desktop\nand not native"', "nyx-macos"
+        ),
+    ),
+    "rerun the suite in a package job through bash -c": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("bash -c 'python -m pytest tests/ -v'", "nyx-macos"),
+    ),
+    "rerun the suite in a package job through a pytest executable": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(r".venv\Scripts\pytest.exe .\tests\ -v"),
+    ),
+    "rerun the suite in a package job through py.test": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as("py.test -v", "nyx-macos"),
+    ),
+    "rerun the suite in a package job from the workspace path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            '"$runner_python" -m pytest "$GITHUB_WORKSPACE/tests" -v', "nyx-macos"
+        ),
+    ),
+    "rerun a suite shard in a package job without a path": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as(
+            "python -m pytest -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}"
+        ),
     ),
     "drop test extras from a suite install": (
         check_baseline_source_suite,
