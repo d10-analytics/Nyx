@@ -38,10 +38,11 @@ BASELINE_JOBS = {
     "nyx-windows": {"runs_on": "windows-latest", "python": "python"},
     "nyx-macos": {"runs_on": "macos-latest", "python": '"$runner_python"'},
 }
-# The source suite runs in sharded jobs, one per package lane: each takes the
-# runner label and interpreter of its package job and splits the suite into
-# ``shards`` matrix entries.  A shard-count change is an edit of this table and
-# of the job's matrix list.
+# The source suite runs in sharded jobs, one per package lane: each must carry
+# the runner label and interpreter of its ``package_job`` entry in
+# ``BASELINE_JOBS`` (``suite_pairing_violations`` rejects a difference) and
+# splits the suite into ``shards`` matrix entries.  A shard-count change is an
+# edit of this table and of the job's matrix list.
 SUITE_JOBS = {
     "nyx-suite": {
         "runs_on": "ubuntu-latest",
@@ -507,8 +508,26 @@ def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
     return problems
 
 
-def check_job_matrix(workflow: dict[str, Any]) -> list[str]:
+def suite_pairing_violations(
+    baseline_jobs: dict[str, dict[str, Any]], suite_jobs: dict[str, dict[str, Any]]
+) -> list[str]:
     problems: list[str] = []
+    for name, spec in suite_jobs.items():
+        package = baseline_jobs.get(spec["package_job"])
+        if package is None:
+            problems.append(f"{name}: package job {spec['package_job']!r} is not a baseline job")
+            continue
+        for key in ("runs_on", "python"):
+            if spec[key] != package[key]:
+                problems.append(
+                    f"{name}: {key} is {spec[key]!r}, but package job "
+                    f"{spec['package_job']} has {package[key]!r}"
+                )
+    return problems
+
+
+def check_job_matrix(workflow: dict[str, Any]) -> list[str]:
+    problems = suite_pairing_violations(BASELINE_JOBS, SUITE_JOBS)
     for name, spec in {**BASELINE_JOBS, **SUITE_JOBS, **DESKTOP_JOBS}.items():
         job = _job(workflow, name)
         if job is None:
@@ -2657,6 +2676,35 @@ def test_build_bound_at_or_above_the_job_cap_is_rejected(
     bounds: dict[str, int], expected: list[str]
 ) -> None:
     assert build_bound_violations(bounds, load_workflow()) == expected
+
+
+def test_suite_jobs_match_their_package_jobs() -> None:
+    assert suite_pairing_violations(BASELINE_JOBS, SUITE_JOBS) == []
+
+
+@pytest.mark.parametrize("key", ["runs_on", "python"])
+@pytest.mark.parametrize("package_job", sorted(BASELINE_JOBS))
+def test_package_job_change_without_its_suite_job_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, package_job: str, key: str
+) -> None:
+    drifted = {**BASELINE_JOBS[package_job], key: "drifted"}
+    monkeypatch.setitem(BASELINE_JOBS, package_job, drifted)
+    suite = next(n for n, s in SUITE_JOBS.items() if s["package_job"] == package_job)
+    assert (
+        f"{suite}: {key} is {SUITE_JOBS[suite][key]!r}, but package job "
+        f"{package_job} has 'drifted'"
+    ) in check_job_matrix(load_workflow())
+
+
+def test_suite_job_change_without_its_package_job_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        SUITE_JOBS, "nyx-macos-suite", {**SUITE_JOBS["nyx-macos-suite"], "runs_on": "macos-15"}
+    )
+    assert (
+        "nyx-macos-suite: runs_on is 'macos-15', but package job nyx-macos has 'macos-latest'"
+    ) in check_job_matrix(load_workflow())
 
 
 def test_altered_copy_beside_an_intact_gate_is_rejected() -> None:
