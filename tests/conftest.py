@@ -7,10 +7,22 @@ port with a running Nyx; the few deliberate fixed-port proofs carry the
 
 Tests that run a daemon on a thread go through ``managed_daemon_run`` so a
 failing assertion still shuts the daemon down and joins its thread.
+
+The ``--nyx-shard=I/N`` option splits one collected suite across ``N`` runs.
+``I`` is the 0-based shard index (``0 <= I < N``, no leading zeros) and ``N``
+the shard count; a run keeps the collected tests whose 0-based position ``i``
+satisfies ``i % N == I`` and reports the rest as deselected.  The selection
+applies after ``-k``, ``-m`` and ``--deselect``, so it shards whatever those
+chose.  A malformed value, including an empty one, stops the session before
+collection with a usage error (exit 4) that names the option and the value.
+Without the option nothing is deselected and pytest runs everything.  The
+option lives on the command line only: child pytest sessions started by tests
+never receive it and collect in full.
 """
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 import time
@@ -28,11 +40,70 @@ SERVICE_PORT_HELD_REASON = "the fixed Nyx control port is held by another proces
 LOOPBACK_DENIED_REASON = "sandbox does not permit loopback sockets"
 
 
+SHARD_OPTION = "--nyx-shard"
+_SHARD_PATTERN = re.compile(r"(0|[1-9][0-9]*)/([1-9][0-9]*)")
+
+
+def parse_shard(value: str) -> tuple[int, int]:
+    """Return ``(index, total)`` for a ``I/N`` shard value.
+
+    The grammar is strict: 0-based ``I`` and ``N >= 1`` as plain decimal
+    numbers without leading zeros, signs or whitespace, and ``I < N``.  Any
+    other value, the empty string included, raises ``pytest.UsageError`` naming
+    the option and the received value.
+    """
+
+    match = _SHARD_PATTERN.fullmatch(value)
+    if match is not None:
+        index, total = int(match.group(1)), int(match.group(2))
+        if index < total:
+            return index, total
+    raise pytest.UsageError(
+        f"{SHARD_OPTION} expects I/N with 0 <= I < N (for example 0/2), got {value!r}"
+    )
+
+
+def select_shard(items: list[Any], index: int, total: int) -> tuple[list[Any], list[Any]]:
+    """Split ``items`` into the shard ``index`` of ``total`` and the rest.
+
+    The shard keeps the items at positions ``i`` with ``i % total == index``;
+    both lists keep the original order.
+    """
+
+    selected = items[index::total]
+    chosen = {id(item) for item in selected}
+    return selected, [item for item in items if id(item) not in chosen]
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        SHARD_OPTION,
+        action="store",
+        default=None,
+        metavar="I/N",
+        help="run only shard I (0-based) of N: the tests whose collection index i has i %% N == I",
+    )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "fixed_port: the test uses the real fixed Nyx port; module port isolation is off",
     )
+    value = config.getoption("nyx_shard", default=None)
+    if value is not None:
+        parse_shard(value)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[Any]) -> None:
+    value = config.getoption("nyx_shard", default=None)
+    if value is None:
+        return
+    selected, deselected = select_shard(items, *parse_shard(value))
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def _free_loopback_port() -> int:
