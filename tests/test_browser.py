@@ -4774,3 +4774,12 @@ def test_launch_failure_after_server_start_stops_the_server_before_raising(
     assert leaked == []
     assert listening == []
     assert elapsed < 30
+
+
+def test_page_launcher_closes_every_context_and_leaves_the_shared_browser_open(shared_browser):
+    """Launcher exit closes a test-opened context and keeps the browser connected."""
+    with page_launcher(shared_browser):
+        stray = shared_browser.new_context()
+        stray.new_page()
+    assert shared_browser.is_connected()
+    assert shared_browser.contexts == []
