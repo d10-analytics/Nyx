@@ -76,7 +76,7 @@ _HEADER_FIELD = re.compile(
 )
 # Raw header values the scan keeps for ``scan_package_heads``; the rendered
 # catalog never reads them.
-_JOIN_LABELS = {"target_repo": "Target repo", "branch": "Branch"}
+_JOIN_LABELS = {"target_repo": "Target repo", "branch": "Branch", "baseline": "Baseline"}
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _REPORTED_EXCLUSIONS = {label.translate(_ASCII_LOWER) for label in (*_HEADER_LABELS, "Status", "Target repo")}
 _REPORTED_FIELD = re.compile(r"^\s*(?:\*\*)?([A-Z][^:*`<>|\[\]\x00-\x1f\x7f]{0,63}?)(?:\*\*:|:\*\*|:)(.*)$")
@@ -1358,6 +1358,18 @@ class BranchHead:
 
 
 @dataclass(frozen=True)
+class BaselineHead:
+    """A package's ``Baseline:`` header.
+
+    ``declared`` carries the full lowercase commit ID (40 or 64 hex characters);
+    any other present value is ``invalid``.
+    """
+
+    status: Literal["declared", "invalid", "absent"]
+    sha: str | None
+
+
+@dataclass(frozen=True)
 class PackageHead:
     """The header facts of one package that a checkout can be joined to."""
 
@@ -1367,6 +1379,7 @@ class PackageHead:
     superseded: bool
     target_repo: TargetRepoHead
     branch: BranchHead
+    baseline: BaselineHead
 
 
 @dataclass(frozen=True)
@@ -1395,6 +1408,21 @@ def _branch_head(raw: str | None) -> BranchHead:
     if _is_branch_name(value):
         return BranchHead("declared", value)
     return BranchHead("invalid", None)
+
+
+_COMMIT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _baseline_head(raw: str | None) -> BaselineHead:
+    tokens = (normalize_header_value(raw) if raw is not None else "").split()
+    if not tokens:
+        return BaselineHead("absent", None)
+    token = tokens[0]
+    if len(token) > 2 and token.startswith("`") and token.endswith("`"):
+        token = token[1:-1]
+    if _COMMIT_ID.fullmatch(token):
+        return BaselineHead("declared", token)
+    return BaselineHead("invalid", None)
 
 
 def _finished_stages(completed_stage_names: Iterable[str] | None) -> frozenset[str]:
@@ -1439,6 +1467,7 @@ def scan_package_heads(
                 ),
                 target_repo=_target_repo_head(join["target_repo"]),
                 branch=_branch_head(join["branch"]),
+                baseline=_baseline_head(join["baseline"]),
             )
         )
     return PackageHeads(
