@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import ast
 import copy
-import posixpath
 import re
-import shlex
 from pathlib import Path
 from typing import Any, Callable
 
@@ -211,6 +209,9 @@ LINUX_SERVICE_GATES = (
 # The cleanup stop is deliberately best-effort (it ends in ``|| true``), so it
 # stays a substring marker rather than an exact gate.
 LINUX_SERVICE_MARKERS = ('"$nyx_verify_root/venv/bin/nyx" --stop',)
+# The continuation line that installs pytest, with the wheel, for the
+# installed-service proof.
+LINUX_SERVICE_PIP_CONTINUATION = '"$nyx_verify_wheel" pytest playwright'
 
 SESSION_PREFLIGHT_GATES = {
     "nyx-desktop-windows": (
@@ -545,196 +546,46 @@ def _suite_command(name: str) -> str:
     return SHARDED_SUITE_COMMAND.replace("{python}", SUITE_JOBS[name]["python"])
 
 
-# Words that end one shell command and start the next, in bash and pwsh.
-_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", ";;", "|", "|&", "&", "(", ")"})
-_PYTEST_COMMANDS = frozenset({"pytest", "py.test"})
-_PIP_COMMAND = re.compile(r"pip[0-9.]*")
-_SHELL_COMMANDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "pwsh", "powershell"})
-# A shell option word whose next word may be the command string: ``-c``, a
-# bundle such as ``-ec``, or pwsh's ``-Command``.  Each such next word is read.
-_SHELL_COMMAND_OPTION = re.compile(r"-[a-z]*c[a-z]*")
-# pytest's own options that read the next word as their value, and this
-# repository's shard option.
-_PYTEST_VALUE_OPTIONS = frozenset(
+# A run line names pytest when, with quotes, backticks and backslashes removed,
+# it contains ``pytest`` or ``py.test`` in any letter case.
+_PYTEST_NAME = re.compile(r"py\.?test", re.IGNORECASE)
+_PYTEST_NAME_MASK = str.maketrans("", "", "\"'`\\")
+
+
+def _names_pytest(line: str) -> bool:
+    return bool(_PYTEST_NAME.search(line.translate(_PYTEST_NAME_MASK)))
+
+
+# The only run lines naming pytest that each package job may hold, compared
+# exactly: the installed-wheel proof in every package job and, in the Linux
+# job, the documented-install proof, the installed-service lines that run
+# pytest and the continuation that installs it for that service.
+_LINUX_PACKAGE_PYTEST_LINES = frozenset(
     {
-        "-c", "-k", "-m", "-o", "-p", "-r", "-W",
-        "--assert", "--basetemp", "--cache-show", "--capture", "--code-highlight",
-        "--color", "--confcutdir", "--config-file", "--debug", "--deselect",
-        "--doctest-glob", "--doctest-report", "--durations", "--durations-min",
-        "--ignore", "--ignore-glob", "--import-mode", "--junit-prefix",
-        "--junit-xml", "--junitprefix", "--junitxml", "--last-failed-no-failures",
-        "--lfnf", "--log-auto-indent", "--log-cli-date-format", "--log-cli-format",
-        "--log-cli-level", "--log-date-format", "--log-disable", "--log-file",
-        "--log-file-date-format", "--log-file-format", "--log-file-level",
-        "--log-file-mode", "--log-format", "--log-level", "--max-warnings",
-        "--maxfail", "--override-ini", "--pastebin", "--pdbcls", "--pythonwarnings",
-        "--report-chars", "--rootdir", "--show-capture", "--tb", "--verbosity",
-        SHARD_OPTION,
+        DOCUMENTED_INSTALL_COMMAND,
+        LINUX_SERVICE_PIP_CONTINUATION,
+        *(line for gate in LINUX_SERVICE_GATES for line in gate if _names_pytest(line)),
     }
 )
-_GLOB_CHARACTERS = frozenset("*?[")
-_GITHUB_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}")
-_FALLBACK_WORD = re.compile(r"[^\s;&|()<>]+|[;&|()<>]+")
-
-
-def _logical_lines(step: Any) -> list[str]:
-    """Return a step's effective lines with continuation lines joined.
-
-    A trailing backtick continues a pwsh line and a trailing backslash any
-    other shell's line.
-    """
-
-    continuation = "`" if step.get("shell") in ("pwsh", "powershell") else "\\"
-    logical: list[str] = []
-    pending = ""
-    for line in _effective_lines(step):
-        if line.endswith(continuation):
-            pending += line[:-1] + " "
-            continue
-        logical.append(pending + line)
-        pending = ""
-    if pending:
-        logical.append(pending.rstrip())
-    return logical
-
-
-def _shell_words(line: str) -> list[str]:
-    """Split a command line into unquoted words and operator words.
-
-    A GitHub expression stays one word, a backslash stays literal (it is a
-    Windows path separator) and a trailing ``#`` comment is dropped.  A line
-    with an unbalanced quote falls back to whitespace and operator splitting.
-    """
-
-    line = _GITHUB_EXPRESSION.sub(
-        lambda match: "${{" + "".join(match.group(1).split()) + "}}", line
-    )
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    lexer.escape = ""
-    try:
-        return list(lexer)
-    except ValueError:
-        return [word.strip("'\"") for word in _FALLBACK_WORD.findall(line)]
-
-
-def _shell_commands(words: list[str]) -> list[list[str]]:
-    """Split words into the separate commands of a line."""
-
-    commands: list[list[str]] = [[]]
-    for word in words:
-        if word in _COMMAND_SEPARATORS:
-            commands.append([])
-        else:
-            commands[-1].append(word)
-    return commands
-
-
-def _command_name(word: str) -> str:
-    name = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return name.removesuffix(".exe")
-
-
-def _is_redirection(word: str) -> bool:
-    return bool(word) and set(word) <= set("<>&|0123456789") and (
-        "<" in word or ">" in word
-    )
-
-
-def _is_path_argument(word: str) -> bool:
-    """Return whether a positional pytest word names a path or node."""
-
-    return (
-        word in (".", "tests")
-        or "/" in word
-        or "\\" in word
-        or "::" in word
-        or word.endswith(".py")
-        or any(character in _GLOB_CHARACTERS for character in word)
-    )
-
-
-def _pytest_targets(arguments: list[str]) -> list[str]:
-    """Return the path arguments of one pytest invocation.
-
-    A value option consumes its next word and a redirection its target; other
-    option words and words that name no path (such as an unknown option's
-    value) select nothing.
-    """
-
-    targets: list[str] = []
-    words = iter(arguments)
-    for word in words:
-        if word in _PYTEST_VALUE_OPTIONS or _is_redirection(word):
-            next(words, None)
-        elif not word.startswith("-") and _is_path_argument(word):
-            targets.append(word)
-    return targets
-
-
-def _is_whole_directory_target(target: str) -> bool:
-    """Return whether a pytest path argument selects the whole test directory.
-
-    After normalisation (``\\`` as ``/``, ``./``, ``..`` and trailing slashes
-    resolved) that is ``.``, any path ending in ``tests``, or a glob at the top
-    level or under ``tests``.
-    """
-
-    parts = posixpath.normpath(target.replace("\\", "/")).split("/")
-    for index, part in enumerate(parts):
-        if any(character in _GLOB_CHARACTERS for character in part):
-            return not any(parts[:index]) or "tests" in parts[:index]
-    return parts == ["."] or parts[-1] == "tests"
-
-
-def _shell_command_strings(command: list[str]) -> list[str]:
-    """Return the command strings a shell word in a command runs (``bash -c``)."""
-
-    for index, word in enumerate(command):
-        if _command_name(word) in _SHELL_COMMANDS:
-            return [
-                command[position + 1]
-                for position in range(index + 1, len(command) - 1)
-                if _SHELL_COMMAND_OPTION.fullmatch(command[position].lower())
-            ]
-    return []
-
-
-def _runs_whole_test_directory(line: str) -> bool:
-    """Return whether a command line runs pytest on the whole ``tests/`` directory.
-
-    Every ``pytest`` (or ``py.test``) word starts an invocation, whether it follows ``-m``, a
-    command separator or a wrapper such as ``timeout`` or ``env``, unless an
-    earlier word of the same command is pip (where ``pytest`` is a package
-    name).  Only words that look like a path or node id are path arguments, so
-    an option's value never counts as one.  An invocation with no path
-    argument, or with one that selects the whole directory, runs the whole
-    suite; a run of files or nodes does not.  A shell's ``-c`` command string
-    is read the same way.
-    """
-
-    for command in _shell_commands(_shell_words(line)):
-        nested = _shell_command_strings(command)
-        if any(_runs_whole_test_directory(string) for string in nested):
-            return True
-        for index, word in enumerate(command):
-            if _command_name(word) not in _PYTEST_COMMANDS or any(
-                _PIP_COMMAND.fullmatch(_command_name(earlier))
-                for earlier in command[:index]
-            ):
-                continue
-            targets = _pytest_targets(command[index + 1 :])
-            if not targets or any(_is_whole_directory_target(target) for target in targets):
-                return True
-    return False
+PACKAGE_JOB_PYTEST_LINES = {
+    name: frozenset({INSTALLED_WHEEL_COMMAND.format(python=spec["python"])})
+    | (_LINUX_PACKAGE_PYTEST_LINES if name == "nyx" else frozenset())
+    for name, spec in BASELINE_JOBS.items()
+}
 
 
 def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
     """Require the sharded source suite in each suite job and nowhere else.
 
     Each suite job holds the exact sharded command and the exact install line
-    its suite needs; a package job holds no whole-directory pytest run (its
-    file-level runs are accepted).
+    its suite needs.  A package job runs pytest only through its designated
+    lines: every effective line of every step that names pytest (case
+    insensitively, ignoring quotes, backticks and backslashes) must equal one
+    of that job's lines in ``PACKAGE_JOB_PYTEST_LINES``.  Any other such line
+    is reported, whatever it selects and whichever command wraps it, so a new
+    pytest run in a package job needs a matching edit of that table.  A name
+    built from variables or split across lines names pytest on no single line
+    and is left to review.
     """
 
     problems: list[str] = []
@@ -758,11 +609,12 @@ def check_baseline_source_suite(workflow: dict[str, Any]) -> list[str]:
         if job is None:
             problems.append(f"{name}: job is missing")
             continue
+        designated = PACKAGE_JOB_PYTEST_LINES[name]
         for step in _steps(job):
             problems.extend(
-                f"{name}: package job runs the whole test directory: {line!r}"
-                for line in _logical_lines(step)
-                if _runs_whole_test_directory(line)
+                f"{name}: step {step.get('name')!r} runs an undesignated pytest line: {line!r}"
+                for line in _effective_lines(step)
+                if _names_pytest(line) and line not in designated
             )
     return problems
 
@@ -2113,6 +1965,16 @@ def _rerun_package_job_suite_as(
     return mutate
 
 
+def _mutate_add_undesignated_file_level_run(workflow: dict[str, Any]) -> None:
+    _rewrite_run_line(
+        workflow,
+        "nyx",
+        LINUX_SERVICE_STEP,
+        WHEEL_BUILD_COMMAND.format(python=BASELINE_JOBS["nyx"]["python"]),
+        _insert_before('"$runner_python" -m pytest tests/test_catalog.py -v'),
+    )
+
+
 def _mutate_drop_suite_test_extras(workflow: dict[str, Any]) -> None:
     step = _step(workflow, "nyx-suite", SUITE_STEP)
     install = SUITE_INSTALL_COMMAND.replace("{python}", SUITE_JOBS["nyx-suite"]["python"])
@@ -2595,6 +2457,14 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         _rerun_package_job_suite_as(
             "python -m pytest -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}"
         ),
+    ),
+    "rerun the whole suite through a quoted command": (
+        check_baseline_source_suite,
+        _rerun_package_job_suite_as('eval "python -m pytest tests/ -v"', "nyx-macos"),
+    ),
+    "add an undesignated file-level run": (
+        check_baseline_source_suite,
+        _mutate_add_undesignated_file_level_run,
     ),
     "drop test extras from a suite install": (
         check_baseline_source_suite,
