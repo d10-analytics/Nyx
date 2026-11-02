@@ -360,6 +360,10 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                     schema_four["schema_version"] = 4
                     schema_four["catalog_digest"] = canonical_digest(schema_four)
                     malformed.append(schema_four)
+                    revision = json.loads(json.dumps(baseline))
+                    revision["configuration_revision"] = []
+                    revision["catalog_digest"] = canonical_digest(revision)
+                    malformed.append(revision)
                     duplicate = json.loads(json.dumps(baseline))
                     duplicate["inventory"]["projects"].append(
                         dict(duplicate["inventory"]["projects"][0])

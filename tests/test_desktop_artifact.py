@@ -617,7 +617,7 @@ def test_delivered_second_process_reports_already_open_without_competing_writes(
             _assert_claims_released(home)
 
 
-@pytest.mark.parametrize("kind", ["malformed", "unsupported", "unverified"])
+@pytest.mark.parametrize("kind", ["malformed", "unsupported"])
 def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
     artifact: ArtifactLayout, kind: str
 ):
@@ -630,7 +630,7 @@ def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
         decoy = _inert_path(root)
         if kind == "malformed":
             preserved = _write_raw_configuration(home, b"{ this is not json\n")
-        elif kind == "unsupported":
+        else:
             preserved = _write_raw_configuration(
                 home,
                 json.dumps(
@@ -640,20 +640,6 @@ def test_delivered_chooser_blocks_a_bad_persisted_state_without_changing_bytes(
                     }
                 ).encode("utf-8"),
             )
-        else:
-            committed = root / "committed.json"
-            committed.write_bytes(
-                json.dumps(
-                    {
-                        "schema_version": state.CONFIG_SCHEMA_VERSION,
-                        "specification_root": str(root),
-                    }
-                ).encode("utf-8")
-            )
-            config_directory = home / ".nyx" / "config"
-            config_directory.mkdir(parents=True)
-            (config_directory / "config.json").symlink_to(committed)
-            preserved = committed
         before = preserved.read_bytes()
         environment = _sanitized_environment(home, decoy)
         with _running_gui(artifact, root, environment) as gui:
@@ -738,6 +724,10 @@ def test_delivered_unverified_committed_state_revalidates_then_starts(
                 # rolled back.
                 assert committed.read_bytes() == before
                 assert gui.close() == 0, gui.diagnostics()
+            # Closing the blocked launch releases both claims and leaves the
+            # committed bytes untouched.
+            _assert_claims_released(home)
+            assert committed.read_bytes() == before
             _wait_port_free(time.monotonic() + 15)
             # Only a safely revalidated record admits a start.
             valid.unlink()
