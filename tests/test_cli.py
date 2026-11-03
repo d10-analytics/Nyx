@@ -2362,34 +2362,72 @@ def _documented_checkout_terms(text: str) -> set[str]:
     return set(re.findall(r"`([a-z_]+)`", text))
 
 
-def _inspect_checkouts_before_code_status(text: str) -> str:
+def _subsection(text: str, heading: str) -> str:
+    """The body of one `###` subsection of the Inspect checkouts section."""
     section = text.split("## Inspect checkouts", 1)[1].split("\n## ", 1)[0]
-    return section.split("### Code Status of specification packages", 1)[0]
+    return section.split(f"### {heading}\n", 1)[1].split("\n### ", 1)[0]
+
+
+def _bulleted_terms(subsection: str) -> set[str]:
+    """Terms named inside the subsection's bullets; other prose does not define them."""
+    bullets = re.findall(r"^- .*?(?=^- |^\n|\Z)", subsection, re.M | re.S)
+    return _documented_checkout_terms("".join(bullets))
 
 
 def _undocumented_checkout_terms(guide: str) -> set[str]:
-    """Attention codes, availability reasons and states the guide's checkout text omits."""
+    """Attention codes missing from Needs attention, reasons and states from Availability."""
     from nyx import models
 
     reasons, states = _availability_vocabulary()
     codes = {code for _, code in models._ATTENTION_CODES}
     assert len(reasons) == 5 and states == {"unknown", "occupied", "assigned", "free"}
-    documented = _documented_checkout_terms(_inspect_checkouts_before_code_status(guide))
-    return (codes | reasons | states) - documented
+    attention = _bulleted_terms(_subsection(guide, "Needs attention"))
+    availability = _bulleted_terms(_subsection(guide, "Availability"))
+    return (codes - attention) | ((reasons | states) - availability)
+
+
+def _guide() -> str:
+    return (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
 
 
 def test_checkout_guide_documents_every_attention_code_reason_and_state():
-    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
-    assert _undocumented_checkout_terms(guide) == set()
+    assert _undocumented_checkout_terms(_guide()) == set()
+
+
+def _without_bullet(guide: str, subsection: str, term: str) -> str:
+    body = _subsection(guide, subsection)
+    bullet = re.search(rf"^- `{term}`.*?(?=^- |^\n|\Z)", body, re.M | re.S)
+    assert bullet, term
+    return guide.replace(bullet.group(0), "")
 
 
 @pytest.mark.parametrize(
-    "term",
-    ["branch_unpushed", "package_scan_unavailable", "operation_in_progress", "occupied"],
+    ("subsection", "term"),
+    [
+        ("Needs attention", "removable"),
+        ("Needs attention", "uncommitted_changes"),
+        ("Needs attention", "branch_unpushed"),
+        ("Availability", "unknown"),
+        ("Availability", "occupied"),
+    ],
 )
-def test_checkout_guide_coverage_fails_when_a_term_is_missing(term):
-    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
-    section_end = guide.index("### Code Status of specification packages")
-    # A term that only appears after the Code Status heading does not count.
-    mutated = guide[:section_end].replace(f"`{term}`", "") + guide[section_end:]
-    assert _undocumented_checkout_terms(mutated) == {term}
+def test_checkout_guide_coverage_fails_when_a_bullet_is_removed(subsection, term):
+    guide = _guide()
+    assert term in _documented_checkout_terms(guide)
+    mutated = _without_bullet(guide, subsection, term)
+    assert term in _undocumented_checkout_terms(mutated)
+
+
+def test_checkout_guide_coverage_ignores_other_subsections_and_other_mentions():
+    guide = _guide()
+    body = _subsection(guide, "Needs attention")
+    mutated = guide.replace(body, body.replace("`operation_in_progress`", ""))
+    # The reason is still in the Availability subsection, which is the right place.
+    assert _undocumented_checkout_terms(mutated) == set()
+    mutated = guide.replace(body, body.replace("`awaiting_merge`", ""))
+    assert "awaiting_merge" in _undocumented_checkout_terms(mutated)
+    # A mention after the Code Status heading is outside every checked subsection.
+    assert "awaiting_merge" in _documented_checkout_terms(guide.split("### Code Status", 1)[1])
+    heading = "### Code Status of specification packages\n"
+    mutated = mutated.replace(heading, heading + "\n- `awaiting_merge` is named here.\n")
+    assert "awaiting_merge" in _undocumented_checkout_terms(mutated)
