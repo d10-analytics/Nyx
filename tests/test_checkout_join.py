@@ -690,6 +690,18 @@ def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
         ("missing key", lambda t, d: t.pop("within_folders"), "target"),
     ):
         assert message in refusal(mutate), name
+    bare_availability = availability_of(document, targets["bare"])
+    assert (bare_availability["state"], bare_availability["reasons"]) == (
+        "occupied", ["linked_worktrees"]
+    )
+    assert bare_availability["assigned_to"] == [
+        {"package_path": path_of("bare"), "basis": "target_repo"},
+        {"package_path": path_of("barework"), "basis": "target_repo_worktree"},
+    ]
+    # git cannot read the holder's bare directory as a work tree, so the clone is not ok
+    assert clone_at(document, targets["holder"])["status"] == "failed"
+    holder_availability = availability_of(document, targets["holder"])
+    assert (holder_availability["state"], holder_availability["reasons"]) == ("unknown", [])
     lines = cli.format_checkouts(document)
     busy = found["busy"]["clone"]
     assert f"{json.dumps(busy)}  too_many_branches" in lines
@@ -4384,23 +4396,6 @@ def test_world_w_ranks_its_free_clones_by_the_distance_of_their_default_branch(w
     assert all(r["free_clones"] == [] for r in w.offline["repositories"] if r["remote"] is None)
 
 
-def test_the_target_collection_marks_a_bare_clone_with_a_worktree_occupied(targets, tmp_path):
-    document = collect_packages(
-        [targets["folder"]],
-        package_root(tmp_path, {"barework": targets["bare_work"], "holder": targets["holder"]}),
-    )
-
-    assert availability_of(document, targets["bare"]) == {
-        "state": "occupied", "reasons": ["linked_worktrees"], "assigned_to": [
-            {"package_path": path_of("barework"), "basis": "target_repo_worktree"}
-        ],
-    }
-    # git cannot read the holder's bare directory as a work tree, so the clone is not ok
-    assert clone_at(document, targets["holder"])["status"] == "failed"
-    assert availability_of(document, targets["holder"])["state"] == "unknown"
-    assert availability_of(document, targets["holder"])["reasons"] == []
-
-
 def main_of(clone_document: dict[str, Any]) -> dict[str, Any]:
     (found,) = [item for item in clone_document["worktrees"] if item["main"]]
     return found
@@ -4646,10 +4641,10 @@ RANKING_ROWS = (
     (
         "no local default branch counts as absent",
         {
-            "Repo Clone 2": ("unknown", None, None), "Repo Clone 3": ("equal", 0, 0),
-            "Repo Clone 4": "no default", "Repo Clone 10": ("equal", 0, 0),
+            "Repo Clone 2": "no default", "Repo Clone 3": ("unknown", None, None),
+            "Repo Clone 4": ("equal", 0, 0), "Repo Clone 10": ("equal", 0, 0),
         },
-        ["Repo Clone 3", "Repo Clone 10", "Repo Clone 2", "Repo Clone 4"],
+        ["Repo Clone 4", "Repo Clone 10", "Repo Clone 3", "Repo Clone 2"],
     ),
 )
 
