@@ -554,133 +554,153 @@ class RootSwitchSettings(BrowserSettings):
         self.revision = "root-b-revision"
 
 
-@contextmanager
-def page_launcher(launch_timeout_ms=15000):
-    """Yield a page launcher; teardown stops every server before asserting."""
+@pytest.fixture(scope="module")
+def shared_browser():
+    """Yield one Chromium for the module; each launcher closes every context but leaves the browser open."""
     with playwright.sync_playwright() as api:
         browser = api.chromium.launch()
-        created = []
+        try:
+            yield browser
+        finally:
+            browser.close()
 
-        def stop_server(application, server, thread):
-            """Stop one launched server; return False if the application did not stop."""
-            if application is None:
-                try:
-                    server.shutdown()
-                    thread.join()
-                finally:
-                    server.server_close()
-                return True
-            return application.shutdown(time.monotonic() + 2) is True
 
-        def launch(
-            client, *, color_scheme="light", init_script=None, settings=None, fake_clock=False
-        ):
-            application = None
-            server = None
-            thread = None
-            if settings is None:
-                server = create_server(client)
-                thread = threading.Thread(target=server.serve_forever)
-                try:
-                    thread.start()
-                except BaseException:
-                    server.server_close()
-                    raise
-            else:
-                application = ApplicationRuntime(
-                    port=0,
-                    deadline=time.monotonic() + 5,
-                    server_factory=lambda **kwargs: _create_application_server(
-                        provider=client,
-                        port=kwargs["port"],
-                        settings_provider=kwargs["settings_provider"],
-                    ),
-                )
-                application.get_settings = settings.get_settings
-                application.get_workspace = settings.get_workspace
-                application.save_settings = settings.save_settings
-                client.settings = settings
-            context = None
+@contextmanager
+def page_launcher(browser, launch_timeout_ms=15000):
+    """Yield a page launcher; teardown stops every server before asserting."""
+    created = []
+
+    def stop_server(application, server, thread):
+        """Stop one launched server; return False if the application did not stop."""
+        if application is None:
             try:
-                if application is not None:
-                    application.start(static_ready=lambda: True)
-                    server = application.server
-                    thread = application.http_thread
-                context = browser.new_context(color_scheme=color_scheme)
-                if fake_clock:
-                    context.clock.install()
-                # D-13: record CSP violations for every page and navigation in
-                # this context and assert none at teardown.
-                violations = []
-                context.expose_binding(
-                    "__nyxCspViolation", lambda source, entry: violations.append(entry)
-                )
-                context.add_init_script(
-                    "window.__cspViolations = [];"
-                    "document.addEventListener('securitypolicyviolation', (event) => {"
-                    "  const entry = {directive: event.violatedDirective,"
-                    "                  blockedURI: event.blockedURI};"
-                    "  window.__cspViolations.push(entry);"
-                    "  window.__nyxCspViolation(entry);"
-                    "});"
-                )
-                page = context.new_page()
-                page._nyx_csp_violations = violations
-                if init_script:
-                    page.add_init_script(init_script)
-                page.goto(f"http://127.0.0.1:{server.server_port}/")
+                server.shutdown()
+                thread.join()
+            finally:
+                server.server_close()
+            return True
+        return application.shutdown(time.monotonic() + 2) is True
+
+    def launch(
+        client, *, color_scheme="light", init_script=None, settings=None, fake_clock=False
+    ):
+        application = None
+        server = None
+        thread = None
+        if settings is None:
+            server = create_server(client)
+            thread = threading.Thread(target=server.serve_forever)
+            try:
+                thread.start()
+            except BaseException:
+                server.server_close()
+                raise
+        else:
+            application = ApplicationRuntime(
+                port=0,
+                deadline=time.monotonic() + 5,
+                server_factory=lambda **kwargs: _create_application_server(
+                    provider=client,
+                    port=kwargs["port"],
+                    settings_provider=kwargs["settings_provider"],
+                ),
+            )
+            application.get_settings = settings.get_settings
+            application.get_workspace = settings.get_workspace
+            application.save_settings = settings.save_settings
+            client.settings = settings
+        context = None
+        try:
+            if application is not None:
+                application.start(static_ready=lambda: True)
+                server = application.server
+                thread = application.http_thread
+            context = browser.new_context(color_scheme=color_scheme)
+            if fake_clock:
+                context.clock.install()
+            # Record CSP violations for every page and navigation in
+            # this context and assert none at teardown.
+            violations = []
+            context.expose_binding(
+                "__nyxCspViolation", lambda source, entry: violations.append(entry)
+            )
+            context.add_init_script(
+                "window.__cspViolations = [];"
+                "document.addEventListener('securitypolicyviolation', (event) => {"
+                "  const entry = {directive: event.violatedDirective,"
+                "                  blockedURI: event.blockedURI};"
+                "  window.__cspViolations.push(entry);"
+                "  window.__nyxCspViolation(entry);"
+                "});"
+            )
+            page = context.new_page()
+            page._nyx_csp_violations = violations
+            if init_script:
+                page.add_init_script(init_script)
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.wait_for_function(
+                "() => document.querySelector("
+                "'#board .card, #board .board-empty, #board-issues')",
+                timeout=launch_timeout_ms,
+            )
+            if application is None:
                 page.wait_for_function(
-                    "() => document.querySelector("
-                    "'#board .card, #board .board-empty, #board-issues')",
+                    "() => new Promise(resolve => requestAnimationFrame("
+                    "() => requestAnimationFrame(resolve)))",
                     timeout=launch_timeout_ms,
                 )
+            else:
+                # Application pages load board settings concurrently with the
+                # first render; give that load time to finish.
                 page.wait_for_timeout(150)
-            except BaseException as failure:
-                # A launch that fails after its server started stops that
-                # server (and closes its context) before the error propagates;
-                # a running non-daemon serve_forever thread would otherwise
-                # keep the interpreter alive at exit.
-                if context is not None:
-                    try:
-                        context.close()
-                    except Exception as cleanup_error:
-                        failure.add_note(f"context close also failed: {cleanup_error!r}")
+        except BaseException as failure:
+            # A launch that fails after its server started stops that
+            # server (and closes its context) before the error propagates;
+            # a running non-daemon serve_forever thread would otherwise
+            # keep the interpreter alive at exit.
+            if context is not None:
                 try:
-                    if not stop_server(application, server, thread):
-                        failure.add_note(f"application did not stop: {application}")
+                    context.close()
                 except Exception as cleanup_error:
-                    failure.add_note(f"server cleanup also failed: {cleanup_error!r}")
-                raise
-            created.append((application, server, thread, page))
-            return page
+                    failure.add_note(f"context close also failed: {cleanup_error!r}")
+            try:
+                if not stop_server(application, server, thread):
+                    failure.add_note(f"application did not stop: {application}")
+            except Exception as cleanup_error:
+                failure.add_note(f"server cleanup also failed: {cleanup_error!r}")
+            raise
+        created.append((application, server, thread, page))
+        return page
 
-        try:
-            yield launch
-        finally:
-            # Every context, server, application and the browser is closed
-            # before any teardown failure is raised, so a failing assertion
-            # can never leave a non-daemon serve_forever thread running.
-            errors = []
-            violations = []
-            unstopped = []
+    try:
+        yield launch
+    finally:
+        # Every context of the shared browser, and every server and
+        # application this launcher started, is closed before any teardown
+        # failure is raised, so a failing assertion can never leave a
+        # non-daemon serve_forever thread running. The browser itself stays
+        # open for the rest of the module.
+        errors = []
+        violations = []
+        unstopped = []
 
-            def attempt(action):
-                try:
-                    return action()
-                except Exception as error:
-                    errors.append(error)
-                    return None
+        def attempt(action):
+            try:
+                return action()
+            except Exception as error:
+                errors.append(error)
+                return None
 
-            for application, server, thread, page in created:
-                attempt(page.context.close)
-                violations.extend(page._nyx_csp_violations)
-                if attempt(lambda: stop_server(application, server, thread)) is False:
-                    unstopped.append(application)
-            attempt(browser.close)
-            if errors:
-                raise errors[0]
-            assert unstopped == [], f"applications that did not stop: {unstopped}"
-            assert violations == [], f"recorded CSP violations: {violations}"
+        for context in list(browser.contexts):
+            attempt(context.close)
+        for application, server, thread, page in created:
+            violations.extend(page._nyx_csp_violations)
+            if attempt(lambda: stop_server(application, server, thread)) is False:
+                unstopped.append(application)
+        if errors:
+            raise errors[0]
+        assert unstopped == [], f"applications that did not stop: {unstopped}"
+        assert violations == [], f"recorded CSP violations: {violations}"
 
 
 # Mirrors POLL_INTERVAL in nyx/static/app.js, the browser's poll interval.
@@ -700,8 +720,8 @@ def fire_poll(page):
 
 
 @pytest.fixture
-def open_page():
-    with page_launcher() as launch:
+def open_page(shared_browser):
+    with page_launcher(shared_browser) as launch:
         yield launch
 
 
@@ -4658,7 +4678,9 @@ def test_csp_violation_recorder_records_and_clears(open_page):
     violations.clear()
 
 
-def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(monkeypatch):
+def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(
+    monkeypatch, shared_browser
+):
     """A recorded violation fails teardown without leaving serve_forever running."""
     servers = []
     original_create_server = create_server
@@ -4671,7 +4693,7 @@ def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(mon
     monkeypatch.setitem(globals(), "create_server", recording_create_server)
     before = set(threading.enumerate())
     with pytest.raises(AssertionError, match="recorded CSP violations") as failure:
-        with page_launcher() as launch:
+        with page_launcher(shared_browser) as launch:
             page = launch(StaticClient(board_payload()))
             page.evaluate(
                 "() => { const img = document.createElement('img');"
@@ -4701,7 +4723,7 @@ def test_csp_violation_teardown_fails_only_after_the_standalone_server_stops(mon
 
 @pytest.mark.parametrize("with_application", [False, True], ids=["standalone", "application"])
 def test_launch_failure_after_server_start_stops_the_server_before_raising(
-    monkeypatch, with_application
+    monkeypatch, shared_browser, with_application
 ):
     """A launch that fails while waiting for the board leaves no server running."""
     servers = []
@@ -4732,7 +4754,7 @@ def test_launch_failure_after_server_start_stops_the_server_before_raising(
     before = set(threading.enumerate())
     started = time.monotonic()
     with pytest.raises(playwright.TimeoutError):
-        with page_launcher(launch_timeout_ms=1000) as launch:
+        with page_launcher(shared_browser, launch_timeout_ms=1000) as launch:
             launch(StaticClient(board_payload()), init_script=hide_board, settings=settings)
     elapsed = time.monotonic() - started
     leaked = [
@@ -4761,3 +4783,12 @@ def test_launch_failure_after_server_start_stops_the_server_before_raising(
     assert leaked == []
     assert listening == []
     assert elapsed < 30
+
+
+def test_page_launcher_closes_every_context_and_leaves_the_shared_browser_open(shared_browser):
+    """Launcher exit closes a test-opened context and keeps the browser connected."""
+    with page_launcher(shared_browser):
+        stray = shared_browser.new_context()
+        stray.new_page()
+    assert shared_browser.is_connected()
+    assert shared_browser.contexts == []
