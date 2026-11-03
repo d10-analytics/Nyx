@@ -555,9 +555,10 @@ is `equal` when the Baseline is the base commit; `behind` when the base has move
 past the Baseline, which is the "base moved" case; `ahead` or `diverged` when the
 Baseline holds commits the base lacks, as with a stale cached base or a Baseline
 off the default branch's history; `differs` when no count can be made, because
-the target clone is shallow or partial, no clone holds the Baseline commit or the
-call failed; `unknown` when the 60 seconds or a single call's 10-second cap ran
-out, or, on a live or recorded base, a git call could not start; and `absent` when the
+the target clone is shallow or partial, no clone holds the Baseline commit, a call
+failed or, on a `cached` base, the count could not start; `unknown` when the 60
+seconds or a single call's 10-second cap ran out, or any other git call could not
+start; and `absent` when the
 clone has no base or could not be read. Counts are made read-only. When the
 target clone lacks the Baseline commit, a sibling clone of the same remote may
 lend it, named in `objects_from`. Drift is computed on every run and never saved.
@@ -711,9 +712,11 @@ means a package may exist that the list does not show; rule 3 below never conclu
 `configured` or `not_configured`, as described below.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
-Finished packages whose branch reads `awaiting merge (no PR)` or `PR #N open` also
-appear in the Needs attention list, as one `awaiting_merge` item for the branch
-that names the packages it serves.
+When every package of a branch is finished and reads `awaiting merge (no PR)` or
+`PR #N open`, and the package scan is complete, the branch also appears in the
+Needs attention list, as one `awaiting_merge` item that names the packages it
+serves. A finished package that shares its branch with an unfinished one, or that
+is listed by an `incomplete` scan, raises no item.
 
 **Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
 checkout, not only its last path component (the browser still shows just the last
