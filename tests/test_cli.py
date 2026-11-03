@@ -2176,6 +2176,7 @@ def test_subprocess_without_the_setting_finishes_no_package(tmp_path, account):
     document = models.parse_checkouts(completed.stdout)
     assert document["package_scan"]["finished_policy"] == "not_configured"
     assert [p["finished"] for p in document["packages"]] == [False, False]
+    assert "finished_stages_not_configured" in [item["code"] for item in document["attention"]]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX permission bits")
@@ -2193,7 +2194,11 @@ def test_subprocess_reports_an_incomplete_scan_for_an_unreadable_specification(
         unreadable.chmod(0o644)
 
     assert completed.returncode == 0, completed.stderr
-    assert models.parse_checkouts(completed.stdout)["package_scan"]["status"] == "incomplete"
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"]["status"] == "incomplete"
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_incomplete"
+    assert "package_scan_unavailable" not in codes
 
 
 def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
@@ -2212,6 +2217,10 @@ def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
         "finished_policy": "configured",
     }
     assert document["packages"] == []
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_unavailable"
+    assert "finished_stages_not_configured" not in codes
+    assert "package_scan_incomplete" not in codes
     for repository_before in before["repositories"]:
         repository_before["package_branches"] = []
         repository_before["free_clones"] = []
@@ -2232,10 +2241,14 @@ def test_subprocess_unavailable_scan_without_the_setting_is_not_configured(tmp_p
     completed = _checkouts_subprocess(account, "--json", "--no-network")
 
     assert completed.returncode == 0, completed.stderr
-    assert models.parse_checkouts(completed.stdout)["package_scan"] == {
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"] == {
         "status": "unavailable",
         "finished_policy": "not_configured",
     }
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_unavailable"
+    assert "finished_stages_not_configured" not in codes
 
 
 def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):

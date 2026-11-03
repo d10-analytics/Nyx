@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -4299,7 +4300,7 @@ def test_an_all_zero_baseline_is_declared_parses_and_differs(world_w):
 
         package["baseline"]["sha"] = zero
         package["baseline"]["drift"] = differs
-        parsed = models.parse_checkouts(json.dumps(redigest(copy)))
+        parsed = models.parse_checkouts(json.dumps(redigest(rederive(copy))))
 
         assert world_package(parsed, "drift-moved")["baseline"] == {
             "status": "declared", "sha": zero, "drift": differs
@@ -4544,9 +4545,12 @@ def test_an_unavailable_scan_makes_every_clone_unknown_and_an_incomplete_one_doe
     assert {tuple(a["reasons"]) for a in derived["availability"].values()} == {()}
     assert all(free == [] for free in derived["free_clones"])
 
+    derived_live = models.derive_attention(w.live)
     incomplete = doc_copy(w.live)
     incomplete["package_scan"]["status"] = "incomplete"
-    assert models.derive_attention(incomplete) == models.derive_attention(w.live)
+    assert models.derive_attention(incomplete)["availability"] == derived_live["availability"]
+    assert models.derive_attention(incomplete)["free_clones"] == derived_live["free_clones"]
+    incomplete = rederive(incomplete)
     assert models.parse_checkouts(json.dumps(redigest(incomplete)))
 
 
@@ -4731,3 +4735,432 @@ def test_the_parser_refuses_availability_and_free_clones_the_facts_contradict(wo
         change(document)
         message = refusal_of(document)
         assert fragment in message, (label, message)
+
+
+# ---------------------------------------------------------------------------
+# The Needs attention list
+# ---------------------------------------------------------------------------
+
+ATTENTION_CODES = (
+    "branch_unpushed", "branch_not_pushed", "default_branch_ahead", "stash",
+    "uncommitted_changes", "awaiting_merge", "removable", "base_moved",
+    "target_repo_missing", "target_repo_not_git", "branch_invalid", "upstream_mismatch",
+    "never_fetched", "no_origin_remote", "checkout_unavailable",
+    "finished_stages_not_configured", "package_scan_incomplete", "package_scan_unavailable",
+)
+ATTENTION_CLASSES = {
+    **dict.fromkeys(ATTENTION_CODES[:5], "unique_work"),
+    "awaiting_merge": "awaiting_merge",
+    "removable": "cleanup_ready",
+    "base_moved": "base_moved",
+    **dict.fromkeys(ATTENTION_CODES[8:], "configuration"),
+}
+
+
+def attention_item(code: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "class": ATTENTION_CLASSES[code], "code": code, "repository": None, "clone": None,
+        "worktree": None, "branch": None, "packages": [], "count": None, "pull_request": None,
+        **fields,
+    }
+
+
+def natural_text(text: str | None) -> list[Any]:
+    if text is None:
+        return []
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text)]
+
+
+def attention_order(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        ATTENTION_CODES.index(item["code"]), natural_text(item["clone"]),
+        natural_text(item["worktree"]), natural_text(item["branch"]),
+        item["packages"][0] if item["packages"] else "",
+    )
+
+
+def world_attention(w: WorldW, document: dict[str, Any]) -> list[dict[str, Any]]:
+    """The items world W's live document is meant to raise, in the order they are listed."""
+    key = repository_of(document, w.c["A"])["remote"]["key"]
+    assert key is not None
+
+    def at(code: str, clone: str, **fields: Any) -> dict[str, Any]:
+        return attention_item(code, repository=key, clone=real(w.c[clone]), **fields)
+
+    def package(name: str) -> str:
+        return world_package(document, name)["package_path"]
+
+    return [
+        at("branch_unpushed", "W", branch="topic", count=1),
+        at("branch_not_pushed", "B", branch="side"),
+        at("branch_not_pushed", "W", branch="local-only"),
+        at("default_branch_ahead", "E", branch="trunk", count=1),
+        at("stash", "W", count=1),
+        at("uncommitted_changes", "W", worktree=real(w.c["wt"]), count=1),
+        attention_item(
+            "awaiting_merge", repository=key, branch="done",
+            packages=[package("done-a"), package("done-b")],
+        ),
+        at("removable", "W", count=2),
+        at("base_moved", "A", packages=[package("drift-moved")], count=1),
+        at("base_moved", "A", packages=[package("drift-twin")], count=1),
+        at("base_moved", "W", packages=[package("drift-held")], count=1),
+        attention_item("target_repo_missing", packages=[package("missing-in")]),
+        attention_item("target_repo_not_git", packages=[package("plain-in")]),
+        at("branch_invalid", "A", packages=[package("branch-invalid")]),
+        at("upstream_mismatch", "W", branch="tracking"),
+        *[at("never_fetched", name) for name in ("A", "B", "C", "E", "D", "S", "W")],
+        attention_item("no_origin_remote", clone=real(w.c["L"])),
+        at("checkout_unavailable", "U"),
+    ]
+
+
+def test_world_w_attention_lists_each_code_once_in_class_code_and_location_order(world_w):
+    w = world_w
+    expected = world_attention(w, w.live)
+    assert w.live["attention"] == expected
+    assert models.derive_attention(w.live)["attention"] == expected
+    assert expected == sorted(expected, key=attention_order)
+    assert "base_moved" not in [item["code"] for item in w.budget["attention"]]
+
+
+def drop_where(items: list[dict[str, Any]], **match: Any) -> list[dict[str, Any]]:
+    return [i for i in items if any(i[key] != value for key, value in match.items())]
+
+
+def attention_after(
+    base: list[dict[str, Any]], drop: tuple[dict[str, Any], ...] = (), add: tuple[dict[str, Any], ...] = ()
+) -> list[dict[str, Any]]:
+    kept = base
+    for match in drop:
+        kept = drop_where(kept, **match)
+    return sorted([*kept, *add], key=attention_order)
+
+
+def test_the_parser_refuses_an_attention_list_the_facts_contradict(world_w):
+    w = world_w
+    assert models.parse_checkouts(json.dumps(redigest(doc_copy(w.live)))), "control"
+
+    def codes(document):
+        return [i["code"] for i in document["attention"]]
+
+    def dropped(document):
+        document["attention"].pop(0)
+
+    def dropped_awaiting(document):
+        document["attention"].pop(codes(document).index("awaiting_merge"))
+
+    def swapped(document):
+        items = document["attention"]
+        items[0], items[1] = items[1], items[0]
+
+    def pulled(document):
+        document["attention"][codes(document).index("stash")]["pull_request"] = 7
+
+    def counted(document):
+        document["attention"][0]["count"] += 1
+
+    def miscounted(document):
+        document["attention"][0]["count"] = True
+
+    def nowhere(document):
+        document["attention"][0]["clone"] = real(w.folder / "Nowhere")
+
+    def added(document):
+        document["attention"].append(doc_copy(document["attention"][-1]))
+
+    def retyped(document):
+        document["attention"] = {}
+
+    for change in (
+        dropped, dropped_awaiting, swapped, pulled, counted, miscounted, nowhere, added, retyped
+    ):
+        document = doc_copy(w.live)
+        change(document)
+        assert "attention" in refusal_of(document), change.__name__
+
+    document = doc_copy(w.live)
+    del document["attention"]
+    assert "invalid shape" in refusal_of(document)
+
+
+def derived_attention(document: dict[str, Any]) -> list[dict[str, Any]]:
+    return models.derive_attention(document)["attention"]
+
+
+def parses_rederived(document: dict[str, Any]) -> None:
+    assert models.parse_checkouts(json.dumps(redigest(rederive(doc_copy(document)))))
+
+
+def restate(document: dict[str, Any], names: tuple[str, ...], **changes: Any) -> None:
+    for name in names:
+        status = world_package(document, name)["code_status"]
+        status.update(changes)
+        status["text"] = models.code_status_text(status)
+
+
+def test_a_pull_request_on_the_finished_branch_is_listed_and_an_unread_scan_lists_none(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+    done = ("done-a", "done-b")
+    awaiting = {"code": "awaiting_merge"}
+
+    document = doc_copy(w.live)
+    restate(document, done, state="pr_open", pull_request=7, push="pushed")
+    (item,) = [i for i in base if i["code"] == "awaiting_merge"]
+    expected = attention_after(base, (awaiting,), (dict(item, pull_request=7),))
+    assert derived_attention(document) == expected
+    parses_rederived(document)
+
+    for form in ({}, {"state": "pr_open", "pull_request": 7, "push": "pushed"}):
+        document = doc_copy(w.live)
+        restate(document, done, **form)
+        document["package_scan"]["status"] = "incomplete"
+        expected = attention_after(base, (awaiting,), (attention_item("package_scan_incomplete"),))
+        assert derived_attention(document) == expected, form
+        assert derived_attention(document)[-1]["code"] == "package_scan_incomplete"
+        parses_rederived(document)
+
+
+def test_an_unset_finished_stage_policy_and_targets_outside_the_checkout_folders(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+
+    document = doc_copy(w.live)
+    document["package_scan"]["finished_policy"] = "not_configured"
+    expected = attention_after(base, (), (attention_item("finished_stages_not_configured"),))
+    assert derived_attention(document) == expected
+    assert expected[-1]["code"] == "finished_stages_not_configured"
+    assert expected[-2]["code"] == "checkout_unavailable"
+    parses_rederived(document)
+
+    missing = {"code": "target_repo_missing"}
+    for label, changes in (
+        ("outside the folders", {"status": "outside_folders", "within_folders": None}),
+        ("invalid", {"status": "invalid", "within_folders": None}),
+        ("missing but not in a checkout folder", {"within_folders": False}),
+    ):
+        document = doc_copy(w.live)
+        world_package(document, "missing-in")["target"].update(changes)
+        assert derived_attention(document) == attention_after(base, (missing,)), label
+        parses_rederived(document)
+
+
+def test_a_main_worktree_with_changes_or_only_an_operation_is_listed_with_its_own_path(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+    c_path = real(w.c["C"])
+    key = base[0]["repository"]
+    for label, changes, operations, count in (
+        ("changes", {"staged": 1, "unstaged": 1, "untracked": 0, "conflicted": 1}, [], 3),
+        ("an operation only", {"staged": 0, "unstaged": 0, "untracked": 0, "conflicted": 0},
+         ["rebase"], 0),
+    ):
+        document = doc_copy(w.live)
+        main = main_of(clone_at(document, w.c["C"]))
+        main["changes"], main["operations"] = changes, operations
+        item = attention_item(
+            "uncommitted_changes", repository=key, clone=c_path, worktree=c_path, count=count
+        )
+        expected = attention_after(base, (), (item,))
+        assert derived_attention(document) == expected, label
+        assert expected.index(item) == 5, label
+        parses_rederived(document)
+
+
+def test_a_linked_worktree_that_cannot_be_read_lists_nothing_and_leaves_its_clone_available(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+    document = doc_copy(w.live)
+    linked_worktree = next(i for i in clone_at(document, w.c["W"])["worktrees"] if not i["main"])
+    linked_worktree.update(
+        status="failed", head=None, changes=None, operations=None, index_lock=None, verdict=None
+    )
+    expected = attention_after(base, ({"code": "uncommitted_changes"},))
+    after = derived_attention(rederive(doc_copy(document)))
+    assert after == expected
+    assert not [i for i in after if i["code"] == "checkout_unavailable" and i["clone"] == real(w.c["W"])]
+    parses_rederived(document)
+
+
+def named_branch(document: dict[str, Any], clone_key: Any, name: str) -> dict[str, Any]:
+    (found,) = [b for b in clone_at(document, clone_key)["branches"] if b["name"] == name]
+    return found
+
+
+def compare(relation: str, ahead: int | None, behind: int | None) -> dict[str, Any]:
+    return {"basis": "live", "relation": relation, "ahead": ahead, "behind": behind, "objects_from": None}
+
+
+def fix_branch(name: str, **changes: Any):
+    def change(document: dict[str, Any], w: WorldW) -> None:
+        named_branch(document, w.c["W"], name).update(changes)
+
+    return change
+
+
+def fix_default(clone_key: str, vs_remote: Any, vs_cached: Any = None):
+    def change(document: dict[str, Any], w: WorldW) -> None:
+        local = clone_at(document, w.c[clone_key])["local_default"]
+        local["vs_remote"] = vs_remote
+        if vs_cached is not None:
+            local["vs_cached"] = vs_cached
+
+    return change
+
+
+def fix_removable(**changes: Any):
+    """Edit the Removable verdicts and references of the branches and worktree of W."""
+
+    def change(document: dict[str, Any], w: WorldW) -> None:
+        work = clone_at(document, w.c["W"])
+        for name, state in changes.get("branches", {}).items():
+            named_branch(document, w.c["W"], name)["removable"] = state
+        for field, value in changes.get("worktree", {}).items():
+            (linked_item,) = [i for i in work["worktrees"] if not i["main"]]
+            linked_item[field] = value
+        for name, packages in changes.get("references", {}).items():
+            named_branch(document, w.c["W"], name)["packages"] = packages
+        for name in changes.get("finished", ()):
+            world_package(document, name)["finished"] = True
+
+    return change
+
+
+def reference(name: str, basis: str) -> dict[str, str]:
+    return {"package_path": f"Fictional/Drafts/{name}", "basis": basis}
+
+
+def free_to_remove() -> dict[str, Any]:
+    return {"removable": True, "blockers": []}
+
+
+def fix_package(name: str, **changes: Any):
+    def change(document: dict[str, Any], w: WorldW) -> None:
+        package = world_package(document, name)
+        for field, value in changes.items():
+            if isinstance(value, dict):
+                package[field].update(value)
+            else:
+                package[field] = value
+
+    return change
+
+
+def unread_clone_b(document: dict[str, Any], w: WorldW) -> None:
+    unreadable_clone(clone_at(document, w.c["B"]))
+
+
+def key_items(w: WorldW, code: str, clone: str, **fields: Any) -> dict[str, Any]:
+    key = repository_of(w.live, w.c["A"])["remote"]["key"]
+    return attention_item(code, repository=key, clone=real(w.c[clone]), **fields)
+
+
+# (label, change, items it removes, items it adds)
+def attention_rows(w: WorldW) -> tuple[Any, ...]:
+    drift_behind = {"drift": {"basis": "live", "relation": "behind", "ahead": 0, "behind": 2, "objects_from": None}}
+
+    def drift(name: str, relation: str):
+        return fix_package(name, baseline={"drift": {"relation": relation}})
+
+    not_pushed = {"code": "branch_not_pushed", "branch": "local-only"}
+    unpushed = {"code": "branch_unpushed", "branch": "topic"}
+    ahead_default = {"code": "default_branch_ahead"}
+    removable_w = {"code": "removable"}
+    return (
+        ("a branch ahead of its remote copy", fix_branch("local-only", vs_remote=compare("ahead", 4, 0)),
+         (not_pushed,), (key_items(w, "branch_unpushed", "W", branch="local-only", count=4),)),
+        ("a diverged branch", fix_branch("local-only", vs_remote=compare("diverged", 2, 1)),
+         (not_pushed,), (key_items(w, "branch_unpushed", "W", branch="local-only", count=2),)),
+        ("a branch level with its remote copy", fix_branch("local-only", vs_remote=compare("equal", 0, 0)),
+         (not_pushed,), ()),
+        ("a branch behind its remote copy", fix_branch("local-only", vs_remote=compare("behind", 0, 3)),
+         (not_pushed,), ()),
+        ("a branch with no comparison", fix_branch("local-only", vs_remote=None), (not_pushed,), ()),
+        ("a merged branch", fix_branch("local-only", verdict={"state": "merged", "rung": "ancestor", "reason": None, "pull_request": None}),
+         (not_pushed,), ()),
+        ("a branch with no verdict still counts", fix_branch("local-only", verdict=None), (), ()),
+        ("a contained branch", fix_branch("local-only", contained_in="topic"), (not_pushed,), ()),
+        ("the verdict base", lambda d, w_: clone_at(d, w_.c["W"])["verdict_base"].update(name="local-only"),
+         (not_pushed,), ()),
+        ("a pushed branch that is merged", fix_branch("topic", verdict={"state": "merged", "rung": "ancestor", "reason": None, "pull_request": None}),
+         (unpushed,), ()),
+        ("a default branch diverged", fix_default("E", compare("diverged", 5, 2)),
+         (ahead_default,), (key_items(w, "default_branch_ahead", "E", branch="trunk", count=5),)),
+        ("a default branch behind", fix_default("E", compare("behind", 0, 1)), (ahead_default,), ()),
+        ("a default branch level", fix_default("E", compare("equal", 0, 0)), (ahead_default,), ()),
+        ("a default branch ahead by the cached comparison", fix_default("C", None, compare("ahead", 2, 0)),
+         (), (key_items(w, "default_branch_ahead", "C", branch="trunk", count=2),)),
+        ("a default branch with no comparison", lambda d, w_: clone_at(d, w_.c["E"]).update(local_default=None),
+         (ahead_default,), ()),
+        ("no stash", lambda d, w_: clone_at(d, w_.c["W"]).update(stash_count=0), ({"code": "stash"},), ()),
+        ("three stashes", lambda d, w_: clone_at(d, w_.c["W"]).update(stash_count=3),
+         ({"code": "stash"},), (key_items(w, "stash", "W", count=3),)),
+        ("a fresh branch whose package is finished is counted",
+         fix_removable(finished=("fresh",)), (removable_w,), (key_items(w, "removable", "W", count=3),)),
+        ("a fresh branch held by a sibling copy is not counted",
+         fix_removable(references={"spec/fresh": [reference("fresh", "sibling_clone")]}), (), ()),
+        ("a fresh branch only contained by the package is counted",
+         fix_removable(references={"spec/fresh": [reference("fresh", "contained")]}),
+         (removable_w,), (key_items(w, "removable", "W", count=3),)),
+        ("a removable linked worktree is counted",
+         fix_removable(worktree={"removable": free_to_remove()}),
+         (removable_w,), (key_items(w, "removable", "W", count=3),)),
+        ("a removable linked worktree on a branch an unfinished package uses is not counted",
+         fix_removable(worktree={"removable": free_to_remove()},
+                       references={"wt": [reference("on-worktree", "target_clone")]}),
+         (), ()),
+        ("an unreadable linked worktree is held through the branch that lists it",
+         fix_removable(worktree={"removable": free_to_remove(), "status": "failed", "head": None},
+                       references={"wt": [reference("on-worktree", "target_clone")]}),
+         ({"code": "uncommitted_changes"},), ()),
+        ("nothing removable",
+         fix_removable(branches={"landed": {"removable": False, "blockers": ["not_merged"]},
+                                 "tracking": {"removable": False, "blockers": ["not_merged"]}}),
+         (removable_w,), ()),
+        ("a finished package on the branch no longer holds it",
+         fix_package("done-b", finished=False), ({"code": "awaiting_merge"},), ()),
+        ("a branch whose packages are merged",
+         lambda d, w_: restate(d, ("done-a", "done-b"), state="merged"), ({"code": "awaiting_merge"},), ()),
+        ("a branch whose packages are in progress",
+         lambda d, w_: restate(d, ("done-a", "done-b"), state="in_progress"), ({"code": "awaiting_merge"},), ()),
+        ("a finished package", fix_package("drift-moved", finished=True), ({"packages": ["Fictional/Drafts/drift-moved"]},), ()),
+        *[
+            (f"drift {relation}", drift("drift-moved", relation), ({"packages": ["Fictional/Drafts/drift-moved"], "code": "base_moved"},), ())
+            for relation in ("equal", "ahead", "diverged", "differs", "unknown", "absent")
+        ],
+        ("a base moved on a linked worktree target and an invalid branch there",
+         fix_package("on-worktree", baseline={"status": "declared", "sha": WORLD_ABSENT, **drift_behind},
+                     branch={"status": "invalid", "name": "x"}),
+         (),
+         (key_items(w, "base_moved", "W", worktree=real(w.c["wt"]), packages=["Fictional/Drafts/on-worktree"], count=2),
+          key_items(w, "branch_invalid", "W", worktree=real(w.c["wt"]), packages=["Fictional/Drafts/on-worktree"]))),
+        ("a missing target of a finished package", fix_package("missing-in", finished=True),
+         ({"code": "target_repo_missing"},), ()),
+        ("a missing target with no applicable branch", fix_package("plain-in", branch={"status": "not_applicable", "name": None}),
+         ({"code": "target_repo_not_git"},), ()),
+        ("an invalid branch of a finished package", fix_package("branch-invalid", finished=True),
+         ({"code": "branch_invalid"},), ()),
+        ("a clone fetched since it was cloned",
+         lambda d, w_: clone_at(d, w_.c["C"])["cached_default"].update(fetched_since_clone=True),
+         ({"code": "never_fetched", "clone": real(w.c["C"])},), ()),
+        ("a clone that cannot be read raises only itself", unread_clone_b,
+         ({"clone": real(w.c["B"])},),
+         (key_items(w, "checkout_unavailable", "B"),)),
+        ("a clone that cannot be read keeps its packages' items",
+         lambda d, w_: unreadable_clone(clone_at(d, w_.c["A"])),
+         ({"clone": real(w.c["A"]), "code": "never_fetched"},),
+         (key_items(w, "checkout_unavailable", "A"),)),
+        ("an added tracking mismatch", lambda d, w_: named_branch(d, w_.c["W"], "done").update(upstream_mismatch=True),
+         (), (key_items(w, "upstream_mismatch", "W", branch="done"),)),
+    )
+
+
+def test_every_attention_rule_raises_and_withholds_what_the_facts_say(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+    for label, change, drop, add in attention_rows(w):
+        document = doc_copy(w.live)
+        change(document, w)
+        expected = attention_after(base, drop, add)
+        assert derived_attention(document) == expected, label

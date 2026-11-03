@@ -1400,7 +1400,8 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def rederive(document: dict[str, Any]) -> dict[str, Any]:
-    """Give every ``ok`` clone the Removable fields its present facts derive.
+    """Give every ``ok`` clone the Removable fields its present facts derive, then the
+    availability, free clones and attention list the whole document derives.
 
     A clone whose facts the derivation cannot read (a mutation that broke their
     shape) keeps its fields: the structural checks refuse it before they matter.
@@ -1425,6 +1426,7 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
         repository["free_clones"] = free
         for item in repository["clones"]:
             item["availability"] = derived["availability"][item["path"]]
+    document["attention"] = derived["attention"]
     return document
 
 
@@ -2029,7 +2031,7 @@ def test_parser_accepts_non_ok_items_with_null_facts(sample):
     worktree.update(
         status="timed_out", head=None, changes=None, operations=None, index_lock=None, verdict=None
     )
-    assert models.parse_checkouts(redigest(broken))
+    assert models.parse_checkouts(redigest(rederive(broken)))
 
 
 def with_branch_count(document: dict[str, Any], count: int) -> dict[str, Any]:
@@ -2062,7 +2064,7 @@ def test_parser_accepts_a_clone_over_the_branch_cap_with_null_facts(sample):
     document, _folder = sample
     crowded = doc_copy(document)
     refused_clone(crowded)["status"] = "too_many_branches"
-    assert models.parse_checkouts(redigest(crowded))
+    assert models.parse_checkouts(redigest(rederive(crowded)))
 
 
 def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
@@ -3232,6 +3234,10 @@ def test_branch_deleted_during_the_remote_query_is_never_a_counted_comparison(
             if item["branches"] is not None:
                 item["branches"] = [b for b in item["branches"] if b["name"] != "feature"
                                     or item["path"] != real(other)]
+        stripped["attention"] = [
+            i for i in stripped["attention"]
+            if (i["branch"], i["clone"]) != ("feature", real(other))
+        ]
         stripped.pop("observed_at")
         stripped.pop("checkouts_digest")
         return stripped
@@ -8716,7 +8722,7 @@ def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lo
     document["remote_checks"] = remote_checks
     document["repositories"][0]["remote"]["key"] = key
     document["repositories"][0]["pr_lookup"] = pr_lookup
-    return redigest(document)
+    return redigest(rederive(document))
 
 
 def recorded_lookup(reason: str | None, checked_at: str | None = "2026-10-24T00:00:00Z"):
