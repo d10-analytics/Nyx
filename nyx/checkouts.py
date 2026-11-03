@@ -3168,8 +3168,9 @@ def _assign_removable(repositories: list[dict[str, Any]]) -> None:
 
 
 def _assign_attention(document: dict[str, Any]) -> None:
-    """Write every clone's availability and every repository's free clones."""
+    """Write every clone's availability, every repository's free clones and the attention list."""
     derived = derive_attention(document)
+    document["attention"] = derived["attention"]
     for repository, free in zip(document["repositories"], derived["free_clones"]):
         repository["free_clones"] = free
         for clone in repository["clones"]:
@@ -4075,6 +4076,7 @@ def collect_checkouts(
             ),
         },
         "packages": packages,
+        "attention": [],
     }
     _assign_attention(document)
     document["checkouts_digest"] = canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED)

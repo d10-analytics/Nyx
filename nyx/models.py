@@ -808,6 +808,7 @@ _CHECKOUTS_KEYS = frozenset(
         "diagnostics",
         "package_scan",
         "packages",
+        "attention",
     }
 )
 _PACKAGE_SCAN_KEYS = frozenset({"status", "finished_policy"})
@@ -1560,13 +1561,164 @@ def _ranking_key(clone: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
-    """Derive what a checkout document says about starting work, from its own facts.
+_ATTENTION_CODES = (
+    ("unique_work", "branch_unpushed"),
+    ("unique_work", "branch_not_pushed"),
+    ("unique_work", "default_branch_ahead"),
+    ("unique_work", "stash"),
+    ("unique_work", "uncommitted_changes"),
+    ("awaiting_merge", "awaiting_merge"),
+    ("cleanup_ready", "removable"),
+    ("base_moved", "base_moved"),
+    ("configuration", "target_repo_missing"),
+    ("configuration", "target_repo_not_git"),
+    ("configuration", "branch_invalid"),
+    ("configuration", "upstream_mismatch"),
+    ("configuration", "never_fetched"),
+    ("configuration", "no_origin_remote"),
+    ("configuration", "checkout_unavailable"),
+    ("configuration", "finished_stages_not_configured"),
+    ("configuration", "package_scan_incomplete"),
+    ("configuration", "package_scan_unavailable"),
+)
+_ATTENTION_POSITION = {pair: index for index, pair in enumerate(_ATTENTION_CODES)}
+_ATTENTION_CLASS = {code: name for name, code in _ATTENTION_CODES}
+_AWAITING_MERGE_STATES = ("awaiting_merge", "pr_open")
 
-    Returns ``{"availability", "free_clones"}``. ``availability`` maps every
-    clone path to ``{"state", "reasons", "assigned_to"}`` and ``free_clones``
-    lists, per repository in document order, the paths of its free clones
-    nearest first.
+
+def _canonical_text(value: Any) -> str:
+    """Text that equals another's only for the same JSON types and values (``1`` is not ``True``)."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _attention_item(code: str, **fields: Any) -> dict[str, Any]:
+    item = {
+        "class": _ATTENTION_CLASS[code],
+        "code": code,
+        "repository": None,
+        "clone": None,
+        "worktree": None,
+        "branch": None,
+        "packages": [],
+        "count": None,
+        "pull_request": None,
+    }
+    item.update(fields)
+    return item
+
+
+def _attention_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+    def located(value: str | None) -> tuple[Any, ...]:
+        return (0,) if value is None else (1, natural_key(value))
+
+    packages = item["packages"]
+    return (
+        _ATTENTION_POSITION[(item["class"], item["code"])],
+        located(item["clone"]),
+        located(item["worktree"]),
+        located(item["branch"]),
+        packages[0] if packages else "",
+    )
+
+
+def _worktree_branch(clone: Mapping[str, Any], worktree: Mapping[str, Any]) -> str | None:
+    """The branch a worktree is on: its own head's when readable, else the one listing it."""
+    if worktree["status"] == "ok":
+        return worktree["head"]["branch"]
+    for branch in clone["branches"]:
+        if worktree["path"] in branch["checked_out_in"]:
+            return branch["name"]
+    return None
+
+
+def _removable_total(clone: Mapping[str, Any], unfinished: set[str]) -> int:
+    """Removable branches and linked worktrees of a clone, less those an unfinished package uses."""
+    held = {
+        branch["name"]
+        for branch in clone["branches"]
+        if any(
+            reference["basis"] in ("target_clone", "sibling_clone")
+            and reference["package_path"] in unfinished
+            for reference in branch["packages"]
+        )
+    }
+    total = sum(
+        1
+        for branch in clone["branches"]
+        if branch["removable"] is not None
+        and branch["removable"]["removable"]
+        and branch["name"] not in held
+    )
+    return total + sum(
+        1
+        for worktree in clone["worktrees"]
+        if worktree["removable"] is not None
+        and worktree["removable"]["removable"]
+        and _worktree_branch(clone, worktree) not in held
+    )
+
+
+def _clone_attention(
+    clone: Mapping[str, Any], key: str | None, unfinished: set[str]
+) -> list[dict[str, Any]]:
+    """The items one clone raises on its own facts."""
+    path = clone["path"]
+    if clone["status"] != "ok":
+        return [_attention_item("checkout_unavailable", repository=key, clone=path)]
+    items: list[dict[str, Any]] = []
+
+    def raise_item(code: str, **fields: Any) -> None:
+        items.append(_attention_item(code, repository=key, clone=path, **fields))
+
+    base = clone["verdict_base"]
+    base_name = None if base is None else base["name"]
+    for branch in clone["branches"]:
+        name = branch["name"]
+        comparison = branch["vs_remote"]
+        verdict = branch["verdict"]
+        unique = (
+            name != base_name
+            and branch["contained_in"] is None
+            and (verdict is None or verdict["state"] != "merged")
+            and comparison is not None
+        )
+        if unique and comparison["relation"] in ("ahead", "diverged"):
+            raise_item("branch_unpushed", branch=name, count=comparison["ahead"])
+        elif unique and comparison["relation"] == "absent":
+            raise_item("branch_not_pushed", branch=name)
+        if branch["upstream_mismatch"]:
+            raise_item("upstream_mismatch", branch=name)
+    distance = _default_distance(clone)
+    if distance is not None and distance["relation"] in ("ahead", "diverged"):
+        raise_item("default_branch_ahead", branch=_default_name(clone), count=distance["ahead"])
+    if clone["stash_count"] > 0:
+        raise_item("stash", count=clone["stash_count"])
+    for worktree in clone["worktrees"]:
+        if worktree["status"] != "ok":
+            continue
+        changed = sum(worktree["changes"].values())
+        if changed > 0 or worktree["operations"]:
+            raise_item("uncommitted_changes", worktree=worktree["path"], count=changed)
+    removable = _removable_total(clone, unfinished)
+    if removable > 0:
+        raise_item("removable", count=removable)
+    cached = clone["cached_default"]
+    if cached is not None and cached["fetched_since_clone"] is False:
+        raise_item("never_fetched")
+    if key is None:
+        raise_item("no_origin_remote")
+    return items
+
+
+def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive what a checkout document says about starting work and what needs attention.
+
+    Returns ``{"availability", "free_clones", "attention"}``. ``availability``
+    maps every clone path to ``{"state", "reasons", "assigned_to"}``,
+    ``free_clones`` lists, per repository in document order, the paths of its
+    free clones nearest first, and ``attention`` is the list of items a person
+    should act on, built from the facts alone. It reads Code Status, so it
+    runs after the join.
 
     A clone is ``unknown`` when its status or its main worktree's is not ``ok``,
     when the package scan is unavailable, or when a non-bare clone has no
@@ -1580,10 +1732,32 @@ def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
     the remote's default head (``equal``, ``behind``, ``ahead``, ``diverged``,
     ``differs``, ``unknown``, ``absent``), then by commits apart (unknown
     last), then by natural path.
+
+    Every attention item has ``class``, ``code``, ``repository`` (the remote
+    key of its group, null without one), ``clone``, ``worktree``, ``branch``,
+    ``packages``, ``count`` and ``pull_request``, the row a person is sent to.
+    Items order by class (unique work, awaiting merge, cleanup ready, base
+    moved, configuration), then code, then clone path, worktree path (null
+    first, natural), branch name and first package path. Unique work is a
+    branch with commits no remote branch holds and no other branch contains
+    (``branch_unpushed``, ``branch_not_pushed``), the default branch ahead of
+    the remote, a stash, or a worktree with changes or an operation in
+    progress. ``awaiting_merge`` is one package-branch entry whose packages are
+    all finished and read ``awaiting_merge`` or ``pr_open`` in a complete scan.
+    ``removable`` counts a clone's Removable branches and linked worktrees
+    except those an unfinished package of the clone or a sibling uses.
+    ``base_moved`` is an unfinished package whose Baseline is behind its
+    target's base. Configuration items are a missing or non-git target inside
+    a configured folder, an invalid branch, an upstream mismatch, a clone
+    never fetched, one without ``origin``, an unreadable clone, an unset
+    finished-stage policy and an incomplete or unavailable package scan.
     """
-    scan_unavailable = document["package_scan"]["status"] == "unavailable"
+    scan = document["package_scan"]
+    scan_unavailable = scan["status"] == "unavailable"
+    packages = sorted(document["packages"], key=package_sort_key)
+    unfinished = {package["package_path"] for package in packages if not package["finished"]}
     assignments: dict[str, list[dict[str, str]]] = {}
-    for package in sorted(document["packages"], key=package_sort_key):
+    for package in packages:
         target = package["target"]
         if package["finished"] or target["status"] not in ("clone", "worktree"):
             continue
@@ -1595,18 +1769,89 @@ def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
         )
     availability: dict[str, dict[str, Any]] = {}
     free_clones: list[list[str]] = []
+    attention: list[dict[str, Any]] = []
+    keys: dict[str, str | None] = {}
     for repository in document["repositories"]:
+        remote = repository["remote"]
+        key = None if remote is None else remote["key"]
         free = []
         for clone in repository["clones"]:
+            keys[clone["path"]] = key
             result = _clone_availability(
                 clone, assignments.get(clone["path"], []), scan_unavailable=scan_unavailable
             )
             availability[clone["path"]] = result
             if result["state"] == "free":
                 free.append(clone)
+            attention.extend(_clone_attention(clone, key, unfinished))
         free.sort(key=_ranking_key)
         free_clones.append([clone["path"] for clone in free])
-    return {"availability": availability, "free_clones": free_clones}
+        by_path = {package["package_path"]: package for package in packages}
+        for entry in repository["package_branches"] if scan["status"] == "complete" else ():
+            members = [by_path.get(path) for path in entry["packages"]]
+            if any(
+                member is None
+                or not member["finished"]
+                or member["code_status"] is None
+                or member["code_status"]["state"] not in _AWAITING_MERGE_STATES
+                for member in members
+            ):
+                continue
+            attention.append(
+                _attention_item(
+                    "awaiting_merge",
+                    repository=key,
+                    branch=entry["name"],
+                    packages=list(entry["packages"]),
+                    pull_request=members[0]["code_status"]["pull_request"],
+                )
+            )
+    for package in packages:
+        if package["finished"]:
+            continue
+        path = package["package_path"]
+        target = package["target"]
+        drift = package["baseline"]["drift"]
+        if drift is not None and drift["relation"] == "behind":
+            attention.append(
+                _attention_item(
+                    "base_moved",
+                    repository=keys.get(target["clone"]),
+                    clone=target["clone"],
+                    worktree=target["worktree"],
+                    packages=[path],
+                    count=drift["behind"],
+                )
+            )
+        if (
+            target["status"] in ("missing", "not_git")
+            and package["branch"]["status"] != "not_applicable"
+            and target["within_folders"] is True
+        ):
+            attention.append(
+                _attention_item(
+                    "target_repo_missing" if target["status"] == "missing" else "target_repo_not_git",
+                    packages=[path],
+                )
+            )
+        if target["status"] in ("clone", "worktree") and package["branch"]["status"] == "invalid":
+            attention.append(
+                _attention_item(
+                    "branch_invalid",
+                    repository=keys.get(target["clone"]),
+                    clone=target["clone"],
+                    worktree=target["worktree"],
+                    packages=[path],
+                )
+            )
+    if scan["finished_policy"] == "not_configured" and not scan_unavailable:
+        attention.append(_attention_item("finished_stages_not_configured"))
+    if scan["status"] == "incomplete":
+        attention.append(_attention_item("package_scan_incomplete"))
+    if scan_unavailable:
+        attention.append(_attention_item("package_scan_unavailable"))
+    attention.sort(key=_attention_key)
+    return {"availability": availability, "free_clones": free_clones, "attention": attention}
 
 
 def _clone_verdicts(
@@ -2446,6 +2691,8 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     derived = derive_attention(document)
+    if _canonical_text(document["attention"]) != _canonical_text(derived["attention"]):
+        raise ProtocolError("attention contradicts the facts of the document")
     for index, repository in enumerate(parsed):
         if repository["free_clones"] != derived["free_clones"][index]:
             raise ProtocolError(
