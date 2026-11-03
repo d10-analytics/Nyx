@@ -686,7 +686,8 @@ cause is gone and a later run sees that.
 - `checkout_unavailable` (clone): git could not read the clone (its line shows the
   status); fix the cause. A linked worktree that cannot be read raises no item.
 - `finished_stages_not_configured`: the workspace selects no stage under **Counts
-  as finished**, so no package is finished; select one.
+  as finished**, so no package is finished; select one. While the package scan is
+  unavailable only `package_scan_unavailable` is listed, not this item.
 - `package_scan_incomplete`: some specification could not be read whole; make it
   readable.
 - `package_scan_unavailable`: the workspace has no specification root or Nyx
