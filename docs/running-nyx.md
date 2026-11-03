@@ -651,9 +651,8 @@ cause is gone and a later run sees that.
 
 - `awaiting_merge` (branch, packages, pr): every package of the branch is finished
   and reads `awaiting merge (no PR)` or `PR #N open`, and the package scan is
-  complete. A finished package that shares the branch with an unfinished one reads
-  the same text but raises no item. The `pr` element is present when a pull
-  request is open. It clears when the work is merged.
+  complete. The `pr` element is present when a pull request is open. It clears
+  when the work is merged.
 
 *Cleanup ready*:
 
