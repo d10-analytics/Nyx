@@ -675,8 +675,10 @@ cause is gone and a later run sees that.
   the clone or correct the header. A target outside the folders raises no item,
   because a specification root shared across machines names paths of other
   machines; neither does an `invalid` target.
-- `branch_invalid` (clone, worktree, packages): an unfinished package's `Branch:`
-  value is not a branch name; correct the header.
+- `branch_invalid` (clone, worktree, packages): an unfinished package whose
+  `Target repo:` is a clone, or a linked worktree of one, has a `Branch:` value
+  that is not a branch name; correct the header. A package whose target is not
+  such a checkout raises no item for its branch.
 - `upstream_mismatch` (clone, branch): a branch's upstream is not the same-named
   branch of `origin`; set it again.
 - `never_fetched` (clone): the clone has never fetched; fetch.
