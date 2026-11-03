@@ -1720,15 +1720,15 @@ def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
     should act on, built from the facts alone. It reads Code Status, so it
     runs after the join.
 
-    A clone is ``unknown`` when its status or its main worktree's is not ``ok``,
-    when the package scan is unavailable, or when a non-bare clone has no
-    default branch name; else ``occupied`` when it has reasons (in order
-    ``not_on_default_branch``, ``detached_head``, ``linked_worktrees``,
-    ``uncommitted_changes``, ``operation_in_progress``; a branch is compared
-    only with a known default name); else ``assigned`` when an unfinished
-    package targets it; else ``free``. A package assigns its clone through
-    ``target_repo``, or through ``target_repo_worktree`` when it names a linked
-    worktree. Free clones order by the relation of the local default branch to
+    A clone is ``unknown`` when its status or its main worktree's is not ``ok``
+    or when the package scan is unavailable; else ``occupied`` when it has
+    reasons (in order ``not_on_default_branch``, ``detached_head``,
+    ``linked_worktrees``, ``uncommitted_changes``, ``operation_in_progress``;
+    a branch is compared only with a known default name); else ``unknown`` when
+    a non-bare clone has no default branch name; else ``assigned`` when an
+    unfinished package targets it; else ``free``. A package assigns its clone
+    through ``target_repo``, or through ``target_repo_worktree`` when it names a
+    linked worktree. Free clones order by the relation of the local default branch to
     the remote's default head (``equal``, ``behind``, ``ahead``, ``diverged``,
     ``differs``, ``unknown``, ``absent``), then by commits apart (unknown
     last), then by natural path.
@@ -1748,8 +1748,9 @@ def derive_attention(document: Mapping[str, Any]) -> dict[str, Any]:
     except those an unfinished package of the clone or a sibling uses.
     ``base_moved`` is an unfinished package whose Baseline is behind its
     target's base. Configuration items are a missing or non-git target inside
-    a configured folder, an invalid branch, an upstream mismatch, a clone
-    never fetched, one without ``origin``, an unreadable clone, an unset
+    a configured folder, an invalid branch of an unfinished package whose
+    target is a clone or one of its linked worktrees, an upstream mismatch, a
+    clone never fetched, one without ``origin``, an unreadable clone, an unset
     finished-stage policy and an incomplete or unavailable package scan.
     """
     scan = document["package_scan"]
