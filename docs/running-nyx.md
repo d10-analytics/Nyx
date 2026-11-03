@@ -562,13 +562,13 @@ Every clone line starts, right after its path, with an availability element, and
 `--json` gives each clone `availability` with a `state`, its `reasons` and
 `assigned_to`. The state answers whether the clone is ready to start new work:
 
-- `free <rank>`: nothing prevents starting there. The rank counts from 1 among the
+- `free` (shown as `free <rank>`): nothing prevents starting there. The rank counts from 1 among the
   free clones of the same repository, nearest first (see Ranking).
-- `assigned <path>[,<path>]`: nothing prevents it, but an unfinished package
+- `assigned` (shown as `assigned <path>[,<path>]`): nothing prevents it, but an unfinished package
   targets the clone (its `Target repo:` is the clone, or a linked worktree of it).
   The paths are the packages', quoted as JSON strings. Finish or retarget the
   package to clear it.
-- `occupied <reason>[,<reason>]`: the main worktree holds something. The reasons
+- `occupied` (shown as `occupied <reason>[,<reason>]`): the main worktree holds something. The reasons
   appear in this order. `not_on_default_branch`: the main worktree is on a branch
   other than the default branch (only judged when the default branch's name is
   known); switch it back. `detached_head`: it is on a detached `HEAD`; check out
