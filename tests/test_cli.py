@@ -2328,3 +2328,68 @@ def test_the_parser_refuses_a_schema_4_document(tmp_path, account):
 
     with pytest.raises(models.ProtocolError, match="unsupported schema version"):
         models.parse_checkouts(document)
+
+
+def _availability_vocabulary() -> tuple[set[str], set[str]]:
+    """The reasons and states `_clone_availability` can produce, read from its source."""
+    import ast
+    import inspect
+
+    from nyx import models
+
+    function = ast.parse(inspect.getsource(models._clone_availability)).body[0]
+    reasons: set[str] = set()
+    states: set[str] = set()
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "reasons"
+        ):
+            reasons.add(node.args[0].value)
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "state" for t in node.targets)
+            and isinstance(node.value, ast.Constant)
+        ):
+            states.add(node.value.value)
+    return reasons, states
+
+
+def _documented_checkout_terms(text: str) -> set[str]:
+    return set(re.findall(r"`([a-z_]+)`", text))
+
+
+def _inspect_checkouts_before_code_status(text: str) -> str:
+    section = text.split("## Inspect checkouts", 1)[1].split("\n## ", 1)[0]
+    return section.split("### Code Status of specification packages", 1)[0]
+
+
+def _undocumented_checkout_terms(guide: str) -> set[str]:
+    """Attention codes, availability reasons and states the guide's checkout text omits."""
+    from nyx import models
+
+    reasons, states = _availability_vocabulary()
+    codes = {code for _, code in models._ATTENTION_CODES}
+    assert len(reasons) == 5 and states == {"unknown", "occupied", "assigned", "free"}
+    documented = _documented_checkout_terms(_inspect_checkouts_before_code_status(guide))
+    return (codes | reasons | states) - documented
+
+
+def test_checkout_guide_documents_every_attention_code_reason_and_state():
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    assert _undocumented_checkout_terms(guide) == set()
+
+
+@pytest.mark.parametrize(
+    "term",
+    ["branch_unpushed", "package_scan_unavailable", "operation_in_progress", "occupied"],
+)
+def test_checkout_guide_coverage_fails_when_a_term_is_missing(term):
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    section_end = guide.index("### Code Status of specification packages")
+    # A term that only appears after the Code Status heading does not count.
+    mutated = guide[:section_end].replace(f"`{term}`", "") + guide[section_end:]
+    assert _undocumented_checkout_terms(mutated) == {term}
