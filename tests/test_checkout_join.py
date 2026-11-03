@@ -5051,6 +5051,20 @@ def unread_clone_b(document: dict[str, Any], w: WorldW) -> None:
     unreadable_clone(clone_at(document, w.c["B"]))
 
 
+def linked_in_b(document: dict[str, Any], w: WorldW) -> None:
+    (source,) = [i for i in clone_at(document, w.c["W"])["worktrees"] if not i["main"]]
+    extra = doc_copy(source)
+    extra["path"] = "/zz/linked-b"
+    clone_at(document, w.c["B"])["worktrees"].append(extra)
+
+
+def scan_is(status: str, policy: str):
+    def change(document: dict[str, Any], w: WorldW) -> None:
+        document["package_scan"].update(status=status, finished_policy=policy)
+
+    return change
+
+
 def key_items(w: WorldW, code: str, clone: str, **fields: Any) -> dict[str, Any]:
     key = repository_of(w.live, w.c["A"])["remote"]["key"]
     return attention_item(code, repository=key, clone=real(w.c[clone]), **fields)
@@ -5144,6 +5158,20 @@ def attention_rows(w: WorldW) -> tuple[Any, ...]:
         ("a clone fetched since it was cloned",
          lambda d, w_: clone_at(d, w_.c["C"])["cached_default"].update(fetched_since_clone=True),
          ({"code": "never_fetched", "clone": real(w.c["C"])},), ()),
+        ("a worktree of an earlier clone follows by clone before worktree", linked_in_b,
+         (), (key_items(w, "uncommitted_changes", "B", worktree="/zz/linked-b", count=1),)),
+        ("an invalid branch of a package with no clone target", fix_package("missing-in", branch={"status": "invalid", "name": "x"}),
+         (), ()),
+        ("an unavailable scan without the finished-stage setting",
+         scan_is("unavailable", "not_configured"),
+         ({"code": "awaiting_merge"},), (attention_item("package_scan_unavailable"),)),
+        ("an unavailable scan with the setting",
+         scan_is("unavailable", "configured"),
+         ({"code": "awaiting_merge"},), (attention_item("package_scan_unavailable"),)),
+        ("an incomplete scan without the setting",
+         scan_is("incomplete", "not_configured"),
+         ({"code": "awaiting_merge"},),
+         (attention_item("finished_stages_not_configured"), attention_item("package_scan_incomplete"))),
         ("a clone that cannot be read raises only itself", unread_clone_b,
          ({"clone": real(w.c["B"])},),
          (key_items(w, "checkout_unavailable", "B"),)),
