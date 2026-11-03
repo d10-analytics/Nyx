@@ -5192,3 +5192,44 @@ def test_every_attention_rule_raises_and_withholds_what_the_facts_say(world_w):
         change(document, w)
         expected = attention_after(base, drop, add)
         assert derived_attention(document) == expected, label
+
+
+def test_awaiting_merge_entries_of_two_repositories_order_by_branch_then_first_package(world_w):
+    """Entries are derived repository by repository, so across repositories only the branch
+    and first-package keys put them in order."""
+    w = world_w
+    base = world_attention(w, w.live)
+    (done,) = [i for i in base if i["code"] == "awaiting_merge"]
+    repositories = w.live["repositories"]
+    assert repositories.index(repository_of(w.live, w.c["A"])) < repositories.index(
+        repository_of(w.live, w.c["L"])
+    )
+    for label, branch, package_path in (
+        ("an earlier branch with a later package", "alpha", "Fictional/Shipped/zz-late"),
+        ("the same branch with an earlier first package", "done", "Fictional/Shipped/aa-early"),
+    ):
+        document = doc_copy(w.live)
+        extra = doc_copy(world_package(document, "done-a"))
+        extra["package_path"] = package_path
+        extra["branch"]["name"] = branch
+        extra["target"].update(status="clone", clone=real(w.c["L"]), worktree=None)
+        document["packages"].append(extra)
+        repository_of(document, w.c["L"])["package_branches"] = [
+            {"name": branch, "remote": None, "packages": [package_path]}
+        ]
+        added = attention_item("awaiting_merge", branch=branch, packages=[package_path])
+        position = base.index(done)
+        assert derived_attention(document) == [*base[:position], added, *base[position:]], label
+
+
+def test_an_unreadable_clone_without_origin_raises_only_its_unavailability(world_w):
+    w = world_w
+    base = world_attention(w, w.live)
+    document = doc_copy(w.live)
+    unreadable_clone(clone_at(document, w.c["L"]))
+    path = real(w.c["L"])
+    expected = attention_after(
+        base, ({"clone": path},), (attention_item("checkout_unavailable", clone=path),)
+    )
+    assert derived_attention(document) == expected
+    parses_rederived(document)
