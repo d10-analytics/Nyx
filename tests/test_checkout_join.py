@@ -3772,7 +3772,7 @@ def build_world_w(base: Path) -> WorldW:
     c["D"] = clone(remote, w.folder / "Repo Clone 10")
     c["E"] = clone(remote, w.folder / "Repo Clone 4")
     sha["Z"] = commit_file(c["E"], "z.txt", "z\n", "Z")
-    c["S"] = clone(f"file://{remote}", w.folder / "Repo Shallow", "--depth", "1")
+    c["S"] = clone(remote.as_uri(), w.folder / "Repo Shallow", "--depth", "1")
     c["U"] = clone(remote, w.folder / "Repo Crowded")
     import_branches(c["U"], models.CHECKOUT_BRANCH_CAP + 1)
     c["L"] = w.folder / "Repo Local"
