@@ -5345,3 +5345,46 @@ def test_an_attention_line_prints_each_element_exactly_when_its_field_is_set(wor
     zero = attention_item("uncommitted_changes", clone="/c", worktree="/w", count=0)
     document["attention"] = [zero]
     assert cli.format_checkouts(document)[0] == 'attention uncommitted_changes "/c" worktree "/w" count 0'
+
+
+def test_a_worktree_precedes_packages_and_every_token_is_an_ascii_json_literal(world_w):
+    document = doc_copy(world_w.live)
+    document["attention"] = [
+        attention_item(
+            "base_moved", clone="/c", worktree="/w", packages=['Fictional/Drafts/caf\u00e9"x'],
+            count=2,
+        ),
+        attention_item("upstream_mismatch", clone="/c", branch='caf\u00e9"x'),
+    ]
+    shallow = world_w.c["S"]
+    clone_at(document, shallow)["availability"]["assigned_to"] = [
+        {"package_path": 'Fictional/Drafts/caf\u00e9"x', "basis": "target_repo"}
+    ]
+
+    lines = cli.format_checkouts(document)
+
+    assert lines[:2] == [
+        r'attention base_moved "/c" worktree "/w" packages "Fictional/Drafts/caf\u00e9\"x" count 2',
+        r'attention upstream_mismatch "/c" branch "caf\u00e9\"x"',
+    ]
+    [line] = [item for item in lines if item.startswith(json.dumps(real(shallow)) + "  ")]
+    assert line.split("  ")[1] == r'assigned "Fictional/Drafts/caf\u00e9\"x"'
+
+
+def test_a_free_rank_counts_within_its_own_repository(world_w):
+    w = world_w
+    document = doc_copy(w.live)
+    local = w.c["L"]
+    clone_at(document, local)["availability"] = {"state": "free", "reasons": [], "assigned_to": []}
+    repository_of(document, local)["free_clones"] = [real(local)]
+
+    lines = cli.format_checkouts(document)
+
+    def element(name: str) -> str:
+        literal = json.dumps(real(w.c[name]))
+        [line] = [item for item in lines if item.startswith(literal + "  ")]
+        return line.split("  ")[1]
+
+    assert [element(name) for name in ("C", "D", "B", "E", "L")] == [
+        "free 1", "free 2", "free 3", "free 4", "free 1",
+    ]
