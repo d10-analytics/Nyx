@@ -705,7 +705,7 @@ def test_every_target_resolves_and_renders_on_every_host(targets, tmp_path):
     assert (holder_availability["state"], holder_availability["reasons"]) == ("unknown", [])
     lines = cli.format_checkouts(document)
     busy = found["busy"]["clone"]
-    assert f"{json.dumps(busy)}  too_many_branches" in lines
+    assert f"{json.dumps(busy)}  unknown  too_many_branches" in lines
     assert any(line.startswith(json.dumps(found["bare"]["clone"]) + "  ") for line in lines)
 
 
@@ -5233,3 +5233,115 @@ def test_an_unreadable_clone_without_origin_raises_only_its_unavailability(world
     )
     assert derived_attention(document) == expected
     parses_rederived(document)
+
+
+def plain_world_lines(w: WorldW) -> tuple[list[str], list[str]]:
+    """The plain lines of world W's live document, split into attention lines and the rest."""
+    lines = cli.format_checkouts(w.live)
+    count = len(w.live["attention"])
+    return lines[:count], lines[count:]
+
+
+def test_world_w_plain_output_starts_with_its_attention_lines_in_document_order(world_w):
+    w = world_w
+    literal = json.dumps
+    path = {name: literal(real(w.c[name])) for name in w.c}
+    drafts = "Fictional/Drafts/"
+    attention, rest = plain_world_lines(w)
+
+    assert attention == [
+        f'attention branch_unpushed {path["W"]} branch "topic" count 1',
+        f'attention branch_not_pushed {path["B"]} branch "side"',
+        f'attention branch_not_pushed {path["W"]} branch "local-only"',
+        f'attention default_branch_ahead {path["E"]} branch "trunk" count 1',
+        f'attention stash {path["W"]} count 1',
+        f'attention uncommitted_changes {path["W"]} worktree {path["wt"]} count 1',
+        'attention awaiting_merge branch "done" packages '
+        '"Fictional/Shipped/done-a","Fictional/Shipped/done-b"',
+        f'attention removable {path["W"]} count 2',
+        f'attention base_moved {path["A"]} packages "{drafts}drift-moved" count 1',
+        f'attention base_moved {path["A"]} packages "{drafts}drift-twin" count 1',
+        f'attention base_moved {path["W"]} packages "{drafts}drift-held" count 1',
+        f'attention target_repo_missing packages "{drafts}missing-in"',
+        f'attention target_repo_not_git packages "{drafts}plain-in"',
+        f'attention branch_invalid {path["A"]} packages "{drafts}branch-invalid"',
+        f'attention upstream_mismatch {path["W"]} branch "tracking"',
+        *[f"attention never_fetched {path[name]}" for name in ("A", "B", "C", "E", "D", "S", "W")],
+        f'attention no_origin_remote {path["L"]}',
+        f"attention checkout_unavailable {path['U']}",
+    ]
+    assert len(attention) == len(w.live["attention"])
+    assert not any(line.startswith("attention") for line in rest)
+
+
+def test_world_w_clone_lines_carry_their_availability_right_after_the_path(world_w):
+    w = world_w
+    path = {name: json.dumps(real(w.c[name])) for name in w.c}
+    _attention, rest = plain_world_lines(w)
+
+    def element(name: str) -> str:
+        [line] = [item for item in rest if item.startswith(path[name] + "  ")]
+        return line.split("  ")[1]
+
+    assigned_to_a = ",".join(
+        json.dumps(f"Fictional/Drafts/{name}")
+        for name in (
+            "baseline-invalid", "branch-invalid", "default", "drift-equal", "drift-moved",
+            "drift-off", "drift-twin", "drift-unheld",
+        )
+    )
+    assert {name: element(name) for name in "ABCDEWLSU"} == {
+        "A": f"assigned {assigned_to_a}",
+        "B": "free 3",
+        "C": "free 1",
+        "D": "free 2",
+        "E": "free 4",
+        "W": "occupied not_on_default_branch,linked_worktrees",
+        "L": "unknown",
+        "S": 'assigned "Fictional/Drafts/drift-shallow"',
+        "U": "unknown",
+    }
+    status_only = f"{path['U']}  unknown  too_many_branches"
+    assert status_only in rest
+    # A linked worktree line has no availability element.
+    [linked] = [item for item in rest if item.startswith("  " + path["wt"] + "  ")]
+    assert linked == (
+        f"  {path['wt']}  branch wt  staged 0 unstaged 0 untracked 1 conflicted 0"
+        "  blocker not_clean"
+    )
+    # Folder, git and diagnostic lines (none here) never fall between the attention lines.
+    assert [item for item in rest if item.startswith(("git ", "folder ", "diagnostic "))] == []
+
+
+def test_a_document_with_an_empty_attention_list_prints_attention_none_first(world_w):
+    document = doc_copy(world_w.live)
+    document["attention"] = []
+    document["git"] = {"status": "missing", "version": None}
+
+    lines = cli.format_checkouts(document)
+
+    assert lines[:2] == ["attention none", "git missing"]
+    assert sum(line.startswith("attention") for line in lines) == 1
+
+
+def test_an_attention_line_prints_each_element_exactly_when_its_field_is_set(world_w):
+    document = doc_copy(world_w.live)
+    merge = next(item for item in document["attention"] if item["code"] == "awaiting_merge")
+    merge["pull_request"] = 17
+    merge["packages"] = ["Fictional/Shipped/done-a"]
+    document["attention"] = [
+        merge,
+        attention_item("never_fetched"),
+        attention_item("target_repo_missing"),
+    ]
+
+    lines = cli.format_checkouts(document)
+
+    assert lines[:3] == [
+        'attention awaiting_merge branch "done" packages "Fictional/Shipped/done-a" pr 17',
+        "attention never_fetched",
+        "attention target_repo_missing",
+    ]
+    zero = attention_item("uncommitted_changes", clone="/c", worktree="/w", count=0)
+    document["attention"] = [zero]
+    assert cli.format_checkouts(document)[0] == 'attention uncommitted_changes "/c" worktree "/w" count 0'
