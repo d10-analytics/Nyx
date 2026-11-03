@@ -973,7 +973,9 @@ def test_missing_git_exits_zero_in_both_modes(tmp_path, account, monkeypatch, ca
 
     code, out, err = _run_checkouts(capsys)
     assert (code, err) == (0, "")
-    assert out.splitlines()[0] == "git missing"
+    lines = out.splitlines()
+    assert lines[0] == "attention finished_stages_not_configured"
+    assert lines[1] == "git missing"
 
 
 @pytest.mark.parametrize(
@@ -1020,10 +1022,15 @@ def test_folder_and_diagnostic_lines_precede_the_clones(tmp_path, account, capsy
 
     lines = _plain_lines(capsys)
 
-    assert lines[0] == f"folder {cli._json_literal(str(absent))} missing"
-    assert lines[1] == f"diagnostic not_a_repository {cli._json_literal(str(folder / 'fake'))}"
-    assert lines[2].startswith(cli._json_literal(real(repository)) + "  ")
-    assert len(lines) == 3
+    path = cli._json_literal(real(repository))
+    assert lines[:2] == [
+        f"attention never_fetched {path}",
+        "attention finished_stages_not_configured",
+    ]
+    assert lines[2] == f"folder {cli._json_literal(str(absent))} missing"
+    assert lines[3] == f"diagnostic not_a_repository {cli._json_literal(str(folder / 'fake'))}"
+    assert lines[4].startswith(path + "  free 1  ")
+    assert len(lines) == 5
 
 
 def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account, capsys):
@@ -1044,14 +1051,15 @@ def test_clone_line_carries_head_real_counts_and_default_facts(tmp_path, account
     line = _line_for(_plain_lines(capsys, "--no-network"), repository)
 
     elements = line.split("  ")[1:]
-    assert elements[0] == "branch feature"
-    assert elements[1] == "staged 1 unstaged 1 untracked 2 conflicted 0"
-    assert elements[2] == "remote off"
-    assert elements[3] == "branches cached local-only 1"
-    assert elements[4] == "default trunk cached ahead never fetched"
-    assert elements[5] == "pr off setting_off"
-    assert elements[6] == "removable 0 branches, 0 worktrees"
-    assert len(elements) == 7
+    assert elements[0] == "occupied not_on_default_branch,uncommitted_changes"
+    assert elements[1] == "branch feature"
+    assert elements[2] == "staged 1 unstaged 1 untracked 2 conflicted 0"
+    assert elements[3] == "remote off"
+    assert elements[4] == "branches cached local-only 1"
+    assert elements[5] == "default trunk cached ahead never fetched"
+    assert elements[6] == "pr off setting_off"
+    assert elements[7] == "removable 0 branches, 0 worktrees"
+    assert len(elements) == 8
     assert not any(element.startswith("operations") for element in elements)
 
 
@@ -1092,7 +1100,8 @@ def test_conflicted_merge_prints_its_operation_and_conflicted_count(
 
     elements = _line_for(_plain_lines(capsys), repository).split("  ")[1:]
 
-    assert elements[:3] == [
+    assert elements[:4] == [
+        "occupied uncommitted_changes,operation_in_progress",
         "branch trunk",
         "staged 0 unstaged 0 untracked 0 conflicted 1",
         "operations merge",
@@ -1190,7 +1199,7 @@ def test_bare_repository_clone_line_has_no_head_or_counts_but_its_worktree_has(
     lines = _plain_lines(capsys)
 
     assert _line_for(lines, remote) == (
-        f"{cli._json_literal(real(remote))}  no origin remote  removable 0 branches, 0 worktrees"
+        f"{cli._json_literal(real(remote))}  occupied linked_worktrees  no origin remote  removable 0 branches, 0 worktrees"
     )
     assert _line_for(lines, linked, "  ").split("  ")[2] == "branch trunk"
     assert _line_for(lines, linked, "  ").endswith("  blocker verdict_unknown")
@@ -1210,7 +1219,9 @@ def test_refused_clone_prints_its_status_instead_of_the_facts(
 
     lines = _plain_lines(capsys)
 
-    assert _line_for(lines, refused) == f"{cli._json_literal(real(refused))}  unsafe_ownership"
+    assert _line_for(lines, refused) == (
+        f"{cli._json_literal(real(refused))}  unknown  unsafe_ownership"
+    )
     assert "no origin remote" not in _line_for(lines, refused)
     assert "branch trunk" in _line_for(lines, trusted)
 
@@ -1227,10 +1238,11 @@ def test_tree_filtered_clone_prints_main_failed_and_keeps_remote_and_default(
 
     elements = _line_for(_plain_lines(capsys, "--no-network"), repository).split("  ")[1:]
 
-    assert elements[0] == "main failed"
-    assert elements[1] == "remote off"
-    assert elements[2] == "branches cached local-only 0"
-    assert elements[3].startswith("default trunk cached ")
+    assert elements[0] == "unknown"
+    assert elements[1] == "main failed"
+    assert elements[2] == "remote off"
+    assert elements[3] == "branches cached local-only 0"
+    assert elements[4].startswith("default trunk cached ")
     assert not any(element.startswith(("branch ", "staged ")) for element in elements)
     assert elements[-1] == "removable 0 branches, 0 worktrees"
 
@@ -1248,7 +1260,9 @@ def test_clone_without_origin_prints_no_origin_remote_and_no_remote_counts(
 
     line = _line_for(_plain_lines(capsys), repository)
 
+    assert line.split("  ")[1] == "unknown"
     assert line.split("  ")[2:] == [
+        "branch main",
         "staged 0 unstaged 0 untracked 0 conflicted 0",
         "no origin remote",
         "removable 0 branches, 0 worktrees",
@@ -1294,10 +1308,11 @@ def test_cut_comparison_prints_unknown_after_local_only(tmp_path, account):
     lines = cli.format_checkouts(models.parse_checkouts(text))
 
     elements = _line_for(lines, repository).split("  ")[1:]
-    assert elements[0] == "main timed_out"
-    assert elements[1] == "remote off"
-    assert elements[2] == "branches cached local-only 0 unknown 1"
-    assert elements[3].startswith("default trunk cached equal ")
+    assert elements[0] == "unknown"
+    assert elements[1] == "main timed_out"
+    assert elements[2] == "remote off"
+    assert elements[3] == "branches cached local-only 0 unknown 1"
+    assert elements[4].startswith("default trunk cached equal ")
 
 
 def test_a_clone_over_the_branch_cap_prints_only_its_status(tmp_path, account, capsys):
@@ -1315,7 +1330,9 @@ def test_a_clone_over_the_branch_cap_prints_only_its_status(tmp_path, account, c
 
     lines = _plain_lines(capsys, "--no-network")
 
-    assert _line_for(lines, repository) == f"{cli._json_literal(real(repository))}  too_many_branches"
+    assert _line_for(lines, repository) == (
+        f"{cli._json_literal(real(repository))}  unknown  too_many_branches"
+    )
     # The sibling clone of the same remote keeps its ordinary line.
     assert "too_many_branches" not in _line_for(lines, sibling)
 
@@ -2153,7 +2170,7 @@ def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 6
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 7
     assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
     assert [
         (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])
@@ -2176,6 +2193,7 @@ def test_subprocess_without_the_setting_finishes_no_package(tmp_path, account):
     document = models.parse_checkouts(completed.stdout)
     assert document["package_scan"]["finished_policy"] == "not_configured"
     assert [p["finished"] for p in document["packages"]] == [False, False]
+    assert "finished_stages_not_configured" in [item["code"] for item in document["attention"]]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX permission bits")
@@ -2193,7 +2211,11 @@ def test_subprocess_reports_an_incomplete_scan_for_an_unreadable_specification(
         unreadable.chmod(0o644)
 
     assert completed.returncode == 0, completed.stderr
-    assert models.parse_checkouts(completed.stdout)["package_scan"]["status"] == "incomplete"
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"]["status"] == "incomplete"
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_incomplete"
+    assert "package_scan_unavailable" not in codes
 
 
 def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
@@ -2212,9 +2234,15 @@ def test_subprocess_after_the_specification_root_is_removed(tmp_path, account):
         "finished_policy": "configured",
     }
     assert document["packages"] == []
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_unavailable"
+    assert "finished_stages_not_configured" not in codes
+    assert "package_scan_incomplete" not in codes
     for repository_before in before["repositories"]:
         repository_before["package_branches"] = []
+        repository_before["free_clones"] = []
         for member in repository_before["clones"]:
+            member["availability"] = {"state": "unknown", "reasons": [], "assigned_to": []}
             for branch in member["branches"]:
                 branch["packages"] = []
     assert document["repositories"] == before["repositories"]
@@ -2230,10 +2258,14 @@ def test_subprocess_unavailable_scan_without_the_setting_is_not_configured(tmp_p
     completed = _checkouts_subprocess(account, "--json", "--no-network")
 
     assert completed.returncode == 0, completed.stderr
-    assert models.parse_checkouts(completed.stdout)["package_scan"] == {
+    document = models.parse_checkouts(completed.stdout)
+    assert document["package_scan"] == {
         "status": "unavailable",
         "finished_policy": "not_configured",
     }
+    codes = [item["code"] for item in document["attention"]]
+    assert codes[-1] == "package_scan_unavailable"
+    assert "finished_stages_not_configured" not in codes
 
 
 def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):
@@ -2256,17 +2288,30 @@ def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):
     assert (completed.returncode, completed.stdout.strip()) == (0, NO_FOLDERS)
 
 
-def test_plain_output_ignores_the_package_list(tmp_path, account, capsys):
-    folder, _repository, _root, _record = _package_world(tmp_path, ["Shipped"])
+def test_plain_output_prints_attention_first_and_the_assigned_clone_of_the_package_list(
+    tmp_path, account, capsys
+):
+    folder, repository, root, _record = _package_world(tmp_path, ["Shipped"])
 
     plain = _plain_lines(capsys, "--no-network")
 
-    bare = checkouts.collect_checkouts(
+    scanned = checkouts.collect_checkouts(
         [str(folder)],
         deadline_ns=time.monotonic_ns() + 60 * 10**9,
         remote_checks=False,
+        package_scan=checkouts.PackageScan(root.resolve(), ("Shipped",)),
     )
-    assert plain == cli.format_checkouts(models.parse_checkouts(bare))
+    document = models.parse_checkouts(scanned)
+    assert plain == cli.format_checkouts(document)
+    path = cli._json_literal(real(repository))
+    attention = [f"attention never_fetched {path}"]
+    assert plain[: len(document["attention"])] == [
+        cli._attention_line(item) for item in document["attention"]
+    ]
+    assert plain[0] == attention[0]
+    [clone_line] = [line for line in plain if line.startswith(path + "  ")]
+    assert clone_line.startswith(f'{path}  assigned "Fictional/Drafts/a"  branch trunk  ')
+    assert plain.index(clone_line) == len(document["attention"])
 
 
 def test_the_parser_refuses_a_schema_4_document(tmp_path, account):
@@ -2283,3 +2328,106 @@ def test_the_parser_refuses_a_schema_4_document(tmp_path, account):
 
     with pytest.raises(models.ProtocolError, match="unsupported schema version"):
         models.parse_checkouts(document)
+
+
+def _availability_vocabulary() -> tuple[set[str], set[str]]:
+    """The reasons and states `_clone_availability` can produce, read from its source."""
+    import ast
+    import inspect
+
+    from nyx import models
+
+    function = ast.parse(inspect.getsource(models._clone_availability)).body[0]
+    reasons: set[str] = set()
+    states: set[str] = set()
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "reasons"
+        ):
+            reasons.add(node.args[0].value)
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "state" for t in node.targets)
+            and isinstance(node.value, ast.Constant)
+        ):
+            states.add(node.value.value)
+    return reasons, states
+
+
+def _documented_checkout_terms(text: str) -> set[str]:
+    return set(re.findall(r"`([a-z_]+)`", text))
+
+
+def _subsection(text: str, heading: str) -> str:
+    """The body of one `###` subsection of the Inspect checkouts section."""
+    section = text.split("## Inspect checkouts", 1)[1].split("\n## ", 1)[0]
+    return section.split(f"### {heading}\n", 1)[1].split("\n### ", 1)[0]
+
+
+def _bulleted_terms(subsection: str) -> set[str]:
+    """Terms named inside the subsection's bullets; other prose does not define them."""
+    bullets = re.findall(r"^- .*?(?=^- |^\n|\Z)", subsection, re.M | re.S)
+    return _documented_checkout_terms("".join(bullets))
+
+
+def _undocumented_checkout_terms(guide: str) -> set[str]:
+    """Attention codes missing from Needs attention, reasons and states from Availability."""
+    from nyx import models
+
+    reasons, states = _availability_vocabulary()
+    codes = {code for _, code in models._ATTENTION_CODES}
+    assert len(reasons) == 5 and states == {"unknown", "occupied", "assigned", "free"}
+    attention = _bulleted_terms(_subsection(guide, "Needs attention"))
+    availability = _bulleted_terms(_subsection(guide, "Availability"))
+    return (codes - attention) | ((reasons | states) - availability)
+
+
+def _guide() -> str:
+    return (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+
+
+def test_checkout_guide_documents_every_attention_code_reason_and_state():
+    assert _undocumented_checkout_terms(_guide()) == set()
+
+
+def _without_bullet(guide: str, subsection: str, term: str) -> str:
+    body = _subsection(guide, subsection)
+    bullet = re.search(rf"^- `{term}`.*?(?=^- |^\n|\Z)", body, re.M | re.S)
+    assert bullet, term
+    return guide.replace(bullet.group(0), "")
+
+
+@pytest.mark.parametrize(
+    ("subsection", "term"),
+    [
+        ("Needs attention", "removable"),
+        ("Needs attention", "uncommitted_changes"),
+        ("Needs attention", "branch_unpushed"),
+        ("Availability", "unknown"),
+        ("Availability", "occupied"),
+    ],
+)
+def test_checkout_guide_coverage_fails_when_a_bullet_is_removed(subsection, term):
+    guide = _guide()
+    assert term in _documented_checkout_terms(guide)
+    mutated = _without_bullet(guide, subsection, term)
+    assert term in _undocumented_checkout_terms(mutated)
+
+
+def test_checkout_guide_coverage_ignores_other_subsections_and_other_mentions():
+    guide = _guide()
+    body = _subsection(guide, "Needs attention")
+    mutated = guide.replace(body, body.replace("`operation_in_progress`", ""))
+    # The reason is still in the Availability subsection, which is the right place.
+    assert _undocumented_checkout_terms(mutated) == set()
+    mutated = guide.replace(body, body.replace("`awaiting_merge`", ""))
+    assert "awaiting_merge" in _undocumented_checkout_terms(mutated)
+    # A mention after the Code Status heading is outside every checked subsection.
+    assert "awaiting_merge" in _documented_checkout_terms(guide.split("### Code Status", 1)[1])
+    heading = "### Code Status of specification packages\n"
+    mutated = mutated.replace(heading, heading + "\n- `awaiting_merge` is named here.\n")
+    assert "awaiting_merge" in _undocumented_checkout_terms(mutated)

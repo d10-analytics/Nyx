@@ -111,7 +111,8 @@ nyx checkouts --no-network
 ```
 
 `nyx checkouts` lists the git checkouts found in the checkout folders configured
-for the current workspace: one line per clone and one indented line per linked
+for the current workspace: first the lines of the Needs attention list (below),
+then one line per clone and one indented line per linked
 worktree, in the same order as the document. `--json` prints the full document
 instead, and `--no-network` skips every remote check (see below). It works on Linux, Windows and macOS from a Python installation of Nyx;
 the packaged desktop application has no `nyx` command. It never starts, stops or
@@ -119,7 +120,8 @@ inspects the Nyx service, never launches the desktop application, and cannot be
 combined with `--setup`, `--stop` or `--status`; `--no-network` is accepted only
 with `checkouts`.
 
-Before the checkouts, a few lines report problems with the setup itself.
+After the attention lines and before the checkouts, a few lines report problems
+with the setup itself.
 `git missing` means no `git` was found on `PATH`, and `git too_old <version>`
 means git is older than 2.36 (without a version when git's answer could not be
 read); either way no checkouts are listed. `folder <path> <status>` names a
@@ -136,10 +138,11 @@ could not be updated. Neither changes any verdict or any other part of the
 document.
 
 Each clone or worktree line starts with the checkout's path, quoted as a JSON
-string, and then gives, separated by two spaces, its branch as `branch <name>`,
+string. A clone line then shows its availability element (see Availability
+below), and every line gives, separated by two spaces, its branch as `branch <name>`,
 `detached <sha>`, or `unborn <name>` for a branch with no commits yet; the
 `staged`, `unstaged`, `untracked` and `conflicted` counts; and any `operations`
-in progress such as `merge`. A clone line shows its main worktree's branch and
+in progress such as `merge`. A clone line shows, after the availability element, its main worktree's branch and
 counts, or `main <status>` when that worktree could not be read; a bare
 repository's line has neither. A clone line with an `origin` remote then adds,
 separated by two spaces and in this order, four more elements.
@@ -323,8 +326,9 @@ The relation is `equal`, `ahead`, `behind`, `diverged`, `differs` (different,
 but not counted, as in a shallow clone), `absent` (one of the two branches does
 not exist) or `unknown`. `cached` only ever labels a basis, as `live` and `recorded` do; the time a clone
 last fetched is always `fetched <time>`. A clone without an `origin` remote shows
-`no origin remote` and no branch or default elements. A checkout git refused or
-could not read shows its path and its status instead: `unsafe_ownership` when
+`no origin remote` and no branch or default elements. A clone git refused or
+could not read shows its path, its availability element (`unknown`) and its status
+instead: `unsafe_ownership` when
 git refuses it for ownership, `timed_out` when git did not finish in time,
 `too_many_branches` when the clone has more than 100 local branches (the default
 branch included), and otherwise `failed`. A `too_many_branches` clone is not
@@ -419,7 +423,9 @@ with `removable` or `blocker <first blocker>`, the first entry of its
 `blockers`, and this follows the status of a worktree that could not be read:
 `failed  removable` is a worktree whose directory is gone and whose branch is
 merged. A checkout that could not be read keeps its `<path>  <status>` line and
-gains no count.
+gains no count. For a clone, its availability element, always `unknown`, stands
+between the path and the status; a linked worktree line has no availability
+element.
 
 By default `nyx checkouts` is networked: it asks each distinct `origin` remote
 once, so clones that share a remote share one answer, and compares against what
@@ -532,6 +538,161 @@ see [Your specification workspace](workspaces.md#checkout-folders) for the
 exact edit. A settings editor arrives with the Checkouts view; until then the
 record is edited by hand.
 
+### Baseline and base drift
+
+A package header may carry `Baseline: <commit>`: the default-branch commit the
+work started from, written as a full 40 or 64 character lower-case hex ID (a
+short ID, upper-case letters or a name is `invalid`, and no value is `absent`;
+`Sanity Baseline:` is a different field and is never read as this one). The
+package's `baseline` in `--json` holds `status` (`declared`, `invalid` or
+`absent`), `sha` (set exactly when declared) and `drift`.
+
+`drift` compares the Baseline with the base the target clone judges its verdicts
+against (`verdict_base`), in the shape of the other comparisons. It is present
+only for an unfinished package with a declared Baseline whose target is a `clone`
+or a `worktree`, when git is available, and is otherwise null. Its `relation`
+is `equal` when the Baseline is the base commit; `behind` when the base has moved
+past the Baseline, which is the "base moved" case; `ahead` or `diverged` when the
+Baseline holds commits the base lacks, as with a stale cached base or a Baseline
+off the default branch's history; `differs` when no count can be made, because
+the target clone is shallow or partial, no clone holds the Baseline commit, a call
+failed or, on a `cached` base, the count could not start; `unknown` when the 60
+seconds or a single call's 10-second cap ran out, or any other git call could not
+start; and `absent` when the
+clone has no base or could not be read. Counts are made read-only. When the
+target clone lacks the Baseline commit, a sibling clone of the same remote may
+lend it, named in `objects_from`. Drift is computed on every run and never saved.
+The `basis` is the base's: `live`, `recorded` or `cached`.
+
+### Availability
+
+Every clone line starts, right after its path, with an availability element, and
+`--json` gives each clone `availability` with a `state`, its `reasons` and
+`assigned_to`. The state answers whether the clone is ready to start new work:
+
+- `free` (shown as `free <rank>`): nothing prevents starting there. The rank counts from 1 among the
+  free clones of the same repository, nearest first (see Ranking).
+- `assigned` (shown as `assigned <path>[,<path>]`): nothing prevents it, but an unfinished package
+  targets the clone (its `Target repo:` is the clone, or a linked worktree of it).
+  The paths are the packages', quoted as JSON strings. Finish or retarget the
+  package to clear it.
+- `occupied` (shown as `occupied <reason>[,<reason>]`): the main worktree holds something. The reasons
+  appear in this order. `not_on_default_branch`: the main worktree is on a branch
+  other than the default branch (only judged when the default branch's name is
+  known); switch it back. `detached_head`: it is on a detached `HEAD`; check out
+  the default branch. `linked_worktrees`: the clone has linked worktrees, a
+  prunable one included; remove them. `uncommitted_changes`: it has a staged,
+  unstaged, untracked or conflicted file; commit, stash or discard it.
+  `operation_in_progress`: a merge, rebase or similar operation is under way;
+  finish or abort it. A bare repository can only have `linked_worktrees`.
+- `unknown`: nothing can be said. An `unknown` clone lists no reasons.
+
+The state is decided in this order. It is `unknown` when git could not read the
+clone, when a clone with a working tree has a main worktree that could not be
+read, or when the package scan is unavailable. Otherwise it is `occupied` when
+there is any reason. Otherwise it is `unknown` when the clone has a working tree
+and no default branch name is known. Otherwise it is `assigned` when an
+unfinished package targets it, and else `free`. A clone with no `origin` remote
+and one untracked file therefore shows `occupied uncommitted_changes`, not
+`unknown`, even though its default branch name may be unknown.
+
+A bare repository is read only through a linked worktree, so a bare repository
+with no linked worktree to read is a `failed` clone and `unknown`.
+
+**Ranking.** Free clones of one repository are ordered by how their local default
+branch compares with the remote's default head (the live or recorded answer, else
+the cached one; a clone without a local default branch ranks as `absent`): the
+relation `equal`, then `behind`, `ahead`, `diverged`, `differs`, `unknown` and
+`absent`; then by the total number of commits apart, a clone whose count cannot
+be made last; then by path. A default branch that is ahead ranks after one that is
+behind because its extra commits are unique work, not a clean start. The first
+free clone in the list is the best place to start. `--json` lists each
+repository's free clones in this order as `free_clones`.
+
+### Needs attention
+
+The top-level `attention` list holds what a person should act on, one item per
+row to look at, and the plain output prints it first, one line per item. Items are
+grouped in classes, in this order, and within a class by code, then clone path,
+worktree path, branch name and first package path. With no item the output starts
+with `attention none`. An item line is
+
+```text
+attention <code> ["<clone>"] [worktree "<path>"] [branch "<name>"] [packages "<path>"[,"<path>"]] [count <n>] [pr <n>]
+```
+
+and shows only the elements the item sets: each path and name is quoted as a JSON
+string, `packages` are the package directories, `count` is the number the code
+defines and `pr` is an open pull request's number. In `--json` an item also gives
+its `class`, its `repository` (the remote key of the group holding the item's clone, or, for
+`awaiting_merge`, of the branch entry's group; null for a group without `origin`
+and for items naming no clone or entry) and its null or empty unset fields. Every item clears itself when its
+cause is gone and a later run sees that.
+
+*Unique work* is what exists only on this machine:
+
+- `branch_unpushed` (clone, branch, count): a branch holds commits its remote
+  branch lacks (`count` of them), counting only a branch other than the default
+  branch that no other branch contains and that is not already merged. This
+  includes a branch that has diverged from its remote copy, which a plain push
+  rejects. Push it (after reconciling a diverged branch with its remote copy), or
+  merge or delete the branch.
+- `branch_not_pushed` (clone, branch): the same, but the branch has no copy on
+  the remote. Push it.
+- `default_branch_ahead` (clone, branch, count): the local default branch holds
+  `count` commits the remote's default branch lacks. Push or reset them.
+- `stash` (clone, count): the clone has `count` stashes. Pop or drop them (applying a stash keeps it).
+- `uncommitted_changes` (clone, worktree, count): a worktree, the main one
+  included, has `count` changed files (the staged, unstaged, untracked and
+  conflicted counts added, 0 when only an operation is in progress) or an
+  operation in progress. Commit, stash or discard them, or finish the operation.
+
+*Awaiting merge*:
+
+- `awaiting_merge` (branch, packages, pr): every package of the branch is finished
+  and reads `awaiting merge (no PR)` or `PR #N open`, and the package scan is
+  complete. The `pr` element is present when a pull request is open. It clears
+  when the work is merged.
+
+*Cleanup ready*:
+
+- `removable` (clone, count): the clone holds `count` Removable branches and
+  linked worktrees together, but the count leaves out a branch an unfinished
+  package of this clone or a sibling clone still uses, and a worktree on it. Remove
+  them. Finishing such a package lifts the exclusion, so the count then rises.
+
+*Base moved*:
+
+- `base_moved` (clone, worktree, packages, count): an unfinished package's base
+  has moved past its Baseline by `count` commits (drift `behind`). Bring the work
+  up to date and set the new `Baseline:`, or finish the package.
+
+*Configuration* is something to fix before the rest can be trusted:
+
+- `target_repo_missing` and `target_repo_not_git` (packages): an unfinished
+  package whose `Branch:` does not say `not applicable` names a `Target repo:` inside a configured
+  checkout folder where nothing exists or no git checkout is the top level. Create
+  the clone or correct the header. A target outside the folders raises no item,
+  because a specification root shared across machines names paths of other
+  machines; neither does an `invalid` target.
+- `branch_invalid` (clone, worktree, packages): an unfinished package whose
+  `Target repo:` is a clone, or a linked worktree of one, has a `Branch:` value
+  that is not a branch name; correct the header. A package whose target is not
+  such a checkout raises no item for its branch.
+- `upstream_mismatch` (clone, branch): a branch's upstream is not the same-named
+  branch of `origin`; set it again.
+- `never_fetched` (clone): the clone has never fetched; fetch.
+- `no_origin_remote` (clone): the clone has no `origin` remote; add one.
+- `checkout_unavailable` (clone): git could not read the clone (its line shows the
+  status); fix the cause. A linked worktree that cannot be read raises no item.
+- `finished_stages_not_configured`: the workspace selects no stage under **Counts
+  as finished**, so no package is finished; select one. While the package scan is
+  unavailable only `package_scan_unavailable` is listed, not this item.
+- `package_scan_incomplete`: some specification could not be read whole; make it
+  readable.
+- `package_scan_unavailable`: the workspace has no specification root or Nyx
+  cannot read it; set one.
+
 ### Code Status of specification packages
 
 The `--json` document also lists, under `packages`, every specification package
@@ -541,7 +702,9 @@ stands. A package has a Code Status only when its target is a `clone` or a
 `worktree` and its branch is found in a readable clone or on the remote. A
 relative, missing or invalid target, a target outside the checkout folders, git
 missing or too old, a branch that is the repository's default branch, and a
-branch found nowhere all leave it empty. The plain lines show none of this. `package_scan.status` is
+branch found nowhere all leave it empty. The plain lines show a package only by its path: after `assigned` on the clone
+line it is assigned to, and in the attention lines that name it. The Code Status text and the rest of the package
+record are in the `--json` document. `package_scan.status` is
 `unavailable` when the workspace has no specification root or Nyx cannot read it,
 and then no package is listed. It is `complete` when Nyx read every specification
 whole, and `incomplete` when some specification could not be read whole. A package
@@ -549,6 +712,13 @@ whose `spec.md` cannot be read is not listed in `packages`, so an `incomplete` s
 means a package may exist that the list does not show; rule 3 below never concludes
 `awaiting merge (no PR)` on an `incomplete` scan. `package_scan.finished_policy` is
 `configured` or `not_configured`, as described below.
+
+Each listed package also has a `baseline` (see Baseline and base drift above).
+When every package of a branch is finished and reads `awaiting merge (no PR)` or
+`PR #N open`, and the package scan is complete, the branch also appears in the
+Needs attention list, as one `awaiting_merge` item that names the packages it
+serves. A finished package that shares its branch with an unfinished one, or that
+is listed by an `incomplete` scan, raises no item.
 
 **Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
 checkout, not only its last path component (the browser still shows just the last

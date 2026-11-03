@@ -1,3 +1,4 @@
+import dataclasses
 import inspect
 import json
 import os
@@ -2506,3 +2507,56 @@ def test_package_heads_judge_target_repo_by_the_host_absolute_form(tmp_path) -> 
         assert by_name["drive"].target_repo == catalog.TargetRepoHead("invalid", None)
     else:
         assert by_name["drive"].target_repo == catalog.TargetRepoHead("usable", "C:\\work\\repo")
+
+
+HEX40 = "0123456789abcdef0123456789abcdef01234567"
+HEX64 = "0123456789abcdef" * 4
+BASELINE_FORMS = {
+    "plain": (f"Baseline: {HEX40}", catalog.BaselineHead("declared", HEX40)),
+    "bold": (f"**Baseline:** `{HEX40}` (note)", catalog.BaselineHead("declared", HEX40)),
+    "dated": (f"Baseline: {HEX40} (2026-09-01)", catalog.BaselineHead("declared", HEX40)),
+    "wide": (f"Baseline: {HEX64}", catalog.BaselineHead("declared", HEX64)),
+    "upper": (f"Baseline: {HEX40.upper()}", catalog.BaselineHead("invalid", None)),
+    "short": ("Baseline: c3e197a", catalog.BaselineHead("invalid", None)),
+    "branch": ("Baseline: main @ abc1234", catalog.BaselineHead("invalid", None)),
+    "long": (f"Baseline: {HEX40}0", catalog.BaselineHead("invalid", None)),
+    "prefixed": (f"Baseline: main {HEX40}", catalog.BaselineHead("invalid", None)),
+    "open_tick": (f"Baseline: `{HEX40}", catalog.BaselineHead("invalid", None)),
+    "double_tick": (f"Baseline: ``{HEX40}`` (note)", catalog.BaselineHead("invalid", None)),
+    "empty": ("Baseline:", catalog.BaselineHead("absent", None)),
+    "missing": (None, catalog.BaselineHead("absent", None)),
+    "sanity": (f"Sanity Baseline: {HEX40}", catalog.BaselineHead("absent", None)),
+}
+
+
+def _baseline_root(base: Path, *, with_baseline: bool) -> Path:
+    root = base / ("with" if with_baseline else "without") / "specs"
+    for name, (line, _) in BASELINE_FORMS.items():
+        lines = ["# Package", "Branch: topic"]
+        if line is not None and (with_baseline or not line.lstrip("*").startswith("Baseline")):
+            lines.append(line)
+        package(root, "Drafts", name, "\n".join(lines) + "\n")
+    return root
+
+
+def test_package_heads_read_the_baseline_header_forms(tmp_path) -> None:
+    with_lines = _heads_by_name(catalog.scan_package_heads(_baseline_root(tmp_path, with_baseline=True)))
+    without = _heads_by_name(catalog.scan_package_heads(_baseline_root(tmp_path, with_baseline=False)))
+    assert set(with_lines) == set(BASELINE_FORMS)
+    for name, (_, expected) in BASELINE_FORMS.items():
+        assert with_lines[name].baseline == expected, name
+        assert without[name].baseline == catalog.BaselineHead("absent", None), name
+        assert dataclasses.replace(with_lines[name], baseline=expected, package_path="") == (
+            dataclasses.replace(without[name], baseline=expected, package_path="")
+        ), name
+
+
+def test_baseline_header_does_not_reach_the_catalog_wire(tmp_path) -> None:
+    root = _baseline_root(tmp_path, with_baseline=True)
+    rendered = catalog.scan_catalog(root)
+    with patch.object(
+        catalog, "_JOIN_LABELS", {"target_repo": "Target repo", "branch": "Branch"}
+    ):
+        assert catalog.scan_catalog(root) == rendered
+    entries = {entry["package_path"]: entry for entry in json.loads(rendered)["entries"]}
+    assert {"name": "Baseline", "value": HEX40} in entries["Fictional/Drafts/plain"]["reported_fields"]

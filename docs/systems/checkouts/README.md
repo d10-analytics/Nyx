@@ -39,6 +39,15 @@ README is narrative only.
   it, the document cannot carry (`unrepresentable_path`) has no clone record, so
   a target at the checkout is reported as outside the checkout folders; this is
   a known limit.
+- Counts each unfinished package's drift, from its declared `Baseline:` commit
+  to the target clone's verdict base, with one read-only `rev-list --left-right
+  --count` per distinct clone and Baseline, using the verdict settings' pinned
+  git options; a sibling clone of the same remote may lend the Baseline commit
+  read-only. Drift is recomputed on every run and never saved. A package target
+  that is missing or not a git checkout also records `within_folders`, true when
+  its path lies in or under a configured checkout folder.
+- Calls `derive_attention` after the join and stores the clone availability,
+  each repository's free clones and the attention list it returns.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no
   git call and reads no file; `nyx/checkouts.py` owns every git call and
   filesystem read and builds the path identities it is given.

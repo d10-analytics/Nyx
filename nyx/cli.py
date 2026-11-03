@@ -172,6 +172,40 @@ def _remote_and_default_elements(
     return elements
 
 
+def _attention_line(item: dict[str, Any]) -> str:
+    """Return one ``attention`` line; each element appears when the item sets its field."""
+
+    parts = ["attention", item["code"]]
+    if item["clone"] is not None:
+        parts.append(_json_literal(item["clone"]))
+    if item["worktree"] is not None:
+        parts.extend(["worktree", _json_literal(item["worktree"])])
+    if item["branch"] is not None:
+        parts.extend(["branch", _json_literal(item["branch"])])
+    if item["packages"]:
+        parts.extend(["packages", ",".join(_json_literal(path) for path in item["packages"])])
+    if item["count"] is not None:
+        parts.extend(["count", str(item["count"])])
+    if item["pull_request"] is not None:
+        parts.extend(["pr", str(item["pull_request"])])
+    return " ".join(parts)
+
+
+def _availability_element(clone: dict[str, Any], repository: dict[str, Any]) -> str:
+    """Return the availability element placed right after a clone's path."""
+
+    availability = clone["availability"]
+    state = availability["state"]
+    if state == "free":
+        return f"free {repository['free_clones'].index(clone['path']) + 1}"
+    if state == "assigned":
+        paths = ",".join(_json_literal(item["package_path"]) for item in availability["assigned_to"])
+        return f"assigned {paths}"
+    if state == "occupied":
+        return "occupied " + ",".join(availability["reasons"])
+    return "unknown"
+
+
 def _pr_element(lookup: dict[str, Any]) -> str:
     if lookup["status"] == "live":
         return "pr live"
@@ -183,7 +217,7 @@ def _pr_element(lookup: dict[str, Any]) -> str:
 def format_checkouts(document: dict[str, Any]) -> list[str]:
     """Return the plain-output lines of a parsed checkout document."""
 
-    lines: list[str] = []
+    lines = [_attention_line(item) for item in document["attention"]] or ["attention none"]
     git = document["git"]
     if git["status"] != "available":
         lines.append(
@@ -198,10 +232,11 @@ def format_checkouts(document: dict[str, Any]) -> list[str]:
         remote = repository["remote"]
         for clone in repository["clones"]:
             path = _json_literal(clone["path"])
+            availability = _availability_element(clone, repository)
             if clone["status"] != "ok":
-                lines.append(f"{path}  {clone['status']}")
+                lines.append(f"{path}  {availability}  {clone['status']}")
                 continue
-            elements: list[str] = []
+            elements: list[str] = [availability]
             if not clone["bare"]:
                 main = next(w for w in clone["worktrees"] if w["main"])
                 if main["status"] != "ok":

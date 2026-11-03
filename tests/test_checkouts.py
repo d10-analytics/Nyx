@@ -1400,7 +1400,8 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def rederive(document: dict[str, Any]) -> dict[str, Any]:
-    """Give every ``ok`` clone the Removable fields its present facts derive.
+    """Give every ``ok`` clone the Removable fields its present facts derive, then the
+    availability, free clones and attention list the whole document derives.
 
     A clone whose facts the derivation cannot read (a mutation that broke their
     shape) keeps its fields: the structural checks refuse it before they matter.
@@ -1417,6 +1418,15 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
         for worktree, verdict in zip(item["worktrees"], derived["worktrees"]):
             worktree["removable"] = verdict
         item["removable_count"] = derived["removable_count"]
+    try:
+        derived = models.derive_attention(document)
+    except (KeyError, TypeError):
+        return document
+    for repository, free in zip(document["repositories"], derived["free_clones"]):
+        repository["free_clones"] = free
+        for item in repository["clones"]:
+            item["availability"] = derived["availability"][item["path"]]
+    document["attention"] = derived["attention"]
     return document
 
 
@@ -1693,6 +1703,7 @@ def without_remote(document):
             "default_branch": None,
             "pr_lookup": None,
             "clones": [clone_document],
+            "free_clones": [],
             "package_branches": [],
         }
     ]
@@ -2020,7 +2031,7 @@ def test_parser_accepts_non_ok_items_with_null_facts(sample):
     worktree.update(
         status="timed_out", head=None, changes=None, operations=None, index_lock=None, verdict=None
     )
-    assert models.parse_checkouts(redigest(broken))
+    assert models.parse_checkouts(redigest(rederive(broken)))
 
 
 def with_branch_count(document: dict[str, Any], count: int) -> dict[str, Any]:
@@ -2053,7 +2064,7 @@ def test_parser_accepts_a_clone_over_the_branch_cap_with_null_facts(sample):
     document, _folder = sample
     crowded = doc_copy(document)
     refused_clone(crowded)["status"] = "too_many_branches"
-    assert models.parse_checkouts(redigest(crowded))
+    assert models.parse_checkouts(redigest(rederive(crowded)))
 
 
 def test_parser_refuses_a_worktree_status_of_too_many_branches(sample):
@@ -2853,7 +2864,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 6
+    assert document["schema_version"] == 7
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3223,6 +3234,10 @@ def test_branch_deleted_during_the_remote_query_is_never_a_counted_comparison(
             if item["branches"] is not None:
                 item["branches"] = [b for b in item["branches"] if b["name"] != "feature"
                                     or item["path"] != real(other)]
+        stripped["attention"] = [
+            i for i in stripped["attention"]
+            if (i["branch"], i["clone"]) != ("feature", real(other))
+        ]
         stripped.pop("observed_at")
         stripped.pop("checkouts_digest")
         return stripped
@@ -3446,7 +3461,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 6
+    assert first["schema_version"] == 7
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7249,7 +7264,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 6 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 7 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
@@ -8707,7 +8722,7 @@ def lookup_document(sample_document, *, github_lookup, remote_checks, key, pr_lo
     document["remote_checks"] = remote_checks
     document["repositories"][0]["remote"]["key"] = key
     document["repositories"][0]["pr_lookup"] = pr_lookup
-    return redigest(document)
+    return redigest(rederive(document))
 
 
 def recorded_lookup(reason: str | None, checked_at: str | None = "2026-10-24T00:00:00Z"):
