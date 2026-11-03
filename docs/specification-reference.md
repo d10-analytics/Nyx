@@ -17,6 +17,7 @@ Put metadata in that header, one field per line.
 | `Status: text` | Optional reported text retained for search; it does not change the stage and is not shown on cards. |
 | `Target repo: path` | The final path component supplies the displayed target project. `nyx checkouts` uses the whole absolute path. |
 | `Branch: name` | Optional. The git branch the work is done on, or a value starting with `not applicable` (then a reason) for work that has no branch. `nyx checkouts` reads it, and its value also stays searchable reported text. |
+| `Baseline: commit` | Optional. The default-branch commit the work started from. The first word must be a full 40 or 64 character lower-case hex commit ID, optionally in one pair of backticks; any other value is `invalid` for `nyx checkouts`, which compares it with the target clone's default branch and reports when the base has moved. Its value also stays searchable reported text. `Sanity Baseline:` is a different field. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
 | `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
 | `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
