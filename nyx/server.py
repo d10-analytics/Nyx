@@ -37,6 +37,9 @@ _DECLARED_LENGTH = re.compile(r"[0-9]{1,10}")
 # attributes before constructing a server.
 _CONNECTION_TIMEOUT_SECONDS = 15.0
 _MAX_ACTIVE_CONNECTIONS = 32
+# An owned shutdown waits up to one poll interval for the loop to notice it,
+# and the standard 0.5 s makes every stop wait up to half a second.
+_SERVE_POLL_SECONDS = 0.05
 _SAFE_ERRORS = frozenset(
     {
         "producer_unavailable",
@@ -394,6 +397,9 @@ class TrackerServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
     daemon_threads = True
+
+    def serve_forever(self, poll_interval: float = _SERVE_POLL_SECONDS) -> None:
+        super().serve_forever(poll_interval)
 
     def server_bind(self) -> None:
         # The listener is already numeric loopback; reverse DNS adds no useful
