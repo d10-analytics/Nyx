@@ -3723,7 +3723,7 @@ def test_a_status_document_handout_is_a_private_copy(status_document, shared_sta
 # ---------------------------------------------------------------------------
 
 WORLD_SHIPPED = frozenset({"drift-finished", "on-c", "done-a", "done-b", "shared-a"})
-WORLD_ABSENT = "0123456789abcdef0123456789abcdef01234567"
+WORLD_ABSENT = "0" * 40
 
 
 class WorldW:
@@ -3986,6 +3986,7 @@ def test_world_w_offline_drift_is_counted_against_the_cached_base_of_the_target(
         "drift-twin": ("cached", "ahead", 1, 0, "B"),
         "drift-off": ("cached", "ahead", 2, 0, "B"),
         "drift-equal": ("cached", "ahead", 2, 0, "C"),
+        "drift-unheld": ("cached", "differs", None, None, None),
         "drift-held": ("cached", "behind", 0, 1, None),
     }
     for name, row in expected.items():
@@ -4278,33 +4279,6 @@ def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
             "GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"
         }
         assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U", "L")}
-
-
-def test_an_all_zero_baseline_is_declared_parses_and_differs(world_w):
-    """An all-zero Baseline is a declared commit ID that no clone holds: its drift is
-    the uncounted ``differs`` the collector gives an unheld Baseline, on the target
-    clone's base basis, and the parser accepts the document."""
-    w = world_w
-    zero = "0" * 40
-    for document in (w.offline, w.live):
-        copy = doc_copy(document)
-        package = world_package(copy, "drift-moved")
-        assert package["baseline"]["status"] == "declared", "control"
-        assert package["baseline"]["drift"]["relation"] != "differs", "control"
-        basis = clone_at(copy, w.c["A"])["verdict_base"]["basis"]
-        differs = {
-            "basis": basis, "relation": "differs", "ahead": None, "behind": None,
-            "objects_from": None,
-        }
-        assert drift_of(copy, "drift-unheld") == differs, "the collector's unheld shape"
-
-        package["baseline"]["sha"] = zero
-        package["baseline"]["drift"] = differs
-        parsed = models.parse_checkouts(json.dumps(redigest(rederive(copy))))
-
-        assert world_package(parsed, "drift-moved")["baseline"] == {
-            "status": "declared", "sha": zero, "drift": differs
-        }, document["remote_checks"]
 
 
 # ---------------------------------------------------------------------------

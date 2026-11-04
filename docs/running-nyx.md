@@ -596,8 +596,9 @@ unfinished package targets it, and else `free`. A clone with no `origin` remote
 and one untracked file therefore shows `occupied uncommitted_changes`, not
 `unknown`, even though its default branch name may be unknown.
 
-A bare repository is read only through a linked worktree, so a bare repository
-with no linked worktree to read is a `failed` clone and `unknown`.
+A bare repository is read only through a linked worktree in a checkout folder.
+With none it gets no clone line; a directory whose `.git` is itself a bare
+repository is a `failed` clone and `unknown`.
 
 **Ranking.** Free clones of one repository are ordered by how their local default
 branch compares with the remote's default head (the live or recorded answer, else
@@ -612,9 +613,12 @@ repository's free clones in this order as `free_clones`.
 ### Needs attention
 
 The top-level `attention` list holds what a person should act on, one item per
-row to look at, and the plain output prints it first, one line per item. Items are
-grouped in classes, in this order, and within a class by code, then clone path,
-worktree path, branch name and first package path. With no item the output starts
+row to look at, and the plain output prints it first, one line per item. With no
+live or saved remote answer, as on a first `--no-network` run, the list rests on
+the clones' own fetched refs and can differ from a networked run's. Items are
+grouped in classes, in this order, and within a class by code in the order
+listed, then clone path, worktree path, branch name and first package path. With
+no item the output starts
 with `attention none`. An item line is
 
 ```text
@@ -629,16 +633,18 @@ its `class`, its `repository` (the remote key of the group holding the item's cl
 and for items naming no clone or entry) and its null or empty unset fields. Every item clears itself when its
 cause is gone and a later run sees that.
 
-*Unique work* is what exists only on this machine:
+*Unique work* is what, as far as this run can tell, exists only on this
+machine:
 
 - `branch_unpushed` (clone, branch, count): a branch holds commits its remote
   branch lacks (`count` of them), counting only a branch other than the default
-  branch that no other branch contains and that is not already merged. This
-  includes a branch that has diverged from its remote copy, which a plain push
-  rejects. Push it (after reconciling a diverged branch with its remote copy), or
-  merge or delete the branch.
+  branch (only judged when the clone has a base) that no other branch contains
+  and that is not already merged. This includes a branch that has diverged from
+  its remote copy, which a plain push rejects. Push it (after reconciling a
+  diverged branch with its remote copy), or merge or delete the branch.
 - `branch_not_pushed` (clone, branch): the same, but the branch has no copy on
-  the remote. Push it.
+  the remote: the live or saved answer says so or, with neither, this clone
+  holds no remote-tracking branch for it, even if the remote has one. Push it.
 - `default_branch_ahead` (clone, branch, count): the local default branch holds
   `count` commits the remote's default branch lacks. Push or reset them.
 - `stash` (clone, count): the clone has `count` stashes. Pop or drop them (applying a stash keeps it).
@@ -649,10 +655,9 @@ cause is gone and a later run sees that.
 
 *Awaiting merge*:
 
-- `awaiting_merge` (branch, packages, pr): every package of the branch is finished
-  and reads `awaiting merge (no PR)` or `PR #N open`, and the package scan is
-  complete. The `pr` element is present when a pull request is open. It clears
-  when the work is merged.
+- `awaiting_merge` (branch, packages, pr): a branch raises this item under the
+  rule stated in Code Status of specification packages below. The `pr` element
+  is present when a pull request is open. It clears when the work is merged.
 
 *Cleanup ready*:
 
@@ -665,7 +670,8 @@ cause is gone and a later run sees that.
 
 - `base_moved` (clone, worktree, packages, count): an unfinished package's base
   has moved past its Baseline by `count` commits (drift `behind`). Bring the work
-  up to date and set the new `Baseline:`, or finish the package.
+  up to date and set the new `Baseline:`, or finish the package. Any other drift
+  raises nothing, so a base that moved but could not be counted is not listed.
 
 *Configuration* is something to fix before the rest can be trusted:
 
@@ -714,11 +720,12 @@ means a package may exist that the list does not show; rule 3 below never conclu
 `configured` or `not_configured`, as described below.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
-When every package of a branch is finished and reads `awaiting merge (no PR)` or
-`PR #N open`, and the package scan is complete, the branch also appears in the
-Needs attention list, as one `awaiting_merge` item that names the packages it
-serves. A finished package that shares its branch with an unfinished one, or that
-is listed by an `incomplete` scan, raises no item.
+When every package that names a branch in its repository is finished and reads
+`awaiting merge (no PR)` or `PR #N open`, and the package scan is complete, the
+branch also appears in the Needs attention list, as one `awaiting_merge` item
+that lists those packages. A finished package that shares its branch with an
+unfinished one in that repository, or that is listed by an `incomplete` scan,
+raises no item.
 
 **Matching.** Nyx uses the package's `Target repo:` whole, as the path of a
 checkout, not only its last path component (the browser still shows just the last
