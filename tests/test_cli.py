@@ -2514,13 +2514,16 @@ def test_checkout_guide_attention_codes_match_the_code():
 
 
 def _awaiting_state_text(merge_state: str) -> str:
-    """The Code Status text for one state in the raise rule, as the code builds it."""
+    """The Code Status text a state produces, with the fields it does not read unset."""
     from nyx import models
 
     fields = {"state": merge_state, "push": None, "checked_out_elsewhere": []}
-    if merge_state == "pr_open":
+    try:
+        return models.code_status_text(fields)
+    except KeyError as missing:
+        assert missing.args == ("pull_request",), missing
         fields["pull_request"] = "N"
-    return models.code_status_text(fields)
+        return models.code_status_text(fields)
 
 
 def test_checkout_guide_states_the_raise_rule_only_after_the_code_status_heading():
