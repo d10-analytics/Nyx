@@ -2368,10 +2368,14 @@ def _subsection(text: str, heading: str) -> str:
     return section.split(f"### {heading}\n", 1)[1].split("\n### ", 1)[0]
 
 
+def _bullets(subsection: str) -> list[str]:
+    """The subsection's bullets, each with its continuation lines."""
+    return re.findall(r"^- .*?(?=^- |^\n|\Z)", subsection, re.M | re.S)
+
+
 def _bulleted_terms(subsection: str) -> set[str]:
     """Terms named inside the subsection's bullets; other prose does not define them."""
-    bullets = re.findall(r"^- .*?(?=^- |^\n|\Z)", subsection, re.M | re.S)
-    return _documented_checkout_terms("".join(bullets))
+    return _documented_checkout_terms("".join(_bullets(subsection)))
 
 
 def _undocumented_checkout_terms(guide: str) -> set[str]:
@@ -2431,3 +2435,102 @@ def test_checkout_guide_coverage_ignores_other_subsections_and_other_mentions():
     heading = "### Code Status of specification packages\n"
     mutated = mutated.replace(heading, heading + "\n- `awaiting_merge` is named here.\n")
     assert "awaiting_merge" in _undocumented_checkout_terms(mutated)
+
+
+def _normalised(text: str) -> str:
+    """One line of text, with every run of whitespace collapsed to one space."""
+    return " ".join(text.split())
+
+
+def _drift_paragraph(guide: str) -> str:
+    """The drift paragraph, from its opening sentence through the basis sentence."""
+    body = _normalised(_subsection(guide, "Baseline and base drift"))
+    start = body.index("`drift` compares the Baseline")
+    ending = "The `basis` is the base's: `live`, `recorded` or `cached`."
+    return body[start : body.index(ending) + len(ending)]
+
+
+def test_checkout_guide_drift_relations_match_the_code():
+    from nyx import models
+
+    paragraph = _drift_paragraph(_guide())
+
+    assert "`behind` when the base has moved past the Baseline" in paragraph
+    documented = {
+        relation for relation in models._COMPARISON_RELATIONS if f"`{relation}`" in paragraph
+    }
+    assert documented == set(models._COMPARISON_RELATIONS)
+
+
+def _ranking_relations(guide: str) -> list[str]:
+    """The relations the Ranking paragraph lists, in the guide's order."""
+    body = _normalised(_subsection(guide, "Availability"))
+    listed = body.split("the relation ", 1)[1].split(";", 1)[0]
+    return re.findall(r"`([a-z_]+)`", listed)
+
+
+def test_checkout_guide_ranking_order_matches_the_code():
+    from nyx import models
+
+    assert _ranking_relations(_guide()) == list(models._DISTANCE_ORDER)
+
+
+def _documented_attention_line(guide: str) -> str:
+    """The documented attention grammar with its optional brackets removed."""
+    body = _subsection(guide, "Needs attention")
+    block = re.search(r"```text\n(.*?)```", body, re.S)
+    assert block
+    line = next(line for line in block.group(1).splitlines() if line.startswith("attention "))
+    return _normalised(line.replace("[", "").replace("]", ""))
+
+
+def test_checkout_guide_attention_line_matches_the_renderer():
+    documented = _documented_attention_line(_guide())
+    item = {
+        "code": "<code>",
+        "clone": "<clone>",
+        "worktree": "<path>",
+        "branch": "<name>",
+        "packages": ["<path>", "<path>"],
+        "count": "<n>",
+        "pull_request": "<n>",
+    }
+
+    assert documented == cli._attention_line(item)
+
+
+def _leading_attention_codes(guide: str) -> list[str]:
+    """The code each Needs attention bullet leads with, in the guide's order."""
+    codes: list[str] = []
+    for bullet in _bullets(_subsection(guide, "Needs attention")):
+        codes.extend(re.findall(r"`([a-z_]+)`", _normalised(bullet.split(":", 1)[0])))
+    return codes
+
+
+def test_checkout_guide_attention_codes_match_the_code():
+    from nyx import models
+
+    assert _leading_attention_codes(_guide()) == [code for _, code in models._ATTENTION_CODES]
+
+
+def _awaiting_state_text(merge_state: str) -> str:
+    """The Code Status text for one state in the raise rule, as the code builds it."""
+    from nyx import models
+
+    fields = {"state": merge_state, "push": None, "checked_out_elsewhere": []}
+    if merge_state == "pr_open":
+        fields["pull_request"] = "N"
+    return models.code_status_text(fields)
+
+
+def test_checkout_guide_states_the_raise_rule_only_after_the_code_status_heading():
+    from nyx import models
+
+    section = _guide().split("## Inspect checkouts", 1)[1]
+    attention = "### Needs attention"
+    code_status = "### Code Status of specification packages"
+    assert section.index(attention) < section.index(code_status)
+    before = _normalised(section.split(code_status, 1)[0])
+
+    for merge_state in (*models._AWAITING_MERGE_STATES, "superseded"):
+        assert _awaiting_state_text(merge_state) not in before
