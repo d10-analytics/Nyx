@@ -6997,11 +6997,11 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
         with patch.object(
             state, "resolve_account_home", return_value=paths.account_home
         ), patch.object(runtime, "_paths", return_value=paths), patch.object(
-            # Budget comfortably above the HTTP listener's 0.5 s
-            # serve_forever poll interval so the first stop times out
-            # because the SIGTERM-resistant worker refuses to die, and the
-            # retry never inherits a leftover poll tail that would make its
-            # convergence depend on scheduler jitter.
+            # Budget comfortably above the HTTP listener's serve_forever poll
+            # interval so the first stop times out because the
+            # SIGTERM-resistant worker refuses to die, and the retry never
+            # inherits a leftover poll tail that would make its convergence
+            # depend on scheduler jitter.
             runtime,
             "SHUTDOWN_TIMEOUT",
             1.0,
