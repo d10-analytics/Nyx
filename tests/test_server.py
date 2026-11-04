@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -1962,9 +1963,9 @@ def test_owned_shutdown_releases_the_listener_when_request_work_does_not_drain()
             connection.sendall(raw_request(port, "GET /api/catalog HTTP/1.1"))
             assert wait_for(lambda: running.server._request_work == 1, 5)
             # The undrained request keeps the shutdown result retryable. The
-            # budget must outlast serve_forever's 0.5 s poll interval, which
-            # stopping the accept loop can wait out in full; a smaller budget
-            # expires before the listener close and the port stays bound.
+            # budget must outlast the listener's serve_forever poll interval,
+            # which stopping the accept loop can wait out in full; a smaller
+            # budget expires before the listener close and the port stays bound.
             assert running.application.shutdown(time.monotonic() + 2) is False
             # The caller's precondition still holds: the released port is
             # usable while the stuck request is reported through the result.
@@ -1980,6 +1981,26 @@ def test_owned_shutdown_releases_the_listener_when_request_work_does_not_drain()
             if running.application.server is not None:
                 assert running.application.shutdown(time.monotonic() + 5)
                 running.application.server = None
+
+
+@pytest.mark.parametrize(
+    "application_owned", [False, True], ids=["standalone", "application"]
+)
+def test_tracker_serve_loop_polls_for_shutdown_every_50_ms(application_owned):
+    real_serve_forever = socketserver.BaseServer.serve_forever
+    recorded = []
+
+    def recording_serve_forever(self, poll_interval=0.5):
+        recorded.append((self, poll_interval))
+        real_serve_forever(self, poll_interval)
+
+    settings = SettingsStub() if application_owned else None
+    with patch.object(socketserver.BaseServer, "serve_forever", recording_serve_forever):
+        running = RunningServer(StubClient(catalog=valid_catalog()), settings)
+        with running:
+            pass
+
+    assert recorded == [(running.server, 0.05)]
 
 
 def test_injected_handler_thread_start_failure_releases_the_slot():

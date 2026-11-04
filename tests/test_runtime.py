@@ -1646,6 +1646,11 @@ def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup
                             **self.identities(),
                         )
                         if self.workers.active_count:
+                            # Cleanup must meet a worker that already ignores
+                            # SIGTERM, and the listener stop alone is too quick
+                            # to guarantee the worker got that far.
+                            while not worker_pid_file.exists() and time.monotonic() < deadline:
+                                time.sleep(0.01)
                             self.server.shutdown()
 
                     def cleanup_start_failure(self, deadline):
@@ -6997,11 +7002,11 @@ def test_public_stop_timeout_retains_authenticated_cleanup_until_retry():
         with patch.object(
             state, "resolve_account_home", return_value=paths.account_home
         ), patch.object(runtime, "_paths", return_value=paths), patch.object(
-            # Budget comfortably above the HTTP listener's 0.5 s
-            # serve_forever poll interval so the first stop times out
-            # because the SIGTERM-resistant worker refuses to die, and the
-            # retry never inherits a leftover poll tail that would make its
-            # convergence depend on scheduler jitter.
+            # Budget comfortably above the HTTP listener's serve_forever poll
+            # interval so the first stop times out because the
+            # SIGTERM-resistant worker refuses to die, and the retry never
+            # inherits a leftover poll tail that would make its convergence
+            # depend on scheduler jitter.
             runtime,
             "SHUTDOWN_TIMEOUT",
             1.0,
