@@ -1646,6 +1646,11 @@ def test_linux_cli_uses_one_application_owner_through_failed_active_work_cleanup
                             **self.identities(),
                         )
                         if self.workers.active_count:
+                            # Cleanup must meet a worker that already ignores
+                            # SIGTERM, and the listener stop alone is too quick
+                            # to guarantee the worker got that far.
+                            while not worker_pid_file.exists() and time.monotonic() < deadline:
+                                time.sleep(0.01)
                             self.server.shutdown()
 
                     def cleanup_start_failure(self, deadline):
