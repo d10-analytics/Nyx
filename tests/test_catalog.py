@@ -2513,6 +2513,7 @@ HEX40 = "0123456789abcdef0123456789abcdef01234567"
 HEX64 = "0123456789abcdef" * 4
 BASELINE_FORMS = {
     "plain": (f"Baseline: {HEX40}", catalog.BaselineHead("declared", HEX40)),
+    "zero": (f"Baseline: {'0' * 40}", catalog.BaselineHead("declared", "0" * 40)),
     "bold": (f"**Baseline:** `{HEX40}` (note)", catalog.BaselineHead("declared", HEX40)),
     "dated": (f"Baseline: {HEX40} (2026-09-01)", catalog.BaselineHead("declared", HEX40)),
     "wide": (f"Baseline: {HEX64}", catalog.BaselineHead("declared", HEX64)),
