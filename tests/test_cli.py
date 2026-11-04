@@ -2526,6 +2526,47 @@ def _awaiting_state_text(merge_state: str) -> str:
         return models.code_status_text(fields)
 
 
+def _raise_rule_problems(guide: str) -> list[str]:
+    """What the guide gets wrong about the rule that raises an awaiting_merge item.
+
+    The rule belongs to Code Status of specification packages, so the
+    Needs attention bullet has to point at a statement that is really there.
+    """
+    from nyx import models
+
+    problems: list[str] = []
+    heading = "Code Status of specification packages"
+    body = _normalised(_subsection(guide, heading))
+    opening = "When every package"
+    closing = "the package scan is complete"
+    start = body.find(opening)
+    end = body.find(closing, start + len(opening)) if start != -1 else -1
+    if start == -1:
+        problems.append(f"{heading} does not state the rule that starts {opening!r}")
+    elif end == -1:
+        problems.append(f"{heading} does not state the rule that ends {closing!r}")
+    else:
+        sentence = body[start : end + len(closing)]
+        for merge_state in models._AWAITING_MERGE_STATES:
+            text = _awaiting_state_text(merge_state)
+            if text not in sentence:
+                problems.append(f"{heading} does not read {text!r} in the rule's condition")
+
+    pointer = next(
+        (
+            bullet
+            for bullet in _bullets(_subsection(guide, "Needs attention"))
+            if bullet.startswith("- `awaiting_merge`")
+        ),
+        None,
+    )
+    if pointer is None:
+        problems.append("Needs attention does not hold an `awaiting_merge` bullet")
+    elif heading not in _normalised(pointer):
+        problems.append(f"the `awaiting_merge` bullet does not name {heading!r}")
+    return problems
+
+
 def test_checkout_guide_states_the_raise_rule_only_after_the_code_status_heading():
     from nyx import models
 
@@ -2537,3 +2578,38 @@ def test_checkout_guide_states_the_raise_rule_only_after_the_code_status_heading
 
     for merge_state in (*models._AWAITING_MERGE_STATES, "superseded"):
         assert _awaiting_state_text(merge_state) not in before
+    assert _raise_rule_problems(_guide()) == []
+
+
+def _without_raise_rule(guide: str) -> str:
+    """The guide with the paragraph that states the raise rule removed."""
+    body = _subsection(guide, "Code Status of specification packages")
+    opening = body.index("When every package")
+    paragraph = body[opening : body.index("\n\n", opening)]
+    return guide.replace(paragraph, "")
+
+
+def _with_any_quantifier(guide: str) -> str:
+    """The guide with the rule's 'every package' quantifier weakened to 'any'."""
+    opening = "When every package"
+    assert guide.count(opening) == 1
+    return guide.replace(opening, "When any package")
+
+
+def _without_raise_rule_pointer(guide: str) -> str:
+    """The guide with the pointer removed from the awaiting_merge bullet."""
+    heading = "Code Status of specification packages"
+    body = _subsection(guide, "Needs attention")
+    bullet = next(bullet for bullet in _bullets(body) if bullet.startswith("- `awaiting_merge`"))
+    assert heading in bullet
+    return guide.replace(bullet, bullet.replace(heading, ""))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_without_raise_rule, _with_any_quantifier, _without_raise_rule_pointer],
+    ids=["rule paragraph deleted", "quantifier weakened", "pointer removed"],
+)
+def test_checkout_guide_raise_rule_check_rejects_a_broken_guide(mutate):
+    assert _raise_rule_problems(_guide()) == []
+    assert _raise_rule_problems(mutate(_guide()))
