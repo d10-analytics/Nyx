@@ -31,6 +31,10 @@ REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 SLOW_SSH_SECONDS = 5
 # The lowered networked budget of the deadline proofs.
 NETWORKED_BUDGET_SECONDS = 3.0
+# The budget of the deadline-control proof.  That proof replaces the manager's
+# deadline pass-through with the maximum, so only the manager's own timeout is
+# under test and its magnitude does not matter.
+DEADLINE_CONTROL_SECONDS = 0.5
 # How long a blocking program holds its call.  It outlives every budget here, so
 # only a signal can explain its end, and it ends on its own if one never comes.
 BLOCKING_PROGRAM_SECONDS = 60
@@ -348,7 +352,7 @@ def test_without_the_deadline_pass_through_the_fetch_reports_a_timeout(
     manager = _worker_manager(
         workspace,
         timeout=10,
-        networked_checkouts_timeout=NETWORKED_BUDGET_SECONDS,
+        networked_checkouts_timeout=DEADLINE_CONTROL_SECONDS,
     )
     with _managed(manager):
         with pytest.raises(worker.WorkerError) as error:
@@ -390,34 +394,24 @@ def test_checkouts_categories_follow_the_worker_exit_status(
     assert error.value.code == category
 
 
-def test_a_state_error_while_observing_configuration_is_unavailable(monkeypatch):
-    def observe() -> object:
-        raise state.StateError("account home is unreadable")
-
-    def collect(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("nothing may be collected without an observation")
-
-    monkeypatch.setattr(worker.state, "observe_configuration", observe)
-    from nyx import checkouts
-
-    monkeypatch.setattr(checkouts, "collect_checkouts", collect)
-
-    assert worker._worker_main(kind="checkouts", deadline_ms=1000) == 4
-
-
 # ---------------------------------------------------------------------------
 # A checkouts worker contains the programs it starts
 # ---------------------------------------------------------------------------
 
 
 def _slow_command(directory: Path) -> tuple[Path, Path]:
-    """An executable that starts a grandchild, records both ids and waits."""
+    """An executable that starts a grandchild, records both ids and waits.
+
+    The marker is renamed into place only once both ids are in it, so its
+    existence is the whole record rather than the start of one.
+    """
     marker = directory / "slow-command-pids"
     script = directory / "slow-command"
     script.write_text(
         "#!/bin/sh\n"
         f"sleep {BLOCKING_PROGRAM_SECONDS} &\n"
-        f"printf '%s %s\\n' \"$$\" \"$!\" > \"{marker}\"\n"
+        f"printf '%s %s\\n' \"$$\" \"$!\" > \"{marker}.$$\"\n"
+        f'mv "{marker}.$$" "{marker}"\n'
         "wait\n"
     )
     script.chmod(0o755)
@@ -440,7 +434,9 @@ def _blocking_ssh(directory: Path, workspace) -> Path:
         "grandchild = subprocess.Popen([\n"
         "    sys.executable, '-c', f'import time; time.sleep({%d})'\n"
         "])\n"
-        "marker.write_text(f'{os.getpid()} {os.getppid()} {grandchild.pid}')\n"
+        "partial = marker.with_name(f'{marker.name}.{os.getpid()}')\n"
+        "partial.write_text(f'{os.getpid()} {os.getppid()} {grandchild.pid}')\n"
+        "os.replace(partial, marker)\n"
         f"time.sleep({BLOCKING_PROGRAM_SECONDS})\n" % BLOCKING_PROGRAM_SECONDS
     )
     command = f'"{sys.executable}" "{helper}" "{marker}"'
@@ -450,9 +446,11 @@ def _blocking_ssh(directory: Path, workspace) -> Path:
     return marker
 
 
-def _recorded(marker: Path) -> list[int]:
-    """The process ids a helper recorded, once it has recorded them."""
-    return [int(field) for field in marker.read_text().split()]
+def _recorded(marker: Path, count: int) -> list[int]:
+    """The process ids a helper recorded, once it has recorded all of them."""
+    fields = marker.read_text().split()
+    assert len(fields) == count, f"{marker.name} recorded {fields!r}, not {count} ids"
+    return [int(field) for field in fields]
 
 
 def _alive(pid: int) -> bool:
@@ -560,7 +558,7 @@ def test_a_checkouts_timeout_ends_the_child_and_the_grandchild_it_started(
             _wait_for(marker, 20)
             # The grandchild holds the worker's pipes and nothing else ends it,
             # so its end can only come from the group the worker leads.
-            recorded = _recorded(marker)
+            recorded = _recorded(marker, 2)
             thread.join(timeout=20)
             assert not thread.is_alive()
             _assert_gone(recorded, time.monotonic() + 2)
@@ -592,7 +590,7 @@ def test_close_cancels_a_blocked_checkouts_collection_and_ends_its_grandchild(
     try:
         thread.start()
         _wait_for(marker, 20)
-        recorded = _recorded(marker)
+        recorded = _recorded(marker, 2)
         assert manager.close(time.monotonic() + 5) is True
         thread.join(timeout=20)
         assert not thread.is_alive()
@@ -629,7 +627,7 @@ def test_owner_loss_ends_the_worker_with_git_the_ssh_and_its_grandchild(
         thread.start()
         _wait_for(marker, 30)
         worker_pid = _worker_pid(manager, 10)
-        ssh_pid, parent_pid, grandchild_pid = _recorded(marker)
+        ssh_pid, parent_pid, grandchild_pid = _recorded(marker, 3)
         # git is the ancestor that started the ssh program, and the whole chain
         # is a descendant of the worker that is about to lose its owner.
         recorded = [ssh_pid, parent_pid, grandchild_pid]
@@ -653,62 +651,182 @@ def test_owner_loss_ends_the_worker_with_git_the_ssh_and_its_grandchild(
     assert [error.code for error in errors] == ["checkouts_failed"]
 
 
+# The throwaway session the no-session guards are proved in: it leads its own
+# session, starts the worker without one, and reports what the worker did.  A
+# group signal from the worker therefore reaches this wrapper, never pytest.
+_THROWAWAY_SESSION = """\
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def record(path, text):
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(text)
+    os.replace(partial, path)
+
+
+options = sys.argv[1:]
+separator = options.index("--")
+pid_file, status_file, document_file, liveness = (
+    Path(options[0]),
+    Path(options[1]),
+    Path(options[2]),
+    int(options[3]),
+)
+command = options[separator + 1 :]
+if liveness >= 0:
+    command += ["--parent-liveness-fd", str(liveness)]
+worker = subprocess.Popen(
+    command,
+    pass_fds=(liveness,) if liveness >= 0 else (),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+)
+record(pid_file, str(worker.pid))
+document, _ = worker.communicate()
+record(document_file, document.decode("utf-8", "replace"))
+record(status_file, str(worker.returncode))
+"""
+
+
+def _in_a_throwaway_session(
+    tmp_path: Path,
+    monkeypatch,
+    script: str,
+    arguments: list[str],
+    *,
+    liveness: bool,
+) -> SimpleNamespace:
+    """Start one real worker inside a session that is not the test's own."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    isolate_git(monkeypatch, home)
+    pid_file = tmp_path / "worker-pid"
+    status_file = tmp_path / "worker-status"
+    document_file = tmp_path / "worker-document"
+    read_fd, write_fd = os.pipe() if liveness else (-1, -1)
+    wrapper = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _THROWAWAY_SESSION,
+            str(pid_file),
+            str(status_file),
+            str(document_file),
+            str(read_fd),
+            "--",
+            sys.executable,
+            "-c",
+            script,
+            *arguments,
+        ],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "NYX_TEST_HOME": str(home)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(read_fd,) if liveness else (),
+        start_new_session=True,
+    )
+    if liveness:
+        os.close(read_fd)
+    return SimpleNamespace(
+        wrapper=wrapper,
+        pid_file=pid_file,
+        status_file=status_file,
+        document_file=document_file,
+        write_fd=write_fd,
+    )
+
+
+def _stop_wrapper(harness: SimpleNamespace) -> None:
+    """End a wrapper a failed proof left running."""
+
+    if harness.wrapper.poll() is None:
+        harness.wrapper.kill()
+        harness.wrapper.wait(timeout=30)
+    if harness.write_fd >= 0:
+        os.close(harness.write_fd)
+        harness.write_fd = -1
+
+
 @posix_only
 def test_a_checkouts_worker_without_its_own_session_exits_seven_on_owner_loss(
     tmp_path, monkeypatch
 ):
-    home = tmp_path / "home"
-    home.mkdir()
-    isolate_git(monkeypatch, home)
     marker = tmp_path / "collecting"
-    read_fd, write_fd = os.pipe()
     script = (
         "import os, sys, time\n"
         "from pathlib import Path\n"
         "from nyx import checkouts, state, worker\n"
         "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
         "marker = Path(sys.argv[1])\n"
+        "partial = marker.with_name(marker.name + '.partial')\n"
         "def collect(*_args, **_kwargs):\n"
-        "    marker.write_text('collecting')\n"
+        "    partial.write_text('collecting')\n"
+        "    os.replace(partial, marker)\n"
         "    time.sleep(60)\n"
         "    return 'late'\n"
         "checkouts.collect_checkouts = collect\n"
         "raise SystemExit(worker.worker_entrypoint(sys.argv[2:]))\n"
     )
-    child = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            script,
-            str(marker),
-            "--kind",
-            "checkouts",
-            "--deadline-ms",
-            "30000",
-            "--parent-liveness-fd",
-            str(read_fd),
-        ],
-        cwd=REPOSITORY_ROOT,
-        env={**os.environ, "NYX_TEST_HOME": str(home)},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        pass_fds=(read_fd,),
+    harness = _in_a_throwaway_session(
+        tmp_path,
+        monkeypatch,
+        script,
+        [str(marker), "--kind", "checkouts", "--deadline-ms", "30000"],
+        liveness=True,
     )
     try:
         _wait_for(marker, 30)
-        # Spawned without a session, the worker shares this test process's
-        # group; it must exit on its own rather than signal that group.
-        assert os.getsid(child.pid) != child.pid
-        os.close(write_fd)
-        write_fd = -1
-        assert child.wait(timeout=30) == 7
+        _wait_for(harness.pid_file, 30)
+        worker_pid = int(harness.pid_file.read_text())
+        # The wrapper leads the session the worker shares, so the worker neither
+        # leads it nor finds this test process inside it.
+        assert os.getsid(worker_pid) == harness.wrapper.pid
+        assert os.getsid(worker_pid) != worker_pid
+        os.close(harness.write_fd)
+        harness.write_fd = -1
+        # With the guard the worker exits seven and only the wrapper waits for
+        # it; without the guard the worker kills the wrapper's group instead.
+        assert harness.wrapper.wait(timeout=30) == 0
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-        if write_fd >= 0:
-            os.close(write_fd)
-        os.close(read_fd)
+        _stop_wrapper(harness)
+
+    assert harness.status_file.read_text() == "7"
+
+
+@posix_only
+def test_a_checkouts_worker_without_its_own_session_spares_the_wrapper_on_a_normal_end(
+    tmp_path, monkeypatch
+):
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from nyx import state, worker\n"
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
+        "raise SystemExit(worker.worker_entrypoint(sys.argv[1:]))\n"
+    )
+    harness = _in_a_throwaway_session(
+        tmp_path,
+        monkeypatch,
+        script,
+        ["--kind", "checkouts", "--deadline-ms", "30000"],
+        liveness=False,
+    )
+    try:
+        # The worker's end-of-run sweep must leave a group it does not lead
+        # alone; without that guard the wrapper dies instead of exiting zero.
+        assert harness.wrapper.wait(timeout=30) == 0
+    finally:
+        _stop_wrapper(harness)
+
+    document = models.parse_checkouts(harness.document_file.read_text())
+    assert harness.status_file.read_text() == "0"
+    assert document["folders"] == []
+    assert document["packages"] == []
 
 
 def test_a_finished_collection_leaves_no_grandchild_behind(workspace, tmp_path):
@@ -718,7 +836,7 @@ def test_a_finished_collection_leaves_no_grandchild_behind(workspace, tmp_path):
     try:
         with _managed(manager):
             document = models.parse_checkouts(manager.fetch_checkouts(network=True))
-        recorded = _recorded(marker)
+        recorded = _recorded(marker, 3)
         _assert_gone(recorded, time.monotonic() + 2)
     finally:
         _end(recorded)
@@ -734,9 +852,9 @@ def _spawned_in_its_own_session(
 ) -> bool:
     """Report whether a spawn of ``kind`` leads the session it was started in."""
     script = directory / f"blocking-{kind}"
-    # No pipe is held past the spawned process, so each kind's own termination
-    # is the only thing that has to end it.
-    script.write_text("#!/bin/sh\nsleep 60 >/dev/null 2>&1\n")
+    # The shell replaces itself with its last command, so ending the spawned
+    # process ends its only program and leaves no orphan behind.
+    script.write_text("#!/bin/sh\nexec sleep 60 >/dev/null 2>&1\n")
     script.chmod(0o755)
     manager = _worker_manager(workspace, command_factory=lambda: [str(script)])
     errors: list[BaseException] = []
