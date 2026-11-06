@@ -87,6 +87,7 @@ from .models import (
     worktree_sort_key,
 )
 from .state import (
+    ConfigurationObservation,
     StateError,
     _is_reparse_or_link,
     checkout_cache_path,
@@ -4159,6 +4160,41 @@ class PackageScan:
 
     spec_root: Path | None
     completed_stage_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CollectionInputs:
+    """Everything one collection needs from the account state, derived once."""
+
+    folders: tuple[str, ...]
+    github_lookup: bool
+    package_scan: PackageScan | None
+
+
+def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs | None:
+    """Derive one collection's inputs from one configuration observation.
+
+    ``None`` means the record is unavailable, so no document can be collected.
+    A not-configured account collects no folder and scans no package, and its
+    document then says so instead of inventing a workspace. A configured
+    record supplies its folders, its GitHub switch and the package scan of its
+    specification root. Callers keep their own answers to these facts: a
+    command line may report that no folder is configured while a service still
+    publishes the empty document.
+    """
+    if observation.status == "unavailable":
+        return None
+    configuration = observation.configuration
+    if configuration is None:
+        return CollectionInputs(folders=(), github_lookup=False, package_scan=None)
+    return CollectionInputs(
+        folders=configuration.checkout_folders,
+        github_lookup=configuration.checkout_github_lookup,
+        package_scan=PackageScan(
+            configuration.specification_root,
+            configuration.completed_stage_names,
+        ),
+    )
 
 
 def _scan_packages(package_scan: PackageScan | None) -> PackageHeads | None:
