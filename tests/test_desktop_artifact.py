@@ -1011,7 +1011,10 @@ def _checkout_home(root: Path) -> tuple[Path, Path, Path, Path]:
     folder = root / "checkouts"
     folder.mkdir()
     clone = _fixture_clone(folder)
-    _write_configuration(home, workspace, checkout_folders=(folder,))
+    # The record's GitHub switch is on, so the document must carry it through.
+    _write_configuration(
+        home, workspace, checkout_folders=(folder,), github_lookup=True
+    )
     return home, decoy, folder, clone
 
 
@@ -1066,7 +1069,7 @@ def test_delivered_worker_helper_collects_checkouts_without_git_on_its_path(
     document = models.parse_checkouts(completed.stdout)
     assert document["folders"] == [{"path": str(folder.resolve()), "status": "ok"}]
     assert document["remote_checks"] == "off"
-    assert document["github_lookup"] == "off"
+    assert document["github_lookup"] == "on"
     if os.name == "nt":
         # Git for Windows is not in System32, so the sanitized PATH lacks git.
         assert document["git"] == {"status": "missing", "version": None}
