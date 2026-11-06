@@ -26,10 +26,9 @@ from unittest.mock import MagicMock, patch
 import native_ui
 import pytest
 
-from nyx import state
+from nyx import models, state, worker
 from nyx._native_claim import NativeClaim
 from nyx.catalog import scan_catalog
-from nyx.worker import CatalogWorkerManager
 
 _ARTIFACT_REQUIRED = os.environ.get("NYX_REQUIRE_NATIVE_DESKTOP") == "1"
 _ARTIFACT_ENV = os.environ.get("NYX_DESKTOP_ARTIFACT")
@@ -130,8 +129,27 @@ def _sanitized_environment(home: Path, decoy: Path) -> dict[str, str]:
 def _write_configuration(
     home: Path,
     workspace: Path,
+    *,
+    checkout_folders: tuple[Path, ...] = (),
+    github_lookup: bool = False,
 ) -> tuple[Path, state.Configuration]:
-    configuration = state.Configuration(workspace.resolve())
+    """Write the schema 4 record of one workspace.
+
+    ``checkout_folders`` adds the workspace's checkout settings, keyed by the
+    record's own root, so a checkout collection reads the same record the
+    catalog does.
+    """
+
+    specification_root = workspace.resolve()
+    checkout_settings: dict[str, state.CheckoutSettings] = {}
+    if checkout_folders:
+        checkout_settings[str(specification_root)] = state.CheckoutSettings(
+            tuple(sorted(str(folder.resolve()) for folder in checkout_folders)),
+            github_lookup,
+        )
+    configuration = state.Configuration(
+        specification_root, checkout_settings=checkout_settings
+    )
     config_directory = home / ".nyx" / "config"
     config_directory.mkdir(parents=True, exist_ok=True)
     config_file = config_directory / "config.json"
@@ -902,7 +920,7 @@ def test_delivered_worker_helper_completes_with_inherited_claims(artifact: Artif
             claim = NativeClaim(recovery_path)
             assert claim.acquire(blocking=False)
             read_fd, write_fd = os.pipe()
-            manager = CatalogWorkerManager(
+            manager = worker.CatalogWorkerManager(
                 command_factory=lambda: [str(artifact.helper)],
                 timeout=30,
                 recovery_claim=claim,
@@ -923,6 +941,200 @@ def test_delivered_worker_helper_completes_with_inherited_claims(artifact: Artif
     assert catalog == expected_text.encode("utf-8")
     assert manager.active_count == 0
     assert not claim.held
+
+
+# The collector deadline production's 30-second checkouts budget derives: the
+# budget less the worker's 1.5-second start reserve.
+_CHECKOUTS_DEADLINE_MS = 28_500
+
+
+def _fixture_git_program() -> Path:
+    """Return the test process's own git, which builds the fixture repository.
+
+    The delivered helper never uses this program directly; it only needs the
+    directory holding it, and on Windows that directory must hold ``git.exe``.
+    """
+
+    found = shutil.which("git.exe" if os.name == "nt" else "git")
+    assert found is not None, "the host must provide git to build a checkout fixture"
+    return Path(found)
+
+
+def _fixture_git(cwd: Path, *arguments: str) -> None:
+    """Run the fixture git to completion, failing the test on any refusal."""
+
+    result = subprocess.run(
+        [str(_fixture_git_program()), *arguments],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"fixture git {arguments} failed: {result.stderr}"
+
+
+def _fixture_clone(folder: Path) -> Path:
+    """Create one committed repository inside ``folder`` with the test's git."""
+
+    repository = folder / "Fixture Clone"
+    repository.mkdir()
+    _fixture_git(repository, "init", "-q", "-b", "trunk")
+    (repository / "README.md").write_text("A fixture checkout.\n", encoding="utf-8")
+    _fixture_git(repository, "add", "README.md")
+    # The identity is carried on the command line so the fixture needs no
+    # account-wide git configuration on the test host.
+    _fixture_git(
+        repository,
+        "-c",
+        "user.name=Nyx Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "fixture",
+    )
+    return repository
+
+
+def _checkout_home(root: Path) -> tuple[Path, Path, Path, Path]:
+    """Write a record whose checkout settings list one folder with one clone.
+
+    The folder and its repository are created by this test process with its own
+    git, so the delivered helper reads only the record under test.
+    """
+
+    home = root / "home"
+    home.mkdir()
+    decoy = _inert_path(root)
+    workspace = root / "workspace"
+    workspace.mkdir()
+    folder = root / "checkouts"
+    folder.mkdir()
+    clone = _fixture_clone(folder)
+    _write_configuration(home, workspace, checkout_folders=(folder,))
+    return home, decoy, folder, clone
+
+
+def _checkouts_environment(home: Path, decoy: Path, *, with_git: bool) -> dict[str, str]:
+    """Return the sanitized environment, optionally with the host git on its PATH."""
+
+    environment = _sanitized_environment(home, decoy)
+    if with_git:
+        environment["PATH"] = os.pathsep.join(
+            [environment["PATH"], str(_fixture_git_program().parent)]
+        )
+    return environment
+
+
+def _run_helper_checkouts(
+    helper: Path, root: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the delivered helper's checkouts kind under ``environment``."""
+
+    return subprocess.run(
+        [str(helper), "--kind", "checkouts", "--deadline-ms", str(_CHECKOUTS_DEADLINE_MS)],
+        cwd=str(root),
+        env=environment,
+        capture_output=True,
+    )
+
+
+def _without_observation(document: dict) -> dict:
+    """Return a parsed document without its collection timestamp."""
+
+    return {key: value for key, value in document.items() if key != "observed_at"}
+
+
+def test_delivered_worker_helper_collects_checkouts_without_git_on_its_path(
+    artifact: ArtifactLayout,
+):
+    """The delivered helper answers the checkouts kind under the system PATH.
+
+    On Windows that PATH holds no git, so the document reports git missing and
+    lists no repository; either way the helper exits 0 with a document the
+    parser accepts.
+    """
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, decoy, folder, _ = _checkout_home(root)
+        completed = _run_helper_checkouts(
+            artifact.helper, root, _checkouts_environment(home, decoy, with_git=False)
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    assert document["folders"] == [{"path": str(folder.resolve()), "status": "ok"}]
+    assert document["remote_checks"] == "off"
+    assert document["github_lookup"] == "off"
+    if os.name == "nt":
+        # Git for Windows is not in System32, so the sanitized PATH lacks git.
+        assert document["git"] == {"status": "missing", "version": None}
+        assert document["repositories"] == []
+
+
+def test_delivered_worker_helper_lists_a_clone_when_git_is_on_its_path(
+    artifact: ArtifactLayout,
+):
+    """The same delivered helper lists the fixture clone once git is on PATH."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, decoy, _, clone = _checkout_home(root)
+        completed = _run_helper_checkouts(
+            artifact.helper, root, _checkouts_environment(home, decoy, with_git=True)
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    document = models.parse_checkouts(completed.stdout)
+    assert document["git"]["status"] == "available"
+    [repository] = document["repositories"]
+    assert [(item["path"], item["status"]) for item in repository["clones"]] == [
+        (str(clone.resolve()), "ok")
+    ]
+
+
+def test_delivered_worker_helper_serves_checkouts_through_the_manager(
+    artifact: ArtifactLayout,
+):
+    """Drive the delivered helper's checkouts kind the way the delivered shell does."""
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, decoy, _, _ = _checkout_home(root)
+        environment = _checkouts_environment(home, decoy, with_git=False)
+        direct = _run_helper_checkouts(artifact.helper, root, environment)
+        assert direct.returncode == 0, direct.stderr
+        _, recovery_path = _claim_paths(home)
+        recovery_path.parent.mkdir(parents=True, exist_ok=True)
+        claim = NativeClaim(recovery_path)
+        assert claim.acquire(blocking=False)
+        read_fd, write_fd = os.pipe()
+        # The production checkouts budget derives the deadline the direct run
+        # names, so both runs collect under the same collector deadline.
+        assert worker._deadline_ms(worker.CHECKOUTS_TIMEOUT) == _CHECKOUTS_DEADLINE_MS
+        manager = worker.CatalogWorkerManager(
+            command_factory=lambda: [str(artifact.helper)],
+            recovery_claim=claim,
+            recovery_path=claim.path,
+            parent_liveness_fd=read_fd,
+        )
+        try:
+            with patch.dict(os.environ, environment, clear=True):
+                collected = manager.fetch_checkouts(network=False)
+            assert manager.close(time.monotonic() + 30)
+            assert claim.held
+        finally:
+            manager.close(time.monotonic() + 30)
+            os.close(write_fd)
+            os.close(read_fd)
+            claim.close()
+
+    assert manager.active_count == 0
+    assert not claim.held
+    assert _without_observation(models.parse_checkouts(collected)) == _without_observation(
+        models.parse_checkouts(direct.stdout)
+    )
 
 
 def test_delivered_gui_never_answers_worker_inheritance_with_a_window(artifact: ArtifactLayout):
