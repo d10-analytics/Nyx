@@ -31,6 +31,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     local_names,
     make_remote,
     nyx_home,
+    object_files,
     outer_github_environment,
     path_with,
     point_origin_at,
@@ -1255,6 +1256,22 @@ def assert_remote(
     assert remote["state"] == state
     assert remote["sha"] == sha
     assert remote["basis"] == basis
+
+
+def remote_verdict_of(
+    document: dict[str, Any], member: Path, name: str = "topic"
+) -> dict[str, Any] | None:
+    """The remote verdict of one package branch entry, with its shape checked."""
+    (entry,) = [e for e in repository_of(document, member)["package_branches"] if e["name"] == name]
+    assert set(entry) == models._PACKAGE_BRANCH_ENTRY_KEYS
+    verdict = entry["remote_verdict"]
+    if verdict is not None:
+        assert set(verdict) == models._VERDICT_KEYS
+    return verdict
+
+
+def remote_unknown(reason: str) -> dict[str, Any]:
+    return {"state": "unknown", "rung": None, "reason": reason, "pull_request": None}
 
 
 class RemoteWorld:
@@ -2543,6 +2560,114 @@ def test_the_pull_request_query_names_a_package_branch_no_clone_holds(
     assert branch_pr_facts(local_alone) == facts
 
 
+# ---------------------------------------------------------------------------
+# Remote-only verdicts: a merged request proves a tip no clone holds
+# ---------------------------------------------------------------------------
+
+
+@posix_only
+def test_a_remote_only_tip_reads_the_lowest_merged_request_into_the_default_base(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    tip = w.push_from_outside("topic")
+    w.branch(w.a, "settled", push=True)
+    assert rev(w.a, "topic") != tip, "control: no configured clone holds the pushed tip"
+    for name in ("topic", "settled"):
+        w.package(name, name)
+    w.github()
+    names = sorted(set(local_names(w.a, w.b)) | {"topic", "settled"})
+    fake = install_fake_gh(tmp_path, monkeypatch)
+    members = (w.a, w.b)
+    before = {member: object_files(member) for member in members}
+
+    # A merged request into another base proves nothing for this branch.
+    fake.replay(
+        stdout=pr_answer(names, {"topic": [pr_node(2, "merged", tip, base="release")]})
+    )
+    elsewhere = w.collect(github_lookup=True)
+
+    assert_remote(remote_of(elsewhere, w.a), "present", tip, "live")
+    assert remote_verdict_of(elsewhere, w.a) == remote_unknown("objects_missing")
+    # A package branch whose remote tip equals a local copy's has no remote verdict.
+    assert remote_verdict_of(elsewhere, w.a, "settled") is None
+
+    # The lowest merged request into the default base decides, not the first listed
+    # and not a lower request into another base.
+    fake.replay(
+        stdout=pr_answer(
+            names,
+            {
+                "topic": [
+                    pr_node(5, "merged", tip),
+                    pr_node(3, "merged", tip),
+                    pr_node(2, "merged", tip, base="release"),
+                ]
+            },
+        )
+    )
+    proved = w.collect(github_lookup=True)
+
+    assert remote_verdict_of(proved, w.a) == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 3,
+    }
+    assert remote_verdict_of(proved, w.a, "settled") is None
+    assert {member: object_files(member) for member in members} == before
+
+
+@posix_only
+def test_without_a_remote_head_the_one_clone_base_name_proves_the_remote_only_tip(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    tip = w.push_from_outside("topic")
+    git(w.a, "push", "-q", "origin", "trunk:master")
+    for member in (w.a, w.b):
+        git(member, "fetch", "-q", "origin")
+    git(w.a, "remote", "set-head", "origin", "trunk")
+    git(w.b, "remote", "set-head", "origin", "master")
+    # The bare remote's HEAD names a branch the remote does not have.
+    git(w.remote, "symbolic-ref", "HEAD", "refs/heads/gone")
+    w.package("topic", "topic")
+    w.github()
+    install_fake_gh(
+        tmp_path,
+        monkeypatch,
+        stdout=pr_answer(
+            sorted(set(local_names(w.a, w.b)) | {"topic"}),
+            # Either clone's base name would match one of these two requests, so the
+            # split below is skipped for naming several, not for lacking a proof.
+            {
+                "topic": [
+                    pr_node(7, "merged", tip),
+                    pr_node(6, "merged", tip, base="master"),
+                ]
+            },
+        ),
+    )
+
+    split = w.collect(github_lookup=True)
+
+    repository = repository_of(split, w.a)
+    assert repository["default_branch"] == {"name": None, "sha": None}
+    assert {
+        clone_at(split, member)["verdict_base"]["name"] for member in (w.a, w.b)
+    } == {"trunk", "master"}
+    assert remote_verdict_of(split, w.a) == remote_unknown("objects_missing")
+
+    git(w.b, "remote", "set-head", "origin", "trunk")
+    agreed = w.collect(github_lookup=True)
+
+    assert {
+        clone_at(agreed, member)["verdict_base"]["name"] for member in (w.a, w.b)
+    } == {"trunk"}
+    assert remote_verdict_of(agreed, w.a) == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 7,
+    }
+
+
 def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
     status_world, tmp_path
 ):
@@ -3393,13 +3518,13 @@ def give_no_commits(name: str):
     return change
 
 
-def test_schema_7_is_accepted_schema_6_refused_and_no_commits_yet_is_strict(status_document):
+def test_schema_8_is_accepted_schema_7_refused_and_no_commits_yet_is_strict(status_document):
     """One collection serves every proof: each case mutates its own copy."""
-    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 7
-    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 7
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 8
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 8
 
     old = doc_copy(status_document)
-    old["schema_version"] = 6
+    old["schema_version"] = 7
     assert refusal_of(old) == "unsupported schema version"
 
     document = doc_copy(status_document)
