@@ -9,13 +9,14 @@ denied. The one exception is the optional remote check: a single
 denial (so git applies the user's own transport policy and credentials), and it
 transfers no objects. When the active workspace turns GitHub lookup on, the same
 phase also makes one ``gh api graphql`` request per GitHub repository, asking for
-the pull requests of its local branch names; it runs the user's own ``gh`` with
-the user's credentials, is never retried, and a missing or failing ``gh`` only
-marks that repository's lookup unavailable. A merged pull request into the verdict
-base, whose head branch is a local branch at a commit, proves that commit merged
-when the request's head is the commit or has it as an ancestor; the ancestry test
-reads only objects already on disk, in the clone or a sibling clone of the same
-remote, and such a verdict is never remembered.
+the pull requests of its local branch names and of the branch names packages
+declare for it; it runs the user's own ``gh`` with the user's credentials, is
+never retried, and a missing or failing ``gh`` only marks that repository's
+lookup unavailable. A merged pull request into the verdict base, whose head branch
+is a local branch at a commit, proves that commit merged when the request's head
+is the commit or has it as an ancestor; the ancestry test reads only objects
+already on disk, in the clone or a sibling clone of the same remote, and such a
+verdict is never remembered.
 """
 
 from __future__ import annotations
@@ -2057,7 +2058,9 @@ def _check_remotes(
     """Phase 2 (one query per remote, and one ``gh`` call per GitHub repository when
     lookup is on; none when ``remote_checks`` is off) then phase 3 (per-clone
     comparisons, on the live answer or, when the check is off or failed, on the
-    remote's saved ``heads``).
+    remote's saved ``heads``). A group's one ``gh`` call asks about the union of its
+    usable clones' local branch names and the branch names ``package_names`` holds
+    for it, so a package branch that no clone holds has pull requests too.
 
     Returns the verdict base of each clone the comparisons reached, the pull
     requests per head branch name for each remote key whose lookup answered or
@@ -2095,6 +2098,7 @@ def _check_remotes(
                 if clone["status"] == "ok"
                 for branch in clone["branches"]
             }
+            names.update(package_names.get(group["remote"]["key"], ()))
             lookups.append((group, sorted(names)))
     # Resolved once, and only when a call will be made.
     gh = _resolve_program("gh") if lookups else None
