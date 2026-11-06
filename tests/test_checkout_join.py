@@ -2865,13 +2865,19 @@ class HolderWorld:
     """One remote with four clones in the folder: A (the target of every package), B,
     a shallow clone whose path sorts first, and a clone with no verdict base.
 
-    Every package branch has no local copy. ``topic`` is squash-merged with A's tracking
-    ref kept; ``topic2`` is squash-merged with A's tracking ref deleted and the shallow
-    clone holding it; ``base-less-shared`` is squash-merged, held by A and the base-less
-    clone; ``base-less-only`` is squash-merged and only the base-less clone holds it.
-    ``empty-pushed`` has no commit of its own, ``fast-forward`` was fast-forward merged
-    and ``merge-commit`` was merged by a merge commit. One module-scoped build serves
-    every collection the holder rules are proved with.
+    Every package branch of the first root has no local copy. ``topic`` is squash-merged
+    with A's tracking ref kept; ``topic2`` is squash-merged with A's tracking ref deleted
+    and the shallow clone holding it; ``base-less-shared`` is squash-merged, held by A and
+    the base-less clone; ``base-less-only`` is squash-merged and only the base-less clone
+    holds it. ``empty-pushed`` has no commit of its own, ``fast-forward`` was fast-forward
+    merged and ``merge-commit`` was merged by a merge commit. A second root names one
+    branch per remote-copy Code Status rule: ``topic-r`` has an open request, ``unheld``
+    no holder and no request, ``pr-proved`` a merged request, ``merged-behind`` a local
+    copy behind a remote another clone merged by a merge commit,
+    ``squash-then-extended`` a squash-merged local copy under an extended remote copy,
+    and ``waiting-remote`` a finished package's branch a clone holds and judges not
+    merged. One module-scoped build serves every collection the holder rules are proved
+    with.
     """
 
     names = (
@@ -2882,6 +2888,14 @@ class HolderWorld:
         "merge-commit",
         "base-less-shared",
         "base-less-only",
+    )
+    extra_names = (
+        "merged-behind",
+        "squash-then-extended",
+        "topic-r",
+        "unheld",
+        "pr-proved",
+        "waiting-remote",
     )
 
     def __init__(self, base: Path) -> None:
@@ -2972,6 +2986,85 @@ class HolderWorld:
             "origin",
             "+refs/heads/topic2:refs/remotes/origin/topic2",
         )
+        # A squash-merges a branch it keeps locally, and the remote copy gains one commit
+        # that B holds only through its tracking ref.
+        name = "squash-then-extended"
+        git(w.a, "checkout", "-q", "-b", name, "trunk")
+        w.commit(w.a)
+        w.commit(w.a)
+        git(w.a, "push", "-q", "origin", name)
+        git(w.a, "checkout", "-q", "trunk")
+        git(w.a, "merge", "-q", "--squash", name)
+        git(w.a, "commit", "-q", "-m", f"land {name}")
+        git(w.a, "push", "-q", "origin", "trunk")
+        git(w.outside, "fetch", "-q", "origin")
+        git(w.outside, "checkout", "-q", "-B", name, f"origin/{name}")
+        w.commit(w.outside)
+        w.sha[name] = rev(w.outside, name)
+        git(w.outside, "push", "-q", "origin", name)
+        git(w.outside, "checkout", "-q", "trunk")
+        git(
+            w.b,
+            "fetch",
+            "-q",
+            "origin",
+            "+refs/heads/trunk:refs/remotes/origin/trunk",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+        )
+        # A keeps a local copy the remote moves past; B merges the remote tip by a merge
+        # commit and deletes its own copy, so it holds the tip only by its tracking ref.
+        name = "merged-behind"
+        git(w.a, "checkout", "-q", "-b", name, "trunk")
+        w.commit(w.a)
+        w.commit(w.a)
+        git(w.a, "push", "-q", "origin", name)
+        git(w.a, "checkout", "-q", "trunk")
+        git(w.outside, "fetch", "-q", "origin")
+        git(w.outside, "checkout", "-q", "-B", name, f"origin/{name}")
+        w.commit(w.outside)
+        w.sha[name] = rev(w.outside, name)
+        git(w.outside, "push", "-q", "origin", name)
+        git(w.outside, "checkout", "-q", "trunk")
+        git(
+            w.b,
+            "fetch",
+            "-q",
+            "origin",
+            "+refs/heads/trunk:refs/remotes/origin/trunk",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+        )
+        git(w.b, "checkout", "-q", "trunk")
+        git(w.b, "merge", "-q", "--ff-only", "origin/trunk")
+        git(w.b, "checkout", "-q", "-B", name, f"origin/{name}")
+        git(w.b, "checkout", "-q", "trunk")
+        git(w.b, "merge", "-q", "--no-ff", "-m", f"merge {name}", name)
+        git(w.b, "push", "-q", "origin", "trunk")
+        git(w.b, "branch", "-q", "-D", name)
+        # A branch B holds only through its tracking ref and judges not merged.
+        name = "waiting-remote"
+        git(w.outside, "fetch", "-q", "origin")
+        git(w.outside, "checkout", "-q", "-B", name, "origin/trunk")
+        w.commit(w.outside)
+        w.sha[name] = rev(w.outside, name)
+        git(w.outside, "push", "-q", "origin", name)
+        git(w.outside, "checkout", "-q", "trunk")
+        git(
+            w.b,
+            "fetch",
+            "-q",
+            "origin",
+            "+refs/heads/trunk:refs/remotes/origin/trunk",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}",
+        )
+        # Branches no configured clone ever fetches: one with an open request, one with
+        # none, and one a merged request proves.
+        for name in ("unheld", "topic-r", "pr-proved"):
+            git(w.outside, "fetch", "-q", "origin")
+            git(w.outside, "checkout", "-q", "-B", name, "origin/trunk")
+            w.commit(w.outside)
+            w.sha[name] = rev(w.outside, name)
+            git(w.outside, "push", "-q", "origin", name)
+            git(w.outside, "checkout", "-q", "trunk")
         for member in (w.a, w.b, w.s, w.n):
             point_origin_at(member, w.remote, GITHUB_URL)
         w.root = base / "spec"
@@ -2988,6 +3081,13 @@ class HolderWorld:
         for name in ("topic", "topic2"):
             make_package(
                 w.squash_root, "Drafts", name, f"Target repo: {w.a}\nBranch: {name}\n"
+            )
+        w.extra_root = base / "extra-spec"
+        for name in w.extra_names:
+            # The finished package waits for a merge no request proves.
+            stage = "Shipped" if name == "waiting-remote" else "Drafts"
+            make_package(
+                w.extra_root, stage, name, f"Target repo: {w.a}\nBranch: {name}\n"
             )
 
     def collect(self, root: Path | None, **options: Any) -> dict[str, Any]:
@@ -3062,6 +3162,24 @@ def holder_world(tmp_path_factory):
         w.github = w.collect(w.root, remote_checks=True, github_lookup=True)
         fake.replay(stdout=pr_answer(sorted(local_names(w.a, w.b, w.s, w.n)), {}))
         w.plain_github = w.collect(None, remote_checks=True, github_lookup=True)
+        # The remote-copy Code Status cases share one more collection of the same world,
+        # with the live listing that answers their open and their merged request.
+        requested = sorted(set(local_names(w.a, w.b, w.s, w.n)) | set(w.extra_names))
+        fake.replay(
+            stdout=pr_answer(
+                requested,
+                {
+                    "topic-r": [pr_node(4, "open", w.sha["topic-r"])],
+                    "pr-proved": [pr_node(6, "merged", w.sha["pr-proved"])],
+                },
+            )
+        )
+        w.extra = w.collect(
+            w.extra_root,
+            completed=FINISHED_STAGES,
+            remote_checks=True,
+            github_lookup=True,
+        )
     return w
 
 
@@ -3217,6 +3335,134 @@ def test_every_holder_collection_leaves_every_local_branch_unchanged(holder_worl
         assert local_verdicts(with_packages) == local_verdicts(without_packages)
 
 
+# ---------------------------------------------------------------------------
+# The Code Status of a remote copy whose tip no local copy holds
+# ---------------------------------------------------------------------------
+
+
+@posix_only
+def test_a_remote_only_branch_reads_its_open_request_from_the_listing(holder_world):
+    w = holder_world
+    repository = repository_of(w.extra, w.a)
+    assert not any(
+        branch["name"] == "topic-r"
+        for clone in repository["clones"]
+        for branch in clone["branches"]
+    ), "control: no local copy lists the request, so the listing alone proves it"
+
+    assert_status(w.extra, "topic-r", "PR #4 open", "pr_open", push="pushed", pull_request=4)
+
+
+@posix_only
+def test_a_remote_only_tip_no_clone_holds_reads_merge_state_unknown(holder_world):
+    w = holder_world
+
+    assert remote_verdict_of(w.extra, w.a, "unheld") == remote_unknown("objects_missing")
+    assert_status(w.extra, "unheld", "merge state unknown", "unknown")
+
+
+@posix_only
+def test_a_merged_request_proves_a_remote_only_tip_merged(holder_world):
+    w = holder_world
+
+    assert remote_verdict_of(w.extra, w.a, "pr-proved") == {
+        "state": "merged",
+        "rung": "pull_request",
+        "reason": None,
+        "pull_request": 6,
+    }
+    # Nothing local is left to clean, so the status is plain merged; collect_packages
+    # parsed it, so the document is valid.
+    assert_status(
+        w.extra, "pr-proved", "merged", "merged", cleanup={"worktrees": 0, "branches": 0}
+    )
+
+
+@posix_only
+def test_a_local_copy_behind_a_merged_remote_the_other_clone_holds_reads_cleanup_pending(
+    holder_world,
+):
+    w = holder_world
+    (local_copy,) = [
+        branch
+        for branch in clone_at(w.extra, w.a)["branches"]
+        if branch["name"] == "merged-behind"
+    ]
+    remote = remote_of(w.extra, w.a, "merged-behind")
+    assert remote["sha"] == w.sha["merged-behind"], (
+        "control: the remote moved past the local copy"
+    )
+    assert local_copy["sha"] != remote["sha"], "control: the tips differ"
+    # The other clone holds the tip only through its tracking ref, and merged it by a
+    # merge commit, so it is off its base's first-parent history.
+    assert not any(
+        branch["name"] == "merged-behind" for branch in clone_at(w.extra, w.b)["branches"]
+    ), "control: the other clone has no local copy"
+    assert rev(w.b, "refs/remotes/origin/merged-behind") == w.sha["merged-behind"]
+    assert remote_verdict_of(w.extra, w.a, "merged-behind") == MERGED_ANCESTOR
+
+    assert_status(
+        w.extra,
+        "merged-behind",
+        f"merged {DOT} cleanup pending (1 branch)",
+        "merged",
+        cleanup={"worktrees": 0, "branches": 1},
+    )
+
+
+@posix_only
+def test_a_squash_merged_local_copy_behind_an_extended_remote_reads_pushed(holder_world):
+    w = holder_world
+    remote = remote_of(w.extra, w.a, "squash-then-extended")
+    assert remote["sha"] == w.sha["squash-then-extended"]
+    assert relation_of(w.extra, w.a, "squash-then-extended") == ("behind", 0, 1)
+    assert not any(
+        branch["name"] == "squash-then-extended"
+        for branch in clone_at(w.extra, w.b)["branches"]
+    ), "control: the other clone has no local copy"
+    assert rev(w.b, "refs/remotes/origin/squash-then-extended") == w.sha[
+        "squash-then-extended"
+    ]
+    verdict = remote_verdict_of(w.extra, w.a, "squash-then-extended")
+    assert (verdict["state"], verdict["rung"]) == ("not_merged", "none")
+
+    assert_status(
+        w.extra,
+        "squash-then-extended",
+        f"in progress {DOT} pushed",
+        "in_progress",
+        push="pushed",
+    )
+
+
+@posix_only
+def test_a_finished_package_waiting_for_a_remote_only_branch_reads_awaiting_merge(
+    holder_world,
+):
+    w = holder_world
+    assert not any(
+        branch["name"] == "waiting-remote" for branch in clone_at(w.extra, w.a)["branches"]
+    ), "control: A has no local copy of the finished package's branch"
+    assert remote_verdict_of(w.extra, w.a, "waiting-remote")["state"] == "not_merged"
+
+    assert_status(
+        w.extra,
+        "waiting-remote",
+        "awaiting merge (no PR)",
+        "awaiting_merge",
+        stage="Shipped",
+    )
+    (item,) = [
+        entry for entry in w.extra["attention"] if entry["branch"] == "waiting-remote"
+    ]
+    assert (item["class"], item["code"]) == ("awaiting_merge", "awaiting_merge")
+    assert item["repository"] == repository_of(w.extra, w.a)["remote"]["key"]
+    assert item["packages"] == ["Fictional/Shipped/waiting-remote"]
+    assert (item["pull_request"], item["count"]) == (None, None)
+    # derive_attention stays the one derivation of the list the parsed document carries.
+    assert models.derive_attention(w.extra)["attention"] == w.extra["attention"]
+
+
 def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
     status_world, tmp_path
 ):
@@ -3263,7 +3509,12 @@ def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
     remote_only = w.collect()
 
     assert remote_of(remote_only, w.a, "done")["state"] == "present", "control"
-    assert_status(remote_only, "clone", "merge state unknown", "unknown")
+    # The remote copy's squash-merged verdict is the package's now, and with no local
+    # copy left there is nothing to clean up: the status is plain merged, and the
+    # document that carries it parses.
+    assert_status(
+        remote_only, "clone", "merged", "merged", cleanup={"worktrees": 0, "branches": 0}
+    )
 
     git(w.a, "push", "-q", "origin", "--delete", "done")
     gone = w.collect()
@@ -4036,18 +4287,42 @@ def test_a_repository_in_a_document_without_git_is_refused(tmp_path, monkeypatch
     )
 
 
-@pytest.mark.parametrize(
-    "cleanup", [{"worktrees": 0, "branches": 0}, {"worktrees": 1, "branches": 1}]
-)
-def test_a_merged_status_needs_exactly_one_positive_cleanup_count(status_document, cleanup):
-    index = package_index(status_document, "landed")
+def test_a_plain_merged_status_is_accepted_with_no_cleanup_counts(status_document):
     assert code_status_of(status_document, "landed")["cleanup"] == {"worktrees": 0, "branches": 1}
+    document = doc_copy(status_document)
+    set_status_retexted("landed", cleanup={"worktrees": 0, "branches": 0})(document)
 
-    message = reference_mutation(status_document, set_status_retexted("landed", cleanup=cleanup))
+    parsed = models.parse_checkouts(redigest(document))
 
-    assert (
-        f"packages[{index}].code_status.cleanup must have exactly one positive count for merged"
-        in message
+    status = code_status_of(parsed, "landed")
+    assert status["text"] == "merged"
+    assert status["cleanup"] == {"worktrees": 0, "branches": 0}
+
+
+def test_a_merged_status_refuses_a_null_cleanup_or_both_counts_positive(status_document):
+    index = package_index(status_document, "landed")
+    for cleanup, message in (
+        (None, f"packages[{index}].code_status.cleanup is set exactly for merged"),
+        (
+            {"worktrees": 1, "branches": 1},
+            f"packages[{index}].code_status.cleanup must not have both counts positive for merged",
+        ),
+    ):
+        assert message in reference_mutation(
+            status_document, set_status_retexted("landed", cleanup=cleanup)
+        ), cleanup
+
+
+def test_a_status_that_is_not_merged_refuses_cleanup(status_document):
+    index = package_index(status_document, "landed")
+
+    def in_progress(document):
+        set_status_retexted(
+            "landed", state="in_progress", push="pushed", cleanup={"worktrees": 1, "branches": 0}
+        )(document)
+
+    assert f"packages[{index}].code_status.cleanup is set exactly for merged" in (
+        reference_mutation(status_document, in_progress)
     )
 
 
