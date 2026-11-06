@@ -2673,6 +2673,70 @@ def test_without_a_remote_head_the_one_clone_base_name_proves_the_remote_only_ti
     }
 
 
+@posix_only
+def test_a_tip_no_clone_holds_reads_the_reason_of_its_probes_when_the_bases_differ(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    git(w.a, "push", "-q", "origin", "trunk:master")
+    for member in (w.a, w.b):
+        git(member, "fetch", "-q", "origin")
+    git(w.a, "remote", "set-head", "origin", "trunk")
+    git(w.b, "remote", "set-head", "origin", "master")
+    git(w.remote, "symbolic-ref", "HEAD", "refs/heads/gone")
+    # The tip is pushed after both clones last fetched, so no configured clone holds it.
+    tip = w.push_from_outside("topic")
+    w.package("topic", "topic")
+    w.github()
+    install_fake_gh(
+        tmp_path,
+        monkeypatch,
+        stdout=pr_answer(
+            sorted(set(local_names(w.a, w.b)) | {"topic"}),
+            {
+                "topic": [
+                    pr_node(7, "merged", tip),
+                    pr_node(6, "merged", tip, base="master"),
+                ]
+            },
+        ),
+    )
+
+    absent = w.collect(github_lookup=True)
+
+    assert {
+        clone_at(absent, member)["verdict_base"]["name"] for member in (w.a, w.b)
+    } == {"trunk", "master"}
+    assert tip not in {rev(w.a, "refs/remotes/origin/topic"), rev(w.b, "refs/remotes/origin/topic")}, (
+        "control: neither clone holds the tip by ref"
+    )
+    # Several base names skip the head-equality proof, and no clone holds the object.
+    assert remote_verdict_of(absent, w.a) == remote_unknown("objects_missing")
+
+    # A failed probe is a failed call, not a missing object.
+    with path_with(
+        monkeypatch,
+        stand_in(tmp_path, "failing-probe", 'case "$*" in *"--no-walk"*) exit 128;; esac'),
+    ):
+        failed = w.collect(github_lookup=True)
+    assert remote_verdict_of(failed, w.a) == remote_unknown("failed")
+
+    # A cut probe of one clone outranks a failed probe of the other.
+    with path_with(
+        monkeypatch,
+        stand_in(
+            tmp_path,
+            "cut-then-failing-probe",
+            'case "$*" in *"Repo Clone A"*"--no-walk"*) exec sleep 60;;'
+            ' *"--no-walk"*) exit 128;; esac',
+        ),
+    ):
+        cut = w.collect(github_lookup=True, call_cap_seconds=1.0)
+    assert remote_verdict_of(cut, w.a) == remote_unknown("deadline")
+    assert local_verdicts(cut) == local_verdicts(absent)
+
+
 def test_a_package_branch_with_no_remote_copy_has_no_remote_verdict(status_world):
     w = status_world
     w.branch(w.a, "unpushed")
