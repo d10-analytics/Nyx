@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import select
+import site
 import subprocess
 import sys
 import threading
@@ -111,7 +112,8 @@ def default_worker_command() -> list[str]:
 
     A standalone application must spawn its bundled console helper.  A source
     or virtual-environment run uses the module entry with ``-P`` so the
-    worker's working directory never joins its import path.
+    worker's working directory never joins its import path; that worker
+    receives its import root from ``source_child_environment``.
     """
 
     if _is_packaged_application():
@@ -120,6 +122,56 @@ def default_worker_command() -> list[str]:
             raise WorkerError("producer_unavailable")
         return bundled
     return [sys.executable, "-P", "-m", "nyx.worker"]
+
+
+def _package_directory() -> str:
+    """Return the directory holding the ``nyx`` package this process imported.
+
+    The value comes from this module's own location at call time, so it names
+    the code the starting process already loaded rather than the working
+    directory, the launch arguments, or the environment.  Only ``os.path`` is
+    used, so the derivation also works under a patched ``os.name``.
+    """
+
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _canonical_directory(path: str) -> str:
+    """Return the form one directory path is compared in."""
+
+    return os.path.normcase(os.path.realpath(path))
+
+
+def source_child_environment() -> dict[str, str] | None:
+    """Return the environment a source-run child needs to import this package.
+
+    ``None`` means the child inherits this process's environment unchanged: a
+    packaged application starts its bundled helper, and a run loaded from one
+    of this interpreter's site folders already resolves the same package while
+    no import path is set and user site packages are enabled.  Every other
+    source run receives a new mapping whose ``PYTHONPATH`` starts with the
+    package directory, followed by any inherited entries verbatim.  A package
+    directory that cannot be one import-path entry is refused before any child
+    is started.
+    """
+
+    if _is_packaged_application():
+        return None
+    directory = _package_directory()
+    inherited = os.environ.get("PYTHONPATH") or ""
+    if not inherited and not sys.flags.no_user_site:
+        installed = site.getsitepackages()
+        if site.ENABLE_USER_SITE:
+            installed = [*installed, site.getusersitepackages()]
+        resolved = _canonical_directory(directory)
+        if any(_canonical_directory(entry) == resolved for entry in installed):
+            return None
+    if os.pathsep in directory:
+        raise WorkerError("producer_unavailable")
+    return {
+        **os.environ,
+        "PYTHONPATH": directory if not inherited else directory + os.pathsep + inherited,
+    }
 
 
 def _windows_parent_pipe_closed(fd: int) -> bool:
@@ -353,7 +405,13 @@ class _InheritedObjects:
 
 
 class CatalogWorkerManager:
-    """Admit, register, cancel and reap catalog worker children."""
+    """Admit, register, cancel and reap catalog worker children.
+
+    When no ``command_factory`` is given, a source-run worker also receives
+    its import environment from ``source_child_environment`` so it loads the
+    package this process loaded.  An injected factory keeps the inherited
+    environment unchanged.
+    """
 
     def __init__(
         self,
@@ -374,6 +432,7 @@ class CatalogWorkerManager:
         """
 
         self._command_factory = command_factory or default_worker_command
+        self._default_command = command_factory is None
         self._timeout = timeout
         self._working_directory = working_directory
         self._recovery_claim = recovery_claim
@@ -408,6 +467,10 @@ class CatalogWorkerManager:
             }
             if self._working_directory is not None:
                 spawn_kwargs["cwd"] = self._working_directory
+            if self._default_command:
+                child_environment = source_child_environment()
+                if child_environment is not None:
+                    spawn_kwargs["env"] = child_environment
             inherited_handles: list[int] = []
             inherited = self._inherited_objects()
             if inherited.descriptors:
@@ -723,5 +786,6 @@ __all__ = [
     "add_worker_arguments",
     "bundled_worker_command",
     "default_worker_command",
+    "source_child_environment",
     "worker_entrypoint",
 ]
