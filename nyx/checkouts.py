@@ -1995,6 +1995,17 @@ def _list_pull_requests(
             ]
 
 
+def _plain_pull_requests(
+    listed: Mapping[str, Sequence[_PullRequest]],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """One group's pull-request listing as the plain data the join reads: each name's
+    requests by number and state, the facts a Code Status uses."""
+    return {
+        name: tuple({"number": pull.number, "state": pull.state} for pull in requests)
+        for name, requests in listed.items()
+    }
+
+
 def _heads_record(answer: _LiveAnswer) -> dict[str, Any]:
     """The saved form of one successful ``ls-remote``: its whole answer."""
     return {
@@ -4313,6 +4324,8 @@ def collect_checkouts(
     packages: list[dict[str, Any]]
     remote_facts: dict[str, RemoteFacts] = {}
     no_commits: dict[tuple[str, str], str] = {}
+    # The live or recorded pull-request listing of each remote key, by branch name.
+    pulls: dict[str, dict[str, tuple[_PullRequest, ...]]] = {}
     # Nothing is decided when git is unavailable: no repository is read, so no
     # package branch resolves to one.
     plan = PackageBranchPlan((), ())
@@ -4465,6 +4478,7 @@ def collect_checkouts(
         plan,
         scan_complete=package_heads is not None and package_heads.status == "complete",
         remote_verdicts=remote_verdicts,
+        pulls={key: _plain_pull_requests(listed) for key, listed in pulls.items()},
         no_commits=no_commits,
     )
     document: dict[str, Any] = {

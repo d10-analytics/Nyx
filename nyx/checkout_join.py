@@ -30,12 +30,16 @@ order. With no answer and no clone holding the ref the state is ``unknown``, nev
 once, after the collector's earlier passes, and the join stores its result.
 
 Each such package also gets its Code Status. The facts are the branch's local copies (the
-branches of that name in the readable clones of the repository) and its remote copy. A
-remote copy whose tip equals no local copy's tip counts as unknown in the Code Status,
-never merged, whatever verdict the collector's remote-only pass decided for it. A branch
-none of whose local copies has a commit of its own, with a remote copy (if any) at the tip
-of one, reads ``no_commits_yet`` ahead of every other rule; a copy whose no-commit check
-did not run counts as unknown. The fields are stored in ``code_status`` and
+branches of that name in the readable clones of the repository), its remote copy, and the
+collection's per-name pull-request listing. A remote copy whose tip equals no local copy's
+tip counts with the verdict the collector's remote-only pass decided for it, and unknown
+without one, so a package with no local copy still reads merged when a holder clone or a
+pull request proves its tip merged, and reads no cleanup when nothing is left to clean. The
+branch's open pull requests come from the listing alone, so a branch no local copy holds
+still reads its open request; a name the listing did not ask about has none. A branch none
+of whose local copies has a commit of its own, with a remote copy (if any) at the tip of
+one, reads ``no_commits_yet`` ahead of every other rule; a copy whose no-commit check did
+not run counts as unknown. The fields are stored in ``code_status`` and
 ``models.code_status_text`` renders them, so a reader recomputes the text from the fields.
 """
 
@@ -411,6 +415,8 @@ def _code_status(
     states: Sequence[str | None],
     remote: Mapping[str, Any] | None,
     *,
+    remote_verdict: Mapping[str, Any] | None,
+    pulls: Sequence[Mapping[str, Any]],
     every_package_finished: bool,
 ) -> dict[str, Any] | None:
     """The Code Status of ``package`` from the copies of its branch, or ``None`` when the
@@ -418,7 +424,10 @@ def _code_status(
 
     ``states`` holds each local copy's no-commit state (``yes``, ``no``, ``unrun`` or
     ``None`` for a copy that was no candidate). A copy whose check did not run counts as
-    ``unknown``, as does a remote copy that takes its verdict.
+    ``unknown``. A present remote copy whose tip no local copy holds counts with its
+    ``remote_verdict``, and counts as ``unknown`` without one. ``pulls`` is the
+    collection's listing for the branch's name, and its open requests are the branch's
+    whether or not a local copy exists.
     """
     remote_present = remote is not None and remote["state"] == "present"
     if not local and not remote_present:
@@ -430,7 +439,12 @@ def _code_status(
     verdicts = list(copy_verdicts)
     if remote_present:
         tips = {copy["sha"]: verdict for copy, verdict in reversed(list(zip(local, copy_verdicts)))}
-        verdicts.append(tips.get(remote["sha"], "unknown"))
+        if remote["sha"] in tips:
+            verdicts.append(tips[remote["sha"]])
+        else:
+            verdicts.append(
+                "unknown" if remote_verdict is None else remote_verdict["state"]
+            )
 
     held = sorted(
         {path for copy in local for path in copy["checked_out_in"]}, key=natural_key
@@ -447,12 +461,7 @@ def _code_status(
         "checked_out_elsewhere": [path for path in held if path != own],
     }
     push, unpushed = _push_fragment(local, remote)
-    open_pulls = [
-        pull["number"]
-        for copy in local
-        for pull in copy["pull_requests"]
-        if pull["state"] == "open"
-    ]
+    open_pulls = [pull["number"] for pull in pulls if pull["state"] == "open"]
     if local and all(state == "yes" for state in states) and (
         not remote_present or remote["sha"] in {copy["sha"] for copy in local}
     ):
@@ -486,6 +495,7 @@ def join_branches(
     *,
     scan_complete: bool,
     remote_verdicts: Mapping[tuple[str, str], Mapping[str, Any]],
+    pulls: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]] | None = None,
     no_commits: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
     """Match the package branches of ``plan`` to the branches of their repository.
@@ -505,10 +515,16 @@ def join_branches(
     named only by finished packages: the cross-package conclusion is withheld and the
     package reads by the remaining rules.
 
+    ``pulls`` holds each remote key's pull-request listing by head branch name, as plain
+    ``number`` and ``state`` facts from a live or recorded lookup; a name it does not list
+    has no requests, the same as an empty list. A branch's open requests are read from it
+    alone, whether or not a local copy exists.
+
     ``no_commits`` maps (clone path, branch name) to the collection's no-commit state of
     a local branch (``yes``, ``no`` or ``unrun``); a branch absent from it was not checked.
     """
     no_commits = no_commits or {}
+    pulls = pulls or {}
     for package in plan.defaults:
         package["branch"] = {"status": "default_branch", "name": None}
     for repository, entries in zip(repositories, plan.branches):
@@ -516,6 +532,7 @@ def join_branches(
         key = None if remote is None else remote["key"]
         by_name = {entry.name: list(entry.packages) for entry in entries}
         copies = {entry.name: entry.remote for entry in entries}
+        listed = {} if key is None else pulls.get(key, {})
         repository["package_branches"] = [
             {
                 "name": entry.name,
@@ -534,7 +551,13 @@ def join_branches(
             )
             for package in named_packages:
                 package["code_status"] = _code_status(
-                    package, local, states, copies[name], every_package_finished=every_finished
+                    package,
+                    local,
+                    states,
+                    copies[name],
+                    remote_verdict=remote_verdicts.get((key, name)) if key is not None else None,
+                    pulls=listed.get(name, ()),
+                    every_package_finished=every_finished,
                 )
         for clone in repository["clones"]:
             if clone["status"] != "ok":
