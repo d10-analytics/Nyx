@@ -491,11 +491,11 @@ def _assert_gone(pids: Iterable[int], deadline: float) -> None:
 
 
 def _end(pids: Iterable[int]) -> None:
-    """End anything a failed proof left behind."""
+    """End anything a failed proof left behind with the strongest signal available."""
     for pid in sorted(set(pids)):
         if _alive(pid):
             with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _process_parents() -> dict[int, int]:
