@@ -952,7 +952,10 @@ CODE_STATUS_MARKERS = (
     "behind the default branch reads `merged · cleanup pending ...`.",
     "A package branch whose copy exists only on the remote and whose commit is on the "
     "default branch's first-parent history, within the newest 5,000 commits, reads "
-    "`merge state unknown`",
+    "`merge state unknown` unless a merged, same-repository pull request into the "
+    "default branch whose head is that commit proves it merged: without that proof, "
+    "the commit is either a branch fast-forward merged or one pushed with no commit "
+    "of its own, and a remote-tracking branch cannot tell which.",
     "A commit older than that bound is not read against that history, so it stays "
     "merged.",
     "A clone whose status is not ok, such as one git could not read or one with too "
@@ -1668,8 +1671,13 @@ def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limit
     limit = f"{FIRST_PARENT_LIMIT:,}"
     assert f"among the latest {limit} commits of the default branch's first-parent" in code_status
     assert f"that is {limit} or more first-parent commits behind" in code_status
-    # The remote-only ambiguity check reads the same first-parent bound.
-    assert f"within the newest {limit} commits" in code_status
+    # The remote-only ambiguity check reads the same first-parent bound, and it
+    # applies only when no merged pull request proves the commit.
+    assert (
+        f"within the newest {limit} commits, reads `merge state unknown` unless a "
+        "merged, same-repository pull request into the default branch whose head is "
+        "that commit proves it merged" in code_status
+    )
 
 
 def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
