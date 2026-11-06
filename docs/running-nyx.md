@@ -1050,12 +1050,13 @@ authentication, so other local accounts on the same host can read the catalog an
 workspace path and change board settings. It does not edit specifications. It has no automatic startup, auto-update, remote
 or shared hosting, cross-host configuration synchronization, or agent
 execution. Configuration and runtime state still live under `.nyx` in your home
-directory. The private worker helper also collects checkout state, which needs
+directory. The private worker helper can also collect checkout state, although
+the application itself neither requests nor shows it. That collection needs
 `git` in an absolute directory on the `PATH` the application starts with: the
-helper searches that `PATH` only, so a `git` your terminal can run but the
-application cannot makes the state report `git missing` and list no checkout.
-Add the directory holding `git` (`git.exe` on Windows) to the environment that
-starts the application. On Linux the desktop application refuses to start and
+helper searches that `PATH` only, so with a `git` your terminal can run but the
+application cannot, its checkout document reports `git missing` and lists no
+checkout. Add the directory holding `git` (`git.exe` on Windows) to the
+environment that starts the application. On Linux the desktop application refuses to start and
 directs you to use the `nyx` console entry instead.
 
 ## Maintainer: record cloud-placeholder behavior

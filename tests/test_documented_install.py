@@ -90,9 +90,11 @@ DESKTOP_GUIDANCE_MARKERS = (
     "returns to the current workspace without quitting",
     "**Close** finishes a blocked close or a board-display failure",
     # A delivered checkout collection finds git only where the helper searches,
-    # so the desktop section names the PATH the application starts with.
+    # so the desktop section names the PATH the application starts with, and
+    # it says the application itself neither requests nor shows that state.
+    "the application itself neither requests nor shows it",
     "`git` in an absolute directory on the `PATH` the application starts with",
-    "the state report `git missing` and list no checkout",
+    "its checkout document reports `git missing` and lists no",
 )
 STAGE_ORDER_GUIDANCE_MARKERS = {
     "README.md": (
