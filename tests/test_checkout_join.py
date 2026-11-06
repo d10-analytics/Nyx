@@ -2674,6 +2674,51 @@ def test_without_a_remote_head_the_one_clone_base_name_proves_the_remote_only_ti
 
 
 @posix_only
+def test_without_a_remote_head_the_agreed_base_name_proves_a_tip_no_clone_holds(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.branch(w.a, "topic", push=True)
+    for member in (w.a, w.b):
+        git(member, "fetch", "-q", "origin")
+        git(member, "remote", "set-head", "origin", "trunk")
+    # The bare remote's HEAD names a branch the remote does not have, so no answer sets
+    # the default branch while both clones' verdict bases name trunk.
+    git(w.remote, "symbolic-ref", "HEAD", "refs/heads/gone")
+    # The tip is pushed after both clones last fetched, so no configured clone holds it.
+    tip = w.push_from_outside("topic")
+    w.package("topic", "topic")
+    w.github()
+    install_fake_gh(
+        tmp_path,
+        monkeypatch,
+        stdout=pr_answer(
+            sorted(set(local_names(w.a, w.b)) | {"topic"}),
+            {"topic": [pr_node(7, "merged", tip)]},
+        ),
+    )
+
+    proved = w.collect(github_lookup=True)
+
+    repository = repository_of(proved, w.a)
+    assert repository["default_branch"] == {"name": None, "sha": None}
+    assert {
+        clone_at(proved, member)["verdict_base"]["name"] for member in (w.a, w.b)
+    } == {"trunk"}, "control: the clones' verdict bases agree on one name"
+    assert tip not in {
+        rev(w.a, "refs/remotes/origin/topic"), rev(w.b, "refs/remotes/origin/topic")
+    }, "control: neither clone holds the tip by ref"
+    assert all(
+        git(member, "cat-file", "-e", tip, check=False).returncode != 0
+        for member in (w.a, w.b)
+    ), "control: neither clone holds the tip's objects"
+    # The one agreed base name is the proof's base even though no remote answer set it.
+    assert remote_verdict_of(proved, w.a) == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 7,
+    }
+
+
+@posix_only
 def test_a_tip_no_clone_holds_reads_the_reason_of_its_probes_when_the_bases_differ(
     status_world, tmp_path, monkeypatch
 ):
