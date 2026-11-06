@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHub state)
+    DELAYED_PATCH_WORK,
     GITHUB_URL,
     LAST_GIT_SECOND,
     cache_entries,
@@ -2655,7 +2656,11 @@ def test_without_a_remote_head_the_one_clone_base_name_proves_the_remote_only_ti
     assert {
         clone_at(split, member)["verdict_base"]["name"] for member in (w.a, w.b)
     } == {"trunk", "master"}
-    assert remote_verdict_of(split, w.a) == remote_unknown("objects_missing")
+    # The head-equality proof is skipped for several base names, but A's own base name
+    # still proves the tip through its holder ladder; A is the first in natural order.
+    assert remote_verdict_of(split, w.a) == {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 7,
+    }
 
     git(w.b, "remote", "set-head", "origin", "trunk")
     agreed = w.collect(github_lookup=True)
@@ -2680,6 +2685,472 @@ def test_a_package_branch_with_no_remote_copy_has_no_remote_verdict(status_world
     for name in ("unpushed", "ghost"):
         assert remote_of(document, w.a, name)["state"] != "present"
         assert remote_verdict_of(document, w.a, name) is None
+
+
+# ---------------------------------------------------------------------------
+# Remote-only verdicts from a holder clone
+# ---------------------------------------------------------------------------
+
+
+def local_verdicts(document: dict[str, Any]) -> dict[tuple[str, str], tuple[Any, Any]]:
+    """Every local branch's verdict and containment, by clone path and branch name."""
+    return {
+        (clone["path"], branch["name"]): (branch["verdict"], branch["contained_in"])
+        for repository in document["repositories"]
+        for clone in repository["clones"]
+        for branch in clone["branches"]
+    }
+
+
+def probes_naming(log: Path, tip: str) -> list[list[str]]:
+    """Every logged object probe of ``tip``."""
+    return [
+        call
+        for call in logged_calls(log)
+        if "rev-list" in call and "--no-walk" in call and tip in call
+    ]
+
+
+def probes_from(log: Path, member: Path, tip: str) -> list[list[str]]:
+    """The logged object probes of ``tip`` that ran in ``member``'s clone."""
+    return [
+        call
+        for call in probes_naming(log, tip)
+        if "-C" in call and real(call[call.index("-C") + 1]) == real(member)
+    ]
+
+
+def first_parent_calls(log: Path) -> list[list[str]]:
+    """Every logged first-parent listing of a verdict base."""
+    return [
+        call
+        for call in logged_calls(log)
+        if "rev-list" in call and "--first-parent" in call
+    ]
+
+
+@posix_only
+def test_a_holder_with_the_tip_as_an_object_decides_it_and_a_cut_run_reads_the_entry(
+    status_world, tmp_path, monkeypatch
+):
+    """The delayed first run is cut, the undelayed second decides from A's object probe
+    and stores its entry, and the delayed third reads that entry."""
+    w = status_world
+    w.branch(w.a, "topic", commits=2, push=True)
+    tip = rev(w.a, "topic")
+    # A lands the work by a squash merge and pushes it, then drops both its local branch
+    # and its own tracking ref, keeping the objects the probe has to find.
+    git(w.a, "merge", "-q", "--squash", "topic")
+    git(w.a, "commit", "-q", "-m", "land topic")
+    git(w.a, "push", "-q", "origin", "trunk")
+    git(w.a, "branch", "-q", "-D", "topic")
+    git(w.a, "branch", "-q", "-dr", "origin/topic")
+    # A local branch a cut of the remote-only pass must not disturb.
+    git(w.a, "branch", "spare", "trunk~1")
+    w.package("topic", "topic")
+    # The chain starts on an account home that holds no saved verdict.
+    cache = nyx_home(Path(os.environ["HOME"]))
+    assert not cache.exists(), "control: the account home holds no saved verdict"
+
+    slow_tip = stand_in(
+        tmp_path, "slow-tip", f'case "$*" in *"{tip}"*) exec sleep 30;; esac'
+    )
+    with path_with(monkeypatch, slow_tip):
+        cut = w.collect(seconds=3.0)
+
+    # A cut probe of the clone with a base is not a missing object.
+    assert remote_verdict_of(cut, w.a) == remote_unknown("deadline")
+    key = f"{tip}.{clone_at(cut, w.a)['verdict_base']['sha']}"
+    assert key not in (cache_entries(cache) if cache.exists() else {}), (
+        "control: no collection stored a verdict for this tip and base"
+    )
+
+    recorder, log = argument_recorder(tmp_path)
+    with path_with(monkeypatch, recorder):
+        decided = w.collect()
+
+    assert remote_verdict_of(decided, w.a) == {
+        "state": "merged",
+        "rung": "squash_equivalent",
+        "reason": None,
+        "pull_request": None,
+    }
+    assert probes_from(log, w.a, tip), "the decided verdict comes from A's object probe"
+    assert cache_entries(cache).get(key) == "squash_equivalent"
+    assert local_verdicts(cut) == local_verdicts(decided)
+
+    work_log = tmp_path / "patch-work.log"
+    slow_work = stand_in(
+        tmp_path,
+        "slow-work",
+        DELAYED_PATCH_WORK.replace(
+            "exec sleep 30", f'printf "%s\\n" "$*" >> "{work_log}"; exec sleep 30'
+        ),
+    )
+    with path_with(monkeypatch, slow_work):
+        stored = w.collect(seconds=3.0)
+
+    assert work_log.exists() and work_log.read_text().strip(), (
+        "control: a patch rung ran and the deadline cut it, so only the entry decides"
+    )
+    assert remote_verdict_of(stored, w.a) == remote_verdict_of(decided, w.a)
+    assert local_verdicts(stored) == local_verdicts(decided)
+
+
+class HolderWorld:
+    """One remote with four clones in the folder: A (the target of every package), B,
+    a shallow clone whose path sorts first, and a clone with no verdict base.
+
+    Every package branch has no local copy. ``topic`` is squash-merged with A's tracking
+    ref kept; ``topic2`` is squash-merged with A's tracking ref deleted and the shallow
+    clone holding it; ``base-less-shared`` is squash-merged, held by A and the base-less
+    clone; ``base-less-only`` is squash-merged and only the base-less clone holds it.
+    ``empty-pushed`` has no commit of its own, ``fast-forward`` was fast-forward merged
+    and ``merge-commit`` was merged by a merge commit. One module-scoped build serves
+    every collection the holder rules are proved with.
+    """
+
+    names = (
+        "topic",
+        "topic2",
+        "empty-pushed",
+        "fast-forward",
+        "merge-commit",
+        "base-less-shared",
+        "base-less-only",
+    )
+
+    def __init__(self, base: Path) -> None:
+        self.folder = base / "folder"
+        self.folder.mkdir()
+        served = base / "served"
+        served.mkdir()
+        self.remote = make_remote(served)
+        self.a = clone(self.remote, self.folder / "Repo Clone 1")
+        self.b = clone(self.remote, self.folder / "Repo Clone 2")
+        self.n = clone(self.remote, self.folder / "Repo No Base")
+        self.outside = clone(self.remote, base / "outside")
+        self.sha: dict[str, str] = {}
+        self.count = 0
+        self.build(base)
+
+    def commit(self, member: Path) -> str:
+        self.count += 1
+        return commit_file(member, f"change-{self.count}.txt", f"{self.count}\n")
+
+    def land(self, name: str, *, keep_ref: bool) -> str:
+        """Push a two-commit branch, squash-merge it into trunk, push trunk and drop the
+        local branch, keeping or deleting A's own tracking ref of the name."""
+        git(self.a, "checkout", "-q", "-b", name, "trunk")
+        self.commit(self.a)
+        self.commit(self.a)
+        tip = rev(self.a, name)
+        git(self.a, "push", "-q", "origin", name)
+        git(self.a, "checkout", "-q", "trunk")
+        git(self.a, "merge", "-q", "--squash", name)
+        git(self.a, "commit", "-q", "-m", f"land {name}")
+        git(self.a, "push", "-q", "origin", "trunk")
+        git(self.a, "branch", "-q", "-D", name)
+        if not keep_ref:
+            git(self.a, "update-ref", "-d", f"refs/remotes/origin/{name}", check=False)
+        return tip
+
+    def build(self, base: Path) -> None:
+        w = self
+        w.sha["topic"] = w.land("topic", keep_ref=True)
+        w.sha["topic2"] = w.land("topic2", keep_ref=False)
+        # A branch pushed with no commit of its own: its tip is the default history.
+        git(w.a, "push", "-q", "origin", "trunk:refs/heads/empty-pushed")
+        git(w.a, "update-ref", "-d", "refs/remotes/origin/empty-pushed", check=False)
+        w.sha["empty-pushed"] = git(w.a, "rev-parse", "trunk").stdout.strip()
+        # One branch fast-forward merged into the default branch, one merged by a merge.
+        for name in ("fast-forward", "merge-commit"):
+            git(w.a, "checkout", "-q", "-b", name, "trunk")
+            w.commit(w.a)
+            w.sha[name] = rev(w.a, name)
+            git(w.a, "push", "-q", "origin", name)
+            git(w.a, "checkout", "-q", "trunk")
+            if name == "fast-forward":
+                git(w.a, "merge", "-q", "--ff-only", name)
+            else:
+                git(w.a, "merge", "-q", "--no-ff", "-m", f"merge {name}", name)
+            git(w.a, "push", "-q", "origin", "trunk")
+            git(w.a, "branch", "-q", "-D", name)
+            git(w.a, "update-ref", "-d", f"refs/remotes/origin/{name}", check=False)
+        # Two branches only a clone outside the folder ever pushes.
+        for name in ("base-less-shared", "base-less-only"):
+            git(w.outside, "fetch", "-q", "origin")
+            git(w.outside, "checkout", "-q", "-B", name, "origin/trunk")
+            w.commit(w.outside)
+            w.commit(w.outside)
+            w.sha[name] = rev(w.outside, name)
+            git(w.outside, "push", "-q", "origin", name)
+            git(w.outside, "checkout", "-q", "trunk")
+        # A lands one of them and keeps its tracking ref; the other it never fetches.
+        git(w.a, "fetch", "-q", "origin", "+refs/heads/base-less-shared:refs/remotes/origin/base-less-shared")
+        git(w.a, "merge", "-q", "--squash", "origin/base-less-shared")
+        git(w.a, "commit", "-q", "-m", "land base-less-shared")
+        git(w.a, "push", "-q", "origin", "trunk")
+        # The base-less clone holds both tips by ref but no default branch at all.
+        for name in ("base-less-shared", "base-less-only"):
+            git(w.n, "fetch", "-q", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}")
+        git(w.n, "update-ref", "-d", "refs/remotes/origin/trunk")
+        git(w.n, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        # The shallow clone sorts first, shares A's base and holds topic2's tip by ref.
+        # A local path clone ignores --depth, so it clones through the remote's URI.
+        w.s = clone(w.remote.as_uri(), w.folder / "A Shallow", "--depth", "1")
+        git(
+            w.s,
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            "origin",
+            "+refs/heads/topic2:refs/remotes/origin/topic2",
+        )
+        for member in (w.a, w.b, w.s, w.n):
+            point_origin_at(member, w.remote, GITHUB_URL)
+        w.root = base / "spec"
+        for name in w.names:
+            make_package(
+                w.root, "Drafts", name, f"Target repo: {w.a}\nBranch: {name}\n"
+            )
+        w.baseless_root = base / "baseless-spec"
+        for name in ("base-less-shared", "base-less-only"):
+            make_package(
+                w.baseless_root, "Drafts", name, f"Target repo: {w.a}\nBranch: {name}\n"
+            )
+        w.squash_root = base / "squash-spec"
+        for name in ("topic", "topic2"):
+            make_package(
+                w.squash_root, "Drafts", name, f"Target repo: {w.a}\nBranch: {name}\n"
+            )
+
+    def collect(self, root: Path | None, **options: Any) -> dict[str, Any]:
+        """Collect the folder with ``root``'s packages, proving no repository changed."""
+        members = (self.a, self.b, self.s, self.n, self.outside, self.remote)
+        before = {member: tree_fingerprint(member) for member in members}
+        document = collect_packages([self.folder], root, **options)
+        assert {member: tree_fingerprint(member) for member in members} == before
+        return document
+
+
+def holder_recorder(directory: Path, name: str) -> tuple[Path, Path]:
+    """An argument recorder of its own, so each collection's calls are read apart."""
+    where = directory / name
+    where.mkdir()
+    return argument_recorder(where)
+
+
+@pytest.fixture(scope="module")
+def holder_world(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "holder-world") as (directory, home, patch):
+        w = HolderWorld(directory)
+        # The base-less clone is no holder, and no saved remote check can give it a base:
+        # this run goes first, on the build home that holds no saved check yet.
+        recorder, log = holder_recorder(directory, "baseless")
+        with path_with(patch, recorder):
+            w.baseless = w.collect(w.baseless_root, remote_checks=False)
+        w.baseless_calls = log
+        w.baseless_plain = w.collect(None, remote_checks=False)
+        w.cache = nyx_home(home)
+        # The first networked collection: no stored verdict answers topic2's tip, so an
+        # implementation that skipped the probe for a shallow ref holder would read it
+        # unknown/incomplete_clone.
+        recorder, log = holder_recorder(directory, "recorded")
+        with path_with(patch, recorder):
+            w.recorded = w.collect(w.root, remote_checks=True)
+        w.recorded_calls = log
+        w.plain = w.collect(None, remote_checks=True)
+        # The same world collected for branches whose tips only the squash rung decides.
+        recorder, log = holder_recorder(directory, "squash")
+        with path_with(patch, recorder):
+            w.squash = w.collect(w.squash_root, remote_checks=True)
+        w.squash_calls = log
+        # One first-parent listing that fails, and one the per-call cap cuts.
+        with path_with(
+            patch,
+            stand_in(
+                directory,
+                "failing-listing",
+                'case "$*" in *"rev-list --first-parent"*) exit 128;; esac',
+            ),
+        ):
+            w.failed = w.collect(w.root, remote_checks=True)
+        with path_with(
+            patch,
+            stand_in(
+                directory,
+                "slow-listing",
+                'case "$*" in *"rev-list --first-parent"*) exec sleep 60;; esac',
+            ),
+        ):
+            w.cut = w.collect(w.root, remote_checks=True, call_cap_seconds=1.0)
+        # A merged request into the default branch proves an otherwise ambiguous tip.
+        names = sorted(set(local_names(w.a, w.b, w.s, w.n)) | set(w.names))
+        fake = install_fake_gh(
+            directory,
+            patch,
+            stdout=pr_answer(
+                names, {"fast-forward": [pr_node(4, "merged", w.sha["fast-forward"])]}
+            ),
+        )
+        w.github = w.collect(w.root, remote_checks=True, github_lookup=True)
+        fake.replay(stdout=pr_answer(sorted(local_names(w.a, w.b, w.s, w.n)), {}))
+        w.plain_github = w.collect(None, remote_checks=True, github_lookup=True)
+    return w
+
+
+SQUASH_MERGED = {
+    "state": "merged",
+    "rung": "squash_equivalent",
+    "reason": None,
+    "pull_request": None,
+}
+MERGED_ANCESTOR = {
+    "state": "merged",
+    "rung": "ancestor",
+    "reason": None,
+    "pull_request": None,
+}
+
+
+@posix_only
+def test_a_complete_ref_holder_decides_its_tip_without_an_object_probe(holder_world):
+    w = holder_world
+
+    assert remote_verdict_of(w.recorded, w.a, "topic") == SQUASH_MERGED
+    assert probes_naming(w.recorded_calls, w.sha["topic"]) == [], (
+        "a complete clone holds the tip by ref, so nothing probes it"
+    )
+
+
+@posix_only
+def test_a_shallow_ref_holder_does_not_skip_the_probe_of_a_complete_clone(holder_world):
+    w = holder_world
+    repository = repository_of(w.recorded, w.a)
+    assert [clone["path"] for clone in repository["clones"]][0] == real(w.s), (
+        "control: the shallow clone sorts first"
+    )
+    assert clone_at(w.recorded, w.s)["shallow"] is True
+    assert clone_at(w.recorded, w.s)["verdict_base"] is not None, (
+        "control: the shallow clone has a base"
+    )
+    assert rev(w.s, "refs/remotes/origin/topic2") == w.sha["topic2"], (
+        "control: the shallow clone holds the tip by ref"
+    )
+    assert probes_from(w.recorded_calls, w.s, w.sha["topic2"]) == [], (
+        "the clone that holds the tip by ref is not probed for it"
+    )
+
+    # A shallow ref holder does not stop the probe: A's object makes A the holder, and a
+    # shallow ladder would only report incomplete_clone.
+    assert remote_verdict_of(w.recorded, w.a, "topic2") == SQUASH_MERGED
+    assert probes_from(w.recorded_calls, w.a, w.sha["topic2"]), (
+        "the verdict comes from A's probe, so a shallow ref holder skipped nothing"
+    )
+
+
+@posix_only
+def test_a_clone_without_a_base_is_no_holder_and_a_base_less_tip_reads_no_base(
+    holder_world,
+):
+    w = holder_world
+    assert clone_at(w.baseless, w.n)["verdict_base"] is None, (
+        "control: the clone has no verdict base"
+    )
+
+    # A complete clone also holds this tip by ref, so it decides it: the base-less clone
+    # is never a candidate holder.
+    assert remote_verdict_of(w.baseless, w.a, "base-less-shared") == SQUASH_MERGED
+    assert probes_naming(w.baseless_calls, w.sha["base-less-shared"]) == [], (
+        "a complete ref holder skips the probe"
+    )
+
+    # Only the base-less clone holds this tip, by ref: the clones with a base are probed
+    # and none of them holds it.
+    assert remote_verdict_of(w.baseless, w.a, "base-less-only") == remote_unknown("no_base")
+    assert probes_from(w.baseless_calls, w.a, w.sha["base-less-only"])
+    assert probes_from(w.baseless_calls, w.b, w.sha["base-less-only"])
+
+
+@posix_only
+def test_a_tip_on_the_default_history_is_ambiguous_and_a_merge_commit_stays_merged(
+    holder_world,
+):
+    w = holder_world
+    repository = repository_of(w.recorded, w.a)
+    assert not (
+        set(w.names)
+        & {branch["name"] for clone in repository["clones"] for branch in clone["branches"]}
+    ), "control: every package branch has no local copy"
+
+    for name in ("empty-pushed", "fast-forward"):
+        assert remote_verdict_of(w.recorded, w.a, name) == remote_unknown("ambiguous_tip")
+        assert_status(w.recorded, name, "merge state unknown", "unknown")
+    assert remote_verdict_of(w.recorded, w.a, "merge-commit") == MERGED_ANCESTOR
+    assert remote_verdict_of(w.recorded, w.a, "topic") == SQUASH_MERGED
+
+
+@posix_only
+def test_one_first_parent_listing_runs_per_holder_with_ancestor_tips(holder_world):
+    w = holder_world
+
+    assert len(first_parent_calls(w.recorded_calls)) == 1, (
+        "one listing for the holder that has ancestor tips"
+    )
+    assert first_parent_calls(w.squash_calls) == [], (
+        "a holder with only squash tips reads no first-parent history"
+    )
+    # Control: the squash-only collection did decide both tips by its holder ladder.
+    for name in ("topic", "topic2"):
+        assert remote_verdict_of(w.squash, w.a, name) == SQUASH_MERGED
+
+
+@posix_only
+def test_a_first_parent_listing_that_fails_or_is_cut_leaves_the_ancestor_tips_unknown(
+    holder_world,
+):
+    w = holder_world
+
+    for document, reason in ((w.failed, "failed"), (w.cut, "deadline")):
+        for name in ("empty-pushed", "fast-forward", "merge-commit"):
+            assert remote_verdict_of(document, w.a, name) == remote_unknown(reason)
+        assert remote_verdict_of(document, w.a, "topic") == SQUASH_MERGED, (
+            "control: a tip the squash rung decides needs no first-parent history"
+        )
+
+
+@posix_only
+def test_a_merged_pull_request_proves_an_otherwise_ambiguous_tip(holder_world):
+    w = holder_world
+
+    assert remote_verdict_of(w.github, w.a, "fast-forward") == {
+        "state": "merged",
+        "rung": "pull_request",
+        "reason": None,
+        "pull_request": 4,
+    }
+    assert remote_verdict_of(w.github, w.a, "empty-pushed") == remote_unknown(
+        "ambiguous_tip"
+    ), "the proof is the tip's own head, not an ambiguous tip beside it"
+
+
+@posix_only
+def test_every_holder_collection_leaves_every_local_branch_unchanged(holder_world):
+    w = holder_world
+
+    # The wrappers above intercept only calls the package pass makes, so the one
+    # collection without a package scan is the same collection for each of them.
+    for with_packages, without_packages in (
+        (w.baseless, w.baseless_plain),
+        (w.recorded, w.plain),
+        (w.squash, w.plain),
+        (w.failed, w.plain),
+        (w.cut, w.plain),
+        (w.github, w.plain_github),
+    ):
+        assert local_verdicts(with_packages) == local_verdicts(without_packages)
 
 
 def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
