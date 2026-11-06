@@ -2569,6 +2569,44 @@ def _check_package_references(
                         raise ProtocolError(f"{label} has a {basis} reference its package does not back")
 
 
+def _check_remote_verdicts(repositories: list[dict[str, Any]]) -> None:
+    """Refuse a package branch's remote verdict wherever its remote copy or a local copy
+    forbids one.
+
+    A remote verdict is stored exactly when the group has a remote, its copy of the
+    branch is ``present``, and no readable clone of the group holds a branch of that
+    name at the copy's tip: a tip a local copy holds already has that copy's verdict,
+    and a copy the remote did not answer for has no tip to decide.
+    """
+    for repo_index, repository in enumerate(repositories):
+        readable = [clone for clone in repository["clones"] if clone["status"] == "ok"]
+        for entry_index, entry in enumerate(repository["package_branches"]):
+            label = f"repositories[{repo_index}].package_branches[{entry_index}].remote_verdict"
+            copy = entry["remote"]
+            verdict = entry["remote_verdict"]
+            if copy is None:
+                if verdict is not None:
+                    raise ProtocolError(f"{label} requires a remote")
+                continue
+            if copy["state"] != "present":
+                if verdict is not None:
+                    raise ProtocolError(f"{label} requires a present remote copy")
+                continue
+            held = any(
+                branch["name"] == entry["name"] and branch["sha"] == copy["sha"]
+                for clone in readable
+                for branch in clone["branches"]
+            )
+            if held and verdict is not None:
+                raise ProtocolError(
+                    f"{label} must be null when a local copy holds the remote tip"
+                )
+            if not held and verdict is None:
+                raise ProtocolError(
+                    f"{label} is required for a remote tip no local copy holds"
+                )
+
+
 def _contained_names(containers: Mapping[str, str | None], start: str) -> set[str]:
     """The branch names reached from ``start`` by following ``contained_in``."""
     reached: set[str] = set()
@@ -2707,6 +2745,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
             )
     _ordered(packages, package_sort_key, "packages")
     _check_package_references(parsed, packages)
+    _check_remote_verdicts(parsed)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     derived = derive_attention(document)
