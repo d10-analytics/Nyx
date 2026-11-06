@@ -2668,6 +2668,20 @@ def test_without_a_remote_head_the_one_clone_base_name_proves_the_remote_only_ti
     }
 
 
+def test_a_package_branch_with_no_remote_copy_has_no_remote_verdict(status_world):
+    w = status_world
+    w.branch(w.a, "unpushed")
+    w.package("unpushed", "unpushed")
+    w.package("ghost", "ghost")
+
+    document = w.collect()
+
+    # A branch never pushed and a branch nobody holds have no present remote copy.
+    for name in ("unpushed", "ghost"):
+        assert remote_of(document, w.a, name)["state"] != "present"
+        assert remote_verdict_of(document, w.a, name) is None
+
+
 def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
     status_world, tmp_path
 ):
