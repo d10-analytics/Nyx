@@ -3678,10 +3678,12 @@ def _assign_remote_only(
     ``unknown``/``ambiguous_tip`` and a listing that could not finish leaves it
     ``unknown`` as the listing's reason says.
 
-    A tip no clone with a base holds is ``unknown``: ``deadline`` when a probe of such a
-    clone was cut, else ``failed`` when any probe failed, else ``no_base`` when only
-    base-less clones hold it, else ``objects_missing``. Nothing is decided for a copy
-    that is not present or whose tip a local copy holds, which leaves the verdict null.
+    A tip no clone with a base holds is ``unknown``: ``deadline`` when any clone's probe
+    of it was cut, with or without a base; else ``failed`` when any probe failed; else
+    ``no_base`` when only base-less clones hold it, by ref or by a present probe; else
+    ``objects_missing``, which every probe must have reported the objects absent for.
+    Nothing is decided for a copy that is not present or whose tip a local copy holds,
+    which leaves the verdict null.
 
     ``pulls`` holds each repository's pull requests by head branch name, from a live or
     recorded lookup; a group without one simply has no proof. Every git call goes
@@ -3711,8 +3713,9 @@ def _assign_remote_only(
     fresh: dict[str, str] = {}
     # The probe state of each tip in each clone, by the work index, clone path and tip.
     probed: dict[tuple[int, str, str], str] = {}
-    # The probe state of each tip in each base-less clone, by the work index and tip.
-    baseless_probed: dict[tuple[int, str], str] = {}
+    # The probe state of each tip in each base-less clone, by the work index, clone path
+    # and tip, so one clone's answer never stands for another's.
+    baseless_probed: dict[tuple[int, str, str], str] = {}
     probe_jobs = []
     for index, work in enumerate(works):
         for clone, context, _base in work.holders:
@@ -3817,19 +3820,27 @@ def _assign_remote_only(
 
         for index, path, states in pool.map(probe_baseless, baseless_jobs.items()):
             for tip, state in states.items():
-                baseless_probed[(index, tip)] = state
+                baseless_probed[(index, path, tip)] = state
 
-    # The reasons a tip no holder decided can carry, in their precedence order: a cut
-    # probe of a clone with a base, a failed probe anywhere, only base-less holders.
+    # The reasons a tip no holder decided can carry, in their precedence order: a probe
+    # cut in any clone, a failed probe anywhere, only base-less holders. A base-less
+    # clone's probe is combined per tip, so no clone's answer hides another's.
     cut = {(index, tip) for (index, _path, tip), state in probed.items() if state == "unknown"}
     differed = {(index, tip) for (index, _path, tip), state in probed.items() if state == "differs"}
-    differed |= {(index, tip) for (index, tip), state in baseless_probed.items() if state == "differs"}
+    for (index, _path, tip), state in baseless_probed.items():
+        if state == "unknown":
+            cut.add((index, tip))
+        elif state == "differs":
+            differed.add((index, tip))
     held_baseless: set[tuple[int, str]] = set()
     for index, work in enumerate(works):
         for tip in work.tips:
             if any(tip in work.refs[clone["path"]] for clone, _context in work.baseless):
                 held_baseless.add((index, tip))
-            if baseless_probed.get((index, tip)) == "present":
+            if any(
+                baseless_probed.get((index, clone["path"], tip)) == "present"
+                for clone, _context in work.baseless
+            ):
                 held_baseless.add((index, tip))
     for index, work in enumerate(works):
         for tip in work.tips:
