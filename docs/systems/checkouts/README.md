@@ -63,6 +63,12 @@ README is narrative only.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no
   git call and reads no file; `nyx/checkouts.py` owns every git call and
   filesystem read and builds the path identities it is given.
+- Derives a collection's inputs once, through `collection_inputs`: the
+  configured record's folders and GitHub switch, and the package scan of its
+  specification root; a not-configured account collects no folder and scans no
+  package, and an unavailable record yields none. The `nyx` command line and
+  the checkouts worker both call it, so no path disagrees about what a
+  collection reads.
 - Never writes or locks a repository.
 
 ## Outside this boundary
@@ -73,7 +79,10 @@ README is narrative only.
 ## Collaborators
 
 - Depends on `catalog`, `protocols`, and `account-state`.
-- Used by `lifecycle-control` (the `nyx` command line).
+- Used by `lifecycle-control` (the `nyx` command line) and
+  `application-serving` (the checkouts worker kind).
+- The collector's deadline is derived from the worker's own budget; see
+  [application-serving invariants](../application-serving/README.md#cross-system-invariants).
 - Reuses the catalog byte bound; see
   [catalog invariants](../catalog/README.md#cross-system-invariants).
 - Calls `derive_removable`; see

@@ -6,20 +6,28 @@ README is narrative only.
 ## Responsibilities
 
 - `ApplicationRuntime`: shared HTTP, catalog admission, and worker lifecycle;
-  the loopback-only server, the catalog worker, and the desktop worker entry.
+  the loopback-only server, the catalog and checkouts workers, and the desktop
+  worker entry.
+- `CatalogWorkerManager` serves two worker kinds through one reservation,
+  spawn, reader, collect and finalizer path. A catalog fetch scans the
+  specification root on a 5-second budget and publishes the `producer_*`
+  categories; a checkouts fetch collects the configured checkout folders once,
+  locally on 30 seconds or networked on 60, and publishes the `checkouts_*`
+  categories. A fetch names its kind, so a catalog worker's command line and
+  categories are unchanged, and the manager never stores a kind.
 - Board settings are read from the held configuration, saved through
   `save_configuration_owned` after the revision check; `/api/workspace` is read-only.
 
 ## Outside this boundary
 
-- The specification scanning rules (`catalog`), writing the configuration file
-  (`account-state`), and the Linux service lifecycle `setup`, `start`, `stop`
-  (`lifecycle-control`).
+- The specification scanning rules (`catalog`), the checkout collection rules
+  (`checkouts`), writing the configuration file (`account-state`), and the
+  Linux service lifecycle `setup`, `start`, `stop` (`lifecycle-control`).
 
 ## Collaborators
 
-- Depends on `account-state`, `protocols`, `catalog`, and `lifecycle-control`
-  (the claim primitive).
+- Depends on `account-state`, `protocols`, `catalog`, `checkouts`, and
+  `lifecycle-control` (the claim primitive).
 - Used by `lifecycle-control` and `desktop`. Serves `board-web`.
 - Byte bound: see [catalog invariants](../catalog/README.md#cross-system-invariants);
   configuration writes: see
@@ -34,6 +42,10 @@ README is narrative only.
   `worker.source_child_environment()`, so it imports `nyx` from its starter's
   package directory, and a new spawn site calls the same function. Members:
   `lifecycle-control`, `desktop`.
+- A checkouts worker hands its collector a deadline 1.5 s below its own
+  budget, so a collection that cannot finish inside its calls returns a
+  document whose affected values read `timed_out` or `deadline` rather than a
+  manager timeout. Members: `checkouts`.
 - A `board-web` file is served only if `_STATIC` lists it and ships in the
   wheel only if `pyproject.toml` package-data matches it; the desktop build
   bundles the whole directory. Members: `board-web`, `desktop`.

@@ -279,36 +279,24 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
     """
 
     try:
-        configuration = state.observe_configuration()
+        observation = state.observe_configuration()
     except state.StateError:
-        configuration = state.ConfigurationObservation("unavailable")
-    if configuration.status == "unavailable":
+        observation = state.ConfigurationObservation("unavailable")
+    inputs = checkouts.collection_inputs(observation)
+    if inputs is None:
         print("nyx: Nyx configuration is unavailable", file=sys.stderr)
         return 1
-    folders = (
-        configuration.configuration.checkout_folders
-        if configuration.status == "configured"
-        else ()
-    )
-    github_lookup = (
-        configuration.configuration.checkout_github_lookup
-        if configuration.status == "configured"
-        else False
-    )
-    if not folders:
+    if not inputs.folders:
         print("no checkout folders are configured")
         return 0
     deadline = time.monotonic_ns() + _CHECKOUTS_DEADLINE_SECONDS * 1_000_000_000
     try:
         rendered = checkouts.collect_checkouts(
-            folders,
+            inputs.folders,
             deadline_ns=deadline,
             remote_checks=not no_network,
-            github_lookup=github_lookup,
-            package_scan=checkouts.PackageScan(
-                configuration.configuration.specification_root,
-                configuration.configuration.completed_stage_names,
-            ),
+            github_lookup=inputs.github_lookup,
+            package_scan=inputs.package_scan,
         )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)

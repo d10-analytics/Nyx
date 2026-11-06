@@ -31,7 +31,7 @@ files = ["nyx/checkouts.py"]
 - `lifecycle-control`: the Linux service lifecycle, its ownership claims, and
   the `nyx` command line.
 - `application-serving`: the loopback HTTP server, catalog admission, and the
-  catalog worker shared by the service and the desktop application.
+  catalog and checkouts workers the service and the desktop application share.
 - `desktop`: the Windows and macOS desktop application and its build.
 - `board-web`: the browser board's HTML, JavaScript, styles, and assets.
 
