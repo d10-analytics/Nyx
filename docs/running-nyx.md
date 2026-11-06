@@ -868,10 +868,11 @@ worktrees` instead. The `--json` document keeps every path.
   behind the default branch reads `merged · cleanup pending ...`.
 - A package branch whose copy exists only on the remote and whose commit is on the
   default branch's first-parent history, within the newest 5,000 commits, reads
-  `merge state unknown`: that commit is either a branch fast-forward merged or one
-  pushed with no commit of its own, and a remote-tracking branch cannot tell
-  which. A commit older than that bound is not read against that history, so it
-  stays merged.
+  `merge state unknown` unless a merged, same-repository pull request into the
+  default branch whose head is that commit proves it merged: without that proof,
+  the commit is either a branch fast-forward merged or one pushed with no commit
+  of its own, and a remote-tracking branch cannot tell which. A commit older than
+  that bound is not read against that history, so it stays merged.
 - A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
 - With no live or saved remote answer, a branch deleted on the remote stays
   present at the tip of any clone that has not pruned it, so a deleted branch
