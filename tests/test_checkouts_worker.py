@@ -10,9 +10,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +31,9 @@ REPOSITORY_ROOT = Path(__file__).parents[1].resolve()
 SLOW_SSH_SECONDS = 5
 # The lowered networked budget of the deadline proofs.
 NETWORKED_BUDGET_SECONDS = 3.0
+# How long a blocking program holds its call.  It outlives every budget here, so
+# only a signal can explain its end, and it ends on its own if one never comes.
+BLOCKING_PROGRAM_SECONDS = 60
 
 
 def _write_record(
@@ -397,3 +403,370 @@ def test_a_state_error_while_observing_configuration_is_unavailable(monkeypatch)
     monkeypatch.setattr(checkouts, "collect_checkouts", collect)
 
     assert worker._worker_main(kind="checkouts", deadline_ms=1000) == 4
+
+
+# ---------------------------------------------------------------------------
+# A checkouts worker contains the programs it starts
+# ---------------------------------------------------------------------------
+
+
+def _slow_command(directory: Path) -> tuple[Path, Path]:
+    """An executable that starts a grandchild, records both ids and waits."""
+    marker = directory / "slow-command-pids"
+    script = directory / "slow-command"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"sleep {BLOCKING_PROGRAM_SECONDS} &\n"
+        f"printf '%s %s\\n' \"$$\" \"$!\" > \"{marker}\"\n"
+        "wait\n"
+    )
+    script.chmod(0o755)
+    return script, marker
+
+
+def _blocking_ssh(directory: Path, workspace) -> Path:
+    """Point every clone at an ssh program that records its chain and blocks.
+
+    git starts the program a repository's own ``core.sshCommand`` names, so the
+    git call that waits for it, the fake ssh and the ssh's own grandchild are
+    all descendants of the worker that collected the folder.
+    """
+    marker = directory / "ssh-pids"
+    helper = directory / "blocking-ssh.py"
+    helper.write_text(
+        "import os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "marker = Path(sys.argv[1])\n"
+        "grandchild = subprocess.Popen([\n"
+        "    sys.executable, '-c', f'import time; time.sleep({%d})'\n"
+        "])\n"
+        "marker.write_text(f'{os.getpid()} {os.getppid()} {grandchild.pid}')\n"
+        f"time.sleep({BLOCKING_PROGRAM_SECONDS})\n" % BLOCKING_PROGRAM_SECONDS
+    )
+    command = f'"{sys.executable}" "{helper}" "{marker}"'
+    for repository in (workspace.first, workspace.second):
+        git(repository, "remote", "set-url", "origin", "ssh://git@example.invalid/r.git")
+        git(repository, "config", "core.sshCommand", command)
+    return marker
+
+
+def _recorded(marker: Path) -> list[int]:
+    """The process ids a helper recorded, once it has recorded them."""
+    return [int(field) for field in marker.read_text().split()]
+
+
+def _alive(pid: int) -> bool:
+    """Report whether one process id still names a running process."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _assert_gone(pids: Iterable[int], deadline: float) -> None:
+    """Wait until no recorded process is alive, naming the survivors."""
+    remaining = sorted(set(pids))
+    while remaining and time.monotonic() < deadline:
+        remaining = [pid for pid in remaining if _alive(pid)]
+        if remaining:
+            time.sleep(0.01)
+    assert not remaining, f"processes {remaining} outlived their worker"
+
+
+def _end(pids: Iterable[int]) -> None:
+    """End anything a failed proof left behind."""
+    for pid in sorted(set(pids)):
+        if _alive(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _process_parents() -> dict[int, int]:
+    """Every live process id and its parent, from one process-table listing."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True
+    ).stdout
+    parents: dict[int, int] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            parents[int(fields[0])] = int(fields[1])
+    return parents
+
+
+def _ancestors(pid: int, stop: int) -> list[int]:
+    """Every process between ``pid`` and ``stop``, excluding ``stop``."""
+    parents = _process_parents()
+    chain: list[int] = []
+    parent = parents.get(pid)
+    while parent not in (None, 0, 1) and parent != stop:
+        chain.append(parent)
+        parent = parents.get(parent)
+    assert parent == stop, f"no process chain from {pid} up to {stop}: {chain}"
+    return chain
+
+
+def _worker_pid(manager: worker.CatalogWorkerManager, timeout: float) -> int:
+    """The process id of the worker this manager registered."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with manager._lock:
+            if manager._children:
+                return manager._children[0].process.pid
+        time.sleep(0.01)
+    raise AssertionError("the manager registered no worker")
+
+
+@posix_only
+def test_a_checkouts_timeout_ends_the_child_and_the_grandchild_it_started(
+    workspace, tmp_path
+):
+    script, marker = _slow_command(tmp_path)
+    manager = _worker_manager(
+        workspace, command_factory=lambda: [str(script)], checkouts_timeout=0.5
+    )
+    errors: list[BaseException] = []
+    recorded: list[int] = []
+
+    def fetch() -> None:
+        try:
+            manager.fetch_checkouts(network=False)
+        except BaseException as error:  # noqa: BLE001 - a failure is the assertion
+            errors.append(error)
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    try:
+        with _managed(manager):
+            thread.start()
+            _wait_for(marker, 20)
+            # The grandchild holds the worker's pipes and nothing else ends it,
+            # so its end can only come from the group the worker leads.
+            recorded = _recorded(marker)
+            thread.join(timeout=20)
+            assert not thread.is_alive()
+            _assert_gone(recorded, time.monotonic() + 2)
+    finally:
+        thread.join(timeout=20)
+        _end(recorded)
+
+    assert [error.code for error in errors] == ["checkouts_timeout"]
+
+
+@posix_only
+def test_close_cancels_a_blocked_checkouts_collection_and_ends_its_grandchild(
+    workspace, tmp_path
+):
+    script, marker = _slow_command(tmp_path)
+    manager = _worker_manager(
+        workspace, command_factory=lambda: [str(script)], checkouts_timeout=30
+    )
+    errors: list[BaseException] = []
+    recorded: list[int] = []
+
+    def fetch() -> None:
+        try:
+            manager.fetch_checkouts(network=False)
+        except BaseException as error:  # noqa: BLE001 - a failure is the assertion
+            errors.append(error)
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    try:
+        thread.start()
+        _wait_for(marker, 20)
+        recorded = _recorded(marker)
+        assert manager.close(time.monotonic() + 5) is True
+        thread.join(timeout=20)
+        assert not thread.is_alive()
+        assert manager.active_count == 0
+        _assert_gone(recorded, time.monotonic() + 2)
+    finally:
+        manager.close(time.monotonic() + 5)
+        thread.join(timeout=20)
+        _end(recorded)
+
+    assert [error.code for error in errors] == ["checkouts_cancelled"]
+
+
+@posix_only
+def test_owner_loss_ends_the_worker_with_git_the_ssh_and_its_grandchild(
+    workspace, tmp_path
+):
+    marker = _blocking_ssh(tmp_path, workspace)
+    read_fd, write_fd = os.pipe()
+    manager = _worker_manager(
+        workspace, networked_checkouts_timeout=60, parent_liveness_fd=read_fd
+    )
+    errors: list[BaseException] = []
+    recorded: list[int] = []
+
+    def fetch() -> None:
+        try:
+            manager.fetch_checkouts(network=True)
+        except BaseException as error:  # noqa: BLE001 - a failure is the assertion
+            errors.append(error)
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    try:
+        thread.start()
+        _wait_for(marker, 30)
+        worker_pid = _worker_pid(manager, 10)
+        ssh_pid, parent_pid, grandchild_pid = _recorded(marker)
+        # git is the ancestor that started the ssh program, and the whole chain
+        # is a descendant of the worker that is about to lose its owner.
+        recorded = [ssh_pid, parent_pid, grandchild_pid]
+        recorded += _ancestors(ssh_pid, worker_pid)
+
+        os.close(write_fd)
+        write_fd = -1
+        closed = time.monotonic()
+
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        _assert_gone(recorded, closed + 2)
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+        manager.close(time.monotonic() + 30)
+        thread.join(timeout=30)
+        _end(recorded)
+
+    assert [error.code for error in errors] == ["checkouts_failed"]
+
+
+@posix_only
+def test_a_checkouts_worker_without_its_own_session_exits_seven_on_owner_loss(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    isolate_git(monkeypatch, home)
+    marker = tmp_path / "collecting"
+    read_fd, write_fd = os.pipe()
+    script = (
+        "import os, sys, time\n"
+        "from pathlib import Path\n"
+        "from nyx import checkouts, state, worker\n"
+        "state.resolve_account_home = lambda: Path(os.environ['NYX_TEST_HOME'])\n"
+        "marker = Path(sys.argv[1])\n"
+        "def collect(*_args, **_kwargs):\n"
+        "    marker.write_text('collecting')\n"
+        "    time.sleep(60)\n"
+        "    return 'late'\n"
+        "checkouts.collect_checkouts = collect\n"
+        "raise SystemExit(worker.worker_entrypoint(sys.argv[2:]))\n"
+    )
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(marker),
+            "--kind",
+            "checkouts",
+            "--deadline-ms",
+            "30000",
+            "--parent-liveness-fd",
+            str(read_fd),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "NYX_TEST_HOME": str(home)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(read_fd,),
+    )
+    try:
+        _wait_for(marker, 30)
+        # Spawned without a session, the worker shares this test process's
+        # group; it must exit on its own rather than signal that group.
+        assert os.getsid(child.pid) != child.pid
+        os.close(write_fd)
+        write_fd = -1
+        assert child.wait(timeout=30) == 7
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+def test_a_finished_collection_leaves_no_grandchild_behind(workspace, tmp_path):
+    marker = _blocking_ssh(tmp_path, workspace)
+    manager = _worker_manager(workspace, networked_checkouts_timeout=NETWORKED_BUDGET_SECONDS)
+    recorded: list[int] = []
+    try:
+        with _managed(manager):
+            document = models.parse_checkouts(manager.fetch_checkouts(network=True))
+        recorded = _recorded(marker)
+        _assert_gone(recorded, time.monotonic() + 2)
+    finally:
+        _end(recorded)
+
+    [repository] = document["repositories"]
+    check = repository["remote"]["check"]
+    assert check["status"] == "failed"
+    assert check["reason"] in {"timed_out", "deadline"}
+
+
+def _spawned_in_its_own_session(
+    workspace, directory: Path, kind: str
+) -> bool:
+    """Report whether a spawn of ``kind`` leads the session it was started in."""
+    script = directory / f"blocking-{kind}"
+    # No pipe is held past the spawned process, so each kind's own termination
+    # is the only thing that has to end it.
+    script.write_text("#!/bin/sh\nsleep 60 >/dev/null 2>&1\n")
+    script.chmod(0o755)
+    manager = _worker_manager(workspace, command_factory=lambda: [str(script)])
+    errors: list[BaseException] = []
+
+    def fetch() -> None:
+        try:
+            if kind == worker.CHECKOUTS_KIND:
+                manager.fetch_checkouts(network=False)
+            else:
+                manager.fetch_catalog()
+        except BaseException as error:  # noqa: BLE001 - a failure is the assertion
+            errors.append(error)
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    try:
+        thread.start()
+        pid = _worker_pid(manager, 10)
+        leads = os.getsid(pid) == pid
+        assert manager.close(time.monotonic() + 5)
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    finally:
+        manager.close(time.monotonic() + 5)
+        thread.join(timeout=10)
+
+    assert len(errors) == 1
+    return leads
+
+
+@posix_only
+def test_only_a_checkouts_worker_leads_its_own_session(workspace, tmp_path):
+    assert _spawned_in_its_own_session(workspace, tmp_path, "checkouts") is True
+    assert _spawned_in_its_own_session(workspace, tmp_path, "catalog") is False
