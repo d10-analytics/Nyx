@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 7)
+# Checkout facts document (schema 8)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 7
+CHECKOUTS_SCHEMA_VERSION = 8
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -961,7 +961,7 @@ _BRANCH_KEYS = frozenset(
 # How a local branch serves a package.
 _BRANCH_PACKAGE_KEYS = frozenset({"package_path", "basis"})
 _BRANCH_PACKAGE_BASES = frozenset({"target_clone", "sibling_clone", "contained"})
-_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "packages"})
+_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "remote_verdict", "packages"})
 # A package branch's remote copy: what the group's remote answered, or the clones' own
 # remote-tracking refs when it did not.
 _REMOTE_COPY_KEYS = frozenset({"state", "sha", "basis"})
@@ -983,6 +983,12 @@ _VERDICT_MERGED_RUNGS = frozenset(
 )
 _VERDICT_UNKNOWN_REASONS = frozenset(
     {"no_base", "incomplete_clone", "git_too_old", "history_limit", "deadline", "failed"}
+)
+# A package branch's remote verdict may be unknown for those reasons too, and also
+# when no clone holds the tip's objects and when the tip's history cannot say whether
+# it was merged. Branch and worktree verdicts never carry either.
+_REMOTE_VERDICT_UNKNOWN_REASONS = _VERDICT_UNKNOWN_REASONS | frozenset(
+    {"objects_missing", "ambiguous_tip"}
 )
 _COMPARISON_RELATIONS = frozenset(
     {"equal", "ahead", "behind", "diverged", "differs", "absent", "unknown"}
@@ -1209,7 +1215,13 @@ def _comparison(
         raise ProtocolError(f"{name} counts contradict {relation}")
 
 
-def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
+def _verdict(
+    value: Any,
+    name: str,
+    *,
+    nullable: bool = False,
+    reasons: frozenset[str] = _VERDICT_UNKNOWN_REASONS,
+) -> None:
     if value is None and nullable:
         return
     item = _object(value, name)
@@ -1223,7 +1235,7 @@ def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
     elif state == "not_merged":
         valid = rung == "none" and reason is None
     else:
-        _choice(reason, _VERDICT_UNKNOWN_REASONS, f"{name}.reason")
+        _choice(reason, reasons, f"{name}.reason")
         valid = rung is None
     if not valid:
         raise ProtocolError(f"{name} carries a rung or reason its state does not allow")
@@ -2335,6 +2347,12 @@ def _repository(
         _text(entry["name"], f"{label}.name")
         _remote_copy(
             entry["remote"], f"{label}.remote", has_remote=remote is not None, check=check_status
+        )
+        _verdict(
+            entry["remote_verdict"],
+            f"{label}.remote_verdict",
+            nullable=True,
+            reasons=_REMOTE_VERDICT_UNKNOWN_REASONS,
         )
         listed = _list(entry["packages"], f"{label}.packages")
         if not listed:

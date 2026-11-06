@@ -16,7 +16,9 @@ lookup unavailable. A merged pull request into the verdict base, whose head bran
 is a local branch at a commit, proves that commit merged when the request's head
 is the commit or has it as an ancestor; the ancestry test reads only objects
 already on disk, in the clone or a sibling clone of the same remote, and such a
-verdict is never remembered.
+verdict is never remembered. A package branch no clone holds is proved merged the
+same way when the request's head is its remote tip, without reading an object; a
+tip without such a request stays ``unknown``.
 """
 
 from __future__ import annotations
@@ -42,14 +44,17 @@ from urllib.parse import unquote
 from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
 from .checkout_join import (
     CloneRefs,
+    PackageBranchPlan,
     PathKey,
     RemoteAnswer,
     RemoteFacts,
     TargetIndex,
+    _default_names,
     declared_branch_names,
     declared_names_by_repository,
     join_branches,
     moved_at_or_after,
+    package_branch_copies,
     resolve_target,
 )
 from .models import (
@@ -2406,6 +2411,44 @@ class _PullRung:
     siblings: Sequence[tuple[dict[str, Any], _CloneContext]] = ()
 
 
+def _merged_requests(
+    requests: Mapping[str, Sequence[_PullRequest]],
+    names: Sequence[str],
+    base: str | None,
+) -> list[_PullRequest]:
+    """The merged, same-repository requests into ``base`` whose head branch is one of
+    ``names``, lowest number first.
+
+    A request is listed once however many of ``names`` it answered for. No request
+    matches a base no one named.
+    """
+    if base is None:
+        return []
+    found: dict[int, _PullRequest] = {}
+    for name in names:
+        for pull in requests.get(name, ()):
+            if pull.state == "merged" and pull.base == base:
+                found[pull.number] = pull
+    return [found[number] for number in sorted(found)]
+
+
+def _same_head_pull(
+    requests: Mapping[str, Sequence[_PullRequest]],
+    names: Sequence[str],
+    base: str | None,
+    tip: str,
+) -> _PullRequest | None:
+    """The lowest-numbered merged request into ``base`` whose head is ``tip``.
+
+    ``names`` are the head branch names the requests were listed for, so a commit is
+    matched only through a name a clone holds or a package declares.
+    """
+    return next(
+        (pull for pull in _merged_requests(requests, names, base) if pull.head == tip),
+        None,
+    )
+
+
 class _Ladder:
     """Decide the merge verdict of tips against one clone's base, read-only."""
 
@@ -2683,17 +2726,12 @@ class _Ladder:
         for tip in tips.values():
             if tip.verdict is not None or tip.error is not None:
                 continue
-            merged: dict[int, _PullRequest] = {}
-            for name in rung.holders.get(tip.sha, ()):
-                for pull in rung.requests.get(name, ()):
-                    if pull.state == "merged" and pull.base == self._base.name:
-                        merged[pull.number] = pull
-            eligible = [merged[number] for number in sorted(merged)]
-            same = next((pull for pull in eligible if pull.head == tip.sha), None)
+            names = rung.holders.get(tip.sha, ())
+            same = _same_head_pull(rung.requests, names, self._base.name, tip.sha)
             if same is not None:
                 tip.verdict = _merged("pull_request", same.number)
                 continue
-            for pull in eligible:
+            for pull in _merged_requests(rung.requests, names, self._base.name):
                 overlay = source(pull.head)
                 if overlay is None:
                     continue
@@ -3459,6 +3497,75 @@ def _assign_drift(
             baseline["drift"] = dict(found)
 
 
+def _remote_only_base(repository: dict[str, Any]) -> str | None:
+    """The base name a remote-only package branch's pull request must name.
+
+    The remote answer's default branch when it named one; otherwise the single name
+    the readable clones' verdict bases give. No name, or several, leave the proof
+    without a base.
+    """
+    names = _default_names(repository)
+    return next(iter(names)) if len(names) == 1 else None
+
+
+def _held_by_a_local_copy(repository: dict[str, Any], name: str, sha: str) -> bool:
+    """Whether a readable clone of ``repository`` holds a branch named ``name`` at ``sha``.
+
+    Only a copy of that branch says anything about it: another branch at the same
+    commit is not this branch's local copy.
+    """
+    return any(
+        branch["sha"] == sha
+        for clone in repository["clones"]
+        if clone["status"] == "ok"
+        for branch in clone["branches"]
+        if branch["name"] == name
+    )
+
+
+def _assign_remote_only(
+    repositories: Sequence[dict[str, Any]],
+    plan: PackageBranchPlan,
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Decide the remote verdict of every package branch no local copy of it holds.
+
+    A package branch whose remote copy is ``present`` at a tip no readable clone
+    holds under that branch name takes a remote-only verdict. A merged,
+    same-repository request into the group's base name whose head is the tip proves
+    it merged, with the lowest such number; without one the merge state is
+    ``unknown``/``objects_missing``, since the step that needs a holder clone's
+    objects is not part of this pass. Nothing is decided for a copy that is not
+    present or whose tip a local copy holds, which leaves the verdict null.
+
+    ``pulls`` holds each repository's pull requests by head branch name, from a live
+    or recorded lookup; a group without one simply has no proof. Returns the verdict
+    of each decided package branch by (remote key, branch name). Read-only: it makes
+    no git call and reads no object.
+    """
+    verdicts: dict[tuple[str, str], dict[str, Any]] = {}
+    for repository, entries in zip(repositories, plan.branches):
+        remote = repository["remote"]
+        if remote is None:
+            continue
+        key = remote["key"]
+        requests = pulls.get(key, {})
+        base = _remote_only_base(repository)
+        for entry in entries:
+            copy = entry.remote
+            if copy is None or copy["state"] != "present":
+                continue
+            if _held_by_a_local_copy(repository, entry.name, copy["sha"]):
+                continue
+            proof = _same_head_pull(requests, (entry.name,), base, copy["sha"])
+            verdicts[(key, entry.name)] = (
+                _merged("pull_request", proof.number)
+                if proof is not None
+                else _unknown("objects_missing")
+            )
+    return verdicts
+
+
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
 _CACHE_KEYS = frozenset({"schema_version", "verdicts", "remote_checks"})
 _CACHE_SCHEMA = 3
@@ -3935,6 +4042,10 @@ def collect_checkouts(
     packages: list[dict[str, Any]]
     remote_facts: dict[str, RemoteFacts] = {}
     no_commits: dict[tuple[str, str], str] = {}
+    # Nothing is decided when git is unavailable: no repository is read, so no
+    # package branch resolves to one.
+    plan = PackageBranchPlan((), ())
+    remote_verdicts: dict[tuple[str, str], dict[str, Any]] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -4047,6 +4158,10 @@ def collect_checkouts(
                 settings,
                 max_parallel,
             )
+            # The names and remote copies are decided once, after every earlier
+            # pass, and the remote-only verdicts are decided from them.
+            plan = package_branch_copies(repositories, packages, remote_facts)
+            remote_verdicts = _assign_remote_only(repositories, plan, pulls)
         _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
@@ -4058,9 +4173,9 @@ def collect_checkouts(
     }.values()
     join_branches(
         repositories,
-        packages,
-        remote_facts,
+        plan,
         scan_complete=package_heads is not None and package_heads.status == "complete",
+        remote_verdicts=remote_verdicts,
         no_commits=no_commits,
     )
     document: dict[str, Any] = {

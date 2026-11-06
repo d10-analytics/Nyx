@@ -26,15 +26,17 @@ the check, and otherwise, with no answer, the tracking ref that moved last among
 readable clones that hold it. One ranking key orders both choices: a ref with a move
 time before one without, then the later move, then the first clone in natural path
 order. With no answer and no clone holding the ref the state is ``unknown``, never
-``absent``; fetch times play no part.
+``absent``; fetch times play no part. ``package_branch_copies`` makes this decision
+once, after the collector's earlier passes, and the join stores its result.
 
 Each such package also gets its Code Status. The facts are the branch's local copies (the
 branches of that name in the readable clones of the repository) and its remote copy. A
-remote copy whose tip equals no local copy's tip has no verdict and counts as unknown,
-never merged. A branch none of whose local copies has a commit of its own, with a remote
-copy (if any) at the tip of one, reads ``no_commits_yet`` ahead of every other rule; a copy
-whose no-commit check did not run counts as unknown. The fields are stored in ``code_status`` and ``models.code_status_text``
-renders them, so a reader recomputes the text from the fields.
+remote copy whose tip equals no local copy's tip counts as unknown in the Code Status,
+never merged, whatever verdict the collector's remote-only pass decided for it. A branch
+none of whose local copies has a commit of its own, with a remote copy (if any) at the tip
+of one, reads ``no_commits_yet`` ahead of every other rule; a copy whose no-commit check
+did not run counts as unknown. The fields are stored in ``code_status`` and
+``models.code_status_text`` renders them, so a reader recomputes the text from the fields.
 """
 
 from __future__ import annotations
@@ -152,6 +154,33 @@ class RemoteFacts:
 
     answer: RemoteAnswer | None
     clones: Mapping[str, CloneRefs]
+
+
+@dataclass(frozen=True)
+class PackageBranch:
+    """One package branch of a repository group.
+
+    ``name`` is the branch packages declare, ``remote`` the copy ``_remote_copy``
+    decides (``None`` for a group without a remote), and ``packages`` the packages
+    that declare it, in package-path order.
+    """
+
+    name: str
+    remote: Mapping[str, Any] | None
+    packages: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class PackageBranchPlan:
+    """What the name-and-copy rules decided for one collection.
+
+    ``branches`` holds each repository group's package branches, aligned with the
+    repositories they belong to; ``defaults`` the packages whose declared branch is
+    their repository's default branch.
+    """
+
+    branches: tuple[tuple[PackageBranch, ...], ...]
+    defaults: tuple[dict[str, Any], ...]
 
 
 def _declared(
@@ -279,6 +308,46 @@ def _default_names(repository: Mapping[str, Any]) -> frozenset[str]:
         for clone in repository["clones"]
         if clone["status"] == "ok" and clone["verdict_base"] is not None
     )
+
+
+def package_branch_copies(
+    repositories: Sequence[dict[str, Any]],
+    packages: Sequence[dict[str, Any]],
+    remotes: Mapping[str, RemoteFacts],
+) -> PackageBranchPlan:
+    """Decide every package branch's remote copy and the packages naming a default
+    branch, mutating nothing.
+
+    The pairs are ``_declared``'s, so only a package whose target resolved to a clone
+    or linked worktree of its repository takes part. A package whose branch is one of
+    its repository's ``_default_names`` is returned separately; every other package is
+    listed under its branch name, with the remote copy ``_remote_copy`` decides from
+    ``remotes`` (``None`` for a group without a remote).
+    """
+    defaults: list[dict[str, Any]] = []
+    named: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for repository, package in _declared(repositories, packages):
+        name = package["branch"]["name"]
+        if name in _default_names(repository):
+            defaults.append(package)
+        else:
+            named.setdefault(id(repository), {}).setdefault(name, []).append(package)
+    branches = []
+    for repository in repositories:
+        remote = repository["remote"]
+        facts = remotes.get(remote["key"]) if remote is not None else None
+        by_name = named.get(id(repository), {})
+        branches.append(
+            tuple(
+                PackageBranch(
+                    name,
+                    None if remote is None else _remote_copy(repository, name, facts),
+                    tuple(sorted(by_name[name], key=lambda item: item["package_path"])),
+                )
+                for name in sorted(by_name, key=natural_key)
+            )
+        )
+    return PackageBranchPlan(tuple(branches), tuple(defaults))
 
 
 def _contained_chain(branches: Mapping[str, str | None], start: str) -> list[str]:
@@ -413,22 +482,23 @@ def _code_status(
 
 def join_branches(
     repositories: Sequence[dict[str, Any]],
-    packages: Sequence[dict[str, Any]],
-    remotes: Mapping[str, RemoteFacts],
+    plan: PackageBranchPlan,
     *,
     scan_complete: bool,
+    remote_verdicts: Mapping[tuple[str, str], Mapping[str, Any]],
     no_commits: Mapping[tuple[str, str], str] | None = None,
 ) -> None:
-    """Match declared package branches to the branches of their repository.
+    """Match the package branches of ``plan`` to the branches of their repository.
 
-    ``packages`` are the package entries after target resolution; ``remotes`` holds the
-    remote facts by remote key. A package whose target resolved to a clone and whose
-    ``Branch:`` equals its repository's default branch becomes ``default_branch`` and is
-    matched to nothing. Every other such package is listed in its repository's
-    ``package_branches``, with the remote copy of the branch (``None`` for a repository
-    without a remote), and on each local branch of that repository's readable clones that
-    carries its branch name or is folded under it, and every package whose branch has a
-    copy gets its Code Status. All three are rewritten in place.
+    ``plan`` is ``package_branch_copies``'s result, decided after the collector's
+    earlier passes. A package it returns as naming its repository's default branch
+    becomes ``default_branch`` and is matched to nothing. Every listed package branch
+    is written to its repository's ``package_branches``, with the remote copy the plan
+    decided (``None`` for a repository without a remote) and the ``remote_verdict``
+    ``remote_verdicts`` holds for its remote key and branch name, if any. Each local
+    branch of that repository's readable clones that carries the name or is folded
+    under it is matched, and every package whose branch has a copy gets its Code
+    Status. All three are rewritten in place.
 
     ``scan_complete`` says whether the package scan read every package. When it did not,
     a package that is not listed may still name the branch, so no branch is concluded to be
@@ -439,30 +509,24 @@ def join_branches(
     a local branch (``yes``, ``no`` or ``unrun``); a branch absent from it was not checked.
     """
     no_commits = no_commits or {}
-    named: dict[int, dict[str, list[dict[str, Any]]]] = {}
-    for repository, package in _declared(repositories, packages):
-        if package["branch"]["name"] in _default_names(repository):
-            package["branch"] = {"status": "default_branch", "name": None}
-            continue
-        named.setdefault(id(repository), {}).setdefault(package["branch"]["name"], []).append(
-            package
-        )
-
-    for repository in repositories:
-        by_name = named.get(id(repository), {})
+    for package in plan.defaults:
+        package["branch"] = {"status": "default_branch", "name": None}
+    for repository, entries in zip(repositories, plan.branches):
         remote = repository["remote"]
-        facts = remotes.get(remote["key"]) if remote is not None else None
+        key = None if remote is None else remote["key"]
+        by_name = {entry.name: list(entry.packages) for entry in entries}
+        copies = {entry.name: entry.remote for entry in entries}
         repository["package_branches"] = [
             {
-                "name": name,
-                "remote": None if remote is None else _remote_copy(repository, name, facts),
-                "packages": sorted(p["package_path"] for p in by_name[name]),
+                "name": entry.name,
+                "remote": entry.remote,
+                "remote_verdict": None if key is None else remote_verdicts.get((key, entry.name)),
+                "packages": sorted(package["package_path"] for package in entry.packages),
             }
-            for name in sorted(by_name, key=natural_key)
+            for entry in entries
         ]
         if not by_name:
             continue
-        copies = {entry["name"]: entry["remote"] for entry in repository["package_branches"]}
         for name, named_packages in by_name.items():
             local, states = _local_copies(repository, name, no_commits)
             every_finished = scan_complete and all(
