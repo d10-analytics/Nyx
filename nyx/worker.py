@@ -467,11 +467,13 @@ class CatalogWorkerManager:
             }
             if self._working_directory is not None:
                 spawn_kwargs["cwd"] = self._working_directory
+            # Bound before any call that can raise, because the platform cleanup
+            # below iterates it whatever failed.
+            inherited_handles: list[int] = []
             if self._default_command:
                 child_environment = source_child_environment()
                 if child_environment is not None:
                     spawn_kwargs["env"] = child_environment
-            inherited_handles: list[int] = []
             inherited = self._inherited_objects()
             if inherited.descriptors:
                 if os.name != "nt":
