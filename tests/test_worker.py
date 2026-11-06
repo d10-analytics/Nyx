@@ -10,10 +10,18 @@ import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from launch_shadow import install_proof_environment, plant_shadow, shadow_imports
+from launch_shadow import (
+    install_proof_environment,
+    marked_copy_imports,
+    plant_marked_copy,
+    plant_shadow,
+    proof_environment,
+    shadow_imports,
+)
 
 from nyx import catalog, state, worker
 from nyx._native_claim import NativeClaim
@@ -813,6 +821,338 @@ def test_source_application_keeps_the_module_worker_entry(tmp_path, monkeypatch)
     ]
 
 
+def _installed_package_root(tmp_path: Path, name: str = "installed-root") -> Path:
+    """Create a tree that can stand in for the package this module loaded."""
+
+    root = (tmp_path / name).resolve()
+    (root / "nyx").mkdir(parents=True)
+    return root
+
+
+def _patch_installation(
+    monkeypatch,
+    root: Path,
+    *,
+    module_file: Path | None = None,
+    site_directories: tuple[str, ...] = (),
+    user_site: str | None = None,
+    user_site_enabled: bool = True,
+    no_user_site: bool = False,
+) -> None:
+    """Report ``root`` as where this module loaded and the listed site folders."""
+
+    user_site_directory = str(root / "user-site") if user_site is None else user_site
+    monkeypatch.setattr(
+        worker,
+        "__file__",
+        str(root / "nyx" / "worker.py" if module_file is None else module_file),
+    )
+    monkeypatch.setattr(
+        worker,
+        "site",
+        SimpleNamespace(
+            getsitepackages=lambda: list(site_directories),
+            getusersitepackages=lambda: user_site_directory,
+            ENABLE_USER_SITE=user_site_enabled,
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "sys",
+        SimpleNamespace(
+            flags=SimpleNamespace(no_user_site=no_user_site),
+            executable=sys.executable,
+        ),
+    )
+
+
+def test_source_child_environment_inherits_for_a_packaged_application(tmp_path, monkeypatch):
+    root = _installed_package_root(tmp_path, name=f"root{os.pathsep}name")
+    _patch_installation(monkeypatch, root)
+    monkeypatch.setenv("PYTHONPATH", "inherited-entry")
+    monkeypatch.setattr(worker, "_is_packaged_application", lambda: True)
+
+    assert worker.source_child_environment() is None
+
+
+@pytest.mark.parametrize("spelling", ["site-entry", "module-location"])
+def test_source_child_environment_inherits_an_equivalent_site_path(
+    tmp_path, monkeypatch, spelling
+):
+    root = _installed_package_root(tmp_path)
+    (root / "extra").mkdir()
+    indirect = str(root / "extra" / "..")
+    if spelling == "site-entry":
+        site_directories = (indirect,)
+        module_file = None
+    else:
+        site_directories = (str(root),)
+        module_file = Path(indirect) / "nyx" / "worker.py"
+    _patch_installation(
+        monkeypatch,
+        root,
+        module_file=module_file,
+        site_directories=site_directories,
+    )
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    assert worker.source_child_environment() is None
+
+
+def test_source_child_environment_inherits_an_installed_location_with_the_separator(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name=f"root{os.pathsep}name")
+    _patch_installation(monkeypatch, root, site_directories=(str(root),))
+    monkeypatch.setenv("PYTHONPATH", "")
+
+    assert worker.source_child_environment() is None
+
+
+def test_source_child_environment_consults_the_user_site_only_when_it_is_enabled(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name="user-site")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    _patch_installation(monkeypatch, root, user_site=str(root), user_site_enabled=True)
+    assert worker.source_child_environment() is None
+
+    _patch_installation(monkeypatch, root, user_site=str(root), user_site_enabled=False)
+    assert worker.source_child_environment() == {**os.environ, "PYTHONPATH": str(root)}
+
+
+def test_source_child_environment_prepends_at_a_site_directory_with_an_import_path(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name="site-packages")
+    _patch_installation(monkeypatch, root, site_directories=(str(root),))
+    monkeypatch.setenv("PYTHONPATH", "vendor")
+
+    assert worker.source_child_environment() == {
+        **os.environ,
+        "PYTHONPATH": str(root) + os.pathsep + "vendor",
+    }
+
+
+def test_source_child_environment_prepends_when_user_site_packages_are_disabled(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name="site-packages")
+    _patch_installation(monkeypatch, root, site_directories=(str(root),), no_user_site=True)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    assert worker.source_child_environment() == {**os.environ, "PYTHONPATH": str(root)}
+
+
+def test_source_child_environment_prepends_the_package_directory_for_a_source_run(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.chdir(elsewhere)
+    before = dict(os.environ)
+
+    environment = worker.source_child_environment()
+
+    assert environment == {**before, "PYTHONPATH": str(root)}
+    assert environment is not os.environ
+    assert dict(os.environ) == before
+
+
+def test_source_child_environment_replaces_an_empty_import_path(tmp_path, monkeypatch):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.setenv("PYTHONPATH", "")
+
+    environment = worker.source_child_environment()
+
+    assert environment is not None
+    assert environment["PYTHONPATH"] == str(root)
+
+
+def test_source_child_environment_keeps_inherited_entries_after_the_directory(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path)
+    inherited = os.pathsep.join([str(tmp_path / "vendor"), "relative-entry"])
+    _patch_installation(monkeypatch, root)
+    monkeypatch.setenv("PYTHONPATH", inherited)
+
+    assert worker.source_child_environment() == {
+        **os.environ,
+        "PYTHONPATH": str(root) + os.pathsep + inherited,
+    }
+
+
+def test_source_child_environment_prepends_even_when_the_first_entry_is_the_directory(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.setenv("PYTHONPATH", str(root))
+
+    assert worker.source_child_environment() == {
+        **os.environ,
+        "PYTHONPATH": str(root) + os.pathsep + str(root),
+    }
+
+
+def test_source_child_environment_prepends_before_a_relative_first_entry(tmp_path, monkeypatch):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("PYTHONPATH", ".")
+
+    environment = worker.source_child_environment()
+
+    assert environment == {**os.environ, "PYTHONPATH": str(root) + os.pathsep + "."}
+    assert os.path.realpath(".") == str(root)
+
+
+def test_source_child_environment_refuses_a_source_directory_with_the_separator(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name=f"root{os.pathsep}name")
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    with pytest.raises(worker.WorkerError) as error:
+        worker.source_child_environment()
+
+    assert error.value.code == "producer_unavailable"
+
+
+def test_source_child_environment_needs_no_platform_specific_path_object(tmp_path, monkeypatch):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    with patch.object(worker.os, "name", "nt"):
+        environment = worker.source_child_environment()
+
+    assert environment == {**os.environ, "PYTHONPATH": str(root)}
+
+
+class _EmptyWorkerPipe:
+    """A spawned child's pipe that is already at end of file."""
+
+    def read(self, size: int = -1) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        pass
+
+
+def _recording_popen(records: list[tuple[list[str], dict[str, object]]]):
+    """Build a ``Popen`` stand-in that records one spawn and exits cleanly."""
+
+    class _RecordingProcess:
+        def __init__(self, arguments, **keywords) -> None:
+            records.append((list(arguments), dict(keywords)))
+            self.stdout = _EmptyWorkerPipe()
+            self.stderr = _EmptyWorkerPipe()
+            self.returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+    return _RecordingProcess
+
+
+def test_default_worker_spawn_carries_the_launching_package_on_its_import_path(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    records: list[tuple[list[str], dict[str, object]]] = []
+    manager = worker.CatalogWorkerManager()
+    try:
+        with patch.object(worker.subprocess, "Popen", _recording_popen(records)):
+            assert manager.fetch_catalog() == b""
+        assert manager.active_count == 0
+    finally:
+        assert manager.close(time.monotonic() + 5)
+
+    assert len(records) == 1
+    command, options = records[0]
+    assert command == [sys.executable, "-P", "-m", "nyx.worker"]
+    environment = options["env"]
+    assert environment["PYTHONPATH"] == str(root)
+    assert {
+        key: value for key, value in environment.items() if key != "PYTHONPATH"
+    } == {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def test_default_worker_spawn_inherits_the_environment_from_a_site_installation(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name="site-packages")
+    _patch_installation(monkeypatch, root, site_directories=(str(root),))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    records: list[tuple[list[str], dict[str, object]]] = []
+    manager = worker.CatalogWorkerManager()
+    try:
+        with patch.object(worker.subprocess, "Popen", _recording_popen(records)):
+            assert manager.fetch_catalog() == b""
+    finally:
+        assert manager.close(time.monotonic() + 5)
+
+    assert worker.source_child_environment() is None
+    assert len(records) == 1
+    command, options = records[0]
+    assert command == [sys.executable, "-P", "-m", "nyx.worker"]
+    assert options.get("env") is None
+
+
+def test_injected_worker_command_keeps_the_inherited_environment(tmp_path, monkeypatch):
+    root = _installed_package_root(tmp_path)
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    factory_command = [sys.executable, "-c", "pass"]
+    records: list[tuple[list[str], dict[str, object]]] = []
+    manager = worker.CatalogWorkerManager(command_factory=lambda: factory_command)
+    try:
+        with patch.object(worker.subprocess, "Popen", _recording_popen(records)):
+            assert manager.fetch_catalog() == b""
+    finally:
+        assert manager.close(time.monotonic() + 5)
+
+    assert worker.source_child_environment() is not None
+    assert len(records) == 1
+    command, options = records[0]
+    assert command == factory_command
+    assert options.get("env") is None
+
+
+def test_default_worker_spawn_is_refused_before_starting_for_a_separator_root(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name=f"root{os.pathsep}name")
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    records: list[tuple[list[str], dict[str, object]]] = []
+    manager = worker.CatalogWorkerManager()
+    try:
+        with patch.object(worker.subprocess, "Popen", _recording_popen(records)):
+            with pytest.raises(worker.WorkerError) as error:
+                manager.fetch_catalog()
+        assert error.value.code == "producer_unavailable"
+        assert manager.active_count == 0
+    finally:
+        assert manager.close(time.monotonic() + 5)
+    assert records == []
+
+
 def test_console_helper_entry_emits_the_same_exact_bytes_as_the_module_entry():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -925,3 +1265,60 @@ def test_missing_worker_directory_fails_without_falling_back_to_the_launch_direc
         assert manager.close(time.monotonic() + 5)
     assert not missing.exists()
     assert shadow_imports(marker) == []
+
+
+def test_worker_inherits_the_import_root_of_the_process_that_started_it(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    package = workspace / "Fictional" / "Queue" / "sample"
+    package.mkdir(parents=True)
+    package.joinpath("spec.md").write_text("# Sample catalog entry\n", encoding="utf-8")
+    install_proof_environment(monkeypatch, home)
+    state.setup(workspace)
+    paths = state.state_paths()
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    marker = tmp_path / "marked-copy.log"
+    copy_root = plant_marked_copy(tmp_path / "marked-copy", marker)
+    payload_path = tmp_path / "worker-catalog.json"
+    script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from nyx import worker\n"
+        "manager = worker.CatalogWorkerManager(working_directory=Path(sys.argv[2]))\n"
+        "try:\n"
+        "    payload = manager.fetch_catalog()\n"
+        "finally:\n"
+        "    manager.close(time.monotonic() + 15)\n"
+        "Path(sys.argv[3]).write_bytes(payload)\n"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-P",
+            "-c",
+            script,
+            str(copy_root),
+            str(paths.state_directory),
+            str(payload_path),
+        ],
+        cwd=launch,
+        env=proof_environment(home),
+        capture_output=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    payload = json.loads(payload_path.read_bytes())
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert [entry["package_path"] for entry in payload["entries"]] == [
+        "Fictional/Queue/sample"
+    ]
+    records = marked_copy_imports(marker)
+    launchers = [directory for argv, directory in records if "nyx.worker" not in argv]
+    workers = [directory for argv, directory in records if "nyx.worker" in argv]
+    assert [directory.resolve() for directory in launchers] == [copy_root]
+    assert [directory.resolve() for directory in workers] == [copy_root]
