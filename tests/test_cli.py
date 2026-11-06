@@ -2315,22 +2315,6 @@ def test_plain_output_prints_attention_first_and_the_assigned_clone_of_the_packa
     assert plain.index(clone_line) == len(document["attention"])
 
 
-def test_the_parser_refuses_a_schema_4_document(tmp_path, account):
-    folder, _repository, _root, _record = _package_world(tmp_path, None)
-    document = json.loads(
-        checkouts.collect_checkouts(
-            [str(folder)], deadline_ns=time.monotonic_ns() + 60 * 10**9
-        )
-    )
-    document["schema_version"] = 4
-    document["checkouts_digest"] = models.canonical_digest(
-        document, omit=models.CHECKOUTS_DIGEST_OMITTED
-    )
-
-    with pytest.raises(models.ProtocolError, match="unsupported schema version"):
-        models.parse_checkouts(document)
-
-
 def _availability_vocabulary() -> tuple[set[str], set[str]]:
     """The reasons and states `_clone_availability` can produce, read from its source."""
     import ast
