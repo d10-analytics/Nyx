@@ -615,6 +615,9 @@ def _run_checkouts(*, network: bool, deadline_ms: int) -> int:
         observation = state.observe_configuration()
         inputs = checkouts.collection_inputs(observation)
     except state.StateError:
+        # observe_configuration itself reports an unreadable record as an
+        # unavailable observation; this catch mirrors the command line's
+        # handling so both entries keep the same contract.
         return 4
     if inputs is None:
         return 4
