@@ -3301,6 +3301,159 @@ def test_a_clone_without_a_base_is_no_holder_and_a_base_less_tip_reads_no_base(
     assert probes_from(w.baseless_calls, w.b, w.sha["base-less-only"])
 
 
+class ObjectOnlyWorld:
+    """One remote with two clones that keep a base and two that do not.
+
+    ``trunk`` moves on the remote after every clone is made, so no clone holds the live
+    base commit; the two no-base clones drop their remote-tracking copy of it, and the
+    two others keep theirs as a stale base. Two package branches are pushed only by a
+    clone outside the folder, and no configured clone holds either by ref: the first
+    no-base clone fetches one tip as an object, and the second never fetches it. The
+    base-less clones are last in natural order, the holder before the other.
+    """
+
+    names = ("object", "cut")
+
+    def __init__(self, base: Path) -> None:
+        self.folder = base / "folder"
+        self.folder.mkdir()
+        served = base / "served"
+        served.mkdir()
+        self.remote = make_remote(served)
+        self.a = clone(self.remote, self.folder / "Repo Clone 1")
+        self.b = clone(self.remote, self.folder / "Repo Clone 2")
+        self.n = clone(self.remote, self.folder / "Repo No Base 1")
+        self.other = clone(self.remote, self.folder / "Repo No Base 2")
+        self.outside = clone(self.remote, base / "outside")
+        self.sha: dict[str, str] = {}
+        self.build(base)
+
+    def build(self, base: Path) -> None:
+        w = self
+        for name in w.names:
+            git(w.outside, "fetch", "-q", "origin")
+            git(w.outside, "checkout", "-q", "-B", name, "origin/trunk")
+            w.sha[name] = commit_file(w.outside, f"{name}.txt", f"{name}\n")
+            git(w.outside, "push", "-q", "origin", name)
+            git(w.outside, "checkout", "-q", "trunk")
+        # The default branch moves past every clone after the branches were pushed, so
+        # the live base commit is one no clone holds.
+        commit_file(w.outside, "trunk.txt", "trunk\n")
+        git(w.outside, "push", "-q", "origin", "trunk")
+        # The two no-base clones keep no remote-tracking copy of the default branch, so
+        # they have neither the remote's current commit nor a cached base.
+        for member in (w.n, w.other):
+            git(member, "update-ref", "-d", "refs/remotes/origin/trunk", check=False)
+            git(member, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD", check=False)
+        # The first no-base clone holds one tip as an object, with no ref naming it.
+        git(w.n, "fetch", "-q", "origin", w.sha["object"])
+        w.object_root = base / "object-spec"
+        make_package(
+            w.object_root, "Drafts", "object", f"Target repo: {w.a}\nBranch: object\n"
+        )
+        w.cut_root = base / "cut-spec"
+        make_package(w.cut_root, "Drafts", "cut", f"Target repo: {w.a}\nBranch: cut\n")
+
+    def collect(self, root: Path, **options: Any) -> dict[str, Any]:
+        """Collect the folder with ``root``'s packages, proving no repository changed."""
+        members = (self.a, self.b, self.n, self.other, self.outside, self.remote)
+        before = {member: tree_fingerprint(member) for member in members}
+        document = collect_packages([self.folder], root, **options)
+        assert {member: tree_fingerprint(member) for member in members} == before
+        return document
+
+
+@pytest.fixture
+def object_only_world(tmp_path):
+    return ObjectOnlyWorld(tmp_path)
+
+
+@posix_only
+def test_a_base_less_clone_holding_the_tip_only_as_an_object_reads_no_base(
+    object_only_world, tmp_path, monkeypatch
+):
+    w = object_only_world
+    shim, log = argument_recorder(tmp_path)
+    with path_with(monkeypatch, shim):
+        document = w.collect(w.object_root, remote_checks=True)
+
+    paths = [clone["path"] for clone in repository_of(document, w.a)["clones"]]
+    assert paths[-2:] == [real(w.n), real(w.other)], (
+        "control: the two base-less clones are probed in this order"
+    )
+    assert clone_at(document, w.n)["verdict_base"] is None, "control: no verdict base"
+    assert clone_at(document, w.other)["verdict_base"] is None, "control: no verdict base"
+    assert clone_at(document, w.a)["verdict_base"] is not None, (
+        "control: a clone with a base"
+    )
+    # The first base-less clone holds the tip as an object only, and no clone of the
+    # repository holds it by ref or, with a base, as an object.
+    assert git(w.n, "cat-file", "-e", w.sha["object"]).returncode == 0
+    assert git(w.other, "cat-file", "-e", w.sha["object"], check=False).returncode != 0
+    for member in (w.a, w.b):
+        assert git(member, "cat-file", "-e", w.sha["object"], check=False).returncode != 0
+    for member in (w.a, w.b, w.n, w.other):
+        assert not git(member, "branch", "--list", "object").stdout.strip()
+        assert (
+            git(
+                member,
+                "rev-parse",
+                "--verify",
+                "-q",
+                "refs/remotes/origin/object",
+                check=False,
+            ).returncode
+            != 0
+        )
+    assert probes_from(log, w.n, w.sha["object"]), "the object holder is probed"
+    assert probes_from(log, w.other, w.sha["object"]), "the other base-less clone is probed"
+
+    # Both base-less clones were probed for the tip, and the absent answer of the second
+    # must not hide the first's present one: the reason is no_base, not objects_missing.
+    assert remote_verdict_of(document, w.a, "object") == remote_unknown("no_base")
+
+
+@posix_only
+def test_a_cut_base_less_probe_reads_deadline_not_objects_missing(
+    object_only_world, tmp_path, monkeypatch
+):
+    w = object_only_world
+    tip = w.sha["cut"]
+    plain = w.collect(w.cut_root, remote_checks=True)
+    assert remote_verdict_of(plain, w.a, "cut") == remote_unknown("objects_missing"), (
+        "control: every probe reported the object absent"
+    )
+
+    # The cut call is the base-less clone's own probe of the tip; the log proves the
+    # delaying wrapper saw no other clone's probe of it.
+    log = tmp_path / "cut-calls.log"
+    record = (
+        'sep=$(printf "\\037"); line=""; '
+        'for argument in "$@"; do line="$line$argument$sep"; done'
+    )
+    shim = stand_in(
+        tmp_path,
+        "cut-baseless-probe",
+        f'{record}; printf "%s\\n" "$line" >> "{log}"; '
+        f'case "$*" in *"Repo No Base 1"*"{tip}"*) exec sleep 60;; esac',
+    )
+    with path_with(monkeypatch, shim):
+        cut = w.collect(w.cut_root, remote_checks=True, call_cap_seconds=1.0)
+
+    delayed = [
+        call
+        for call in probes_naming(log, tip)
+        if any("Repo No Base 1" in argument for argument in call)
+    ]
+    assert delayed == probes_from(log, w.n, tip), "only the base-less clone's probe is delayed"
+    assert len(delayed) == 1
+    assert probes_from(log, w.a, tip) and probes_from(log, w.b, tip), (
+        "the clones with a base probed the tip and were not cut"
+    )
+    assert remote_verdict_of(cut, w.a, "cut") == remote_unknown("deadline")
+    assert local_verdicts(cut) == local_verdicts(plain)
+
+
 @posix_only
 def test_a_tip_on_the_default_history_is_ambiguous_and_a_merge_commit_stays_merged(
     holder_world,
