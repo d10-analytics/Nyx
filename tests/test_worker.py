@@ -1158,6 +1158,29 @@ def test_default_worker_spawn_is_refused_before_starting_for_a_separator_root(
     assert records == []
 
 
+def test_default_worker_spawn_refuses_a_separator_root_on_the_windows_branch(
+    tmp_path, monkeypatch
+):
+    root = _installed_package_root(tmp_path, name=f"root{os.pathsep}name")
+    _patch_installation(monkeypatch, root)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    records: list[tuple[list[str], dict[str, object]]] = []
+    manager = worker.CatalogWorkerManager()
+    try:
+        # The reported platform selects the native handle cleanup, which must
+        # stay well defined when the refused spawn raises before any transfer.
+        with patch.object(worker.os, "name", "nt"), patch.object(
+            worker.subprocess, "Popen", _recording_popen(records)
+        ):
+            with pytest.raises(worker.WorkerError) as error:
+                manager.fetch_catalog()
+        assert error.value.code == "producer_unavailable"
+        assert manager.active_count == 0
+    finally:
+        assert manager.close(time.monotonic() + 5)
+    assert records == []
+
+
 def test_console_helper_entry_emits_the_same_exact_bytes_as_the_module_entry():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
