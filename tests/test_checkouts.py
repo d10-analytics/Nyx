@@ -1,8 +1,10 @@
-"""Behavioral proofs for the checkout facts collector, against real repositories.
+"""Behavioral proofs for the checkout facts collector.
 
-Every state is produced by git itself in a temporary directory under an
-isolated home, so neither the developer's nor the runner's git configuration
-changes any outcome.  Timeouts are lowered only through collector parameters.
+The pure classification tables are proved by calling the deciding function
+directly, with end-to-end representatives through git.  Every state is produced
+by git itself in a temporary directory under an isolated home, so neither the
+developer's nor the runner's git configuration changes any outcome.  Timeouts
+are lowered only through collector parameters.
 """
 
 from __future__ import annotations
@@ -8184,6 +8186,11 @@ class GhCall:
         self.started = int((directory / "started").read_text())
 
 
+def gh_stdout_text(stdout: str | dict[str, Any]) -> str:
+    """The text a fake ``gh`` prints for ``stdout``: a string as it is, a mapping as JSON."""
+    return stdout if isinstance(stdout, str) else json.dumps(stdout)
+
+
 class FakeGh:
     """A POSIX shell script standing in for ``gh``: it logs the arguments, the
     environment, the request body and the start time of each call and replays a
@@ -8222,8 +8229,7 @@ exit "$(cat "$state/code")"
     def replay(
         self, stdout: str | dict[str, Any] = "", stderr: str = "", code: int = 0, delay: float = 0
     ) -> None:
-        text = stdout if isinstance(stdout, str) else json.dumps(stdout)
-        (self.state / "stdout").write_text(text)
+        (self.state / "stdout").write_text(gh_stdout_text(stdout))
         (self.state / "stderr").write_text(stderr)
         (self.state / "code").write_text(str(code))
         (self.state / "delay").write_text(str(delay))
@@ -8312,6 +8318,10 @@ def merged_world(tmp_path: Path) -> Path:
     land(work, "done")
     point_origin_at(work, remote, GITHUB_URL)
     return folder
+
+
+# The branch names that world's one request carries, in the order it sends them.
+MERGED_WORLD_BRANCHES = ("done", "trunk")
 
 
 @posix_only
@@ -8637,6 +8647,13 @@ CATEGORY_CASES = [
     *((name, {"code": 0, "stdout": answer}, "failed") for name, answer in ODD_SHAPE_CASES),
 ]
 
+CATEGORY_CASES_BY_NAME = {case[0]: case for case in CATEGORY_CASES}
+
+# One end-to-end answer shape per category source: an exit code, a rate-limited
+# error, a null repository and an oversized answer.  A name that is not a row
+# above raises while the cases are collected.
+CATEGORY_REPRESENTATIVES = ("exit-4", "rate-limited-type", "null-repository", "over-8-mib")
+
 
 @posix_only
 def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
@@ -8658,8 +8675,8 @@ def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
 @posix_only
 @pytest.mark.parametrize(
     ("replay", "reason"),
-    [case[1:] for case in CATEGORY_CASES],
-    ids=[case[0] for case in CATEGORY_CASES],
+    [CATEGORY_CASES_BY_NAME[name][1:] for name in CATEGORY_REPRESENTATIVES],
+    ids=list(CATEGORY_REPRESENTATIVES),
 )
 def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladder_alone(
     tmp_path, monkeypatch, replay, reason
@@ -8675,6 +8692,29 @@ def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladd
     assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
     [work] = all_clones(document)
     assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+    # The one request carries the world's branch names in order, and no other, so
+    # the branch names the pure table reads are the ones this call really sends.
+    [call] = fake.calls()
+    assert {
+        name: value
+        for name, value in json.loads(call.body)["variables"].items()
+        if name.startswith("h")
+    } == {f"h{index}": branch for index, branch in enumerate(MERGED_WORLD_BRANCHES)}
+
+
+@pytest.mark.parametrize(
+    ("replay", "reason"),
+    [case[1:] for case in CATEGORY_CASES],
+    ids=[case[0] for case in CATEGORY_CASES],
+)
+def test_each_gh_category_is_decided_by_the_answer_it_reads(replay, reason):
+    outcome = checkouts._Outcome(
+        replay.get("code", 0),
+        out=gh_stdout_text(replay.get("stdout", "")).encode("utf-8"),
+        err=replay.get("stderr", "").encode("utf-8"),
+    )
+
+    assert checkouts._github_answer(outcome, MERGED_WORLD_BRANCHES) == (reason, {})
 
 
 @posix_only
@@ -10850,9 +10890,6 @@ def test_a_networked_collection_whose_remote_moved_away_reports_the_saved_check(
 
 
 GH_FAILURES = [
-    ("not_authenticated", {"code": 4}),
-    ("rate_limited", {"code": 1, "stderr": "API rate limit exceeded"}),
-    ("not_found", {"code": 0, "stdout": NULL_REPOSITORY}),
     ("failed", {"code": 0, "stdout": "this is not json"}),
     ("timed_out", {"code": 0, "delay": 30}),
     ("gh_missing", None),
