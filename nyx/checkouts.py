@@ -17,8 +17,14 @@ is a local branch at a commit, proves that commit merged when the request's head
 is the commit or has it as an ancestor; the ancestry test reads only objects
 already on disk, in the clone or a sibling clone of the same remote, and such a
 verdict is never remembered. A package branch no clone holds is proved merged the
-same way when the request's head is its remote tip, without reading an object; a
-tip without such a request stays ``unknown``.
+same way when the request's head is its remote tip, without reading an object.
+A tip without such a request is decided by the same ladder in a second pass, run
+after every clone's first pass, in a clone that holds it: a clone holds a tip
+when the tip is one of its local or remote-tracking refs, or when the object probe
+finds the object there, and the preferred holder decides. A tip on the default
+branch's own first-parent history never reads merged, because a branch pushed with
+no commit of its own and a branch fast-forward merged cannot be told apart from a
+remote-tracking ref.
 """
 
 from __future__ import annotations
@@ -2589,12 +2595,17 @@ class _Ladder:
     def first_parent_chain(self) -> frozenset[str] | None:
         """The newest ``FIRST_PARENT_LIMIT`` commits on the base's first-parent chain, or
         ``None`` when the listing was cut or failed."""
+        return self.first_parent_listing()[0]
+
+    def first_parent_listing(self) -> tuple[frozenset[str] | None, str | None]:
+        """The newest ``FIRST_PARENT_LIMIT`` commits on the base's first-parent chain, and
+        the reason a listing that could not finish was cut (``deadline``) or failed."""
         listing = self._git(
             ["rev-list", "--first-parent", f"--max-count={FIRST_PARENT_LIMIT}", self._base.sha]
         )
         if not listing.ok:
-            return None
-        return frozenset(_decode(listing.out).split())
+            return None, _call_failure(listing)
+        return frozenset(_decode(listing.out).split()), None
 
     def _priority(self, tip: _Tip) -> tuple[int, int, int]:
         """Tips with no saved answer first, then the oldest saved answer, then the newest.
@@ -2628,20 +2639,28 @@ class _Ladder:
         detached: Sequence[str],
     ) -> None:
         base = self._base.sha
-        listing = self._git(
-            ["for-each-ref", f"--merged={base}", "--format=%(objectname) %(refname)", "refs/heads"]
-        )
-        if not listing.ok:
-            for tip in tips.values():
-                tip.fail(_call_failure(listing))
-            return
+        # A ladder with no branch name has nothing the merged listing answers, so it
+        # makes no call: a holder ladder for a tip no local copy names is one.
         merged: dict[str, str] = {}
-        for line in _decode(listing.out).split("\n"):
-            if not line:
-                continue
-            sha, _, ref = line.partition(" ")
-            if ref.startswith("refs/heads/"):
-                merged[ref[len("refs/heads/") :]] = sha
+        if branches:
+            listing = self._git(
+                [
+                    "for-each-ref",
+                    f"--merged={base}",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                ]
+            )
+            if not listing.ok:
+                for tip in tips.values():
+                    tip.fail(_call_failure(listing))
+                return
+            for line in _decode(listing.out).split("\n"):
+                if not line:
+                    continue
+                sha, _, ref = line.partition(" ")
+                if ref.startswith("refs/heads/"):
+                    merged[ref[len("refs/heads/") :]] = sha
         checked: dict[str, bool | str] = {}
 
         def is_ancestor(tip: _Tip) -> None:
@@ -3523,47 +3542,299 @@ def _held_by_a_local_copy(repository: dict[str, Any], name: str, sha: str) -> bo
     )
 
 
+# Where a holder's verdict base came from, best first: a live comparison, then a saved
+# remote check, then the clone's own tracking ref.
+_HOLDER_BASIS_RANK = {"live": 0, "recorded": 1, "cached": 2}
+
+
+def _clone_ref_tips(context: _CloneContext) -> frozenset[str]:
+    """Every commit the clone holds as a local or remote-tracking tip."""
+    local = {sha for sha, _upstream in context.local.values()}
+    return frozenset(local | set(context.cached.values()))
+
+
+def _complete_clone(context: _CloneContext) -> bool:
+    """Whether the clone has the whole history and every object it names."""
+    return not context.shallow and not context.partial
+
+
+@dataclass
+class _HolderWork:
+    """The remote-only holder search of one repository group.
+
+    ``tips`` maps each tip still needing a verdict to the package branch names whose
+    remote copy it is, in plan order. ``holders`` are the usable clones with a verdict
+    base, ``baseless`` those without one, both in the group's natural order; ``refs``
+    holds the commits each clone holds as a tip. ``held`` records the tips a holder
+    decided.
+    """
+
+    key: str
+    requests: Mapping[str, Sequence[_PullRequest]]
+    tips: dict[str, list[str]]
+    holders: list[tuple[dict[str, Any], _CloneContext, _Base]]
+    baseless: list[tuple[dict[str, Any], _CloneContext]]
+    refs: dict[str, frozenset[str]]
+    held: set[str] = field(default_factory=set)
+
+
+def _ref_holder_answers(work: _HolderWork, tip: str) -> bool:
+    """Whether a complete clone with a base holds ``tip`` by ref, which skips the probe.
+
+    A shallow, partial or base-less ref holder does not: a complete clone may still hold
+    the tip as objects only, and a base-less holder can only give ``no_base``.
+    """
+    return any(
+        _complete_clone(context) and tip in work.refs[clone["path"]]
+        for clone, context, _base in work.holders
+    )
+
+
+def _holder_rank(item: tuple[dict[str, Any], _CloneContext, _Base]) -> tuple[int, int]:
+    """Rank a candidate holder of one tip: a complete clone first, then a better base."""
+    _clone, context, base = item
+    return (0 if _complete_clone(context) else 1, _HOLDER_BASIS_RANK.get(base.basis, 3))
+
+
+def _holder_work(
+    repository: dict[str, Any],
+    entries: Sequence[Any],
+    contexts: Mapping[str, _CloneContext],
+    verdicts: Mapping[str, _CloneVerdicts],
+    requests: Mapping[str, Sequence[_PullRequest]],
+    base_name: str | None,
+    decided: dict[tuple[str, str], dict[str, Any]],
+) -> _HolderWork | None:
+    """The tips of one repository still needing a holder, and the clones that may hold them.
+
+    A present remote copy takes a verdict. A merged, same-repository request into
+    ``base_name`` whose head is its tip proves it merged, with the lowest such number,
+    and is written to ``decided``; such a tip leaves the holder search. A copy that is
+    not present, or whose tip a local copy of its branch holds, is left alone.
+    """
+    key = repository["remote"]["key"]
+    tips: dict[str, list[str]] = {}
+    for entry in entries:
+        copy = entry.remote
+        if copy is None or copy["state"] != "present":
+            continue
+        if _held_by_a_local_copy(repository, entry.name, copy["sha"]):
+            continue
+        proof = _same_head_pull(requests, (entry.name,), base_name, copy["sha"])
+        if proof is not None:
+            decided[(key, entry.name)] = _merged("pull_request", proof.number)
+            continue
+        tips.setdefault(copy["sha"], []).append(entry.name)
+    if not tips:
+        return None
+    holders: list[tuple[dict[str, Any], _CloneContext, _Base]] = []
+    baseless: list[tuple[dict[str, Any], _CloneContext]] = []
+    refs: dict[str, frozenset[str]] = {}
+    for clone, context in _usable_clones(repository["clones"], contexts):
+        result = verdicts.get(clone["path"])
+        base = None if result is None else result.base
+        refs[clone["path"]] = _clone_ref_tips(context)
+        if base is None:
+            baseless.append((clone, context))
+        else:
+            holders.append((clone, context, base))
+    return _HolderWork(key, requests, tips, holders, baseless, refs)
+
+
 def _assign_remote_only(
+    runner: _GitRunner,
     repositories: Sequence[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    verdicts: Mapping[str, _CloneVerdicts],
     plan: PackageBranchPlan,
     pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
-) -> dict[tuple[str, str], dict[str, Any]]:
+    settings: _VerdictSettings,
+    max_parallel: int,
+    cache: Mapping[str, tuple[str, int]],
+) -> tuple[dict[tuple[str, str], dict[str, Any]], _CloneVerdicts]:
     """Decide the remote verdict of every package branch no local copy of it holds.
 
-    A package branch whose remote copy is ``present`` at a tip no readable clone
-    holds under that branch name takes a remote-only verdict. A merged,
-    same-repository request into the group's base name whose head is the tip proves
-    it merged, with the lowest such number; without one the merge state is
-    ``unknown``/``objects_missing``, since the step that needs a holder clone's
-    objects is not part of this pass. Nothing is decided for a copy that is not
-    present or whose tip a local copy holds, which leaves the verdict null.
+    A merged, same-repository request into the group's base name whose head is the
+    remote tip proves it merged, with the lowest such number. Otherwise the tip is
+    decided by the same ladder in a holder clone: a usable clone with a verdict base
+    holds a tip by ref when it is one of the clone's local or remote-tracking tips, or
+    by the object probe. A complete ref holder skips the probe for its tip; every other
+    clone with a base is probed once for all its tips, and a base-less clone only for a
+    tip no holder decides, to tell ``no_base`` from ``objects_missing``. Among the
+    candidates the preferred complete clone decides, then the better base basis, then
+    the first in natural order. When a holder's ladder decides a tip ``merged`` by the
+    ancestor rung, a tip on that base's own first-parent history becomes
+    ``unknown``/``ambiguous_tip`` and a listing that could not finish leaves it
+    ``unknown`` as the listing's reason says.
 
-    ``pulls`` holds each repository's pull requests by head branch name, from a live
-    or recorded lookup; a group without one simply has no proof. Returns the verdict
-    of each decided package branch by (remote key, branch name). Read-only: it makes
-    no git call and reads no object.
+    A tip no clone with a base holds is ``unknown``: ``deadline`` when a probe of such a
+    clone was cut, else ``failed`` when any probe failed, else ``no_base`` when only
+    base-less clones hold it, else ``objects_missing``. Nothing is decided for a copy
+    that is not present or whose tip a local copy holds, which leaves the verdict null.
+
+    ``pulls`` holds each repository's pull requests by head branch name, from a live or
+    recorded lookup; a group without one simply has no proof. Every git call goes
+    through ``runner`` and reads only. Returns the verdict of each decided package
+    branch by (remote key, branch name), and the cache keys the holder ladders used or
+    decided.
     """
-    verdicts: dict[tuple[str, str], dict[str, Any]] = {}
+    decided: dict[tuple[str, str], dict[str, Any]] = {}
+    works: list[_HolderWork] = []
     for repository, entries in zip(repositories, plan.branches):
         remote = repository["remote"]
         if remote is None:
             continue
-        key = remote["key"]
-        requests = pulls.get(key, {})
-        base = _remote_only_base(repository)
-        for entry in entries:
-            copy = entry.remote
-            if copy is None or copy["state"] != "present":
-                continue
-            if _held_by_a_local_copy(repository, entry.name, copy["sha"]):
-                continue
-            proof = _same_head_pull(requests, (entry.name,), base, copy["sha"])
-            verdicts[(key, entry.name)] = (
-                _merged("pull_request", proof.number)
-                if proof is not None
-                else _unknown("objects_missing")
+        work = _holder_work(
+            repository,
+            entries,
+            contexts,
+            verdicts,
+            pulls.get(remote["key"], {}),
+            _remote_only_base(repository),
+            decided,
+        )
+        if work is not None:
+            works.append(work)
+
+    used: set[str] = set()
+    fresh: dict[str, str] = {}
+    # The probe state of each tip in each clone, by the work index, clone path and tip.
+    probed: dict[tuple[int, str, str], str] = {}
+    # The probe state of each tip in each base-less clone, by the work index and tip.
+    baseless_probed: dict[tuple[int, str], str] = {}
+    probe_jobs = []
+    for index, work in enumerate(works):
+        for clone, context, _base in work.holders:
+            wanted = [
+                tip
+                for tip in work.tips
+                if tip not in work.refs[clone["path"]] and not _ref_holder_answers(work, tip)
+            ]
+            if wanted:
+                probe_jobs.append((index, clone, context, wanted))
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+
+        def probe(job: Any) -> tuple[int, str, dict[str, str]]:
+            index, clone, context, wanted = job
+            states = _present_objects(
+                runner,
+                context,
+                wanted,
+                overlay=settings.overlay,
+                pinned=settings.pinned,
             )
-    return verdicts
+            return index, clone["path"], states
+
+        for index, path, states in pool.map(probe, probe_jobs):
+            for tip, state in states.items():
+                probed[(index, path, tip)] = state
+
+        ladder_jobs = []
+        for index, work in enumerate(works):
+            chosen: dict[str, list[str]] = {}
+            for tip in work.tips:
+                candidates = [
+                    (clone, context, base)
+                    for clone, context, base in work.holders
+                    if tip in work.refs[clone["path"]]
+                    or probed.get((index, clone["path"], tip)) == "present"
+                ]
+                if not candidates:
+                    continue
+                clone, _context, _base = min(candidates, key=_holder_rank)
+                chosen.setdefault(clone["path"], []).append(tip)
+                work.held.add(tip)
+            for clone, context, base in work.holders:
+                tips = chosen.get(clone["path"])
+                if tips:
+                    ladder_jobs.append((index, work, clone, context, base, tips))
+
+        def decide_holder(job: Any) -> tuple[dict[tuple[str, str], dict[str, Any]], set[str], dict[str, str]]:
+            _index, work, _clone, context, base, tips = job
+            rung = _PullRung(work.requests, {tip: tuple(work.tips[tip]) for tip in tips})
+            ladder = _Ladder(runner, context, base, settings, cache, rung)
+            by_tip = ladder.decide([], tips)
+            chain: frozenset[str] | None = None
+            reason: str | None = None
+            listed = False
+            found: dict[tuple[str, str], dict[str, Any]] = {}
+            for tip in tips:
+                verdict = by_tip[tip]
+                if verdict["state"] == "merged" and verdict["rung"] == "ancestor":
+                    # A remote-tracking ref cannot tell a branch fast-forward merged from
+                    # one pushed with no commit of its own, so a tip on the base's own
+                    # first-parent history stays unknown.
+                    if not listed:
+                        chain, reason = ladder.first_parent_listing()
+                        listed = True
+                    if chain is None:
+                        verdict = _unknown(reason or "failed")
+                    elif tip in chain:
+                        verdict = _unknown("ambiguous_tip")
+                for name in work.tips[tip]:
+                    found[(work.key, name)] = dict(verdict)
+            return found, ladder.used, ladder.fresh
+
+        for found, ladder_used, ladder_fresh in pool.map(decide_holder, ladder_jobs):
+            decided.update(found)
+            used |= ladder_used
+            fresh.update(ladder_fresh)
+
+        # A base-less clone holds a tip only for the reason ``no_base``; it is probed for
+        # the tips no holder decided so that reason is not claimed from a missing object.
+        baseless_jobs: dict[tuple[int, str], list[Any]] = {}
+        for index, work in enumerate(works):
+            for tip in work.tips:
+                if tip in work.held:
+                    continue
+                for clone, context in work.baseless:
+                    if tip not in work.refs[clone["path"]]:
+                        job = baseless_jobs.setdefault((index, clone["path"]), [clone, context, []])
+                        job[2].append(tip)
+
+        def probe_baseless(job: Any) -> tuple[int, str, dict[str, str]]:
+            (index, _path), (clone, context, wanted) = job
+            states = _present_objects(
+                runner,
+                context,
+                wanted,
+                overlay=settings.overlay,
+                pinned=settings.pinned,
+            )
+            return index, clone["path"], states
+
+        for index, path, states in pool.map(probe_baseless, baseless_jobs.items()):
+            for tip, state in states.items():
+                baseless_probed[(index, tip)] = state
+
+    # The reasons a tip no holder decided can carry, in their precedence order: a cut
+    # probe of a clone with a base, a failed probe anywhere, only base-less holders.
+    cut = {(index, tip) for (index, _path, tip), state in probed.items() if state == "unknown"}
+    differed = {(index, tip) for (index, _path, tip), state in probed.items() if state == "differs"}
+    differed |= {(index, tip) for (index, tip), state in baseless_probed.items() if state == "differs"}
+    held_baseless: set[tuple[int, str]] = set()
+    for index, work in enumerate(works):
+        for tip in work.tips:
+            if any(tip in work.refs[clone["path"]] for clone, _context in work.baseless):
+                held_baseless.add((index, tip))
+            if baseless_probed.get((index, tip)) == "present":
+                held_baseless.add((index, tip))
+    for index, work in enumerate(works):
+        for tip in work.tips:
+            if tip in work.held:
+                continue
+            if (index, tip) in cut:
+                verdict = _unknown("deadline")
+            elif (index, tip) in differed:
+                verdict = _unknown("failed")
+            elif (index, tip) in held_baseless:
+                verdict = _unknown("no_base")
+            else:
+                verdict = _unknown("objects_missing")
+            for name in work.tips[tip]:
+                decided[(work.key, name)] = dict(verdict)
+    return decided, _CloneVerdicts(frozenset(used), dict(fresh))
 
 
 _CACHE_KEY = re.compile(r"(?:[0-9a-f]{40}\.[0-9a-f]{40}|[0-9a-f]{64}\.[0-9a-f]{64})")
@@ -4046,6 +4317,7 @@ def collect_checkouts(
     # package branch resolves to one.
     plan = PackageBranchPlan((), ())
     remote_verdicts: dict[tuple[str, str], dict[str, Any]] = {}
+    holder_verdicts = _CloneVerdicts()
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -4161,10 +4433,27 @@ def collect_checkouts(
             # The names and remote copies are decided once, after every earlier
             # pass, and the remote-only verdicts are decided from them.
             plan = package_branch_copies(repositories, packages, remote_facts)
-            remote_verdicts = _assign_remote_only(repositories, plan, pulls)
+            remote_verdicts, holder_verdicts = _assign_remote_only(
+                verdict_runner,
+                repositories,
+                contexts,
+                verdicts,
+                plan,
+                pulls,
+                settings,
+                max_parallel,
+                cache.verdicts,
+            )
         _assign_removable(repositories)
         if cache_path is not None:
-            _store_cache(cache_path, verdicts.values(), cache, checked, deadline_ns, diagnostics)
+            _store_cache(
+                cache_path,
+                [*verdicts.values(), holder_verdicts],
+                cache,
+                checked,
+                deadline_ns,
+                diagnostics,
+            )
     else:
         packages = _package_entries(package_heads, None)
 
