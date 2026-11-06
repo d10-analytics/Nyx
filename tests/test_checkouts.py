@@ -1439,6 +1439,14 @@ def refusal_of(document: dict[str, Any]) -> str:
     return str(error.value)
 
 
+def assert_refused_under_a_valid_digest(document: dict[str, Any], mutation) -> None:
+    """Prove the base parses, then that ``mutation`` is refused for its own rule."""
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    mutation(broken)
+    assert "removable" not in refusal_of(rederive(broken))
+
+
 def first_clone(document: dict[str, Any]) -> dict[str, Any]:
     return document["repositories"][0]["clones"][0]
 
@@ -1492,11 +1500,18 @@ def mutate_folder_enum(document):
     document["folders"][0]["status"] = "gone"
 
 
+def mutation_name(factory: str, *arguments: Any) -> str:
+    """Name a mutator after the factory that built it and the arguments it was given."""
+    rendered = "_".join(re.sub(r"\s+", "_", repr(argument)) for argument in arguments)
+    return f"{factory}_{rendered}"
+
+
 def mutate_comparison_counts(relation):
     def mutate(document):
         comparison = first_clone(document)["branches"][0]["vs_remote"]
         comparison.update(relation=relation, ahead=1, behind=0)
 
+    mutate.__name__ = mutation_name("mutate_comparison_counts", relation)
     return mutate
 
 
@@ -1510,6 +1525,7 @@ def mutate_schema(value):
     def mutate(document):
         document["schema_version"] = value
 
+    mutate.__name__ = mutation_name("mutate_schema", value)
     return mutate
 
 
@@ -1527,6 +1543,7 @@ def mutate_timestamp(field_path, value):
             )
             clone_document["cached_default"]["last_fetched_at"] = value
 
+    mutate.__name__ = mutation_name("mutate_timestamp", field_path, value)
     return mutate
 
 
@@ -1891,10 +1908,7 @@ REJECTED_VERDICT_DOCUMENTS = {
 @pytest.mark.parametrize("mutation", list(REJECTED_VERDICT_DOCUMENTS), ids=str)
 def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sample, mutation):
     document, _folder = sample
-    assert models.parse_checkouts(redigest(doc_copy(document)))
-    broken = doc_copy(document)
-    REJECTED_VERDICT_DOCUMENTS[mutation](broken)
-    assert "removable" not in refusal_of(rederive(broken))
+    assert_refused_under_a_valid_digest(document, REJECTED_VERDICT_DOCUMENTS[mutation])
 
 
 def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
@@ -1992,26 +2006,28 @@ def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
         models.parse_checkouts(redigest(retired))
 
 
+# The one form of each fact a non-ok item must leave null: a false boolean, an empty
+# object or list, a zero count, and the containment outcome a full clone reports.
 NULLABLE_CLONE_FACTS = {
-    "bare": (False, 0, "", []),
-    "partial_clone": (False, 0, "", []),
-    "shallow": (False, 0, "", []),
-    "cached_default": ({}, "", [], False),
-    "local_default": ({}, "", [], False),
-    "cached_vs_remote": ({}, "", [], False),
-    "stash_count": (0, False, "", []),
-    "worktrees": ([], "", 0, False),
-    "branches": ([], "", 0, False),
-    "verdict_base": ({}, "", [], False, 0),
-    "containment": ("complete", "", [], False, 0),
-    "removable_count": ({}, "", [], False, 0),
+    "bare": False,
+    "partial_clone": False,
+    "shallow": False,
+    "cached_default": {},
+    "local_default": {},
+    "cached_vs_remote": {},
+    "stash_count": 0,
+    "worktrees": [],
+    "branches": [],
+    "verdict_base": {},
+    "containment": "complete",
+    "removable_count": {},
 }
 NULLABLE_WORKTREE_FACTS = {
-    "head": ({}, "", [], False),
-    "changes": ({}, "", [], False, 0),
-    "operations": ([], "", 0, False),
-    "index_lock": (False, 0, "", []),
-    "verdict": ({}, "", [], False, 0),
+    "head": {},
+    "changes": {},
+    "operations": [],
+    "index_lock": False,
+    "verdict": {},
 }
 
 
@@ -2093,36 +2109,29 @@ def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
     }
     broken = doc_copy(document)
     refused_clone(broken)["status"] = "too_many_branches"
+    rederive(broken)
     first_clone(broken)[fact] = facts[fact]
-    with pytest.raises(models.ProtocolError):
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize(
-    ("fact", "empty"),
-    [(fact, empty) for fact, forms in NULLABLE_CLONE_FACTS.items() for empty in forms],
-    ids=lambda value: str(value)[:12],
-)
-def test_parser_rejects_empty_forms_for_clone_facts_that_must_be_null(sample, fact, empty):
+@pytest.mark.parametrize("fact", list(NULLABLE_CLONE_FACTS), ids=str)
+def test_parser_rejects_empty_forms_for_clone_facts_that_must_be_null(sample, fact):
     document, _folder = sample
     broken = doc_copy(document)
-    refused_clone(broken)[fact] = empty
-    with pytest.raises(models.ProtocolError):
+    refused_clone(broken)[fact] = NULLABLE_CLONE_FACTS[fact]
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize(
-    ("fact", "empty"),
-    [(fact, empty) for fact, forms in NULLABLE_WORKTREE_FACTS.items() for empty in forms],
-    ids=lambda value: str(value)[:12],
-)
-def test_parser_rejects_empty_forms_for_worktree_facts_that_must_be_null(sample, fact, empty):
+@pytest.mark.parametrize("fact", list(NULLABLE_WORKTREE_FACTS), ids=str)
+def test_parser_rejects_empty_forms_for_worktree_facts_that_must_be_null(sample, fact):
     document, _folder = sample
     broken = doc_copy(document)
     worktree = broken["repositories"][0]["clones"][1]["worktrees"][0]
     worktree.update(status="failed", head=None, changes=None, operations=None, index_lock=None)
-    worktree[fact] = empty
-    with pytest.raises(models.ProtocolError):
+    worktree[fact] = NULLABLE_WORKTREE_FACTS[fact]
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
@@ -7256,10 +7265,7 @@ REJECTED_CONTAINMENT_DOCUMENTS = {
 @pytest.mark.parametrize("mutation", list(REJECTED_CONTAINMENT_DOCUMENTS), ids=str)
 def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(sample, mutation):
     document, _folder = sample
-    assert models.parse_checkouts(redigest(doc_copy(document)))
-    broken = doc_copy(document)
-    REJECTED_CONTAINMENT_DOCUMENTS[mutation](broken)
-    assert "removable" not in refusal_of(rederive(broken))
+    assert_refused_under_a_valid_digest(document, REJECTED_CONTAINMENT_DOCUMENTS[mutation])
 
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
