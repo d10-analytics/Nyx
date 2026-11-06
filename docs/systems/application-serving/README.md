@@ -46,6 +46,16 @@ README is narrative only.
   budget, so a collection that cannot finish inside its calls returns a
   document whose affected values read `timed_out` or `deadline` rather than a
   manager timeout. Members: `checkouts`.
+- A checkouts worker ends with every program it started, and with the programs
+  those started. On POSIX it leads its own session, so one group holds exactly
+  its programs; the manager signals that group on a timeout and on
+  cancellation, the worker sweeps the same group after its document is out, and
+  a worker that loses its owner force-kills it. A worker that does not lead its
+  own session — one started by hand or by a test — signals no group and keeps
+  the plain exit status, so it never stops its starter. On Windows the worker
+  owns a kill-on-close job object instead, which ends its programs however the
+  worker ends. A catalog worker starts no program and keeps its unchanged spawn
+  and its process-only termination. Members: `checkouts`.
 - A `board-web` file is served only if `_STATIC` lists it and ships in the
   wheel only if `pyproject.toml` package-data matches it; the desktop build
   bundles the whole directory. Members: `board-web`, `desktop`.

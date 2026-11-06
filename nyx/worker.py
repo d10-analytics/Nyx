@@ -2,15 +2,25 @@
 
 One worker process runs one kind: the catalog scan, or one collection of the
 configured checkout folders.  Both kinds take the same inherited objects, the
-same spawn, stdout and stderr caps, the same timeout, cancellation and reaping
-mechanism, and the same exit-status categories; only the kind's arguments, its
-budget and the names its failures are published under differ.
+same spawn protocol, stdout and stderr caps, the same timeout, cancellation and
+reaping mechanism, and the same exit-status categories; only the kind's
+arguments, its budget and the names its failures are published under differ.
+
+A checkouts worker contains the programs it starts.  The manager gives it a
+session of its own on POSIX, so the manager stops the whole group it leads at
+either terminate site, the worker sweeps the same group once its document is
+out, and a worker that loses its owner force-kills that group because no
+manager remains to stop anything.  On Windows the worker owns a kill-on-close
+job object, so the kernel ends every program it started however it ends.  A
+catalog worker starts no program and keeps its unchanged spawn and its
+process-only termination.
 """
 
 from __future__ import annotations
 
 import os
 import select
+import signal
 import site
 import subprocess
 import sys
@@ -243,6 +253,164 @@ def _windows_parent_pipe_closed(fd: int) -> bool:
     raise OSError(error, "PeekNamedPipe failed")
 
 
+def _leads_own_session() -> bool:
+    """Report whether this process leads the session its programs inherit.
+
+    Only such a worker may signal its own process group: any other worker
+    shares its starter's group, so a group signal there would stop the starter
+    instead of only the programs this worker started.
+    """
+
+    try:
+        return os.getsid(0) == os.getpid()
+    except (AttributeError, OSError):  # pragma: no cover - no sessions on Windows
+        return False
+
+
+def _stop_descendants() -> None:
+    """Stop the programs this worker started, once its document is out.
+
+    The worker ignores the signal for itself first, so the stop reaches what it
+    started and nothing more, and it signals nothing when it does not lead its
+    own session.  A program that deliberately ignores that signal survives, and
+    a worker the operating system ends outright runs no sweep at all.
+    """
+
+    if not _leads_own_session():
+        return
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (AttributeError, OSError, ValueError):  # pragma: no cover - signal setup
+        return
+    try:
+        os.killpg(os.getpgid(0), signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _end_on_owner_loss(kind: str) -> None:
+    """End a worker whose owner is gone.
+
+    A checkouts worker that leads its own session force-kills the group it owns,
+    because no manager remains to stop those programs afterwards; every other
+    worker keeps the plain exit status.
+    """
+
+    if kind == CHECKOUTS_KIND and _leads_own_session():
+        try:
+            os.killpg(os.getpgid(0), signal.SIGKILL)
+        except OSError:
+            pass
+    os._exit(7)
+
+
+if os.name == "nt":  # pragma: no cover - exercised by the native Windows lane
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    # The worker holds the only, non-inheritable job handle; the kernel closes
+    # it when the process ends, however it ends, and the job with it.
+    _containment_job: int | None = None
+
+    class _JobBasicLimits(ctypes.Structure):
+        """The fixed-shape lead of a job object's extended limits."""
+
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JobIOCounters(ctypes.Structure):
+        """The input and output counters every extended-limits value carries."""
+
+        _fields_ = [
+            (name, ctypes.c_ulonglong)
+            for name in (
+                "ReadOperationCount",
+                "WriteOperationCount",
+                "OtherOperationCount",
+                "ReadTransferCount",
+                "WriteTransferCount",
+                "OtherTransferCount",
+            )
+        ]
+
+    class _JobExtendedLimits(ctypes.Structure):
+        """The extended limits of one job object."""
+
+        _fields_ = [
+            ("BasicLimitInformation", _JobBasicLimits),
+            ("IoInfo", _JobIOCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    def _contain_descendants() -> bool:
+        """Give this worker a job that ends its programs with it.
+
+        The job is created kill-on-close and the worker joins it before its
+        first child, so a normal end, a terminated process and ``_exit`` all
+        end every descendant.  ``False`` means no such guarantee exists, which
+        the caller reports as an unavailable worker.
+        """
+
+        global _containment_job
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.SetInformationJobObject.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            )
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = (
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+            )
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.GetCurrentProcess.argtypes = ()
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            limits = _JobExtendedLimits()
+            limits.BasicLimitInformation.LimitFlags = (
+                _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            )
+            if not kernel32.SetInformationJobObject(
+                job,
+                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits),
+                ctypes.sizeof(limits),
+            ):
+                return False
+            if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+                return False
+        except (AttributeError, OSError):
+            return False
+        _containment_job = job
+        return True
+
+else:
+
+    def _contain_descendants() -> bool:
+        """Report that this worker needs no job: its session is the containment."""
+
+        return True
+
+
 class WorkerError(RuntimeError):
     """A safe category returned by a catalog worker."""
 
@@ -254,8 +422,9 @@ class WorkerError(RuntimeError):
 class _ParentLossObserver:
     """Terminate a worker once its liveness pipe's write end is closed by its holder."""
 
-    def __init__(self, fd: int) -> None:
+    def __init__(self, fd: int, kind: str = CATALOG_KIND) -> None:
         self.fd = fd
+        self.kind = kind
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._observe,
@@ -266,6 +435,11 @@ class _ParentLossObserver:
     def start(self) -> None:
         self._thread.start()
 
+    def _end(self) -> None:
+        """End this worker, taking a contained kind's programs with it."""
+
+        _end_on_owner_loss(self.kind)
+
     def _observe(self) -> None:
         try:
             while not self._stop.is_set():
@@ -275,7 +449,7 @@ class _ParentLossObserver:
                     except OSError:
                         return
                     if parent_closed and not self._stop.is_set():
-                        os._exit(7)
+                        self._end()
                     self._stop.wait(0.05)
                     continue
                 try:
@@ -289,7 +463,7 @@ class _ParentLossObserver:
                 except OSError:
                     return
                 if not data and not self._stop.is_set():
-                    os._exit(7)
+                    self._end()
         finally:
             try:
                 os.close(self.fd)
@@ -305,6 +479,8 @@ def _receive_worker_inheritance(
     recovery_fd: int | None,
     recovery_path: Path | None,
     parent_liveness_fd: int | None,
+    *,
+    kind: str = CATALOG_KIND,
 ) -> tuple[NativeClaim | None, _ParentLossObserver | None] | None:
     """Validate a worker's inherited objects before configuration can be loaded.
 
@@ -335,7 +511,7 @@ def _receive_worker_inheritance(
             received_fd = None
         else:
             liveness_fd = NativeClaim.receive_handle(parent_liveness_fd, read_only=True)
-        observer = _ParentLossObserver(liveness_fd)
+        observer = _ParentLossObserver(liveness_fd, kind)
         observer.start()
         liveness_fd = None
         succeeded = True
@@ -374,7 +550,7 @@ def _worker_main(
     if not _arguments_admitted(kind, network, deadline_ms):
         return 4
     inherited = _receive_worker_inheritance(
-        recovery_fd, recovery_path, parent_liveness_fd
+        recovery_fd, recovery_path, parent_liveness_fd, kind=kind
     )
     if inherited is None:
         if recovery_fd is not None or recovery_path is not None or parent_liveness_fd is not None:
@@ -423,12 +599,15 @@ def _run_catalog() -> int:
 def _run_checkouts(*, network: bool, deadline_ms: int) -> int:
     """Collect the configured checkout folders as one checkout document.
 
+    The containment job exists before the first program this worker starts.
     ``nyx.checkouts`` is imported here, so a catalog worker's start time does
     not include the collector's import.  An unavailable configuration is
     reported as the kind's unavailable status, and a not-configured account
     still emits a document whose folders are empty.
     """
 
+    if not _contain_descendants():
+        return 4
     deadline_ns = time.monotonic_ns() + deadline_ms * 1_000_000
     from . import checkouts
 
@@ -457,11 +636,16 @@ def _run_checkouts(*, network: bool, deadline_ms: int) -> int:
         return 5
     except Exception:  # noqa: BLE001 - worker boundary has a category-safe envelope
         return 6
+    finally:
+        # After the document is out, because a call that timed out can leave the
+        # program it started behind and only this worker's group knows of it.
+        _stop_descendants()
 
 
 @dataclass
 class _Child:
     process: subprocess.Popen[bytes]
+    kind: str = CATALOG_KIND
     cancelled: bool = False
     terminal_reason: str | None = None
     finalizer_started: bool = False
@@ -622,6 +806,12 @@ class CatalogWorkerManager:
             }
             if self._working_directory is not None:
                 spawn_kwargs["cwd"] = self._working_directory
+            # A checkouts worker leads its own session, so the one group the
+            # manager signals holds exactly the programs that worker starts and
+            # their children.  A catalog worker starts none and keeps its
+            # unchanged spawn.
+            if kind == CHECKOUTS_KIND and os.name != "nt":
+                spawn_kwargs["start_new_session"] = True
             # Bound before any call that can raise, because the platform cleanup
             # below iterates it whatever failed.
             inherited_handles: list[int] = []
@@ -655,7 +845,7 @@ class CatalogWorkerManager:
                 for handle in inherited_handles:
                     os.set_handle_inheritable(handle, False)
 
-        child = _Child(process)
+        child = _Child(process, kind)
         with self._lock:
             self._reservations.remove(reservation)
             self._children.append(child)
@@ -786,6 +976,29 @@ class CatalogWorkerManager:
                     child.readers_complete.set()
                 child.progress.set()
 
+    def _terminate(self, child: _Child) -> None:
+        """Stop one child: a checkouts worker's group, a catalog worker's process.
+
+        A checkouts worker leads the group the manager started it in, so its own
+        programs and their children stop with it.  The group is signalled only
+        while its leader is unreaped, because a reaped leader's group id could
+        name an unrelated process.  A catalog worker starts no program and keeps
+        the process-only termination its resistant-child proofs require.
+        """
+
+        if child.process.poll() is not None:
+            return
+        if child.kind == CHECKOUTS_KIND and os.name != "nt":
+            try:
+                os.killpg(child.process.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            return
+        try:
+            child.process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+
     def _select_terminal_locked(self, child: _Child, reason: str) -> None:
         """Select the first terminal request reason and start its finalizer."""
 
@@ -798,11 +1011,8 @@ class CatalogWorkerManager:
                 "producer_timeout",
                 "producer_output_too_large",
             }
-        if child.process.poll() is None and reason != "producer_failed":
-            try:
-                child.process.terminate()
-            except (OSError, ProcessLookupError):
-                pass
+        if reason != "producer_failed":
+            self._terminate(child)
         child.progress.set()
         self._start_finalizer_locked(child)
 
@@ -823,11 +1033,7 @@ class CatalogWorkerManager:
         """Terminate, reap, drain and close a child without request coupling."""
 
         try:
-            if child.process.poll() is None:
-                try:
-                    child.process.terminate()
-                except (OSError, ProcessLookupError):
-                    pass
+            self._terminate(child)
             # No request deadline is used here.  close() supplies the separate
             # manager shutdown deadline while this operation retains ownership.
             child.process.wait()
