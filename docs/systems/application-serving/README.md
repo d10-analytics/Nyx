@@ -30,6 +30,10 @@ README is narrative only.
 - The Linux service and the desktop both serve through `ApplicationRuntime`,
   each with its own `CatalogWorkerManager`; servers are built only in
   `nyx/server.py`. Members: `lifecycle-control`, `desktop`.
+- Every Python child Nyx starts from a source run takes its environment from
+  `worker.source_child_environment()`, so it imports `nyx` from its starter's
+  package directory, and a new spawn site calls the same function. Members:
+  `lifecycle-control`, `desktop`.
 - A `board-web` file is served only if `_STATIC` lists it and ships in the
   wheel only if `pyproject.toml` package-data matches it; the desktop build
   bundles the whole directory. Members: `board-web`, `desktop`.

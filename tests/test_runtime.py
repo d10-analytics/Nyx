@@ -14,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -27,9 +28,15 @@ from conftest import (
     managed_daemon_run,
     skip_if_service_port_is_held,
 )
-from launch_shadow import plant_shadow, proof_environment, shadow_imports
+from launch_shadow import (
+    marked_copy_imports,
+    plant_marked_copy,
+    plant_shadow,
+    proof_environment,
+    shadow_imports,
+)
 
-from nyx import _native_claim, catalog, runtime, state, worker
+from nyx import _native_claim, catalog, cli, runtime, state, worker
 from nyx.models import SCHEMA_VERSION, canonical_digest
 
 pytestmark = pytest.mark.usefixtures("isolated_port")
@@ -345,6 +352,103 @@ def test_windows_spawn_transfers_native_handles_and_child_maps_them():
     assert receive.call_args_list[0].args == (101,)
     assert receive.call_args_list[1].args == (202,)
     assert receive.call_args_list[1].kwargs == {"write_only": True}
+
+
+@contextmanager
+def _recorded_daemon_spawn(platform: str):
+    """Patch the platform spawn surface and record what the start decided.
+
+    The caller runs ``_spawn_daemon`` inside the context; the yielded mocks
+    then show whether a child was started and whether a native handle was
+    transferred before the start made its decision.
+    """
+
+    startup = SimpleNamespace(lpAttributeList=None)
+    with patch.object(runtime.os, "name", platform), patch.object(
+        runtime.NativeClaim, "transfer_handle", side_effect=[101, 202]
+    ) as transfer_handle, patch.object(
+        runtime.os, "set_handle_inheritable", create=True
+    ), patch.object(
+        runtime.subprocess, "STARTUPINFO", return_value=startup, create=True
+    ), patch.object(runtime.subprocess, "DETACHED_PROCESS", 8, create=True), patch.object(
+        runtime.subprocess, "CREATE_NEW_PROCESS_GROUP", 16, create=True
+    ), patch.object(runtime.subprocess, "Popen", return_value=object()) as popen:
+        yield popen, transfer_handle, startup
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_daemon_spawn_passes_the_source_child_environment(platform, tmp_path, monkeypatch):
+    package_root = tmp_path / "package-root"
+    directory = tmp_path / "state"
+    directory.mkdir()
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(worker, "_package_directory", lambda: str(package_root))
+    with _recorded_daemon_spawn(platform) as (popen, transfer_handle, startup):
+        process = runtime._spawn_daemon(
+            11, 1234, ack_fd=22, claim_path=Path("claim"), working_directory=directory
+        )
+    command, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+    assert process is popen.return_value
+    assert kwargs["env"] == {**os.environ, "PYTHONPATH": str(package_root)}
+    assert kwargs["env"] is not os.environ
+    assert kwargs["cwd"] == directory
+    assert kwargs["close_fds"] is True
+    assert command[:4] == [sys.executable, "-P", "-m", "nyx.runtime"]
+    if platform == "nt":
+        assert command[command.index("--daemon-handle") + 1] == "101"
+        assert command[command.index("--ack-handle") + 1] == "202"
+        assert "--daemon-fd" not in command and "--ack-fd" not in command
+        assert startup.lpAttributeList == {"handle_list": [101, 202]}
+        assert kwargs["creationflags"] == 24
+        transfer_handle.assert_called()
+    else:
+        assert command[command.index("--daemon-fd") + 1] == "11"
+        assert command[command.index("--ack-fd") + 1] == "22"
+        assert kwargs["pass_fds"] == (11, 22)
+        assert kwargs["start_new_session"] is True
+        transfer_handle.assert_not_called()
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_daemon_spawn_keeps_the_inherited_environment_without_a_source_environment(
+    platform, tmp_path
+):
+    directory = tmp_path / "state"
+    directory.mkdir()
+    with patch.object(
+        runtime, "source_child_environment", return_value=None
+    ), _recorded_daemon_spawn(platform) as (popen, _transfer_handle, _startup):
+        assert (
+            runtime._spawn_daemon(
+                11, 1234, ack_fd=22, claim_path=Path("claim"), working_directory=directory
+            )
+            is popen.return_value
+        )
+    kwargs = popen.call_args.kwargs
+    assert kwargs.get("env") is None
+    assert kwargs["cwd"] == directory
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_daemon_spawn_refuses_a_separator_package_directory_before_starting(
+    platform, tmp_path, monkeypatch
+):
+    package_root = tmp_path / f"package{os.pathsep}root"
+    directory = tmp_path / "state"
+    directory.mkdir()
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(worker, "_package_directory", lambda: str(package_root))
+    with _recorded_daemon_spawn(platform) as (popen, transfer_handle, _startup):
+        with pytest.raises(runtime.StartupError) as caught:
+            runtime._spawn_daemon(
+                11, 1234, ack_fd=22, claim_path=Path("claim"), working_directory=directory
+            )
+    assert str(caught.value) == "Nyx daemon could not be started"
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    popen.assert_not_called()
+    if platform == "nt":
+        transfer_handle.assert_not_called()
 
 
 def test_daemon_rejects_expired_deadline_before_path_admission():
@@ -2174,6 +2278,32 @@ def test_posix_spawn_preserves_detached_descriptor_contract():
     assert kwargs["stderr"] is subprocess.DEVNULL
 
 
+def test_public_start_refuses_a_separator_package_directory_and_releases_the_claim(
+    tmp_path, monkeypatch, capsys
+):
+    paths, _, _ = _fixture(tmp_path)
+    directory = tmp_path / f"package{os.pathsep}root"
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(worker, "_package_directory", lambda: str(directory))
+    with patch.object(runtime, "_paths", return_value=paths), patch.object(
+        runtime.subprocess, "Popen"
+    ) as popen, pytest.raises(runtime.StartupError) as caught:
+        runtime.start()
+    assert str(caught.value) == "Nyx daemon could not be started"
+    popen.assert_not_called()
+
+    contender = runtime._lease_lock(paths, timeout=0.0)
+    assert contender.acquire(blocking=False)
+    contender.close()
+
+    with patch.object(runtime, "desktop_host", return_value=False), patch.object(
+        runtime, "_paths", return_value=paths
+    ), patch.object(runtime.subprocess, "Popen") as popen:
+        assert cli.main([]) == 1
+    assert capsys.readouterr().err == "nyx: Nyx daemon could not be started\n"
+    popen.assert_not_called()
+
+
 def test_public_start_spawns_the_daemon_in_its_admitted_state_directory():
     class SpawnRecorded(Exception):
         pass
@@ -2306,6 +2436,51 @@ def test_cli_service_children_leave_the_launch_directory_for_the_state_directory
             shadow_directory=launch,
             marker=root / "shadow-imports.log",
         )
+
+
+@pytest.mark.fixed_port
+@pytest.mark.skipif(
+    runtime.desktop_host(),
+    reason="the detached Linux service is not dispatched on desktop hosts",
+)
+def test_cli_service_daemon_and_worker_import_the_launching_copy():
+    skip_if_service_port_is_held()
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        launch = root / "launch"
+        launch.mkdir()
+        copy_marker = root / "marked-copy.log"
+        copy_root = plant_marked_copy(root / "marked-copy", copy_marker)
+        # The launcher puts the copy first on its own search path only, so
+        # every child reaches it through the environment its starter passes.
+        bootstrap = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(copy_root)!r})\n"
+            "from nyx.cli import main\n"
+            "raise SystemExit(main())\n"
+        )
+        _prove_isolated_cli_service(
+            cli=[sys.executable, "-P", "-c", bootstrap],
+            launch=launch,
+            environment=proof_environment(home),
+            workspace=_sample_workspace(root),
+            shadow_directory=home / ".nyx",
+            marker=root / "shadow-imports.log",
+        )
+        records = marked_copy_imports(copy_marker)
+
+    launchers = [directory for argv, directory in records if argv[2:3] == ("-c",)]
+    daemons = [
+        directory for argv, directory in records if argv[2:4] == ("-m", "nyx.runtime")
+    ]
+    workers = [
+        directory for argv, directory in records if argv[2:4] == ("-m", "nyx.worker")
+    ]
+    assert {directory.resolve() for directory in launchers} == {copy_root}
+    assert {directory.resolve() for directory in daemons} == {copy_root}
+    assert {directory.resolve() for directory in workers} == {copy_root}
 
 
 @pytest.mark.skipif(

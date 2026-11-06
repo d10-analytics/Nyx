@@ -25,3 +25,5 @@ README is narrative only.
   [account-state invariants](../account-state/README.md#cross-system-invariants).
 - Shared serving: see
   [application-serving invariants](../application-serving/README.md#cross-system-invariants).
+- Single import root for started children: see
+  [application-serving invariants](../application-serving/README.md#cross-system-invariants).
