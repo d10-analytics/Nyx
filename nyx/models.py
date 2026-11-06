@@ -780,10 +780,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 7)
+# Checkout facts document (schema 8)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 7
+CHECKOUTS_SCHEMA_VERSION = 8
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -961,7 +961,7 @@ _BRANCH_KEYS = frozenset(
 # How a local branch serves a package.
 _BRANCH_PACKAGE_KEYS = frozenset({"package_path", "basis"})
 _BRANCH_PACKAGE_BASES = frozenset({"target_clone", "sibling_clone", "contained"})
-_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "packages"})
+_PACKAGE_BRANCH_ENTRY_KEYS = frozenset({"name", "remote", "remote_verdict", "packages"})
 # A package branch's remote copy: what the group's remote answered, or the clones' own
 # remote-tracking refs when it did not.
 _REMOTE_COPY_KEYS = frozenset({"state", "sha", "basis"})
@@ -983,6 +983,12 @@ _VERDICT_MERGED_RUNGS = frozenset(
 )
 _VERDICT_UNKNOWN_REASONS = frozenset(
     {"no_base", "incomplete_clone", "git_too_old", "history_limit", "deadline", "failed"}
+)
+# A package branch's remote verdict may be unknown for those reasons too, and also
+# when no clone holds the tip's objects and when the tip's history cannot say whether
+# it was merged. Branch and worktree verdicts never carry either.
+_REMOTE_VERDICT_UNKNOWN_REASONS = _VERDICT_UNKNOWN_REASONS | frozenset(
+    {"objects_missing", "ambiguous_tip"}
 )
 _COMPARISON_RELATIONS = frozenset(
     {"equal", "ahead", "behind", "diverged", "differs", "absent", "unknown"}
@@ -1209,7 +1215,13 @@ def _comparison(
         raise ProtocolError(f"{name} counts contradict {relation}")
 
 
-def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
+def _verdict(
+    value: Any,
+    name: str,
+    *,
+    nullable: bool = False,
+    reasons: frozenset[str] = _VERDICT_UNKNOWN_REASONS,
+) -> None:
     if value is None and nullable:
         return
     item = _object(value, name)
@@ -1223,7 +1235,7 @@ def _verdict(value: Any, name: str, *, nullable: bool = False) -> None:
     elif state == "not_merged":
         valid = rung == "none" and reason is None
     else:
-        _choice(reason, _VERDICT_UNKNOWN_REASONS, f"{name}.reason")
+        _choice(reason, reasons, f"{name}.reason")
         valid = rung is None
     if not valid:
         raise ProtocolError(f"{name} carries a rung or reason its state does not allow")
@@ -2336,6 +2348,12 @@ def _repository(
         _remote_copy(
             entry["remote"], f"{label}.remote", has_remote=remote is not None, check=check_status
         )
+        _verdict(
+            entry["remote_verdict"],
+            f"{label}.remote_verdict",
+            nullable=True,
+            reasons=_REMOTE_VERDICT_UNKNOWN_REASONS,
+        )
         listed = _list(entry["packages"], f"{label}.packages")
         if not listed:
             raise ProtocolError(f"{label}.packages must not be empty")
@@ -2484,9 +2502,9 @@ def _code_status(value: Any, name: str, *, allowed: bool) -> None:
         _keys(cleanup, _CLEANUP_KEYS, f"{name}.cleanup")
         for key in ("worktrees", "branches"):
             _count(cleanup[key], f"{name}.cleanup.{key}")
-        if state == "merged" and (cleanup["worktrees"] > 0) == (cleanup["branches"] > 0):
+        if state == "merged" and cleanup["worktrees"] > 0 and cleanup["branches"] > 0:
             raise ProtocolError(
-                f"{name}.cleanup must have exactly one positive count for merged"
+                f"{name}.cleanup must not have both counts positive for merged"
             )
     paths = _list(item["checked_out_elsewhere"], f"{name}.checked_out_elsewhere")
     for index, path in enumerate(paths):
@@ -2549,6 +2567,44 @@ def _check_package_references(
                         valid = named in chain
                     if not valid:
                         raise ProtocolError(f"{label} has a {basis} reference its package does not back")
+
+
+def _check_remote_verdicts(repositories: list[dict[str, Any]]) -> None:
+    """Refuse a package branch's remote verdict wherever its remote copy or a local copy
+    forbids one.
+
+    A remote verdict is stored exactly when the group has a remote, its copy of the
+    branch is ``present``, and no readable clone of the group holds a branch of that
+    name at the copy's tip: a tip a local copy holds already has that copy's verdict,
+    and a copy the remote did not answer for has no tip to decide.
+    """
+    for repo_index, repository in enumerate(repositories):
+        readable = [clone for clone in repository["clones"] if clone["status"] == "ok"]
+        for entry_index, entry in enumerate(repository["package_branches"]):
+            label = f"repositories[{repo_index}].package_branches[{entry_index}].remote_verdict"
+            copy = entry["remote"]
+            verdict = entry["remote_verdict"]
+            if copy is None:
+                if verdict is not None:
+                    raise ProtocolError(f"{label} requires a remote")
+                continue
+            if copy["state"] != "present":
+                if verdict is not None:
+                    raise ProtocolError(f"{label} requires a present remote copy")
+                continue
+            held = any(
+                branch["name"] == entry["name"] and branch["sha"] == copy["sha"]
+                for clone in readable
+                for branch in clone["branches"]
+            )
+            if held and verdict is not None:
+                raise ProtocolError(
+                    f"{label} must be null when a local copy holds the remote tip"
+                )
+            if not held and verdict is None:
+                raise ProtocolError(
+                    f"{label} is required for a remote tip no local copy holds"
+                )
 
 
 def _contained_names(containers: Mapping[str, str | None], start: str) -> set[str]:
@@ -2689,6 +2745,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
             )
     _ordered(packages, package_sort_key, "packages")
     _check_package_references(parsed, packages)
+    _check_remote_verdicts(parsed)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:
         raise ProtocolError("checkouts digest mismatch")
     derived = derive_attention(document)

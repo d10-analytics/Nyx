@@ -20,6 +20,18 @@ README is narrative only.
   below the others; fetch times play no part). When no readable clone holds it
   the copy is `unknown`, never `absent`: only a live or saved answer says
   `absent`.
+- Decides the remote copy's verdict, `remote_verdict` in the document, for a
+  present copy whose commit no local copy of the branch has: a merged,
+  same-repository pull request into the default branch whose head is that commit
+  proves it merged, and otherwise the same verdict ladder runs in a clone that
+  holds the commit, judged against that clone's base. So a branch that exists only
+  on the remote gets a verdict. A copy whose commit no clone holds stays
+  `unknown`, and two reasons belong to this verdict alone: `objects_missing` when
+  no clone holds the commit, `ambiguous_tip` when it lies on the default branch's
+  first-parent history, where a fast-forward merge and a branch pushed with no
+  commit of its own look alike. The verdict is null exactly when there is nothing
+  to decide: no `origin` remote, a copy that is not `present`, or a copy at the tip
+  of a local copy of the branch.
 - Concludes that every package naming a branch is finished only from a complete
   package scan; on an incomplete one a package that may share the branch is
   unseen, so no package reads `awaiting_merge`.

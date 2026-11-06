@@ -241,6 +241,17 @@ CHECKOUT_RETIRED_WORDING = (
     "clone's own remote-tracking copy points to",
     "the newest 10 pull requests from the same repository (not a fork)",
     "the newest 10 same-repository pull requests of each branch name",
+    "the remote copy has the verdict of a local copy at the same commit, or else "
+    "`unknown`.",
+    "Nyx computes no verdict for a tip that exists only on the remote.",
+    "A branch that exists only on the remote reads `merge state unknown`.",
+    "A remote copy at a commit that no local copy holds counts as unknown too, so it "
+    "keeps a merged local branch from reading as merged.",
+    "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
+    "branch that exists only on the remote, which Nyx does not compute.",
+    "a branch deleted on the remote stays present at the tip of any clone that has "
+    "not pruned it, so a merged and deleted branch can read `merge state unknown`; "
+    "until a networked run answers.",
 )
 CHECKOUT_GUIDANCE_MARKERS = {
     "docs/running-nyx.md": (
@@ -388,6 +399,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "a remembered answer never replaces a `tree_equal` verdict that the cold run decides",
         "which can only make matching stricter",
         "so once the attributes are gone a run that decides the branch reports its own verdict",
+        "An `unknown` branch or worktree verdict has no rung and one of six reasons.",
         "`incomplete_clone` means the clone is shallow or partial",
         "`git_too_old` means git is older than 2.39",
         "the two patch rungs, `patch_equivalent` and `squash_equivalent`, need 2.39 for exact "
@@ -866,6 +878,8 @@ CODE_STATUS_MARKERS = (
     "decides the text, and the order matters:",
     "1. Every copy is merged: `merged · cleanup pending (N worktrees)`",
     "`merged · cleanup pending (N branches)`",
+    "When no local copy exists there is nothing to clean up, so it reads plain "
+    "`merged`.",
     "2. A pull request for the branch is open in the lookup's listing",
     "`PR #N open`, with the highest open number, and ` · N unpushed` after it only "
     "when the push state below is unpushed.",
@@ -882,13 +896,19 @@ CODE_STATUS_MARKERS = (
     "When no readable clone holds the remote-tracking branch, the copy is `unknown`, "
     "never `absent`",
     "Only a live or saved answer says `absent`.",
+    "each `package_branches[]` entry carries the copy's verdict as `remote_verdict`. "
+    "It is null exactly when there is nothing to decide",
+    "`objects_missing`, when no clone of the repository holds that commit, and "
+    "`ambiguous_tip`, when a clone does hold it and the commit lies on the default "
+    "branch's first-parent history",
+    "A branch or worktree verdict never carries either reason.",
     "It is `complete` when Nyx read every specification whole, and `incomplete` when "
     "some specification could not be read whole.",
     "A package whose `spec.md` cannot be read is not listed in `packages`",
     "rule 3 below never concludes `awaiting merge (no PR)` on an `incomplete` scan.",
     "a branch deleted on the remote stays present at the tip of any clone that has "
-    "not pruned it, so a merged and deleted branch can read `merge state unknown`; "
-    "until a networked run answers.",
+    "not pruned it, so a deleted branch reads by the verdict of the clone that still "
+    "holds its tip: the deletion shows only once a networked run answers.",
     "a branch that was never pushed reads `in progress · push state unknown`; until "
     "a networked run answers.",
     "the package has a well-formed `Superseded By:` header, whether or not its "
@@ -900,7 +920,11 @@ CODE_STATUS_MARKERS = (
     "`push state unknown` otherwise.",
     "` · in <name>, <name>`",
     "` · in N other worktrees` instead",
-    "A branch that exists only on the remote reads `merge state unknown`.",
+    "A branch that exists only on the remote gets a verdict from a clone that holds "
+    "its tip, or from a merged pull request whose head is its tip; with neither it "
+    "reads `merge state unknown`.",
+    "A remote copy at a commit no local copy holds is therefore judged on its own, "
+    "even when a local copy is ahead of, behind or diverged from it.",
     "0. At least one local copy exists, every local copy is a branch with no commit of "
     "its own, and the remote copy, if there is one, is at the commit of one of them: "
     "`in progress · no commits yet`.",
@@ -926,8 +950,14 @@ CODE_STATUS_MARKERS = (
     "`merged · cleanup pending ...` for such a branch.",
     "A branch with no commit of its own that is 5,000 or more first-parent commits "
     "behind the default branch reads `merged · cleanup pending ...`.",
-    "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
-    "branch that exists only on the remote, which Nyx does not compute.",
+    "A package branch whose copy exists only on the remote and whose commit is on the "
+    "default branch's first-parent history, within the newest 5,000 commits, reads "
+    "`merge state unknown` unless a merged, same-repository pull request into the "
+    "default branch whose head is that commit proves it merged: without that proof, "
+    "the commit is either a branch fast-forward merged or one pushed with no commit "
+    "of its own, and a remote-tracking branch cannot tell which.",
+    "A commit older than that bound is not read against that history, so it stays "
+    "merged.",
     "A clone whose status is not ok, such as one git could not read or one with too "
     "many branches, is not seen (see matching above).",
     "clones whose status is ok are searched. Any other clone, whether git could not "
@@ -1641,6 +1671,13 @@ def test_checkout_guide_documents_every_code_status_rule_in_order_with_its_limit
     limit = f"{FIRST_PARENT_LIMIT:,}"
     assert f"among the latest {limit} commits of the default branch's first-parent" in code_status
     assert f"that is {limit} or more first-parent commits behind" in code_status
+    # The remote-only ambiguity check reads the same first-parent bound, and it
+    # applies only when no merged pull request proves the commit.
+    assert (
+        f"within the newest {limit} commits, reads `merge state unknown` unless a "
+        "merged, same-repository pull request into the default branch whose head is "
+        "that commit proves it merged" in code_status
+    )
 
 
 def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
@@ -1653,6 +1690,38 @@ def test_checkout_system_readme_states_the_no_answer_remote_copy_rule():
     )
     _assert_unique_markers(readme, markers, "docs/systems/checkouts/README.md")
     assert "newer of last fetch" not in readme
+
+
+def test_checkout_system_readme_states_the_remote_copy_verdict():
+    readme = _normalized("docs/systems/checkouts/README.md")
+    markers = (
+        "Decides the remote copy's verdict, `remote_verdict` in the document, for a "
+        "present copy whose commit no local copy of the branch has",
+        "a merged, same-repository pull request into the default branch whose head is "
+        "that commit proves it merged, and otherwise the same verdict ladder runs in a "
+        "clone that holds the commit",
+        "So a branch that exists only on the remote gets a verdict.",
+        "two reasons belong to this verdict alone: `objects_missing` when no clone holds "
+        "the commit, `ambiguous_tip` when it lies on the default branch's first-parent "
+        "history, where a fast-forward merge and a branch pushed with no commit of its "
+        "own look alike",
+        "The verdict is null exactly when there is nothing to decide: no `origin` "
+        "remote, a copy that is not `present`, or a copy at the tip of a local copy of "
+        "the branch.",
+    )
+    _assert_unique_markers(readme, markers, "docs/systems/checkouts/README.md")
+
+
+def test_protocols_readme_states_the_merged_cleanup_rule():
+    readme = _normalized("docs/systems/protocols/README.md")
+    markers = (
+        "a `merged` status whose cleanup counts are both positive",
+        "it still requires a cleanup exactly for `merged`",
+        "a merged branch with nothing left to clean has a cleanup of two zeros and "
+        "reads plain `merged`",
+    )
+    _assert_unique_markers(readme, markers, "docs/systems/protocols/README.md")
+    assert "without exactly one positive count" not in readme
 
 
 def test_checkout_guide_texts_equal_the_texts_the_code_builds():
@@ -1699,11 +1768,13 @@ def test_checkout_guide_promises_plain_merged_nowhere_else():
     section = _section("docs/running-nyx.md", "## Inspect checkouts")
     code_status = section.split("### Code Status of specification packages", 1)[1]
     sentence = (
-        "Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a "
-        "branch that exists only on the remote, which Nyx does not compute."
+        "When no local copy exists there is nothing to clean up, so it reads plain "
+        "`merged`."
     )
     assert sentence in code_status
-    assert "`merged`" not in code_status.replace(sentence, "")
+    # Rule 1's no-local-copy case is the only place that names plain `merged`; every
+    # other merged text keeps its cleanup counts.
+    assert code_status.count("`merged`") == 1
 
 
 def test_workspace_guide_says_counts_as_finished_decides_checkout_packages():
