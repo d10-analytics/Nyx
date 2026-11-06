@@ -26,7 +26,11 @@ from .app_runtime import (
 )
 from .models import Catalog
 from .server import CatalogError, TrackerServer, create_server  # noqa: F401
-from .worker import CatalogWorkerManager, WorkerError  # noqa: F401
+from .worker import (
+    CatalogWorkerManager,
+    WorkerError,
+    source_child_environment,
+)  # noqa: F401
 
 
 def _port_bindings(port: int) -> tuple[str, str]:
@@ -1514,8 +1518,9 @@ class _Daemon:
 
 def _daemon_command(deadline_ns: int) -> list[str]:
     # ``-P`` keeps the daemon's working directory off its import path so that
-    # modules there cannot replace the installed package.  ``--port`` carries
-    # this process's port, read now, into the daemon.
+    # modules there cannot replace the package it imports.  ``_spawn_daemon``
+    # passes the daemon's import root in the child environment.  ``--port``
+    # carries this process's port, read now, into the daemon.
     return [
         sys.executable,
         "-P",
@@ -1540,9 +1545,17 @@ def _spawn_daemon(
 
     The daemon never inherits the launcher's directory: a relative import
     path entry would otherwise resolve against wherever the user ran ``nyx``.
-    A missing directory fails the spawn rather than falling back.
+    A missing directory fails the spawn rather than falling back.  Its
+    environment comes from ``source_child_environment`` so the daemon imports
+    the package this process loaded; a package directory that cannot be one
+    import-path entry fails the start before any handle is transferred or any
+    child exists.
     """
 
+    try:
+        child_environment = source_child_environment()
+    except WorkerError:
+        raise StartupError("Nyx daemon could not be started") from None
     command = _daemon_command(deadline_ns)
     pass_fds = [lease_fd]
     if claim_path is not None:
@@ -1554,6 +1567,8 @@ def _spawn_daemon(
         close_fds=True,
         cwd=working_directory,
     )
+    if child_environment is not None:
+        kwargs["env"] = child_environment
     if os.name == "nt":  # pragma: no cover - native Windows lane
         claim_handle = NativeClaim.transfer_handle(lease_fd)
         ack_handle = NativeClaim.transfer_handle(ack_fd) if ack_fd is not None else None

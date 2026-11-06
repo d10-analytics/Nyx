@@ -20,5 +20,6 @@ README is narrative only.
 - Bundles `board-web`.
 - Configuration writes: see
   [account-state invariants](../account-state/README.md#cross-system-invariants).
-- Shared serving and board assets: see
+- Shared serving, board assets and the single import root for started
+  children: see
   [application-serving invariants](../application-serving/README.md#cross-system-invariants).
