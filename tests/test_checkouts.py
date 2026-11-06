@@ -5518,10 +5518,7 @@ def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
     }
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["garbage", "extra_key", "foreign_schema", "ancestor_rung", "key_lengths", "oversized", "symlink"],
-)
+@pytest.mark.parametrize("kind", ["garbage", "oversized", "symlink"])
 def test_an_unreadable_cache_changes_only_a_diagnostic_and_is_repaired(
     tmp_path, isolated_git, kind
 ):
@@ -10673,7 +10670,7 @@ SAVED_FILE_VARIANTS = {
 }
 
 
-@pytest.mark.parametrize("kind", ["valid", *SAVED_FILE_VARIANTS])
+@pytest.mark.parametrize("kind", ["valid", "schema_4"])
 def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
     tmp_path, isolated_git, kind
 ):
@@ -10707,6 +10704,50 @@ def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
         *cold["diagnostics"],
         {"code": "checkout_cache_unreadable", "path": str(cache)},
     ]
+
+
+# A schema-3 verdict key: a merge base and a tip, each a 40-character object ID.
+CACHE_VERDICT_KEY = "a" * 40 + "." + "a" * 40
+
+
+def cache_writer_file() -> bytes:
+    """The file the production writer makes for one verdict, next to the one saved
+    remote check a valid saved file carries."""
+    return checkouts._cache_bytes(
+        {CACHE_VERDICT_KEY: ("none", 1)}, valid_saved_file()["remote_checks"]
+    )
+
+
+# Every form a schema-3 cache file reaches the parser in, by the name of what it
+# breaks.  The reader refuses an oversized file and a symbolic link before the
+# parser sees them, so those two forms stay end to end.
+CACHE_PARSER_FORMS = {
+    **{
+        kind: payload
+        for kind, payload in invalid_cache_payloads(cache_writer_file()).items()
+        if kind != "oversized"
+    },
+    **{
+        kind: json.dumps(_mutated(change)).encode()
+        for kind, change in SAVED_FILE_VARIANTS.items()
+    },
+}
+
+
+@pytest.mark.parametrize("kind", list(CACHE_PARSER_FORMS))
+def test_the_parser_refuses_every_form_a_saved_cache_reaches_it_in(kind):
+    with pytest.raises(models.ProtocolError):
+        checkouts._parse_cache(CACHE_PARSER_FORMS[kind])
+
+
+def test_both_unmutated_cache_bases_parse_into_the_entries_they_were_written_with():
+    written = checkouts._parse_cache(cache_writer_file())
+    assert written.verdicts == {CACHE_VERDICT_KEY: ("none", 1)}
+    assert set(written.remote_checks) == {GITHUB_KEY}
+
+    saved = checkouts._parse_cache(json.dumps(valid_saved_file()).encode())
+    assert saved.verdicts == {}
+    assert set(saved.remote_checks) == {GITHUB_KEY}
 
 
 # ---------------------------------------------------------------------------
