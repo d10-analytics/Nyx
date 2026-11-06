@@ -909,23 +909,24 @@ def test_unreadable_record_prints_only_the_unavailable_line_and_exits_one(
     assert (code, out, err) == (1, "", UNAVAILABLE)
 
 
-def test_a_document_over_two_mebibytes_is_refused_with_one_error_line(
-    tmp_path, account, capsys
+def test_a_document_over_the_output_bound_is_refused_with_one_error_line(
+    tmp_path, account, capsys, monkeypatch
 ):
+    # The real bound is the shared 2 MiB output limit, and the collector's own
+    # refusal check builds a real document over it. Here the bound is lowered so
+    # that one clone's document exceeds it and only the command's handling of
+    # the refusal is in question.
+    assert checkouts.MAX_OUTPUT_BYTES == 2 * 1024 * 1024
+    lowered_bound = 256
     remote = make_remote(tmp_path)
     folder = tmp_path / "folder"
     folder.mkdir()
-    # Each clone holds the most branches one clone may (the default and 99
-    # more), all at the default's tip, and long names fill the document.
-    for index in range(48):
-        repository = clone(remote, folder / f"many-{index:03d}")
-        head = git(repository, "rev-parse", "HEAD").stdout.strip()
-        add_packed_refs(
-            repository,
-            {f"refs/heads/{index:03d}-{n:03d}-" + "x" * 230: head for n in range(99)},
-        )
-    assert len(git(repository, "for-each-ref", "refs/heads").stdout.splitlines()) == 100
+    clone(remote, folder / "only")
     _configure(tmp_path, [folder])
+    code, out, err = _run_checkouts(capsys, "--json", "--no-network")
+    assert (code, err) == (0, "")
+    assert len(out.encode("utf-8")) > lowered_bound
+    monkeypatch.setattr(checkouts, "MAX_OUTPUT_BYTES", lowered_bound)
 
     for arguments in ((), ("--json",), ("--no-network",), ("--json", "--no-network")):
         code, out, err = _run_checkouts(capsys, *arguments)
