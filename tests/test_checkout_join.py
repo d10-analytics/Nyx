@@ -4391,6 +4391,189 @@ def test_schema_8_is_accepted_schema_7_refused_and_no_commits_yet_is_strict(stat
 
 
 # ---------------------------------------------------------------------------
+# Parser invariants: the remote verdict is stored exactly when it applies
+# ---------------------------------------------------------------------------
+
+def branch_entry_of(repository: dict[str, Any], name: str) -> dict[str, Any]:
+    """One package branch entry of a repository, by the branch it names."""
+    (entry,) = [item for item in repository["package_branches"] if item["name"] == name]
+    return entry
+
+
+def test_the_parser_refuses_a_remote_verdict_beside_a_local_copy_at_the_tip(status_document):
+    (repository,) = status_document["repositories"]
+    entry = branch_entry_of(repository, "both")
+    entry_index = repository["package_branches"].index(entry)
+    copy = entry["remote"]
+    target = package_of(status_document, "both")["target"]["clone"]
+    local = clone_at(status_document, target)
+    assert copy["state"] == "present", "control: the remote answered for the branch"
+    assert copy["sha"] in {item["sha"] for item in local["branches"] if item["name"] == "both"}, (
+        "control: a local copy holds the remote tip"
+    )
+    assert entry["remote_verdict"] is None, "control: the accepted document stores no verdict"
+    assert models.parse_checkouts(json.dumps(status_document))
+
+    def stored(document):
+        document["repositories"][0]["package_branches"][entry_index]["remote_verdict"] = dict(
+            MERGED_ANCESTOR
+        )
+
+    assert (
+        f"repositories[0].package_branches[{entry_index}].remote_verdict "
+        "must be null when a local copy holds the remote tip"
+    ) in reference_mutation(status_document, stored)
+
+
+def test_the_parser_refuses_a_null_remote_verdict_for_an_unmatched_present_tip(status_document):
+    (repository,) = status_document["repositories"]
+    entry = branch_entry_of(repository, "ahead")
+    entry_index = repository["package_branches"].index(entry)
+    copy = entry["remote"]
+    target = package_of(status_document, "ahead")["target"]["clone"]
+    local = clone_at(status_document, target)
+    assert copy["state"] == "present", "control: the remote answered for the branch"
+    assert copy["sha"] not in {item["sha"] for item in local["branches"] if item["name"] == "ahead"}, (
+        "control: no local copy holds the remote tip"
+    )
+    assert entry["remote_verdict"] is not None, "control: the accepted document stores a verdict"
+    assert models.parse_checkouts(json.dumps(status_document))
+
+    def dropped(document):
+        document["repositories"][0]["package_branches"][entry_index]["remote_verdict"] = None
+
+    assert (
+        f"repositories[0].package_branches[{entry_index}].remote_verdict "
+        "is required for a remote tip no local copy holds"
+    ) in reference_mutation(status_document, dropped)
+
+
+def test_the_parser_refuses_a_remote_verdict_without_a_present_remote_copy(status_document):
+    (repository,) = status_document["repositories"]
+    entry = branch_entry_of(repository, "zero")
+    entry_index = repository["package_branches"].index(entry)
+    assert entry["remote"]["state"] == "absent", "control: the branch was never pushed"
+    assert entry["remote_verdict"] is None, "control: the accepted document stores no verdict"
+    assert models.parse_checkouts(json.dumps(status_document))
+
+    def stored(document):
+        document["repositories"][0]["package_branches"][entry_index]["remote_verdict"] = dict(
+            MERGED_ANCESTOR
+        )
+
+    assert (
+        f"repositories[0].package_branches[{entry_index}].remote_verdict "
+        "requires a present remote copy"
+    ) in reference_mutation(status_document, stored)
+
+
+def test_the_parser_refuses_a_remote_verdict_on_an_unknown_remote_copy(collected, collected_layout):
+    repository = repository_of(collected, collected_layout["a"])
+    entry = branch_entry_of(repository, "topic")
+    index = collected["repositories"].index(repository)
+    entry_index = repository["package_branches"].index(entry)
+    assert entry["remote"]["state"] == "unknown", "control: no answer names a tip"
+    assert entry["remote_verdict"] is None, "control: the accepted document stores no verdict"
+
+    def stored(document):
+        document["repositories"][index]["package_branches"][entry_index]["remote_verdict"] = dict(
+            MERGED_ANCESTOR
+        )
+
+    assert (
+        f"repositories[{index}].package_branches[{entry_index}].remote_verdict "
+        "requires a present remote copy"
+    ) in reference_mutation(collected, stored)
+
+
+def test_the_parser_refuses_a_remote_verdict_in_a_repository_without_a_remote(
+    collected, collected_layout
+):
+    repository = repository_of(collected, collected_layout["d"])
+    entry = branch_entry_of(repository, "topic")
+    index = collected["repositories"].index(repository)
+    entry_index = repository["package_branches"].index(entry)
+    assert repository["remote"] is None and entry["remote"] is None, "control: no remote"
+    assert entry["remote_verdict"] is None, "control: the accepted document stores no verdict"
+    assert models.parse_checkouts(json.dumps(collected))
+
+    def stored(document):
+        document["repositories"][index]["package_branches"][entry_index]["remote_verdict"] = dict(
+            MERGED_ANCESTOR
+        )
+
+    assert (
+        f"repositories[{index}].package_branches[{entry_index}].remote_verdict requires a remote"
+    ) in reference_mutation(collected, stored)
+
+
+def test_the_parser_refuses_a_remote_only_reason_on_a_local_branch_verdict(
+    collected, collected_layout
+):
+    """The two reasons only a remote verdict may carry are refused on a local copy's
+    verdict, which a clone without a base leaves ``unknown``/``no_base``."""
+    repository = repository_of(collected, collected_layout["d"])
+    index = collected["repositories"].index(repository)
+    (clone_document,) = repository["clones"]
+    branch_index = next(
+        position
+        for position, item in enumerate(clone_document["branches"])
+        if item["name"] == "topic"
+    )
+    assert clone_document["branches"][branch_index]["verdict"] == remote_unknown("no_base"), (
+        "control: a clone with no verdict base"
+    )
+    assert models.parse_checkouts(json.dumps(collected))
+
+    for reason in ("objects_missing", "ambiguous_tip"):
+
+        def changed(document, reason=reason):
+            document["repositories"][index]["clones"][0]["branches"][branch_index]["verdict"][
+                "reason"
+            ] = reason
+
+        assert (
+            f"repositories[{index}].clones[0].branches[{branch_index}].verdict.reason is invalid"
+            in reference_mutation(collected, changed)
+        ), reason
+
+
+def test_the_parser_refuses_a_remote_only_reason_on_a_worktree_verdict(tmp_path):
+    """A detached checkout of a clone without a base carries its own verdict, and the two
+    remote-only reasons are refused there too."""
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    solo = folder / "solo"
+    git(folder, "init", "-q", "-b", "trunk", str(solo))
+    commit_file(solo, "one.txt", "one\n", "one")
+    git(solo, "branch", "work")
+    linked(solo, tmp_path, "detached", "--detach", "work")
+    document = collect_packages([folder], None)
+    (repository,) = document["repositories"]
+    (clone_document,) = repository["clones"]
+    assert clone_document["verdict_base"] is None, "control: no remote gives no base"
+    worktree_index = next(
+        position
+        for position, item in enumerate(clone_document["worktrees"])
+        if not item["main"]
+    )
+    assert clone_document["worktrees"][worktree_index]["verdict"] == remote_unknown("no_base")
+    assert models.parse_checkouts(json.dumps(document))
+
+    for reason in ("objects_missing", "ambiguous_tip"):
+
+        def changed(document, reason=reason):
+            document["repositories"][0]["clones"][0]["worktrees"][worktree_index]["verdict"][
+                "reason"
+            ] = reason
+
+        assert (
+            f"repositories[0].clones[0].worktrees[{worktree_index}].verdict.reason is invalid"
+            in reference_mutation(document, changed)
+        ), reason
+
+
+# ---------------------------------------------------------------------------
 # Branches with no commit of their own
 # ---------------------------------------------------------------------------
 
