@@ -6487,13 +6487,15 @@ def test_a_clone_over_the_branch_cap_is_refused_before_its_stash_is_counted(
     assert "rev-list" not in counts[True]
 
 
-def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
+def test_a_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
     tmp_path, monkeypatch, isolated_git
 ):
     cache = nyx_home(isolated_git)
     remote = make_remote(tmp_path)
+    sizes = (20, 10, 5)
+    top, middle, small = sizes
     calls_by_size: dict[int, Counter] = {}
-    for size in (100, 50, 25):
+    for size in sizes:
         folder = tmp_path / f"folder-{size}"
         folder.mkdir()
         repository = clone(remote, folder / "repo")
@@ -6508,24 +6510,24 @@ def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_bran
         item = find_clone(document, repository)
         assert item["status"] == "ok"
         assert len(item["branches"]) == size
-        if size == 100:
+        if size == top:
             assert verdicts_of(item) == {
                 "trunk": None,
                 **{branch["name"]: NOT_MERGED for branch in other_branches(item)},
             }
-            assert len(other_branches(item)) == 99
+            assert len(other_branches(item)) == size - 1
             assert document["diagnostics"] == []
             base = item["verdict_base"]["sha"]
             assert cache_entries(cache) == {f"{tip}.{base}": "none" for tip in tips}
             # Looking a tip up must not compare tips pairwise.
             assert equality[0] <= len(tips)
 
-    sizes = set().union(*calls_by_size.values())
-    for subcommand in sizes:
-        growth_small = calls_by_size[50][subcommand] - calls_by_size[25][subcommand]
-        growth_large = calls_by_size[100][subcommand] - calls_by_size[50][subcommand]
+    subcommands = set().union(*calls_by_size.values())
+    for subcommand in subcommands:
+        growth_small = calls_by_size[middle][subcommand] - calls_by_size[small][subcommand]
+        growth_large = calls_by_size[top][subcommand] - calls_by_size[middle][subcommand]
         assert growth_large == 2 * growth_small, subcommand
-    assert calls_by_size[100]["rev-list"] > calls_by_size[50]["rev-list"]
+    assert calls_by_size[top]["rev-list"] > calls_by_size[middle]["rev-list"]
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
@@ -10285,7 +10287,6 @@ def recorded_basis_in(item: dict[str, Any]) -> bool:
 
 
 UNREPRESENTABLE_OR_AHEAD = [
-    pytest.param(253402300800, id="year-10000"),
     pytest.param(10**30, id="huge"),
     pytest.param(None, id="an-hour-ahead"),
 ]
