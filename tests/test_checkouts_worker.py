@@ -51,6 +51,8 @@ def _write_record(
         },
     }
     paths = state.state_paths(create=True)
+    # The proof writes into the isolated home, never the caller's account state.
+    assert paths.config_file.is_relative_to(home)
     paths.config_file.write_bytes(
         (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     )
@@ -206,7 +208,7 @@ def test_a_not_configured_home_still_yields_an_empty_document(tmp_path, monkeypa
     }
 
 
-def test_worker_entrypoint_refuses_kind_arguments_before_loading(workspace, monkeypatch):
+def test_worker_entrypoint_refuses_kind_arguments_before_loading(monkeypatch):
     loaded: list[str] = []
 
     def refuse(name: str):
