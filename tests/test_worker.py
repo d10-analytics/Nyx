@@ -1079,9 +1079,12 @@ def test_default_worker_spawn_carries_the_launching_package_on_its_import_path(
     try:
         with patch.object(worker.subprocess, "Popen", _recording_popen(records)):
             assert manager.fetch_catalog() == b""
-        assert manager.active_count == 0
     finally:
+        # A completed fetch hands its child to manager-owned cleanup that runs
+        # after the request returns, so emptiness is asserted where the manager
+        # guarantees it instead of racing the reaping thread.
         assert manager.close(time.monotonic() + 5)
+    assert manager.active_count == 0
 
     assert len(records) == 1
     command, options = records[0]
@@ -1147,6 +1150,8 @@ def test_default_worker_spawn_is_refused_before_starting_for_a_separator_root(
             with pytest.raises(worker.WorkerError) as error:
                 manager.fetch_catalog()
         assert error.value.code == "producer_unavailable"
+        # The refused spawn registers no child and starts no cleanup thread, so
+        # its reservation is already released where the error surfaces.
         assert manager.active_count == 0
     finally:
         assert manager.close(time.monotonic() + 5)
