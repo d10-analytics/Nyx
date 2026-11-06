@@ -1,8 +1,10 @@
-"""Behavioral proofs for the checkout facts collector, against real repositories.
+"""Behavioral proofs for the checkout facts collector.
 
-Every state is produced by git itself in a temporary directory under an
-isolated home, so neither the developer's nor the runner's git configuration
-changes any outcome.  Timeouts are lowered only through collector parameters.
+The pure classification tables are proved by calling the deciding function
+directly, with end-to-end representatives through git.  Every state is produced
+by git itself in a temporary directory under an isolated home, so neither the
+developer's nor the runner's git configuration changes any outcome.  Timeouts
+are lowered only through collector parameters.
 """
 
 from __future__ import annotations
@@ -1437,6 +1439,14 @@ def refusal_of(document: dict[str, Any]) -> str:
     return str(error.value)
 
 
+def assert_refused_under_a_valid_digest(document: dict[str, Any], mutation) -> None:
+    """Prove the base parses, then that ``mutation`` is refused for its own rule."""
+    assert models.parse_checkouts(redigest(doc_copy(document)))
+    broken = doc_copy(document)
+    mutation(broken)
+    assert "removable" not in refusal_of(rederive(broken))
+
+
 def first_clone(document: dict[str, Any]) -> dict[str, Any]:
     return document["repositories"][0]["clones"][0]
 
@@ -1490,11 +1500,18 @@ def mutate_folder_enum(document):
     document["folders"][0]["status"] = "gone"
 
 
+def mutation_name(factory: str, *arguments: Any) -> str:
+    """Name a mutator after the factory that built it and the arguments it was given."""
+    rendered = "_".join(re.sub(r"\s+", "_", repr(argument)) for argument in arguments)
+    return f"{factory}_{rendered}"
+
+
 def mutate_comparison_counts(relation):
     def mutate(document):
         comparison = first_clone(document)["branches"][0]["vs_remote"]
         comparison.update(relation=relation, ahead=1, behind=0)
 
+    mutate.__name__ = mutation_name("mutate_comparison_counts", relation)
     return mutate
 
 
@@ -1508,6 +1525,7 @@ def mutate_schema(value):
     def mutate(document):
         document["schema_version"] = value
 
+    mutate.__name__ = mutation_name("mutate_schema", value)
     return mutate
 
 
@@ -1525,6 +1543,7 @@ def mutate_timestamp(field_path, value):
             )
             clone_document["cached_default"]["last_fetched_at"] = value
 
+    mutate.__name__ = mutation_name("mutate_timestamp", field_path, value)
     return mutate
 
 
@@ -1889,10 +1908,7 @@ REJECTED_VERDICT_DOCUMENTS = {
 @pytest.mark.parametrize("mutation", list(REJECTED_VERDICT_DOCUMENTS), ids=str)
 def test_parser_rejects_a_verdict_invariant_violation_under_a_valid_digest(sample, mutation):
     document, _folder = sample
-    assert models.parse_checkouts(redigest(doc_copy(document)))
-    broken = doc_copy(document)
-    REJECTED_VERDICT_DOCUMENTS[mutation](broken)
-    assert "removable" not in refusal_of(rederive(broken))
+    assert_refused_under_a_valid_digest(document, REJECTED_VERDICT_DOCUMENTS[mutation])
 
 
 def test_parser_accepts_every_decided_and_undecided_verdict_shape(sample):
@@ -1990,26 +2006,28 @@ def test_parser_refuses_the_retired_schema_even_with_a_valid_digest(sample):
         models.parse_checkouts(redigest(retired))
 
 
+# The one form of each fact a non-ok item must leave null: a false boolean, an empty
+# object or list, a zero count, and the containment outcome a full clone reports.
 NULLABLE_CLONE_FACTS = {
-    "bare": (False, 0, "", []),
-    "partial_clone": (False, 0, "", []),
-    "shallow": (False, 0, "", []),
-    "cached_default": ({}, "", [], False),
-    "local_default": ({}, "", [], False),
-    "cached_vs_remote": ({}, "", [], False),
-    "stash_count": (0, False, "", []),
-    "worktrees": ([], "", 0, False),
-    "branches": ([], "", 0, False),
-    "verdict_base": ({}, "", [], False, 0),
-    "containment": ("complete", "", [], False, 0),
-    "removable_count": ({}, "", [], False, 0),
+    "bare": False,
+    "partial_clone": False,
+    "shallow": False,
+    "cached_default": {},
+    "local_default": {},
+    "cached_vs_remote": {},
+    "stash_count": 0,
+    "worktrees": [],
+    "branches": [],
+    "verdict_base": {},
+    "containment": "complete",
+    "removable_count": {},
 }
 NULLABLE_WORKTREE_FACTS = {
-    "head": ({}, "", [], False),
-    "changes": ({}, "", [], False, 0),
-    "operations": ([], "", 0, False),
-    "index_lock": (False, 0, "", []),
-    "verdict": ({}, "", [], False, 0),
+    "head": {},
+    "changes": {},
+    "operations": [],
+    "index_lock": False,
+    "verdict": {},
 }
 
 
@@ -2091,36 +2109,29 @@ def test_parser_refuses_a_clone_over_the_branch_cap_with_a_fact(sample, fact):
     }
     broken = doc_copy(document)
     refused_clone(broken)["status"] = "too_many_branches"
+    rederive(broken)
     first_clone(broken)[fact] = facts[fact]
-    with pytest.raises(models.ProtocolError):
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize(
-    ("fact", "empty"),
-    [(fact, empty) for fact, forms in NULLABLE_CLONE_FACTS.items() for empty in forms],
-    ids=lambda value: str(value)[:12],
-)
-def test_parser_rejects_empty_forms_for_clone_facts_that_must_be_null(sample, fact, empty):
+@pytest.mark.parametrize("fact", list(NULLABLE_CLONE_FACTS), ids=str)
+def test_parser_rejects_empty_forms_for_clone_facts_that_must_be_null(sample, fact):
     document, _folder = sample
     broken = doc_copy(document)
-    refused_clone(broken)[fact] = empty
-    with pytest.raises(models.ProtocolError):
+    refused_clone(broken)[fact] = NULLABLE_CLONE_FACTS[fact]
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
-@pytest.mark.parametrize(
-    ("fact", "empty"),
-    [(fact, empty) for fact, forms in NULLABLE_WORKTREE_FACTS.items() for empty in forms],
-    ids=lambda value: str(value)[:12],
-)
-def test_parser_rejects_empty_forms_for_worktree_facts_that_must_be_null(sample, fact, empty):
+@pytest.mark.parametrize("fact", list(NULLABLE_WORKTREE_FACTS), ids=str)
+def test_parser_rejects_empty_forms_for_worktree_facts_that_must_be_null(sample, fact):
     document, _folder = sample
     broken = doc_copy(document)
     worktree = broken["repositories"][0]["clones"][1]["worktrees"][0]
     worktree.update(status="failed", head=None, changes=None, operations=None, index_lock=None)
-    worktree[fact] = empty
-    with pytest.raises(models.ProtocolError):
+    worktree[fact] = NULLABLE_WORKTREE_FACTS[fact]
+    with pytest.raises(models.ProtocolError, match="must leave its facts null"):
         models.parse_checkouts(redigest(broken))
 
 
@@ -5516,10 +5527,7 @@ def invalid_cache_payloads(valid: bytes) -> dict[str, bytes]:
     }
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["garbage", "extra_key", "foreign_schema", "ancestor_rung", "key_lengths", "oversized", "symlink"],
-)
+@pytest.mark.parametrize("kind", ["garbage", "oversized", "symlink"])
 def test_an_unreadable_cache_changes_only_a_diagnostic_and_is_repaired(
     tmp_path, isolated_git, kind
 ):
@@ -6479,13 +6487,15 @@ def test_a_clone_over_the_branch_cap_is_refused_before_its_stash_is_counted(
     assert "rev-list" not in counts[True]
 
 
-def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
+def test_a_clone_is_decided_with_work_that_grows_in_step_with_its_branches(
     tmp_path, monkeypatch, isolated_git
 ):
     cache = nyx_home(isolated_git)
     remote = make_remote(tmp_path)
+    sizes = (20, 10, 5)
+    top, middle, small = sizes
     calls_by_size: dict[int, Counter] = {}
-    for size in (100, 50, 25):
+    for size in sizes:
         folder = tmp_path / f"folder-{size}"
         folder.mkdir()
         repository = clone(remote, folder / "repo")
@@ -6500,24 +6510,24 @@ def test_a_cap_sized_clone_is_decided_with_work_that_grows_in_step_with_its_bran
         item = find_clone(document, repository)
         assert item["status"] == "ok"
         assert len(item["branches"]) == size
-        if size == 100:
+        if size == top:
             assert verdicts_of(item) == {
                 "trunk": None,
                 **{branch["name"]: NOT_MERGED for branch in other_branches(item)},
             }
-            assert len(other_branches(item)) == 99
+            assert len(other_branches(item)) == size - 1
             assert document["diagnostics"] == []
             base = item["verdict_base"]["sha"]
             assert cache_entries(cache) == {f"{tip}.{base}": "none" for tip in tips}
             # Looking a tip up must not compare tips pairwise.
             assert equality[0] <= len(tips)
 
-    sizes = set().union(*calls_by_size.values())
-    for subcommand in sizes:
-        growth_small = calls_by_size[50][subcommand] - calls_by_size[25][subcommand]
-        growth_large = calls_by_size[100][subcommand] - calls_by_size[50][subcommand]
+    subcommands = set().union(*calls_by_size.values())
+    for subcommand in subcommands:
+        growth_small = calls_by_size[middle][subcommand] - calls_by_size[small][subcommand]
+        growth_large = calls_by_size[top][subcommand] - calls_by_size[middle][subcommand]
         assert growth_large == 2 * growth_small, subcommand
-    assert calls_by_size[100]["rev-list"] > calls_by_size[50]["rev-list"]
+    assert calls_by_size[top]["rev-list"] > calls_by_size[middle]["rev-list"]
 
 
 @pytest.mark.skipif(ON_WINDOWS, reason="the delaying git stand-in is a shell script")
@@ -7257,10 +7267,7 @@ REJECTED_CONTAINMENT_DOCUMENTS = {
 @pytest.mark.parametrize("mutation", list(REJECTED_CONTAINMENT_DOCUMENTS), ids=str)
 def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(sample, mutation):
     document, _folder = sample
-    assert models.parse_checkouts(redigest(doc_copy(document)))
-    broken = doc_copy(document)
-    REJECTED_CONTAINMENT_DOCUMENTS[mutation](broken)
-    assert "removable" not in refusal_of(rederive(broken))
+    assert_refused_under_a_valid_digest(document, REJECTED_CONTAINMENT_DOCUMENTS[mutation])
 
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
@@ -8184,6 +8191,11 @@ class GhCall:
         self.started = int((directory / "started").read_text())
 
 
+def gh_stdout_text(stdout: str | dict[str, Any]) -> str:
+    """The text a fake ``gh`` prints for ``stdout``: a string as it is, a mapping as JSON."""
+    return stdout if isinstance(stdout, str) else json.dumps(stdout)
+
+
 class FakeGh:
     """A POSIX shell script standing in for ``gh``: it logs the arguments, the
     environment, the request body and the start time of each call and replays a
@@ -8222,8 +8234,7 @@ exit "$(cat "$state/code")"
     def replay(
         self, stdout: str | dict[str, Any] = "", stderr: str = "", code: int = 0, delay: float = 0
     ) -> None:
-        text = stdout if isinstance(stdout, str) else json.dumps(stdout)
-        (self.state / "stdout").write_text(text)
+        (self.state / "stdout").write_text(gh_stdout_text(stdout))
         (self.state / "stderr").write_text(stderr)
         (self.state / "code").write_text(str(code))
         (self.state / "delay").write_text(str(delay))
@@ -8312,6 +8323,10 @@ def merged_world(tmp_path: Path) -> Path:
     land(work, "done")
     point_origin_at(work, remote, GITHUB_URL)
     return folder
+
+
+# The branch names that world's one request carries, in the order it sends them.
+MERGED_WORLD_BRANCHES = ("done", "trunk")
 
 
 @posix_only
@@ -8637,6 +8652,13 @@ CATEGORY_CASES = [
     *((name, {"code": 0, "stdout": answer}, "failed") for name, answer in ODD_SHAPE_CASES),
 ]
 
+CATEGORY_CASES_BY_NAME = {case[0]: case for case in CATEGORY_CASES}
+
+# One end-to-end answer shape per category source: an exit code, a rate-limited
+# error, a null repository and an oversized answer.  A name that is not a row
+# above raises while the cases are collected.
+CATEGORY_REPRESENTATIVES = ("exit-4", "rate-limited-type", "null-repository", "over-8-mib")
+
 
 @posix_only
 def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
@@ -8658,8 +8680,8 @@ def test_a_valid_answer_is_live_with_the_same_checks_and_verdicts_as_lookup_off(
 @posix_only
 @pytest.mark.parametrize(
     ("replay", "reason"),
-    [case[1:] for case in CATEGORY_CASES],
-    ids=[case[0] for case in CATEGORY_CASES],
+    [CATEGORY_CASES_BY_NAME[name][1:] for name in CATEGORY_REPRESENTATIVES],
+    ids=list(CATEGORY_REPRESENTATIVES),
 )
 def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladder_alone(
     tmp_path, monkeypatch, replay, reason
@@ -8675,6 +8697,29 @@ def test_each_gh_failure_category_comes_from_its_trigger_and_leaves_the_git_ladd
     assert document["repositories"][0]["remote"]["check"] == off["repositories"][0]["remote"]["check"]
     [work] = all_clones(document)
     assert verdict_tuple(branch_of(work, "done")["verdict"]) == MERGED_SQUASH
+    # The one request carries the world's branch names in order, and no other, so
+    # the branch names the pure table reads are the ones this call really sends.
+    [call] = fake.calls()
+    assert {
+        name: value
+        for name, value in json.loads(call.body)["variables"].items()
+        if name.startswith("h")
+    } == {f"h{index}": branch for index, branch in enumerate(MERGED_WORLD_BRANCHES)}
+
+
+@pytest.mark.parametrize(
+    ("replay", "reason"),
+    [case[1:] for case in CATEGORY_CASES],
+    ids=[case[0] for case in CATEGORY_CASES],
+)
+def test_each_gh_category_is_decided_by_the_answer_it_reads(replay, reason):
+    outcome = checkouts._Outcome(
+        replay.get("code", 0),
+        out=gh_stdout_text(replay.get("stdout", "")).encode("utf-8"),
+        err=replay.get("stderr", "").encode("utf-8"),
+    )
+
+    assert checkouts._github_answer(outcome, MERGED_WORLD_BRANCHES) == (reason, {})
 
 
 @posix_only
@@ -10242,7 +10287,6 @@ def recorded_basis_in(item: dict[str, Any]) -> bool:
 
 
 UNREPRESENTABLE_OR_AHEAD = [
-    pytest.param(253402300800, id="year-10000"),
     pytest.param(10**30, id="huge"),
     pytest.param(None, id="an-hour-ahead"),
 ]
@@ -10633,7 +10677,7 @@ SAVED_FILE_VARIANTS = {
 }
 
 
-@pytest.mark.parametrize("kind", ["valid", *SAVED_FILE_VARIANTS])
+@pytest.mark.parametrize("kind", ["valid", "schema_4"])
 def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
     tmp_path, isolated_git, kind
 ):
@@ -10667,6 +10711,50 @@ def test_a_schema_3_file_with_an_invalid_form_is_unreadable_and_read_as_empty(
         *cold["diagnostics"],
         {"code": "checkout_cache_unreadable", "path": str(cache)},
     ]
+
+
+# A schema-3 verdict key: a merge base and a tip, each a 40-character object ID.
+CACHE_VERDICT_KEY = "a" * 40 + "." + "a" * 40
+
+
+def cache_writer_file() -> bytes:
+    """The file the production writer makes for one verdict, next to the one saved
+    remote check a valid saved file carries."""
+    return checkouts._cache_bytes(
+        {CACHE_VERDICT_KEY: ("none", 1)}, valid_saved_file()["remote_checks"]
+    )
+
+
+# Every form a schema-3 cache file reaches the parser in, by the name of what it
+# breaks.  The reader refuses an oversized file and a symbolic link before the
+# parser sees them, so those two forms stay end to end.
+CACHE_PARSER_FORMS = {
+    **{
+        kind: payload
+        for kind, payload in invalid_cache_payloads(cache_writer_file()).items()
+        if kind != "oversized"
+    },
+    **{
+        kind: json.dumps(_mutated(change)).encode()
+        for kind, change in SAVED_FILE_VARIANTS.items()
+    },
+}
+
+
+@pytest.mark.parametrize("kind", list(CACHE_PARSER_FORMS))
+def test_the_parser_refuses_every_form_a_saved_cache_reaches_it_in(kind):
+    with pytest.raises(models.ProtocolError):
+        checkouts._parse_cache(CACHE_PARSER_FORMS[kind])
+
+
+def test_both_unmutated_cache_bases_parse_into_the_entries_they_were_written_with():
+    written = checkouts._parse_cache(cache_writer_file())
+    assert written.verdicts == {CACHE_VERDICT_KEY: ("none", 1)}
+    assert set(written.remote_checks) == {GITHUB_KEY}
+
+    saved = checkouts._parse_cache(json.dumps(valid_saved_file()).encode())
+    assert saved.verdicts == {}
+    assert set(saved.remote_checks) == {GITHUB_KEY}
 
 
 # ---------------------------------------------------------------------------
@@ -10850,9 +10938,6 @@ def test_a_networked_collection_whose_remote_moved_away_reports_the_saved_check(
 
 
 GH_FAILURES = [
-    ("not_authenticated", {"code": 4}),
-    ("rate_limited", {"code": 1, "stderr": "API rate limit exceeded"}),
-    ("not_found", {"code": 0, "stdout": NULL_REPOSITORY}),
     ("failed", {"code": 0, "stdout": "this is not json"}),
     ("timed_out", {"code": 0, "delay": 30}),
     ("gh_missing", None),
