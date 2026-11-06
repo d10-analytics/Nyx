@@ -2432,6 +2432,117 @@ def test_a_recorded_pull_request_answers_when_no_network_is_used(
     assert_status(offline, "topic", "PR #9 open", "pr_open", push="pushed", pull_request=9)
 
 
+def branch_pr_facts(document: dict[str, Any]) -> dict[tuple[str, str], tuple[Any, ...]]:
+    """Every local branch's pull requests and verdict facts, by clone path and name."""
+    return {
+        (clone["path"], branch["name"]): (
+            branch["pull_requests"],
+            branch["verdict"],
+            branch["contained_in"],
+            branch["removable"],
+        )
+        for repository in document["repositories"]
+        for clone in repository["clones"]
+        for branch in clone["branches"]
+    }
+
+
+def requested_names(body: bytes) -> list[str]:
+    """The branch names one recorded ``gh`` request asked about, in alias order."""
+    variables = json.loads(body)["variables"]
+    aliases = len(variables) - 2
+    assert set(variables) == {"owner", "name"} | {f"h{index}" for index in range(aliases)}
+    return [variables[f"h{index}"] for index in range(aliases)]
+
+
+def one_gh_request(fake, before: set[Path]) -> bytes:
+    """The body of the one ``gh`` request recorded after ``before``."""
+    fresh = set(fake.state.glob("call.*")) - before
+    assert len(fresh) == 1, f"one gh call per repository, not {len(fresh)}"
+    [directory] = fresh
+    return (directory / "body").read_bytes()
+
+
+@posix_only
+def test_the_pull_request_query_names_a_package_branch_no_clone_holds(
+    status_world, tmp_path, monkeypatch
+):
+    w = status_world
+    w.github()
+    w.branch(w.a, "topic", push=True)
+    topic_tip = rev(w.a, "topic")
+    git(w.a, "branch", "plain", "trunk")
+    land(w.a, "landed")
+    w.branch(w.a, "topic-r", push=True)
+    remote_tip = rev(w.a, "topic-r")
+    git(w.a, "branch", "-q", "-D", "topic-r")
+    w.package("remote-only", "topic-r")
+    local = local_names(w.a, w.b)
+    assert "topic-r" not in local, "control: no clone holds a local copy of the package branch"
+    union = sorted(set(local) | {"topic-r"})
+    pulled = {
+        "plain": [pr_node(3, "open", UNKNOWN_HEAD)],
+        "topic": [pr_node(7, "open", topic_tip)],
+        "topic-r": [pr_node(4, "open", remote_tip)],
+    }
+    fake = install_fake_gh(tmp_path, monkeypatch, stderr="lookup failed\n", code=1)
+
+    # A failed call loses the whole group's listing, package name or not.
+    failed = w.collect(github_lookup=True)
+    key = failed["repositories"][0]["remote"]["key"]
+    assert key.startswith("github.com/"), "control: one GitHub group"
+    assert failed["repositories"][0]["pr_lookup"] == {
+        "status": "unavailable",
+        "reason": "failed",
+        "checked_at": None,
+    }
+    assert all(
+        branch["pull_requests"] == []
+        for clone in failed["repositories"][0]["clones"]
+        for branch in clone["branches"]
+    ), "the failed call leaves no pull requests"
+    saved = json.loads(nyx_home(Path(os.environ["HOME"])).read_text())
+    assert saved["remote_checks"][key]["pull_requests"] is None
+
+    cache = nyx_home(use_fresh_home(tmp_path, monkeypatch, Path(os.environ["HOME"])))
+    failed_alone = collect([w.folder], remote_checks=True, github_lookup=True)
+    assert failed_alone["repositories"][0]["pr_lookup"] == failed["repositories"][0]["pr_lookup"]
+    assert branch_pr_facts(failed) == branch_pr_facts(failed_alone)
+
+    # With an answer, the one call asks about the sorted union and keeps each name's
+    # listing; every local fact equals the same collection without a package scan.
+    fake.replay(stdout=pr_answer(union, pulled))
+    before = set(fake.state.glob("call.*"))
+    widened = w.collect(github_lookup=True)
+    assert requested_names(one_gh_request(fake, before)) == union
+    assert widened["repositories"][0]["pr_lookup"] == {
+        "status": "live",
+        "reason": None,
+        "checked_at": None,
+    }
+    stored = json.loads(cache.read_text())["remote_checks"][key]["pull_requests"]
+    assert set(stored["by_head"]) == set(union)
+    assert stored["by_head"]["topic-r"] == [
+        {"number": 4, "state": "open", "head": remote_tip, "base": "trunk"}
+    ]
+    facts = branch_pr_facts(widened)
+    assert facts[(real(w.a), "topic")][0] == [
+        {"number": 7, "state": "open", "head_matches": True}
+    ]
+    assert facts[(real(w.a), "plain")][0] == [
+        {"number": 3, "state": "open", "head_matches": False}
+    ]
+    assert facts[(real(w.a), "trunk")][0] == []
+    assert facts[(real(w.a), "landed")][1]["state"] == "merged", "control: a merged local branch"
+    assert facts[(real(w.a), "topic")][1]["state"] == "not_merged", "control: an unmerged one"
+
+    fake.replay(stdout=pr_answer(sorted(local), pulled))
+    before = set(fake.state.glob("call.*"))
+    local_alone = collect([w.folder], remote_checks=True, github_lookup=True)
+    assert requested_names(one_gh_request(fake, before)) == sorted(local)
+    assert branch_pr_facts(local_alone) == facts
+
+
 def test_squash_merged_work_reads_cleanup_pending_until_every_copy_is_gone(
     status_world, tmp_path
 ):
