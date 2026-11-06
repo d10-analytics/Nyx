@@ -248,7 +248,8 @@ merge of a file over 1 MiB, a branch change or a landing that touched more than
 5,000 paths, a landing that needed more than 16 content merges, or more than eight
 base commits with the identity. `tree_equal`: the branch's file contents are identical to the content of
 some commit on the base. `not_merged` has the rung `none`: every rung that could
-run found nothing. An `unknown` verdict has no rung and one of six reasons.
+run found nothing. An `unknown` branch or worktree verdict has no rung and one
+of six reasons.
 `no_base` is described above. `incomplete_clone` means the clone is shallow or
 partial, so only the `ancestor` and `pull_request` rungs run and the others are skipped rather
 than fetching missing files. `git_too_old` means git is older than 2.39: the two
@@ -780,11 +781,28 @@ Nyx cannot tell a branch that was never pushed from one that no clone recorded.
 Only a live or saved answer says `absent`. The copy is `present`, `absent` or `unknown`. A repository with no `origin` remote
 has no remote copy.
 
+In the `--json` document each `package_branches[]` entry carries the copy's
+verdict as `remote_verdict`. It is null exactly when there is nothing to decide:
+the repository has no `origin` remote, the copy is not `present`, or the copy's
+commit is the tip of a local copy of the branch. A present copy at a commit no
+local copy has is decided by a merged, same-repository pull request into the
+default branch whose head is that commit, or else by the same ladder in a clone
+that holds the commit, judged against that clone's base. Two `unknown` reasons
+belong to this verdict alone: `objects_missing`, when no clone of the repository
+holds that commit, and `ambiguous_tip`, when a clone does hold it and the commit
+lies on the default branch's first-parent history, where a fast-forward merge and
+a branch pushed with no commit of its own look alike. A branch or worktree verdict
+never carries either reason.
+
 **Reading a Code Status.** Each copy has a verdict (see the verdicts above): a
-local copy has its own, and the remote copy has the verdict of a local copy at the
-same commit, or else `unknown`. Nyx computes no verdict for a tip that exists only
-on the remote. A copy whose verdict is `unknown`, such as a branch in a clone with no
-base, counts as neither merged nor not merged. The first of these rules that matches
+local copy has its own, and a present remote copy has the verdict of one of its
+local copies at the same commit, or else its own `remote_verdict`. A branch that
+exists only on the remote gets a verdict from a clone that holds its tip, or from
+a merged pull request whose head is its tip; with neither it reads `merge state
+unknown`. A remote copy at a commit no local copy holds is therefore judged on
+its own, even when a local copy is ahead of, behind or diverged from it. A copy
+whose verdict is `unknown`, such as a branch in a clone with no base, counts as
+neither merged nor not merged. The first of these rules that matches
 decides the text, and the order matters:
 
 0. At least one local copy exists, every local copy is a branch with no commit of its
@@ -799,7 +817,8 @@ decides the text, and the order matters:
    the distinct checkouts that have the branch checked out, the package's own
    target included. When none does, it reads `merged · cleanup pending (N
    branches)`, with N the number of local copies. A single one reads `1 worktree`
-   or `1 branch`.
+   or `1 branch`. When no local copy exists there is nothing to clean up, so it
+   reads plain `merged`.
 2. A pull request for the branch is open in the lookup's listing (live or saved;
    it needs the GitHub lookup): `PR #N open`, with the highest open number, and
    ` · N unpushed` after it only when the push state below is unpushed.
@@ -830,9 +849,6 @@ worktrees` instead. The `--json` document keeps every path.
 
 **Limits.** These follow from what Nyx computes today.
 
-- A branch that exists only on the remote reads `merge state unknown`. A remote
-  copy at a commit that no local copy holds counts as unknown too, so it keeps a
-  merged local branch from reading as merged.
 - When the check for a branch with no commit of its own did not run, because its
   reflog read or its first-parent listing was cut by the time limit or failed, or
   because the branch moved during the run, that copy counts as unknown in rules 1
@@ -850,12 +866,17 @@ worktrees` instead. The `--json` document keeps every path.
   `merged · cleanup pending ...` for such a branch.
 - A branch with no commit of its own that is 5,000 or more first-parent commits
   behind the default branch reads `merged · cleanup pending ...`.
-- Plain `merged`, without cleanup, does not occur yet: it needs a verdict for a
-  branch that exists only on the remote, which Nyx does not compute.
+- A package branch whose copy exists only on the remote and whose commit is on the
+  default branch's first-parent history, within the newest 5,000 commits, reads
+  `merge state unknown`: that commit is either a branch fast-forward merged or one
+  pushed with no commit of its own, and a remote-tracking branch cannot tell
+  which. A commit older than that bound is not read against that history, so it
+  stays merged.
 - A clone whose status is not ok, such as one git could not read or one with too many branches, is not seen (see matching above).
 - With no live or saved remote answer, a branch deleted on the remote stays
-  present at the tip of any clone that has not pruned it, so a merged and deleted
-  branch can read `merge state unknown`; until a networked run answers.
+  present at the tip of any clone that has not pruned it, so a deleted branch
+  reads by the verdict of the clone that still holds its tip: the deletion shows
+  only once a networked run answers.
 - With no live or saved remote answer, a branch that was never pushed reads
   `in progress · push state unknown`; until a networked run answers.
 

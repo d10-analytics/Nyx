@@ -36,6 +36,8 @@ README is narrative only.
   `checkouts` calls it when it builds the document and `parse_checkouts`
   recomputes it from the stored fields, so a document whose text disagrees with
   its fields is refused. The same parser refuses a field set in a state that
-  does not use it, a field missing from a state that does, and a merged cleanup
-  without exactly one positive count, so no consumer needs its own rendering or
+  does not use it, a field missing from a state that does, and a `merged` status
+  whose cleanup counts are both positive; it still requires a cleanup exactly for
+  `merged`, so a merged branch with nothing left to clean has a cleanup of two
+  zeros and reads plain `merged`, and no consumer needs its own rendering or
   consistency rules.
