@@ -382,3 +382,18 @@ def test_checkouts_categories_follow_the_worker_exit_status(
             manager.fetch_checkouts(network=False)
 
     assert error.value.code == category
+
+
+def test_a_state_error_while_observing_configuration_is_unavailable(monkeypatch):
+    def observe() -> object:
+        raise state.StateError("account home is unreadable")
+
+    def collect(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("nothing may be collected without an observation")
+
+    monkeypatch.setattr(worker.state, "observe_configuration", observe)
+    from nyx import checkouts
+
+    monkeypatch.setattr(checkouts, "collect_checkouts", collect)
+
+    assert worker._worker_main(kind="checkouts", deadline_ms=1000) == 4
