@@ -15,9 +15,23 @@ README is narrative only.
   categories; a checkouts fetch collects the configured checkout folders once,
   locally on 30 seconds or networked on 60, and publishes the `checkouts_*`
   categories. A fetch names its kind, so a catalog worker's command line and
-  categories are unchanged, and the manager never stores a kind. Neither the
-  service nor the desktop application calls `fetch_checkouts`; both fetch only
-  the catalog.
+  categories are unchanged, and the manager never stores a kind. Both the
+  service and the desktop application call `fetch_checkouts` through the
+  checkout serving below.
+- The Linux service and the desktop application serve checkout state through
+  `ApplicationRuntime`: `GET` and `HEAD /api/checkouts` answer with its
+  `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`,
+  and `POST /api/checkouts/remote-check` queues a networked check through
+  `refresh_remote_checks()`. The standalone catalog server offers neither route.
+- A served document is refreshed in the background once
+  `LOCAL_REFRESH_INTERVAL` (60 s) has passed since the start of the run that
+  published it, or of the latest local run that failed, and a networked check is
+  due once `REMOTE_CHECK_INTERVAL` (300 s) has passed since the last check
+  started; both happen only while a request asks for checkout data. One serial
+  run queue runs one collection at a time with at most one waiting, and a run
+  that publishes replaces the served document only if it started at the current
+  change count. `mark_checkouts_changed()` increments that count and starts
+  nothing.
 - Board settings are read from the held configuration, saved through
   `save_configuration_owned` after the revision check; `/api/workspace` is read-only.
 
