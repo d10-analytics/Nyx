@@ -13,11 +13,19 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from test_checkouts import isolate_git
 
 from nyx import server, state
-from nyx.app_runtime import ApplicationRuntime
-from nyx.models import SCHEMA_VERSION, ProtocolError, canonical_digest, parse_catalog
+from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
+from nyx.models import (
+    SCHEMA_VERSION,
+    ProtocolError,
+    canonical_digest,
+    parse_catalog,
+    parse_checkouts,
+)
 from nyx.server import CatalogError, _create_application_server, create_server
+from nyx.worker import CatalogWorkerManager
 
 
 class StubClient:
@@ -233,16 +241,26 @@ class RunningServer:
         self.server.server_close()
 
 
-def request(port, method, path, host=None, body=None):
+def request(port, method, path, host=None, body=None, content_type=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     headers = {} if host is None else {"Host": host}
     if body is not None:
-        headers["Content-Type"] = "application/json"
+        headers["Content-Type"] = content_type or "application/json"
     connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     body = response.read()
     connection.close()
     return response.status, response.getheader("Content-Type"), body
+
+
+def head_request(port, path):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection.request("HEAD", path, headers={})
+    response = connection.getresponse()
+    headers = dict(response.getheaders())
+    body = response.read()
+    connection.close()
+    return response.status, headers, body
 
 
 class SettingsStub:
@@ -889,6 +907,139 @@ def test_application_settings_put_returns_safe_error_when_admission_closes():
     assert status == 503
     assert content_type == "application/json"
     assert json.loads(body) == {"error": "settings_unavailable"}
+
+
+def test_application_checkouts_route_serves_the_published_envelope(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    isolate_git(monkeypatch, home)
+    application = ApplicationRuntime(
+        port=0,
+        deadline=time.monotonic() + 5,
+        workers=CatalogWorkerManager(working_directory=tmp_path),
+    )
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        status, content_type, body = request(port, "GET", "/api/checkouts")
+        assert status == 502
+        assert content_type == "application/json"
+        assert json.loads(body) == {"error": "checkouts_unavailable"}
+
+        application.admit_catalog()
+        status, content_type, body = request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert content_type == "application/json"
+        envelope = json.loads(body)
+        assert set(envelope) == {"checkouts", "remote_checks"}
+        remote_checks = envelope["remote_checks"]
+        assert set(remote_checks) == {"state", "interval_seconds", "next_due_at", "last"}
+        assert remote_checks["state"] == "idle"
+        assert remote_checks["interval_seconds"] == REMOTE_CHECK_INTERVAL
+        assert isinstance(remote_checks["next_due_at"], str)
+        document = parse_checkouts(envelope["checkouts"])
+        assert document["folders"] == []
+        last = remote_checks["last"]
+        assert set(last) == {"started_at", "finished_at", "outcome", "repositories"}
+        assert last["outcome"] == "completed"
+        assert last["repositories"] == []
+
+        head_status, head_headers, head_body = head_request(port, "/api/checkouts")
+        assert head_status == 200
+        assert head_body == b""
+        assert head_headers["Content-Type"] == content_type
+        assert head_headers["Content-Length"] == str(len(body))
+
+
+def test_application_checkouts_routes_reject_other_methods_and_foreign_hosts():
+    with RunningServer(StubClient(catalog=valid_catalog()), SettingsStub()) as port:
+        for method in ("POST", "PUT", "DELETE"):
+            assert request(port, method, "/api/checkouts")[0] == 405
+        for method in ("GET", "PUT", "OPTIONS"):
+            assert request(port, method, "/api/checkouts/remote-check")[0] == 405
+        assert request(port, "GET", "/api/checkouts", host=f"outside.invalid:{port}")[0] == 404
+        status, _, _ = request(
+            port, "GET", "/api/checkouts/remote-check", host=f"127.0.0.1:{port + 1}"
+        )
+        assert status == 404
+
+
+def test_standalone_server_hides_the_checkout_paths():
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        assert request(port, "GET", "/api/checkouts")[0] == 404
+        assert request(port, "HEAD", "/api/checkouts")[0] == 404
+        assert request(port, "POST", "/api/checkouts")[0] == 404
+        assert request(port, "GET", "/api/checkouts/remote-check")[0] == 404
+        assert request(port, "POST", "/api/checkouts/remote-check", body="{}")[0] == 404
+
+
+def _checkouts_double_envelope():
+    return {
+        "checkouts": {"marker": "served by the installed provider"},
+        "remote_checks": {
+            "state": "idle",
+            "interval_seconds": REMOTE_CHECK_INTERVAL,
+            "next_due_at": None,
+            "last": None,
+        },
+    }
+
+
+def test_application_checkouts_route_serves_an_installed_provider_double():
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+    envelope = _checkouts_double_envelope()
+    application.get_checkouts = lambda: envelope
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        status, content_type, body = request(port, "GET", "/api/checkouts")
+    assert status == 200
+    assert content_type == "application/json"
+    assert json.loads(body) == envelope
+
+
+def test_application_checkouts_route_maps_an_unexpected_provider_failure():
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+
+    def fail():
+        raise RuntimeError("private capture details")
+
+    application.get_checkouts = fail
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        status, content_type, body = request(port, "GET", "/api/checkouts")
+    assert status == 502
+    assert content_type == "application/json"
+    assert json.loads(body) == {"error": "checkouts_failed"}
+    assert b"private capture details" not in body
+
+
+def test_application_remote_check_route_requires_a_json_object_body():
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+    envelope = _checkouts_double_envelope()
+    calls = []
+
+    def refresh():
+        calls.append(True)
+        return envelope
+
+    application.refresh_remote_checks = refresh
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        status, _, body = request(
+            port,
+            "POST",
+            "/api/checkouts/remote-check",
+            body="{}",
+            content_type="text/plain",
+        )
+        assert status == 400
+        assert json.loads(body) == {"error": "invalid_payload"}
+        assert request(port, "POST", "/api/checkouts/remote-check", body="[]")[0] == 400
+        assert request(port, "POST", "/api/checkouts/remote-check", body="")[0] == 400
+        assert calls == []
+
+        status, content_type, body = request(
+            port, "POST", "/api/checkouts/remote-check", body="{}"
+        )
+    assert status == 200
+    assert content_type == "application/json"
+    assert json.loads(body) == envelope
+    assert calls == [True]
 
 
 def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_preserves_failure():
