@@ -10,7 +10,9 @@ when the remote-check entry point asks for one.  A run that fails with no
 current document answers its waiters with its category and holds further
 requests for one refresh interval, and a configuration change announced through
 ``mark_checkouts_changed`` keeps a run that started before it from replacing the
-served document.
+served document.  Shutdown and start-failure cleanup close the queue first, so
+no run starts once cleanup begins: a queued run's waiters are answered as
+cancelled, and every started run thread is joined within the same deadline.
 """
 
 from __future__ import annotations
@@ -126,6 +128,7 @@ class ApplicationRuntime:
         self._checkouts_running: _CheckoutsRun | None = None
         self._checkouts_pending: _CheckoutsRun | None = None
         self._checkouts_threads: set[threading.Thread] = set()
+        self._checkouts_queue_closed = False
 
     @property
     def configuration(self) -> state.Configuration | None:
@@ -314,6 +317,8 @@ class ApplicationRuntime:
             raise CatalogError("checkouts_unavailable")
         with self._checkouts_condition:
             while True:
+                if self._checkouts_queue_closed:
+                    raise CatalogError("checkouts_cancelled")
                 if self._checkouts_document_is_current():
                     self._queue_background_run()
                     return self._checkouts_envelope(self._checkouts_latest)
@@ -341,6 +346,8 @@ class ApplicationRuntime:
         if not self.catalog_admitted:
             raise CatalogError("checkouts_unavailable")
         with self._checkouts_condition:
+            if self._checkouts_queue_closed:
+                raise CatalogError("checkouts_cancelled")
             self._checkouts_check_requested = True
             run = self._checkouts_pending
             if run is None:
@@ -575,6 +582,39 @@ class ApplicationRuntime:
             self._checkouts_last_check_started_wall + REMOTE_CHECK_INTERVAL
         )
 
+    def _close_checkouts_queue(self) -> None:
+        """Refuse new runs and answer the queued run's waiters as cancelled.
+
+        Nothing starts once this returns: the in-flight run is cancelled by the
+        worker admission close that follows, and its waiters are answered when
+        its run settles.
+        """
+
+        with self._checkouts_condition:
+            self._checkouts_queue_closed = True
+            pending = self._checkouts_pending
+            self._checkouts_pending = None
+            if pending is not None:
+                self._settle_checkouts_run(pending, None, "checkouts_cancelled")
+            self._checkouts_condition.notify_all()
+
+    def _join_checkouts_runs(self, deadline: float) -> bool:
+        """Join every started run thread within the deadline.
+
+        A thread still alive at the deadline reports the cleanup as not closed;
+        a retried call repeats the join on the threads it still finds.
+        """
+
+        with self._checkouts_condition:
+            threads = tuple(self._checkouts_threads)
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
+            if thread.is_alive():
+                return False
+        return True
+
     def _close_settings_admission(self, deadline: float) -> bool:
         with self._settings_condition:
             self._settings_accepting = False
@@ -687,9 +727,11 @@ class ApplicationRuntime:
         """Close failed-start resources, retaining ownership if work remains."""
 
         self.catalog_admitted = False
+        self._close_checkouts_queue()
         settings_closed = self._close_settings_admission(deadline)
         listener_closed = True
         workers_closed = False
+        runs_joined = False
         try:
             try:
                 self.workers.close_admission()
@@ -720,22 +762,28 @@ class ApplicationRuntime:
                 workers_closed = self.workers.close(deadline)
             except Exception:
                 workers_closed = False
+            runs_joined = self._join_checkouts_runs(deadline)
         finally:
             self.catalog_admitted = False
-        return settings_closed and listener_closed and workers_closed
+        return settings_closed and listener_closed and workers_closed and runs_joined
 
     def shutdown(self, deadline: float) -> bool:
         """Close listener and workers before lifecycle ownership is released.
 
-        The accepted sockets close before the listener so a kept-alive handler
-        stops waiting, and the listener is released even when parsed request
-        work does not drain inside the deadline: the caller's precondition is
-        the released port, so an undrained request is reported through the
-        result instead of by skipping the listener close.  An expired deadline
-        still stops before the next cleanup phase begins.
+        The checkout queue closes before the settings wait, so no run can start
+        while cleanup is under way and the waiter of a run that never starts is
+        told it was cancelled.  The accepted sockets close before the listener
+        so a kept-alive handler stops waiting, and the listener is released even
+        when parsed request work does not drain inside the deadline: the
+        caller's precondition is the released port, so an undrained request is
+        reported through the result instead of by skipping the listener close.
+        A checkout run thread still alive at the deadline reports the same way
+        and a retried call repeats the join.  An expired deadline still stops
+        before the next cleanup phase begins.
         """
 
         self.catalog_admitted = False
+        self._close_checkouts_queue()
         if not self._close_settings_admission(deadline):
             return False
         self.workers.close_admission()
@@ -757,7 +805,8 @@ class ApplicationRuntime:
         if time.monotonic() >= deadline:
             return False
         workers_closed = self.workers.close(deadline)
-        return workers_closed and drained and time.monotonic() < deadline
+        joined = self._join_checkouts_runs(deadline)
+        return workers_closed and drained and joined and time.monotonic() < deadline
 
 
 __all__ = [
