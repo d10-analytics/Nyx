@@ -28,12 +28,15 @@ import pytest
 from test_checkouts import (
     clone,
     commit_file,
+    doc_copy,
     find_clone,
     git,
     install_fake_gh,
     isolate_git,
     make_remote,
     point_origin_at,
+    rederive,
+    redigest,
     repository_fingerprint,
 )
 from test_server import RunningServer, StubClient, valid_catalog
@@ -344,6 +347,55 @@ def test_the_first_request_waits_for_one_check_and_a_concurrent_request_shares_i
         "pr_lookup": {"status": "off", "reason": "setting_off"},
     }
     _settle(serving.runtime)
+
+
+def _two_remote_document(captured: bytes) -> bytes:
+    """Return two repositories whose display order and remote-key order differ."""
+
+    document = json.loads(captured)
+    first = doc_copy(document["repositories"][0])
+    second = doc_copy(first)
+    path = first["clones"][0]["path"]
+    second = json.loads(
+        json.dumps(second).replace(json.dumps(path), json.dumps(f"{path} Two"))
+    )
+    first["remote"]["key"] = "z.example/team/alpha"
+    first["remote"]["display"] = "Alpha Remote"
+    second["remote"]["key"] = "a.example/team/beta"
+    second["remote"]["display"] = "Beta Remote"
+    document["repositories"] = [first, second]
+    redigest(rederive(document))
+    return json.dumps(document, separators=(",", ":")).encode("utf-8")
+
+
+def test_a_check_records_repository_remotes_in_key_order(captured_checkouts):
+    document = _two_remote_document(captured_checkouts)
+    listed = [repository["remote"]["key"] for repository in json.loads(document)["repositories"]]
+    assert listed == ["z.example/team/alpha", "a.example/team/beta"]
+    assert listed != sorted(listed)
+
+    manager = CheckoutsManagerDouble(document)
+    runtime = ApplicationRuntime(
+        port=0,
+        deadline=time.monotonic() + 60,
+        clock=InjectedClock(),
+        workers=manager,
+    )
+    runtime.admit_catalog()
+    try:
+        request = _Request(runtime.get_checkouts).start()
+        manager.wait_for_calls(1)
+        assert manager.calls[0].network is True
+        manager.release(0)
+        envelope = request.join()
+        recorded = [
+            repository["remote"]
+            for repository in envelope["remote_checks"]["last"]["repositories"]
+        ]
+        assert recorded == sorted(listed)
+        _settle(runtime)
+    finally:
+        assert runtime.shutdown(time.monotonic() + 5) is True
 
 
 def test_served_requests_answer_without_a_collection(serving):
