@@ -895,6 +895,8 @@ def test_a_real_worker_serves_an_accepted_document_and_a_refresh_shows_a_new_com
     runtime.admit_catalog()
     try:
         first = _Request(runtime.get_checkouts).start().join()
+        assert first["remote_checks"]["last"]["outcome"] == "completed"
+        assert first["remote_checks"]["last"]["repositories"] == []
         document = models.parse_checkouts(first["checkouts"])
         [repository_document] = document["repositories"]
         assert repository_document["remote"] is None

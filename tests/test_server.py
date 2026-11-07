@@ -1042,6 +1042,32 @@ def test_application_remote_check_route_requires_a_json_object_body():
     assert calls == [True]
 
 
+def test_application_remote_check_route_rejects_a_body_over_the_limit():
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+    envelope = _checkouts_double_envelope()
+    calls = []
+
+    def refresh():
+        calls.append(True)
+        return envelope
+
+    application.refresh_remote_checks = refresh
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        padded = "{}" + " " * 1024
+        assert len(padded.encode("utf-8")) > 1024
+        status, content_type, body = request(
+            port,
+            "POST",
+            "/api/checkouts/remote-check",
+            body=padded,
+            content_type="application/json",
+        )
+        assert status == 400
+        assert content_type == "application/json"
+        assert json.loads(body) == {"error": "invalid_payload"}
+        assert calls == []
+
+
 def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_preserves_failure():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
