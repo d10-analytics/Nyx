@@ -585,7 +585,11 @@ When Nyx cannot answer with a document, or is starting or stopping, the request
 fails with one category, and each clears in its own way:
 
 - `checkouts_unavailable`: Nyx is not accepting checkout work yet or is
-  closing; it clears once Nyx serves the request again.
+  closing; it clears once Nyx serves the request again. The request also fails
+  while Nyx cannot read the account's configuration record, because the record
+  is malformed or unreadable; it clears once the record is readable again. It
+  also fails when Nyx cannot start or contain the worker that collects the
+  data; it clears once a collection worker starts.
 - `checkouts_cancelled`: Nyx is stopping and dropped the collection; it clears
   when the service or application starts again.
 - `checkouts_failed`: the collection failed unexpectedly; it clears when a
