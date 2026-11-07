@@ -403,11 +403,26 @@ class ApplicationRuntime:
             return run
         run = _CheckoutsRun()
         if self._checkouts_running is None:
-            self._checkouts_running = run
-            self._begin_checkouts_run(run)
+            self._start_checkouts_run(run)
         else:
             self._checkouts_pending = run
         return run
+
+    def _start_checkouts_run(self, run: _CheckoutsRun) -> None:
+        """Make ``run`` the in-flight run and start its thread.
+
+        A run that cannot start ends at once as an unexpected failure, with the
+        accounting of any failed run, so its waiters are answered and the queue
+        keeps no slot that cannot make progress.
+        """
+
+        self._checkouts_running = run
+        try:
+            self._begin_checkouts_run(run)
+        except Exception:  # noqa: BLE001 - a run failure must stay category-safe
+            self._checkouts_running = None
+            self._settle_checkouts_run(run, None, "checkouts_failed")
+            self._checkouts_condition.notify_all()
 
     def _begin_checkouts_run(self, run: _CheckoutsRun) -> None:
         run.change = self._checkouts_change
@@ -430,7 +445,11 @@ class ApplicationRuntime:
             daemon=True,
         )
         self._checkouts_threads.add(thread)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            self._checkouts_threads.discard(thread)
+            raise
 
     def _collect_checkouts(self, run: _CheckoutsRun) -> None:
         document: dict[str, Any] | None = None
@@ -449,8 +468,10 @@ class ApplicationRuntime:
             except Exception:  # noqa: BLE001 - a run failure must stay category-safe
                 failure = "checkouts_failed"
         with self._checkouts_condition:
-            self._finish_checkouts_run(run, document, failure)
-            self._checkouts_condition.notify_all()
+            try:
+                self._finish_checkouts_run(run, document, failure)
+            finally:
+                self._checkouts_condition.notify_all()
 
     def _finish_checkouts_run(
         self,
@@ -458,10 +479,27 @@ class ApplicationRuntime:
         document: dict[str, Any] | None,
         failure: str | None,
     ) -> None:
+        self._checkouts_threads.discard(threading.current_thread())
+        try:
+            self._settle_checkouts_run(run, document, failure)
+        finally:
+            pending = self._checkouts_pending
+            self._checkouts_pending = None
+            self._checkouts_running = None
+            if pending is not None:
+                self._start_checkouts_run(pending)
+
+    def _settle_checkouts_run(
+        self,
+        run: _CheckoutsRun,
+        document: dict[str, Any] | None,
+        failure: str | None,
+    ) -> None:
+        """Record how ``run`` ended and apply it to the served state."""
+
         run.done = True
         run.document = document
         run.error = failure
-        self._checkouts_threads.discard(threading.current_thread())
         current = run.change == self._checkouts_change
         if document is not None:
             if current:
@@ -478,13 +516,6 @@ class ApplicationRuntime:
                 self._checkouts_local_refresh = run.started_monotonic
             if run.kind == _CHECK:
                 self._record_checkouts_check(run, failure, None)
-        if self._checkouts_pending is not None:
-            pending = self._checkouts_pending
-            self._checkouts_pending = None
-            self._checkouts_running = pending
-            self._begin_checkouts_run(pending)
-        else:
-            self._checkouts_running = None
 
     def _record_checkouts_check(
         self,
