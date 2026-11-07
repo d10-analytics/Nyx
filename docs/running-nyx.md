@@ -539,6 +539,72 @@ see [Your specification workspace](workspaces.md#checkout-folders) for the
 exact edit. A settings editor arrives with the Checkouts view; until then the
 record is edited by hand.
 
+### Served checkout state
+
+The Linux service and the private desktop application answer requests for
+checkout data at the same loopback address that serves the board. The answer is
+an object with two elements: `checkouts`, the document `nyx checkouts --json`
+prints, and `remote_checks`, the schedule and the last check. A request is
+answered from the latest finished collection, kept in memory: the document's
+`observed_at` is that collection's time, and a `recorded` value keeps the time
+of the check it came from, so the answer says how old it is. Once a document
+exists, a request is answered at once from it; a refresh runs behind the answer
+and the request does not wait for it.
+
+While checkout data is requested, Nyx refreshes the served answer in the
+background about once a minute, and starts a networked check when none has
+started in this runtime or when five minutes have passed since the last one
+started, so checks run at most every five minutes; while nothing requests
+checkout data, Nyx makes no network call. One collection runs at a time, and at
+most one waits: a request that needs a document while one runs shares that
+collection instead of starting another.
+
+The first request of a runtime waits for a collection, because there is no
+document yet. A collection that fails before a document exists answers with
+its category, and every request for about a minute after it started is answered
+with that category without starting another collection; the first request after
+that minute starts the next collection, which clears the category if it
+succeeds. Once a document exists, a failed background collection does not
+replace it: the old answer keeps serving, and a failed check is not retried
+automatically before its next due time.
+
+`remote_checks` reports the schedule and the last check. `state` is `running`
+while a check is in flight or waiting and `idle` otherwise. `interval_seconds`
+is 300, and `next_due_at` is when the next check falls due, or null when the
+next request starts one. `last` is null until the runtime's first check
+finishes; then it gives that check's `started_at` and `finished_at`, its
+`outcome` (`completed` or the category of a failed check), and, after a
+completed check, each remote's key with its `check` and `pr_lookup` status and
+reason.
+
+Serving never fetches: a collection reads the configured folders with read-only
+git calls and asks each remote with `git ls-remote`, exactly as `nyx checkouts`
+does, so it leaves every clone as it was.
+
+When Nyx cannot answer with a document, or is starting or stopping, the request
+fails with one category, and each clears in its own way:
+
+- `checkouts_unavailable`: Nyx is not accepting checkout work yet or is
+  closing; it clears once Nyx serves the request again. The request also fails
+  while Nyx cannot read the account's configuration record, because the record
+  is malformed or unreadable; it clears once the record is readable again. It
+  also fails when Nyx cannot start or contain the worker that collects the
+  data; it clears once a collection worker starts.
+- `checkouts_cancelled`: Nyx is stopping and dropped the collection; it clears
+  when the service or application starts again.
+- `checkouts_failed`: the collection failed unexpectedly; it clears when a
+  later collection publishes a document.
+- `checkouts_timeout`: the collection did not finish within its budget, 30
+  seconds locally or 60 seconds networked; it clears when a later collection
+  finishes in time.
+- `checkouts_output_too_large`: the collection's document exceeded the 2 MiB
+  bound; it clears when a later collection's document fits.
+- `checkouts_protocol_error`: the collection returned a document Nyx could not
+  read; it clears when a later collection returns a valid one.
+
+A check that fails reports its category as `remote_checks.last.outcome` until
+the next check finishes.
+
 ### Baseline and base drift
 
 A package header may carry `Baseline: <commit>`: the default-branch commit the

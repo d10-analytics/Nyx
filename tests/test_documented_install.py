@@ -508,6 +508,64 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the remote-tracking branch pruned with `git fetch --prune`, or when a force-push "
         "moved the remote branch back to an older commit",
         "the saved value then stands until a networked run checks again",        "a size bound, a shallow or partial clone or a git older than 2.39",
+        # The served checkout state: where it is answered, its cadence, its
+        # waits, the recorded values and their time, read-only collection, and
+        # each serving category with what clears it.
+        "### Served checkout state",
+        "answer requests for checkout data at the same loopback address that serves the board",
+        "the document `nyx checkouts --json` prints, and `remote_checks`, the schedule "
+        "and the last check",
+        "A request is answered from the latest finished collection, kept in memory",
+        "the document's `observed_at` is that collection's time",
+        "a `recorded` value keeps the time of the check it came from",
+        "Once a document exists, a request is answered at once from it",
+        "refreshes the served answer in the background about once a minute",
+        "starts a networked check when none has started in this runtime or when five "
+        "minutes have passed since the last one started",
+        "so checks run at most every five minutes",
+        "while nothing requests checkout data, Nyx makes no network call",
+        "One collection runs at a time, and at most one waits",
+        "a request that needs a document while one runs shares that collection instead "
+        "of starting another",
+        "The first request of a runtime waits for a collection",
+        "A collection that fails before a document exists answers with its category",
+        "every request for about a minute after it started is answered with that "
+        "category",
+        "the first request after that minute starts the next collection, which clears "
+        "the category if it succeeds",
+        "a failed check is not retried automatically before its next due time",
+        "`remote_checks` reports the schedule and the last check",
+        "`interval_seconds` is 300",
+        "`next_due_at` is when the next check falls due, or null when the next request "
+        "starts one",
+        "`last` is null until the runtime's first check finishes",
+        "gives that check's `started_at` and `finished_at`",
+        "each remote's key with its `check` and `pr_lookup` status and reason",
+        "Serving never fetches",
+        "a collection reads the configured folders with read-only git calls and asks "
+        "each remote with `git ls-remote`",
+        "When Nyx cannot answer with a document, or is starting or stopping, the "
+        "request fails with one category",
+        "`checkouts_unavailable`: Nyx is not accepting checkout work yet or is closing; "
+        "it clears once Nyx serves the request again",
+        "The request also fails while Nyx cannot read the account's configuration record, "
+        "because the record is malformed or unreadable; it clears once the record is "
+        "readable again",
+        "It also fails when Nyx cannot start or contain the worker that collects the data; "
+        "it clears once a collection worker starts",
+        "`checkouts_cancelled`: Nyx is stopping and dropped the collection; it clears "
+        "when the service or application starts again",
+        "`checkouts_failed`: the collection failed unexpectedly; it clears when a later "
+        "collection publishes a document",
+        "`checkouts_timeout`: the collection did not finish within its budget, 30 "
+        "seconds locally or 60 seconds networked; it clears when a later collection "
+        "finishes in time",
+        "`checkouts_output_too_large`: the collection's document exceeded the 2 MiB "
+        "bound; it clears when a later collection's document fits",
+        "`checkouts_protocol_error`: the collection returned a document Nyx could not "
+        "read; it clears when a later collection returns a valid one",
+        "A check that fails reports its category as `remote_checks.last.outcome` until "
+        "the next check finishes",
     ),
     "docs/workspaces.md": (
         '"schema_version": 4',
