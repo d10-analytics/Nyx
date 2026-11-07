@@ -975,11 +975,6 @@ class UploadPackRecorder:
             assert time.monotonic() < deadline, "the transport program did not run"
             time.sleep(0.005)
 
-    def let_through(self) -> None:
-        """Release the transport the recorder is holding."""
-
-        self.release.write_bytes(b"")
-
 
 def _real_world(
     tmp_path: Path,
@@ -1152,8 +1147,10 @@ def test_a_real_failed_check_keeps_the_saved_record_and_its_reason_in_last(tmp_p
         assert repository["check"] == {"status": "recorded", "reason": reason}
 
         world.clock.advance(LOCAL_REFRESH_INTERVAL)
+        before = _fingerprints(world.first, world.second)
         _answer(world.runtime.get_checkouts, timeout=5)
         _settle(world.runtime, timeout=90)
+        assert _fingerprints(world.first, world.second) == before
         local = _answer(world.runtime.get_checkouts)
         [group] = local["checkouts"]["repositories"]
         assert group["remote"]["check"] == {
@@ -1250,6 +1247,7 @@ def test_the_envelope_reports_a_pending_check_and_an_overdue_in_flight_one(servi
 
     settled = _Request(runtime.get_checkouts).start().join(timeout=5)
     assert settled["remote_checks"]["state"] == "idle"
+    assert settled["remote_checks"]["interval_seconds"] == 300
     last = settled["remote_checks"]["last"]
     due_at = _timestamp_after(last["started_at"], REMOTE_CHECK_INTERVAL)
     assert settled["remote_checks"]["next_due_at"] == due_at
@@ -1277,14 +1275,13 @@ def test_the_envelope_reports_a_pending_check_and_an_overdue_in_flight_one(servi
     assert queued.join(timeout=5)["remote_checks"]["last"]["outcome"] == "completed"
 
 
-def test_three_remote_check_requests_share_the_one_check_queued_behind_a_held_run(serving):
-    runtime, manager, clock = serving.runtime, serving.manager, serving.clock
+def test_three_remote_check_requests_share_the_one_check_queued_behind_a_held_check(serving):
+    runtime, manager = serving.runtime, serving.manager
     _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
-    _Request(runtime.get_checkouts).start().join(timeout=5)
+    held = _Request(runtime.refresh_remote_checks).start()
     manager.wait_for_calls(2)
-    assert manager.calls[1].network is False
+    assert manager.calls[1].network is True
 
     arrived = threading.Barrier(4)
 
@@ -1295,7 +1292,7 @@ def test_three_remote_check_requests_share_the_one_check_queued_behind_a_held_ru
     posts = [_Request(remote_check).start() for _ in range(3)]
     arrived.wait()
     _wait_for_pending(runtime)
-    assert len(manager.calls) == 2
+    assert len(manager.calls) == 2, "a queued request started its own check"
 
     manager.release(1)
     manager.wait_for_calls(3)
@@ -1304,6 +1301,7 @@ def test_three_remote_check_requests_share_the_one_check_queued_behind_a_held_ru
 
     answers = [post.join(timeout=10) for post in posts]
     assert {_observed(answer) for answer in answers} == {_document_timestamp(3)}
+    assert _observed(held.join(timeout=10)) == _document_timestamp(2)
     assert len(manager.calls) == 3, "a second check served one of the requests"
 
     served = _Request(runtime.get_checkouts).start().join(timeout=5)
