@@ -31,7 +31,10 @@ README is narrative only.
   run queue runs one collection at a time with at most one waiting, and a run
   that publishes replaces the served document only if it started at the current
   change count. `mark_checkouts_changed()` increments that count and starts
-  nothing.
+  nothing. Neither host calls it yet: it is the hook for a save of the checkout
+  inputs (the folder list and the GitHub switch). A board settings save does
+  not mark, because the next local refresh carries a changed stage within a
+  minute.
 - Board settings are read from the held configuration, saved through
   `save_configuration_owned` after the revision check; `/api/workspace` is read-only.
 
