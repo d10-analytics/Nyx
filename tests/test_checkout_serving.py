@@ -1589,3 +1589,43 @@ def test_shutdown_cancels_a_real_check_held_in_the_transport(tmp_path, monkeypat
         _close_world(world)
 
 
+def test_a_request_that_read_admission_before_the_close_starts_no_run(serving, monkeypatch):
+    runtime, manager = serving.runtime, serving.manager
+    _establish_document(serving)
+    assert runtime.shutdown(time.monotonic() + 5) is True
+
+    def refuse(run: object) -> None:
+        raise AssertionError("a run was started after the queue closed")
+
+    monkeypatch.setattr(runtime, "_start_checkouts_run", refuse)
+    runtime.catalog_admitted = True
+    for method in (runtime.get_checkouts, runtime.refresh_remote_checks):
+        with pytest.raises(CatalogError) as error:
+            method()
+        assert error.value.code == "checkouts_cancelled"
+    assert len(manager.calls) == 1
+
+
+def test_the_queue_closes_before_an_unfinished_settings_wait_returns(serving):
+    runtime, manager = serving.runtime, serving.manager
+    first = _Request(runtime.get_checkouts).start()
+    manager.wait_for_calls(1)
+    queued = _Request(runtime.refresh_remote_checks).start()
+    _wait_for_pending(runtime)
+
+    with runtime._settings_condition:  # noqa: SLF001 - a settings operation still active
+        runtime._settings_active += 1  # noqa: SLF001
+    try:
+        assert runtime.shutdown(time.monotonic() + 0.2) is False
+        with pytest.raises(CatalogError) as error:
+            queued.join(timeout=5)
+        assert error.value.code == "checkouts_cancelled"
+        assert len(manager.calls) == 1, "the queued check started"
+    finally:
+        with runtime._settings_condition:  # noqa: SLF001
+            runtime._settings_active -= 1  # noqa: SLF001
+    # The settings wait returned first, so the worker admission was never closed
+    # and the held run still answers its own waiter.
+    manager.release(0)
+    first.join(timeout=5)
+    assert runtime.shutdown(time.monotonic() + 5) is True
