@@ -1440,6 +1440,27 @@ def test_start_failure_cleanup_cancels_the_same_waiters(serving):
     assert len(manager.calls) == 1
 
 
+@pytest.mark.parametrize("cleanup", ["shutdown", "cleanup_start_failure"])
+def test_cleanup_drops_a_queued_run_whose_held_one_ignores_cancellation(serving, cleanup):
+    runtime, manager = serving.runtime, serving.manager
+    manager.ignore_cancellation = True
+
+    first = _Request(runtime.get_checkouts).start()
+    manager.wait_for_calls(1)
+    queued = _Request(runtime.refresh_remote_checks).start()
+    _wait_for_pending(runtime)
+
+    assert getattr(runtime, cleanup)(time.monotonic() + 0.3) is False
+
+    with pytest.raises(CatalogError) as error:
+        queued.join(timeout=5)
+    assert error.value.code == "checkouts_cancelled"
+    assert len(manager.calls) == 1, "the queued check started"
+
+    manager.release(0)
+    first.join(timeout=5)
+
+
 def test_a_request_after_shutdown_begins_starts_nothing(serving):
     runtime, manager = serving.runtime, serving.manager
     _establish_document(serving)
