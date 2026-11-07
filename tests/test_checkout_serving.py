@@ -666,6 +666,147 @@ def test_a_worker_cancellation_answers_its_waiters_without_opening_a_gate(servin
     assert again.value.code == "checkouts_cancelled"
 
 
+class RunStartFailure:
+    """Make chosen checkout run threads fail to start, as thread creation can."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self._armed = 0
+
+    def arm(self) -> None:
+        """Fail the next checkout run thread start."""
+
+        self._armed += 1
+
+    def start(self, original: Any, thread: threading.Thread) -> None:
+        if thread.name == "nyx-checkouts-run":
+            self.attempts += 1
+            if self._armed:
+                self._armed -= 1
+                raise RuntimeError("can't start new thread")
+        original(thread)
+
+
+@pytest.fixture
+def run_start(monkeypatch):
+    failure = RunStartFailure()
+    original = threading.Thread.start
+    monkeypatch.setattr(
+        threading.Thread, "start", lambda thread: failure.start(original, thread)
+    )
+    return failure
+
+
+def _wait_for_pending(runtime: ApplicationRuntime, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        with runtime._checkouts_condition:  # noqa: SLF001 - the serving owner's state
+            if runtime._checkouts_pending is not None:  # noqa: SLF001
+                return
+        assert time.monotonic() < deadline, "no run was queued"
+        time.sleep(0.001)
+
+
+def test_a_first_run_that_cannot_start_answers_its_category_and_leaves_the_queue_usable(
+    serving, run_start
+):
+    manager, clock = serving.manager, serving.clock
+
+    run_start.arm()
+    with pytest.raises(CatalogError) as error:
+        _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert error.value.code == "checkouts_failed"
+    _settle(serving.runtime)
+
+    with pytest.raises(CatalogError) as gated:
+        _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert gated.value.code == "checkouts_failed"
+
+    run_start.arm()
+    with pytest.raises(CatalogError) as checked:
+        _Request(serving.runtime.refresh_remote_checks).start().join(timeout=5)
+    assert checked.value.code == "checkouts_failed"
+    assert serving.runtime._checkouts_last_check["outcome"] == "checkouts_failed"  # noqa: SLF001
+    assert run_start.attempts == 2
+    assert manager.calls == []
+    _settle(serving.runtime)
+
+    clock.advance(LOCAL_REFRESH_INTERVAL)
+    repaired = _Request(serving.runtime.get_checkouts).start()
+    manager.wait_for_calls(1)
+    manager.release(0)
+    assert _observed(repaired.join()) == _document_timestamp(1)
+    _settle(serving.runtime)
+
+
+def test_a_queued_run_that_cannot_start_answers_every_waiter(serving, run_start):
+    manager, clock = serving.manager, serving.clock
+
+    first = _Request(serving.runtime.get_checkouts).start()
+    manager.wait_for_calls(1)
+    serving.runtime.mark_checkouts_changed()
+    check = _Request(serving.runtime.refresh_remote_checks).start()
+    _wait_for_pending(serving.runtime)
+    run_start.arm()
+    manager.release(0)
+
+    assert _observed(first.join(timeout=5)) == _document_timestamp(1)
+    with pytest.raises(CatalogError) as error:
+        check.join(timeout=5)
+    assert error.value.code == "checkouts_failed"
+    _settle(serving.runtime)
+
+    with pytest.raises(CatalogError) as gated:
+        _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert gated.value.code == "checkouts_failed"
+    assert len(manager.calls) == 1
+
+    clock.advance(LOCAL_REFRESH_INTERVAL)
+    repaired = _Request(serving.runtime.get_checkouts).start()
+    manager.wait_for_calls(2)
+    assert manager.calls[1].network is False
+    manager.release(1)
+    assert _observed(repaired.join()) == _document_timestamp(2)
+    assert run_start.attempts == 3
+    _settle(serving.runtime)
+
+
+def test_a_run_that_cannot_start_behind_a_served_document_changes_only_its_clocks(
+    serving, run_start
+):
+    manager, clock = serving.manager, serving.clock
+    observed = _establish_document(serving)
+
+    run_start.arm()
+    envelope = _Request(serving.runtime.refresh_remote_checks).start().join(timeout=5)
+    assert _observed(envelope) == observed
+    assert envelope["remote_checks"]["last"]["outcome"] == "checkouts_failed"
+    assert serving.runtime._checkouts_failure is None  # noqa: SLF001 - a current document exists
+
+    clock.advance(LOCAL_REFRESH_INTERVAL)
+    run_start.arm()
+    behind = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert _observed(behind) == observed
+    assert run_start.attempts == 3
+    _settle(serving.runtime)
+
+    inside = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert _observed(inside) == observed
+    assert run_start.attempts == 3
+    assert serving.runtime._checkouts_failure is None  # noqa: SLF001
+    assert len(manager.calls) == 1
+
+    clock.advance(LOCAL_REFRESH_INTERVAL)
+    after = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert _observed(after) == observed
+    manager.wait_for_calls(2)
+    assert manager.calls[1].network is False
+    manager.release(1)
+    _settle(serving.runtime)
+    final = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert _observed(final) == _document_timestamp(2)
+
+
 def _write_record(home, specification, folders):
     """Write the account record whose checkout inputs name ``folders``."""
 
