@@ -6,6 +6,27 @@ README is narrative only.
 ## Responsibilities
 
 - Reports the git state of the configured checkout folders.
+- On macOS, when git resolves to the system `/usr/bin/git` Command Line Tools
+  shim, checks the developer tools before the first git child: the pure
+  `developer_tools_probe(platform, git_executable)` decides whether a check is
+  needed, its caller passes the normalized executable, and the developer
+  directory the check reports must hold `usr/bin/git`. Without that, git reads
+  `missing`, no version and no repository, and no git runs at all, so the
+  installer dialog cannot appear on every refresh; a git resolved anywhere else
+  needs no check.
+- `folder_status(path)` is the one folder rule: `ok`, `missing`, `unreadable` or
+  `not_directory`, from one `stat` and, for a directory that opens, one
+  `scandir` handle opened and closed without reading a name. Discovery uses it
+  for every configured folder and the settings save uses it for every newly
+  submitted folder, so a saved folder and a listed one cannot disagree.
+- Suggests the parent folders whose configuration would reveal a package target
+  the configured folders do not: `folder_suggestions` in the document, one
+  `{path, package_count}` entry per folder, decided by a pure rule over the
+  facts the collector prepares for each package's usable target. A target
+  discovery already admits, one its child admission test would reject, the
+  filesystem root, and a parent that is already configured contribute nothing,
+  so the rule reads no file, runs no git, and its list cannot change with git's
+  availability.
 - A read-only collector: networked by default through one `git ls-remote` per
   distinct remote, which transfers no objects, and, when the workspace turns
   GitHub lookup on, one optional `gh` request per GitHub repository for its pull
@@ -89,3 +110,10 @@ README is narrative only.
   [protocols invariants](../protocols/README.md#cross-system-invariants).
 - Calls `code_status_text`; see
   [protocols invariants](../protocols/README.md#cross-system-invariants).
+
+## Cross-system invariants
+
+- `folder_status` is the single folder rule: `checkouts` reads every configured
+  folder with it and an `application-serving` checkout settings save reads every
+  newly submitted folder with it, so a folder the save accepts and a folder the
+  document lists can never disagree. Members: `application-serving`.
