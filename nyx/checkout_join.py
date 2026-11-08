@@ -56,6 +56,7 @@ no git, and cannot change with git's availability.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -156,17 +157,17 @@ def folder_suggestions(
     ``facts`` arrive in package-path order and ``folder_keys`` holds the
     configured folders' identities. A package contributes its parent only when
     its target has an identity, discovery did not admit it, discovery's admission
-    test would accept it, and the parent is neither the target itself (the
-    filesystem root) nor a configured folder. Entries group by the parent's
-    identity, so two spellings of one folder form one entry that keeps the first
-    spelling in package-path order, and the list is sorted in natural path order;
-    each entry counts the packages that contributed to it.
+    test would accept it, and the parent is neither a filesystem root nor a
+    configured folder. Entries group by the parent's identity, so two spellings
+    of one folder form one entry that keeps the first spelling in package-path
+    order, and the list is sorted in natural path order; each entry counts the
+    packages that contributed to it.
     """
     entries: dict[PathKey, dict[str, Any]] = {}
     for fact in facts:
         if fact.key is None or fact.admitted or not fact.accepted:
             continue
-        if fact.parent_key is None or fact.parent == fact.path:
+        if fact.parent_key is None or os.path.dirname(fact.parent) == fact.parent:
             continue
         if fact.parent_key in folder_keys:
             continue
