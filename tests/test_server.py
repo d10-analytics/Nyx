@@ -1574,6 +1574,28 @@ def test_checkout_settings_put_refuses_an_invalid_shape_without_touching_the_rec
                 assert status == 400, body
                 assert content_type == "application/json"
                 assert json.loads(response) == {"error": "invalid_payload"}, body
+            # The server refuses on the declared length before it reads a byte,
+            # so a request that declares an over-bound body and sends none
+            # reaches the refusal deterministically on every platform.
+            data = send_and_drain(
+                port,
+                raw_request(
+                    port,
+                    "PUT /api/checkout-settings HTTP/1.1",
+                    content_length=1024 * 1024 + 1,
+                ),
+            )
+            head, response = one_response_with_close(data)
+            assert response_status(head) == 400
+            assert b"content-type: application/json" in head.lower()
+            assert json.loads(response) == {"error": "invalid_payload"}
+
+            # With the whole body actually sent, the refusal is the same, but the
+            # answer is not guaranteed to arrive: the server answers and closes
+            # while the client is still uploading, so the kernel may reset the
+            # socket and the received bytes are then empty.  Only the effect
+            # belongs to the platform contract, so assert the bytes when they
+            # arrived and the unchanged record either way.
             too_long = json.dumps(
                 {"revision": revision, "folders": [str(folder)], "github_lookup": False}
             ) + " " * (1024 * 1024)
@@ -1587,9 +1609,11 @@ def test_checkout_settings_put_refuses_an_invalid_shape_without_touching_the_rec
                     content_length=len(too_long.encode()),
                 ),
             )
-            head, response = one_response_with_close(data)
-            assert response_status(head) == 400
-            assert json.loads(response) == {"error": "invalid_payload"}
+            if data:
+                head, separator, response = data.partition(b"\r\n\r\n")
+                assert data.startswith(b"HTTP/1.1 400")
+                if separator:
+                    assert json.loads(response) == {"error": "invalid_payload"}
         assert paths.config_file.read_bytes() == before
 
 
