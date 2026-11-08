@@ -2171,7 +2171,7 @@ def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 8
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 9
     assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
     assert [
         (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])
@@ -2287,6 +2287,43 @@ def test_subprocess_with_no_checkout_folders_still_says_so(tmp_path, account):
     completed = _checkouts_subprocess(account, "--json")
 
     assert (completed.returncode, completed.stdout.strip()) == (0, NO_FOLDERS)
+
+
+def test_in_process_json_records_the_revision_a_stage_order_save_changes(tmp_path, account, capsys):
+    """The printed document names the configuration it was collected under.
+
+    The save rewrites the record's own row order and nothing else, so the next
+    collection differs only in the revision it read and in what that revision
+    feeds: the document digest and the observation time.
+    """
+    _folder, _repository, _root, record = _package_world(tmp_path, ["Shipped"])
+    before_record = json.loads(record.read_text())
+    workspace = str((tmp_path / "spec").resolve())
+
+    code, out, err = _run_checkouts(capsys, "--json", "--no-network")
+
+    assert (code, err) == (0, "")
+    before = models.parse_checkouts(out)
+    assert before["configuration_revision"] == state.configuration_revision()
+    assert before["folder_suggestions"] == []
+
+    state.save_configuration_owned(workspace, stage_order=["Shipped", "Drafts"])
+    after_record = json.loads(record.read_text())
+    assert {key for key in after_record if after_record[key] != before_record.get(key)} == {
+        "stage_orders"
+    }
+    assert after_record["checkout_settings"] == before_record["checkout_settings"]
+
+    code, out, err = _run_checkouts(capsys, "--json", "--no-network")
+
+    assert (code, err) == (0, "")
+    after = models.parse_checkouts(out)
+    assert after["configuration_revision"] == state.configuration_revision()
+    assert after["configuration_revision"] != before["configuration_revision"]
+    assert after["checkouts_digest"] != before["checkouts_digest"]
+    assert {
+        key for key in before if before[key] != after[key]
+    } <= {"configuration_revision", "checkouts_digest", "observed_at"}
 
 
 def test_plain_output_prints_attention_first_and_the_assigned_clone_of_the_package_list(
