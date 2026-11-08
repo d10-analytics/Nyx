@@ -628,6 +628,7 @@ def _run_checkouts(*, network: bool, deadline_ms: int) -> int:
             remote_checks=network,
             github_lookup=inputs.github_lookup,
             package_scan=inputs.package_scan,
+            configuration_revision=inputs.configuration_revision,
         )
         encoded = rendered.encode("utf-8")
         sys.stdout.buffer.write(encoded)

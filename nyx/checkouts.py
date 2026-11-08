@@ -25,6 +25,15 @@ finds the object there, and the preferred holder decides. A tip on the default
 branch's own first-parent history never reads merged, because a branch pushed with
 no commit of its own and a branch fast-forward merged cannot be told apart from a
 remote-tracking ref.
+
+The document records, beside those facts, the revision of the configuration the
+collection loaded (``null`` when no record was loaded) and the parent folders
+whose configuration would bring the packages' unseen ``Target repo:`` checkouts
+into view. A suggestion is a folder discovery itself would reveal a checkout in:
+the collector prepares each usable target's path, identity, whether discovery
+admitted it, whether discovery's child admission test would accept it, and its
+parent's text and identity, and the rule over those facts reads no file and runs
+no git. The list therefore cannot change with git's availability.
 """
 
 from __future__ import annotations
@@ -54,10 +63,12 @@ from .checkout_join import (
     PathKey,
     RemoteAnswer,
     RemoteFacts,
+    SuggestionFacts,
     TargetIndex,
     _default_names,
     declared_branch_names,
     declared_names_by_repository,
+    folder_suggestions,
     join_branches,
     moved_at_or_after,
     package_branch_copies,
@@ -557,6 +568,24 @@ def _has_git_entry(path: str) -> bool:
     return details is not None and (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode))
 
 
+def _admits_checkout(path: str) -> bool:
+    """Whether discovery takes ``path`` as a checkout an immediate child may be.
+
+    It must not be a symbolic link or a junction, must be a directory, and must
+    hold a ``.git`` entry that is a directory or a regular file. ``_discover``
+    admits a child under this one test, and the folder-suggestion facts ask the
+    same test whether a package's own target would pass it, so a suggestion is
+    exactly a folder discovery would reveal a package target under.
+    """
+    details = _lstat(path)
+    return (
+        details is not None
+        and not _is_reparse_or_link(Path(path), details)
+        and stat.S_ISDIR(details.st_mode)
+        and _has_git_entry(path)
+    )
+
+
 def _discover(folders: Iterable[str]) -> _Discovery:
     result = _Discovery()
     seen_real: set[str] = set()
@@ -593,13 +622,7 @@ def _discover(folders: Iterable[str]) -> _Discovery:
             add(folder, None)
         for name in names:
             child = os.path.join(folder, name)
-            child_details = _lstat(child)
-            if (
-                child_details is None
-                or _is_reparse_or_link(Path(child), child_details)
-                or not stat.S_ISDIR(child_details.st_mode)
-                or not _has_git_entry(child)
-            ):
+            if not _admits_checkout(child):
                 continue
             if not _representable(child):
                 result.diagnostics.append({"code": "unrepresentable_path", "path": folder})
@@ -4169,6 +4192,7 @@ class CollectionInputs:
     folders: tuple[str, ...]
     github_lookup: bool
     package_scan: PackageScan | None
+    configuration_revision: str | None = None
 
 
 def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs | None:
@@ -4177,10 +4201,11 @@ def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs
     ``None`` means the record is unavailable, so no document can be collected.
     A not-configured account collects no folder and scans no package, and its
     document then says so instead of inventing a workspace. A configured
-    record supplies its folders, its GitHub switch and the package scan of its
-    specification root. Callers keep their own answers to these facts: a
-    command line may report that no folder is configured while a service still
-    publishes the empty document.
+    record supplies its folders, its GitHub switch, the package scan of its
+    specification root and its own revision, which the document records as the
+    configuration it was collected under. Callers keep their own answers to
+    these facts: a command line may report that no folder is configured while a
+    service still publishes the empty document.
     """
     if observation.status == "unavailable":
         return None
@@ -4194,6 +4219,7 @@ def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs
             configuration.specification_root,
             configuration.completed_stage_names,
         ),
+        configuration_revision=configuration.revision,
     )
 
 
@@ -4298,6 +4324,45 @@ def _within_folders(path: str, folder_keys: frozenset[PathKey]) -> bool:
         current = parent
 
 
+def _folder_suggestion_entries(
+    scan: PackageHeads | None,
+    admitted: frozenset[PathKey],
+    folder_keys: frozenset[PathKey],
+) -> list[dict[str, Any]]:
+    """Prepare every package's suggestion facts and apply the suggestion rule.
+
+    Only a package with a usable ``Target repo:`` path contributes, and only
+    when the document can carry that path's text; its parent is a prefix, so it
+    is text the document can carry too. A path the text rule cannot render is
+    one discovery would leave out of its candidates rather than write, exactly
+    as an unrepresentable configured folder is left out of ``folders``. Both
+    admission flags and both identities are read here, so the rule itself stays
+    a pure function over plain facts.
+    """
+    if scan is None:
+        return []
+    facts: list[SuggestionFacts] = []
+    for head in scan.heads:
+        path = head.target_repo.path
+        if head.target_repo.status != "usable" or path is None:
+            continue
+        if not _representable(path):
+            continue
+        parent = os.path.dirname(os.path.normpath(path))
+        key = _path_key(path)
+        facts.append(
+            SuggestionFacts(
+                path=path,
+                key=key,
+                admitted=key is not None and key in admitted,
+                accepted=_admits_checkout(path),
+                parent=parent,
+                parent_key=_path_key(parent),
+            )
+        )
+    return folder_suggestions(facts, folder_keys)
+
+
 def _package_entries(
     scan: PackageHeads | None,
     index: TargetIndex | None,
@@ -4347,6 +4412,7 @@ def collect_checkouts(
     remote_checks: bool = False,
     github_lookup: bool = False,
     package_scan: PackageScan | None = None,
+    configuration_revision: str | None = None,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
@@ -4361,11 +4427,23 @@ def collect_checkouts(
     is not made or fails. ``package_scan`` names the specification root whose
     packages are listed; without it, or when the root cannot be read, the
     document says the package scan is ``unavailable`` and lists no package.
+    ``configuration_revision`` is the revision of the configuration the caller
+    loaded, recorded as the configuration this document was collected under; it
+    is ``None`` for an account with no configuration record.
     """
     observed_at = _utc_text(int(time.time()))
     package_heads = _scan_packages(package_scan)
     folder_paths = [os.fspath(folder) for folder in folders]
     discovery = _discover(folder_paths)
+    folder_keys = frozenset(key for key in map(_path_key, folder_paths) if key is not None)
+    # The identities discovery admitted, so a package target already revealed by a
+    # configured folder contributes no suggestion. Read from the filesystem alone,
+    # so the list is the same with git and without it.
+    admitted_keys = frozenset(
+        key
+        for key in map(_path_key, (candidate.path for candidate in discovery.candidates))
+        if key is not None
+    )
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
     packages: list[dict[str, Any]]
@@ -4444,9 +4522,6 @@ def collect_checkouts(
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
         target_index = _target_index(repositories, candidate_clones, not_git_candidates)
-        folder_keys = frozenset(
-            key for key in map(_path_key, folder_paths) if key is not None
-        )
         packages = _package_entries(package_heads, target_index, folder_keys)
         bases, pulls, checked, remote_facts = _check_remotes(
             runner,
@@ -4532,6 +4607,7 @@ def collect_checkouts(
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
         "observed_at": observed_at,
+        "configuration_revision": configuration_revision,
         "git": git_state,
         "remote_checks": "on" if remote_checks else "off",
         "github_lookup": "on" if github_lookup else "off",
@@ -4544,6 +4620,9 @@ def collect_checkouts(
                 package_scan.completed_stage_names if package_scan is not None else None
             ),
         },
+        "folder_suggestions": _folder_suggestion_entries(
+            package_heads, admitted_keys, folder_keys
+        ),
         "packages": packages,
         "attention": [],
     }

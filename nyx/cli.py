@@ -297,6 +297,7 @@ def _checkouts_command(as_json: bool, no_network: bool) -> int:
             remote_checks=not no_network,
             github_lookup=inputs.github_lookup,
             package_scan=inputs.package_scan,
+            configuration_revision=inputs.configuration_revision,
         )
     except checkouts.CheckoutsOutputTooLargeError as error:
         print(f"nyx: {error.category}: {error}", file=sys.stderr)
