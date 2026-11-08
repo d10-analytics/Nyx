@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from test_checkouts import (
@@ -1036,8 +1037,16 @@ def _real_world(
     *,
     github_lookup: bool = False,
     hold: bool = False,
+    separate_folders: bool = False,
+    captured: bool = False,
 ) -> SimpleNamespace:
-    """A runtime over a real worker manager and two clones of one bare remote."""
+    """A runtime over a real worker manager and two clones of one bare remote.
+
+    ``separate_folders`` clones them into two sibling folders and names only
+    the first in the record, so a save can add the second.  ``captured`` loads
+    that record into the runtime's settings boundary, so a save reaches the real
+    bytes on disk.
+    """
 
     home = tmp_path / "home"
     home.mkdir()
@@ -1047,13 +1056,22 @@ def _real_world(
     remote = make_remote(served)
     folder = tmp_path / "checkouts"
     folder.mkdir()
-    first = clone(remote.as_uri(), folder / "Clone A")
-    second = clone(remote.as_uri(), folder / "Clone B")
+    if separate_folders:
+        first_folder = folder / "a"
+        second_folder = folder / "b"
+        first_folder.mkdir()
+        second_folder.mkdir()
+    else:
+        first_folder = second_folder = folder
+    first = clone(remote.as_uri(), first_folder / "Clone A")
+    second = clone(remote.as_uri(), second_folder / "Clone B")
     recorder = UploadPackRecorder(tmp_path / "recorder", hold=hold)
     recorder.install(first, second)
     specification = tmp_path / "specification"
     specification.mkdir()
-    paths = _write_record(home, specification, [folder], github_lookup=github_lookup)
+    paths = _write_record(
+        home, specification, [first_folder], github_lookup=github_lookup
+    )
     manager = worker.CatalogWorkerManager(working_directory=paths.state_directory)
     clock = InjectedClock()
     runtime = ApplicationRuntime(
@@ -1062,17 +1080,21 @@ def _real_world(
         clock=clock,
         workers=manager,
     )
+    if captured:
+        runtime.capture_configuration(state.load_configuration(paths), paths)
     runtime.admit_catalog()
     return SimpleNamespace(
         home=home,
         remote=remote,
         folder=folder,
+        folders=(first_folder, second_folder),
         first=first,
         second=second,
         recorder=recorder,
         manager=manager,
         runtime=runtime,
         clock=clock,
+        paths=paths,
     )
 
 
@@ -1244,6 +1266,187 @@ def test_a_real_github_lookup_failure_reaches_the_last_check_report(tmp_path, mo
         assert world.recorder.lines(), "the GitHub-style origin did not reach the bare remote"
     finally:
         _close_world(world)
+
+
+# ---------------------------------------------------------------------------
+# Saving the checkout inputs
+# ---------------------------------------------------------------------------
+
+
+def _document_clone_paths(document: dict[str, Any]) -> list[str]:
+    """Every clone path the served document lists, in listing order."""
+
+    return [
+        clone_document["path"]
+        for repository in document["repositories"]
+        for clone_document in repository["clones"]
+    ]
+
+
+def _put_checkout_settings(port, revision, folders, github_lookup=True):
+    return http_request(
+        port,
+        "PUT",
+        "/api/checkout-settings",
+        body=json.dumps(
+            {
+                "revision": revision,
+                "folders": [str(folder) for folder in folders],
+                "github_lookup": github_lookup,
+            }
+        ),
+    )
+
+
+def test_a_saved_checkout_folder_marks_the_inputs_so_the_next_request_checks_it(
+    tmp_path, monkeypatch
+):
+    """The mark, not the clock, makes the newly saved folder's clone appear."""
+
+    world = _real_world(tmp_path, monkeypatch, separate_folders=True, captured=True)
+    first_folder, second_folder = world.folders
+    with RunningServer(StubClient(catalog=valid_catalog()), world.runtime) as port:
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        first = json.loads(body)
+        assert first["remote_checks"]["last"]["outcome"] == "completed"
+        document = models.parse_checkouts(first["checkouts"])
+        assert document["folders"] == [{"path": str(first_folder), "status": "ok"}]
+        assert _document_clone_paths(document) == [str(world.first)]
+        recorded = len(world.recorder.lines())
+        assert recorded >= 1
+        revision = world.runtime.configuration.revision
+        assert world.clock.value == 1000.0
+
+        status, content_type, body = _put_checkout_settings(
+            port, revision, [first_folder, second_folder], True
+        )
+        assert status == 200
+        assert content_type == "application/json"
+        saved = json.loads(body)
+        assert saved["outcome"] == "success"
+        assert saved["folders"] == [str(first_folder), str(second_folder)]
+        assert saved["github_lookup"] is True
+        assert saved["revision"] != revision
+
+        # No interval has elapsed, so only the save's mark can make this check.
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert world.clock.value == 1000.0
+        after = json.loads(body)
+        document = models.parse_checkouts(after["checkouts"])
+        assert document["folders"] == [
+            {"path": str(first_folder), "status": "ok"},
+            {"path": str(second_folder), "status": "ok"},
+        ]
+        assert _document_clone_paths(document) == sorted(
+            [str(world.first), str(world.second)]
+        )
+        assert document["configuration_revision"] == saved["revision"]
+        assert document["github_lookup"] == "on"
+        assert len(world.recorder.lines()) == recorded + 1
+        stored = json.loads(world.paths.config_file.read_bytes())
+        key = str(world.runtime.configuration.specification_root)
+        assert stored["checkout_settings"][key] == {
+            "folders": [str(first_folder), str(second_folder)],
+            "github_lookup": True,
+        }
+
+
+def test_a_reconciled_checkout_settings_save_still_marks_the_inputs(tmp_path, monkeypatch):
+    """A commit-verification failure the core reconciled to success still marks."""
+
+    world = _real_world(tmp_path, monkeypatch, separate_folders=True, captured=True)
+    first_folder, second_folder = world.folders
+    with RunningServer(StubClient(catalog=valid_catalog()), world.runtime) as port:
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert json.loads(body)["remote_checks"]["last"]["outcome"] == "completed"
+        recorded = len(world.recorder.lines())
+        assert recorded >= 1
+        revision = world.runtime.configuration.revision
+        assert world.clock.value == 1000.0
+        seen = state._verify_record
+        fires = []
+
+        def fail_once_after_replace(path, *args, **kwargs):
+            details = seen(path, *args, **kwargs)
+            if fires or path != world.paths.config_file:
+                return details
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            key = str(world.runtime.configuration.specification_root)
+            entry = payload.get("checkout_settings", {}).get(key)
+            if entry is None or entry.get("github_lookup") is not True:
+                return details
+            fires.append(path)
+            raise OSError("injected post-replacement verification failure")
+
+        with patch.object(state, "_verify_record", side_effect=fail_once_after_replace):
+            # The submitted spelling normalizes to the stored folder, so the
+            # reconciliation compares the normalized entry and reports success.
+            status, _, body = _put_checkout_settings(
+                port, revision, [str(second_folder) + os.sep + "."], True
+            )
+        assert fires == [world.paths.config_file]
+        assert status == 200
+        saved = json.loads(body)
+        assert saved["outcome"] == "success"
+        assert saved["folders"] == [str(second_folder)]
+        assert saved["revision"] != revision
+
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert world.clock.value == 1000.0
+        document = models.parse_checkouts(json.loads(body)["checkouts"])
+        assert document["folders"] == [{"path": str(second_folder), "status": "ok"}]
+        assert document["configuration_revision"] == saved["revision"]
+        assert len(world.recorder.lines()) == recorded + 1
+
+
+def test_a_saved_folder_removed_from_disk_still_saves_and_lists_as_missing(
+    tmp_path, monkeypatch
+):
+    world = _real_world(tmp_path, monkeypatch, captured=True)
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    with RunningServer(StubClient(catalog=valid_catalog()), world.runtime) as port:
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert json.loads(body)["remote_checks"]["last"]["outcome"] == "completed"
+        revision = world.runtime.configuration.revision
+
+        status, _, body = _put_checkout_settings(port, revision, [kept, gone], True)
+        assert status == 200
+        saved = json.loads(body)
+        assert saved["outcome"] == "success"
+        gone.rmdir()
+        assert not gone.exists()
+
+        # The saved folder is exempt from the write-time existence check, so it
+        # keeps saving while it is gone.
+        status, _, body = _put_checkout_settings(
+            port, saved["revision"], [kept, gone, fresh], True
+        )
+        assert status == 200
+        again = json.loads(body)
+        assert again["outcome"] == "success"
+        assert again["folders"] == sorted([str(kept), str(gone), str(fresh)])
+
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        document = models.parse_checkouts(json.loads(body)["checkouts"])
+        assert {folder["path"]: folder["status"] for folder in document["folders"]} == {
+            str(kept): "ok",
+            str(gone): "missing",
+            str(fresh): "ok",
+        }
+        stored = json.loads(world.paths.config_file.read_bytes())
+        key = str(world.runtime.configuration.specification_root)
+        assert str(gone) in stored["checkout_settings"][key]["folders"]
 
 
 # ---------------------------------------------------------------------------

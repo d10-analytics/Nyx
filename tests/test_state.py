@@ -1653,6 +1653,198 @@ def test_save_paths_carry_checkout_settings_and_revision_covers_them():
             assert state.configuration_revision(paths) == legacy_revision
 
 
+def _owned_checkout_world(root: Path):
+    """An isolated home holding a record for one active and one other workspace.
+
+    The active workspace has a stage order and a completed-stage policy, and
+    each workspace has its own checkout entry, so a save can be seen to leave
+    every other value alone. Returns the home patch parts and the pieces the
+    callers assert against.
+    """
+
+    home = isolated_home(root)
+    active = isolated_root(root, "active")
+    other = isolated_root(root, "other")
+    return home, active, other
+
+
+def _checkout_records(root: Path, active: Path, other: Path) -> dict[str, object]:
+    """A schema 4 record naming both workspaces and the other workspace's entry."""
+
+    elsewhere = str(root / "elsewhere")
+    return {
+        "schema_version": 4,
+        "specification_root": str(active.resolve()),
+        "stage_orders": {str(active.resolve()): ["Queue", "Review"]},
+        "completed_stages": {str(active.resolve()): ["Queue"]},
+        "checkout_settings": {
+            str(other.resolve()): _checkout_entry(elsewhere, github_lookup=True),
+        },
+    }
+
+
+def test_an_owned_save_writes_the_active_checkout_entry_and_keeps_every_other_value():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, active, other = _owned_checkout_world(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            record = _checkout_records(root, active, other)
+            _write_record(paths, record)
+            before_revision = state.configuration_revision(paths)
+            first = str(root / "one")
+            second = str(root / "two")
+
+            saved = state.save_configuration_owned(
+                active,
+                paths=paths,
+                checkout_folders=[second, first, second],
+                github_lookup=True,
+            )
+
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["checkout_settings"] == {
+                str(active.resolve()): {
+                    "folders": [first, second],
+                    "github_lookup": True,
+                },
+                **record["checkout_settings"],
+            }
+            assert stored["stage_orders"] == record["stage_orders"]
+            assert stored["completed_stages"] == record["completed_stages"]
+            assert saved.checkout_folders == (first, second)
+            assert saved.checkout_github_lookup is True
+            assert saved.stage_order == ("Queue", "Review")
+            assert state.configuration_revision(paths) == saved.revision
+            assert saved.revision != before_revision
+
+
+def test_an_owned_save_with_an_empty_folder_list_removes_only_the_active_entry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, active, other = _owned_checkout_world(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            record = _checkout_records(root, active, other)
+            record["checkout_settings"][str(active.resolve())] = _checkout_entry(
+                str(root / "saved"), github_lookup=True
+            )
+            _write_record(paths, record)
+
+            saved = state.save_configuration_owned(
+                active, paths=paths, checkout_folders=(), github_lookup=True
+            )
+
+            stored = json.loads(paths.config_file.read_bytes())
+            assert str(active.resolve()) not in stored["checkout_settings"]
+            assert stored["checkout_settings"] == {
+                str(other.resolve()): record["checkout_settings"][str(other.resolve())]
+            }
+            assert saved.checkout_folders == ()
+            assert saved.checkout_github_lookup is False
+            assert state.load_configuration(paths).checkout_folders == ()
+            assert state.load_configuration(paths).checkout_settings[
+                str(other.resolve())
+            ].folders
+
+
+def test_candidate_validation_applies_the_checkout_keywords_without_writing():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, active, other = _owned_checkout_world(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            record = _checkout_records(root, active, other)
+            _write_record(paths, record)
+            before = paths.config_file.read_bytes()
+            saved_revision = state.configuration_revision(paths)
+            folder = str(root / "folder")
+
+            candidate = state.validate_configuration_candidate(
+                active, paths=paths, checkout_folders=[folder], github_lookup=True
+            )
+
+            assert paths.config_file.read_bytes() == before
+            assert candidate.checkout_folders == (folder,)
+            assert candidate.checkout_github_lookup is True
+            assert candidate.revision != saved_revision
+
+            carried = state.validate_configuration_candidate(
+                active, paths=paths, stage_order=["Archive"]
+            )
+            assert carried.checkout_folders == ()
+            assert carried.stage_order == ("Archive",)
+            assert paths.config_file.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("relative", "checkout folders are invalid"),
+        ("nul", "checkout folders are invalid"),
+        ("unnormalized", "checkout folders are invalid"),
+        ("text", "checkout folders are invalid"),
+        ("lookup-not-bool", "boolean GitHub lookup"),
+        ("lookup-missing", "boolean GitHub lookup"),
+        ("lookup-alone", "must accompany"),
+    ],
+)
+def test_invalid_checkout_save_keywords_are_refused_and_leave_the_record(case, message):
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, active, other = _owned_checkout_world(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            _write_record(paths, _checkout_records(root, active, other))
+            before = paths.config_file.read_bytes()
+            saved = str(root / "saved")
+            keywords = {
+                "relative": {"checkout_folders": ["relative"]},
+                "nul": {"checkout_folders": [saved + "\x00"]},
+                "unnormalized": {
+                    "checkout_folders": [saved + os.sep + ".." + os.sep + "saved"]
+                },
+                "text": {"checkout_folders": "absolute-text"},
+                "lookup-not-bool": {"checkout_folders": [saved], "github_lookup": 1},
+                "lookup-missing": {"checkout_folders": [saved]},
+                "lookup-alone": {"github_lookup": True},
+            }[case]
+            with pytest.raises(state.ConfigurationError, match=message):
+                state.save_configuration_owned(active, paths=paths, **keywords)
+            assert paths.config_file.read_bytes() == before
+
+
+def test_a_folder_that_disappears_after_saving_still_loads_and_keeps_its_entry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home, active, other = _owned_checkout_world(root)
+        home_patch, uid_patch = configure_home(home)
+        with home_patch, uid_patch:
+            state.state_paths(create=True)
+            paths = state.state_paths()
+            folder = root / "folder"
+            folder.mkdir()
+            _write_record(paths, _checkout_records(root, active, other))
+            saved = state.save_configuration_owned(
+                active, paths=paths, checkout_folders=[str(folder)], github_lookup=True
+            )
+            folder.rmdir()
+            assert not folder.exists()
+
+            reloaded = state.load_configuration(paths)
+            assert reloaded.checkout_folders == (str(folder),)
+            assert reloaded.checkout_github_lookup is True
+            assert reloaded.revision == saved.revision
+
+
 # -- the shared atomic replacement and the checkout verdict cache ------------
 
 
