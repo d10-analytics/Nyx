@@ -6975,6 +6975,58 @@ def test_a_configured_parent_discovery_could_not_list_is_never_suggested(tmp_pat
     assert document["folder_suggestions"] == []
 
 
+@posix_only
+def test_the_folder_suggestions_never_name_a_filesystem_root():
+    """A target directly under ``/`` names the root as its parent, no suggestion."""
+    under_root = checkout_join.SuggestionFacts(
+        path="/srv",
+        key=("id", 1, 2),
+        admitted=False,
+        accepted=True,
+        parent="/",
+        parent_key=("id", 1, 3),
+    )
+    ordinary = checkout_join.SuggestionFacts(
+        path="/srv/app",
+        key=("id", 1, 4),
+        admitted=False,
+        accepted=True,
+        parent="/srv",
+        parent_key=("id", 1, 2),
+    )
+
+    assert checkout_join.folder_suggestions([under_root], frozenset()) == []
+    assert checkout_join.folder_suggestions([ordinary], frozenset()) == [
+        {"path": "/srv", "package_count": 1}
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs a Windows drive root")
+def test_the_folder_suggestions_never_name_a_drive_root():
+    """A target directly under a drive root names it as its parent, no suggestion."""
+    under_root = checkout_join.SuggestionFacts(
+        path="D:\\work",
+        key=("id", 1, 2),
+        admitted=False,
+        accepted=True,
+        parent="D:\\",
+        parent_key=("id", 1, 3),
+    )
+    ordinary = checkout_join.SuggestionFacts(
+        path="D:\\work\\repo",
+        key=("id", 1, 4),
+        admitted=False,
+        accepted=True,
+        parent="D:\\work",
+        parent_key=("id", 1, 2),
+    )
+
+    assert checkout_join.folder_suggestions([under_root], frozenset()) == []
+    assert checkout_join.folder_suggestions([ordinary], frozenset()) == [
+        {"path": "D:\\work", "package_count": 1}
+    ]
+
+
 def suggestions_document(tmp_path: Path) -> dict[str, Any]:
     """A collected document whose suggestions name two unconfigured folders."""
     remote = make_remote(tmp_path)
