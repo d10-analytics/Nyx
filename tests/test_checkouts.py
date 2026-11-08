@@ -1078,11 +1078,12 @@ def recorded_starts(log: Path) -> list[str]:
 
 
 def recording_git(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
-    """Put the existing recording git shim on PATH and return it and its log.
+    """Put a recording git shim on PATH in the ``git_shim`` pattern.
 
     The shim appends each start to the log and then runs the real git, so a
     collection that starts git leaves a record.  It is installed after the test
-    builds its world, so the log holds only the collection's own starts.
+    builds its world, so the log holds only the collection's own starts.  The
+    shim and its log are returned.
     """
     log = tmp_path / "shim.log"
     real_git = shutil.which("git")

@@ -4467,6 +4467,7 @@ def test_desktop_runtime_serves_and_saves_the_active_checkout_settings():
             try:
                 application = session.start_runtime()
                 # The session's own runtime answers the read with its claims held.
+                assert session.runtime is application
                 assert session.claims.held
                 status, listed = request_checkout_settings()
                 assert status == 200
