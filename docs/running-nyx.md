@@ -539,6 +539,18 @@ see [Your specification workspace](workspaces.md#checkout-folders) for the
 exact edit. A settings editor arrives with the Checkouts view; until then the
 record is edited by hand.
 
+The `--json` document records the revision of the configuration the collection
+loaded as `configuration_revision`, or `null` when no record was loaded. It also
+lists, under `folder_suggestions`, the parent folders whose configuration would
+bring a package's unseen `Target repo:` checkout into view: each entry gives the
+folder's `path` and its `package_count`, the number of packages that one folder
+would reveal. A package contributes its parent only when discovery would accept
+its target as a checkout (a directory holding a `.git` entry, not a link), no
+configured folder already reveals it, and the parent is neither the filesystem
+root nor already configured. The entries are in natural path order. The list is
+empty when the package scan is unavailable, and it is read from the filesystem
+alone, so git's availability cannot change it.
+
 ### Served checkout state
 
 The Linux service and the private desktop application answer requests for
@@ -549,15 +561,21 @@ answered from the latest finished collection, kept in memory: the document's
 `observed_at` is that collection's time, and a `recorded` value keeps the time
 of the check it came from, so the answer says how old it is. Once a document
 exists, a request is answered at once from it; a refresh runs behind the answer
-and the request does not wait for it.
+and the request does not wait for it. The exception is the first request after a
+checkout settings save: the served document was collected under the folders and
+GitHub lookup from before the save, so that request waits for a collection that
+reads the new settings, and the check it waits on is a networked one.
 
 While checkout data is requested, Nyx refreshes the served answer in the
 background about once a minute, and starts a networked check when none has
 started in this runtime or when five minutes have passed since the last one
 started, so checks run at most every five minutes; while nothing requests
-checkout data, Nyx makes no network call. One collection runs at a time, and at
-most one waits: a request that needs a document while one runs shares that
-collection instead of starting another.
+checkout data, Nyx makes no network call. A checkout settings save also makes
+the next check due at once, outside that five-minute cadence, so the collection
+that follows a save can start sooner than five minutes after the previous
+check. One collection runs at a time, and at most one waits: a request that
+needs a document while one runs shares that collection instead of starting
+another.
 
 The first request of a runtime waits for a collection, because there is no
 document yet. A collection that fails before a document exists answers with
@@ -1113,7 +1131,8 @@ report that the desktop application has no lifecycle commands.
 
 The application serves the board on the fixed loopback address without caller
 authentication, so other local accounts on the same host can read the catalog and
-workspace path and change board settings. It does not edit specifications. It has no automatic startup, auto-update, remote
+workspace path, change board settings, and change the active workspace's checkout
+folders and GitHub lookup. It does not edit specifications. It has no automatic startup, auto-update, remote
 or shared hosting, cross-host configuration synchronization, or agent
 execution. Configuration and runtime state still live under `.nyx` in your home
 directory. The private worker helper can also collect checkout state, although
@@ -1122,7 +1141,14 @@ the application itself neither requests nor shows it. That collection needs
 helper searches that `PATH` only, so with a `git` your terminal can run but the
 application cannot, its checkout document reports `git missing` and lists no
 checkout. Add the directory holding `git` (`git.exe` on Windows) to the
-environment that starts the application. On Linux the desktop application refuses to start and
+environment that starts the application. On macOS, an application opened from Finder searches
+the fixed `PATH` macOS gives it, `/usr/bin:/bin:/usr/sbin:/sbin`, where `git` is
+a Command Line Tools placeholder: the collection checks the developer tools
+before it starts that `git`, so without them its checkout document reports `git
+missing` and lists no checkout instead of raising the installer prompt on every
+refresh. Install the Command Line Tools with `xcode-select --install` in your own
+shell, or start the application from an environment whose `PATH` names a
+complete `git`. On Linux the desktop application refuses to start and
 directs you to use the `nyx` console entry instead.
 
 ## Maintainer: record cloud-placeholder behavior
@@ -1365,5 +1391,6 @@ repeatable browser session; it does not add a permanent screenshot framework.
 Nyx reads specification files without modifying them. Setup and runtime commands
 do write account-local configuration and runtime state. The service is intended
 for use on a fixed loopback interface without caller authentication, so other local
-accounts on the same host can read the catalog and workspace path and change
-board settings; shared or remote hosting is not supported.
+accounts on the same host can read the catalog and workspace path, change board
+settings, and change the active workspace's checkout folders and GitHub lookup;
+shared or remote hosting is not supported.

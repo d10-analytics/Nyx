@@ -199,5 +199,6 @@ Nyx itself does not launch agents or execute the work described by a specificati
 
 Nyx serves the board on the fixed loopback address without caller
 authentication, so other local accounts on the same host can read the catalog
-and workspace path and change board settings. The browser never edits
+and workspace path, change board settings, and change the active workspace's
+checkout folders and GitHub lookup. The browser never edits
 specification files; shared or remote hosting is not supported.

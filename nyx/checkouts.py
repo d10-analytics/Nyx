@@ -26,6 +26,16 @@ branch's own first-parent history never reads merged, because a branch pushed wi
 no commit of its own and a branch fast-forward merged cannot be told apart from a
 remote-tracking ref.
 
+On macOS the executable the system ``PATH`` names, ``/usr/bin/git``, is a
+Command Line Tools shim that fails with an ``xcrun`` error and raises the
+installer dialog on every start while the tools are missing. The collector
+therefore asks ``xcode-select -p`` before the first git start when git resolves
+to that system shim, under the caller's own environment and with the same
+per-call budget as a git call, and requires the reported developer directory to
+hold an existing ``usr/bin/git``; otherwise git reads ``missing`` and no git
+runs at all, so no dialog can appear. A git resolved anywhere else needs no
+check.
+
 The document records, beside those facts, the revision of the configuration the
 collection loaded (``null`` when no record was loaded) and the parent folders
 whose configuration would bring the packages' unseen ``Target repo:`` checkouts
@@ -219,6 +229,21 @@ def _resolve_program(stem: str) -> str | None:
     return None
 
 
+def developer_tools_probe(platform: str, git_executable: str) -> tuple[str, str] | None:
+    """Return the command that checks macOS developer tools, or ``None``.
+
+    On macOS the system ``git`` is a Command Line Tools shim, so a collection
+    must know the tools are usable before it starts it.  Only that system shim
+    needs the check: a git resolved anywhere else is a full installation.  The
+    decision reads no file and runs nothing, and it is called with the
+    *normalized* executable, so a ``PATH`` written as ``/usr//bin`` still
+    matches.
+    """
+    if platform == "darwin" and git_executable == "/usr/bin/git":
+        return ("/usr/bin/xcode-select", "-p")
+    return None
+
+
 def _start(command: Sequence[str], environment: Mapping[str, str], timeout: float) -> _Outcome:
     """Run one child with standard input closed, its output kept in temporary
     files, and a kill when ``timeout`` seconds pass."""
@@ -249,6 +274,29 @@ def _start(command: Sequence[str], environment: Mapping[str, str], timeout: floa
         out.seek(0)
         err.seek(0)
         return _Outcome(process.returncode, out.read(), err.read())
+
+
+def _developer_tools_usable(
+    probe: Sequence[str], deadline_ns: int, call_cap_seconds: float
+) -> bool:
+    """Whether the developer directory a probe reports holds a usable git.
+
+    The probe runs under the caller's environment, because the git runner's
+    filtered environment does not exist yet, and with the git runner's per-call
+    cap and the collection deadline.  A start failure, a non-zero exit or a
+    timed-out probe means the tools are not usable; so does a report that is
+    not an absolute developer directory, and one that does not hold
+    ``usr/bin/git``, because removing the tools can leave the selection in
+    place.
+    """
+    remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+    outcome = _start(probe, os.environ, min(call_cap_seconds, remaining))
+    if not outcome.ok:
+        return False
+    directory = _decode(outcome.out).strip()
+    if not os.path.isabs(directory):
+        return False
+    return os.path.isfile(os.path.join(directory, "usr", "bin", "git"))
 
 
 class _GitRunner:
@@ -4478,7 +4526,18 @@ def collect_checkouts(
 
     executable = _resolve_program("git")
     runner: _GitRunner | None = None
-    if executable is not None:
+    # The system git on macOS is a Command Line Tools shim: without the tools it
+    # fails and raises the installer dialog on every start. The normalized
+    # executable decides whether that check is needed, and it runs before any
+    # git child, so an unusable installation reads as missing git.
+    probe = (
+        developer_tools_probe(sys.platform, os.path.normpath(executable))
+        if executable is not None
+        else None
+    )
+    if executable is not None and (
+        probe is None or _developer_tools_usable(probe, deadline_ns, call_cap_seconds)
+    ):
         runner = _GitRunner(executable, deadline_ns, call_cap_seconds)
         version_outcome = runner.run(["--version"])
         version = _parse_version(version_outcome.out) if version_outcome.ok else None

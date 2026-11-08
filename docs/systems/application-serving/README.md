@@ -23,6 +23,18 @@ README is narrative only.
   `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`,
   and `POST /api/checkouts/remote-check` queues a networked check through
   `refresh_remote_checks()`. The standalone catalog server offers neither route.
+- Both hosts read and save the active workspace's checkout folder settings
+  through `ApplicationRuntime`: `GET`/`HEAD /api/checkout-settings` answers
+  exactly `{folders, github_lookup, revision}` from the captured configuration,
+  and `PUT` takes exactly `{revision, folders, github_lookup}`, applies the
+  collector's one folder rule to every folder the workspace's saved entry does
+  not already hold, answers 400 `invalid_checkout_folders` with every problem's
+  index and reason, and otherwise answers exactly `{folders, github_lookup,
+  revision, outcome}` with the board settings save's outcomes and status
+  mapping. An empty folder list removes the entry and answers `folders: []` and
+  `github_lookup: false`. Both routes share the board settings admission counter
+  and operation lock, they answer 503 `settings_unavailable` while admission is
+  closed, and the standalone catalog server answers 404.
 - A served document is refreshed in the background once
   `LOCAL_REFRESH_INTERVAL` (60 s) has passed since the start of the run that
   published it, or of the latest local run that failed, and a networked check is
@@ -31,10 +43,17 @@ README is narrative only.
   run queue runs one collection at a time with at most one waiting, and a run
   that publishes replaces the served document only if it started at the current
   change count. `mark_checkouts_changed()` increments that count and starts
-  nothing. Neither host calls it yet: it is the hook for a save of the checkout
-  inputs (the folder list and the GitHub switch). A board settings save does
-  not mark, because the next local refresh carries a changed stage within a
-  minute.
+  nothing; every successful checkout settings save calls it after the
+  replacement, so the next request waits for a networked collection of the new
+  folders, outside the five-minute cadence. A board settings save does not mark,
+  because the next local refresh carries a changed stage within a minute.
+- Board settings and checkout settings are saved through one private
+  compare-and-save core that runs, in order, the revision compare, the caller's
+  content check, the replacement, and the commit-verification reconciliation
+  with the caller's own holds-the-request test, all inside the settings
+  operation lock. Each save supplies its result shaper, so `/api/settings` keeps
+  its `{order, completed, revision, outcome}` body byte-identical while the
+  checkout save answers its own keys on every outcome.
 - Board settings are read from the held configuration, saved through
   `save_configuration_owned` after the revision check; `/api/workspace` is read-only.
 
@@ -52,6 +71,8 @@ README is narrative only.
 - Byte bound: see [catalog invariants](../catalog/README.md#cross-system-invariants);
   configuration writes: see
   [account-state invariants](../account-state/README.md#cross-system-invariants).
+- The checkout folder rule a settings save applies: see
+  [checkouts invariants](../checkouts/README.md#cross-system-invariants).
 
 ## Cross-system invariants
 
