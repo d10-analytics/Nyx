@@ -13,12 +13,21 @@ requests for one refresh interval, and a configuration change announced through
 served document.  Shutdown and start-failure cleanup close the queue first, so
 no run starts once cleanup begins: a queued run's waiters are answered as
 cancelled, and every started run thread is joined within the same deadline.
+
+The active workspace's checkout settings are read and saved beside the board
+settings through one compare-and-save core: the revision compare, the caller's
+content check, the replacement, and the commit-verification reconciliation.  A
+successful checkout settings save replaces the record, updates the captured
+configuration and then marks the checkout inputs changed, so the next request
+collects the new folders rather than answering from a document collected
+before them.
 """
 
 from __future__ import annotations
 
 import errno
 import http.client
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -26,10 +35,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import state
-from .models import Catalog, ProtocolError, parse_catalog, parse_checkouts
+from .models import Catalog, ProtocolError, _safe_text, parse_catalog, parse_checkouts
 from .server import (
     _CHECKOUTS_ERRORS,
     CatalogError,
+    InvalidCheckoutFolders,
     TrackerServer,
     _create_application_server,
 )
@@ -45,6 +55,50 @@ _LOCAL = "local"
 Deadline = float | Callable[[], float]
 ServerFactory = Callable[..., TrackerServer]
 ThreadFactory = Callable[..., threading.Thread]
+
+
+def _checkout_settings_request(
+    current: state.Configuration, folders: object, github_lookup: object
+) -> tuple[tuple[str, ...], bool]:
+    """Validate one submitted checkout settings request.
+
+    The request's shape is checked first, then every folder in submitted order:
+    text the rendered document can carry, then absoluteness, then normalization.
+    A normalized folder that is not already in the saved entry must answer the
+    collector's one folder status with ``ok``; a folder already saved is exempt,
+    so it keeps saving while its drive is unmounted and still lists as missing.
+    Duplicates collapse and the stored order is canonical.  Any problem refuses
+    the whole request with its submitted indexes.
+    """
+
+    if type(github_lookup) is not bool:
+        raise ValueError("checkout GitHub lookup must be a boolean")
+    if not isinstance(folders, list):
+        raise ValueError("checkout folders must be a list")
+    from .checkouts import folder_status
+
+    saved = set(current.checkout_folders)
+    stored: set[str] = set()
+    problems: list[dict[str, object]] = []
+    for index, folder in enumerate(folders):
+        if not _safe_text(folder):
+            problems.append({"index": index, "reason": "invalid_path"})
+            continue
+        if not os.path.isabs(folder):
+            problems.append({"index": index, "reason": "not_absolute"})
+            continue
+        path = os.path.normpath(folder)
+        if path not in saved:
+            status = folder_status(path)
+            if status != "ok":
+                problems.append({"index": index, "reason": status})
+                continue
+        stored.add(path)
+    if problems:
+        raise InvalidCheckoutFolders(problems)
+    if not stored:
+        return (), False
+    return tuple(sorted(stored)), github_lookup
 
 
 def _utc_timestamp(instant: float) -> str:
@@ -212,6 +266,84 @@ class ApplicationRuntime:
         finally:
             self._settings_release()
 
+    def get_checkout_settings(self) -> dict[str, object]:
+        """Return the active workspace's checkout folders, switch and revision."""
+
+        self._settings_admit()
+        try:
+            with self._settings_operation_lock:
+                configuration = self._configuration
+                if configuration is None:
+                    raise CatalogError("settings_unavailable")
+                return self._checkout_settings_body(configuration)
+        finally:
+            self._settings_release()
+
+    def _checkout_settings_body(
+        self, configuration: state.Configuration | None
+    ) -> dict[str, object]:
+        if configuration is None:
+            return {"folders": [], "github_lookup": False, "revision": None}
+        return {
+            "folders": list(configuration.checkout_folders),
+            "github_lookup": configuration.checkout_github_lookup,
+            "revision": configuration.revision,
+        }
+
+    def _checkout_settings_result(
+        self, configuration: state.Configuration | None, outcome: str
+    ) -> dict[str, object]:
+        return {**self._checkout_settings_body(configuration), "outcome": outcome}
+
+    def save_checkout_settings(
+        self, revision: object, folders: object, github_lookup: object
+    ) -> dict[str, object]:
+        """Compare and save the active workspace's checkout folders and switch.
+
+        A successful save replaces the record, updates the captured
+        configuration and then marks the checkout inputs changed, so the next
+        checkout request collects the new folders instead of answering from a
+        document collected before them.
+        """
+
+        def prepare(current: state.Configuration) -> tuple[tuple[str, ...], bool]:
+            return _checkout_settings_request(current, folders, github_lookup)
+
+        def write(
+            current: state.Configuration,
+            paths: state.StatePaths,
+            requested: tuple[tuple[str, ...], bool],
+        ) -> state.Configuration:
+            requested_folders, requested_lookup = requested
+            return state.save_configuration_owned(
+                current.specification_root,
+                paths=paths,
+                checkout_folders=requested_folders,
+                github_lookup=requested_lookup,
+            )
+
+        def holds(
+            reloaded: state.Configuration, requested: tuple[tuple[str, ...], bool]
+        ) -> bool:
+            requested_folders, requested_lookup = requested
+            entry = reloaded.checkout_settings.get(str(reloaded.specification_root))
+            if not requested_folders:
+                return entry is None
+            return (
+                entry is not None
+                and entry.folders == requested_folders
+                and entry.github_lookup is requested_lookup
+            )
+
+        return self._save_settings_change(
+            revision,
+            prepare=prepare,
+            write=write,
+            holds=holds,
+            shape=self._checkout_settings_result,
+            announce=self.mark_checkouts_changed,
+        )
+
     def save_settings(
         self, revision: str, order: object, completed: object = state._OMITTED
     ) -> dict[str, object]:
@@ -221,6 +353,64 @@ class ApplicationRuntime:
         A commit verification failure is immediately revalidated so callers can
         distinguish a successful requested write, a competing valid write, and
         an unreadable record without a rollback or recovery record.
+        """
+
+        def prepare(current: state.Configuration) -> object:
+            return (
+                current.completed_stage_names
+                if completed is state._OMITTED
+                else completed
+            )
+
+        def write(
+            current: state.Configuration, paths: state.StatePaths, requested_completed: object
+        ) -> state.Configuration:
+            return state.save_configuration_owned(
+                current.specification_root,
+                paths=paths,
+                stage_order=order,
+                completed_stage_names=requested_completed,
+            )
+
+        def holds(reloaded: state.Configuration, requested_completed: object) -> bool:
+            try:
+                requested = tuple(order)  # validation already happened before replacement
+            except TypeError:
+                requested = ()
+            try:
+                requested_completed_tuple = tuple(requested_completed)
+            except TypeError:
+                requested_completed_tuple = ()
+            return reloaded.stage_order == requested and reloaded.completed_stage_names == tuple(
+                sorted(requested_completed_tuple)
+            )
+
+        return self._save_settings_change(
+            revision,
+            prepare=prepare,
+            write=write,
+            holds=holds,
+            shape=self._settings_result,
+        )
+
+    def _save_settings_change(
+        self,
+        revision: object,
+        *,
+        prepare: Callable[[state.Configuration], Any],
+        write: Callable[[state.Configuration, state.StatePaths, Any], state.Configuration],
+        holds: Callable[[state.Configuration, Any], bool],
+        shape: Callable[[state.Configuration | None, str], dict[str, object]],
+        announce: Callable[[], None] | None = None,
+    ) -> dict[str, object]:
+        """Run one compare-and-save: revision, content check, write, reconcile.
+
+        The order is load-bearing.  A stale revision answers before the content
+        check, so a stale editor never receives a folder refusal the board
+        editor would not show; the check runs before the replacement, so a
+        refused request leaves the record byte-identical.  Both settings saves
+        share this mechanism, including the commit-verification reconciliation,
+        which asks the caller whether the reloaded record holds the request.
         """
 
         self._settings_admit()
@@ -233,65 +423,55 @@ class ApplicationRuntime:
                 if not isinstance(revision, str):
                     raise ValueError("settings revision must be text")
                 if revision != current.revision:
-                    return self._settings_result(current, "conflict")
-                requested_completed = (
-                    current.completed_stage_names
-                    if completed is state._OMITTED
-                    else completed
-                )
+                    return shape(current, "conflict")
+                requested = prepare(current)
                 try:
-                    committed = state.save_configuration_owned(
-                        current.specification_root,
-                        paths=paths,
-                        stage_order=order,
-                        completed_stage_names=requested_completed,
-                    )
+                    committed = write(current, paths, requested)
                 except (state.StageOrderError, state.CompletedStageError):
                     raise
                 except state.ConfigurationCommitVerificationError:
-                    return self._reconcile_settings_write(current, order, requested_completed)
+                    return self._reconcile_settings_write(
+                        current, requested, holds, shape, announce
+                    )
                 except state.ConfigurationError:
                     # A pre-replacement error leaves the old record in place.
                     try:
                         reloaded = state.revalidate_configuration(paths)
                     except state.StateError:
-                        return self._settings_result(None, "reload-needed", order=(), completed=())
+                        return shape(None, "reload-needed")
                     self._configuration = reloaded
-                    return self._settings_result(reloaded, "failure")
+                    return shape(reloaded, "failure")
                 self._configuration = committed
-                return self._settings_result(committed, "success")
+                if announce is not None:
+                    announce()
+                return shape(committed, "success")
         finally:
             self._settings_release()
 
     def _reconcile_settings_write(
         self,
         previous: state.Configuration,
-        requested_order: object,
-        requested_completed: object,
+        requested: Any,
+        holds: Callable[[state.Configuration, Any], bool],
+        shape: Callable[[state.Configuration | None, str], dict[str, object]],
+        announce: Callable[[], None] | None,
     ) -> dict[str, object]:
         paths = self._settings_paths
         if paths is None:
-            return self._settings_result(None, "reload-needed", order=(), completed=())
+            return shape(None, "reload-needed")
         try:
             reloaded = state.revalidate_configuration(paths)
         except state.StateError:
-            return self._settings_result(None, "reload-needed", order=(), completed=())
+            return shape(None, "reload-needed")
         self._configuration = reloaded
-        try:
-            requested = tuple(requested_order)  # validation already happened before replacement
-        except TypeError:
-            requested = ()
-        try:
-            requested_completed_tuple = tuple(requested_completed)
-        except TypeError:
-            requested_completed_tuple = ()
         if (
             reloaded.specification_root == previous.specification_root
-            and reloaded.stage_order == requested
-            and reloaded.completed_stage_names == tuple(sorted(requested_completed_tuple))
+            and holds(reloaded, requested)
         ):
-            return self._settings_result(reloaded, "success")
-        return self._settings_result(reloaded, "conflict")
+            if announce is not None:
+                announce()
+            return shape(reloaded, "success")
+        return shape(reloaded, "conflict")
 
     def mark_checkouts_changed(self) -> None:
         """Announce that the checkout inputs changed.

@@ -586,6 +586,32 @@ def _admits_checkout(path: str) -> bool:
     )
 
 
+def folder_status(path: str) -> str:
+    """Return one checkout folder's status without listing a child.
+
+    The answer is ``ok``, ``missing``, ``unreadable`` or ``not_directory``, the
+    same status ``_discover`` records for a configured folder, so a saved folder
+    and a listed one can never disagree.  It costs one ``stat`` and, for a
+    directory that opens, one ``scandir`` handle opened and closed without
+    reading a name; it runs no git and never looks inside the folder.
+    """
+
+    try:
+        details = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISDIR(details.st_mode):
+        return "not_directory"
+    try:
+        with os.scandir(path):
+            pass
+    except OSError:
+        return "unreadable"
+    return "ok"
+
+
 def _discover(folders: Iterable[str]) -> _Discovery:
     result = _Discovery()
     seen_real: set[str] = set()
@@ -600,24 +626,16 @@ def _discover(folders: Iterable[str]) -> _Discovery:
         if not _representable(folder):
             result.diagnostics.append({"code": "unrepresentable_path", "path": None})
             continue
-        try:
-            details = os.stat(folder)
-        except (FileNotFoundError, NotADirectoryError):
-            result.folders.append({"path": folder, "status": "missing"})
-            continue
-        except OSError:
-            result.folders.append({"path": folder, "status": "unreadable"})
-            continue
-        if not stat.S_ISDIR(details.st_mode):
-            result.folders.append({"path": folder, "status": "not_directory"})
+        status = folder_status(folder)
+        result.folders.append({"path": folder, "status": status})
+        if status != "ok":
             continue
         try:
             with os.scandir(folder) as scan:
                 names = sorted(entry.name for entry in scan)
         except OSError:
-            result.folders.append({"path": folder, "status": "unreadable"})
+            result.folders[-1]["status"] = "unreadable"
             continue
-        result.folders.append({"path": folder, "status": "ok"})
         if _has_git_entry(folder):
             add(folder, None)
         for name in names:
