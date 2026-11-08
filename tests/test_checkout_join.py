@@ -6937,6 +6937,44 @@ def test_folder_suggestions_name_the_parents_that_would_reveal_unseen_checkouts(
     assert gone["folder_suggestions"] == []
 
 
+def test_a_configured_folder_that_is_itself_a_checkout_is_never_suggested(tmp_path):
+    """Discovery admits a configured clone itself, so its parent is no suggestion."""
+    remote = make_remote(tmp_path)
+    configured = clone(remote, tmp_path / "G")
+    root = tmp_path / "spec"
+    make_package(root, "Drafts", "g", f"Target repo: {configured}\n")
+
+    document = collect_packages([configured], root)
+
+    assert resolve(document)["g"]["status"] == "clone"
+    assert document["folders"] == [{"path": str(configured), "status": "ok"}]
+    assert document["folder_suggestions"] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX permission bits")
+def test_a_configured_parent_discovery_could_not_list_is_never_suggested(tmp_path):
+    """A readable folder is suggested only when no configured folder is its parent."""
+    remote = make_remote(tmp_path)
+    configured = tmp_path / "G"
+    configured.mkdir()
+    clone(remote, configured / "c")
+    root = tmp_path / "spec"
+    make_package(root, "Drafts", "g", f"Target repo: {configured / 'c'}\n")
+    # Traversal stays possible, so the target is still a checkout, but discovery
+    # cannot list the folder's children and admits none of them.
+    configured.chmod(0o311)
+    try:
+        if os.access(configured, os.R_OK):  # a user that ignores permission bits
+            pytest.skip("file permissions are not enforced for this user")
+        document = collect_packages([configured], root)
+    finally:
+        configured.chmod(0o755)
+
+    assert document["folders"] == [{"path": str(configured), "status": "unreadable"}]
+    assert resolve(document)["g"]["status"] == "outside_folders"
+    assert document["folder_suggestions"] == []
+
+
 def suggestions_document(tmp_path: Path) -> dict[str, Any]:
     """A collected document whose suggestions name two unconfigured folders."""
     remote = make_remote(tmp_path)
