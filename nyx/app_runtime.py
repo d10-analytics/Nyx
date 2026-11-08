@@ -75,6 +75,8 @@ def _checkout_settings_request(
         raise ValueError("checkout GitHub lookup must be a boolean")
     if not isinstance(folders, list):
         raise ValueError("checkout folders must be a list")
+    # The collector is imported by the save path, not at service start, so a
+    # settings save pays for it only when a submitted folder needs its rule.
     from .checkouts import folder_status
 
     saved = set(current.checkout_folders)
@@ -215,20 +217,15 @@ class ApplicationRuntime:
             self._settings_condition.notify_all()
 
     def _settings_result(
-        self,
-        configuration: state.Configuration | None,
-        outcome: str,
-        *,
-        order: tuple[str, ...] | None = None,
-        completed: tuple[str, ...] | None = None,
+        self, configuration: state.Configuration | None, outcome: str
     ) -> dict[str, object]:
-        if order is None:
-            order = () if configuration is None else configuration.stage_order
-        if completed is None:
-            completed = () if configuration is None else configuration.completed_stage_names
+        """The board settings body, unchanged for every outcome."""
+
         return {
-            "order": list(order),
-            "completed": list(completed),
+            "order": [] if configuration is None else list(configuration.stage_order),
+            "completed": (
+                [] if configuration is None else list(configuration.completed_stage_names)
+            ),
             "revision": None if configuration is None else configuration.revision,
             "outcome": outcome,
         }
@@ -282,6 +279,8 @@ class ApplicationRuntime:
     def _checkout_settings_body(
         self, configuration: state.Configuration | None
     ) -> dict[str, object]:
+        """The checkout settings body every read and every outcome answers."""
+
         if configuration is None:
             return {"folders": [], "github_lookup": False, "revision": None}
         return {
@@ -293,6 +292,8 @@ class ApplicationRuntime:
     def _checkout_settings_result(
         self, configuration: state.Configuration | None, outcome: str
     ) -> dict[str, object]:
+        """The checkout settings body plus the save's outcome."""
+
         return {**self._checkout_settings_body(configuration), "outcome": outcome}
 
     def save_checkout_settings(
