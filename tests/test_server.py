@@ -1591,11 +1591,12 @@ def test_checkout_settings_put_refuses_an_invalid_shape_without_touching_the_rec
             assert json.loads(response) == {"error": "invalid_payload"}
 
             # With the whole body actually sent, the refusal is the same, but the
-            # answer is not guaranteed to arrive: the server answers and closes
-            # while the client is still uploading, so the kernel may reset the
-            # socket and the received bytes are then empty.  Only the effect
-            # belongs to the platform contract, so assert the bytes when they
-            # arrived and the unchanged record either way.
+            # answer is not guaranteed to arrive whole: the server answers and
+            # closes while the client is still uploading, so the kernel may reset
+            # the socket and the received bytes are then empty, or headers with a
+            # body cut off.  Only the effect belongs to the platform contract, so
+            # a partly received answer is checked by its status line alone; the
+            # header-only request above proves the exact body.
             too_long = json.dumps(
                 {"revision": revision, "folders": [str(folder)], "github_lookup": False}
             ) + " " * (1024 * 1024)
@@ -1610,10 +1611,7 @@ def test_checkout_settings_put_refuses_an_invalid_shape_without_touching_the_rec
                 ),
             )
             if data:
-                head, separator, response = data.partition(b"\r\n\r\n")
                 assert data.startswith(b"HTTP/1.1 400")
-                if separator:
-                    assert json.loads(response) == {"error": "invalid_payload"}
         assert paths.config_file.read_bytes() == before
 
 
