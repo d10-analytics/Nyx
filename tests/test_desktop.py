@@ -4432,6 +4432,86 @@ def test_active_workspace_switch_real_settings_endpoint_restores_each_root_order
                 session.close()
 
 
+def test_desktop_runtime_serves_and_saves_the_active_checkout_settings():
+    port = runtime.PORT
+
+    def request_checkout_settings(method="GET", payload=None):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            body = None if payload is None else json.dumps(payload).encode()
+            headers = {"Host": f"127.0.0.1:{port}"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = str(len(body))
+            connection.request(
+                method, "/api/checkout-settings", body=body, headers=headers
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        home = _home(root)
+        workspace = _workspace(root, "workspace")
+        checkouts_folder = workspace / "repositories"
+        checkouts_folder.mkdir()
+        with (
+            _home_patches(home)[0],
+            patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}),
+        ):
+            state.setup(workspace)
+            session = desktop.DesktopSession()
+            application = None
+            try:
+                application = session.start_runtime()
+                # The session's own runtime answers the read with its claims held.
+                assert session.claims.held
+                status, listed = request_checkout_settings()
+                assert status == 200
+                assert listed["folders"] == []
+                assert listed["github_lookup"] is False
+                assert isinstance(listed["revision"], str)
+
+                saved_status, saved = request_checkout_settings(
+                    "PUT",
+                    {
+                        "revision": listed["revision"],
+                        "folders": [str(checkouts_folder)],
+                        "github_lookup": True,
+                    },
+                )
+                assert saved_status == 200
+                assert saved["outcome"] == "success"
+                assert saved["folders"] == [str(checkouts_folder)]
+                assert saved["github_lookup"] is True
+                assert saved["revision"] != listed["revision"]
+                assert session.claims.held
+
+                # The record now holds the entry, under the reported revision,
+                # and the runtime reads the new captured configuration back.
+                configuration = state.load_configuration()
+                entry = configuration.checkout_settings[str(workspace.resolve())]
+                assert entry.folders == (str(checkouts_folder),)
+                assert entry.github_lookup is True
+                assert configuration.revision == saved["revision"]
+                status, reloaded = request_checkout_settings()
+                assert status == 200
+                assert reloaded == {
+                    "folders": saved["folders"],
+                    "github_lookup": saved["github_lookup"],
+                    "revision": saved["revision"],
+                }
+            finally:
+                session.close()
+
+    # The close released the session's claims and stopped its workers.
+    assert not session.claims.held
+    assert application is not None
+    assert application.workers.active_count == 0
+
+
 def test_active_switch_postcommit_verification_failure_preserves_b_on_quit():
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
