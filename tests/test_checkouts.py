@@ -1061,6 +1061,134 @@ def test_linked_worktree_git_refuses_for_ownership_is_marked(
 
 
 # ---------------------------------------------------------------------------
+# macOS developer tools are checked before the first git start
+# ---------------------------------------------------------------------------
+
+# The recording git stand-in is a shell script, while Windows searches only
+# for ``git.exe`` (``_resolve_program``), so the stand-in cannot answer there.
+MACOS_TOOLS_SHIM_REASON = (
+    "a shell-script git shim cannot stand in for git.exe, the only executable "
+    "Windows searches for"
+)
+
+
+def recorded_starts(log: Path) -> list[str]:
+    """The starts a recording stand-in wrote, empty when it never ran."""
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def recording_git(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+    """Put a recording git shim on PATH in the ``git_shim`` pattern.
+
+    The shim appends each start to the log and then runs the real git, so a
+    collection that starts git leaves a record.  It is installed after the test
+    builds its world, so the log holds only the collection's own starts.  The
+    shim and its log are returned.
+    """
+    log = tmp_path / "shim.log"
+    real_git = shutil.which("git")
+    shim = marker_script(
+        tmp_path / "shim-bin", "git", log, f'exec "{real_git}" "$@"'
+    )
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+    return shim, log
+
+
+def test_the_developer_tools_check_names_only_the_macos_system_git():
+    assert checkouts.developer_tools_probe("darwin", "/usr/bin/git") == (
+        "/usr/bin/xcode-select",
+        "-p",
+    )
+    assert checkouts.developer_tools_probe("darwin", "/opt/homebrew/bin/git") is None
+    assert checkouts.developer_tools_probe("linux", "/usr/bin/git") is None
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason=MACOS_TOOLS_SHIM_REASON)
+@pytest.mark.parametrize("probe_result", ["fails", "empty", "ready"])
+def test_the_developer_tools_check_decides_before_any_git_starts(
+    tmp_path, monkeypatch, probe_result
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = clone(remote, folder / "work")
+    developer = tmp_path / "developer"
+    developer.mkdir()
+    report = f'printf "%s\\n" "{developer}"'
+    if probe_result == "ready":
+        (developer / "usr" / "bin").mkdir(parents=True)
+        (developer / "usr" / "bin" / "git").write_bytes(b"")
+    probe_marker = tmp_path / "probe-started.log"
+    then = "exit 1" if probe_result == "fails" else report
+    probe = marker_script(tmp_path / "probe-bin", "probe", probe_marker, then)
+    recorded: list[tuple[str, str]] = []
+
+    def recording_probe(platform: str, executable: str):
+        recorded.append((platform, executable))
+        return (str(probe),)
+
+    monkeypatch.setattr(checkouts, "developer_tools_probe", recording_probe)
+    shim, git_log = recording_git(tmp_path, monkeypatch)
+    shim_git = os.path.normpath(str(shim))
+
+    document = collect([folder])
+
+    # The probe is not git: its own start is a separate record, and it ran once.
+    assert recorded_starts(probe_marker) == ["ran"], probe_result
+    assert recorded == [(sys.platform, shim_git)], probe_result
+    if probe_result == "ready":
+        assert recorded_starts(git_log), "the shim should record the git starts"
+        assert document["git"] == {
+            "status": "available",
+            "version": real_git_version(),
+        }
+        assert find_clone(document, work)["status"] == "ok"
+    else:
+        # The decision is taken before any git start, so the shim never ran.
+        assert recorded_starts(git_log) == [], probe_result
+        assert document["git"] == {"status": "missing", "version": None}
+        assert document["repositories"] == []
+
+
+@pytest.mark.skipif(ON_WINDOWS, reason=MACOS_TOOLS_SHIM_REASON)
+def test_the_developer_tools_check_receives_the_normalized_git_executable(
+    tmp_path, monkeypatch
+):
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    work = clone(remote, folder / "work")
+    developer = tmp_path / "developer"
+    (developer / "usr" / "bin").mkdir(parents=True)
+    (developer / "usr" / "bin" / "git").write_bytes(b"")
+    probe = marker_script(
+        tmp_path / "probe-bin", "probe", tmp_path / "probe-started.log",
+        f'printf "%s\\n" "{developer}"',
+    )
+    recorded: list[tuple[str, str]] = []
+
+    def recording_probe(platform: str, executable: str):
+        recorded.append((platform, executable))
+        return (str(probe),)
+
+    monkeypatch.setattr(checkouts, "developer_tools_probe", recording_probe)
+    shim, _git_log = recording_git(tmp_path, monkeypatch)
+    shim_git = os.path.normpath(str(shim))
+    # The shim's directory is named in PATH with a doubled separator, so the
+    # executable resolved from it carries the doubled spelling until the
+    # collector normalizes it before asking which check applies.
+    doubled_entry = f"{shim.parent}{os.sep}{os.sep}"
+    assert os.path.join(doubled_entry, "git") != shim_git, "control: the separator is doubled"
+    monkeypatch.setenv("PATH", f"{doubled_entry}{os.pathsep}{os.environ['PATH']}")
+
+    document = collect([folder])
+
+    assert recorded == [(sys.platform, shim_git)]
+    assert document["git"]["status"] == "available"
+    assert find_clone(document, work)["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
 # AC-07 cached default branch, comparisons and freshness
 # ---------------------------------------------------------------------------
 
@@ -2876,7 +3004,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 8
+    assert document["schema_version"] == 9
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3473,7 +3601,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 8
+    assert first["schema_version"] == 9
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7272,7 +7400,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 8 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 9 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):

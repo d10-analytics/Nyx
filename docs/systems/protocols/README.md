@@ -6,6 +6,12 @@ README is narrative only.
 ## Responsibilities
 
 - Typed validation of catalog and checkout documents.
+- The checkout document is schema 9, and its two whole-document fields are part
+  of the digest: `configuration_revision` is `null` or one lowercase
+  64-character SHA-256 digest, and `folder_suggestions` holds entries of exactly
+  `{path, package_count}` whose paths are absolute, strictly increasing in
+  natural path order, never a configured folder, and whose counts are at least
+  one package each; the list is empty while the package scan is unavailable.
 - The canonical digest helper and the sort keys.
 - The schema constants that `catalog` and `checkouts` import, and the field
   limits `catalog` imports.

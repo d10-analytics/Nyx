@@ -49,6 +49,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
 )
 
 from nyx import checkout_join, checkouts, cli, models
+from nyx import state as nyx_state
 
 ID_A = "11111111-1111-4111-8111-111111111111"
 ID_B = "22222222-2222-4222-8222-222222222222"
@@ -4540,13 +4541,13 @@ def give_no_commits(name: str):
     return change
 
 
-def test_schema_8_is_accepted_schema_7_refused_and_no_commits_yet_is_strict(status_document):
+def test_schema_9_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(status_document):
     """One collection serves every proof: each case mutates its own copy."""
-    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 8
-    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 8
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 9
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 9
 
     old = doc_copy(status_document)
-    old["schema_version"] = 7
+    old["schema_version"] = 8
     assert refusal_of(old) == "unsupported schema version"
 
     document = doc_copy(status_document)
@@ -6803,3 +6804,369 @@ def test_a_free_rank_counts_within_its_own_repository(world_w):
     assert [element(name) for name in ("C", "D", "B", "E", "L")] == [
         "free 1", "free 2", "free 3", "free 4", "free 1",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Folder suggestions and the configuration revision
+# ---------------------------------------------------------------------------
+
+# A digest-shaped value: the document records the revision its caller loaded.
+REVISION = "0123456789abcdef" * 4
+
+
+def suggestion_world(tmp_path: Path) -> dict[str, Path]:
+    """Real checkouts around a configured folder, and packages naming each case.
+
+    ``F`` is the configured folder: it holds a clone, a linked worktree of that
+    clone, and a clone two levels down. ``P1``, ``P2`` and ``P5`` hold
+    unconfigured clones, ``P3`` holds a link to ``P1``'s clone, ``P4`` holds a
+    directory that is no checkout, and ``L5`` is a link to ``P5``.
+    """
+    base = tmp_path / "suggest"
+    base.mkdir()
+    remote = make_remote(base)
+    folder = base / "F"
+    folder.mkdir()
+    child = clone(remote, folder / "child")
+    worktree = folder / "wt"
+    git(child, "worktree", "add", "-q", "-b", "wt", str(worktree), "trunk")
+    inner = clone(remote, folder / "x" / "inner")
+    first = base / "P1"
+    first_clone = clone(remote, first / "c")
+    second = base / "P2"
+    second_clone = clone(remote, second / "c")
+    shared = base / "P5"
+    shared_clone = clone(remote, shared / "c")
+    spelling = base / "L5"
+    spelling.symlink_to(shared, target_is_directory=True)
+    linked = base / "P3"
+    linked.mkdir()
+    (linked / "link").symlink_to(first_clone, target_is_directory=True)
+    plain = base / "P4"
+    plain.mkdir()
+    (plain / "plain").mkdir()
+    root = base / "spec"
+    for stage, name, target in (
+        ("Drafts", "alpha", str(first_clone)),
+        ("Shipped", "beta", str(first_clone)),
+        ("Drafts", "gamma", str(second_clone)),
+        ("Drafts", "delta", str(folder / "absent")),
+        ("Drafts", "epsilon", str(plain / "plain")),
+        ("Drafts", "zeta", "relative/repo"),
+        ("Drafts", "eta", str(worktree)),
+        ("Drafts", "theta", str(inner)),
+        ("Drafts", "iota", str(child)),
+        ("Drafts", "kappa", str(linked / "link")),
+        ("Drafts", "lambda", str(spelling / "c")),
+        ("Drafts", "mu", str(shared_clone)),
+    ):
+        make_package(root, stage, name, f"Target repo: {target}\n")
+    return {
+        "folder": folder,
+        "child": child,
+        "worktree": worktree,
+        "inner": inner,
+        "first": first,
+        "second": second,
+        "shared": shared,
+        "spelling": spelling,
+        "linked": linked,
+        "plain": plain,
+        "root": root,
+    }
+
+
+def test_folder_suggestions_name_the_parents_that_would_reveal_unseen_checkouts(tmp_path):
+    world = suggestion_world(tmp_path)
+    folder, root = world["folder"], world["root"]
+    # ``L5`` is the spelling of the first of the two packages naming one clone
+    # through two spellings of its parent, in package-path order.
+    expected = [
+        {"path": str(folder / "x"), "package_count": 1},
+        {"path": str(world["spelling"]), "package_count": 2},
+        {"path": str(world["first"]), "package_count": 2},
+        {"path": str(world["second"]), "package_count": 1},
+    ]
+
+    document = collect_packages(
+        [folder], root, ("Shipped",), configuration_revision=REVISION
+    )
+
+    # The world is what the rule is asked about: the immediate child and the
+    # linked worktree are revealed, the nested and outside checkouts are not.
+    by_name = resolve(document)
+    assert (by_name["iota"]["status"], by_name["eta"]["status"]) == ("clone", "worktree")
+    assert by_name["theta"]["status"] == "outside_folders"
+    assert by_name["delta"]["status"] == "missing"
+    assert by_name["kappa"]["status"] == "outside_folders"
+    assert document["configuration_revision"] == REVISION
+    assert document["folder_suggestions"] == expected
+
+    configured = collect_packages(
+        [folder, world["first"]], root, ("Shipped",), configuration_revision=REVISION
+    )
+    assert configured["folder_suggestions"] == [
+        {"path": str(folder / "x"), "package_count": 1},
+        {"path": str(world["spelling"]), "package_count": 2},
+        {"path": str(world["second"]), "package_count": 1},
+    ]
+
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("PATH", str(empty))
+        without_git = collect_packages(
+            [folder], root, ("Shipped",), configuration_revision=REVISION
+        )
+
+    assert without_git["git"]["status"] == "missing"
+    assert without_git["folder_suggestions"] == document["folder_suggestions"]
+
+    folderless = collect_packages(
+        [], root, ("Shipped",), configuration_revision=REVISION
+    )
+    assert folderless["folder_suggestions"] == [
+        {"path": str(folder), "package_count": 2},
+        *expected,
+    ]
+
+    shutil.rmtree(root)
+    gone = collect_packages([folder], root, ("Shipped",))
+
+    assert gone["package_scan"]["status"] == "unavailable"
+    assert gone["folder_suggestions"] == []
+
+
+def test_a_configured_folder_that_is_itself_a_checkout_is_never_suggested(tmp_path):
+    """Discovery admits a configured clone itself, so its parent is no suggestion."""
+    remote = make_remote(tmp_path)
+    configured = clone(remote, tmp_path / "G")
+    root = tmp_path / "spec"
+    make_package(root, "Drafts", "g", f"Target repo: {configured}\n")
+
+    document = collect_packages([configured], root)
+
+    assert resolve(document)["g"]["status"] == "clone"
+    assert document["folders"] == [{"path": str(configured), "status": "ok"}]
+    assert document["folder_suggestions"] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX permission bits")
+def test_a_configured_parent_discovery_could_not_list_is_never_suggested(tmp_path):
+    """A readable folder is suggested only when no configured folder is its parent."""
+    remote = make_remote(tmp_path)
+    configured = tmp_path / "G"
+    configured.mkdir()
+    clone(remote, configured / "c")
+    root = tmp_path / "spec"
+    make_package(root, "Drafts", "g", f"Target repo: {configured / 'c'}\n")
+    # Traversal stays possible, so the target is still a checkout, but discovery
+    # cannot list the folder's children and admits none of them.
+    configured.chmod(0o311)
+    try:
+        if os.access(configured, os.R_OK):  # a user that ignores permission bits
+            pytest.skip("file permissions are not enforced for this user")
+        document = collect_packages([configured], root)
+    finally:
+        configured.chmod(0o755)
+
+    assert document["folders"] == [{"path": str(configured), "status": "unreadable"}]
+    assert resolve(document)["g"]["status"] == "outside_folders"
+    assert document["folder_suggestions"] == []
+
+
+@posix_only
+def test_the_folder_suggestions_never_name_a_filesystem_root():
+    """A target directly under ``/`` names the root as its parent, no suggestion."""
+    under_root = checkout_join.SuggestionFacts(
+        path="/srv",
+        key=("id", 1, 2),
+        admitted=False,
+        accepted=True,
+        parent="/",
+        parent_key=("id", 1, 3),
+    )
+    ordinary = checkout_join.SuggestionFacts(
+        path="/srv/app",
+        key=("id", 1, 4),
+        admitted=False,
+        accepted=True,
+        parent="/srv",
+        parent_key=("id", 1, 2),
+    )
+
+    assert checkout_join.folder_suggestions([under_root], frozenset()) == []
+    assert checkout_join.folder_suggestions([ordinary], frozenset()) == [
+        {"path": "/srv", "package_count": 1}
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs a Windows drive root")
+def test_the_folder_suggestions_never_name_a_drive_root():
+    """A target directly under a drive root names it as its parent, no suggestion."""
+    under_root = checkout_join.SuggestionFacts(
+        path="D:\\work",
+        key=("id", 1, 2),
+        admitted=False,
+        accepted=True,
+        parent="D:\\",
+        parent_key=("id", 1, 3),
+    )
+    ordinary = checkout_join.SuggestionFacts(
+        path="D:\\work\\repo",
+        key=("id", 1, 4),
+        admitted=False,
+        accepted=True,
+        parent="D:\\work",
+        parent_key=("id", 1, 2),
+    )
+
+    assert checkout_join.folder_suggestions([under_root], frozenset()) == []
+    assert checkout_join.folder_suggestions([ordinary], frozenset()) == [
+        {"path": "D:\\work", "package_count": 1}
+    ]
+
+
+def suggestions_document(tmp_path: Path) -> dict[str, Any]:
+    """A collected document whose suggestions name two unconfigured folders."""
+    remote = make_remote(tmp_path)
+    folder = tmp_path / "F"
+    folder.mkdir()
+    root = tmp_path / "spec"
+    make_package(
+        root, "Drafts", "a", f"Target repo: {clone(remote, tmp_path / 'P1' / 'c')}\n"
+    )
+    make_package(
+        root, "Drafts", "b", f"Target repo: {clone(remote, tmp_path / 'P2' / 'c')}\n"
+    )
+
+    document = collect_packages([folder], root)
+
+    assert document["configuration_revision"] is None
+    assert document["folder_suggestions"] == [
+        {"path": str(tmp_path / "P1"), "package_count": 1},
+        {"path": str(tmp_path / "P2"), "package_count": 1},
+    ]
+    return document
+
+
+def test_the_parser_enforces_every_folder_suggestion_invariant(tmp_path):
+    document = suggestions_document(tmp_path)
+    assert models.parse_checkouts(json.dumps(document))
+    configured = document["folders"][0]["path"]
+
+    def entry(broken: dict[str, Any]) -> dict[str, Any]:
+        return broken["folder_suggestions"][0]
+
+    cases = {
+        "unsorted": (
+            lambda broken: broken["folder_suggestions"].reverse(),
+            "folder_suggestions must be unique and in canonical order",
+        ),
+        "duplicated": (
+            lambda broken: broken["folder_suggestions"].append(entry(broken)),
+            "folder_suggestions must be unique and in canonical order",
+        ),
+        "configured": (
+            lambda broken: entry(broken).update(path=configured),
+            "folder_suggestions[0].path names a configured folder",
+        ),
+        "configured through another spelling": (
+            lambda broken: entry(broken).update(path=configured + os.sep),
+            "folder_suggestions[0].path names a configured folder",
+        ),
+        "count zero": (
+            lambda broken: entry(broken).update(package_count=0),
+            "folder_suggestions[0].package_count must be a positive integer",
+        ),
+        "count text": (
+            lambda broken: entry(broken).update(package_count="2"),
+            "folder_suggestions[0].package_count must be a positive integer",
+        ),
+        "relative": (
+            lambda broken: entry(broken).update(path="P1"),
+            "folder_suggestions[0].path must be absolute",
+        ),
+        "control character": (
+            lambda broken: entry(broken).update(path=entry(broken)["path"] + "\x01"),
+            "folder_suggestions[0].path must be safe text",
+        ),
+        "extra key": (
+            lambda broken: entry(broken).update(status="ok"),
+            "folder_suggestions[0] has an invalid shape",
+        ),
+        "missing key": (
+            lambda broken: entry(broken).pop("package_count"),
+            "folder_suggestions[0] has an invalid shape",
+        ),
+    }
+    for case, (change, message) in cases.items():
+        refusal = reference_mutation(document, change)
+        assert message in refusal, (case, refusal)
+
+    unavailable = doc_copy(document)
+    unavailable["package_scan"]["status"] = "unavailable"
+    assert "folder_suggestions must be empty when the package scan is unavailable" in (
+        refusal_of(unavailable)
+    )
+
+
+def test_the_parser_refuses_either_new_field_without_a_recomputed_digest(tmp_path):
+    document = suggestions_document(tmp_path)
+
+    def refusal_of_stale(change) -> str:
+        broken = doc_copy(document)
+        change(broken)
+        with pytest.raises(models.ProtocolError) as error:
+            models.parse_checkouts(broken)
+        return str(error.value)
+
+    assert refusal_of_stale(
+        lambda broken: broken.update(configuration_revision="f" * 64)
+    ) == "checkouts digest mismatch"
+    assert refusal_of_stale(
+        lambda broken: broken["folder_suggestions"][0].update(package_count=2)
+    ) == "checkouts digest mismatch"
+
+
+def test_the_parser_pins_the_configuration_revision_shape(tmp_path):
+    document = suggestions_document(tmp_path)
+    assert models.parse_checkouts(json.dumps(document))["configuration_revision"] is None
+
+    for revision in ("A" * 64, "0" * 63, "g" * 64, "", 7):
+        broken = doc_copy(document)
+        broken["configuration_revision"] = revision
+        assert "configuration_revision must be null or a lowercase SHA-256 digest" in (
+            refusal_of(broken)
+        ), revision
+
+    accepted = doc_copy(document)
+    accepted["configuration_revision"] = REVISION
+    assert models.parse_checkouts(redigest(accepted))["configuration_revision"] == REVISION
+
+
+def test_collection_inputs_carry_the_loaded_configuration_revision(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    root = tmp_path / "spec"
+    root.mkdir()
+    observation = nyx_state.ConfigurationObservation(
+        "configured",
+        specification_root=root,
+        checkout_settings={str(root): nyx_state.CheckoutSettings((str(folder),), False)},
+    )
+
+    inputs = checkouts.collection_inputs(observation)
+
+    assert inputs is not None
+    assert inputs.configuration_revision == observation.configuration.revision
+    assert inputs.configuration_revision == nyx_state.configuration_revision(
+        observation.configuration
+    )
+    absent = checkouts.collection_inputs(
+        nyx_state.ConfigurationObservation("not_configured")
+    )
+    assert absent == checkouts.CollectionInputs(
+        folders=(), github_lookup=False, package_scan=None
+    )
+    assert absent.configuration_revision is None

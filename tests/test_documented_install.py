@@ -292,6 +292,19 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The command is read-only",
         "writes no alternates file and never fetches",
         "Checkout folders are set per workspace",
+        "The `--json` document records the revision of the configuration the collection "
+        "loaded as `configuration_revision`, or `null` when no record was loaded",
+        "It also lists, under `folder_suggestions`, the parent folders whose configuration "
+        "would bring a package's unseen `Target repo:` checkout into view",
+        "each entry gives the folder's `path` and its `package_count`, the number of "
+        "packages that one folder would reveal",
+        "A package contributes its parent only when discovery would accept its target as a "
+        "checkout (a directory holding a `.git` entry, not a link), no configured folder "
+        "already reveals it, and the parent is neither the filesystem root nor already "
+        "configured",
+        "The entries are in natural path order",
+        "The list is empty when the package scan is unavailable, and it is read from the "
+        "filesystem alone, so git's availability cannot change it",
         "A settings editor arrives with the Checkouts view",
         "cannot be combined with `--setup`, `--stop` or `--status`",
         "exits 1 with one line only when the configuration is unavailable, the document "
@@ -519,10 +532,22 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the document's `observed_at` is that collection's time",
         "a `recorded` value keeps the time of the check it came from",
         "Once a document exists, a request is answered at once from it",
+        # A checkout settings save is the one exception to the answer-at-once
+        # rule, and it makes a networked check due outside the five-minute
+        # cadence.
+        "The exception is the first request after a checkout settings save",
+        "the served document was collected under the folders and GitHub lookup from before "
+        "the save",
+        "that request waits for a collection that reads the new settings, and the check it "
+        "waits on is a networked one",
         "refreshes the served answer in the background about once a minute",
         "starts a networked check when none has started in this runtime or when five "
         "minutes have passed since the last one started",
         "so checks run at most every five minutes",
+        "A checkout settings save also makes the next check due at once, outside that "
+        "five-minute cadence",
+        "the collection that follows a save can start sooner than five minutes after the "
+        "previous check",
         "while nothing requests checkout data, Nyx makes no network call",
         "One collection runs at a time, and at most one waits",
         "a request that needs a document while one runs shares that collection instead "
@@ -1216,11 +1241,127 @@ def test_documents_state_the_loopback_exposure_without_caller_authentication():
     readme = _normalized("README.md")
     assert "The browser is read-only;" not in readme
     assert "without caller authentication, so other local accounts on the same host" in readme
+    # The checkout folder settings are writable over the same loopback address,
+    # so every exposure statement names them beside the board settings.
+    assert "change board settings" in readme
+    assert "change the active workspace's checkout folders and GitHub lookup" in readme
     assert "The browser never edits specification files" in readme
     for heading in ("### Desktop limits", "## If something looks wrong\n"):
         section = _section("docs/running-nyx.md", heading)
         assert "without caller authentication, so other local accounts on the same host" in section, heading
         assert "change board settings" in section, heading
+        assert "change the active workspace's checkout folders and GitHub lookup" in section, heading
+
+
+def test_desktop_guide_states_the_macos_command_line_tools_requirement():
+    section = _section("docs/running-nyx.md", "### Desktop limits")
+    for marker in (
+        "an application opened from Finder searches the fixed `PATH` macOS gives it, "
+        "`/usr/bin:/bin:/usr/sbin:/sbin`, where `git` is a Command Line Tools placeholder",
+        "the collection checks the developer tools before it starts that `git`",
+        "so without them its checkout document reports `git missing` and lists no checkout "
+        "instead of raising the installer prompt on every refresh",
+        "Install the Command Line Tools with `xcode-select --install`",
+        "start the application from an environment whose `PATH` names a complete `git`",
+    ):
+        assert marker in section, marker
+
+
+def test_the_checkout_guide_promises_no_folder_editor():
+    guide = _normalized("docs/running-nyx.md")
+    assert (
+        "A settings editor arrives with the Checkouts view; until then the record is "
+        "edited by hand"
+    ) in guide
+    assert "**Checkout settings**" not in guide
+    for promise in ("checkout settings editor", "folder editor", "edit your checkout folders"):
+        assert promise not in guide.lower(), promise
+    # The workspace guide keeps its own hand-edit instruction and its own
+    # statement that the editor has not arrived.
+    workspaces = _normalized("docs/workspaces.md")
+    assert "The settings editor that arrives with the Checkouts view will set it" in workspaces
+
+
+def test_checkout_system_readme_states_the_developer_tools_check():
+    readme = _normalized("docs/systems/checkouts/README.md")
+    for marker in (
+        "checks the developer tools before the first git child",
+        "the pure `developer_tools_probe(platform, git_executable)` decides whether a check "
+        "is needed, its caller passes the normalized executable",
+        "the developer directory the check reports must hold `usr/bin/git`",
+        "Without that, git reads `missing`, no version and no repository, and no git runs "
+        "at all",
+        "a git resolved anywhere else needs no check",
+    ):
+        assert marker in readme, marker
+
+
+def test_checkout_system_readme_states_the_folder_rule_and_the_suggestion_rule():
+    readme = _normalized("docs/systems/checkouts/README.md")
+    for marker in (
+        "`folder_status(path)` is the one folder rule",
+        "Discovery uses it for every configured folder and the settings save uses it for "
+        "every newly submitted folder, so a saved folder and a listed one cannot disagree",
+        "Suggests the parent folders whose configuration would reveal a package target the "
+        "configured folders do not",
+        "one `{path, package_count}` entry per folder",
+        "A target discovery already admits, one its child admission test would reject, the "
+        "filesystem root, and a parent that is already configured contribute nothing",
+        "so the rule reads no file, runs no git, and its list cannot change with git's "
+        "availability",
+        "`folder_status` is the single folder rule: `checkouts` reads every configured "
+        "folder with it and an `application-serving` checkout settings save reads every "
+        "newly submitted folder with it",
+    ):
+        assert marker in readme, marker
+
+
+def test_protocols_readme_states_the_checkout_schema_and_its_two_fields():
+    readme = _normalized("docs/systems/protocols/README.md")
+    for marker in (
+        "The checkout document is schema 9, and its two whole-document fields are part of "
+        "the digest",
+        "`configuration_revision` is `null` or one lowercase 64-character SHA-256 digest",
+        "`folder_suggestions` holds entries of exactly `{path, package_count}`",
+        "strictly increasing in natural path order, never a configured folder",
+        "the list is empty while the package scan is unavailable",
+    ):
+        assert marker in readme, marker
+
+
+def test_account_state_readme_states_the_checkout_settings_save_keywords():
+    readme = _normalized("docs/systems/account-state/README.md")
+    for marker in (
+        "`save_configuration_owned` and `validate_configuration_candidate` take "
+        "`checkout_folders` and `github_lookup`",
+        "omitted by default so a save of any other setting carries the stored entry forward",
+        "A non-empty folder list requires a boolean switch",
+        "an empty list removes the active workspace's entry",
+        "every other workspace's entry survives either save",
+    ):
+        assert marker in readme, marker
+
+
+def test_application_serving_readme_states_the_checkout_settings_routes_and_core():
+    readme = _normalized("docs/systems/application-serving/README.md")
+    for marker in (
+        "`GET`/`HEAD /api/checkout-settings` answers exactly `{folders, github_lookup, "
+        "revision}`",
+        "`PUT` takes exactly `{revision, folders, github_lookup}`",
+        "applies the collector's one folder rule to every folder the workspace's saved "
+        "entry does not already hold",
+        "answers 400 `invalid_checkout_folders` with every problem's index and reason",
+        "answers exactly `{folders, github_lookup, revision, outcome}`",
+        "every successful checkout settings save calls it after the replacement",
+        "so the next request waits for a networked collection of the new folders, outside "
+        "the five-minute cadence",
+        "Board settings and checkout settings are saved through one private "
+        "compare-and-save core",
+        "Each save supplies its result shaper, so `/api/settings` keeps its `{order, "
+        "completed, revision, outcome}` body byte-identical",
+    ):
+        assert marker in readme, marker
+    assert "Neither host calls it yet" not in readme
 
 
 def _run_command(command: str, *, root: Path, environment: dict[str, str]):

@@ -1,16 +1,19 @@
-"""Typed validation for the producer's catalog protocol.
+"""Typed validation for the producer's catalog and checkout protocols.
 
-The tracker consumes only the fields it renders: package identity, lifecycle,
-declared values, diagnostics, program membership, and direct prerequisites.
-Every other producer field is accepted as part of the fixed shape and then
-discarded, so the wire contract stays strict without carrying unused concepts.
+The tracker consumes only the catalog fields it renders: package identity,
+lifecycle, declared values, diagnostics, program membership, and direct
+prerequisites. Every other producer field is accepted as part of the fixed shape
+and then discarded, so the wire contract stays strict without carrying unused
+concepts. The checkout document is validated in full, because every field it
+carries is either shown to a reader or re-derived from the others.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -780,10 +783,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 8)
+# Checkout facts document (schema 9)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 8
+CHECKOUTS_SCHEMA_VERSION = 9
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -800,6 +803,7 @@ _CHECKOUTS_KEYS = frozenset(
         "schema_version",
         "checkouts_digest",
         "observed_at",
+        "configuration_revision",
         "git",
         "remote_checks",
         "github_lookup",
@@ -807,10 +811,12 @@ _CHECKOUTS_KEYS = frozenset(
         "repositories",
         "diagnostics",
         "package_scan",
+        "folder_suggestions",
         "packages",
         "attention",
     }
 )
+_SUGGESTION_KEYS = frozenset({"path", "package_count"})
 _PACKAGE_SCAN_KEYS = frozenset({"status", "finished_policy"})
 _PACKAGE_SCAN_STATUSES = frozenset({"complete", "incomplete", "unavailable"})
 _FINISHED_POLICIES = frozenset({"configured", "not_configured"})
@@ -2617,6 +2623,50 @@ def _contained_names(containers: Mapping[str, str | None], start: str) -> set[st
     return reached
 
 
+def _configuration_revision(value: Any) -> str | None:
+    """Return a configuration revision, or ``None`` when no record was loaded."""
+    if value is None:
+        return None
+    if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
+        raise ProtocolError("configuration_revision must be null or a lowercase SHA-256 digest")
+    return value
+
+
+def _folder_key(path: str) -> str:
+    """One folder's spelling under the host's case and separator rules."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _folder_suggestions(
+    value: Any, configured_paths: Sequence[str], scan_status: str
+) -> None:
+    """Validate the parent folders a collection suggests configuring.
+
+    Each entry names one absolute, representable parent folder and the positive
+    number of packages it serves; the list is strictly increasing by natural path
+    order, names no configured folder, and is empty when no package was scanned.
+    """
+    suggestions = _list(value, "folder_suggestions")
+    configured = {_folder_key(path) for path in configured_paths}
+    for index, raw in enumerate(suggestions):
+        name = f"folder_suggestions[{index}]"
+        entry = _object(raw, name)
+        _keys(entry, _SUGGESTION_KEYS, name)
+        path = _text(entry["path"], f"{name}.path")
+        if not os.path.isabs(path):
+            raise ProtocolError(f"{name}.path must be absolute")
+        if _folder_key(path) in configured:
+            raise ProtocolError(f"{name}.path names a configured folder")
+        count = entry["package_count"]
+        if type(count) is not int or count < 1:
+            raise ProtocolError(f"{name}.package_count must be a positive integer")
+    _ordered(suggestions, folder_sort_key, "folder_suggestions")
+    if scan_status == "unavailable" and suggestions:
+        raise ProtocolError(
+            "folder_suggestions must be empty when the package scan is unavailable"
+        )
+
+
 def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     """Parse, strictly validate, and authenticate one checkout facts document."""
     if isinstance(payload, (bytes, str)):
@@ -2635,6 +2685,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     if _SHA256_HEX.fullmatch(digest) is None:
         raise ProtocolError("invalid checkouts digest")
     _timestamp(document["observed_at"], "observed_at")
+    _configuration_revision(document["configuration_revision"])
 
     git = _object(document["git"], "git")
     _keys(git, _GIT_KEYS, "git")
@@ -2652,10 +2703,11 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     github_lookup = _choice(document["github_lookup"], _GITHUB_LOOKUP, "github_lookup")
 
     folders = _list(document["folders"], "folders")
+    configured_paths: list[str] = []
     for index, raw_folder in enumerate(folders):
         folder = _object(raw_folder, f"folders[{index}]")
         _keys(folder, _FOLDER_KEYS, f"folders[{index}]")
-        _text(folder["path"], f"folders[{index}].path")
+        configured_paths.append(_text(folder["path"], f"folders[{index}].path"))
         _choice(folder["status"], _FOLDER_STATUSES, f"folders[{index}].status")
     _ordered(folders, folder_sort_key, "folders")
 
@@ -2703,6 +2755,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
     _choice(
         package_scan["finished_policy"], _FINISHED_POLICIES, "package_scan.finished_policy"
     )
+    _folder_suggestions(document["folder_suggestions"], configured_paths, scan_status)
     packages = _list(document["packages"], "packages")
     if scan_status == "unavailable" and packages:
         raise ProtocolError("packages must be empty when the package scan is unavailable")

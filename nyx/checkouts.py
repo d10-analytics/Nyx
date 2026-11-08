@@ -25,6 +25,25 @@ finds the object there, and the preferred holder decides. A tip on the default
 branch's own first-parent history never reads merged, because a branch pushed with
 no commit of its own and a branch fast-forward merged cannot be told apart from a
 remote-tracking ref.
+
+On macOS the executable the system ``PATH`` names, ``/usr/bin/git``, is a
+Command Line Tools shim that fails with an ``xcrun`` error and raises the
+installer dialog on every start while the tools are missing. The collector
+therefore asks ``xcode-select -p`` before the first git start when git resolves
+to that system shim, under the caller's own environment and with the same
+per-call budget as a git call, and requires the reported developer directory to
+hold an existing ``usr/bin/git``; otherwise git reads ``missing`` and no git
+runs at all, so no dialog can appear. A git resolved anywhere else needs no
+check.
+
+The document records, beside those facts, the revision of the configuration the
+collection loaded (``null`` when no record was loaded) and the parent folders
+whose configuration would bring the packages' unseen ``Target repo:`` checkouts
+into view. A suggestion is a folder discovery itself would reveal a checkout in:
+the collector prepares each usable target's path, identity, whether discovery
+admitted it, whether discovery's child admission test would accept it, and its
+parent's text and identity, and the rule over those facts reads no file and runs
+no git. The list therefore cannot change with git's availability.
 """
 
 from __future__ import annotations
@@ -54,10 +73,12 @@ from .checkout_join import (
     PathKey,
     RemoteAnswer,
     RemoteFacts,
+    SuggestionFacts,
     TargetIndex,
     _default_names,
     declared_branch_names,
     declared_names_by_repository,
+    folder_suggestions,
     join_branches,
     moved_at_or_after,
     package_branch_copies,
@@ -208,6 +229,21 @@ def _resolve_program(stem: str) -> str | None:
     return None
 
 
+def developer_tools_probe(platform: str, git_executable: str) -> tuple[str, str] | None:
+    """Return the command that checks macOS developer tools, or ``None``.
+
+    On macOS the system ``git`` is a Command Line Tools shim, so a collection
+    must know the tools are usable before it starts it.  Only that system shim
+    needs the check: a git resolved anywhere else is a full installation.  The
+    decision reads no file and runs nothing, and it is called with the
+    *normalized* executable, so a ``PATH`` written as ``/usr//bin`` still
+    matches.
+    """
+    if platform == "darwin" and git_executable == "/usr/bin/git":
+        return ("/usr/bin/xcode-select", "-p")
+    return None
+
+
 def _start(command: Sequence[str], environment: Mapping[str, str], timeout: float) -> _Outcome:
     """Run one child with standard input closed, its output kept in temporary
     files, and a kill when ``timeout`` seconds pass."""
@@ -238,6 +274,29 @@ def _start(command: Sequence[str], environment: Mapping[str, str], timeout: floa
         out.seek(0)
         err.seek(0)
         return _Outcome(process.returncode, out.read(), err.read())
+
+
+def _developer_tools_usable(
+    probe: Sequence[str], deadline_ns: int, call_cap_seconds: float
+) -> bool:
+    """Whether the developer directory a probe reports holds a usable git.
+
+    The probe runs under the caller's environment, because the git runner's
+    filtered environment does not exist yet, and with the git runner's per-call
+    cap and the collection deadline.  A start failure, a non-zero exit or a
+    timed-out probe means the tools are not usable; so does a report that is
+    not an absolute developer directory, and one that does not hold
+    ``usr/bin/git``, because removing the tools can leave the selection in
+    place.
+    """
+    remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+    outcome = _start(probe, os.environ, min(call_cap_seconds, remaining))
+    if not outcome.ok:
+        return False
+    directory = _decode(outcome.out).strip()
+    if not os.path.isabs(directory):
+        return False
+    return os.path.isfile(os.path.join(directory, "usr", "bin", "git"))
 
 
 class _GitRunner:
@@ -557,6 +616,50 @@ def _has_git_entry(path: str) -> bool:
     return details is not None and (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode))
 
 
+def _admits_checkout(path: str) -> bool:
+    """Whether discovery takes ``path`` as a checkout an immediate child may be.
+
+    It must not be a symbolic link or a junction, must be a directory, and must
+    hold a ``.git`` entry that is a directory or a regular file. ``_discover``
+    admits a child under this one test, and the folder-suggestion facts ask the
+    same test whether a package's own target would pass it, so a suggestion is
+    exactly a folder discovery would reveal a package target under.
+    """
+    details = _lstat(path)
+    return (
+        details is not None
+        and not _is_reparse_or_link(Path(path), details)
+        and stat.S_ISDIR(details.st_mode)
+        and _has_git_entry(path)
+    )
+
+
+def folder_status(path: str) -> str:
+    """Return one checkout folder's status without listing a child.
+
+    The answer is ``ok``, ``missing``, ``unreadable`` or ``not_directory``, the
+    same status ``_discover`` records for a configured folder, so a saved folder
+    and a listed one can never disagree.  It costs one ``stat`` and, for a
+    directory that opens, one ``scandir`` handle opened and closed without
+    reading a name; it runs no git and never looks inside the folder.
+    """
+
+    try:
+        details = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISDIR(details.st_mode):
+        return "not_directory"
+    try:
+        with os.scandir(path):
+            pass
+    except OSError:
+        return "unreadable"
+    return "ok"
+
+
 def _discover(folders: Iterable[str]) -> _Discovery:
     result = _Discovery()
     seen_real: set[str] = set()
@@ -571,35 +674,21 @@ def _discover(folders: Iterable[str]) -> _Discovery:
         if not _representable(folder):
             result.diagnostics.append({"code": "unrepresentable_path", "path": None})
             continue
-        try:
-            details = os.stat(folder)
-        except (FileNotFoundError, NotADirectoryError):
-            result.folders.append({"path": folder, "status": "missing"})
-            continue
-        except OSError:
-            result.folders.append({"path": folder, "status": "unreadable"})
-            continue
-        if not stat.S_ISDIR(details.st_mode):
-            result.folders.append({"path": folder, "status": "not_directory"})
+        status = folder_status(folder)
+        result.folders.append({"path": folder, "status": status})
+        if status != "ok":
             continue
         try:
             with os.scandir(folder) as scan:
                 names = sorted(entry.name for entry in scan)
         except OSError:
-            result.folders.append({"path": folder, "status": "unreadable"})
+            result.folders[-1]["status"] = "unreadable"
             continue
-        result.folders.append({"path": folder, "status": "ok"})
         if _has_git_entry(folder):
             add(folder, None)
         for name in names:
             child = os.path.join(folder, name)
-            child_details = _lstat(child)
-            if (
-                child_details is None
-                or _is_reparse_or_link(Path(child), child_details)
-                or not stat.S_ISDIR(child_details.st_mode)
-                or not _has_git_entry(child)
-            ):
+            if not _admits_checkout(child):
                 continue
             if not _representable(child):
                 result.diagnostics.append({"code": "unrepresentable_path", "path": folder})
@@ -4169,6 +4258,7 @@ class CollectionInputs:
     folders: tuple[str, ...]
     github_lookup: bool
     package_scan: PackageScan | None
+    configuration_revision: str | None = None
 
 
 def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs | None:
@@ -4177,10 +4267,11 @@ def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs
     ``None`` means the record is unavailable, so no document can be collected.
     A not-configured account collects no folder and scans no package, and its
     document then says so instead of inventing a workspace. A configured
-    record supplies its folders, its GitHub switch and the package scan of its
-    specification root. Callers keep their own answers to these facts: a
-    command line may report that no folder is configured while a service still
-    publishes the empty document.
+    record supplies its folders, its GitHub switch, the package scan of its
+    specification root and its own revision, which the document records as the
+    configuration it was collected under. Callers keep their own answers to
+    these facts: a command line may report that no folder is configured while a
+    service still publishes the empty document.
     """
     if observation.status == "unavailable":
         return None
@@ -4194,6 +4285,7 @@ def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs
             configuration.specification_root,
             configuration.completed_stage_names,
         ),
+        configuration_revision=configuration.revision,
     )
 
 
@@ -4298,6 +4390,45 @@ def _within_folders(path: str, folder_keys: frozenset[PathKey]) -> bool:
         current = parent
 
 
+def _folder_suggestion_entries(
+    scan: PackageHeads | None,
+    admitted: frozenset[PathKey],
+    folder_keys: frozenset[PathKey],
+) -> list[dict[str, Any]]:
+    """Prepare every package's suggestion facts and apply the suggestion rule.
+
+    Only a package with a usable ``Target repo:`` path contributes, and only
+    when the document can carry that path's text; its parent is a prefix, so it
+    is text the document can carry too. A path the text rule cannot render is
+    one discovery would leave out of its candidates rather than write, exactly
+    as an unrepresentable configured folder is left out of ``folders``. Both
+    admission flags and both identities are read here, so the rule itself stays
+    a pure function over plain facts.
+    """
+    if scan is None:
+        return []
+    facts: list[SuggestionFacts] = []
+    for head in scan.heads:
+        path = head.target_repo.path
+        if head.target_repo.status != "usable" or path is None:
+            continue
+        if not _representable(path):
+            continue
+        parent = os.path.dirname(os.path.normpath(path))
+        key = _path_key(path)
+        facts.append(
+            SuggestionFacts(
+                path=path,
+                key=key,
+                admitted=key is not None and key in admitted,
+                accepted=_admits_checkout(path),
+                parent=parent,
+                parent_key=_path_key(parent),
+            )
+        )
+    return folder_suggestions(facts, folder_keys)
+
+
 def _package_entries(
     scan: PackageHeads | None,
     index: TargetIndex | None,
@@ -4347,6 +4478,7 @@ def collect_checkouts(
     remote_checks: bool = False,
     github_lookup: bool = False,
     package_scan: PackageScan | None = None,
+    configuration_revision: str | None = None,
 ) -> str:
     """Collect the checkout facts of ``folders`` as one canonical JSON document.
 
@@ -4361,11 +4493,23 @@ def collect_checkouts(
     is not made or fails. ``package_scan`` names the specification root whose
     packages are listed; without it, or when the root cannot be read, the
     document says the package scan is ``unavailable`` and lists no package.
+    ``configuration_revision`` is the revision of the configuration the caller
+    loaded, recorded as the configuration this document was collected under; it
+    is ``None`` for an account with no configuration record.
     """
     observed_at = _utc_text(int(time.time()))
     package_heads = _scan_packages(package_scan)
     folder_paths = [os.fspath(folder) for folder in folders]
     discovery = _discover(folder_paths)
+    folder_keys = frozenset(key for key in map(_path_key, folder_paths) if key is not None)
+    # The identities discovery admitted, so a package target already revealed by a
+    # configured folder contributes no suggestion. Read from the filesystem alone,
+    # so the list is the same with git and without it.
+    admitted_keys = frozenset(
+        key
+        for key in map(_path_key, (candidate.path for candidate in discovery.candidates))
+        if key is not None
+    )
     git_state: dict[str, Any] = {"status": "missing", "version": None}
     repositories: list[dict[str, Any]] = []
     packages: list[dict[str, Any]]
@@ -4382,7 +4526,18 @@ def collect_checkouts(
 
     executable = _resolve_program("git")
     runner: _GitRunner | None = None
-    if executable is not None:
+    # The system git on macOS is a Command Line Tools shim: without the tools it
+    # fails and raises the installer dialog on every start. The normalized
+    # executable decides whether that check is needed, and it runs before any
+    # git child, so an unusable installation reads as missing git.
+    probe = (
+        developer_tools_probe(sys.platform, os.path.normpath(executable))
+        if executable is not None
+        else None
+    )
+    if executable is not None and (
+        probe is None or _developer_tools_usable(probe, deadline_ns, call_cap_seconds)
+    ):
         runner = _GitRunner(executable, deadline_ns, call_cap_seconds)
         version_outcome = runner.run(["--version"])
         version = _parse_version(version_outcome.out) if version_outcome.ok else None
@@ -4444,9 +4599,6 @@ def collect_checkouts(
             cache_path = None
         cache = _load_cache(cache_path, diagnostics) if cache_path is not None else _SavedCache()
         target_index = _target_index(repositories, candidate_clones, not_git_candidates)
-        folder_keys = frozenset(
-            key for key in map(_path_key, folder_paths) if key is not None
-        )
         packages = _package_entries(package_heads, target_index, folder_keys)
         bases, pulls, checked, remote_facts = _check_remotes(
             runner,
@@ -4532,6 +4684,7 @@ def collect_checkouts(
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
         "observed_at": observed_at,
+        "configuration_revision": configuration_revision,
         "git": git_state,
         "remote_checks": "on" if remote_checks else "off",
         "github_lookup": "on" if github_lookup else "off",
@@ -4544,6 +4697,9 @@ def collect_checkouts(
                 package_scan.completed_stage_names if package_scan is not None else None
             ),
         },
+        "folder_suggestions": _folder_suggestion_entries(
+            package_heads, admitted_keys, folder_keys
+        ),
         "packages": packages,
         "attention": [],
     }

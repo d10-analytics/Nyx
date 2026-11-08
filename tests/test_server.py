@@ -13,7 +13,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-from test_checkouts import isolate_git
+from test_checkouts import NOT_ROOT, isolate_git
 
 from nyx import server, state
 from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
@@ -1337,6 +1337,635 @@ def test_real_application_settings_http_reports_reload_needed_for_unreadable_rec
             "outcome": "reload-needed",
         }
         assert paths.config_file.read_bytes() == b"{"
+
+
+# -- the active workspace's checkout settings over HTTP ---------------------
+
+
+def _checkout_settings_world(
+    root: Path,
+    *,
+    folders=(),
+    github_lookup: bool = False,
+    extra_entries=None,
+    stage_orders=None,
+    completed_stages=None,
+    admitted: bool = True,
+):
+    """Serve one schema 4 record through a real runtime and its own settings.
+
+    The record is written by hand into an isolated home, loaded through the
+    state owner, and captured by a runtime, so a save reaches the real record
+    bytes. ``extra_entries`` are other workspaces' checkout entries, keyed by
+    their raw path.
+    """
+
+    home = root / "home"
+    home.mkdir()
+    specification = root / "specifications"
+    specification.mkdir()
+    with patch.object(state, "resolve_account_home", return_value=home):
+        paths = state.state_paths(create=True)
+        key = str(specification.resolve())
+        checkout_settings = {
+            str(Path(workspace).resolve()): {
+                "folders": [str(folder) for folder in entry[0]],
+                "github_lookup": entry[1],
+            }
+            for workspace, entry in (extra_entries or {}).items()
+        }
+        if folders:
+            checkout_settings[key] = {
+                "folders": sorted(str(folder) for folder in folders),
+                "github_lookup": github_lookup,
+            }
+        payload = {
+            "schema_version": 4,
+            "specification_root": key,
+            "checkout_settings": checkout_settings,
+        }
+        if stage_orders:
+            payload["stage_orders"] = {key: list(stage_orders)}
+        if completed_stages:
+            payload["completed_stages"] = {key: list(completed_stages)}
+        paths.config_file.write_bytes(
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        )
+        configuration = state.load_configuration(paths)
+    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
+    application.capture_configuration(configuration, paths)
+    if admitted:
+        application.admit_catalog()
+    return application, paths, specification
+
+
+def _checkout_put(port, revision, folders, github_lookup):
+    return request(
+        port,
+        "PUT",
+        "/api/checkout-settings",
+        body=json.dumps(
+            {"revision": revision, "folders": folders, "github_lookup": github_lookup}
+        ),
+    )
+
+
+def test_checkout_settings_route_reads_the_active_entry_with_the_settings_revision():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folders"
+        folder.mkdir()
+        elsewhere = root / "elsewhere"
+        elsewhere.mkdir()
+        application, paths, _ = _checkout_settings_world(
+            root,
+            folders=[folder],
+            github_lookup=True,
+            extra_entries={str(elsewhere): ([str(root / "saved")], False)},
+        )
+        revision = application.configuration.revision
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, content_type, body = request(port, "GET", "/api/checkout-settings")
+            assert status == 200
+            assert content_type == "application/json"
+            assert json.loads(body) == {
+                "folders": [str(folder)],
+                "github_lookup": True,
+                "revision": revision,
+            }
+            settings_status, _, settings_body = request(port, "GET", "/api/settings")
+            assert settings_status == 200
+            assert json.loads(settings_body)["revision"] == revision
+            head_status, head_headers, head_body = head_request(port, "/api/checkout-settings")
+            assert head_status == 200
+            assert head_body == b""
+            assert head_headers["Content-Type"] == content_type
+            assert head_headers["Content-Length"] == str(len(body))
+
+
+def test_checkout_settings_route_reports_an_empty_entry_without_one():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        application, _, _ = _checkout_settings_world(root)
+        revision = application.configuration.revision
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+        assert status == 200
+        assert json.loads(body) == {
+            "folders": [],
+            "github_lookup": False,
+            "revision": revision,
+        }
+
+
+def test_checkout_settings_put_refuses_a_stale_revision_before_the_folder_check():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[folder])
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, content_type, body = _checkout_put(port, "stale", [str(root / "other")], True)
+            assert status == 409
+            assert content_type == "application/json"
+            assert json.loads(body) == {
+                "folders": [str(folder)],
+                "github_lookup": False,
+                "revision": revision,
+                "outcome": "conflict",
+            }
+            # The stale revision answers before the folder content, so a stale
+            # editor never receives a folder refusal the board editor would not
+            # show.
+            status, _, body = _checkout_put(port, "stale", ["relative", str(root / "gone")], True)
+            assert status == 409
+            assert json.loads(body)["outcome"] == "conflict"
+        assert paths.config_file.read_bytes() == before
+
+
+def test_checkout_settings_put_reports_every_bad_folder_and_keeps_the_record():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        valid = root / "valid"
+        valid.mkdir()
+        regular = root / "regular.txt"
+        regular.write_text("not a folder\n", encoding="utf-8")
+        application, paths, _ = _checkout_settings_world(root, folders=[valid])
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, content_type, body = _checkout_put(
+                port,
+                application.configuration.revision,
+                [
+                    "relative-folder",
+                    str(root / "missing"),
+                    str(regular),
+                    str(root / ("bad" + "\x01" + "name")),
+                    str(valid),
+                ],
+                False,
+            )
+        assert status == 400
+        assert content_type == "application/json"
+        assert json.loads(body) == {
+            "error": "invalid_checkout_folders",
+            "problems": [
+                {"index": 0, "reason": "not_absolute"},
+                {"index": 1, "reason": "missing"},
+                {"index": 2, "reason": "not_directory"},
+                {"index": 3, "reason": "invalid_path"},
+            ],
+        }
+        assert paths.config_file.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt" or not NOT_ROOT, reason="needs POSIX permissions, not root")
+def test_checkout_settings_put_reports_an_unreadable_folder_and_keeps_the_record():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        locked = root / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0o000)
+        try:
+            application, paths, _ = _checkout_settings_world(root)
+            before = paths.config_file.read_bytes()
+            with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+                status, _, body = _checkout_put(
+                    port, application.configuration.revision, [str(locked)], False
+                )
+            assert status == 400
+            assert json.loads(body) == {
+                "error": "invalid_checkout_folders",
+                "problems": [{"index": 0, "reason": "unreadable"}],
+            }
+            assert paths.config_file.read_bytes() == before
+        finally:
+            os.chmod(locked, 0o700)
+
+
+def test_checkout_settings_put_refuses_an_invalid_shape_without_touching_the_record():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[folder])
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        bodies = [
+            {"revision": 7, "folders": [], "github_lookup": False},
+            {"revision": revision, "folders": [1], "github_lookup": False},
+            {"revision": revision, "folders": str(folder), "github_lookup": False},
+            {"revision": revision, "folders": [], "github_lookup": "yes"},
+            {"revision": revision, "folders": []},
+            {"revision": revision, "folders": [], "github_lookup": False, "extra": 1},
+            {"revision": revision, "order": [], "completed": []},
+            [],
+            "text",
+            b"{",
+        ]
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            for body in bodies:
+                payload = body if isinstance(body, bytes) else json.dumps(body)
+                status, content_type, response = request(
+                    port, "PUT", "/api/checkout-settings", body=payload
+                )
+                assert status == 400, body
+                assert content_type == "application/json"
+                assert json.loads(response) == {"error": "invalid_payload"}, body
+            # The server refuses on the declared length before it reads a byte,
+            # so a request that declares an over-bound body and sends none
+            # reaches the refusal deterministically on every platform.
+            data = send_and_drain(
+                port,
+                raw_request(
+                    port,
+                    "PUT /api/checkout-settings HTTP/1.1",
+                    content_length=1024 * 1024 + 1,
+                ),
+            )
+            head, response = one_response_with_close(data)
+            assert response_status(head) == 400
+            assert b"content-type: application/json" in head.lower()
+            assert json.loads(response) == {"error": "invalid_payload"}
+
+            # With the whole body actually sent, the refusal is the same, but the
+            # answer is not guaranteed to arrive whole: the server answers and
+            # closes while the client is still uploading, so the kernel may reset
+            # the socket and the received bytes are then empty, or headers with a
+            # body cut off.  Only the effect belongs to the platform contract, so
+            # a partly received answer is checked by its status line alone; the
+            # header-only request above proves the exact body.
+            too_long = json.dumps(
+                {"revision": revision, "folders": [str(folder)], "github_lookup": False}
+            ) + " " * (1024 * 1024)
+            assert len(too_long.encode()) > 1024 * 1024
+            data = send_and_drain(
+                port,
+                raw_request(
+                    port,
+                    "PUT /api/checkout-settings HTTP/1.1",
+                    body=too_long.encode(),
+                    content_length=len(too_long.encode()),
+                ),
+            )
+            if data:
+                assert data.startswith(b"HTTP/1.1 400")
+        assert paths.config_file.read_bytes() == before
+
+
+def test_checkout_settings_put_keeps_a_saved_folder_that_has_since_been_removed():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        gone = root / "gone"
+        gone.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[gone])
+        key = str(application.configuration.specification_root)
+        gone.rmdir()
+        fresh = root / "fresh"
+        fresh.mkdir()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = _checkout_put(
+                port, application.configuration.revision, [str(gone), str(fresh)], True
+            )
+            saved = json.loads(body)
+            assert status == 200
+            assert saved["outcome"] == "success"
+            assert saved["folders"] == sorted([str(gone), str(fresh)])
+            assert saved["github_lookup"] is True
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["checkout_settings"][key]["folders"] == sorted(
+                [str(gone), str(fresh)]
+            )
+            assert stored["checkout_settings"][key]["github_lookup"] is True
+            assert not gone.exists()
+
+            before = paths.config_file.read_bytes()
+            status, _, body = _checkout_put(
+                port,
+                saved["revision"],
+                [str(gone), str(fresh), str(root / "new-missing")],
+                True,
+            )
+            assert status == 400
+            assert json.loads(body) == {
+                "error": "invalid_checkout_folders",
+                "problems": [{"index": 2, "reason": "missing"}],
+            }
+            assert paths.config_file.read_bytes() == before
+
+
+def test_checkout_settings_put_stores_normalized_folders_and_preserves_other_state():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        first = root / "a"
+        first.mkdir()
+        second = root / "b"
+        second.mkdir()
+        other = root / "other"
+        other.mkdir()
+        other_folders = [str(root / "elsewhere")]
+        application, paths, _ = _checkout_settings_world(
+            root,
+            folders=[first],
+            extra_entries={str(other): (other_folders, True)},
+            stage_orders=["Queue", "Review"],
+            completed_stages=["Queue"],
+        )
+        key = str(application.configuration.specification_root)
+        initial_revision = application.configuration.revision
+        before = json.loads(paths.config_file.read_bytes())
+        requested = [str(first) + os.sep + ".", str(first), str(second)]
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = _checkout_put(port, initial_revision, requested, True)
+            saved = json.loads(body)
+            assert status == 200
+            assert saved["outcome"] == "success"
+            assert saved["folders"] == sorted([str(first), str(second)])
+            assert saved["github_lookup"] is True
+            assert saved["revision"] != initial_revision
+            settings_status, _, settings_body = request(port, "GET", "/api/settings")
+            assert settings_status == 200
+            assert json.loads(settings_body)["revision"] == saved["revision"]
+            read_status, _, read_body = request(port, "GET", "/api/checkout-settings")
+            assert read_status == 200
+            assert json.loads(read_body) == {
+                "folders": sorted([str(first), str(second)]),
+                "github_lookup": True,
+                "revision": saved["revision"],
+            }
+        stored = json.loads(paths.config_file.read_bytes())
+        assert stored["checkout_settings"] == {
+            key: {"folders": sorted([str(first), str(second)]), "github_lookup": True},
+            str(other): {"folders": other_folders, "github_lookup": True},
+        }
+        assert stored["stage_orders"] == before["stage_orders"]
+        assert stored["completed_stages"] == before["completed_stages"]
+        assert state.configuration_revision(paths) == saved["revision"]
+
+
+def test_checkout_settings_put_with_an_empty_folder_list_removes_the_active_entry():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        other = root / "other"
+        other.mkdir()
+        other_entry = {"folders": [str(root / "saved")], "github_lookup": True}
+        application, paths, _ = _checkout_settings_world(
+            root,
+            folders=[folder],
+            github_lookup=True,
+            extra_entries={str(other): ([str(root / "saved")], True)},
+        )
+        key = str(application.configuration.specification_root)
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = _checkout_put(
+                port, application.configuration.revision, [], True
+            )
+            saved = json.loads(body)
+            assert status == 200
+            assert saved["outcome"] == "success"
+            assert saved["folders"] == []
+            assert saved["github_lookup"] is False
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+            assert status == 200
+            assert json.loads(body) == {
+                "folders": [],
+                "github_lookup": False,
+                "revision": saved["revision"],
+            }
+        stored = json.loads(paths.config_file.read_bytes())
+        assert key not in stored["checkout_settings"]
+        assert stored["checkout_settings"] == {str(other): other_entry}
+        assert state.load_configuration(paths).checkout_folders == ()
+
+
+def test_one_revision_serves_one_settings_save_and_the_record_holds_that_change():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        first = root / "a"
+        first.mkdir()
+        second = root / "b"
+        second.mkdir()
+        third = root / "c"
+        third.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[first])
+        key = str(application.configuration.specification_root)
+        revision = application.configuration.revision
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = _checkout_put(port, revision, [str(second)], True)
+            assert status == 200
+            assert json.loads(body)["outcome"] == "success"
+            new_revision = json.loads(body)["revision"]
+            status, _, body = request(
+                port,
+                "PUT",
+                "/api/settings",
+                body=json.dumps(
+                    {"revision": revision, "order": ["Queue"], "completed": []}
+                ),
+            )
+            assert status == 409
+            assert json.loads(body)["outcome"] == "conflict"
+            stored = json.loads(paths.config_file.read_bytes())
+            assert stored["checkout_settings"][key]["folders"] == [str(second)]
+            assert "stage_orders" not in stored
+
+            status, _, body = request(
+                port,
+                "PUT",
+                "/api/settings",
+                body=json.dumps(
+                    {"revision": new_revision, "order": ["Queue"], "completed": []}
+                ),
+            )
+            assert status == 200
+            assert json.loads(body)["outcome"] == "success"
+            after_board = json.loads(body)["revision"]
+            status, _, body = _checkout_put(port, new_revision, [str(third)], True)
+            assert status == 409
+            assert json.loads(body)["outcome"] == "conflict"
+        stored = json.loads(paths.config_file.read_bytes())
+        assert stored["stage_orders"] == {key: ["Queue"]}
+        assert stored["checkout_settings"][key]["folders"] == [str(second)]
+        assert state.configuration_revision(paths) == after_board
+
+
+def _checkout_settings_http_replaced_record(root: Path, replacement: bytes):
+    """PUT folders while the replaced record becomes a competing write once.
+
+    The injected failure fires only when the record already holds the requested
+    switch, so it never lands before the replacement.
+    """
+
+    original = root / "original"
+    original.mkdir()
+    fresh = root / "fresh"
+    fresh.mkdir()
+    application, paths, _ = _checkout_settings_world(root, folders=[original])
+    key = str(application.configuration.specification_root)
+    revision = application.configuration.revision
+    seen = state._verify_record
+    fires = []
+
+    def overwrite_then_fail_once(path, *args, **kwargs):
+        details = seen(path, *args, **kwargs)
+        if fires or path != paths.config_file:
+            return details
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entry = payload.get("checkout_settings", {}).get(key)
+        if entry is None or entry.get("github_lookup") is not True:
+            return details
+        fires.append(path)
+        path.write_bytes(replacement)
+        raise OSError("injected post-replacement verification failure")
+
+    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+        with patch.object(state, "_verify_record", side_effect=overwrite_then_fail_once):
+            status, _, body = _checkout_put(
+                port, revision, [str(original) + os.sep + "."], True
+            )
+    return status, json.loads(body), len(fires), paths, key
+
+
+def test_real_checkout_settings_http_reports_conflict_for_a_competing_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        replacement = state._configuration_bytes(root / "specifications", {}, {}, {})
+        status, body, fires, paths, key = _checkout_settings_http_replaced_record(
+            root, replacement
+        )
+        assert fires == 1
+        assert status == 409
+        assert body == {
+            "folders": [],
+            "github_lookup": False,
+            "revision": state.configuration_revision(paths),
+            "outcome": "conflict",
+        }
+        assert json.loads(paths.config_file.read_bytes()).get("checkout_settings") is None
+
+
+def test_real_checkout_settings_http_reports_reload_needed_for_unreadable_record_after_replace():
+    with TemporaryDirectory() as temporary:
+        status, body, fires, paths, key = _checkout_settings_http_replaced_record(
+            Path(temporary).resolve(), b"{"
+        )
+        assert fires == 1
+        assert status == 409
+        assert body == {
+            "folders": [],
+            "github_lookup": False,
+            "revision": None,
+            "outcome": "reload-needed",
+        }
+        assert paths.config_file.read_bytes() == b"{"
+
+
+def test_checkout_settings_put_reports_a_failed_replacement_without_marking_the_inputs():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        old = root / "old"
+        old.mkdir()
+        fresh = root / "fresh"
+        fresh.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[old])
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            with (
+                patch.object(state.os, "replace", side_effect=OSError("injected")),
+                patch.object(
+                    application,
+                    "mark_checkouts_changed",
+                    wraps=application.mark_checkouts_changed,
+                ) as mark,
+            ):
+                status, content_type, body = _checkout_put(port, revision, [str(fresh)], True)
+            mark.assert_not_called()
+            assert status == 500
+            assert content_type == "application/json"
+            assert json.loads(body) == {
+                "folders": [str(old)],
+                "github_lookup": False,
+                "revision": revision,
+                "outcome": "failure",
+            }
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+            assert json.loads(body)["folders"] == [str(old)]
+        assert paths.config_file.read_bytes() == before
+
+
+def test_checkout_settings_routes_answer_503_when_settings_admission_is_closed():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        application, paths, _ = _checkout_settings_world(
+            root, folders=[folder], admitted=False
+        )
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, content_type, body = request(port, "GET", "/api/checkout-settings")
+            assert status == 503
+            assert content_type == "application/json"
+            assert json.loads(body) == {"error": "settings_unavailable"}
+            status, _, body = _checkout_put(port, revision, [str(folder)], False)
+            assert status == 503
+            assert json.loads(body) == {"error": "settings_unavailable"}
+        assert paths.config_file.read_bytes() == before
+
+
+def test_checkout_settings_routes_reject_other_methods_and_foreign_hosts():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[folder])
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            for method in ("POST", "DELETE", "PATCH", "OPTIONS"):
+                assert request(port, method, "/api/checkout-settings")[0] == 405
+            assert (
+                request(
+                    port,
+                    "GET",
+                    "/api/checkout-settings",
+                    host=f"outside.invalid:{port}",
+                )[0]
+                == 404
+            )
+            foreign = request(
+                port,
+                "PUT",
+                "/api/checkout-settings",
+                host=f"127.0.0.1:{port + 1}",
+                body=json.dumps(
+                    {"revision": revision, "folders": [str(folder)], "github_lookup": False}
+                ),
+            )
+            assert foreign[0] == 404
+        assert paths.config_file.read_bytes() == before
+
+
+def test_the_standalone_server_hides_the_checkout_settings_routes():
+    with RunningServer(StubClient(catalog=valid_catalog())) as port:
+        assert request(port, "GET", "/api/checkout-settings")[0] == 404
+        assert request(port, "HEAD", "/api/checkout-settings")[0] == 404
+        assert request(port, "POST", "/api/checkout-settings")[0] == 404
+        assert (
+            request(
+                port,
+                "PUT",
+                "/api/checkout-settings",
+                body=json.dumps({"revision": "opaque", "folders": [], "github_lookup": False}),
+            )[0]
+            == 404
+        )
 
 
 @pytest.mark.parametrize(

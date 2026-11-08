@@ -41,15 +41,27 @@ of whose local copies has a commit of its own, with a remote copy (if any) at th
 one, reads ``no_commits_yet`` ahead of every other rule; a copy whose no-commit check did
 not run counts as unknown. The fields are stored in ``code_status`` and
 ``models.code_status_text`` renders them, so a reader recomputes the text from the fields.
+
+``folder_suggestions`` is the document's list of parent folders whose
+configuration would bring a package's unseen target checkout into view. It is a
+rule over facts the collector prepared for every package with a usable target:
+the target path and its identity, whether discovery admitted it, whether
+discovery's own child admission test would accept it, and the parent's text and
+identity. A target discovery already admits is revealed by a configured folder
+already, a target that test rejects would stay unseen under any parent, and a
+configured parent or the filesystem root contributes nothing. Entries group by
+the parent's identity and count their packages, so the rule reads no file, runs
+no git, and cannot change with git's availability.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+import os
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .models import code_status_text, natural_key
+from .models import code_status_text, folder_sort_key, natural_key
 
 PathKey = tuple[Any, ...]
 
@@ -111,6 +123,60 @@ def resolve_target(
 
 def _target(status: str, clone: str | None = None, worktree: str | None = None) -> dict[str, Any]:
     return {"status": status, "clone": clone, "worktree": worktree, "within_folders": None}
+
+
+# ---------------------------------------------------------------------------
+# Folder suggestions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SuggestionFacts:
+    """One package's usable target, as the collector read it.
+
+    ``path`` is the package's ``Target repo:`` path and ``key`` its identity.
+    ``admitted`` says discovery took the path into its candidate set, the
+    configured folder itself or an immediate child, and ``accepted`` says
+    discovery's own child admission test would take it. ``parent`` is
+    ``dirname(normpath(path))`` and ``parent_key`` its identity.
+    """
+
+    path: str
+    key: PathKey | None
+    admitted: bool
+    accepted: bool
+    parent: str
+    parent_key: PathKey | None
+
+
+def folder_suggestions(
+    facts: Iterable[SuggestionFacts], folder_keys: Collection[PathKey]
+) -> list[dict[str, Any]]:
+    """The parent folders whose configuration would bring unseen checkouts into view.
+
+    ``facts`` arrive in package-path order and ``folder_keys`` holds the
+    configured folders' identities. A package contributes its parent only when
+    its target has an identity, discovery did not admit it, discovery's admission
+    test would accept it, and the parent is neither a filesystem root nor a
+    configured folder. Entries group by the parent's identity, so two spellings
+    of one folder form one entry that keeps the first spelling in package-path
+    order, and the list is sorted in natural path order; each entry counts the
+    packages that contributed to it.
+    """
+    entries: dict[PathKey, dict[str, Any]] = {}
+    for fact in facts:
+        if fact.key is None or fact.admitted or not fact.accepted:
+            continue
+        if fact.parent_key is None or os.path.dirname(fact.parent) == fact.parent:
+            continue
+        if fact.parent_key in folder_keys:
+            continue
+        entry = entries.get(fact.parent_key)
+        if entry is None:
+            entries[fact.parent_key] = {"path": fact.parent, "package_count": 1}
+        else:
+            entry["package_count"] += 1
+    return sorted(entries.values(), key=folder_sort_key)
 
 
 # How a local branch serves a package.
