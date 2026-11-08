@@ -1842,6 +1842,40 @@ def test_real_checkout_settings_http_reports_reload_needed_for_unreadable_record
         assert paths.config_file.read_bytes() == b"{"
 
 
+def test_checkout_settings_put_reports_a_failed_replacement_without_marking_the_inputs():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        old = root / "old"
+        old.mkdir()
+        fresh = root / "fresh"
+        fresh.mkdir()
+        application, paths, _ = _checkout_settings_world(root, folders=[old])
+        revision = application.configuration.revision
+        before = paths.config_file.read_bytes()
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            with (
+                patch.object(state.os, "replace", side_effect=OSError("injected")),
+                patch.object(
+                    application,
+                    "mark_checkouts_changed",
+                    wraps=application.mark_checkouts_changed,
+                ) as mark,
+            ):
+                status, content_type, body = _checkout_put(port, revision, [str(fresh)], True)
+            mark.assert_not_called()
+            assert status == 500
+            assert content_type == "application/json"
+            assert json.loads(body) == {
+                "folders": [str(old)],
+                "github_lookup": False,
+                "revision": revision,
+                "outcome": "failure",
+            }
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+            assert json.loads(body)["folders"] == [str(old)]
+        assert paths.config_file.read_bytes() == before
+
+
 def test_checkout_settings_routes_answer_503_when_settings_admission_is_closed():
     with TemporaryDirectory() as temporary:
         root = Path(temporary).resolve()
