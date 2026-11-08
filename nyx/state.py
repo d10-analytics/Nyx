@@ -3,7 +3,9 @@
 This module owns the host-local ``Path.home() / ".nyx"`` tree, configuration
 schema, structural admission, and atomic configuration replacement.  Lifecycle
 ownership remains in :mod:`nyx.runtime`; this module never treats a locator or
-runtime file as proof of ownership.
+runtime file as proof of ownership.  An owned save may name the active
+workspace's checkout folders and GitHub lookup: every other entry and setting
+is carried forward, and an empty folder list removes that workspace's entry.
 """
 
 from __future__ import annotations
@@ -675,6 +677,25 @@ def _checkout_settings_from_payload(raw: Any) -> dict[str, CheckoutSettings]:
     return _validate_checkout_settings(result)
 
 
+def _validate_checkout_folders(values: Iterable[str]) -> tuple[str, ...]:
+    """Validate a save request's folders and return the stored canonical tuple.
+
+    Each folder must be a string naming one absolute, already-normalized path
+    without NUL; the result is deduplicated and sorted, which is exactly the
+    order and uniqueness the stored entry requires.
+    """
+
+    if isinstance(values, (str, bytes)):
+        raise ConfigurationError("Nyx configuration checkout folders are invalid")
+    try:
+        folders = tuple(values)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationError("Nyx configuration checkout folders are invalid") from error
+    if any(not _is_canonical_root(folder) for folder in folders):
+        raise ConfigurationError("Nyx configuration checkout folders are invalid")
+    return tuple(sorted(set(folders)))
+
+
 def _configuration_from_payload(payload: Any) -> Configuration:
     if not isinstance(payload, dict) or "schema_version" not in payload:
         raise ConfigurationError("Nyx configuration schema is invalid")
@@ -1121,6 +1142,8 @@ def validate_configuration_candidate(
     stage_order: Iterable[str] | object = _OMITTED,
     completed_stages: Mapping[str, Iterable[str]] | object = _OMITTED,
     completed_stage_names: Iterable[str] | object = _OMITTED,
+    checkout_folders: Iterable[str] | object = _OMITTED,
+    github_lookup: bool | object = _OMITTED,
 ) -> Configuration:
     """Validate a prospective configuration without changing persisted state."""
 
@@ -1133,6 +1156,10 @@ def validate_configuration_candidate(
         raise StageOrderError("provide stage_orders or stage_order, not both")
     if completed_stages is not _OMITTED and completed_stage_names is not _OMITTED:
         raise CompletedStageError("provide completed_stages or completed_stage_names, not both")
+    if checkout_folders is _OMITTED and github_lookup is not _OMITTED:
+        raise ConfigurationError(
+            "Nyx configuration checkout folders must accompany the GitHub lookup"
+        )
     if stage_orders is _OMITTED:
         validated_orders = {} if current is None else dict(current.stage_orders or {})
     else:
@@ -1167,6 +1194,17 @@ def validate_configuration_candidate(
         else:
             validated_completed.pop(str(root), None)
     validated_checkout = {} if current is None else dict(current.checkout_settings or {})
+    if checkout_folders is not _OMITTED:
+        folders = _validate_checkout_folders(checkout_folders)
+        if folders:
+            if type(github_lookup) is not bool:
+                raise ConfigurationError(
+                    "Nyx configuration checkout settings require a boolean GitHub lookup"
+                )
+            validated_checkout[str(root)] = CheckoutSettings(folders, github_lookup)
+        else:
+            # An empty submitted list is the removal of this workspace's entry.
+            validated_checkout.pop(str(root), None)
     return Configuration(root, validated_orders, validated_completed, validated_checkout)
 
 
@@ -1180,6 +1218,8 @@ def save_configuration_owned(
     stage_order: Iterable[str] | object = _OMITTED,
     completed_stages: Mapping[str, Iterable[str]] | object = _OMITTED,
     completed_stage_names: Iterable[str] | object = _OMITTED,
+    checkout_folders: Iterable[str] | object = _OMITTED,
+    github_lookup: bool | object = _OMITTED,
 ) -> Configuration:
     """Persist validated configuration for a caller holding lifecycle claims.
 
@@ -1201,6 +1241,8 @@ def save_configuration_owned(
         stage_order=stage_order,
         completed_stages=completed_stages,
         completed_stage_names=completed_stage_names,
+        checkout_folders=checkout_folders,
+        github_lookup=github_lookup,
     )
     return _save_configuration(
         selected_paths,

@@ -1,10 +1,13 @@
 """Loopback-only HTTP surface for the catalog and checkout views.
 
-The catalog is served to either server; the checkout document and its
-remote-check entry point belong to the application server, which answers them
-through the provider object it already holds and reads that object's methods on
-every request.  A standalone catalog server therefore hides both checkout
-paths, and every checkout failure leaves the server as one safe category.
+The catalog is served to either server; the checkout document, its
+remote-check entry point and the active workspace's checkout settings belong to
+the application server, which answers them through the provider object it
+already holds and reads that object's methods on every request.  A standalone
+catalog server therefore hides every checkout path, and every checkout failure
+leaves the server as one safe category.  A checkout settings save refuses a
+malformed folder list as its own ``invalid_checkout_folders`` category carrying
+one problem per submitted index.
 """
 
 from __future__ import annotations
@@ -78,6 +81,19 @@ class CatalogError(RuntimeError):
             raise ValueError("invalid catalog error code")
         self.code = code
         super().__init__(code)
+
+
+class InvalidCheckoutFolders(Exception):
+    """A refused checkout folder list, carrying one problem per submitted index.
+
+    It deliberately derives from neither ``ConfigurationError`` nor
+    ``ValueError``, so the save route answers it as its own 400 category instead
+    of inheriting the settings-unavailable or invalid-payload mapping.
+    """
+
+    def __init__(self, problems: list[dict[str, object]]) -> None:
+        self.problems = problems
+        super().__init__("invalid checkout folders")
 
 
 class CatalogProvider(Protocol):
@@ -317,6 +333,102 @@ def _handler_for(
                 status = HTTPStatus.INTERNAL_SERVER_ERROR
             self._send(status, _json_bytes(result), "application/json")
 
+        def _checkout_settings_route(self) -> None:
+            """Answer the checkout settings path, or hide it from a server without it."""
+
+            settings = self._settings_provider()
+            if settings is None or not (
+                hasattr(settings, "get_checkout_settings")
+                or hasattr(settings, "save_checkout_settings")
+            ):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            if self.command in {"GET", "HEAD"}:
+                self._checkout_settings_get()
+                return
+            if self.command == "PUT":
+                self._checkout_settings_put()
+                return
+            self._send(
+                HTTPStatus.METHOD_NOT_ALLOWED, b"Method not allowed\n", "text/plain; charset=utf-8"
+            )
+
+        def _checkout_settings_get(self) -> None:
+            settings = self._settings_provider()
+            if settings is None or not hasattr(settings, "get_checkout_settings"):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            try:
+                body = settings.get_checkout_settings()
+            except CatalogError as error:
+                self._send(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    _json_bytes({"error": error.code}),
+                    "application/json",
+                )
+                return
+            self._send(HTTPStatus.OK, _json_bytes(body), "application/json")
+
+        def _checkout_settings_put(self) -> None:
+            settings = self._settings_provider()
+            if settings is None or not hasattr(settings, "save_checkout_settings"):
+                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+                return
+            length = self._body_length()
+            if length is None or length > 1024 * 1024:
+                self._invalid_payload()
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, RecursionError):
+                self._invalid_payload()
+                return
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"revision", "folders", "github_lookup"}
+                or not isinstance(payload.get("revision"), str)
+                or not isinstance(payload.get("folders"), list)
+                or not all(isinstance(folder, str) for folder in payload["folders"])
+                or not isinstance(payload.get("github_lookup"), bool)
+            ):
+                self._invalid_payload()
+                return
+            try:
+                result = settings.save_checkout_settings(
+                    payload["revision"], payload["folders"], payload["github_lookup"]
+                )
+            except InvalidCheckoutFolders as error:
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_bytes(
+                        {"error": "invalid_checkout_folders", "problems": error.problems}
+                    ),
+                    "application/json",
+                )
+                return
+            except CatalogError as error:
+                self._send(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    _json_bytes({"error": error.code}),
+                    "application/json",
+                )
+                return
+            except (ValueError, ProtocolError, TypeError):
+                self._invalid_payload()
+                return
+            except (ConfigurationError, StateError):
+                self._send(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    _json_bytes({"error": "settings_unavailable"}),
+                    "application/json",
+                )
+                return
+            outcome = result.get("outcome")
+            status = HTTPStatus.CONFLICT if outcome in {"conflict", "reload-needed"} else HTTPStatus.OK
+            if outcome == "failure":
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+            self._send(status, _json_bytes(result), "application/json")
+
         def _provider_method(self, name: str) -> Any | None:
             """Return one application provider method as it is right now."""
             provider = self._settings_provider()
@@ -426,6 +538,9 @@ def _handler_for(
                     self._workspace_get()
                 else:
                     self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"Method not allowed\n", "text/plain; charset=utf-8")
+                return
+            if self.path == "/api/checkout-settings":
+                self._checkout_settings_route()
                 return
             if self.path == "/api/checkouts":
                 self._checkouts_route()
