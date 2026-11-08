@@ -302,6 +302,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "checkout (a directory holding a `.git` entry, not a link), no configured folder "
         "already reveals it, and the parent is neither the filesystem root nor already "
         "configured",
+        "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
         "A settings editor arrives with the Checkouts view",

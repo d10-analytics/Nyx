@@ -1068,7 +1068,7 @@ def test_linked_worktree_git_refuses_for_ownership_is_marked(
 # for ``git.exe`` (``_resolve_program``), so the stand-in cannot answer there.
 MACOS_TOOLS_SHIM_REASON = (
     "a shell-script git shim cannot stand in for git.exe, the only executable "
-    "Windows searches for (F-23)"
+    "Windows searches for"
 )
 
 
