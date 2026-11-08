@@ -7019,6 +7019,10 @@ def test_the_parser_enforces_every_folder_suggestion_invariant(tmp_path):
             lambda broken: entry(broken).update(path=configured),
             "folder_suggestions[0].path names a configured folder",
         ),
+        "configured through another spelling": (
+            lambda broken: entry(broken).update(path=configured + os.sep),
+            "folder_suggestions[0].path names a configured folder",
+        ),
         "count zero": (
             lambda broken: entry(broken).update(package_count=0),
             "folder_suggestions[0].package_count must be a positive integer",
