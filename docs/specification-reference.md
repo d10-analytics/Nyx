@@ -54,6 +54,16 @@ when the browser uses friendlier labels. Nyx presents each specification as a
 **Target Folder** on the card when that context is useful. Each card shows its
 directory path as **Filepath**; the stable `Package ID` stays in the file.
 
+A card whose package has a Code Status also shows a `Code Status:` line directly
+after **Filepath**, with the same text `nyx checkouts --json` gives for that
+package. That text is searchable and comes from Nyx's last successful checkout
+scan, which Nyx repeats about once a minute while a board page is open, so the
+line updates in place without **Apply update**. No line is shown while Nyx has
+no scan to serve, when the issues panel then says `Code Status unavailable`; and
+no line is shown, with no issues-panel entry, while the board displays a
+configuration the scan was not made under, which can last up to about 75 seconds
+after a Board settings save.
+
 Nyx reads a `spec.md` header as UTF-8. A single leading UTF-8 byte order mark
 (BOM) is ignored; a second BOM, or a BOM anywhere else, is content. The header
 limit is 65,536 bytes, counted from the first byte of the file and including

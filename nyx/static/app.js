@@ -128,10 +128,14 @@
   let settingsRequestSerial = 0;
   let queuedSettingsRefresh = null;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
-  // envelope, or "failed" with its category.  Only "failed" adds a Code Status
-  // part, and it is the one consumer this outcome has.
+  // envelope, or "failed" with its category.  "failed" adds a Code Status part
+  // to the issues panel, and every settled outcome rewrites the cards' lines.
   let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
   let checkoutsBusy = false;
+  // The Code Status line of each rendered card, and the entry it was rendered
+  // from, so the in-place update rewrites exactly the line and the search text.
+  let cardCodeStatus = new Map();
+  let renderedEntries = new Map();
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -465,11 +469,28 @@
       (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`blocks: ${railNames.join(" · ")}`)}</span>` : "");
   }
 
-  function searchText(entry) {
+  // The line map every card reads: empty unless the last outcome is "ready" and
+  // its document was scanned under the configuration the board is showing.  A
+  // text computed under another configuration is wrong rather than late, so it
+  // is hidden; a null catalog revision never matches.
+  function codeStatusLineMap() {
+    const lines = new Map();
+    const revision = displayed?.configuration_revision;
+    if (!revision || checkoutsOutcome.state !== "ready") return lines;
+    const document = checkoutsOutcome.envelope.checkouts;
+    if (document.configuration_revision !== revision) return lines;
+    document.packages.forEach((item) => {
+      if (item.code_status) lines.set(item.package_path, item.code_status.text);
+    });
+    return lines;
+  }
+
+  function searchText(entry, line) {
     return [
       entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title,
       ...DECLARED_FIELDS.map((field) => entry.declared[field]),
       ...entry.reported_fields.map((field) => field.value),
+      line,
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 
@@ -479,13 +500,16 @@
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
+    const codeStatus = cardCodeStatus.get(entry.package_path);
     return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
-      `${idAttribute} data-search="${text(searchText(entry))}">` +
+      `${idAttribute} data-search="${text(searchText(entry, codeStatus))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
       (targetProject ? `<span class="card-project">Target Folder: ${text(targetProject)}</span>` : "") +
       `<span class="card-filepath">Filepath: ${text(entry.package_path)}</span>` +
+      (codeStatus === undefined ? "" :
+        `<span class="card-code-status">Code Status: ${text(codeStatus)}</span>`) +
       '<span class="visually-hidden card-start-text"></span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
@@ -674,6 +698,10 @@
       : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
+    // A render shows the current lines for the snapshot it is given, so a
+    // catalog change and the checkouts outcome never disagree about them.
+    renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
+    cardCodeStatus = codeStatusLineMap();
     // Keyed by path so cards sharing a package identity keep their own relationships.
     cardPrerequisites = new Map(entries.map((entry) => [
       entry.package_path,
@@ -804,6 +832,48 @@
       cell.classList.toggle("filtered-empty", cards.length > 0 && cards.every((card) => card.hidden));
     });
     drawRails();
+  }
+
+  // Every settled checkouts outcome reaches the rendered cards directly: only
+  // each card's Code Status line and search text change, so keyboard focus,
+  // selection, the issues panel's open state and the scroll position stay, and
+  // one filter pass redraws the rails.  Rebuilding the board here would lose
+  // all four, and a line that no card's path holds is simply absent.
+  function updateCardCodeStatus() {
+    cardCodeStatus = codeStatusLineMap();
+    let changed = false;
+    board.querySelectorAll(".card[data-package-path]").forEach((card) => {
+      const path = card.dataset.packagePath;
+      const value = cardCodeStatus.get(path);
+      const shown = card.querySelector(".card-code-status");
+      if (value === undefined) {
+        if (shown) {
+          shown.remove();
+          changed = true;
+        }
+      } else if (shown) {
+        const label = `Code Status: ${value}`;
+        if (shown.textContent !== label) {
+          shown.textContent = label;
+          changed = true;
+        }
+      } else {
+        const line = document.createElement("span");
+        line.className = "card-code-status";
+        line.textContent = `Code Status: ${value}`;
+        card.querySelector(".card-filepath").after(line);
+        changed = true;
+      }
+      const entry = renderedEntries.get(path);
+      if (entry) {
+        const search = searchText(entry, value);
+        if (card.dataset.search !== search) {
+          card.dataset.search = search;
+          changed = true;
+        }
+      }
+    });
+    if (changed) applyFilter();
   }
 
   function drawRails() {
@@ -1468,6 +1538,9 @@
         const changed = outcome.state !== checkoutsOutcome.state ||
           outcome.failure !== checkoutsOutcome.failure;
         checkoutsOutcome = outcome;
+        // The cards follow every settled outcome, including one that only
+        // rewrites the text they already show.
+        updateCardCodeStatus();
         if (changed) syncBoardIssues();
       });
   }
