@@ -1604,8 +1604,17 @@
       ? "Find a checkout, branch, or work item…"
       : "Find a work item, project, or program…";
     syncViewLabels();
+    // Each view shows its own controls, so the toolbar can change height here;
+    // the sticky heads below it follow at once rather than a frame later, when
+    // a caller such as Show on board has already measured them.
+    syncToolbarHeight();
     // The shown view applies the shared query; switching views re-runs it.
     applyFilter();
+  }
+
+  function syncToolbarHeight() {
+    document.documentElement.style.setProperty(
+      "--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
   }
 
   function setShownView(value) {
@@ -3326,15 +3335,12 @@
         ? checkoutsGroupsHtml(checkoutsOutcome.envelope.checkouts) : "");
     if (checkoutsOutcome.state === "ready") pruneCheckoutsState(fresh.content);
     const focus = captureCheckoutsFocus();
-    const left = window.scrollX;
-    const top = window.scrollY;
     reconcileChildren(checkoutsBody, fresh.content);
     applyCheckoutsState();
     applyFilter();
-    if (shownView === VIEW_CHECKOUTS) {
-      restoreCheckoutsFocus(focus);
-      if (window.scrollX !== left || window.scrollY !== top) window.scrollTo(left, top);
-    }
+    // The scroll position stays because the view takes no part in scroll
+    // anchoring (style.css) and focus moves without scrolling.
+    if (shownView === VIEW_CHECKOUTS) restoreCheckoutsFocus(focus);
   }
 
   // Show one work item on the board: the selection moves to it and is never
@@ -3737,10 +3743,8 @@
   quietCheckoutsControl.addEventListener("change", () =>
     setQuietCheckoutsPreference(quietCheckoutsControl.checked));
   if (typeof ResizeObserver === "function") {
-    const updateToolbarHeight = () =>
-      document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
-    updateToolbarHeight();
-    new ResizeObserver(updateToolbarHeight).observe(toolbar);
+    syncToolbarHeight();
+    new ResizeObserver(syncToolbarHeight).observe(toolbar);
     let resizeFrame = null;
     new ResizeObserver(() => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
