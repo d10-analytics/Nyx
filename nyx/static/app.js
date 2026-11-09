@@ -1754,12 +1754,17 @@
     checkoutsBody.innerHTML = checkoutsPanelHtml();
   }
 
-  // The run result is announced once, and only for the request that asked for
-  // it: a 404 leaves the shown outcome alone because a provider may serve
-  // checkout state without the method.
+  // Every settle of a pressed check announces its result once, even when it is
+  // the same words as the previous one: one write per settle is one text
+  // change, so a repeated completion or failure is still announced.
   function setCheckoutsActionStatus(message) {
-    if (checkoutsActionStatus.textContent === message) return;
-    checkoutsActionStatus.textContent = message;
+    const text = checkoutsActionStatus.firstChild;
+    if (text !== null && text === checkoutsActionStatus.lastChild &&
+      text.nodeType === Node.TEXT_NODE) {
+      text.data = message;
+    } else {
+      checkoutsActionStatus.textContent = message;
+    }
   }
 
   function remoteCheckMessage(outcome) {
@@ -1856,12 +1861,19 @@
           if (changed) syncBoardIssues();
           if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
         }
-        checkoutsCheckRequested = false;
-        renderCheckRemotesButton();
+        // The press state lasts from the press until the request that answers
+        // it settles.  A read hands the press to its queued POST and keeps the
+        // state, so the button and the status line still say a check is running
+        // while that POST is in flight; only a POST's own settle clears it.
+        const handOff = checkoutsQueuedCheck;
+        if (!handOff) {
+          checkoutsCheckRequested = false;
+          renderCheckRemotesButton();
+        }
         renderCheckouts();
         // The press that arrived while a read was in flight is sent now, on
         // that read's settle, rather than at the next tick.
-        if (checkoutsQueuedCheck) {
+        if (handOff) {
           checkoutsQueuedCheck = false;
           requestCheckouts("check");
         }
