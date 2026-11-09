@@ -7368,13 +7368,14 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
 
     # The eight column headers, once per group table.
     assert remote_view.locator(
-        "table.checkouts-clones thead th").all_inner_texts() == [
+        "table.checkouts-clones > thead th").all_inner_texts() == [
         "Checkout", "Availability", "HEAD", "Default branch vs remote",
         "Tree", "Branches", "Cleanup", "Package",
     ]
     # Clone rows follow the group's clones, and a linked worktree sits directly
     # under the clone that owns it.
-    assert remote_view.locator("table.checkouts-clones tbody tr").evaluate_all(
+    assert remote_view.locator(
+        "table.checkouts-clones > tbody > tr:not(.checkouts-detail)").evaluate_all(
         "rows => rows.map(row => row.classList.contains('checkouts-worktree')"
         " ? row.dataset.worktree : row.dataset.clone)") == [
         "Repo Clone 2", "outside", "Repo Clone 3", "Repo Clone 10",
@@ -8003,3 +8004,690 @@ def test_checkouts_git_problem_escapes_the_version_once(open_page, view_checkout
     kinds = page.locator("#checkouts-body .checkouts-setup-item").evaluate_all(
         "items => items.map(item => item.dataset.setup)")
     assert kinds == ["git", "folder", "diagnostic"]
+
+
+# ---------------------------------------------------------------------------
+# Needs attention, expanded rows, Show on board and the settings sentence
+# ---------------------------------------------------------------------------
+
+ATTENTION_PACKAGE_IDS = {
+    "alpha": "123e4567-e89b-42d3-a456-426614174b01",
+    "gamma": "123e4567-e89b-42d3-a456-426614174b03",
+    "zeta": "123e4567-e89b-42d3-a456-426614174b06",
+}
+
+
+@pytest.fixture(scope="module")
+def attention_checkouts(tmp_path_factory):
+    """One real checkout world that holds every attention code the view navigates.
+
+    A bare ``trunk`` remote is cloned three times into one folder.  ``Repo Clone 2``
+    holds ``topic-a`` (pushed, then one more local commit), ``topic-a-part`` (a
+    branch whose tip ``topic-a`` holds), ``topic-merged`` (merged with
+    ``--no-ff``), ``topic-squash`` (``merge --squash`` plus a commit), a pushed
+    finished-stage branch, and a linked worktree with a change.  ``Repo Clone 3``
+    holds a branch never pushed and a stash; ``Repo Clone 10`` never fetched.  One
+    work item has a Baseline trunk has moved past and one names a Target repo that
+    does not exist; ``catalog`` is built before that one is written, so a board
+    shown from it does not hold it, and ``catalog_all`` holds every work item.  The captures are the world as built and the same world
+    with no finished stage.
+    """
+    root = tmp_path_factory.mktemp("attention-checkouts")
+    folder = root / "checkouts"
+    folder.mkdir()
+    served = root / "served"
+    served.mkdir()
+    (root / "home").mkdir()
+    (root / "home" / ".nyx").mkdir()
+    spec_root = root / "specification-root"
+    with pytest.MonkeyPatch.context() as patch:
+        isolate_git(patch, root / "home")
+        remote = make_remote(served)
+        clone_two = clone(remote.as_uri(), folder / "Repo Clone 2")
+        clone_three = clone(remote.as_uri(), folder / "Repo Clone 3")
+        clone(remote.as_uri(), folder / "Repo Clone 10")
+        git(clone_two, "fetch", "-q")
+        git(clone_three, "fetch", "-q")
+        seed = git(clone_two, "rev-parse", "trunk").stdout.strip()
+
+        git(clone_two, "checkout", "-q", "-b", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-a")
+        git(clone_two, "branch", "topic-a-part")
+        commit_file(clone_two, "alpha.txt", "alpha two\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "checkout", "-q", "-b", "topic-merged")
+        commit_file(clone_two, "merged.txt", "merged\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "merge", "-q", "--no-ff", "-m", "merge topic-merged", "topic-merged")
+        git(clone_two, "checkout", "-q", "-b", "topic-squash")
+        commit_file(clone_two, "squash.txt", "squash\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "merge", "-q", "--squash", "topic-squash")
+        git(clone_two, "commit", "-q", "-m", "squash topic-squash")
+        git(clone_two, "checkout", "-q", "-b", "topic-g", "trunk")
+        commit_file(clone_two, "gamma.txt", "gamma\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-g")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "push", "-q", "origin", "trunk")
+        git(clone_two, "worktree", "add", "-q", str(root / "linked"), "-b", "wt-branch")
+        (root / "linked" / "dirty.txt").write_bytes(b"dirty\n")
+
+        git(clone_three, "pull", "-q")
+        git(clone_three, "checkout", "-q", "-b", "local-only")
+        commit_file(clone_three, "local.txt", "local\n")
+        git(clone_three, "checkout", "-q", "trunk")
+        commit_file(clone_three, "stash.txt", "stash one\n")
+        git(clone_three, "reset", "-q", "--hard", "origin/trunk")
+        (clone_three / "file.txt").write_bytes(b"stashed\n")
+        git(clone_three, "stash", "push", "-q")
+
+        target = [f"Target repo: {clone_two}"]
+        _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"],
+                      ["Branch: topic-a", f"Baseline: {seed}", *target])
+        _package_spec(spec_root, "Shipped", "gamma", ATTENTION_PACKAGE_IDS["gamma"],
+                      ["Branch: topic-g", *target])
+        catalog = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+        _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"],
+                      ["Branch: topic-z", f"Target repo: {folder / 'Missing Clone'}"])
+        catalog_all = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+
+        def collect(stages):
+            return json.loads(collect_checkouts(
+                [str(folder)],
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+                package_scan=PackageScan(spec_root, stages),
+                configuration_revision=CHECKOUTS_REVISION,
+            ))
+
+        document = collect(("Shipped",))
+        document_no_finished = collect(())
+    return SimpleNamespace(
+        folder=folder, spec_root=spec_root, linked=root / "linked", catalog=catalog,
+        catalog_all=catalog_all,
+        document=document, document_no_finished=document_no_finished,
+    )
+
+
+def test_checkouts_attention_fixture_holds_every_code_it_names(attention_checkouts):
+    """Both captures parse, and the world holds the codes the proofs navigate."""
+    for document in (attention_checkouts.document, attention_checkouts.document_no_finished):
+        models.parse_checkouts(json.dumps(document))
+    assert [item["code"] for item in attention_checkouts.document["attention"]] == [
+        "branch_unpushed", "branch_not_pushed", "stash", "uncommitted_changes",
+        "awaiting_merge", "removable", "base_moved", "target_repo_missing", "never_fetched",
+    ]
+    assert attention_checkouts.document_no_finished["attention"][-1]["code"] == \
+        "finished_stages_not_configured"
+    _, clone_two = checkout_clone(attention_checkouts.document, "Repo Clone 2")
+    branches = {branch["name"]: branch for branch in clone_two["branches"]}
+    assert branches["topic-a-part"]["contained_in"] == "topic-a"
+    assert branches["topic-merged"]["verdict"]["rung"] == "ancestor"
+    assert branches["topic-a"]["verdict"]["state"] == "not_merged"
+    assert branches["wt-branch"]["removable"]["blockers"] == ["worktree_not_clean"]
+
+
+def open_attention_checkouts(launch, attention_checkouts, document, *, catalog=None, client=None):
+    """Open the checkouts view over the attention world's board and ``document``."""
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(
+        launch,
+        SimpleNamespace(
+            catalog=attention_checkouts.catalog_all if catalog is None else catalog,
+            revision=CHECKOUTS_REVISION,
+        ),
+        double,
+        client=client,
+    )
+    return page, double
+
+
+def attention_words(item):
+    """The words one attention item must read, built from the view's own block."""
+    words = checkout_words()
+    values = {
+        "branch": item["branch"] or "",
+        "clone": Path(item["clone"]).name if item["clone"] else "",
+        "worktree": Path(item["worktree"]).name if item["worktree"] else "",
+        "count": "" if item["count"] is None else item["count"],
+        "workItem": item["packages"][0] if item["packages"] else "",
+    }
+    if item["code"] == "uncommitted_changes" and item["count"] == 0:
+        template = words["text"]["uncommittedOperation"]
+    else:
+        template = words["attentionCode"][item["code"]]
+    sentence = template.format(**values)
+    if item["code"] == "awaiting_merge" and item["pull_request"] is not None:
+        sentence += " " + words["text"]["awaitingMergePullRequest"].format(n=item["pull_request"])
+    return sentence
+
+
+def focused_checkouts_target(page):
+    """What holds focus, described by the fields the view's rows carry."""
+    return page.evaluate("""() => {
+      const el = document.activeElement;
+      const row = el.closest('tr.checkouts-clone');
+      return {
+        tag: el.tagName,
+        cls: el.className,
+        branch: el.dataset.branch || null,
+        worktree: el.dataset.worktree || null,
+        clone: row === null ? null : row.dataset.clone,
+        packagePath: el.dataset.packagePath || null,
+        expanded: el.getAttribute('aria-expanded'),
+      };
+    }""")
+
+
+def focused_inside_viewport(page):
+    """Whether the focused element lies below the sticky toolbar and above the fold."""
+    box = page.evaluate("""() => {
+      const rect = document.activeElement.getBoundingClientRect();
+      return {
+        top: rect.top, bottom: rect.bottom, height: window.innerHeight,
+        bar: document.querySelector('.toolbar').getBoundingClientRect().bottom,
+      };
+    }""")
+    return box["top"] >= box["bar"] - 1 and box["bottom"] <= box["height"] + 1
+
+
+def test_checkouts_attention_list_follows_the_document(open_page, attention_checkouts):
+    """Items equal the served array in order, with class headings and served counts (R-04, D-21)."""
+    document = attention_checkouts.document
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    items = page.locator("#checkouts-body .checkouts-attention li[data-code]")
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"]]
+    # A class heading appears exactly where the class changes in document order.
+    classes = []
+    for item in document["attention"]:
+        if not classes or classes[-1] != item["class"]:
+            classes.append(item["class"])
+    headings = page.locator("#checkouts-body .checkouts-attention .checkouts-attention-class")
+    assert headings.evaluate_all("nodes => nodes.map(node => node.dataset.class)") == classes
+    assert headings.all_inner_texts() == [
+        checkout_words()["attentionClass"][name] for name in classes]
+    assert page.locator(".checkouts-attention h2").inner_text() == "Needs attention"
+    # Each item reads its words with the served count.
+    texts = items.evaluate_all(
+        "rows => rows.map(row => row.querySelector("
+        "'button.checkouts-attention-go, .checkouts-attention-words').innerText)")
+    assert texts == [attention_words(item) for item in document["attention"]]
+    assert texts[0] == "topic-a in Repo Clone 2 has 1 commits not on the remote"
+    assert texts[4] == "topic-g is finished but not merged"
+    # Items that name a clone or repository are controls; one that names only a
+    # work item is text with that work item's Show on board.
+    kinds = items.evaluate_all("rows => rows.map(row => row.dataset.attentionKind)")
+    assert kinds == ["branch", "branch", "clone", "worktree", "package-branch", "clone",
+                     "clone", "work-items", "clone"]
+    missing = page.locator('li[data-code="target_repo_missing"]')
+    assert missing.locator("button.checkouts-attention-go").count() == 0
+    assert missing.locator("[data-show-on-board]").get_attribute("data-show-on-board") == \
+        "Repo/Drafts/zeta"
+
+
+def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
+    open_page, attention_checkouts
+):
+    """A finished item with an open pull request names it (D-21)."""
+    def open_pull_request(document):
+        package = next(item for item in document["packages"]
+                       if item["package_path"] == "Repo/Shipped/gamma")
+        status = package["code_status"]
+        status["state"] = "pr_open"
+        status["pull_request"] = 7
+        status["push"] = "pushed"
+        status["text"] = models.code_status_text(status)
+
+    document = checkout_variant(attention_checkouts.document, open_pull_request)
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    sentence = page.locator('li[data-code="awaiting_merge"] button').inner_text()
+    assert sentence == "topic-g is finished but not merged (pull request #7)"
+    assert sentence == attention_words(
+        next(item for item in document["attention"] if item["code"] == "awaiting_merge"))
+
+
+def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
+    open_page, attention_checkouts
+):
+    """Enter on an item opens, unfolds and focuses what it names, in view (D-18, R-04)."""
+    document = attention_checkouts.document
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+
+    def press(code):
+        page.locator(f'li[data-code="{code}"] button').press("Enter")
+
+    press("branch_unpushed")
+    clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    assert page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]').is_visible()
+    assert focused_checkouts_target(page)["branch"] == "topic-a"
+    assert "checkouts-clone-branch" in focused_checkouts_target(page)["cls"]
+    assert focused_inside_viewport(page)
+
+    press("uncommitted_changes")
+    target = focused_checkouts_target(page)
+    assert (target["worktree"], target["cls"]) == ("linked", "checkouts-worktree")
+    assert focused_inside_viewport(page)
+
+    press("never_fetched")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"], target["expanded"]) == (
+        "Repo Clone 10", "checkouts-toggle", "false")
+    assert focused_inside_viewport(page)
+
+    press("awaiting_merge")
+    target = focused_checkouts_target(page)
+    assert (target["branch"], target["cls"]) == ("topic-g", "checkouts-branch")
+    assert page.evaluate("document.activeElement.closest('table').className") == \
+        "checkouts-package-branches"
+    assert focused_inside_viewport(page)
+
+    # A clone-only item focuses that clone's toggle without opening it.
+    for code, name in (("stash", "Repo Clone 3"), ("removable", "Repo Clone 2"),
+                       ("base_moved", "Repo Clone 2")):
+        press(code)
+        target = focused_checkouts_target(page)
+        assert (target["clone"], target["cls"]) == (name, "checkouts-toggle"), code
+
+    # An item that names only a work item moves nothing.
+    page.locator('li[data-code="target_repo_missing"] .checkouts-attention-words').click()
+    assert focused_checkouts_target(page)["cls"] != "checkouts-attention-go"
+    before = focused_checkouts_target(page)
+    page.locator('li[data-code="target_repo_missing"] .checkouts-attention-words').click()
+    assert focused_checkouts_target(page) == before
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+
+    # Without a finished stage, the policy item is words and no control.
+    serve_checkouts(page, double, attention_checkouts.document_no_finished)
+    policy = page.locator('li[data-code="finished_stages_not_configured"]')
+    assert policy.inner_text() == (
+        "No stage counts as finished; choose one under Counts as finished in Board settings")
+    assert policy.locator("button, a, [tabindex]").count() == 0
+
+
+def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
+    open_page, attention_checkouts
+):
+    """A clone that cannot be read, or a worktree at the clone's own path, focuses the clone row."""
+    page, double = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+
+    def unreadable(document):
+        _, clone = checkout_clone(document, "Repo Clone 10")
+        set_clone_status(clone, "failed")
+
+    serve_checkouts(page, double, checkout_variant(attention_checkouts.document, unreadable))
+    page.locator('li[data-code="checkout_unavailable"] button').press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"]) == ("Repo Clone 10", "checkouts-clone")
+    assert page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 10"] .checkouts-toggle').count() == 0
+
+    def own_worktree(document):
+        _, clone = checkout_clone(document, "Repo Clone 3")
+        main = next(worktree for worktree in clone["worktrees"] if worktree["main"])
+        main["changes"]["untracked"] = 2
+
+    variant = checkout_variant(attention_checkouts.document, own_worktree)
+    serve_checkouts(page, double, variant)
+    page.locator('li[data-code="uncommitted_changes"]').filter(
+        has_text="Repo Clone 3 has 2 uncommitted changes").locator("button").press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"]) == ("Repo Clone 3", "checkouts-clone")
+
+
+def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
+    open_page, attention_checkouts
+):
+    """A branch behind a fold is shown, with its fold open, when an item names it (D-18)."""
+    def mismatch(document):
+        _, clone = checkout_clone(document, "Repo Clone 2")
+        next(branch for branch in clone["branches"]
+             if branch["name"] == "topic-a-part")["upstream_mismatch"] = True
+
+    document = checkout_variant(attention_checkouts.document, mismatch)
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    page.locator('li[data-code="upstream_mismatch"] button').press("Enter")
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "topic-a-part"
+    assert page.locator('tr.checkouts-clone-branch[data-branch="topic-a"] '
+                        '.checkouts-fold-toggle').get_attribute("aria-expanded") == "true"
+    assert focused_inside_viewport(page)
+
+
+def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
+    open_page, attention_checkouts
+):
+    """Every item stays listed under a search; moving to a hidden destination clears it (R-04)."""
+    document = attention_checkouts.document
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    page.fill("#filter", "zzz")
+    items = page.locator("#checkouts-body li[data-code]")
+    assert items.count() == len(document["attention"])
+    assert page.locator(".checkouts-group").evaluate_all(
+        "groups => groups.map(group => group.hidden)") == [True]
+    page.locator('li[data-code="branch_unpushed"] button').press("Enter")
+    assert page.locator("#filter").input_value() == ""
+    assert page.locator(".checkouts-group").evaluate_all(
+        "groups => groups.map(group => group.hidden)") == [False]
+    assert focused_checkouts_target(page)["branch"] == "topic-a"
+
+    # The package-branch destination clears it the same way.
+    page.fill("#filter", "zzz")
+    page.locator('li[data-code="awaiting_merge"] button').press("Enter")
+    assert page.locator("#filter").input_value() == ""
+    assert focused_checkouts_target(page)["branch"] == "topic-g"
+    assert items.count() == len(document["attention"])
+
+
+def open_clone_detail(page, name):
+    """Open one clone row from its toggle and return its detail row."""
+    row = page.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+    row.locator(".checkouts-toggle").click()
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    playwright.expect(detail).to_be_visible()
+    return detail
+
+
+def served_verdict_words(group, verdict):
+    """The words a served merge verdict must read, from the view's own block."""
+    words = checkout_words()
+    state = words["verdictState"][verdict["state"]]
+    if verdict["state"] == "merged" and verdict["rung"] not in (None, "none"):
+        rung = words["verdictRung"][verdict["rung"]].format(
+            default=group["default_branch"]["name"], n=verdict["pull_request"] or "")
+        return f"{state} — {rung}"
+    return state
+
+
+def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items(
+    open_page, attention_checkouts
+):
+    """An opened clone shows its path, branch table, folds, blockers and work items (R-08, AC-05)."""
+    document = attention_checkouts.document
+    group, clone = checkout_clone(document, "Repo Clone 2")
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    assert not detail.is_visible()
+    detail = open_clone_detail(page, "Repo Clone 2")
+    assert detail.locator(".checkouts-clone-path-value").inner_text() == clone["path"]
+
+    # The branch table follows the document's order; a branch another branch's
+    # tip holds is folded under it until the fold is opened.
+    rows = detail.locator("tr.checkouts-clone-branch")
+    assert rows.evaluate_all("rows => rows.map(row => row.dataset.branch)") == [
+        branch["name"] for branch in clone["branches"]]
+    assert detail.locator("th[scope=col]").all_inner_texts()[:6] == [
+        "Branch", "Checked out in", "Tip", "Remote", "Verdict", "Cleanup"]
+    part = detail.locator('tr[data-branch="topic-a-part"]')
+    assert not part.is_visible()
+    fold = detail.locator('tr[data-branch="topic-a"] .checkouts-fold-toggle')
+    assert fold.inner_text() == "Folded branches (1)"
+    fold.click()
+    assert part.is_visible()
+    assert fold.get_attribute("aria-expanded") == "true"
+    fold.click()
+    assert not part.is_visible()
+    assert fold.get_attribute("aria-expanded") == "false"
+
+    # Each verdict reads the words of its served verdict, with its base's basis.
+    for branch in clone["branches"]:
+        cell = detail.locator(f'tr[data-branch="{branch["name"]}"] td.checkouts-verdict')
+        if branch["verdict"] is None:
+            assert cell.inner_text() == "—", branch["name"]
+            continue
+        assert cell.locator(".checkouts-verdict-words").inner_text() == \
+            served_verdict_words(group, branch["verdict"]), branch["name"]
+        assert cell.locator(".checkouts-basis").inner_text() == checkout_words()[
+            "comparisonBasis"][clone["verdict_base"]["basis"]], branch["name"]
+    words_of = {
+        name: detail.locator(f'tr[data-branch="{name}"] .checkouts-verdict-words').inner_text()
+        for name in ("topic-a", "topic-merged", "topic-squash")
+    }
+    assert words_of == {
+        "topic-a": "not merged",
+        "topic-merged": "merged — tip is in trunk",
+        "topic-squash": "merged — every change is in trunk",
+    }
+
+    # Cleanup names what blocks a branch or linked worktree, and Removable otherwise.
+    cleanup = {
+        name: detail.locator(f'tr[data-branch="{name}"] .checkouts-branch-cleanup').inner_text()
+        for name in ("topic-a", "topic-merged", "wt-branch")
+    }
+    assert cleanup == {
+        "topic-a": "not merged", "topic-merged": "Removable",
+        "wt-branch": "its worktree has changes",
+    }
+    assert detail.locator(
+        'tr.checkouts-detail-worktree[data-worktree="linked"] .checkouts-worktree-cleanup'
+    ).inner_text() == "has changes"
+
+    # The work items the clone serves: how each matched, its served Code Status text.
+    served = {item["package_path"]: item for item in document["packages"]}
+    items = detail.locator("li.checkouts-clone-work-item")
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.package)") == [
+        "Repo/Drafts/alpha", "Repo/Shipped/gamma"]
+    alpha = detail.locator('li[data-package="Repo/Drafts/alpha"]')
+    assert alpha.locator(".checkouts-basis").inner_text() == \
+        "(Target repo, folded into this branch)"
+    assert alpha.locator(".checkouts-code-status").inner_text() == \
+        served["Repo/Drafts/alpha"]["code_status"]["text"]
+    gamma = detail.locator('li[data-package="Repo/Shipped/gamma"]')
+    assert gamma.locator(".checkouts-basis").inner_text() == "(Target repo)"
+    assert gamma.locator(".checkouts-code-status").inner_text() == "awaiting merge (no PR)"
+
+
+def test_checkouts_show_on_board_selects_without_toggling_and_a_card_click_still_toggles(
+    open_page, attention_checkouts
+):
+    """The expanded row's action selects, focuses and shows the card; repeating keeps it (D-08, F-06)."""
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('li[data-package="Repo/Drafts/alpha"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    card = page.locator('.card[data-package-path="Repo/Drafts/alpha"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/alpha"
+    assert focused_inside_viewport(page)
+
+    # Doing it again leaves the card selected.
+    show_checkouts_view(page)
+    page.locator('tr.checkouts-detail li[data-package="Repo/Drafts/alpha"] '
+                 '[data-show-on-board]').click()
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert card.get_attribute("aria-pressed") == "true"
+
+    # The card's own click keeps its toggle.
+    card.click()
+    assert card.get_attribute("aria-pressed") == "false"
+    assert "selected" not in (card.get_attribute("class") or "").split()
+    card.click()
+    assert card.get_attribute("aria-pressed") == "true"
+
+
+def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
+    open_page, attention_checkouts
+):
+    """A search that hides the work item's card is cleared before the board shows (D-08)."""
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+    page.fill("#filter", "zzz")
+    page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == ""
+    card = page.locator('.card[data-package-path="Repo/Drafts/zeta"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert card.is_visible()
+    assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/zeta"
+
+
+def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
+    open_page, attention_checkouts
+):
+    """Where the card cannot be shown the view stays and says why; the preference is left alone (D-08)."""
+    document = attention_checkouts.document
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    key = "spec-tracker-hide-terminal-rows"
+    stored = page.evaluate("key => window.localStorage.getItem(key)", key)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('li[data-package="Repo/Shipped/gamma"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+    assert page.evaluate("key => window.localStorage.getItem(key)", key) == stored
+
+    # A work item the displayed catalog does not hold.
+    other, _ = open_attention_checkouts(
+        open_page, attention_checkouts, document, catalog=attention_checkouts.catalog)
+    stored = other.evaluate("key => window.localStorage.getItem(key)", key)
+    other.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+    playwright.expect(other.locator("#checkouts")).to_be_visible()
+    playwright.expect(other.locator("#board")).to_be_hidden()
+    assert other.locator("#checkouts-action-status").inner_text() == (
+        "This work item is not on the displayed board; choose Refresh view on the board.")
+    assert other.evaluate("key => window.localStorage.getItem(key)", key) == stored
+
+
+class HexRevisionSettings(BrowserSettings):
+    """Board settings whose saved revision is one a checkout document can carry."""
+
+    def save_settings(self, revision, order, completed):
+        result = super().save_settings(revision, order, completed)
+        if result["outcome"] == "success":
+            self.revision = result["revision"] = "2" * 64
+        return result
+
+
+SETTINGS_SENTENCE = "Collected under different settings from the board shown."
+
+
+def open_settings_checkouts(launch, attention_checkouts, document, *, client=None, settings=None):
+    """Open the checkouts view over a board whose settings the page can save."""
+    double = BrowserCheckouts(document)
+    settings = settings or HexRevisionSettings(completed=["Shipped"], revision=CHECKOUTS_REVISION)
+    page = launch(
+        client or StaticClient(attention_checkouts.catalog_all),
+        settings=settings, checkouts=double, fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page, double, settings
+
+
+def test_checkouts_settings_sentence_follows_a_board_settings_save(
+    open_page, attention_checkouts
+):
+    """A save changes the board's revision, not the scan: the scan stays and says so (D-03)."""
+    document = attention_checkouts.document
+    page, double, settings = open_settings_checkouts(open_page, attention_checkouts, document)
+    line = page.locator("#checkouts-status-line")
+    items = page.locator("#checkouts-body li[data-code]")
+    groups = page.locator("#checkouts-body .checkouts-group")
+    assert SETTINGS_SENTENCE not in line.inner_text()
+    assert items.count() == len(document["attention"])
+    assert groups.count() == 1
+    local_state = line.locator("time").first.inner_text()
+
+    page.locator("#stage-order-editor summary").click()
+    page.get_by_role("checkbox", name="Counts as finished: Shipped").uncheck()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
+    assert settings.revision == "2" * 64
+    playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
+    assert line.inner_text().count(SETTINGS_SENTENCE) == 1
+    assert items.count() == len(document["attention"])
+    assert groups.count() == 1
+    assert line.locator("time").first.inner_text() == local_state
+
+    # The next tick still serves the old document, so the sentence stays.
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert line.inner_text().count(SETTINGS_SENTENCE) == 1
+    assert items.count() == len(document["attention"])
+    assert line.locator("time").first.inner_text() == local_state
+
+    # A capture collected under the new revision clears it.
+    double.serve(checkouts_with_revision(document, "2" * 64))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert SETTINGS_SENTENCE not in line.inner_text()
+    assert items.count() == len(document["attention"])
+
+
+def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
+    open_page, attention_checkouts
+):
+    """With no catalog displayed there is no revision to match, and the scan still renders (D-03)."""
+    document = attention_checkouts.document
+    client = SequenceClient([CatalogError("producer_unavailable")])
+    page, _, _ = open_settings_checkouts(
+        open_page, attention_checkouts, document, client=client)
+    line = page.locator("#checkouts-status-line")
+    playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
+    assert page.locator("#checkouts-body li[data-code]").count() == len(document["attention"])
+    assert page.locator("#checkouts-body .checkouts-group").count() == 1
+
+
+def covered_card_clearance(page):
+    """How far the focused card's edges lie outside the area the sticky heads leave."""
+    return page.evaluate("""() => {
+      const rect = document.activeElement.getBoundingClientRect();
+      let covered = 0;
+      document.querySelectorAll('.toolbar, .board-corner, .column-head').forEach((head) => {
+        covered = Math.max(covered, head.getBoundingClientRect().bottom);
+      });
+      return {top: rect.top, bottom: rect.bottom, covered, height: window.innerHeight,
+              scrolled: window.scrollY, path: document.activeElement.dataset.packagePath};
+    }""")
+
+
+def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
+    open_page, attention_checkouts, tmp_path
+):
+    """Whether the card lies above or below the window, it ends fully below the heads (D-08)."""
+    spec_root = tmp_path / "tall-root"
+    _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
+    _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
+    for number in range(60):
+        _package_spec(spec_root, "Drafts", f"filler-{number:02d}",
+                      f"123e4567-e89b-42d3-a456-4266141750{number:02d}", [])
+    catalog = json.loads(scan_catalog(
+        spec_root, completed_stage_names=["Shipped"],
+        configuration_revision=CHECKOUTS_REVISION,
+    ))
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document, catalog=catalog)
+    page.locator("#view-board").click()
+    assert page.evaluate("document.documentElement.scrollHeight") > 3 * 720
+
+    for target, scroll_to in (("Repo/Drafts/alpha", "bottom"), ("Repo/Drafts/zeta", "top")):
+        page.locator("#view-board").click()
+        page.evaluate(
+            "where => window.scrollTo(0, where === 'bottom' ? document.documentElement.scrollHeight : 0)",
+            scroll_to)
+        show_checkouts_view(page)
+        if target == "Repo/Drafts/zeta":
+            page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+        else:
+            detail = open_clone_detail(page, "Repo Clone 2")
+            detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
+        playwright.expect(page.locator("#board")).to_be_visible()
+        box = covered_card_clearance(page)
+        assert box["path"] == target
+        assert box["top"] >= box["covered"], (target, box)
+        assert box["bottom"] <= box["height"], (target, box)
