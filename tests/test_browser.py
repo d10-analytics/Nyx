@@ -6941,8 +6941,8 @@ def view_checkouts(tmp_path_factory):
     clone, and a clone outside the folder pushes a package branch no listed
     clone holds.  The documents are captured as built, after a remote check
     that follows a push from another clone, on the next local collection, with
-    the bare remote renamed, after one more commit on ``topic-a``, after that
-    branch is deleted, after a stash in the quiet clone, with no finished
+    the bare remote renamed, after one more commit on ``topic-a``, after a
+    second one, after that branch is deleted, after a stash in the quiet clone, with no finished
     stage, and with no ``git`` on ``PATH``.  This world is separate from
     ``real_checkouts`` so that fixture's pinned Code Status texts stay as they
     are.
@@ -7020,6 +7020,8 @@ def view_checkouts(tmp_path_factory):
         git(clone_two, "checkout", "-q", "topic-a")
         commit_file(clone_two, "alpha.txt", "alpha two\n")
         document_topic_committed = collect()
+        commit_file(clone_two, "alpha.txt", "alpha three\n")
+        document_topic_recommitted = collect()
         git(clone_two, "checkout", "-q", "trunk")
         git(clone_two, "branch", "-D", "topic-a")
         document_topic_deleted = collect()
@@ -7041,6 +7043,7 @@ def view_checkouts(tmp_path_factory):
         document_recorded=document_recorded,
         document_renamed=document_renamed,
         document_topic_committed=document_topic_committed,
+        document_topic_recommitted=document_topic_recommitted,
         document_topic_deleted=document_topic_deleted,
         document_quiet_stashed=document_quiet_stashed,
         document_no_finished=document_no_finished,
@@ -7057,6 +7060,7 @@ def test_checkouts_view_fixture_captures_the_states_it_names(view_checkouts):
         "recorded": view_checkouts.document_recorded,
         "renamed": view_checkouts.document_renamed,
         "topic committed": view_checkouts.document_topic_committed,
+        "topic recommitted": view_checkouts.document_topic_recommitted,
         "topic deleted": view_checkouts.document_topic_deleted,
         "quiet stashed": view_checkouts.document_quiet_stashed,
         "no finished stage": view_checkouts.document_no_finished,
@@ -8691,3 +8695,541 @@ def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
         assert box["path"] == target
         assert box["top"] >= box["covered"], (target, box)
         assert box["bottom"] <= box["height"], (target, box)
+
+
+# ---------------------------------------------------------------------------
+# AC-08 and AC-09: in-place refresh, the narrow layout and accessibility
+# ---------------------------------------------------------------------------
+
+
+def folded_variant(document):
+    """The capture with the ``outside`` branch of Repo Clone 2 folded under ``topic-a``."""
+    def fold(value):
+        _, clone = checkout_clone(value, "Repo Clone 2")
+        next(branch for branch in clone["branches"]
+             if branch["name"] == "outside")["contained_in"] = "topic-a"
+
+    return checkout_variant(document, fold)
+
+
+def with_observed_at(document, observed_at):
+    """The same capture with one observation time; the digest does not cover it."""
+    changed = copy.deepcopy(document)
+    changed["observed_at"] = observed_at
+    return changed
+
+
+def observe_checkouts_mutations(page):
+    """Record every DOM change inside ``#checkouts`` with the keyed blocks it touches.
+
+    A change to a node's own text or attributes belongs to the block it sits in;
+    a node added or removed is itself the block.  The status line and the
+    action status are told apart, because only the status line may change.
+    """
+    page.evaluate("""() => {
+      window.checkoutsRecords = [];
+      const status = document.querySelector('#checkouts-status-line');
+      const action = document.querySelector('#checkouts-action-status');
+      const own = (node) => {
+        const element = node.nodeType === 1 ? node : node.parentElement;
+        if (element === null) return null;
+        const block = element.closest('[data-key]');
+        return block === null ? null : block.getAttribute('data-key');
+      };
+      new MutationObserver((records) => {
+        for (const record of records) {
+          const moved = [...record.addedNodes, ...record.removedNodes];
+          window.checkoutsRecords.push({
+            status: status.contains(record.target),
+            action: action.contains(record.target),
+            keys: record.type === 'childList' ? moved.map(own) : [own(record.target)],
+          });
+        }
+      }).observe(document.querySelector('#checkouts'),
+        {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+
+def checkouts_records(page):
+    """The records seen since the last call, as ``(status, action, keys)`` tuples."""
+    records = page.evaluate(
+        "() => window.checkoutsRecords.splice(0, window.checkoutsRecords.length)")
+    return [(item["status"], item["action"], item["keys"]) for item in records]
+
+
+def checkouts_focus(page):
+    """The focused element's key and control, or None outside a keyed block."""
+    return page.evaluate("""() => {
+      const el = document.activeElement;
+      return {key: el.getAttribute('data-key'), control: el.getAttribute('data-control'),
+              tag: el.tagName, cls: el.className, id: el.id};
+    }""")
+
+
+def open_clone_two_state(page):
+    """Open the quiet row, Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
+
+    Returns the toggle's key and control.
+    """
+    page.set_viewport_size({"width": 1280, "height": 600})
+    page.locator("details.checkouts-quiet > summary").click()
+    detail = open_clone_detail(page, "Repo Clone 2")
+    fold = detail.locator(".checkouts-fold-toggle")
+    assert fold.count() == 1
+    fold.click()
+    assert fold.get_attribute("aria-expanded") == "true"
+    toggle = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-toggle')
+    toggle.focus()
+    page.evaluate("window.scrollTo(0, 200)")
+    assert page.evaluate("window.scrollY") == 200
+    return checkouts_focus(page)
+
+
+def assert_clone_two_state_kept(page, focus):
+    """The quiet row, the row, its fold, the focus and the scroll are as they were."""
+    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    assert detail.evaluate("el => el.hidden") is False
+    fold = detail.locator(".checkouts-fold-toggle")
+    assert fold.get_attribute("aria-expanded") == "true"
+    assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
+    assert checkouts_focus(page) == focus
+    assert page.evaluate("window.scrollY") == 200
+
+
+def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
+    open_page, view_checkouts
+):
+    """A tick replaces only the blocks that changed and keeps what the reader did (R-11, D-11)."""
+    before = folded_variant(view_checkouts.document_topic_committed)
+    after = with_observed_at(
+        folded_variant(view_checkouts.document_topic_recommitted), before["observed_at"])
+    clone_path = checkout_clone(before, "Repo Clone 2")[1]["path"]
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    focus = open_clone_two_state(page)
+    assert focus["control"] == "toggle" and clone_path in focus["key"]
+    held = page.evaluate_handle("document.activeElement")
+    arm_focus_sampler(page)
+    observe_checkouts_mutations(page)
+    pushed = page.locator("#checkouts-action-status").inner_text()
+
+    # Two ticks over an unchanged document change nothing but the status line.
+    for _ in range(2):
+        serve_checkouts(page, double, before)
+        records = checkouts_records(page)
+        assert records and all(status for status, _, _ in records), records
+        assert held.evaluate("node => node === document.activeElement")
+        assert_clone_two_state_kept(page, focus)
+
+    # One more commit on topic-a updates Repo Clone 2's blocks alone.
+    row = page.locator('tr.checkouts-clone-branch[data-branch="topic-a"]')
+    assert "1 ahead" in row.locator(".checkouts-remote-state").inner_text()
+    old_tip = row.locator(".checkouts-tip").inner_text()
+    serve_checkouts(page, double, after)
+    records = checkouts_records(page)
+    outside = [keys for status, _, keys in records if not status]
+    assert outside, "the new commit changed no block"
+    assert all(keys and all(key is not None and clone_path in json.loads(key) for key in keys)
+               for keys in outside), outside
+    assert "2 ahead" in row.locator(".checkouts-remote-state").inner_text()
+    assert row.locator(".checkouts-tip").inner_text() != old_tip
+    assert_clone_two_state_kept(page, focus)
+    assert page.locator("#checkouts-action-status").inner_text() == pushed
+    assert all(not action for _, action, _ in records)
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
+    open_page, view_checkouts
+):
+    """A removed row hands focus to the next row toggle, else the group heading (D-11)."""
+    before = view_checkouts.document_topic_committed
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('tr[data-branch="topic-a"]').focus()
+    arm_focus_sampler(page)
+
+    # The tick that deletes the focused branch row moves focus to the next row
+    # toggle in the group, Repo Clone 3's.
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator('tr[data-branch="topic-a"].checkouts-clone-branch').count() == 0
+    focus = checkouts_focus(page)
+    assert focus["control"] == "toggle"
+    assert checkout_clone(before, "Repo Clone 3")[1]["path"] in focus["key"]
+    assert_focus_sampler_clean(page)
+
+    # The tick that removes the group's last row moves it to the group heading.
+    page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 10"] .checkouts-toggle').focus()
+
+    def without_last_clone(document):
+        group = checkout_group(document, "remote")
+        group["clones"] = [item for item in group["clones"]
+                           if not item["path"].endswith("Repo Clone 10")]
+
+    serve_checkouts(page, double, checkout_variant(before, without_last_clone))
+    assert page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]').count() == 0
+    focus = page.evaluate("""() => ({
+      head: document.activeElement.classList.contains('checkouts-group-head'),
+      group: document.activeElement.closest('.checkouts-group').dataset.checkoutsGroup,
+    })""")
+    assert focus["head"] is True
+    assert focus["group"] == checkout_group(before, "remote")["remote"]["key"]
+    assert_focus_sampler_clean(page)
+
+    # With no group left the view's own heading takes it.
+    serve_checkouts(page, double, view_checkouts.document_no_git)
+    assert page.evaluate("document.activeElement.id") == "checkouts-heading"
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failure(
+    open_page, view_checkouts
+):
+    """The mismatch sentence comes and goes, and a failed outcome returns, with state kept (D-03)."""
+    before = folded_variant(view_checkouts.document_topic_committed)
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    focus = open_clone_two_state(page)
+    sentence = "Collected under different settings from the board shown."
+    line = page.locator("#checkouts-status-line")
+    arm_focus_sampler(page)
+    observe_checkouts_mutations(page)
+
+    # A revision that differs from the board's adds the sentence; the same
+    # revision clears it.  Neither touches a block.
+    double.serve(checkouts_with_revision(before, "2" * 64))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert sentence in line.inner_text()
+    assert_clone_two_state_kept(page, focus)
+    serve_checkouts(page, double, before)
+    assert sentence not in line.inner_text()
+    assert_clone_two_state_kept(page, focus)
+    assert all(status for status, _, _ in checkouts_records(page))
+
+    # A failed outcome shows the failed panel in place of the view; the next
+    # ready one restores the open row, its fold and the quiet row.
+    double.fail("checkouts_timeout")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert page.locator(".checkouts-group").count() == 0
+    assert page.locator("details.checkouts-quiet").count() == 0
+    assert page.evaluate("document.activeElement.id") == "checkouts-heading"
+    serve_checkouts(page, double, before)
+    assert page.locator(".checkouts-panel").count() == 0
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    assert detail.evaluate("el => el.hidden") is False
+    assert detail.locator(".checkouts-fold-toggle").get_attribute("aria-expanded") == "true"
+    assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
+    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
+    open_page, view_checkouts
+):
+    """A row the document drops is not reopened if it returns later (D-11)."""
+    before = view_checkouts.document_topic_committed
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    open_clone_detail(page, "Repo Clone 3")
+
+    def without_clone_three(document):
+        group = checkout_group(document, "remote")
+        group["clones"] = [item for item in group["clones"]
+                           if not item["path"].endswith("Repo Clone 3")]
+
+    serve_checkouts(page, double, checkout_variant(before, without_clone_three))
+    assert page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]').count() == 0
+    serve_checkouts(page, double, before)
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "false"
+    assert row.locator("xpath=following-sibling::tr[1]").evaluate("el => el.hidden") is True
+
+
+def long_name_variant(view_checkouts):
+    """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
+    document = view_checkouts.document_topic_committed
+    clone_ten = checkout_clone(document, "Repo Clone 10")[1]["path"]
+    long_path = clone_ten.rsplit("/", 1)[0] + "/RepoClone" + "x" * 291
+    rendered = json.dumps(document).replace(json.dumps(clone_ten), json.dumps(long_path))
+    rendered = rendered.replace('"topic-a"', json.dumps("p" * 300))
+    variant = reseal_checkouts(json.loads(rendered))
+    models.parse_checkouts(json.dumps(variant))
+    return variant
+
+
+def open_every_clone_row(page):
+    """Open each clone row's detail from its toggle."""
+    for toggle in page.locator("#checkouts-body .checkouts-toggle").all():
+        toggle.click()
+
+
+def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
+    open_page, view_checkouts
+):
+    """Stacked at 360 px, tabular from 701 px, with table roles throughout (R-12, D-12)."""
+    document = long_name_variant(view_checkouts)
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
+               "Tree", "Branches", "Cleanup", "Package"]
+    for theme in ("dark", "light"):
+        page.get_by_label("Theme", exact=True).select_option(theme)
+
+        page.set_viewport_size({"width": 360, "height": 800})
+        open_every_clone_row(page)
+        settle_frames(page)
+        assert page.evaluate("""() => [document.documentElement.scrollWidth,
+          document.documentElement.clientWidth]""") == [360, 360]
+        row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        labels = row.evaluate("""el => [...el.children].map(cell => {
+          const label = cell.firstElementChild;
+          const value = document.createRange();
+          value.setStartAfter(label);
+          value.setEnd(cell, cell.childNodes.length);
+          const shown = getComputedStyle(label);
+          return {
+            text: label.textContent, label: label.className, display: shown.display,
+            visibility: shown.visibility, before: label.getBoundingClientRect().bottom,
+            value: value.getBoundingClientRect().top,
+            hasValue: cell.textContent.trim().length > label.textContent.trim().length,
+          };
+        })""")
+        assert [item["text"] for item in labels] == columns
+        for item in labels:
+            assert item["label"] == "cell-label" and item["display"] == "block"
+            assert item["visibility"] == "visible"
+            assert item["hasValue"] and item["before"] <= item["value"] + 1, item
+        for role, count in (("table", 1), ("row", 1), ("columnheader", 8), ("cell", 1)):
+            assert page.get_by_role(role).count() >= count, role
+        assert page.get_by_role("columnheader", name="Default branch vs remote").count() >= 1
+        assert page.get_by_role("cell").filter(has_text="3 branches").count() >= 1
+
+        # The long names wrap inside their cells instead of widening the view.
+        inside = page.evaluate("""() => [...document.querySelectorAll('#checkouts td, #checkouts th')]
+          .filter(cell => /p{300}|x{291}/.test(cell.textContent))
+          .map(cell => ({tag: cell.tagName, scroll: cell.scrollWidth, client: cell.clientWidth,
+                         right: cell.getBoundingClientRect().right}))""")
+        assert len(inside) >= 4, inside
+        assert all(item["scroll"] <= item["client"] + 1 and item["right"] <= 360.5
+                   for item in inside), inside
+
+        # At 701 px the names are visually hidden and the rows are tabular.
+        page.set_viewport_size({"width": 701, "height": 800})
+        settle_frames(page)
+        assert page.evaluate("""() => [...document.querySelectorAll('#checkouts .cell-label')]
+          .every(label => getComputedStyle(label).display === 'none')""") is True
+        assert page.evaluate("""() => document.querySelectorAll('#checkouts .cell-label').length""") > 0
+        assert row.evaluate("el => getComputedStyle(el).display") == "table-row"
+        assert row.evaluate("el => getComputedStyle(el.closest('table')).display") == "table"
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
+
+        # At 1600 px the same roles resolve and nothing scrolls sideways.
+        page.set_viewport_size({"width": 1600, "height": 900})
+        settle_frames(page)
+        for role in ("table", "row", "columnheader", "cell"):
+            assert page.get_by_role(role).count() >= 1, role
+        assert page.get_by_role("columnheader", name="Cleanup").count() >= 1
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
+
+
+CHECKOUTS_TEXT_SAMPLES = {
+    "status line": "#checkouts-status-line",
+    "column headers": "#checkouts th[scope=col]",
+    "cell values": (
+        "#checkouts-body td, #checkouts-body th[scope=row], .checkouts-basis, "
+        ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
+        ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
+        ".checkouts-quiet summary, .checkouts-quiet li"),
+    "attention items": (
+        ".checkouts-attention h2, .checkouts-attention-class, "
+        ".checkouts-attention-item, .checkouts-attention-go"),
+    "freshness words": ".checkouts-freshness",
+    "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
+}
+
+
+def checkouts_text_colors(page):
+    """Each sample's text color over the first opaque background behind it."""
+    return page.evaluate("""(samples) => {
+      const backdrop = (node) => {
+        for (let el = node; el; el = el.parentElement) {
+          const color = getComputedStyle(el).backgroundColor;
+          const channels = color.match(/[\\d.]+/g).map(Number);
+          if (channels.length === 3 || channels[3] === 1) return color;
+        }
+        return getComputedStyle(document.documentElement).backgroundColor;
+      };
+      const found = {};
+      for (const [name, selector] of Object.entries(samples)) {
+        const pairs = new Map();
+        for (const el of document.querySelectorAll(selector)) {
+          if (!el.getClientRects().length || !el.textContent.trim()) continue;
+          const color = getComputedStyle(el).color;
+          pairs.set(color + '|' + backdrop(el), el.textContent.trim().slice(0, 30));
+        }
+        found[name] = [...pairs].map(([pair, text]) => [...pair.split('|'), text]);
+      }
+      return found;
+    }""", CHECKOUTS_TEXT_SAMPLES)
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_checkouts_text_and_focus_rings_have_readable_contrast(
+    open_page, view_checkouts, theme
+):
+    """Text keeps 4.5:1 and every control's focus ring 3:1 in both themes (R-12)."""
+    cached = folded_variant(view_checkouts.document_built)
+    setup = checkout_variant(
+        folded_variant(view_checkouts.document_checked), add_setup_problems(view_checkouts))
+    page, double = open_view_checkouts(open_page, view_checkouts, cached)
+    page.set_viewport_size({"width": 1600, "height": 1200})
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    open_every_clone_row(page)
+    detail = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]').locator(
+        "xpath=following-sibling::tr[1]")
+    detail.locator(".checkouts-fold-toggle").click()
+    # The cached capture shows the freshness words; the setup capture its panel.
+    shown = {}
+    for document in (cached, setup):
+        if document is setup:
+            serve_checkouts(page, double, setup)
+        settle_frames(page)
+        for name, pairs in checkouts_text_colors(page).items():
+            shown.setdefault(name, []).extend(pairs)
+    for name, pairs in shown.items():
+        assert pairs, f"nothing is shown for {name}"
+        for color, background, sample in pairs:
+            ratio = contrast_ratio(color, background)
+            assert ratio >= 4.5, (name, sample, color, background, ratio)
+
+    rings = {
+        "view switch": "#view-checkouts",
+        "row toggle": 'tr.checkouts-clone[data-clone="Repo Clone 3"] .checkouts-toggle',
+        "fold": ".checkouts-fold-toggle",
+        "attention item": ".checkouts-attention-go",
+        "Check remotes now": "#check-remotes",
+        "Show on board": ".checkouts-show-on-board",
+    }
+    for name, selector in rings.items():
+        # A key press makes the next script focus show as keyboard focus.
+        page.keyboard.press("Shift")
+        assert_focus_indicator(page.locator(selector).first), name
+
+
+def tab_until(page, probe):
+    """Press Tab, then Shift+Tab, until ``probe`` holds for the focused element."""
+    for key, limit in (("Tab", 80), ("Shift+Tab", 160)):
+        for _ in range(limit):
+            if page.evaluate(probe):
+                return
+            page.keyboard.press(key)
+    raise AssertionError(f"keyboard never reached {probe}")
+
+
+def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkouts):
+    """Tab, Shift+Tab, Enter and Space reach and operate each control (R-12)."""
+    document = folded_variant(view_checkouts.document_topic_committed)
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    clone_two = checkout_clone(document, "Repo Clone 2")[1]["path"]
+    clone_three = checkout_clone(document, "Repo Clone 3")[1]["path"]
+    page.evaluate("document.activeElement.blur()")
+
+    # The view switch: Enter returns to the board and Space shows the view again,
+    # with focus staying on the pressed switch.
+    tab_until(page, "document.activeElement.id === 'view-board'")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#board")).to_be_visible()
+    tab_until(page, "document.activeElement.id === 'view-checkouts'")
+    page.keyboard.press("Space")
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+
+    # Check remotes now: this provider has no remote check, and says so.
+    tab_until(page, "document.activeElement.id === 'check-remotes'")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#checkouts-action-status")).to_have_text(
+        "This server does not offer remote checks.")
+
+    # A row toggle opens with Enter and closes with Space.
+    toggle_probe = f"""(() => {{
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'toggle' &&
+        JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_two)};
+    }})()"""
+    tab_until(page, toggle_probe)
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    toggle = row.locator(".checkouts-toggle")
+    page.keyboard.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+    page.keyboard.press("Space")
+    assert toggle.get_attribute("aria-expanded") == "false"
+    page.keyboard.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+
+    # The fold in its detail opens with Space and closes with Enter.
+    tab_until(page, "document.activeElement.getAttribute('data-control') === 'fold'")
+    fold = page.locator(".checkouts-fold-toggle")
+    outside = page.locator('tr.checkouts-clone-branch[data-branch="outside"]')
+    page.keyboard.press("Space")
+    assert fold.get_attribute("aria-expanded") == "true"
+    assert outside.evaluate("el => el.hidden") is False
+    page.keyboard.press("Enter")
+    assert fold.get_attribute("aria-expanded") == "false"
+    assert outside.evaluate("el => el.hidden") is True
+
+    # Another row's toggle is reached after the open detail's controls.
+    tab_until(page, f"""(() => {{
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'toggle' &&
+        JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_three)};
+    }})()""")
+
+    # An attention item moves focus to the row it names.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'go' &&
+        el.closest('li').dataset.code === 'branch_unpushed';
+    })()""")
+    page.keyboard.press("Enter")
+    assert page.evaluate("""() => document.activeElement.dataset.branch + ' ' +
+      document.activeElement.className""") == "topic-a checkouts-clone-branch"
+
+    # Show on board shows the board with the work item's card selected and focused.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'show:Repo/Drafts/alpha' &&
+        el.closest('tr').classList.contains('checkouts-branch');
+    })()""")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.evaluate("document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+
+def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_checkouts):
+    """Refreshed content is never announced; the action status is the one region (R-12, D-11)."""
+    ready = view_checkouts.document_topic_committed
+    setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
+    page, double = open_view_checkouts(open_page, view_checkouts, ready)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    observe_checkouts_mutations(page)
+    live = """() => [...document.querySelectorAll(
+      '#checkouts [aria-live], #checkouts [role=status], #checkouts [role=alert], #checkouts output')]
+      .map(el => el.id)"""
+    for step in (ready, setup, view_checkouts.document_topic_recommitted, "failed"):
+        if step == "failed":
+            double.fail("checkouts_unavailable")
+            fire_checkouts_poll(page)
+            playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+        else:
+            serve_checkouts(page, double, step)
+        assert page.evaluate(live) == ["checkouts-action-status"]
+        # A tick never writes the action status.
+        assert all(not action for _, action, _ in checkouts_records(page))
+        assert page.locator("#checkouts-action-status").inner_text() == ""
