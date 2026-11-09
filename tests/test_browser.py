@@ -5742,6 +5742,9 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     page.set_viewport_size({"width": 900, "height": 320})
     page.evaluate("() => window.scrollTo(0, 120)")
     assert page.evaluate("window.scrollY") > 0
+    # Let the resize-driven redraw settle before the tick's own redraw is
+    # observed, so the layer that goes away is the one the tick replaced.
+    settle_frames(page)
     assert page.locator(
         f'.connection[data-source="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]'
         f'[data-dependent="{CHECKOUTS_PACKAGE_IDS["beta"]}"]'
