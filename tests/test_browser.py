@@ -5085,11 +5085,6 @@ def real_checkouts(tmp_path_factory):
         rendered_three = collect()
         catalog_after = json.loads(catalog())
     return SimpleNamespace(
-        folder=folder,
-        remote=remote,
-        clone_two=clone_two,
-        clone_ten=clone_ten,
-        spec_root=spec_root,
         revision=CHECKOUTS_REVISION,
         revision_moved=CHECKOUTS_REVISION_MOVED,
         catalog=catalog_before,
@@ -5437,7 +5432,31 @@ def checkouts_document_mutations():
     ]
 
 
-def test_checkouts_validator_refuses_each_document_mutation(open_page, real_checkouts):
+def checkouts_envelope_mutations():
+    """Each envelope mutation the browser must refuse as a protocol failure.
+
+    ``document`` marks the mutations that also leave the served document itself
+    one the collector's parser refuses.
+    """
+
+    def extra_envelope_key(envelope):
+        envelope["unexpected"] = None
+
+    def no_document(envelope):
+        envelope["checkouts"] = None
+
+    return [
+        {"id": "extra-envelope-key", "mutate": extra_envelope_key, "document": False},
+        {"id": "no-document", "mutate": no_document, "document": True},
+    ]
+
+
+def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
+    """Every malformed envelope shows the protocol failure and nothing else.
+
+    One page alternates each case with the unchanged document, so every case
+    must create the notice itself and that document must clear it again.
+    """
     double = BrowserCheckouts(real_checkouts.document_zero)
     page = open_checkouts_page(open_page, real_checkouts, double)
     wait_for_responses(page, "checkoutsResponses", 1)
@@ -5481,34 +5500,6 @@ def test_checkouts_validator_refuses_each_document_mutation(open_page, real_chec
     double.serve(envelope)
     fire_checkouts_poll(page)
     playwright.expect(summary).to_have_count(0)
-
-
-def checkouts_envelope_mutations():
-    """Each envelope mutation the browser must refuse as a protocol failure.
-
-    ``document`` marks the mutations that also leave the served document itself
-    one the collector's parser refuses.
-    """
-
-    def extra_envelope_key(envelope):
-        envelope["unexpected"] = None
-
-    def no_document(envelope):
-        envelope["checkouts"] = None
-
-    return [
-        {"id": "extra-envelope-key", "mutate": extra_envelope_key, "document": False},
-        {"id": "no-document", "mutate": no_document, "document": True},
-    ]
-
-
-def test_checkouts_validator_refuses_each_envelope_mutation(open_page, real_checkouts):
-    double = BrowserCheckouts(real_checkouts.document_zero)
-    page = open_checkouts_page(open_page, real_checkouts, double)
-    wait_for_responses(page, "checkoutsResponses", 1)
-    settle_frames(page)
-    summary = page.locator(".checkouts-issue-summary")
-    assert summary.count() == 0
     for case in checkouts_envelope_mutations():
         envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
         case["mutate"](envelope)
