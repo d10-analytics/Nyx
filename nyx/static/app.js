@@ -312,7 +312,10 @@
       "remoteCopy": "Remote copy",
       "verdict": "Verdict",
       "pullRequests": "Pull requests",
-      "workItems": "Work items"
+      "workItems": "Work items",
+      "checkedOutIn": "Checked out in",
+      "tip": "Tip",
+      "remoteState": "Remote"
     },
     "text": {
       "localState": "Local state {time}",
@@ -340,10 +343,18 @@
       "quietRow": "Quiet repositories ({count})",
       "freeClones": "Free clones: {clones}",
       "workItemBranches": "Work item branches",
+      "attentionHeading": "Needs attention",
+      "detailsToggle": "Details",
+      "detailsToggleLabel": "Details of {clone}",
+      "clonePath": "Path",
+      "branchesHeading": "Branches",
+      "worktreesHeading": "Linked worktrees",
+      "workItemsHeading": "Work items",
+      "foldedBranches": "Folded branches ({count})",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
       "showOnBoardMissing": "This work item is not on the displayed board; choose Refresh view on the board.",
-      "uncommittedOperation": "an unfinished git operation",
+      "uncommittedOperation": "{worktree} has an unfinished git operation",
       "awaitingMergePullRequest": "(pull request #{n})",
       "settingsDiffer": "Collected under different settings from the board shown.",
       "shallow": "shallow",
@@ -1297,14 +1308,20 @@
     board.append(svg);
   }
 
-  function select(path) {
-    selectedPath = selectedPath === path ? null : path;
+  // The one place the selection changes: a path selects it and null clears it.
+  // A card click toggles through select; Show on board never does.
+  function setSelection(path) {
+    selectedPath = path;
     board.querySelectorAll(".card").forEach((card) => {
       const selected = card.dataset.packagePath === selectedPath;
       card.classList.toggle("selected", selected);
       card.setAttribute("aria-pressed", String(selected));
     });
     drawRails();
+  }
+
+  function select(path) {
+    setSelection(selectedPath === path ? null : path);
   }
 
   function digestOf(snapshot) {
@@ -2208,7 +2225,7 @@
   function groupHeaderHtml(document, group) {
     const defaultBranch = group.default_branch === null ? null : group.default_branch.name;
     const free = freeClonesHtml(document, group);
-    return '<h2 class="checkouts-group-head">' +
+    return '<h2 class="checkouts-group-head" tabindex="-1">' +
       `<span class="checkouts-group-name">${text(remoteName(group))}</span>` +
       (defaultBranch === null ? "" :
         `<span class="checkouts-group-default">${text(defaultBranch)}</span>`) +
@@ -2335,18 +2352,14 @@
     return ` <span class="checkouts-basis">${basis}</span>`;
   }
 
-  function verdictWords(document, group, entry) {
-    const remoteVerdict = entry.remote_verdict;
-    const local = localBranchOf(group, entry.name);
-    const verdict = remoteVerdict !== null && remoteVerdict !== undefined
-      ? remoteVerdict
-      : (local === null ? null : local.branch.verdict);
+  // One merge verdict with its proof and the basis its verdict base was
+  // compared against.
+  function verdictHtml(document, group, verdict, clone) {
     if (verdict === null || verdict === undefined) return dashHtml();
     const state = text(codeWords("verdictState", verdict.state));
     const base = group.default_branch === null || group.default_branch.name === null
       ? "" : group.default_branch.name;
-    const basis = verdictBasisHtml(document, group,
-      local === null ? firstReadableClone(group) : local.clone);
+    const basis = verdictBasisHtml(document, group, clone);
     let words = state;
     if (verdict.state === "merged" && verdict.rung !== null && verdict.rung !== undefined) {
       const rung = wordText("verdictRung", verdict.rung, {
@@ -2360,6 +2373,16 @@
       words = `${state} — ${text(codeWords("verdictReason", verdict.reason))}`;
     }
     return `<span class="checkouts-verdict-words">${words}</span>${basis}`;
+  }
+
+  function verdictWords(document, group, entry) {
+    const remoteVerdict = entry.remote_verdict;
+    const local = localBranchOf(group, entry.name);
+    const verdict = remoteVerdict !== null && remoteVerdict !== undefined
+      ? remoteVerdict
+      : (local === null ? null : local.branch.verdict);
+    return verdictHtml(document, group, verdict,
+      local === null ? firstReadableClone(group) : local.clone);
   }
 
   function remoteCopyWords(document, group, copy) {
@@ -2400,6 +2423,12 @@
     return [...bases].sort();
   }
 
+  function showOnBoardButtonHtml(path) {
+    return '<button type="button" class="checkouts-show-on-board" ' +
+      `data-show-on-board="${text(path)}">` +
+      `${text(codeWords("text", "showOnBoard"))}</button>`;
+  }
+
   // Each work item names how the group serves it and its own board action.
   function workItemsHtml(group, entry) {
     return entry.packages.map((path) => {
@@ -2410,9 +2439,7 @@
         : "";
       return '<span class="checkouts-work-item">' +
         `<span class="checkouts-package-path">${text(path)}</span>${suffix} ` +
-        '<button type="button" class="checkouts-show-on-board" ' +
-        `data-show-on-board="${text(path)}">` +
-        `${text(codeWords("text", "showOnBoard"))}</button></span>`;
+        `${showOnBoardButtonHtml(path)}</span>`;
     }).join(" · ");
   }
 
@@ -2422,7 +2449,7 @@
     const head = PACKAGE_COLUMNS.map((key) =>
       `<th scope="col">${text(codeWords("column", key))}</th>`).join("");
     const rows = entries.map((entry) =>
-      `<tr class="checkouts-branch" data-branch="${text(entry.name)}">` +
+      `<tr class="checkouts-branch" data-branch="${text(entry.name)}" tabindex="-1">` +
       `<th scope="row">${text(entry.name)}</th>` +
       `<td class="checkouts-remote-copy">${remoteCopyWords(document, group, entry.remote)}</td>` +
       `<td class="checkouts-verdict">${verdictWords(document, group, entry)}</td>` +
@@ -2457,10 +2484,20 @@
       "</span>";
   }
 
+  // A readable clone opens into its detail row; one that could not be read has
+  // no facts to open and so no toggle.
+  function cloneToggleHtml(clone) {
+    if (clone.status !== "ok") return "";
+    return '<button type="button" class="checkouts-toggle" aria-expanded="false" ' +
+      `aria-label="${wordText("text", "detailsToggleLabel", {clone: checkoutName(clone.path)})}">` +
+      `${text(codeWords("text", "detailsToggle"))}</button>`;
+  }
+
   function checkoutCellHtml(document, clone) {
     return '<th scope="row" class="checkouts-checkout">' +
       `<span class="checkouts-name">${text(checkoutName(clone.path))}</span>` +
       cloneFlagsHtml(document, clone) + freshnessHtml(document, clone) +
+      cloneToggleHtml(clone) +
       "</th>";
   }
 
@@ -2584,6 +2621,142 @@
       : dashHtml();
   }
 
+  // ---------------------------------------------------------------------
+  // The expanded clone row: path, branches with their folds, cleanup of linked
+  // worktrees and the work items the clone serves
+  // ---------------------------------------------------------------------
+
+  const BRANCH_COLUMNS = ["branch", "checkedOutIn", "tip", "remoteState", "verdict", "cleanup"];
+
+  function comparisonCellHtml(document, group, comparison) {
+    if (comparison === null || comparison === undefined) return dashHtml();
+    const check = group.remote === null ? null : group.remote.check;
+    const basis = basisWords(document, comparison.basis,
+      check === null || check === undefined ? null : check.checked_at);
+    return `<span class="checkouts-relation">${comparisonWords(comparison)}</span>` +
+      (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`);
+  }
+
+  function removableWordsHtml(removable, table) {
+    if (removable === null || removable === undefined) return dashHtml();
+    if (removable.removable) return text(codeWords("text", "removable"));
+    return blockersHtml(removable.blockers, table);
+  }
+
+  function branchRowHtml(document, group, clone, branch, parent, depth, folded) {
+    const fold = folded > 0
+      ? '<button type="button" class="checkouts-fold-toggle" aria-expanded="false" ' +
+        `data-fold="${text(branch.name)}">` +
+        `${wordText("text", "foldedBranches", {count: folded})}</button>`
+      : "";
+    return '<tr class="checkouts-clone-branch" tabindex="-1" ' +
+      `data-branch="${text(branch.name)}" data-depth="${depth}"` +
+      (parent === null ? "" : ` data-parent="${text(parent)}" hidden`) + ">" +
+      `<th scope="row" class="checkouts-branch-name">${text(branch.name)}${fold}</th>` +
+      `<td>${branch.checked_out_in === null || branch.checked_out_in === undefined
+        ? dashHtml() : text(checkoutName(branch.checked_out_in))}</td>` +
+      `<td class="checkouts-tip">${text(String(branch.sha).slice(0, 7))}</td>` +
+      `<td class="checkouts-remote-state">${comparisonCellHtml(document, group, branch.vs_remote)}</td>` +
+      `<td class="checkouts-verdict">${verdictHtml(document, group, branch.verdict, clone)}</td>` +
+      `<td class="checkouts-branch-cleanup">${removableWordsHtml(branch.removable, "branchBlocker")}</td>` +
+      "</tr>";
+  }
+
+  // Branches follow the document's order; one whose tip another branch holds
+  // sits under that branch, behind its fold.
+  function branchTableHtml(document, group, clone) {
+    if (!clone.branches.length) return "";
+    const names = new Set(clone.branches.map((branch) => branch.name));
+    const children = new Map();
+    clone.branches.forEach((branch) => {
+      const parent = branch.contained_in !== null && branch.contained_in !== undefined &&
+        names.has(branch.contained_in) ? branch.contained_in : null;
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(branch);
+    });
+    const rows = [];
+    const walk = (parent, depth) => {
+      (children.get(parent) || []).forEach((branch) => {
+        rows.push(branchRowHtml(document, group, clone, branch, parent, depth,
+          (children.get(branch.name) || []).length));
+        walk(branch.name, depth + 1);
+      });
+    };
+    walk(null, 0);
+    const head = BRANCH_COLUMNS.map((key) =>
+      `<th scope="col">${text(codeWords("column", key))}</th>`).join("");
+    return '<table class="checkouts-branch-table">' +
+      `<caption>${text(codeWords("text", "branchesHeading"))}</caption>` +
+      `<thead><tr>${head}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  }
+
+  function linkedWorktreesHtml(clone) {
+    const linked = clone.worktrees.filter((worktree) => !worktree.main);
+    if (!linked.length) return "";
+    const rows = linked.map((worktree) => {
+      const status = text(codeWords("status", worktree.status));
+      return `<tr class="checkouts-detail-worktree" data-worktree="${text(checkoutName(worktree.path))}">` +
+        `<th scope="row">${text(checkoutName(worktree.path))}</th>` +
+        `<td>${worktree.status === "ok" ? headCellHtml(worktree) : status}</td>` +
+        `<td class="checkouts-worktree-cleanup">${worktree.status === "ok"
+          ? worktreeCleanupHtml(worktree) : status}</td></tr>`;
+    }).join("");
+    const head = ["checkout", "head", "cleanup"].map((key) =>
+      `<th scope="col">${text(codeWords("column", key))}</th>`).join("");
+    return '<table class="checkouts-detail-worktrees">' +
+      `<caption>${text(codeWords("text", "worktreesHeading"))}</caption>` +
+      `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  // Every work item the clone serves: the packages a branch of it names and
+  // the packages that target it, each with how it matched.
+  function cloneWorkItems(document, clone) {
+    const bases = new Map();
+    const note = (path, words) => {
+      if (!bases.has(path)) bases.set(path, new Set());
+      bases.get(path).add(words);
+    };
+    clone.branches.forEach((branch) => {
+      (branch.packages || []).forEach((reference) => {
+        note(reference.package_path, codeWords("branchPackageBasis", reference.basis));
+      });
+    });
+    document.packages.forEach((item) => {
+      const target = item.target;
+      if (target === null || target === undefined || target.clone !== clone.path) return;
+      note(item.package_path, codeWords("assignmentBasis",
+        target.worktree === null || target.worktree === undefined
+          ? "target_repo" : "target_repo_worktree"));
+    });
+    return document.packages.filter((item) => bases.has(item.package_path))
+      .map((item) => ({item, bases: [...bases.get(item.package_path)]}));
+  }
+
+  function cloneWorkItemsHtml(document, clone) {
+    const served = cloneWorkItems(document, clone);
+    if (!served.length) return "";
+    const rows = served.map(({item, bases}) => {
+      const status = item.code_status === null || item.code_status === undefined
+        ? "" : `<span class="checkouts-code-status">${text(item.code_status.text)}</span>`;
+      return `<li class="checkouts-clone-work-item" data-package="${text(item.package_path)}">` +
+        `<span class="checkouts-package-path">${text(item.package_path)}</span> ` +
+        `<span class="checkouts-basis">(${text(bases.join(", "))})</span>` +
+        (status === "" ? "" : ` ${status}`) + ` ${showOnBoardButtonHtml(item.package_path)}</li>`;
+    }).join("");
+    return '<section class="checkouts-detail-work-items">' +
+      `<h3>${text(codeWords("text", "workItemsHeading"))}</h3><ul>${rows}</ul></section>`;
+  }
+
+  function cloneDetailHtml(document, group, clone) {
+    return `<tr class="checkouts-detail" data-detail-for="${text(clone.path)}" hidden>` +
+      `<td colspan="${CLONE_COLUMNS.length}">` +
+      '<p class="checkouts-clone-path">' +
+      `<span class="checkouts-clone-path-label">${text(codeWords("text", "clonePath"))}</span> ` +
+      `<span class="checkouts-clone-path-value">${text(clone.path)}</span></p>` +
+      branchTableHtml(document, group, clone) + linkedWorktreesHtml(clone) +
+      cloneWorkItemsHtml(document, clone) + "</td></tr>";
+  }
+
   function cloneRowHtml(document, group, clone) {
     const name = checkoutName(clone.path);
     const cells = [checkoutCellHtml(document, clone),
@@ -2594,7 +2767,8 @@
       cells.push(`<td class="checkouts-status" colspan="5">` +
         `${text(codeWords("status", clone.status))}</td>`);
       cells.push(`<td class="checkouts-package">${packageCellHtml(document, clone, null)}</td>`);
-      return `<tr class="checkouts-clone" data-clone="${text(name)}">${cells.join("")}</tr>`;
+      return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
+        `data-clone-path="${text(clone.path)}" tabindex="-1">${cells.join("")}</tr>`;
     }
     const main = clone.worktrees.find((worktree) => worktree.main) || null;
     const readable = main !== null && main.status === "ok";
@@ -2611,7 +2785,9 @@
     cells.push(`<td class="checkouts-branches">${branchesCellHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-cleanup">${cleanupCellHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-package">${packageCellHtml(document, clone, null)}</td>`);
-    return `<tr class="checkouts-clone" data-clone="${text(name)}">${cells.join("")}</tr>`;
+    return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
+      `data-clone-path="${text(clone.path)}" tabindex="-1">${cells.join("")}</tr>` +
+      cloneDetailHtml(document, group, clone);
   }
 
   function worktreeCleanupHtml(worktree) {
@@ -2642,8 +2818,8 @@
         ? worktreeCleanupHtml(worktree) : dashHtml()}</td>`,
       `<td class="checkouts-package">${packageCellHtml(document, clone, worktree)}</td>`,
     ];
-    return `<tr class="checkouts-worktree" data-worktree="${text(name)}">` +
-      `${cells.join("")}</tr>`;
+    return `<tr class="checkouts-worktree" data-worktree="${text(name)}" ` +
+      `data-worktree-path="${text(worktree.path)}" tabindex="-1">${cells.join("")}</tr>`;
   }
 
   function cloneTableHtml(document, group) {
@@ -2702,13 +2878,173 @@
       "</section>";
   }
 
+  // ---------------------------------------------------------------------
+  // Needs attention: the document's items in its order, each in words
+  // ---------------------------------------------------------------------
+
+  function attentionWords(item) {
+    const values = {
+      branch: item.branch,
+      clone: item.clone === null ? "" : checkoutName(item.clone),
+      worktree: item.worktree === null ? "" : checkoutName(item.worktree),
+      count: item.count,
+      workItem: item.packages.length ? item.packages[0] : "",
+    };
+    let words = item.code === "uncommitted_changes" && item.count === 0
+      ? wordText("text", "uncommittedOperation", values)
+      : wordText("attentionCode", item.code, values);
+    if (item.code === "awaiting_merge" &&
+      item.pull_request !== null && item.pull_request !== undefined) {
+      words += ` ${wordText("text", "awaitingMergePullRequest", {n: item.pull_request})}`;
+    }
+    return words;
+  }
+
+  // The first destination an item names (D-18): a clone and branch, a clone and
+  // worktree, a clone, a repository and branch, work items, nothing.
+  function attentionKind(item) {
+    if (item.clone !== null && item.branch !== null) return "branch";
+    if (item.clone !== null && item.worktree !== null) return "worktree";
+    if (item.clone !== null) return "clone";
+    if (item.repository !== null && item.branch !== null) return "package-branch";
+    if (item.packages.length) return "work-items";
+    return "text";
+  }
+
+  function attentionItemHtml(item, index) {
+    const kind = attentionKind(item);
+    const words = attentionWords(item);
+    const head = '<li class="checkouts-attention-item" ' +
+      `data-code="${text(item.code)}" data-attention-kind="${kind}">`;
+    if (kind === "text") return `${head}<span class="checkouts-attention-words">${words}</span></li>`;
+    if (kind === "work-items") {
+      return `${head}<span class="checkouts-attention-words">${words}</span> ` +
+        `${item.packages.map(showOnBoardButtonHtml).join(" ")}</li>`;
+    }
+    return `${head}<button type="button" class="checkouts-attention-go" ` +
+      `data-attention-index="${index}">${words}</button></li>`;
+  }
+
+  function attentionHtml(document) {
+    if (!document.attention.length) return "";
+    const parts = [];
+    let current = null;
+    document.attention.forEach((item, index) => {
+      if (item.class !== current) {
+        if (current !== null) parts.push("</ul>");
+        current = item.class;
+        parts.push('<h3 class="checkouts-attention-class" ' +
+          `data-class="${text(item.class)}">${text(codeWords("attentionClass", item.class))}</h3>` +
+          '<ul class="checkouts-attention-list">');
+      }
+      parts.push(attentionItemHtml(item, index));
+    });
+    parts.push("</ul>");
+    return '<section class="checkouts-attention">' +
+      `<h2>${text(codeWords("text", "attentionHeading"))}</h2>${parts.join("")}</section>`;
+  }
+
+  function cloneRowFor(path) {
+    return [...checkoutsBody.querySelectorAll("tr.checkouts-clone")]
+      .find((row) => row.dataset.clonePath === path) || null;
+  }
+
+  // A destination the search hides clears the search first.
+  function revealDestination(element) {
+    const group = element.closest(".checkouts-group");
+    if (group === null || !group.hidden) return;
+    filter.value = "";
+    applyFilter();
+  }
+
+  function focusDestination(element) {
+    element.scrollIntoView({block: "nearest"});
+    element.focus({preventScroll: true});
+  }
+
+  function setCloneOpen(row, open) {
+    const toggle = row.querySelector(".checkouts-toggle");
+    const detail = row.nextElementSibling;
+    if (toggle === null || detail === null || !detail.classList.contains("checkouts-detail")) {
+      return null;
+    }
+    toggle.setAttribute("aria-expanded", String(open));
+    detail.hidden = !open;
+    return detail;
+  }
+
+  // A folded row shows only while every fold above it is open.
+  function applyFolds(detail) {
+    const shown = new Map();
+    detail.querySelectorAll("tr.checkouts-clone-branch").forEach((row) => {
+      const parent = row.dataset.parent;
+      let visible = true;
+      if (parent !== undefined) {
+        const holder = shown.get(parent);
+        const toggle = detail.querySelector(
+          `tr.checkouts-clone-branch[data-branch="${CSS.escape(parent)}"] .checkouts-fold-toggle`);
+        visible = holder !== false && toggle !== null &&
+          toggle.getAttribute("aria-expanded") === "true";
+      }
+      shown.set(row.dataset.branch, visible);
+      row.hidden = !visible;
+    });
+  }
+
+  function goToAttention(index) {
+    if (checkoutsOutcome.state !== "ready") return;
+    const item = checkoutsOutcome.envelope.checkouts.attention[index];
+    if (item === undefined) return;
+    const kind = attentionKind(item);
+    if (kind === "package-branch") {
+      const group = [...checkoutsBody.querySelectorAll(".checkouts-group")]
+        .find((section) => section.dataset.checkoutsGroup === item.repository);
+      if (group === undefined) return;
+      revealDestination(group);
+      const row = [...group.querySelectorAll("table.checkouts-package-branches tr[data-branch]")]
+        .find((candidate) => candidate.dataset.branch === item.branch);
+      focusDestination(row === undefined ? group.querySelector(".checkouts-group-head") : row);
+      return;
+    }
+    const cloneRow = cloneRowFor(item.clone);
+    if (cloneRow === null) return;
+    revealDestination(cloneRow);
+    if (kind === "worktree") {
+      const nested = item.worktree === item.clone ? cloneRow
+        : [...checkoutsBody.querySelectorAll("tr.checkouts-worktree")]
+          .find((row) => row.dataset.worktreePath === item.worktree) || cloneRow;
+      focusDestination(nested);
+      return;
+    }
+    const toggle = cloneRow.querySelector(".checkouts-toggle");
+    if (kind === "branch" && toggle !== null) {
+      const detail = setCloneOpen(cloneRow, true);
+      const row = [...detail.querySelectorAll("tr.checkouts-clone-branch")]
+        .find((candidate) => candidate.dataset.branch === item.branch);
+      if (row !== undefined) {
+        // Every fold above the branch opens so its row is shown.
+        let parent = row.dataset.parent;
+        while (parent !== undefined) {
+          const above = detail.querySelector(
+            `tr.checkouts-clone-branch[data-branch="${CSS.escape(parent)}"]`);
+          above.querySelector(".checkouts-fold-toggle").setAttribute("aria-expanded", "true");
+          parent = above.dataset.parent;
+        }
+        applyFolds(detail);
+        focusDestination(row);
+        return;
+      }
+    }
+    focusDestination(toggle === null ? cloneRow : toggle);
+  }
+
   function checkoutsGroupsHtml(document) {
     const quiet = document.repositories.filter((group) =>
       isQuietRepository(document, group));
     const shown = hideQuietCheckouts
       ? document.repositories.filter((group) => !isQuietRepository(document, group))
       : document.repositories;
-    return checkoutSetupHtml(document) +
+    return checkoutSetupHtml(document) + attentionHtml(document) +
       (hideQuietCheckouts && quiet.length ? quietRowHtml(document, quiet) : "") +
       shown.map((group) => groupHtml(document, group)).join("");
   }
@@ -2745,7 +3081,7 @@
       applyFilter();
     }
     setShownView(VIEW_BOARD);
-    if (selectedPath !== path) select(path);
+    setSelection(path);
     if (card === undefined) return;
     card.scrollIntoView({block: "nearest"});
     card.focus();
@@ -2753,8 +3089,26 @@
 
   checkoutsBody.addEventListener("click", (event) => {
     const button = event.target.closest("[data-show-on-board]");
-    if (button === null) return;
-    showOnBoard(button.dataset.showOnBoard);
+    if (button !== null) {
+      showOnBoard(button.dataset.showOnBoard);
+      return;
+    }
+    const attention = event.target.closest("[data-attention-index]");
+    if (attention !== null) {
+      goToAttention(Number(attention.dataset.attentionIndex));
+      return;
+    }
+    const toggle = event.target.closest(".checkouts-toggle");
+    if (toggle !== null) {
+      const row = toggle.closest("tr.checkouts-clone");
+      setCloneOpen(row, toggle.getAttribute("aria-expanded") !== "true");
+      return;
+    }
+    const fold = event.target.closest(".checkouts-fold-toggle");
+    if (fold !== null) {
+      fold.setAttribute("aria-expanded", String(fold.getAttribute("aria-expanded") !== "true"));
+      applyFolds(fold.closest("tr.checkouts-detail"));
+    }
   });
 
   // Every settle of a pressed check announces its result once, even when it is

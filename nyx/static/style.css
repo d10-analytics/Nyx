@@ -338,6 +338,97 @@ button.pending {
   gap: .25rem;
 }
 .checkouts-verdict-words { font-weight: 600; }
+.checkouts-attention {
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-attention h2 {
+  margin: 0 0 .4rem;
+  color: var(--heading);
+  font-size: 1.05rem;
+}
+.checkouts-attention-class {
+  margin: .6rem 0 .2rem;
+  color: var(--muted);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-attention-list {
+  margin: 0;
+  padding-left: 1.15rem;
+}
+.checkouts-attention-item { margin: .2rem 0; overflow-wrap: anywhere; }
+.checkouts-attention-go {
+  padding: .1rem .35rem;
+  font: inherit;
+  font-size: .9rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.checkouts-toggle,
+.checkouts-fold-toggle {
+  display: block;
+  margin-top: .25rem;
+  padding: .05rem .4rem;
+  font-size: .75rem;
+  font-weight: 400;
+  white-space: normal;
+}
+.checkouts-detail > td {
+  padding: .6rem .75rem .9rem 1.75rem;
+  background: var(--page);
+}
+.checkouts-detail[hidden],
+.checkouts-clone-branch[hidden] { display: none; }
+.checkouts-clone-path { margin: 0 0 .6rem; overflow-wrap: anywhere; }
+.checkouts-clone-path-label { color: var(--muted); font-weight: 700; }
+.checkouts-branch-table,
+.checkouts-detail-worktrees {
+  width: 100%;
+  margin-bottom: .6rem;
+  border-collapse: collapse;
+  font-size: .85rem;
+}
+.checkouts-branch-table caption,
+.checkouts-detail-worktrees caption {
+  padding-bottom: .3rem;
+  color: var(--heading);
+  font-weight: 700;
+  text-align: left;
+}
+.checkouts-branch-table th,
+.checkouts-branch-table td,
+.checkouts-detail-worktrees th,
+.checkouts-detail-worktrees td {
+  padding: .3rem .5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.checkouts-branch-table thead th,
+.checkouts-detail-worktrees thead th {
+  color: var(--muted);
+  font-size: .78rem;
+  white-space: nowrap;
+}
+.checkouts-branch-name { overflow-wrap: anywhere; }
+.checkouts-clone-branch[data-depth="1"] .checkouts-branch-name { padding-left: 1.5rem; }
+.checkouts-clone-branch[data-depth="2"] .checkouts-branch-name { padding-left: 2.5rem; }
+.checkouts-detail-work-items h3 {
+  margin: 0 0 .3rem;
+  color: var(--heading);
+  font-size: .9rem;
+}
+.checkouts-detail-work-items ul { margin: 0; padding-left: 1.15rem; }
+.checkouts-clone-work-item { margin: .25rem 0; overflow-wrap: anywhere; }
+.checkouts-code-status { color: var(--muted); }
+/* Attention destinations take focus programmatically; the sticky toolbar must
+   not cover them once they scroll into view. */
+#checkouts [tabindex="-1"] { scroll-margin: 8rem 0 2rem; }
+#checkouts [tabindex="-1"]:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+#board .card { scroll-margin: 8rem 0 2rem; }
 .checkouts-show-on-board {
   padding: .05rem .4rem;
   font-size: .75rem;
