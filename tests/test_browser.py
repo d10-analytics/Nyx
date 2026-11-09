@@ -5824,7 +5824,7 @@ def test_checkouts_failure_hides_every_code_status_line(open_page, real_checkout
     assert page.locator(".checkouts-issue-summary").count() == 0
 
 
-def test_apply_update_hides_the_lines_until_a_matching_scan(open_page, real_checkouts):
+def test_apply_update_hides_the_code_status_until_a_matching_scan(open_page, real_checkouts):
     """A saved board revision keeps the displayed lines, and applying it hides them."""
     double = BrowserCheckouts(real_checkouts.document_zero)
     settings = BrowserSettings(revision=real_checkouts.revision)
@@ -5859,7 +5859,7 @@ def test_apply_update_hides_the_lines_until_a_matching_scan(open_page, real_chec
         assert code_status_line(page, path) == f"Code Status: {expected}", path
 
 
-def test_null_configuration_revision_never_shows_a_line(open_page, real_checkouts):
+def test_null_configuration_revision_never_shows_a_code_status_line(open_page, real_checkouts):
     """Null equals null is not a match, and no line or notice appears."""
     catalog = copy.deepcopy(real_checkouts.catalog)
     catalog["configuration_revision"] = None
