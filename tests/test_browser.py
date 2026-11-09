@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -9,13 +10,17 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
+from test_checkouts import clone, commit_file, git, isolate_git, make_remote, redigest
 from test_server import embedded_put, raw_catalog, reported_contract_cases
 
-from nyx.app_runtime import ApplicationRuntime
+from nyx import models
+from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
 from nyx.catalog import scan_catalog
+from nyx.checkouts import PackageScan, collect_checkouts
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
 from nyx.server import CatalogError, _create_application_server, create_server
 
@@ -554,6 +559,113 @@ class RootSwitchSettings(BrowserSettings):
         self.revision = "root-b-revision"
 
 
+_EMPTY_CHECKOUTS_DOCUMENT = None
+
+
+def empty_checkouts_document():
+    """One real collector document with no folders and no package scan.
+
+    Built once for the module: every application page answers the checkouts
+    request with it, so the page runs the success path and shows nothing.
+    """
+    global _EMPTY_CHECKOUTS_DOCUMENT
+    if _EMPTY_CHECKOUTS_DOCUMENT is None:
+        with TemporaryDirectory(prefix="nyx-empty-checkouts-") as home:
+            with pytest.MonkeyPatch.context() as patch:
+                isolate_git(patch, Path(home))
+                rendered = collect_checkouts(
+                    [], deadline_ns=time.monotonic_ns() + 30_000_000_000
+                )
+        _EMPTY_CHECKOUTS_DOCUMENT = json.loads(rendered)
+    return copy.deepcopy(_EMPTY_CHECKOUTS_DOCUMENT)
+
+
+def checkouts_envelope(document):
+    """The envelope the application route serves around one checkout document."""
+    return {
+        "checkouts": document,
+        "remote_checks": {
+            "state": "idle",
+            "interval_seconds": REMOTE_CHECK_INTERVAL,
+            "next_due_at": None,
+            "last": None,
+        },
+    }
+
+
+class BrowserCheckouts:
+    """The application's checkout provider double for the browser tests.
+
+    A request answers with the current document, or with the outcome queued for
+    it: an envelope the test built, or a ``CatalogError`` the route turns into a
+    502 with that code.  ``hold`` keeps the next request in flight until the
+    test releases it and records when it started, so a tick can observe one
+    request still running.
+    """
+
+    def __init__(self, document=None):
+        self.document = empty_checkouts_document() if document is None else document
+        self.calls = 0
+        self.queued = []
+        self.gate = None
+        self.entered = threading.Event()
+
+    def envelope(self):
+        """The envelope a request answers with when nothing is queued."""
+        return checkouts_envelope(self.document)
+
+    def hold(self):
+        """Hold the next request until the returned event is set."""
+        self.gate = threading.Event()
+        return self.gate
+
+    def serve(self, envelope):
+        """Answer the next request with ``envelope``."""
+        self.queued.append(envelope)
+
+    def fail(self, code):
+        """Answer the next request with the server's 502 for ``code``."""
+        self.queued.append(CatalogError(code))
+
+    def get_checkouts(self):
+        self.calls += 1
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(timeout=10)
+        outcome = self.queued.pop(0) if self.queued else self.envelope()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class CheckoutsWorkerStandIn:
+    """The worker manager a real-runtime page needs, answering captured bytes.
+
+    The application collects through its worker boundary, so a page against the
+    real provider stands this in for the subprocess: a collection returns the
+    captured document, so nothing starts a child, contacts git or uses the
+    network.
+    """
+
+    def __init__(self, document):
+        self.document = document
+        self.fetch_calls = 0
+
+    def fetch_checkouts(self, *, network):
+        self.fetch_calls += 1
+        return self.document
+
+    def fetch_catalog(self):
+        raise AssertionError("the page's catalog comes from the catalog client")
+
+    def close_admission(self):
+        """Accept the runtime's admission close; the stand-in starts no child."""
+
+    def close(self, deadline):
+        """Report the stand-in closed within the runtime's deadline."""
+        return True
+
+
 @pytest.fixture(scope="module")
 def shared_browser():
     """Yield one Chromium for the module; each launcher closes every context but leaves the browser open."""
@@ -582,8 +694,17 @@ def page_launcher(browser, launch_timeout_ms=15000):
         return application.shutdown(time.monotonic() + 2) is True
 
     def launch(
-        client, *, color_scheme="light", init_script=None, settings=None, fake_clock=False
+        client, *, color_scheme="light", init_script=None, settings=None,
+        checkouts=None, workers=None, fake_clock=False,
     ):
+        """Open one page over a standalone server or an application runtime.
+
+        ``settings`` installs the board-settings seam and the checkout provider
+        double, so the application path serves the checkouts route; ``checkouts``
+        replaces that double.  ``workers`` instead launches the real application
+        runtime over a worker stand-in, leaving the real checkout provider in
+        place.
+        """
         application = None
         server = None
         thread = None
@@ -604,15 +725,22 @@ def page_launcher(browser, launch_timeout_ms=15000):
                     port=kwargs["port"],
                     settings_provider=kwargs["settings_provider"],
                 ),
+                workers=workers,
             )
             application.get_settings = settings.get_settings
             application.get_workspace = settings.get_workspace
             application.save_settings = settings.save_settings
             client.settings = settings
+            if workers is None:
+                application.get_checkouts = (
+                    checkouts or BrowserCheckouts()).get_checkouts
         context = None
         try:
             if application is not None:
                 application.start(static_ready=lambda: True)
+                # The checkouts route asks the application for this provider at
+                # request time, so admission is open before the page loads.
+                application.admit_catalog()
                 server = application.server
                 thread = application.http_thread
             context = browser.new_context(color_scheme=color_scheme)
@@ -717,6 +845,54 @@ def fire_poll(page):
     with page.expect_response("**/api/catalog", timeout=5000) as response:
         page.clock.fast_forward(POLL_INTERVAL_MS)
     response.value.finished()
+
+
+# Records the status of every board response the page receives, including the
+# ones its first load sends before a test can attach a listener.
+RESPONSE_RECORDER = """
+window.checkoutsResponses = [];
+window.catalogResponses = [];
+const nyxRecordFetch = window.fetch;
+window.fetch = function (...args) {
+  const route = String(args[0]);
+  return nyxRecordFetch(...args).then(function (response) {
+    if (route.includes("/api/checkouts")) window.checkoutsResponses.push(response.status);
+    if (route.includes("/api/catalog")) window.catalogResponses.push(response.status);
+    return response;
+  });
+};
+"""
+
+
+def wait_for_responses(page, recorder, count):
+    """Wait until the page has received ``count`` responses on one route."""
+    page.wait_for_function(f"() => window.{recorder}.length >= {count}", timeout=5000)
+
+
+def settle_frames(page):
+    """Flush the page's pending response continuations before a DOM assertion."""
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame("
+        "() => requestAnimationFrame(resolve)))"
+    )
+
+
+def fire_checkouts_poll(page):
+    """Advance one tick, waiting for its catalog and checkouts responses.
+
+    Use it only when the tick's checkouts request is answered: a tick that finds
+    a checkouts request in flight sends none.
+    """
+    with page.expect_response("**/api/checkouts", timeout=5000) as response:
+        fire_poll(page)
+    response.value.finished()
+
+
+def card_paths(page):
+    """The package path of every rendered card, in board order."""
+    return page.locator(".card[data-package-path]").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)"
+    )
 
 
 @pytest.fixture
@@ -4792,3 +4968,579 @@ def test_page_launcher_closes_every_context_and_leaves_the_shared_browser_open(s
         stray.new_page()
     assert shared_browser.is_connected()
     assert shared_browser.contexts == []
+
+
+# ---------------------------------------------------------------------------
+# Checkouts client, document validation and the Code Status failure notice
+# ---------------------------------------------------------------------------
+
+# Two distinct configuration revisions, each a 64-character lowercase digest.
+CHECKOUTS_REVISION = "1" * 64
+CHECKOUTS_REVISION_MOVED = "2" * 64
+CHECKOUTS_PACKAGE_IDS = {
+    "alpha": "123e4567-e89b-42d3-a456-426614174a01",
+    "beta": "123e4567-e89b-42d3-a456-426614174a02",
+    "gamma": "123e4567-e89b-42d3-a456-426614174a03",
+    "delta": "123e4567-e89b-42d3-a456-426614174a04",
+    "epsilon": "123e4567-e89b-42d3-a456-426614174a05",
+}
+# The six categories a failed checkouts request reports.
+CHECKOUTS_FAILURE_CODES = [
+    "checkouts_unavailable",
+    "checkouts_timeout",
+    "checkouts_failed",
+    "checkouts_output_too_large",
+    "checkouts_cancelled",
+    "checkouts_protocol_error",
+]
+
+
+def _package_spec(root, stage, name, package_id, fields):
+    """Write one fictional package document under ``<root>/Repo/<stage>/<name>``."""
+    folder = root / "Repo" / stage / name
+    folder.mkdir(parents=True)
+    lines = [f"# {name.title()}", f"Package ID: {package_id}", "Status: approved", *fields]
+    (folder / "spec.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def real_checkouts(tmp_path_factory):
+    """One real workspace, its checkout documents and the catalog beside them.
+
+    A bare ``trunk`` remote is cloned twice into one checkout folder.  A
+    fictional specification root declares ``alpha`` on a pushed branch, ``beta``
+    on a branch only the second clone holds, ``gamma`` in a finished stage,
+    ``delta`` without a branch and ``epsilon`` on a branch nothing holds.  The
+    document is captured as built, after one more commit on ``alpha``, after two
+    more, and after ``alpha`` moves to the finished stage, with the catalog of
+    each side of that move.  Every proof therefore reads documents the real
+    collector and catalog wrote rather than a fixture imitating them, and the
+    later captures are what the Code Status line proofs read.
+    """
+    root = tmp_path_factory.mktemp("real-checkouts")
+    folder = root / "checkouts"
+    folder.mkdir()
+    served = root / "served"
+    served.mkdir()
+    (root / "home").mkdir()
+    spec_root = root / "specification-root"
+    with pytest.MonkeyPatch.context() as patch:
+        isolate_git(patch, root / "home")
+        remote = make_remote(served)
+        clone_two = clone(remote.as_uri(), folder / "Repo Clone 2")
+        clone_ten = clone(remote.as_uri(), folder / "Repo Clone 10")
+        # topic-a and topic-c are pushed from the first clone; topic-b is
+        # committed and checked out only in the second one.
+        git(clone_two, "checkout", "-q", "-b", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-a")
+        git(clone_ten, "checkout", "-q", "-b", "topic-b")
+        commit_file(clone_ten, "beta.txt", "beta one\n")
+        git(clone_two, "checkout", "-q", "-b", "topic-c", "trunk")
+        commit_file(clone_two, "gamma.txt", "gamma one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-c")
+        git(clone_two, "checkout", "-q", "topic-a")
+
+        target = [f"Target repo: {clone_two}"]
+        _package_spec(spec_root, "Drafts", "alpha", CHECKOUTS_PACKAGE_IDS["alpha"],
+                      ["Branch: topic-a", *target])
+        _package_spec(
+            spec_root, "Drafts", "beta", CHECKOUTS_PACKAGE_IDS["beta"],
+            ["Branch: topic-b", *target,
+             f"Completion Prerequisite: {CHECKOUTS_PACKAGE_IDS['alpha']}"],
+        )
+        _package_spec(spec_root, "Shipped", "gamma", CHECKOUTS_PACKAGE_IDS["gamma"],
+                      ["Branch: topic-c", *target])
+        _package_spec(spec_root, "Drafts", "delta", CHECKOUTS_PACKAGE_IDS["delta"], target)
+        _package_spec(spec_root, "Drafts", "epsilon", CHECKOUTS_PACKAGE_IDS["epsilon"],
+                      ["Branch: topic-e", *target])
+
+        def collect():
+            """One real collection of the fixture folder and package scan."""
+            return collect_checkouts(
+                [str(folder)],
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+                package_scan=PackageScan(spec_root, ("Shipped",)),
+                configuration_revision=CHECKOUTS_REVISION,
+            )
+
+        def catalog():
+            """The catalog of the specification root as it stands now."""
+            return scan_catalog(
+                spec_root,
+                completed_stage_names=["Shipped"],
+                configuration_revision=CHECKOUTS_REVISION,
+            )
+
+        catalog_before = json.loads(catalog())
+        rendered_zero = collect()
+        commit_file(clone_two, "alpha.txt", "alpha two\n")
+        rendered_one = collect()
+        commit_file(clone_two, "alpha.txt", "alpha three\n")
+        commit_file(clone_two, "alpha.txt", "alpha four\n")
+        rendered_two = collect()
+        (spec_root / "Repo" / "Drafts" / "alpha").rename(
+            spec_root / "Repo" / "Shipped" / "alpha"
+        )
+        rendered_three = collect()
+        catalog_after = json.loads(catalog())
+    return SimpleNamespace(
+        folder=folder,
+        remote=remote,
+        clone_two=clone_two,
+        clone_ten=clone_ten,
+        spec_root=spec_root,
+        revision=CHECKOUTS_REVISION,
+        revision_moved=CHECKOUTS_REVISION_MOVED,
+        catalog=catalog_before,
+        catalog_after_move=catalog_after,
+        document_zero=json.loads(rendered_zero),
+        document_zero_bytes=rendered_zero.encode("utf-8"),
+        document_one=json.loads(rendered_one),
+        document_two=json.loads(rendered_two),
+        document_three=json.loads(rendered_three),
+    )
+
+
+def open_checkouts_page(launch, real_checkouts, double, *, client=None):
+    """Open one fake-clock application page over the checkout provider double."""
+    return launch(
+        client or StaticClient(real_checkouts.catalog),
+        settings=BrowserSettings(revision=real_checkouts.revision),
+        checkouts=double,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+
+
+def test_checkouts_client_requests_at_load_and_once_per_tick(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.checkoutsResponses") == [200]
+    assert double.calls == 1
+    fire_checkouts_poll(page)
+    assert double.calls == 2
+
+
+def test_checkouts_tick_is_skipped_while_one_request_is_in_flight(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    gate = double.hold()
+    client = SequenceClient([
+        real_checkouts.catalog,
+        real_checkouts.catalog,
+        real_checkouts.catalog,
+        real_checkouts.catalog_after_move,
+    ])
+    page = open_checkouts_page(open_page, real_checkouts, double, client=client)
+    assert double.entered.wait(timeout=10)
+    assert double.calls == 1
+    # Two ticks answer their own catalog request while the first checkouts
+    # request is still held; neither starts another one.
+    fire_poll(page)
+    assert double.calls == 1
+    fire_poll(page)
+    assert double.calls == 1
+    # The third tick answers a changed catalog, which offers an update.
+    fire_poll(page)
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    assert double.calls == 1
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    fire_checkouts_poll(page)
+    assert double.calls == 2
+
+
+def test_checkouts_client_ignores_the_catalog_buttons(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([
+        real_checkouts.catalog,
+        real_checkouts.catalog,
+        real_checkouts.catalog_after_move,
+    ])
+    page = open_checkouts_page(open_page, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    assert "Repo/Drafts/alpha" in card_paths(page)
+    assert double.calls == 1
+    # Refresh view asks the catalog for another snapshot and nothing else.
+    with page.expect_response("**/api/catalog") as refreshed:
+        page.locator("#refresh").click()
+    refreshed.value.finished()
+    assert double.calls == 1
+    # Applying an offered update installs that snapshot and asks for nothing.
+    fire_poll(page)
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    wait_for_responses(page, "checkoutsResponses", 2)
+    settle_frames(page)
+    # The tick itself asked for checkouts; the button press adds no request.
+    assert double.calls == 2
+    page.locator("#refresh").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    settle_frames(page)
+    assert "Repo/Drafts/alpha" not in card_paths(page)
+    assert double.calls == 2
+    assert page.evaluate("window.checkoutsResponses") == [200, 200]
+
+
+def test_standalone_server_offers_no_checkouts_route(open_page, real_checkouts):
+    page = open_page(
+        SequenceClient([real_checkouts.catalog]),
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    shown = card_paths(page)
+    assert shown
+    fire_poll(page)
+    fire_poll(page)
+    wait_for_responses(page, "checkoutsResponses", 3)
+    settle_frames(page)
+    assert page.evaluate("window.checkoutsResponses") == [404, 404, 404]
+    assert page.locator("#board-issues").count() == 0
+    assert card_paths(page) == shown
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh.pending").count() == 0
+    assert page.locator("#refresh-status").inner_text() == ""
+
+
+def test_checkouts_request_does_not_wait_for_the_catalog(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = BlockingSequenceClient([real_checkouts.catalog] * 3, blocked_call=3)
+    page = open_checkouts_page(open_page, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    fire_checkouts_poll(page)
+    assert double.calls == 2
+    # The next tick's catalog fetch is held; its checkouts request is not.
+    page.clock.fast_forward(POLL_INTERVAL_MS)
+    assert client.started.wait(timeout=10)
+    wait_for_responses(page, "checkoutsResponses", 3)
+    assert double.calls == 3
+    assert not client.release.is_set()
+    client.release.set()
+    wait_for_responses(page, "catalogResponses", 3)
+
+
+def test_checkouts_failure_notice_keeps_focus_and_the_catalog(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    card = page.locator(f'.card[data-package-id="{CHECKOUTS_PACKAGE_IDS["beta"]}"]')
+    card.focus()
+    card.press("Enter")
+    kept = card.element_handle()
+    observe_removed_cards(page)
+    observe_refresh_status(page)
+    shown = card_paths(page)
+    summary = page.locator(".checkouts-issue-summary")
+    for code in CHECKOUTS_FAILURE_CODES:
+        double.fail(code)
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_count(1)
+        playwright.expect(summary).to_have_text(f"Code Status unavailable: {code}")
+        playwright.expect(page.locator("#board-issues ul li")).to_have_text(
+            [f"checkouts Code Status unavailable: {code}"]
+        )
+        assert page.locator(".refresh-issue-summary").count() == 0, code
+        assert page.locator("#refresh").inner_text() == "Refresh view", code
+        assert page.locator("#refresh.pending").count() == 0, code
+        assert kept.evaluate("node => node.isConnected && node === document.activeElement"), code
+        assert kept.get_attribute("aria-pressed") == "true", code
+        assert page.evaluate("window.removedCards") == 0, code
+        assert page.evaluate("window.refreshStatusRecords") == 0, code
+        assert card_paths(page) == shown, code
+
+
+CHECKOUTS_ROUTED_REPLIES = [
+    ("a-producer-code", {"status": 502, "body": '{"error": "producer_timeout"}'},
+     "checkouts_unavailable"),
+    ("an-unknown-code", {"status": 502, "body": '{"error": "surprise"}'},
+     "checkouts_unavailable"),
+    ("no-code", {"status": 502, "body": "{}"}, "checkouts_unavailable"),
+    ("a-non-json-502", {"status": 502, "body": "not json"}, "checkouts_protocol_error"),
+    ("a-non-json-200", {"status": 200, "body": "not json"}, "checkouts_protocol_error"),
+    ("an-aborted-request", {"abort": True}, "checkouts_unavailable"),
+]
+
+
+def test_checkouts_routed_replies_map_to_their_categories(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    reply = {}
+
+    def answer(route):
+        if reply.get("abort"):
+            route.abort()
+        elif reply.get("pass"):
+            route.continue_()
+        else:
+            route.fulfill(status=reply["status"], body=reply["body"])
+
+    page.route("**/api/checkouts", answer)
+    summary = page.locator(".checkouts-issue-summary")
+    for label, body, expected in CHECKOUTS_ROUTED_REPLIES:
+        reply.clear()
+        reply.update(body)
+        fire_poll(page)
+        playwright.expect(summary).to_have_count(1)
+        playwright.expect(summary).to_have_text(f"Code Status unavailable: {expected}")
+        assert page.locator(".refresh-issue-summary").count() == 0, label
+        # The served document clears the part again, so each case has to
+        # recreate it rather than inherit the previous one.
+        reply.clear()
+        reply["pass"] = True
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_count(0)
+
+
+def test_checkouts_categories_stay_on_their_own_surface(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([real_checkouts.catalog, CatalogError("checkouts_timeout")])
+    page = open_checkouts_page(open_page, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator("#refresh-status")).to_have_text(
+        "Latest refresh issue: producer_unavailable"
+    )
+    assert page.locator("#board-issues summary").inner_text() == (
+        "Latest refresh issue: producer_unavailable"
+    )
+    assert page.locator(".checkouts-issue-summary").count() == 0
+
+
+def test_checkouts_and_refresh_issues_join_and_clear_independently(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([
+        real_checkouts.catalog,
+        CatalogError("producer_unavailable"),
+        real_checkouts.catalog,
+    ])
+    page = open_checkouts_page(open_page, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    double.fail("checkouts_timeout")
+    double.fail("checkouts_timeout")
+    fire_checkouts_poll(page)
+    panel = page.locator("#board-issues")
+    playwright.expect(panel.locator("summary")).to_have_text(
+        "Latest refresh issue: producer_unavailable"
+        " · Code Status unavailable: checkouts_timeout"
+    )
+    assert panel.locator(".refresh-issue-summary").inner_text() == (
+        "Latest refresh issue: producer_unavailable"
+    )
+    playwright.expect(panel.locator("ul li")).to_have_text([
+        "refresh producer_unavailable",
+        "checkouts Code Status unavailable: checkouts_timeout",
+    ])
+    panel.locator("summary").click()
+    assert panel.get_attribute("open") is not None
+    kept = panel.element_handle()
+    # The catalog recovers: its part goes and the checkouts part stays.
+    fire_checkouts_poll(page)
+    playwright.expect(panel.locator(".checkouts-issue-summary")).to_have_text(
+        "Code Status unavailable: checkouts_timeout"
+    )
+    assert page.locator(".refresh-issue-summary").count() == 0
+    assert kept.evaluate("node => node.isConnected")
+    assert panel.get_attribute("open") is not None
+    playwright.expect(panel.locator("ul li")).to_have_text([
+        "checkouts Code Status unavailable: checkouts_timeout",
+    ])
+    # The checkouts recover too: with nothing left, the panel goes.
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator("#board-issues")).to_have_count(0)
+
+
+def checkouts_document_mutations():
+    """Each document mutation the browser must refuse as a protocol failure.
+
+    ``reseal`` recomputes the digest, so what the browser refuses is the
+    mutation rather than a digest that mutation invalidated.
+    """
+    def previous_schema(document):
+        document["schema_version"] = models.CHECKOUTS_SCHEMA_VERSION - 1
+
+    def extra_top_level_key(document):
+        document["unexpected"] = 1
+
+    def missing_top_level_key(document):
+        del document["diagnostics"]
+
+    def missing_revision(document):
+        del document["configuration_revision"]
+
+    def text_revision(document):
+        document["configuration_revision"] = "revision-1"
+
+    def upper_case_digest(document):
+        document["checkouts_digest"] = "A" * 64
+
+    def changed_after_sealing(document):
+        document["packages"][0]["finished"] = True
+
+    def packages_object(document):
+        document["packages"] = {}
+
+    def extra_package_key(document):
+        document["packages"][0]["unexpected"] = 1
+
+    def missing_package_key(document):
+        del document["packages"][0]["branch"]
+
+    def absolute_package_path(document):
+        document["packages"][0]["package_path"] = "/Repo/Drafts/alpha"
+
+    def parent_package_path(document):
+        document["packages"][0]["package_path"] = "Repo/Drafts/../alpha"
+
+    def duplicate_package_path(document):
+        document["packages"][1]["package_path"] = document["packages"][0]["package_path"]
+
+    def text_code_status(document):
+        document["packages"][0]["code_status"] = "in progress"
+
+    def extra_code_status_key(document):
+        document["packages"][0]["code_status"]["unexpected"] = 1
+
+    def control_code_status_text(document):
+        document["packages"][0]["code_status"]["text"] = "in progress\u0007"
+
+    def non_string_code_status_text(document):
+        document["packages"][0]["code_status"]["text"] = 7
+
+    return [
+        {"id": "previous-schema", "mutate": previous_schema, "reseal": True},
+        {"id": "extra-top-level-key", "mutate": extra_top_level_key, "reseal": True},
+        {"id": "missing-top-level-key", "mutate": missing_top_level_key, "reseal": True},
+        {"id": "missing-revision", "mutate": missing_revision, "reseal": True},
+        {"id": "text-revision", "mutate": text_revision, "reseal": True},
+        {"id": "upper-case-digest", "mutate": upper_case_digest, "reseal": False},
+        {"id": "changed-after-sealing", "mutate": changed_after_sealing, "reseal": False},
+        {"id": "packages-object", "mutate": packages_object, "reseal": True},
+        {"id": "extra-package-key", "mutate": extra_package_key, "reseal": True},
+        {"id": "missing-package-key", "mutate": missing_package_key, "reseal": True},
+        {"id": "absolute-package-path", "mutate": absolute_package_path, "reseal": True},
+        {"id": "parent-package-path", "mutate": parent_package_path, "reseal": True},
+        {"id": "duplicate-package-path", "mutate": duplicate_package_path, "reseal": True},
+        {"id": "text-code-status", "mutate": text_code_status, "reseal": True},
+        {"id": "extra-code-status-key", "mutate": extra_code_status_key, "reseal": True},
+        {"id": "control-code-status-text", "mutate": control_code_status_text,
+         "reseal": True},
+        {"id": "non-string-code-status-text", "mutate": non_string_code_status_text,
+         "reseal": True},
+    ]
+
+
+def test_checkouts_validator_refuses_each_document_mutation(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    summary = page.locator(".checkouts-issue-summary")
+    assert summary.count() == 0
+    card = page.locator(f'.card[data-package-id="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]')
+    card.click()
+    kept = card.element_handle()
+    shown = card_paths(page)
+    for case in checkouts_document_mutations():
+        envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
+        case["mutate"](envelope["checkouts"])
+        if case["reseal"]:
+            redigest(envelope["checkouts"])
+        # The collector's parser refuses every one of these documents, so the
+        # browser can meet none of them from a server that served a valid one.
+        with pytest.raises(models.ProtocolError):
+            models.parse_checkouts(copy.deepcopy(envelope["checkouts"]))
+        double.serve(envelope)
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_count(1)
+        playwright.expect(summary).to_have_text(
+            "Code Status unavailable: checkouts_protocol_error"
+        )
+        # Only the notice changes: the catalog, its selection and the button stay.
+        assert summary.count() == 1, case["id"]
+        assert page.locator("#refresh").inner_text() == "Refresh view", case["id"]
+        assert page.locator("#refresh.pending").count() == 0, case["id"]
+        assert card_paths(page) == shown, case["id"]
+        assert kept.evaluate("node => node.isConnected && node === document.activeElement"), (
+            case["id"]
+        )
+        # The unchanged document clears the part before the next case.
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_count(0)
+    # A changed observation instant is outside the digest, so it is accepted.
+    envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
+    envelope["checkouts"]["observed_at"] = "2020-01-01T00:00:00Z"
+    models.parse_checkouts(copy.deepcopy(envelope["checkouts"]))
+    double.serve(envelope)
+    fire_checkouts_poll(page)
+    playwright.expect(summary).to_have_count(0)
+
+
+def checkouts_envelope_mutations():
+    """Each envelope mutation the browser must refuse as a protocol failure.
+
+    ``document`` marks the mutations that also leave the served document itself
+    one the collector's parser refuses.
+    """
+
+    def extra_envelope_key(envelope):
+        envelope["unexpected"] = None
+
+    def no_document(envelope):
+        envelope["checkouts"] = None
+
+    return [
+        {"id": "extra-envelope-key", "mutate": extra_envelope_key, "document": False},
+        {"id": "no-document", "mutate": no_document, "document": True},
+    ]
+
+
+def test_checkouts_validator_refuses_each_envelope_mutation(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    summary = page.locator(".checkouts-issue-summary")
+    assert summary.count() == 0
+    for case in checkouts_envelope_mutations():
+        envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
+        case["mutate"](envelope)
+        if case["document"]:
+            with pytest.raises(models.ProtocolError):
+                models.parse_checkouts(copy.deepcopy(envelope["checkouts"]))
+        double.serve(envelope)
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_text(
+            "Code Status unavailable: checkouts_protocol_error"
+        )
+        assert summary.count() == 1, case["id"]
+        fire_checkouts_poll(page)
+        playwright.expect(summary).to_have_count(0)
+
+
+def test_checkouts_real_runtime_serves_the_collected_document(open_page, real_checkouts):
+    workers = CheckoutsWorkerStandIn(real_checkouts.document_zero_bytes)
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        settings=BrowserSettings(revision=real_checkouts.revision),
+        workers=workers,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    # The real provider accepted the collected document, so the envelope keys
+    # and the digest omission agree with the collector's.
+    assert page.evaluate("window.checkoutsResponses") == [200, 200]
+    assert workers.fetch_calls >= 1
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator(".checkouts-issue-summary").count() == 0
+
