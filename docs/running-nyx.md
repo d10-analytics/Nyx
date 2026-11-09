@@ -819,9 +819,12 @@ scan: while a board page is open Nyx rescans about once a minute, and the line
 updates on its own, without **Apply update**. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
-the board displays a configuration other than the one the scan was made under,
-which lasts until a scan under the new configuration arrives: up to about 75
-seconds after a Board settings save.
+the board displays a configuration other than the one the scan was made under.
+After a Board settings save on the same page that lasts until a scan under the
+new configuration arrives, up to about 75 seconds. After a configuration change
+saved elsewhere, such as a checkout settings save or settings saved from another
+page, the scan arrives first and the line stays hidden until **Apply update**
+installs the new catalog.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
 When every package that names a branch in its repository is finished and reads
@@ -1257,8 +1260,9 @@ minute while a board page is open, so the line updates on its own, without
 **Apply update**; **Search** covers it. While Nyx has no scan to serve, no card
 shows a line and the issues panel says `Code Status unavailable`. The lines are
 also hidden, with no message, while the board displays a configuration other
-than the one the scan was made under, which lasts for up to about 75 seconds
-after a Board settings save.
+than the one the scan was made under: for up to about 75 seconds after a Board
+settings save on the same page, and, after a configuration change saved
+elsewhere, until you press **Apply update**.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that

@@ -61,8 +61,9 @@ scan, which Nyx repeats about once a minute while a board page is open, so the
 line updates in place without **Apply update**. No line is shown while Nyx has
 no scan to serve, when the issues panel then says `Code Status unavailable`; and
 no line is shown, with no issues-panel entry, while the board displays a
-configuration the scan was not made under, which can last up to about 75 seconds
-after a Board settings save.
+configuration the scan was not made under: up to about 75 seconds after a Board
+settings save on the same page, or, after a configuration change saved elsewhere,
+until **Apply update** installs the new catalog.
 
 Nyx reads a `spec.md` header as UTF-8. A single leading UTF-8 byte order mark
 (BOM) is ignored; a second BOM, or a BOM anywhere else, is content. The header

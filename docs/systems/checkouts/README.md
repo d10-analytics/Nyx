@@ -101,7 +101,9 @@ README is narrative only.
   place on its own without **Apply update**, searchable with the card's other
   text, and hidden while the served document's `configuration_revision` differs
   from the displayed catalog's, which adds no entry and lasts for up to about
-  75 seconds after a Board settings save; while no document can be served the
+  75 seconds after a Board settings save on the same page, or, after a
+  configuration change saved elsewhere, until **Apply update** installs the new
+  catalog; while no document can be served the
   issues panel says `Code Status unavailable`.
 
 ## Collaborators
