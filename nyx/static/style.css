@@ -192,10 +192,14 @@ button.pending {
 }
 /* The grid and flex display rules would otherwise win over [hidden]. */
 #board[hidden], #checkouts[hidden] { display: none; }
+/* A refresh never moves the page: without this, a line that changes above
+   the reader's place (the status row wrapping, say) would make the browser
+   shift the scroll position to follow whatever it chose as the anchor. */
 #checkouts {
   min-height: 70vh;
   padding: 1.5rem 2rem 1rem;
   color: var(--text);
+  overflow-anchor: none;
 }
 #checkouts h1 {
   margin: 0 0 1rem;
