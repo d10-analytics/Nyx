@@ -1362,10 +1362,12 @@ folders are configured.` and points to
 
 ## Capture and review the fictional example
 
-The checked-in images use only the complete fictional community-event fixture
-listed in the [workspace guide](workspaces.md): four `spec.md` work items
-(Queue/festival, Done/permit, Needs_Fixes/cleanup, and
-Under_Development/event-site), and two `.gitkeep` empty dimensions. Create that
+The checked-in images use only fictional data. Three show the complete
+community-event fixture listed in the [workspace guide](workspaces.md): four
+`spec.md` work items (Queue/festival, Done/permit, Needs_Fixes/cleanup, and
+Under_Development/event-site), and two `.gitkeep` empty dimensions. The fourth,
+`docs/images/sample-checkouts.png`, adds the fictional checkout fixture
+described below. Create that
 disposable workspace outside the repository, configure it with
 `nyx --setup <fixture-root>`, and start Nyx through
 its normal local server and scanner. Do not use a private workspace for a public
@@ -1380,11 +1382,12 @@ instance, remove its temporary home, and confirm the owner's configuration hash
 is unchanged.
 
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
-fresh browser context so the compact preference starts checked. Before saving the
+fresh browser context so the compact preference starts checked and **Board** is
+the selected view. Before saving the
 first image, open **Board settings**, use the row-order editor to move **Queue**
 above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
-**Hide terminal rows** checked for all three images.
+**Hide terminal rows** checked for all three board images.
 
 Before each capture, inspect the live `/api/catalog` response: the workspace
 diagnostics in `discovery_diagnostics` must be empty. Both identity and program
@@ -1406,6 +1409,10 @@ hidden). Keep **Board settings** closed in every image.
 3. Uncheck **Hide empty rows and columns** to reveal the empty `Planning` row
    and `Community_Resources` column. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
+4. Check **Hide empty rows and columns** again, choose **Dark** and the
+   **Checkouts** view, and open the **Details** row of the second festival
+   clone. Save this view as `docs/images/sample-checkouts.png` (see the
+   checkout fixture below).
 
 The first image is light with the saved row order and selected festival card
 showing its filepath. The second is dark with compact view checked and the same
@@ -1413,11 +1420,44 @@ selected card and filepath. Both omit the empty dimensions. The third remains
 dark with the same selected card and filepath,
 unchecks compact view, and shows the empty Planning row and Community_Resources
 column. All three omit the finished Done row and permit card and have no issues
-panel.
+panel. Each board image shows the **Board** and **Checkouts** switch in the
+toolbar with **Board** selected.
+
+The fourth image is dark, 1600 × 1200, with **Checkouts** selected and **Hide
+quiet checkouts** checked. It shows the status line with **Check remotes now**,
+the **Needs attention** list with its one item, the **Quiet repositories** row,
+and the repository with two clones, with the second clone's **Details** open.
+Create its fictional fixture outside the repository, beside the workspace
+fixture. Make two local bare remotes whose default branch is `trunk`,
+`festival-site` and `volunteer-roster`, and clone `festival-site` twice
+(`festival-site` and `festival-site-2`) and `volunteer-roster` once. In
+`festival-site-2` switch to a new branch `signage` and make one commit on it
+without pushing. Run `git fetch` once in each of the three clones before Nyx
+starts: a fresh clone writes no `FETCH_HEAD`, and Nyx would then report it as
+never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixture`
+(a path under your home directory would show your username).
+With the isolated instance stopped, configure the clones' parent folder by the
+documented hand edit (see [Checkout folders](workspaces.md#checkout-folders)) in
+the isolated account home's configuration record, with `"github_lookup": false`;
+a Board settings save keeps that entry. Then start Nyx and save the Board
+settings described above, which also clears the
+`finished_stages_not_configured` attention item. If the owner's instance holds
+the control port, run the isolated instance on another free port rather than
+stopping it. Wait until the status line no longer says `Collected under
+different settings from the board shown.`, which follows a Board settings save by
+up to about 75 seconds.
+
+Before saving the fourth image, read the live `/api/checkouts` document: git is
+`available`, there is exactly one folder and its status is `ok`, `diagnostics`
+is empty, `attention` is exactly one `branch_not_pushed` item for `signage`, and
+there are two repositories. Reject the image if any path in it shows a username
+or home directory.
 
 Review each file directly beside the running browser in both themes. Confirm
 that the selected card, package path, empty dimensions, saved row order, labels,
-controls, and absence of workspace or refresh issues match the browser.
+controls, and absence of workspace or refresh issues match the browser, and that
+the Checkouts image matches the browser's status line, attention item and open
+clone row and shows only the fictional fixture.
 Reject a capture if the catalog is incomplete, any workspace diagnostic or issues panel
 is present, it contains a private path or value, was drawn by
 hand, or no longer shows the named state. This procedure is intentionally a
