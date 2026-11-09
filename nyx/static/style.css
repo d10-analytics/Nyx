@@ -428,7 +428,6 @@ button.pending {
    not cover them once they scroll into view. */
 #checkouts [tabindex="-1"] { scroll-margin: 8rem 0 2rem; }
 #checkouts [tabindex="-1"]:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
-#board .card { scroll-margin: 8rem 0 2rem; }
 .checkouts-show-on-board {
   padding: .05rem .4rem;
   font-size: .75rem;
