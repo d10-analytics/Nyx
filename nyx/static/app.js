@@ -76,6 +76,9 @@
   ];
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
+  const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
+  const VIEW_BOARD = "board";
+  const VIEW_CHECKOUTS = "checkouts";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
   // The terminal-row preference mirrors the compact-view preference: it is a
   // browser-local display choice applied to the catalog already fetched.  It
@@ -83,6 +86,11 @@
   // makes finished stages eligible for display again.
   const TERMINAL_STORAGE_KEY = "spec-tracker-hide-terminal-rows";
   const DESELECT_STORAGE_KEY = "spec-tracker-deselect-on-empty-click";
+  // The shown view is a browser-local display choice stored like the other
+  // preferences: a fixed Board default, read and written in try/catch, and an
+  // unknown stored value falls back to Board.
+  const VIEW_STORAGE_KEY = "spec-tracker-view";
+  const QUIET_CHECKOUTS_STORAGE_KEY = "spec-tracker-hide-quiet-checkouts";
 
   const board = document.querySelector("#board");
   const toolbar = document.querySelector(".toolbar");
@@ -90,7 +98,17 @@
   const compactControl = document.querySelector("#compact-view");
   const terminalControl = document.querySelector("#hide-terminal-rows");
   const deselectControl = document.querySelector("#deselect-on-empty-click");
+  const quietCheckoutsControl = document.querySelector("#hide-quiet-checkouts");
+  const quietCheckoutsLabel = quietCheckoutsControl.closest("label");
+  const viewBoardButton = document.querySelector("#view-board");
+  const viewCheckoutsButton = document.querySelector("#view-checkouts");
+  const checkoutsView = document.querySelector("#checkouts");
+  const checkoutsStatusLine = document.querySelector("#checkouts-status-line");
+  const checkoutsActionStatus = document.querySelector("#checkouts-action-status");
+  const checkoutsBody = document.querySelector("#checkouts-body");
+  const checkRemotesButton = document.querySelector("#check-remotes");
   const refreshButton = document.querySelector("#refresh");
+
   const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
@@ -117,6 +135,8 @@
   let hideTerminalRows = true;
   let deselectOnEmptyClick = false;
   let refreshFailure = null;
+  let shownView = VIEW_BOARD;
+  let hideQuietCheckouts = true;
   let savedStageOrder = [];
   let savedCompletedStages = [];
   let editorStageOrder = [];
@@ -132,6 +152,11 @@
   // to the issues panel, and every settled outcome rewrites the cards' lines.
   let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
   let checkoutsBusy = false;
+  // One press at a time: a press while a request is in flight is remembered as
+  // the single queued POST and sent when that request settles.  The flag stays
+  // set from the press to the POST's settle, so further presses do nothing.
+  let checkoutsCheckRequested = false;
+  let checkoutsQueuedCheck = false;
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
@@ -823,6 +848,9 @@
   }
 
   function applyFilter() {
+    // The checkouts view has no rows to filter yet; the shared query is
+    // re-applied to the board when it is shown again.
+    if (shownView === VIEW_CHECKOUTS) return;
     const query = filter.value.trim().toLowerCase();
     board.querySelectorAll(".card").forEach((card) => {
       card.hidden = Boolean(query) && !card.dataset.search.includes(query);
@@ -1198,7 +1226,69 @@
   function setPending(available) {
     refreshButton.dataset.pending = String(available);
     refreshButton.classList.toggle("pending", available);
-    refreshButton.textContent = available ? "Apply update" : "Refresh view";
+    syncViewLabels();
+  }
+
+  function readViewPreference() {
+    shownView = VIEW_BOARD;
+    try {
+      const value = window.localStorage.getItem(VIEW_STORAGE_KEY);
+      if (value === VIEW_BOARD || value === VIEW_CHECKOUTS) shownView = value;
+    } catch (_) {
+      // Board is the safe fallback when browser storage is unavailable.
+    }
+  }
+
+  function syncViewLabels() {
+    refreshButton.textContent = pending && shownView === VIEW_BOARD
+      ? "Apply update" : "Refresh view";
+    viewBoardButton.textContent = pending && shownView === VIEW_CHECKOUTS
+      ? "Board (update waiting)" : "Board";
+    viewBoardButton.setAttribute("aria-pressed", String(shownView === VIEW_BOARD));
+    viewCheckoutsButton.setAttribute("aria-pressed", String(shownView === VIEW_CHECKOUTS));
+  }
+
+  // Exactly one view is shown.  Switching keeps focus on the pressed switch
+  // button and never applies a waiting catalog: the board keeps its pending
+  // snapshot, and the switch names it while the checkouts view is shown.
+  function applyView() {
+    const checkoutsShown = shownView === VIEW_CHECKOUTS;
+    board.hidden = checkoutsShown;
+    checkoutsView.hidden = !checkoutsShown;
+    compactControl.closest("label").hidden = checkoutsShown;
+    terminalControl.closest("label").hidden = checkoutsShown;
+    quietCheckoutsLabel.hidden = !checkoutsShown;
+    filter.placeholder = checkoutsShown
+      ? "Find a checkout, branch, or work item…"
+      : "Find a work item, project, or program…";
+    syncViewLabels();
+    // The shown view applies the shared query.  The checkouts view has no rows
+    // yet, so only the board redraws here.
+    if (!checkoutsShown && displayed) applyFilter();
+  }
+
+  function setShownView(value) {
+    shownView = value;
+    try { window.localStorage.setItem(VIEW_STORAGE_KEY, value); } catch (_) { /* fallback is in-memory */ }
+    applyView();
+  }
+
+  function readQuietCheckoutsPreference() {
+    hideQuietCheckouts = true;
+    try {
+      const value = window.localStorage.getItem(QUIET_CHECKOUTS_STORAGE_KEY);
+      if (value === "true") hideQuietCheckouts = true;
+      if (value === "false") hideQuietCheckouts = false;
+    } catch (_) {
+      // A checked box is the safe fallback when browser storage is unavailable.
+    }
+    quietCheckoutsControl.checked = hideQuietCheckouts;
+  }
+
+  function setQuietCheckoutsPreference(value) {
+    hideQuietCheckouts = value;
+    try { window.localStorage.setItem(QUIET_CHECKOUTS_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
+    quietCheckoutsControl.checked = hideQuietCheckouts;
   }
 
   function settingsErrorMessage(error) {
@@ -1475,11 +1565,41 @@
     return SAFE_CATEGORIES.includes(code) && code.startsWith(prefix) ? code : fallback;
   }
 
-  // The card reads only the envelope shape, the document's identity and the
-  // package paths and Code Status text; every other subtree stays the
-  // server's, which parsed the whole document before serving it.
+  // A UTC timestamp in the one shape the collector and the runtime write.
+  function utcTimestamp(value) {
+    if (typeof value !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return false;
+    const parsed = new Date(value);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === `${value.slice(0, 19)}.000Z`;
+  }
+
+  // The schedule the status line reads: the check state, its interval, when the
+  // next check is due, and the last run's times, outcome and repositories.
+  function validateRemoteChecks(value) {
+    protocol(exactKeys(value, ["state", "interval_seconds", "next_due_at", "last"]));
+    protocol(["idle", "running"].includes(value.state));
+    protocol(typeof value.interval_seconds === "number" &&
+      Number.isFinite(value.interval_seconds) && value.interval_seconds > 0);
+    protocol(value.next_due_at === null || utcTimestamp(value.next_due_at));
+    protocol(value.last === null || exactKeys(value.last,
+      ["started_at", "finished_at", "outcome", "repositories"]));
+    if (value.last !== null) {
+      protocol(utcTimestamp(value.last.started_at) && utcTimestamp(value.last.finished_at));
+      protocol(value.last.outcome === "completed" ||
+        (typeof value.last.outcome === "string" &&
+          value.last.outcome.startsWith("checkouts_") &&
+          SAFE_CATEGORIES.includes(value.last.outcome)));
+      protocol(Array.isArray(value.last.repositories));
+    }
+  }
+
+  // The view reads the envelope shape, the document's identity, the package
+  // paths and Code Status text, and the remote-check schedule; every other
+  // subtree stays the server's, which parsed the whole document before
+  // serving it.
   async function validateCheckouts(payload) {
     protocol(exactKeys(payload, ["checkouts", "remote_checks"]));
+    validateRemoteChecks(payload.remote_checks);
     const document = payload.checkouts;
     protocol(exactKeys(document, CHECKOUTS_KEYS) &&
       document.schema_version === CHECKOUTS_SCHEMA_VERSION &&
@@ -1501,15 +1621,209 @@
     return payload;
   }
 
-  // One checkouts request at most is in flight: a tick that finds one running
-  // is skipped rather than queued, because the server answers every request
-  // with the document it has and rescans at most once a minute.
-  function requestCheckouts() {
+  // The document's own settings record, so the status line can name the lookup
+  // state without re-deriving the collector's decisions.
+  function lookupReasonWords(reason) {
+    const words = {
+      gh_missing: "the GitHub CLI (gh) was not found",
+      not_authenticated: "gh is not signed in",
+      not_found: "not found on GitHub",
+      rate_limited: "GitHub rate limit reached",
+      timed_out: "timed out",
+      failed: "failed",
+      setting_off: "lookup is off for this workspace",
+      not_github: "not a GitHub repository",
+      remote_checks_off: "remote checks are off",
+    };
+    return words[reason] || String(reason);
+  }
+
+  function utcDate(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function pad(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  function localDateKey(date) {
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  function clockText(date, seconds) {
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}` +
+      (seconds ? `:${pad(date.getSeconds())}` : "");
+  }
+
+  // A local time in a time element; the date is named when the value falls on
+  // another local day than the observation it belongs to.
+  function localTimeHtml(value, referenceValue, seconds = true) {
+    const date = utcDate(value);
+    if (date === null) return text(String(value));
+    const reference = utcDate(referenceValue);
+    const day = reference === null ? "" :
+      localDateKey(date) === localDateKey(reference) ? "" : `${localDateKey(date)} `;
+    return `<time datetime="${text(String(value))}">${text(day + clockText(date, seconds))}</time>`;
+  }
+
+  // The pull-request lookup state of the document: the settings record, then
+  // the most serious state any repository reached.
+  function lookupWords(document) {
+    if (document.github_lookup === "off") return "Pull request lookup off";
+    const lookups = document.repositories
+      .map((repository) => repository.pr_lookup)
+      .filter((lookup) => lookup !== null && lookup !== undefined);
+    const unavailable = lookups.find((lookup) => lookup.status === "unavailable");
+    if (unavailable) return `Pull requests unavailable: ${lookupReasonWords(unavailable.reason)}`;
+    const recorded = lookups
+      .filter((lookup) => lookup.status === "recorded")
+      .sort((first, second) => String(second.checked_at).localeCompare(String(first.checked_at)))[0];
+    if (recorded) {
+      return `Pull requests recorded ${localTimeHtml(recorded.checked_at, document.observed_at, false)}`;
+    }
+    if (lookups.some((lookup) => lookup.status === "live")) return "Pull requests live";
+    const off = lookups.find((lookup) => lookup.reason && lookup.reason !== "setting_off");
+    if (off) return `Pull requests unavailable: ${lookupReasonWords(off.reason)}`;
+    return "Pull request lookup off";
+  }
+
+  function nextCheckWords(envelope) {
+    const next = envelope.remote_checks.next_due_at;
+    return next === null
+      ? "Next check at the next refresh"
+      : `Next check about ${localTimeHtml(next, envelope.checkouts.observed_at)}`;
+  }
+
+  function remoteCheckWords(envelope) {
+    if (checkoutsCheckRequested || envelope.remote_checks.state === "running") {
+      return "Checking remotes…";
+    }
+    const last = envelope.remote_checks.last;
+    if (last === null) return "Remotes not checked yet";
+    const when = localTimeHtml(last.finished_at, envelope.checkouts.observed_at);
+    return last.outcome === "completed"
+      ? `Remotes checked ${when}`
+      : `Last remote check failed (${text(last.outcome)}) at ${when}`;
+  }
+
+  function renderCheckoutsStatusLine() {
+    const envelope = checkoutsOutcome.state === "ready" ? checkoutsOutcome.envelope : null;
+    if (envelope === null) {
+      checkoutsStatusLine.innerHTML = "";
+      return;
+    }
+    checkoutsStatusLine.innerHTML = [
+      `Local state ${localTimeHtml(envelope.checkouts.observed_at, envelope.checkouts.observed_at)}`,
+      remoteCheckWords(envelope),
+      nextCheckWords(envelope),
+      lookupWords(envelope.checkouts),
+    ].join(" · ");
+  }
+
+  // What the next successful collection does for a category the view shows.
+  const CHECKOUTS_CLEARING_WORDS = {
+    checkouts_unavailable: "It clears once Nyx serves checkout state again.",
+    checkouts_cancelled: "It clears when Nyx starts again.",
+    checkouts_failed: "It clears when a later collection publishes a document.",
+    checkouts_timeout: "It clears when a later collection finishes in time.",
+    checkouts_output_too_large: "It clears when a later collection's document fits.",
+    checkouts_protocol_error: "It clears when a later collection returns a valid document.",
+  };
+
+  // One panel per unavailable state, before the groups.  A ready document
+  // shows no panel, and its own setup problems belong to the setup panel.
+  function checkoutsPanelHtml() {
+    if (checkoutsOutcome.state === "not_offered") {
+      return '<section class="checkouts-panel"><p>' +
+        "This Nyx server does not serve checkout state.</p></section>";
+    }
+    if (checkoutsOutcome.state === "failed") {
+      const category = checkoutsOutcome.failure;
+      const clearing = CHECKOUTS_CLEARING_WORDS[category] ||
+        "It clears when a later collection succeeds.";
+      return '<section class="checkouts-panel"><p>' +
+        `Checkout state is unavailable: ${text(category)}. ${text(clearing)}` +
+        "</p></section>";
+    }
+    return "";
+  }
+
+  function renderCheckouts() {
+    renderCheckoutsStatusLine();
+    checkoutsBody.innerHTML = checkoutsPanelHtml();
+  }
+
+  // Every settle of a pressed check announces its result once, even when it is
+  // the same words as the previous one: one write per settle is one text
+  // change, so a repeated completion or failure is still announced.
+  function setCheckoutsActionStatus(message) {
+    const text = checkoutsActionStatus.firstChild;
+    if (text !== null && text === checkoutsActionStatus.lastChild &&
+      text.nodeType === Node.TEXT_NODE) {
+      text.data = message;
+    } else {
+      checkoutsActionStatus.textContent = message;
+    }
+  }
+
+  function remoteCheckMessage(outcome) {
+    if (outcome.state === "ready") {
+      const last = outcome.envelope.remote_checks.last;
+      if (last !== null && last.outcome === "completed") return "Remote check finished.";
+      return `Remote check failed: ${last !== null ? last.outcome : "checkouts_failed"}.`;
+    }
+    if (outcome.state === "failed") return `Remote check failed: ${outcome.failure}.`;
+    return "This server does not offer remote checks.";
+  }
+
+  function renderCheckRemotesButton() {
+    if (checkoutsCheckRequested) {
+      checkRemotesButton.setAttribute("aria-disabled", "true");
+      checkRemotesButton.textContent = "Checking remotes…";
+    } else {
+      checkRemotesButton.removeAttribute("aria-disabled");
+      checkRemotesButton.textContent = "Check remotes now";
+    }
+  }
+
+  // One press asks for one remote check.  It is sent at once when nothing is in
+  // flight, and otherwise as the single queued follow-up of the in-flight
+  // request; a second press before the answer does nothing.
+  function pressCheckRemotes() {
+    if (checkoutsCheckRequested) return;
+    checkoutsCheckRequested = true;
+    renderCheckRemotesButton();
+    renderCheckoutsStatusLine();
+    if (checkoutsBusy) {
+      checkoutsQueuedCheck = true;
+      return;
+    }
+    requestCheckouts("check");
+  }
+
+  // One checkouts request at most is in flight: a tick, or the view's refresh
+  // button, that finds one running is skipped rather than queued, because the
+  // server answers every request with the document it has and rescans at most
+  // once a minute.  A POST queued by the button is the one exception.
+  function requestCheckouts(kind = "read") {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
-    fetch(CHECKOUTS_ROUTE, {cache: "no-store"})
+    const checking = kind === "check";
+    fetch(checking ? REMOTE_CHECK_ROUTE : CHECKOUTS_ROUTE, checking ? {
+      method: "POST",
+      cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    } : {cache: "no-store"})
       .then(async (response) => {
-        if (response.status === 404) return {state: "not_offered", envelope: null, failure: null};
+        if (response.status === 404) {
+          // A 404 on the POST means this provider serves checkout state without
+          // a remote-check method, so the shown outcome stays as it is.
+          return checking
+            ? {state: "unchanged", envelope: null, failure: null}
+            : {state: "not_offered", envelope: null, failure: null};
+        }
         let payload = null;
         try {
           payload = JSON.parse(await response.text());
@@ -1535,13 +1849,34 @@
       .catch(() => ({state: "failed", envelope: null, failure: "checkouts_unavailable"}))
       .then((outcome) => {
         checkoutsBusy = false;
-        const changed = outcome.state !== checkoutsOutcome.state ||
-          outcome.failure !== checkoutsOutcome.failure;
-        checkoutsOutcome = outcome;
-        // The cards follow every settled outcome, including one that only
-        // rewrites the text they already show.
-        updateCardCodeStatus();
-        if (changed) syncBoardIssues();
+        if (outcome.state === "unchanged") {
+          setCheckoutsActionStatus("This server does not offer remote checks.");
+        } else {
+          const changed = outcome.state !== checkoutsOutcome.state ||
+            outcome.failure !== checkoutsOutcome.failure;
+          checkoutsOutcome = outcome;
+          // The cards follow every settled outcome, including one that only
+          // rewrites the text they already show.
+          updateCardCodeStatus();
+          if (changed) syncBoardIssues();
+          if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
+        }
+        // The press state lasts from the press until the request that answers
+        // it settles.  A read hands the press to its queued POST and keeps the
+        // state, so the button and the status line still say a check is running
+        // while that POST is in flight; only a POST's own settle clears it.
+        const handOff = checkoutsQueuedCheck;
+        if (!handOff) {
+          checkoutsCheckRequested = false;
+          renderCheckRemotesButton();
+        }
+        renderCheckouts();
+        // The press that arrived while a read was in flight is sent now, on
+        // that read's settle, rather than at the next tick.
+        if (handOff) {
+          checkoutsQueuedCheck = false;
+          requestCheckouts("check");
+        }
       });
   }
 
@@ -1670,7 +2005,23 @@
       }
     });
   });
+  viewBoardButton.addEventListener("click", () => {
+    if (shownView !== VIEW_BOARD) setShownView(VIEW_BOARD);
+  });
+  viewCheckoutsButton.addEventListener("click", () => {
+    if (shownView !== VIEW_CHECKOUTS) setShownView(VIEW_CHECKOUTS);
+  });
+  checkRemotesButton.addEventListener("click", () => {
+    if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
+    pressCheckRemotes();
+  });
   refreshButton.addEventListener("click", () => {
+    // In the checkouts view the button asks for the latest served scan and
+    // never applies a waiting board catalog.
+    if (shownView === VIEW_CHECKOUTS) {
+      requestCheckouts("read");
+      return;
+    }
     if (pending) apply(pending);
     else request("manual");
   });
@@ -1719,6 +2070,8 @@
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   terminalControl.addEventListener("change", () => setTerminalPreference(terminalControl.checked));
   deselectControl.addEventListener("change", () => setDeselectPreference(deselectControl.checked));
+  quietCheckoutsControl.addEventListener("change", () =>
+    setQuietCheckoutsPreference(quietCheckoutsControl.checked));
   if (typeof ResizeObserver === "function") {
     const updateToolbarHeight = () =>
       document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
@@ -1737,6 +2090,11 @@
   readCompactPreference();
   readTerminalPreference();
   readDeselectPreference();
+  readViewPreference();
+  readQuietCheckoutsPreference();
+  applyView();
+  renderCheckRemotesButton();
+  renderCheckouts();
   loadSettings();
   request("manual");
   requestCheckouts();
