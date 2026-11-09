@@ -1310,12 +1310,20 @@ folders, their clones, branches and linked worktrees, and the work items whose
 never changes a repository or a specification file, and it cannot change the
 folders; see [Inspect checkouts](#inspect-checkouts) for what each value means,
 including the explanation of every code the view shows, which this section does
-not repeat. While **Checkouts** is shown, **Search** filters the repositories by
-their names, clones, branches and work items (the field's hint changes to match), and
-**Hide empty rows and columns** and **Hide terminal rows** give way to **Hide
-quiet checkouts**. Switching views never applies a waiting board update: the
-board keeps it, and the switch reads **Board (update waiting)** until you apply
-it on the board.
+not repeat. While **Checkouts** is shown, **Search** keeps the repositories
+that match what you type, ignoring case, and hides the others (the field's hint
+changes to match). A repository matches by its name, default branch, any clone
+or linked worktree name or path, any branch name, the path of any work item it
+serves and that work item's Code Status text, the availability, HEAD and tree
+words of any clone row, and the HEAD words of a linked worktree. It searches the
+same words the rows show, so a phrase you read in a cell finds its repository.
+The **Quiet repositories** row stays where it is whatever you type. **Hide empty
+rows and columns** and **Hide terminal rows** give way to **Hide quiet
+checkouts**. Switching views never applies a waiting board update: the board
+keeps it, and the switch reads **Board (update waiting)** until you apply it on
+the board. **Refresh view** in **Checkouts** asks for the latest served scan
+and nothing else: Nyx answers from the scan it has, which it renews at most about
+once a minute, so pressing it more often returns the same scan.
 
 The line under the heading says how current the page is: `Local state` with the
 time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
@@ -1323,32 +1331,64 @@ time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
 time or `Next check at the next refresh`, and whether pull request lookup is
 live, recorded, off or unavailable. When the scan was made under different
 settings from the board shown, the line adds `Collected under different
-settings from the board shown.` **Check remotes now** asks Nyx to check every
-remote immediately instead of waiting for the next due check; it reads
-`Checking remotes…` while the check runs, and a note beside it says `Remote
-check finished.` or `Remote check failed:` with the category. Only one check
-runs at a time, and a server that does not offer remote checks says so.
+settings from the board shown.` Nyx checks the remotes itself at most every
+five minutes while a board page is open, which is what `Next check about` counts
+toward; **Check remotes now** asks for a check immediately instead of waiting
+for the next due one. It reads `Checking remotes…` while the check runs, and a
+note beside it says `Remote check finished.` or `Remote check failed:` with the
+category. Only one check runs at a time, and a server that does not offer remote
+checks says `This server does not offer remote checks.`
+
+The view marks how fresh a value is only where it can be old. A comparison with a
+remote says whether it is `live`, `recorded` with the time (`recorded 14:05`) of
+the check it came from, or `cached`. A clone whose default branch is compared
+from its cached copy of the remote says once on its row how old that copy is,
+`cached, fetched 12 min ago`, or `cached, never fetched`; when the latest check
+failed, the comparison adds `(latest check failed: remote unreachable)` with the
+reason it gave. Local
+values (HEAD, working tree, branch counts) carry no label of their own, because
+every one of them was read at the scan time that the line's `Local state` gives.
 
 **Needs attention** comes first and lists, under a heading for each class
 (`Work only on this machine`, `Finished, not merged`, `Ready to clean up`, `Base
-moved`, `Setup problems`), one sentence per item. Selecting an item that names
-a clone, branch or worktree opens that clone's row and moves focus to it; an
-item that names work items has a **Show on board** button for each of them,
-which switches to the board and selects that card. If the work item is in a
-finished row the view says to uncheck **Hide terminal rows**, and if the board
-does not show it the view says to choose **Refresh view** on the board.
+moved`, `Setup problems`), one sentence per item. Selecting an item moves focus
+to what it names. An item that names a clone and a branch opens that clone's
+**Details**, opens any folds above the branch and focuses the branch's row. An item that
+names a clone only focuses that clone's **Details** button, or its row when the
+clone could not be read. An item that names a linked worktree focuses that
+worktree's own row under its clone (the clone's row when it is the main
+worktree). An item that names a repository and a
+branch but no clone focuses the branch's row in that repository's **Work item
+branches**, and the repository's heading when no such row exists. An item that
+names work items has a **Show on board** button for each of them, which
+switches to the board and selects that card. If the work item is in a finished
+row the view says to uncheck **Hide terminal rows**, and if the board does not
+show it the view says to choose **Refresh view** on the board.
 
 Below the list each repository is a group named by its remote, with its default
 branch, the state of its remote check and pull request lookup, and its free
-clones. A group's table lists each clone with its availability, HEAD, default
-branch against the remote, working tree, branches, cleanup and package. **Details**
+clones, listed best place to start first, each with how its default branch
+compares with the remote's (the ranking is in [Inspect checkouts](#inspect-checkouts)).
+When work items name branches of the repository, a **Work item branches** table
+comes first: one row for each such branch with its remote copy, its merge
+verdict, its pull requests and the work items that name it, each with **Show on
+board**, even when no listed clone holds the branch. A group's table lists each
+clone with its availability, HEAD, default branch against the remote, working
+tree, branches, cleanup and package. A merge verdict reads `merged` with the
+proof that decided it (such as `tip is in main` or `pull request #7 merged`),
+`not merged`, or `merge state unknown` with the reason. Cleanup says
+`nothing to remove` or counts what is removable, and names each branch or
+worktree that is not removable with what blocks it, such as `not merged`,
+`merge state unknown` or `its worktree has changes`. **Details**
 opens a clone's row to show its path, branches, linked worktrees and work items;
 a branch that another branch contains is listed under **Folded branches**, which
 you open on demand. Repositories that need nothing are collected into one
 **Quiet repositories** row that you open to list them; clear **Hide quiet
-checkouts** to show each as a group of its own. The view refreshes in place on
-every scan: the rows, folds and quiet row you opened stay open, and focus and
-scroll position stay where they were. At a narrow width the tables stack, each
+checkouts** to show each as a group of its own. While **Checkouts** is shown the
+view refreshes in place on every scan: the rows, folds and quiet row you opened
+stay open, and focus and scroll position stay where they were. While the board
+is shown the view is not redrawn; switching to **Checkouts** draws the latest
+scan. At a narrow width the tables stack, each
 cell labelled by its column, so the page needs no sideways scroll.
 
 When there is nothing to read, a panel explains why instead of a list: `This

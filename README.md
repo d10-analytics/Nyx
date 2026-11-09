@@ -39,7 +39,7 @@ rows and their dependency connections.
 The **Checkouts** view, chosen with the switch in the header, shows the git
 state of your configured checkout folders beside the board: a **Needs
 attention** list, each repository's clones and branches, and a **Check remotes
-now** button. It reads the same state as `nyx checkouts`, changes no repository,
+now** button, and the header search filters it by what the rows show. It reads the same state as `nyx checkouts`, changes no repository,
 and is described in [Use the Checkouts
 view](docs/running-nyx.md#use-the-checkouts-view).
 
