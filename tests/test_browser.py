@@ -8691,6 +8691,9 @@ def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
             detail = open_clone_detail(page, "Repo Clone 2")
             detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
         playwright.expect(page.locator("#board")).to_be_visible()
+        # The checkouts toolbar is shorter than the board's, so the heads settle
+        # lower once the switch is painted; the card must clear where they end.
+        settle_frames(page)
         box = covered_card_clearance(page)
         assert box["path"] == target
         assert box["top"] >= box["covered"], (target, box)
@@ -8785,7 +8788,7 @@ def open_clone_two_state(page):
     return checkouts_focus(page)
 
 
-def assert_clone_two_state_kept(page, focus):
+def assert_clone_two_state_kept(page, focus, scroll=200):
     """The quiet row, the row, its fold, the focus and the scroll are as they were."""
     assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
     row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
@@ -8796,7 +8799,7 @@ def assert_clone_two_state_kept(page, focus):
     assert fold.get_attribute("aria-expanded") == "true"
     assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
     assert checkouts_focus(page) == focus
-    assert page.evaluate("window.scrollY") == 200
+    assert page.evaluate("window.scrollY") == scroll
 
 
 def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
@@ -8809,7 +8812,7 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     clone_path = checkout_clone(before, "Repo Clone 2")[1]["path"]
     page, double = open_view_checkouts(open_page, view_checkouts, before)
     focus = open_clone_two_state(page)
-    assert focus["control"] == "toggle" and clone_path in focus["key"]
+    assert focus["control"] == "toggle" and json.loads(focus["key"]) == ["clone", clone_path]
     held = page.evaluate_handle("document.activeElement")
     arm_focus_sampler(page)
     observe_checkouts_mutations(page)
@@ -8857,7 +8860,7 @@ def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     assert page.locator('tr[data-branch="topic-a"].checkouts-clone-branch').count() == 0
     focus = checkouts_focus(page)
     assert focus["control"] == "toggle"
-    assert checkout_clone(before, "Repo Clone 3")[1]["path"] in focus["key"]
+    assert json.loads(focus["key"]) == ["clone", checkout_clone(before, "Repo Clone 3")[1]["path"]]
     assert_focus_sampler_clean(page)
 
     # The tick that removes the group's last row moves it to the group heading.
@@ -8894,6 +8897,15 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     focus = open_clone_two_state(page)
     sentence = "Collected under different settings from the board shown."
     line = page.locator("#checkouts-status-line")
+    # The status row straddles the window's top edge, so its line is the first
+    # thing fully in view; the sentence wraps the row and moves that line up.
+    scroll = page.evaluate("""() => {
+      const row = document.querySelector('.checkouts-status').getBoundingClientRect();
+      window.scrollTo(0, Math.ceil(row.top + window.scrollY) + 4);
+      return window.scrollY;
+    }""")
+    line_top = line.evaluate("el => el.getBoundingClientRect().top")
+    assert 0 <= line_top < 20
     arm_focus_sampler(page)
     observe_checkouts_mutations(page)
 
@@ -8903,10 +8915,11 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     fire_checkouts_poll(page)
     settle_frames(page)
     assert sentence in line.inner_text()
-    assert_clone_two_state_kept(page, focus)
+    assert_clone_two_state_kept(page, focus, scroll)
+    assert line.evaluate("el => el.getBoundingClientRect().top") < line_top
     serve_checkouts(page, double, before)
     assert sentence not in line.inner_text()
-    assert_clone_two_state_kept(page, focus)
+    assert_clone_two_state_kept(page, focus, scroll)
     assert all(status for status, _, _ in checkouts_records(page))
 
     # A failed outcome shows the failed panel in place of the view; the next
@@ -8954,7 +8967,7 @@ def long_name_variant(view_checkouts):
     """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
     document = view_checkouts.document_topic_committed
     clone_ten = checkout_clone(document, "Repo Clone 10")[1]["path"]
-    long_path = clone_ten.rsplit("/", 1)[0] + "/RepoClone" + "x" * 291
+    long_path = str(Path(clone_ten).with_name("RepoClone" + "x" * 291))
     rendered = json.dumps(document).replace(json.dumps(clone_ten), json.dumps(long_path))
     rendered = rendered.replace('"topic-a"', json.dumps("p" * 300))
     variant = reseal_checkouts(json.loads(rendered))
