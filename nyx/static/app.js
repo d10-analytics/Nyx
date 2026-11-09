@@ -3083,8 +3083,24 @@
     setShownView(VIEW_BOARD);
     setSelection(path);
     if (card === undefined) return;
-    card.scrollIntoView({block: "nearest"});
-    card.focus();
+    revealCard(card);
+    card.focus({preventScroll: true});
+  }
+
+  // Scroll just far enough that the card clears the sticky toolbar and column
+  // heads above it and the window's lower edge, so it is never covered.
+  function revealCard(card) {
+    let clearance = 0;
+    document.querySelectorAll(".toolbar, .board-corner, .column-head").forEach((head) => {
+      clearance = Math.max(clearance, head.getBoundingClientRect().bottom);
+    });
+    const rect = card.getBoundingClientRect();
+    const margin = 8;
+    if (rect.top < clearance + margin) {
+      window.scrollBy(0, rect.top - clearance - margin);
+    } else if (rect.bottom > window.innerHeight - margin) {
+      window.scrollBy(0, rect.bottom - window.innerHeight + margin);
+    }
   }
 
   checkoutsBody.addEventListener("click", (event) => {
