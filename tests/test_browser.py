@@ -6375,8 +6375,9 @@ def test_checkouts_check_remotes_now_sends_one_held_post_and_announces_once(
 
 
 def test_checkouts_check_remotes_now_waits_for_a_held_read(open_page, real_checkouts):
-    """A press during a held read is sent on that read's settle, not at a tick."""
+    """A press during a held read is handed to a held POST and announced once."""
     document = real_checkouts.document_zero
+    observed = document["observed_at"]
     finished = "2026-11-09T12:00:00Z"
     double = RemoteCheckCheckouts(document)
     double.serve_remote_check(
@@ -6393,16 +6394,70 @@ def test_checkouts_check_remotes_now_waits_for_a_held_read(open_page, real_check
     assert button.inner_text() == "Checking remotes…"
     assert double.remote_calls == 0
     assert page.evaluate("window.remoteCheckResponses") == []
+    # Hold the queued POST too, so the hand-off itself is observed in flight.
+    post_gate = double.hold_remote_check()
     read_gate.set()
     wait_for_responses(page, "checkoutsResponses", 1)
-    wait_for_responses(page, "remoteCheckResponses", 1)
-    settle_frames(page)
+    assert double.remote_entered.wait(timeout=10)
+    # The read's settle sent the POST immediately and kept the pressed state:
+    # the button and the status line both still say a check is running.
     assert double.remote_calls == 1
-    assert page.evaluate("window.remoteCheckResponses") == [200]
+    assert double.calls == 1
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    assert "Checking remotes…" in page.locator("#checkouts-status-line").inner_text()
+    assert page.evaluate("window.remoteCheckResponses") == []
     # No catalog tick fired between the read's settle and the POST.
     assert page.evaluate("window.catalogResponses.length") == 1
+    # Two further presses and two ticks send nothing while the POST is held.
+    button.dispatch_event("click")
+    button.dispatch_event("click")
+    fire_poll(page)
+    fire_poll(page)
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    observe_refresh_status(page, "#checkouts-action-status")
+    post_gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    # One POST, one announcement, and the pressed state ends on the POST settle.
+    assert double.remote_calls == 1
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.evaluate("window.refreshStatusTexts") == ["Remote check finished."]
     assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert f"Remotes checked {checkouts_local_time(finished, observed)}" in (
+        page.locator("#checkouts-status-line").inner_text()
+    )
     assert button.inner_text() == "Check remotes now"
+    assert button.get_attribute("aria-disabled") is None
+
+
+def test_checkouts_action_status_announces_each_completed_check(
+    open_page, real_checkouts
+):
+    """Each completed check is announced even when its words repeat."""
+    document = real_checkouts.document_zero
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    for _ in range(2):
+        double.serve_remote_check(
+            checkouts_remote_envelope(
+                document, last=checkouts_remote_run(finished_at=finished)
+            )
+        )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    observe_refresh_status(page, "#checkouts-action-status")
+    for expected in (1, 2):
+        page.locator("#check-remotes").click()
+        wait_for_responses(page, "remoteCheckResponses", expected)
+        settle_frames(page)
+        assert page.evaluate("window.refreshStatusRecords") == expected
+        assert page.evaluate("window.refreshStatusTexts") == (
+            ["Remote check finished."] * expected
+        )
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
 
 
 def test_checkouts_remote_check_failed_outcome_writes_its_category(
