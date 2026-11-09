@@ -8641,3 +8641,53 @@ def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
     playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
     assert page.locator("#checkouts-body li[data-code]").count() == len(document["attention"])
     assert page.locator("#checkouts-body .checkouts-group").count() == 1
+
+
+def covered_card_clearance(page):
+    """How far the focused card's edges lie outside the area the sticky heads leave."""
+    return page.evaluate("""() => {
+      const rect = document.activeElement.getBoundingClientRect();
+      let covered = 0;
+      document.querySelectorAll('.toolbar, .board-corner, .column-head').forEach((head) => {
+        covered = Math.max(covered, head.getBoundingClientRect().bottom);
+      });
+      return {top: rect.top, bottom: rect.bottom, covered, height: window.innerHeight,
+              scrolled: window.scrollY, path: document.activeElement.dataset.packagePath};
+    }""")
+
+
+def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
+    open_page, attention_checkouts, tmp_path
+):
+    """Whether the card lies above or below the window, it ends fully below the heads (D-08)."""
+    spec_root = tmp_path / "tall-root"
+    _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
+    _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
+    for number in range(60):
+        _package_spec(spec_root, "Drafts", f"filler-{number:02d}",
+                      f"123e4567-e89b-42d3-a456-4266141750{number:02d}", [])
+    catalog = json.loads(scan_catalog(
+        spec_root, completed_stage_names=["Shipped"],
+        configuration_revision=CHECKOUTS_REVISION,
+    ))
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document, catalog=catalog)
+    page.locator("#view-board").click()
+    assert page.evaluate("document.documentElement.scrollHeight") > 3 * 720
+
+    for target, scroll_to in (("Repo/Drafts/alpha", "bottom"), ("Repo/Drafts/zeta", "top")):
+        page.locator("#view-board").click()
+        page.evaluate(
+            "where => window.scrollTo(0, where === 'bottom' ? document.documentElement.scrollHeight : 0)",
+            scroll_to)
+        show_checkouts_view(page)
+        if target == "Repo/Drafts/zeta":
+            page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+        else:
+            detail = open_clone_detail(page, "Repo Clone 2")
+            detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
+        playwright.expect(page.locator("#board")).to_be_visible()
+        box = covered_card_clearance(page)
+        assert box["path"] == target
+        assert box["top"] >= box["covered"], (target, box)
+        assert box["bottom"] <= box["height"], (target, box)
