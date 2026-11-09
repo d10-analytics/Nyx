@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -7874,3 +7874,66 @@ def test_checkouts_status_line_names_a_scan_from_other_settings(
     assert line.inner_text().endswith(sentence)
     # The values are still rendered: the scan is its own dated answer.
     assert page.locator("#checkouts-body .checkouts-group").count() >= 1
+
+
+def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
+    open_page, view_checkouts
+):
+    """A main worktree git did not answer for fills HEAD and Tree and is never nested (D-20)."""
+
+    def unanswered(worktree):
+        worktree["status"] = "timed_out"
+        for field in ("head", "changes", "operations", "index_lock", "verdict"):
+            worktree[field] = None
+
+    def mutate(document):
+        _, clone_two = checkout_clone(document, "Repo Clone 2")
+        unanswered(next(item for item in clone_two["worktrees"] if item["main"]))
+        unanswered(checkout_worktree(clone_two, "outside"))
+
+    document = checkout_variant(view_checkouts.document_built, mutate)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator("td.checkouts-head").inner_text() == "git did not answer in time"
+    assert clone_two.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
+    # The main worktree is never a nested row; the linked one shows the same words.
+    assert page.locator("tr.checkouts-worktree").evaluate_all(
+        "rows => rows.map(row => row.dataset.worktree)") == ["outside"]
+    linked = page.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator("td.checkouts-head").inner_text() == "git did not answer in time"
+    assert linked.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
+
+    # A linked worktree on a branch with no commit reads "unborn <branch>".
+    def unborn(value):
+        _, clone = checkout_clone(value, "Repo Clone 2")
+        checkout_worktree(clone, "outside")["head"] = {"branch": "outside", "sha": None}
+
+    served = checkout_raw_variant(view_checkouts.document_built, unborn)
+    page, _ = open_view_checkouts(open_page, view_checkouts, served)
+    assert page.locator(
+        'tr.checkouts-worktree[data-worktree="outside"] td.checkouts-head'
+    ).inner_text() == "unborn outside"
+
+
+def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
+    open_page, view_checkouts
+):
+    """A cached value names the clone's fetch age once, in whole units (D-06)."""
+    document = view_checkouts.document_built
+    observed = datetime.fromisoformat(document["observed_at"].replace("Z", "+00:00"))
+
+    def fetched(minutes):
+        def mutate(value):
+            _, clone = checkout_clone(value, "Repo Clone 2")
+            moment = observed - timedelta(minutes=minutes, seconds=30)
+            clone["cached_default"]["last_fetched_at"] = moment.strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            clone["cached_default"]["fetched_since_clone"] = True
+        return checkout_variant(document, mutate)
+
+    page, double = open_view_checkouts(open_page, view_checkouts, fetched(0))
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-freshness')
+    assert row.inner_text() == "cached, fetched <1 min ago"
+    for minutes, words in ((7, "7 min"), (125, "2 h"), (60 * 49, "2 d")):
+        serve_checkouts(page, double, fetched(minutes))
+        assert row.inner_text() == f"cached, fetched {words} ago"
