@@ -305,7 +305,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "A settings editor arrives with the Checkouts view",
+        "The **Checkouts** view shows these folders but cannot change them; until a "
+        "settings editor arrives, the record is edited by hand",
         "cannot be combined with `--setup`, `--stop` or `--status`",
         "exits 1 with one line only when the configuration is unavailable, the document "
         "exceeds 2 MiB, or a temporary file or directory it needs cannot be made",
@@ -598,7 +599,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         '"github_lookup": false',
         "`github_lookup` is the workspace's switch for the optional GitHub pull-request "
         "lookup of `nyx checkouts`",
-        "The settings editor that arrives with the Checkouts view will set it",
+        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
+        "settings editor arrives, it is edited by hand like the folders",
         "The key under `checkout_settings` is the record's own `specification_root` value",
         "Each entry in `folders` must be an absolute path, and the list must be sorted",
         "write each backslash as `\\\\` in JSON",
@@ -1267,19 +1269,24 @@ def test_desktop_guide_states_the_macos_command_line_tools_requirement():
         assert marker in section, marker
 
 
-def test_the_checkout_guide_promises_no_folder_editor():
+def test_the_checkout_guide_says_the_view_does_not_edit_folders():
     guide = _normalized("docs/running-nyx.md")
     assert (
-        "A settings editor arrives with the Checkouts view; until then the record is "
-        "edited by hand"
+        "The **Checkouts** view shows these folders but cannot change them; until a "
+        "settings editor arrives, the record is edited by hand"
     ) in guide
     assert "**Checkout settings**" not in guide
     for promise in ("checkout settings editor", "folder editor", "edit your checkout folders"):
         assert promise not in guide.lower(), promise
     # The workspace guide keeps its own hand-edit instruction and its own
-    # statement that the editor has not arrived.
+    # statement that the view cannot change the lookup.
     workspaces = _normalized("docs/workspaces.md")
-    assert "The settings editor that arrives with the Checkouts view will set it" in workspaces
+    assert (
+        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
+        "settings editor arrives, it is edited by hand like the folders"
+    ) in workspaces
+    for name, text in (("docs/running-nyx.md", guide), ("docs/workspaces.md", workspaces)):
+        assert "arrives with the Checkouts view" not in text, name
 
 
 def test_checkout_system_readme_states_the_developer_tools_check():

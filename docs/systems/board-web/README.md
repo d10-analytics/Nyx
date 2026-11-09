@@ -22,6 +22,18 @@ README is narrative only.
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
+- Shows the Checkouts view beside the board, chosen with a header switch whose
+  choice and **Hide quiet checkouts** are browser-local preferences. The view
+  renders the served checkouts document: a status line with **Check remotes
+  now** (the one write it can cause, a request for a remote check through
+  `application-serving`), a **Needs attention** list whose items open a clone's
+  row or select a work item's card, one group per repository with openable
+  clone **Details**, and a quiet row. Every enumerated value and sentence comes
+  from one words block, so an unknown code renders raw; a refresh replaces only
+  the blocks that changed, so what the reader opened and focused stays. A panel
+  replaces the groups when the server serves no checkout state, a collection
+  failed, or no folders are configured. It never edits the folders.
+
 ## Outside this boundary
 
 - Any write other than the board-settings `PUT`; editing specification files.
