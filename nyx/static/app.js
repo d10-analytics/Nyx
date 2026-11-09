@@ -45,6 +45,9 @@
   const SAFE_CATEGORIES = [
     "producer_unavailable", "producer_timeout", "producer_failed",
     "producer_output_too_large", "producer_protocol_error",
+    "checkouts_unavailable", "checkouts_timeout", "checkouts_failed",
+    "checkouts_output_too_large", "checkouts_cancelled",
+    "checkouts_protocol_error",
   ];
   const SVG_NS = "http://www.w3.org/2000/svg";
   const RAIL_PITCH = 14;
@@ -52,6 +55,25 @@
   const RAIL_LANE_CAP = 8;
   const POLL_INTERVAL = 10000;
   const CATALOG_ROUTE = "/api/catalog";
+  const CHECKOUTS_ROUTE = "/api/checkouts";
+  // The card reads the checkout facts document at exactly this schema, and the
+  // digest covers every top-level key except the digest and its observation
+  // instant, so a document the collector wrote authenticates unchanged.
+  const CHECKOUTS_SCHEMA_VERSION = 9;
+  const CHECKOUTS_DIGEST_OMITTED = ["checkouts_digest", "observed_at"];
+  const CHECKOUTS_KEYS = [
+    "schema_version", "checkouts_digest", "observed_at", "configuration_revision",
+    "git", "remote_checks", "github_lookup", "folders", "repositories",
+    "diagnostics", "package_scan", "folder_suggestions", "packages", "attention",
+  ];
+  const CHECKOUTS_PACKAGE_KEYS = [
+    "package_path", "package_id", "finished", "superseded", "target", "branch",
+    "baseline", "code_status",
+  ];
+  const CHECKOUTS_CODE_STATUS_KEYS = [
+    "state", "text", "pull_request", "push", "unpushed", "cleanup",
+    "checked_out_elsewhere",
+  ];
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
@@ -105,6 +127,11 @@
   let settingsBusy = false;
   let settingsRequestSerial = 0;
   let queuedSettingsRefresh = null;
+  // The last checkouts outcome: "idle", "not_offered", "ready" with its
+  // envelope, or "failed" with its category.  Only "failed" adds a Code Status
+  // part, and it is the one consumer this outcome has.
+  let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
+  let checkoutsBusy = false;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -565,7 +592,12 @@
 
   function syncBoardIssues(panel = board.querySelector("#board-issues")) {
     const diagnostics = workspaceDiagnostics(displayed);
-    if (!diagnostics.length && !refreshFailure) {
+    // A checkouts failure is a card-scoped part beside the catalog's refresh
+    // issue: it never changes the catalog, the button, focus or selection, and
+    // it never reaches the live region.
+    const checkoutsFailure = checkoutsOutcome.state === "failed"
+      ? checkoutsOutcome.failure : null;
+    if (!diagnostics.length && !refreshFailure && !checkoutsFailure) {
       panel?.remove();
       return;
     }
@@ -577,11 +609,15 @@
           diagnostics.map((item) => item.code).join(", ")} (${diagnostics.length})`)}</span>` : "",
       refreshFailure
         ? `<span class="refresh-issue-summary">${text(`Latest refresh issue: ${refreshFailure}`)}</span>` : "",
+      checkoutsFailure
+        ? `<span class="checkouts-issue-summary">${text(`Code Status unavailable: ${checkoutsFailure}`)}</span>` : "",
     ].filter(Boolean).join(" · ");
     const issueItems = diagnostics.map((item) =>
       `<li><code>${text(item.code)}</code> ${text(item.message)}</li>`).join("");
     const refreshItem = refreshFailure
       ? `<li><code>refresh</code> ${text(refreshFailure)}</li>` : "";
+    const checkoutsItem = checkoutsFailure
+      ? `<li><code>checkouts</code> ${text(`Code Status unavailable: ${checkoutsFailure}`)}</li>` : "";
     if (!panel) {
       panel = document.createElement("details");
       panel.id = "board-issues";
@@ -589,7 +625,7 @@
       panel.innerHTML = '<summary></summary><ul class="diagnostics"></ul>';
     }
     panel.querySelector("summary").innerHTML = summary;
-    panel.querySelector("ul").innerHTML = issueItems + refreshItem;
+    panel.querySelector("ul").innerHTML = issueItems + refreshItem + checkoutsItem;
     if (board.firstElementChild !== panel) board.prepend(panel);
   }
 
@@ -993,13 +1029,21 @@
     return `{${Object.keys(value).sort().map((key) => `${asciiString(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   }
 
-  async function authenticate(snapshot) {
+  async function authenticate(snapshot, digestKey, omitted) {
     const unsigned = {...snapshot};
-    delete unsigned.catalog_digest;
+    omitted.forEach((key) => delete unsigned[key]);
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(unsigned)));
     const actual = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    protocol(actual === snapshot.catalog_digest);
+    protocol(actual === snapshot[digestKey]);
     return snapshot;
+  }
+
+  // The one relative-package-path rule both documents use: bounded text of the
+  // same shape as the producer's normalized relative POSIX path.
+  function relativePackagePath(path) {
+    return safeText(path) &&
+      !(path.startsWith("/") || path.includes("\\") ||
+        path.split("/").some((part) => !part || part === "." || part === ".."));
   }
 
   function validateSnapshot(snapshot) {
@@ -1056,9 +1100,8 @@
         "project", "relationship", "stage"]));
       uuid(entry.package_id, true);
       protocol(component(entry.project) && component(entry.stage) &&
-        inventoryStages.has(`${entry.project}\u0000${entry.stage}`) && safeText(entry.package_path) &&
-        !(entry.package_path.startsWith("/") || entry.package_path.includes("\\") ||
-          entry.package_path.split("/").some((part) => !part || part === "." || part === "..")) &&
+        inventoryStages.has(`${entry.project}\u0000${entry.stage}`) &&
+        relativePackagePath(entry.package_path) &&
         (entry.package_path === `${entry.project}/${entry.stage}` ||
           entry.package_path.startsWith(`${entry.project}/${entry.stage}/`)));
       protocol(exactKeys(entry.declared, DECLARED_FIELDS));
@@ -1079,7 +1122,7 @@
     protocol(paths.every((path, index) => index === 0 ||
       scalarCompare(path, paths[index - 1]) >= 0) &&
       new Set(paths).size === paths.length);
-    return authenticate(snapshot);
+    return authenticate(snapshot, "catalog_digest", ["catalog_digest"]);
   }
 
   function setPending(available) {
@@ -1355,8 +1398,78 @@
     try { window.localStorage.setItem(DESELECT_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
   }
 
-  function safeCategory(error) {
-    return SAFE_CATEGORIES.includes(error.message) ? error.message : "producer_unavailable";
+  // Only the surface's own prefix is accepted, so one provider's failure can
+  // never be displayed as the other's.
+  function safeCategory(error, prefix, fallback) {
+    const code = error && typeof error.message === "string" ? error.message : "";
+    return SAFE_CATEGORIES.includes(code) && code.startsWith(prefix) ? code : fallback;
+  }
+
+  // The card reads only the envelope shape, the document's identity and the
+  // package paths and Code Status text; every other subtree stays the
+  // server's, which parsed the whole document before serving it.
+  async function validateCheckouts(payload) {
+    protocol(exactKeys(payload, ["checkouts", "remote_checks"]));
+    const document = payload.checkouts;
+    protocol(exactKeys(document, CHECKOUTS_KEYS) &&
+      document.schema_version === CHECKOUTS_SCHEMA_VERSION &&
+      /^[0-9a-f]{64}$/.test(document.checkouts_digest));
+    protocol(document.configuration_revision === null ||
+      (typeof document.configuration_revision === "string" &&
+        /^[0-9a-f]{64}$/.test(document.configuration_revision)));
+    protocol(Array.isArray(document.packages));
+    const paths = new Set();
+    document.packages.forEach((item) => {
+      protocol(exactKeys(item, CHECKOUTS_PACKAGE_KEYS) &&
+        relativePackagePath(item.package_path) && !paths.has(item.package_path));
+      paths.add(item.package_path);
+      const status = item.code_status;
+      protocol(status === null ||
+        (exactKeys(status, CHECKOUTS_CODE_STATUS_KEYS) && safeText(status.text)));
+    });
+    await authenticate(document, "checkouts_digest", CHECKOUTS_DIGEST_OMITTED);
+    return payload;
+  }
+
+  // One checkouts request at most is in flight: a tick that finds one running
+  // is skipped rather than queued, because the server answers every request
+  // with the document it has and rescans at most once a minute.
+  function requestCheckouts() {
+    if (checkoutsBusy) return;
+    checkoutsBusy = true;
+    fetch(CHECKOUTS_ROUTE, {cache: "no-store"})
+      .then(async (response) => {
+        if (response.status === 404) return {state: "not_offered", envelope: null, failure: null};
+        let payload = null;
+        try {
+          payload = JSON.parse(await response.text());
+        } catch (_) {
+          return {state: "failed", envelope: null, failure: "checkouts_protocol_error"};
+        }
+        if (!response.ok) {
+          const body = payload && typeof payload === "object" && !Array.isArray(payload);
+          const code = body && typeof payload.error === "string" ? payload.error : "";
+          return {
+            state: "failed", envelope: null,
+            failure: safeCategory(new Error(code), "checkouts_", "checkouts_unavailable"),
+          };
+        }
+        try {
+          return {state: "ready", envelope: await validateCheckouts(payload), failure: null};
+        } catch (_) {
+          // Validation and digest failures are their own category and never a
+          // mapped server code.
+          return {state: "failed", envelope: null, failure: "checkouts_protocol_error"};
+        }
+      })
+      .catch(() => ({state: "failed", envelope: null, failure: "checkouts_unavailable"}))
+      .then((outcome) => {
+        checkoutsBusy = false;
+        const changed = outcome.state !== checkoutsOutcome.state ||
+          outcome.failure !== checkoutsOutcome.failure;
+        checkoutsOutcome = outcome;
+        if (changed) syncBoardIssues();
+      });
   }
 
   function request(kind, expectedRevision = null) {
@@ -1429,7 +1542,7 @@
           loadSettings({refreshCatalog: true});
           return;
         }
-        const failure = safeCategory(error);
+        const failure = safeCategory(error, "producer_", "producer_unavailable");
         const changed = failure !== refreshFailure;
         refreshFailure = failure;
         syncBoardIssues();
@@ -1553,5 +1666,9 @@
   readDeselectPreference();
   loadSettings();
   request("manual");
-  window.setInterval(() => request("poll"), POLL_INTERVAL);
+  requestCheckouts();
+  window.setInterval(() => {
+    request("poll");
+    requestCheckouts();
+  }, POLL_INTERVAL);
 })();
