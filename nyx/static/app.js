@@ -1608,8 +1608,11 @@
     // the sticky heads below it follow at once rather than a frame later, when
     // a caller such as Show on board has already measured them.
     syncToolbarHeight();
-    // The shown view applies the shared query; switching views re-runs it.
-    applyFilter();
+    // The shown view applies the shared query; switching views re-runs it.  The
+    // checkouts view also draws the latest outcome, which its settles skipped
+    // while the board was shown.
+    if (checkoutsShown) renderCheckouts();
+    else applyFilter();
   }
 
   function syncToolbarHeight() {
@@ -2830,6 +2833,26 @@
       cloneWorkItemsHtml(document, clone) + "</td></tr>";
   }
 
+  // A main worktree that could not be read shows its own status words in the
+  // HEAD and tree cells; it is never a nested row of its own.
+  function cloneMainWorktree(clone) {
+    return clone.worktrees.find((worktree) => worktree.main) || null;
+  }
+
+  function cloneHeadHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "bareRepository"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return headCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
+  function cloneTreeHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "noWorkingTree"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return treeCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
   function cloneRowHtml(document, group, clone) {
     const name = checkoutName(clone.path);
     const cells = [checkoutCellHtml(document, clone),
@@ -2846,18 +2869,11 @@
         `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
         `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>`;
     }
-    const main = clone.worktrees.find((worktree) => worktree.main) || null;
-    const readable = main !== null && main.status === "ok";
-    // A main worktree that could not be read shows its own status words in
-    // both cells; it is never a nested row of its own.
-    const mainStatus = main === null ? "" : text(codeWords("status", main.status));
-    cells.push(`<td class="checkouts-head" role="cell">${cellLabelHtml("head")}${clone.bare
-      ? text(codeWords("text", "bareRepository"))
-      : readable ? headCellHtml(main) : mainStatus}</td>`);
+    cells.push(`<td class="checkouts-head" role="cell">${cellLabelHtml("head")}` +
+      `${cloneHeadHtml(clone)}</td>`);
     cells.push(defaultCellHtml(document, group, clone));
-    cells.push(`<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}${clone.bare
-      ? text(codeWords("text", "noWorkingTree"))
-      : readable ? treeCellHtml(main) : mainStatus}</td>`);
+    cells.push(`<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
+      `${cloneTreeHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}` +
       `${branchesCellHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
@@ -2918,31 +2934,59 @@
     return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""));
   }
 
+  // The words a cell shows, without its markup, so the search matches what the
+  // reader sees.
+  function wordsOf(html) {
+    const holder = document.createElement("template");
+    holder.innerHTML = html;
+    return holder.content.textContent;
+  }
+
   function groupSearchText(document, group) {
     const values = [remoteName(group)];
     if (group.default_branch !== null && group.default_branch.name !== null) {
       values.push(group.default_branch.name);
     }
-    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    const served = new Map();
+    const notePackage = (item) => served.set(item.package_path, item);
     group.clones.forEach((clone) => {
       values.push(checkoutName(clone.path), clone.path);
+      values.push(wordsOf(availabilityCellHtml(clone)));
+      if (clone.status === "ok") {
+        values.push(wordsOf(cloneHeadHtml(clone)), wordsOf(cloneTreeHtml(clone)));
+        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
+      } else {
+        values.push(wordsOf(text(codeWords("status", clone.status))));
+      }
       (clone.worktrees || []).forEach((worktree) => {
         values.push(checkoutName(worktree.path), worktree.path);
+        values.push(wordsOf(worktree.status === "ok"
+          ? headCellHtml(worktree) : text(codeWords("status", worktree.status))));
       });
       (clone.branches || []).forEach((branch) => values.push(branch.name));
     });
-    (group.package_branches || []).forEach((entry) => {
-      values.push(entry.name);
-      entry.packages.forEach((path) => values.push(path));
-    });
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
     document.packages.forEach((item) => {
       if (item.target !== null && item.target !== undefined &&
-        clonePaths.has(item.target.clone)) {
-        values.push(item.package_path);
+        clonePaths.has(item.target.clone)) notePackage(item);
+    });
+    (group.package_branches || []).forEach((entry) => {
+      values.push(entry.name);
+      entry.packages.forEach((path) => {
+        values.push(path);
+        const item = document.packages.find((candidate) => candidate.package_path === path);
+        if (item !== undefined) notePackage(item);
+      });
+    });
+    served.forEach((item, path) => {
+      values.push(path);
+      if (item.code_status !== null && item.code_status !== undefined) {
+        values.push(item.code_status.text);
       }
     });
     return values
-      .filter((value) => value !== null && value !== undefined && value !== "")
+      .filter((value) => value !== null && value !== undefined && value !== "" &&
+        value !== "—")
       .join(" ").toLowerCase();
   }
 
@@ -3520,7 +3564,7 @@
       .then((outcome) => {
         checkoutsBusy = false;
         if (outcome.state === "unchanged") {
-          setCheckoutsActionStatus("This server does not offer remote checks.");
+          setCheckoutsActionStatus(codeWords("text", "doesNotOfferRemotes"));
         } else {
           const changed = outcome.state !== checkoutsOutcome.state ||
             outcome.failure !== checkoutsOutcome.failure;
@@ -3540,7 +3584,9 @@
           checkoutsCheckRequested = false;
           renderCheckRemotesButton();
         }
-        renderCheckouts();
+        // Only the shown view is drawn; switching to Checkouts draws the latest
+        // outcome, so a tick while the board is shown leaves the board alone.
+        if (shownView === VIEW_CHECKOUTS) renderCheckouts();
         // The press that arrived while a read was in flight is sent now, on
         // that read's settle, rather than at the next tick.
         if (handOff) {
@@ -3762,7 +3808,6 @@
   readQuietCheckoutsPreference();
   applyView();
   renderCheckRemotesButton();
-  renderCheckouts();
   loadSettings();
   request("manual");
   requestCheckouts();

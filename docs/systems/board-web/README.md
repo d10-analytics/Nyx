@@ -26,11 +26,17 @@ README is narrative only.
   choice and **Hide quiet checkouts** are browser-local preferences. The view
   renders the served checkouts document: a status line with **Check remotes
   now** (the one write it can cause, a request for a remote check through
-  `application-serving`), a **Needs attention** list whose items open a clone's
-  row or select a work item's card, one group per repository with openable
-  clone **Details**, and a quiet row. Every enumerated value and sentence comes
-  from one words block, so an unknown code renders raw; a refresh replaces only
-  the blocks that changed, so what the reader opened and focused stays. A panel
+  `application-serving`), a **Needs attention** list whose items focus the
+  branch, clone, worktree or **Work item branches** row they name (a branch item
+  opens the clone's **Details** first) or select a work item's card, one group
+  per repository with openable clone **Details**, and a quiet row. The shared
+  search keeps a repository when its names, paths, branches, work item paths and
+  Code Status text, or the availability, HEAD and tree words its rows show,
+  match. Every enumerated value and sentence comes from one words block, so an
+  unknown code renders raw. The view is drawn only while it is shown, and once on
+  switching to it with the latest outcome, so a scan that settles while the board
+  is shown does not touch the board; a refresh replaces only the blocks that
+  changed, so what the reader opened and focused stays. A panel
   replaces the groups when the server serves no checkout state, a collection
   failed, or no folders are configured. It never edits the folders.
 

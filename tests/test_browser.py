@@ -6540,6 +6540,76 @@ def test_checkouts_check_remotes_now_404_keeps_the_shown_outcome(
     assert page.locator("#check-remotes").inner_text() == "Check remotes now"
 
 
+def test_checkouts_check_remotes_404_says_what_the_words_block_says(
+    open_page, real_checkouts
+):
+    """The 404 sentence comes from the words block: editing one without the page fails."""
+    edited = "Remote checks are not part of this server."
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    entry = f'"doesNotOfferRemotes": {json.dumps(checkout_words()["text"]["doesNotOfferRemotes"])}'
+    assert source.count(entry) == 1
+    # Only the words entry is edited; any other copy of the sentence stays.
+    page_source = source.replace(entry, f'"doesNotOfferRemotes": {json.dumps(edited)}')
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    page.route("**/static/app.js", lambda route: route.fulfill(
+        status=200, content_type="text/javascript", body=page_source))
+    page.reload()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [404]
+    assert page.locator("#checkouts-action-status").inner_text() == edited
+
+
+def test_checkouts_settles_leave_the_board_alone_until_the_view_is_shown(
+    open_page, real_checkouts
+):
+    """Ticks while the board is shown touch no board node; switching shows the latest outcome."""
+    document = real_checkouts.document_zero
+    double = BrowserCheckouts(document)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    settle_frames(page)
+    rail_layer = page.locator(".rail-layer").element_handle()
+    page.evaluate("""() => {
+      window.boardRecords = [];
+      new MutationObserver((records) => window.boardRecords.push(...records.map(
+        (record) => record.type + ':' + (record.attributeName || ''))))
+        .observe(document.querySelector('#board'),
+          {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+    # An unchanged tick, then one whose outcome changes only the scan's time:
+    # neither re-filters the board or redraws its rails.
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    later = "2030-01-01T00:00:00Z"
+    double.serve(checkouts_envelope(with_observed_at(document, later)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("window.boardRecords") == []
+    assert rail_layer.evaluate("node => node.isConnected")
+
+    # A failure while the board is shown is still recorded for the view.
+    double.fail("checkouts_timeout")
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    double.serve(checkouts_envelope(with_observed_at(document, later)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    assert page.locator("#checkouts-status-line").inner_text().startswith(
+        f"Local state {checkouts_local_time(later, later)}")
+    assert page.locator(".checkouts-panel").count() == 0
+    assert page.locator(".checkouts-group").count() > 0
+
+
 def checkouts_remote_check_mutations():
     """Each remote-check mutation the browser must refuse as a protocol failure."""
     run = checkouts_remote_run(finished_at="2026-11-09T12:00:00Z")
@@ -7565,6 +7635,48 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     page.fill("#filter", "")
     assert page.locator(".checkouts-group:not([hidden])").count() == len(
         document["repositories"])
+
+
+def mutate_searchable_words(document):
+    """A quiet clone with a detached, edited tree and a detached linked worktree."""
+    verdict = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+    _, quiet = checkout_clone(document, "Quiet Clone")
+    main = next(item for item in quiet["worktrees"] if item["main"])
+    main["head"] = {"branch": None, "sha": "abc1234" + "0" * 33}
+    main["verdict"] = dict(verdict)
+    main["changes"]["unstaged"] = 3
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    linked = checkout_worktree(clone_two, "outside")
+    linked["head"] = {"branch": None, "sha": "fedcba9" + "0" * 33}
+    linked["verdict"] = dict(verdict)
+
+
+def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_checkouts):
+    """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
+    document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    remote = checkout_group(document, "remote")["remote"]["display"]
+    quiet = checkout_group(document, "quiet")["remote"]["display"]
+
+    def shown(query):
+        page.fill("#filter", query)
+        return page.locator(
+            ".checkouts-group:not([hidden]) .checkouts-group-name").all_inner_texts()
+
+    assert sorted(shown("")) == sorted([remote, quiet])
+    # The served Code Status text of a work item the group serves.
+    assert shown("in progress · pushed") == [remote]
+    # The availability words of a clone row.
+    assert shown("has linked worktrees") == [remote]
+    # The HEAD words of the quiet clone's main worktree, and its tree words.
+    assert shown("detached at abc1234") == [quiet]
+    assert shown("3 unstaged") == [quiet]
+    # A linked worktree's HEAD words.
+    assert shown("detached at fedcba9") == [remote]
+    assert shown("no such words anywhere") == []
 
 
 # ---------------------------------------------------------------------------
@@ -8745,6 +8857,7 @@ def observe_checkouts_mutations(page):
           window.checkoutsRecords.push({
             status: status.contains(record.target),
             action: action.contains(record.target),
+            attribute: record.type === 'attributes' ? record.attributeName : null,
             keys: record.type === 'childList' ? moved.map(own) : [own(record.target)],
           });
         }
@@ -8753,10 +8866,17 @@ def observe_checkouts_mutations(page):
     }""")
 
 
-def checkouts_records(page):
-    """The records seen since the last call, as ``(status, action, keys)`` tuples."""
+def checkouts_records(page, *, with_attribute=False):
+    """The records seen since the last call, as ``(status, action, keys)`` tuples.
+
+    ``with_attribute`` appends the changed attribute's name (None for a text or
+    node change) as a fourth item.
+    """
     records = page.evaluate(
         "() => window.checkoutsRecords.splice(0, window.checkoutsRecords.length)")
+    if with_attribute:
+        return [(item["status"], item["action"], item["keys"], item["attribute"])
+                for item in records]
     return [(item["status"], item["action"], item["keys"]) for item in records]
 
 
@@ -8831,16 +8951,23 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     assert "1 ahead" in row.locator(".checkouts-remote-state").inner_text()
     old_tip = row.locator(".checkouts-tip").inner_text()
     serve_checkouts(page, double, after)
-    records = checkouts_records(page)
-    outside = [keys for status, _, keys in records if not status]
+    records = checkouts_records(page, with_attribute=True)
+    outside = [(keys, attribute) for status, _, keys, attribute in records if not status]
     assert outside, "the new commit changed no block"
-    assert all(keys and all(key is not None and clone_path in json.loads(key) for key in keys)
-               for keys in outside), outside
+    # The group's search words follow the served Code Status text and HEAD
+    # words, so its own search attribute is the one write a group block takes;
+    # every other change sits in a block of Repo Clone 2.
+    assert all(
+        keys and all(
+            key is not None and (clone_path in json.loads(key) or (
+                json.loads(key)[0] == "group" and attribute == "data-search"))
+            for key in keys)
+        for keys, attribute in outside), outside
     assert "2 ahead" in row.locator(".checkouts-remote-state").inner_text()
     assert row.locator(".checkouts-tip").inner_text() != old_tip
     assert_clone_two_state_kept(page, focus)
     assert page.locator("#checkouts-action-status").inner_text() == pushed
-    assert all(not action for _, action, _ in records)
+    assert all(not action for _, action, _, _ in records)
     assert_focus_sampler_clean(page)
 
 
