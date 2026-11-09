@@ -570,7 +570,12 @@ While checkout data is requested, Nyx refreshes the served answer in the
 background about once a minute, and starts a networked check when none has
 started in this runtime or when five minutes have passed since the last one
 started, so checks run at most every five minutes; while nothing requests
-checkout data, Nyx makes no network call. A checkout settings save also makes
+checkout data, Nyx makes no network call. A board page requests checkout data
+while it is open, so an open board is what keeps that refresh running: Nyx
+refreshes its served document about once a minute, and makes a networked check,
+with the GitHub lookup when it is enabled, at most every five minutes. With no
+checkout folders configured, a collection reaches no repository and makes no
+network call either. A checkout settings save also makes
 the next check due at once, outside that five-minute cadence, so the collection
 that follows a save can start sooner than five minutes after the previous
 check. One collection runs at a time, and at most one waits: a request that
@@ -794,8 +799,10 @@ stands. A package has a Code Status only when its target is a `clone` or a
 relative, missing or invalid target, a target outside the checkout folders, git
 missing or too old, a branch that is the repository's default branch, and a
 branch found nowhere all leave it empty. The plain lines show a package only by its path: after `assigned` on the clone
-line it is assigned to, and in the attention lines that name it. The Code Status text and the rest of the package
-record are in the `--json` document. `package_scan.status` is
+line it is assigned to, and in the attention lines that name it. The Code Status
+text and the rest of the package record are in the `--json` document, and a
+package that has a Code Status also shows that text on its board card.
+`package_scan.status` is
 `unavailable` when the workspace has no specification root or Nyx cannot read it,
 and then no package is listed. It is `complete` when Nyx read every specification
 whole, and `incomplete` when some specification could not be read whole. A package
@@ -803,6 +810,18 @@ whose `spec.md` cannot be read is not listed in `packages`, so an `incomplete` s
 means a package may exist that the list does not show; rule 3 below never concludes
 `awaiting merge (no PR)` on an `incomplete` scan. `package_scan.finished_policy` is
 `configured` or `not_configured`, as described below.
+
+**On the board.** A card whose package has a Code Status shows one
+`Code Status:` line directly after its filepath, holding exactly the text
+`nyx checkouts --json` gives for that package; the browser shows what it is
+served and rebuilds nothing. That text comes from Nyx's last successful checkout
+scan: while a board page is open Nyx rescans about once a minute, and the line
+updates on its own, without **Apply update**. The line is part of the card's
+search text. It is hidden while Nyx has no scan to serve, and the issues panel
+then says `Code Status unavailable`. It is also hidden, with no message, while
+the board displays a configuration other than the one the scan was made under,
+which lasts until a scan under the new configuration arrives: up to about 75
+seconds after a Board settings save.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
 When every package that names a branch in its repository is finished and reads
@@ -1228,7 +1247,18 @@ a brief confirmation beside the card when the copy succeeds.
 
 Nyx checks for changed information every ten seconds. **Apply update** loads the
 waiting snapshot; **Refresh view** requests an immediate check when no update is
-waiting. Changes are not applied automatically while you are reading a snapshot.
+waiting. Catalog changes are not applied automatically while you are reading a
+snapshot.
+
+A card whose package has a Code Status shows a `Code Status:` line under its
+filepath, holding the same text `nyx checkouts --json` gives for that package.
+Nyx reads it from its last successful checkout scan, and it rescans about once a
+minute while a board page is open, so the line updates on its own, without
+**Apply update**; **Search** covers it. While Nyx has no scan to serve, no card
+shows a line and the issues panel says `Code Status unavailable`. The lines are
+also hidden, with no message, while the board displays a configuration other
+than the one the scan was made under, which lasts for up to about 75 seconds
+after a Board settings save.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that
