@@ -94,8 +94,17 @@ README is narrative only.
 
 ## Outside this boundary
 
-- Fetching, writing or locking a repository; the board, which never shows
-  checkout state.
+- Fetching, writing or locking a repository. The board renders the served
+  document's Code Status as a card line and never derives, rescans or ages it:
+  the line holds the text `nyx checkouts --json` gives from the last successful
+  scan, refreshed about once a minute by `application-serving` and updated in
+  place on its own without **Apply update**, searchable with the card's other
+  text, and hidden while the served document's `configuration_revision` differs
+  from the displayed catalog's, which adds no entry and lasts for up to about
+  75 seconds after a Board settings save on the same page, or, after a
+  configuration change saved elsewhere, until **Apply update** installs the new
+  catalog; while no document can be served the
+  issues panel says `Code Status unavailable`.
 
 ## Collaborators
 
