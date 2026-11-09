@@ -5591,6 +5591,21 @@ def code_status_line(page, path):
     return lines.inner_text() if lines.count() else None
 
 
+def card_code_status_structure(page):
+    """Each card's line count and the class names of the elements around its line.
+
+    A line a full render writes and a line an update inserts in place must agree
+    on both neighbours, which is where Filepath and the start text sit.
+    """
+    return page.locator(".card[data-package-path]").evaluate_all("""cards => cards.map(card => ({
+      path: card.dataset.packagePath,
+      tag: card.tagName,
+      lines: card.querySelectorAll('.card-code-status').length,
+      previous: card.querySelector('.card-code-status')?.previousElementSibling?.className,
+      next: card.querySelector('.card-code-status')?.nextElementSibling?.className,
+    }))""")
+
+
 def visible_card_paths(page, query):
     """The package paths a search leaves visible."""
     page.fill("#filter", query)
@@ -5627,13 +5642,7 @@ def test_code_status_line_shows_the_served_document(open_page, real_checkouts):
         assert "Code Status" not in code_status_card(page, path).inner_text(), path
     # The line follows Filepath inside the card's button and precedes its start
     # text, exactly where Filepath and Target Folder are.
-    structure = page.locator(".card[data-package-path]").evaluate_all("""cards => cards.map(card => ({
-      path: card.dataset.packagePath,
-      tag: card.tagName,
-      lines: card.querySelectorAll('.card-code-status').length,
-      previous: card.querySelector('.card-code-status')?.previousElementSibling?.className,
-      next: card.querySelector('.card-code-status')?.nextElementSibling?.className,
-    }))""")
+    structure = card_code_status_structure(page)
     assert len(structure) == len(CHECKOUTS_CARD_PATHS)
     for card in structure:
         assert card["tag"] == "BUTTON", card
@@ -5824,6 +5833,13 @@ def test_checkouts_failure_hides_every_code_status_line(open_page, real_checkout
     fire_checkouts_poll(page)
     for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
         assert code_status_line(page, path) == f"Code Status: {expected}", path
+    # This recovery inserted each line into a card the board already held, so
+    # the in-place insert must put it exactly where a rendered card puts it:
+    # directly after Filepath and before the start text.
+    for card in card_code_status_structure(page):
+        if card["path"] in CHECKOUTS_CODE_STATUS_TEXTS:
+            assert card["previous"] == "card-filepath", card
+            assert card["next"] == "visually-hidden card-start-text", card
     assert page.locator(".checkouts-issue-summary").count() == 0
 
 
