@@ -820,7 +820,7 @@ updates on its own, without **Apply update**. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
-After a Board settings save on the same page that lasts until a scan under the
+A Board settings save on the same page keeps it hidden until a scan under the
 new configuration arrives, up to about 75 seconds. After a configuration change
 saved elsewhere, such as a checkout settings save or settings saved from another
 page, the scan arrives first and the line stays hidden until **Apply update**
