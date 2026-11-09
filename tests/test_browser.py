@@ -1,3 +1,4 @@
+import ast
 import copy
 import json
 import os
@@ -6783,3 +6784,1093 @@ def test_checkouts_view_malformed_body_shows_the_protocol_panel(
     fire_checkouts_poll(page)
     playwright.expect(panel).to_have_count(0)
     assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+# ---------------------------------------------------------------------------
+# The checkouts view: words, groups, rows and the Checkout setup panel
+# ---------------------------------------------------------------------------
+
+CHECKOUTS_WORDS_BEGIN = "// checkout words: begin"
+CHECKOUTS_WORDS_END = "// checkout words: end"
+
+
+def checkouts_view_source():
+    """The one browser file the view's words and rendering live in."""
+    return Path(__file__).resolve().parents[1] / "nyx" / "static" / "app.js"
+
+
+def checkout_words():
+    """The view's one words block, read between its markers as the JSON it must stay."""
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    assert source.count(CHECKOUTS_WORDS_BEGIN) == 1
+    assert source.count(CHECKOUTS_WORDS_END) == 1
+    block = source.split(CHECKOUTS_WORDS_BEGIN, 1)[1].split(CHECKOUTS_WORDS_END, 1)[0]
+    match = re.fullmatch(r"\s*const WORDS = (\{.*\});\s*", block, re.S)
+    assert match is not None, "the words block is not one `const WORDS = {…};` literal"
+    return json.loads(match.group(1))
+
+
+def _checkout_literal_strings(node):
+    """Every string a word-carrying expression names, however it nests."""
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    if isinstance(node, ast.IfExp):
+        return _checkout_literal_strings(node.body) | _checkout_literal_strings(node.orelse)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        found = set()
+        for element in node.elts:
+            found |= _checkout_literal_strings(element)
+        return found
+    return set()
+
+
+def checkout_function_literals(name):
+    """The string literals one collector function appends, returns or keys state/basis with."""
+    source = (Path(__file__).resolve().parents[1] / "nyx" / "models.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    [function] = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    found = {"appended": set(), "returned": set(), "named": set()}
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                node.func.attr in ("append", "extend") and node.args:
+            found["appended"] |= _checkout_literal_strings(node.args[0])
+        if isinstance(node, ast.Return) and node.value is not None:
+            found["returned"] |= _checkout_literal_strings(node.value)
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and key.value in ("state", "basis"):
+                    found["named"] |= _checkout_literal_strings(value)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id in ("state", "basis"):
+                    found["named"] |= _checkout_literal_strings(node.value)
+    return found
+
+
+def checkout_word_requirements():
+    """Every value the view renders, paired with the tables that must name it."""
+    availability = checkout_function_literals("_clone_availability")
+    blockers = checkout_function_literals("derive_removable")["appended"] | \
+        checkout_function_literals("_verdict_blockers")["returned"]
+    attention_basis = checkout_function_literals("derive_attention")["named"]
+    return [
+        (("attentionClass",), {name for name, _ in models._ATTENTION_CODES}),
+        (("attentionCode",), {code for _, code in models._ATTENTION_CODES}),
+        (("availabilityState",), availability["named"]),
+        (("availabilityReason",), availability["appended"]),
+        (("assignmentBasis",), attention_basis),
+        (("status",), set(models._CLONE_STATUSES)),
+        (("comparisonRelation",), set(models._COMPARISON_RELATIONS)),
+        (("comparisonBasis",), set(models._COMPARISON_BASES)),
+        (("verdictState",), set(models._VERDICT_STATES)),
+        (("verdictRung",), set(models._VERDICT_MERGED_RUNGS) | {"none"}),
+        (("verdictReason",), set(models._REMOTE_VERDICT_UNKNOWN_REASONS)),
+        (("branchBlocker", "worktreeBlocker"), blockers),
+        (("operation",), set(models.OPERATIONS)),
+        (("changeKind",), set(models._CHANGE_KEYS)),
+        (("folderStatus",), set(models._FOLDER_STATUSES)),
+        (("gitStatus",), set(models._GIT_STATUSES)),
+        (("checkStatus",), set(models._CHECK_STATUSES)),
+        (("checkReason",), set(models._CHECK_FAILURE_REASONS)),
+        (("lookupStatus",), set(models._PR_LOOKUP_STATUSES)),
+        (("lookupReason",), set(models._PR_LOOKUP_FAILURE_REASONS)),
+        (("remoteCopy",), set(models._REMOTE_COPY_STATES)),
+        (("pullRequestState",), set(models._PULL_REQUEST_STATES)),
+        (("branchPackageBasis",), set(models._BRANCH_PACKAGE_BASES)),
+        (("containment",), set(models._CONTAINMENT_OUTCOMES)),
+        (("diagnostic",), set(models.CHECKOUTS_DIAGNOSTIC_CODES)),
+        (("lookupReason",), {"setting_off", "not_github", "remote_checks_off"}),
+        (("checkReason",), {"remote_checks_off"}),
+        (("containment",), {"no_base", "incomplete", "git_too_old"}),
+        (("verdictRung",), {"none"}),
+    ]
+
+
+def missing_checkout_words(words):
+    """Every value the words block does not name, as ``(table, value)`` pairs."""
+    missing = []
+    for tables, values in checkout_word_requirements():
+        for value in sorted(values):
+            if not any(value in (words.get(table) or {}) for table in tables):
+                missing.append((tables[0], value))
+    return missing
+
+
+def test_checkouts_words_cover_every_served_value():
+    """A collector value without browser words fails; one removed value fails too."""
+    words = checkout_words()
+    assert missing_checkout_words(words) == []
+
+    # Removing one value from a test-local copy fails the same comparison, so
+    # the test above cannot pass on an empty or stale word table.
+    broken = copy.deepcopy(words)
+    assert broken["comparisonRelation"].pop("diverged") == "{a} ahead, {b} behind"
+    assert missing_checkout_words(broken) == [("comparisonRelation", "diverged")]
+
+
+def test_checkouts_words_block_names_the_view_markers_once():
+    """The block is one JSON literal between the exact markers the test reads."""
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    assert source.count(CHECKOUTS_WORDS_BEGIN) == 1
+    assert source.count(CHECKOUTS_WORDS_END) == 1
+    words = checkout_words()
+    # The rows, headers and setup sentences the view shows are in the block too.
+    assert words["text"]["noFolders"].startswith("No checkout folders are configured.")
+    assert words["column"]["default"] == "Default branch vs remote"
+    assert words["text"]["workItemBranches"] == "Work item branches"
+
+
+# ---------------------------------------------------------------------------
+# The view's real git world and the documents it captures once
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def view_checkouts(tmp_path_factory):
+    """One real checkout world and the documents every view proof reads.
+
+    A bare ``trunk`` remote is cloned three times into one folder: the second
+    clone carries a linked worktree outside the folder, the third is level with
+    the remote, and the tenth never fetched.  A second remote holds one clean
+    clone, and a clone outside the folder pushes a package branch no listed
+    clone holds.  The documents are captured as built, after a remote check
+    that follows a push from another clone, on the next local collection, with
+    the bare remote renamed, after one more commit on ``topic-a``, after that
+    branch is deleted, after a stash in the quiet clone, with no finished
+    stage, and with no ``git`` on ``PATH``.  This world is separate from
+    ``real_checkouts`` so that fixture's pinned Code Status texts stay as they
+    are.
+    """
+    root = tmp_path_factory.mktemp("view-checkouts")
+    folder = root / "checkouts"
+    folder.mkdir()
+    served = root / "served"
+    served.mkdir()
+    (root / "home").mkdir()
+    # The saved remote check lives in ~/.nyx, so a later local collection can
+    # read the answer the check recorded.
+    (root / "home" / ".nyx").mkdir()
+    spec_root = root / "specification-root"
+    missing_folder = root / "missing-folder"
+    with pytest.MonkeyPatch.context() as patch:
+        isolate_git(patch, root / "home")
+        remote = make_remote(served)
+        quiet_remote = make_remote(served, "quiet.git")
+        clone_two = clone(remote.as_uri(), folder / "Repo Clone 2")
+        clone_three = clone(remote.as_uri(), folder / "Repo Clone 3")
+        clone(remote.as_uri(), folder / "Repo Clone 10")
+        quiet = clone(quiet_remote.as_uri(), folder / "Quiet Clone")
+        # The quiet clone and two others have fetched; the tenth has not, which
+        # is a freshness state of its own.
+        git(quiet, "fetch", "-q")
+        git(clone_two, "fetch", "-q")
+        git(clone_three, "fetch", "-q")
+        outside = root / "outside"
+        git(clone_two, "worktree", "add", "-q", str(outside), "-b", "outside")
+        # A clone outside the folder pushes a package branch no listed clone
+        # holds, so the group serves a remote-only verdict.
+        away = clone(remote.as_uri(), root / "away" / "Away Clone")
+        git(away, "checkout", "-q", "-b", "topic-d")
+        commit_file(away, "delta.txt", "delta one\n")
+        git(away, "push", "-q", "-u", "origin", "topic-d")
+        git(clone_two, "checkout", "-q", "-b", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-a")
+        git(clone_two, "checkout", "-q", "trunk")
+
+        target = [f"Target repo: {clone_two}"]
+        _package_spec(spec_root, "Drafts", "alpha", CHECKOUTS_PACKAGE_IDS["alpha"],
+                      ["Branch: topic-a", *target])
+        _package_spec(spec_root, "Drafts", "delta", CHECKOUTS_PACKAGE_IDS["delta"],
+                      ["Branch: topic-d", *target])
+        _package_spec(spec_root, "Shipped", "gamma", CHECKOUTS_PACKAGE_IDS["gamma"],
+                      ["Branch: topic-c", *target])
+
+        def collect(stages=("Shipped",), **options):
+            """One real collection of the fixture folder and package scan."""
+            return json.loads(collect_checkouts(
+                [str(folder)],
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+                package_scan=PackageScan(spec_root, stages),
+                configuration_revision=CHECKOUTS_REVISION,
+                **options,
+            ))
+
+        catalog = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+        document_built = collect()
+        # Another clone pushes a commit, so the first clone is behind and the
+        # third is level when the remote is checked.
+        commit_file(clone_three, "moved.txt", "moved\n")
+        git(clone_three, "push", "-q", "origin", "trunk")
+        document_checked = collect(remote_checks=True)
+        document_recorded = collect()
+        away_remote = remote.rename(served / "remote.away")
+        document_renamed = collect(remote_checks=True)
+        away_remote.rename(remote)
+        git(clone_two, "checkout", "-q", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha two\n")
+        document_topic_committed = collect()
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "branch", "-D", "topic-a")
+        document_topic_deleted = collect()
+        (quiet / "file.txt").write_bytes(b"stashed\n")
+        git(quiet, "stash", "push", "-q")
+        document_quiet_stashed = collect()
+        document_no_finished = collect(stages=())
+        empty_bin = root / "empty-bin"
+        empty_bin.mkdir()
+        patch.setenv("PATH", str(empty_bin))
+        document_no_git = collect()
+    return SimpleNamespace(
+        folder=folder,
+        spec_root=spec_root,
+        missing_folder=missing_folder,
+        outside=outside,
+        document_built=document_built,
+        document_checked=document_checked,
+        document_recorded=document_recorded,
+        document_renamed=document_renamed,
+        document_topic_committed=document_topic_committed,
+        document_topic_deleted=document_topic_deleted,
+        document_quiet_stashed=document_quiet_stashed,
+        document_no_finished=document_no_finished,
+        document_no_git=document_no_git,
+        catalog=catalog,
+    )
+
+
+def test_checkouts_view_fixture_captures_the_states_it_names(view_checkouts):
+    """Every capture parses, and each one carries the state its name claims."""
+    captures = {
+        "built": view_checkouts.document_built,
+        "checked": view_checkouts.document_checked,
+        "recorded": view_checkouts.document_recorded,
+        "renamed": view_checkouts.document_renamed,
+        "topic committed": view_checkouts.document_topic_committed,
+        "topic deleted": view_checkouts.document_topic_deleted,
+        "quiet stashed": view_checkouts.document_quiet_stashed,
+        "no finished stage": view_checkouts.document_no_finished,
+        "no git": view_checkouts.document_no_git,
+    }
+    for label, document in captures.items():
+        models.parse_checkouts(json.dumps(document))
+
+    def group(document, suffix):
+        return checkout_group(document, suffix)
+
+    def branch_names(document):
+        _, clone = checkout_clone(document, "Repo Clone 2")
+        return [branch["name"] for branch in clone["branches"]]
+
+    assert group(view_checkouts.document_built, "remote")["remote"]["check"]["status"] == "off"
+    assert group(view_checkouts.document_checked, "remote")["remote"]["check"]["status"] == "live"
+    assert group(view_checkouts.document_recorded, "remote")["remote"]["check"]["status"] == "recorded"
+    assert group(view_checkouts.document_renamed, "remote")["remote"]["check"] == {
+        "status": "recorded", "reason": "not_found",
+        "checked_at": group(view_checkouts.document_renamed, "remote")
+        ["remote"]["check"]["checked_at"],
+    }
+    assert "topic-a" not in branch_names(view_checkouts.document_topic_deleted)
+    assert "topic-a" in branch_names(view_checkouts.document_topic_committed)
+    assert checkout_clone(view_checkouts.document_quiet_stashed, "Quiet Clone")[1][
+        "stash_count"] == 1
+    assert view_checkouts.document_no_finished["package_scan"]["finished_policy"] == \
+        "not_configured"
+    assert view_checkouts.document_no_git["git"]["status"] == "missing"
+    assert view_checkouts.document_no_git["repositories"] == []
+
+
+# ---------------------------------------------------------------------------
+# Re-digested shape variants the parser must still accept
+# ---------------------------------------------------------------------------
+
+
+def checkout_group(document, display_suffix):
+    """The group whose served display name ends with ``display_suffix``."""
+    for group in document["repositories"]:
+        remote = group["remote"]
+        if remote is not None and str(remote["display"]).endswith(display_suffix):
+            return group
+    raise AssertionError(
+        f"no group display ends with {display_suffix}: "
+        f"{[group['remote'] for group in document['repositories']]}"
+    )
+
+
+def checkout_clone(document, name):
+    """The group and clone whose path is named ``name``."""
+    for group in document["repositories"]:
+        for item in group["clones"]:
+            if Path(item["path"]).name == name:
+                return group, item
+    raise AssertionError(f"no clone named {name}")
+
+
+def checkout_worktree(clone, name):
+    """The linked worktree of ``clone`` named ``name``."""
+    return next(
+        worktree for worktree in clone["worktrees"]
+        if not worktree["main"] and Path(worktree["path"]).name == name
+    )
+
+
+def set_clone_status(clone, status):
+    """Make one clone unreadable in one named way, leaving the facts it cannot hold."""
+    clone["status"] = status
+    for field in (
+        "bare", "partial_clone", "shallow", "cached_default", "local_default",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
+        "verdict_base", "containment", "removable_count",
+    ):
+        clone[field] = None
+
+
+CLONE_FACTS = (
+    "bare", "partial_clone", "shallow", "cached_default", "local_default",
+    "cached_vs_remote", "stash_count", "worktrees", "branches",
+    "verdict_base", "containment", "removable_count",
+)
+
+
+def reseal_checkouts(document):
+    """Recompute every derived value the parser checks, then re-digest."""
+    # Removable comes first: the attention list counts the items it decides.
+    for group in document["repositories"]:
+        for item in group["clones"]:
+            if item["status"] != "ok":
+                continue
+            removable = models.derive_removable(item)
+            for branch, value in zip(item["branches"], removable["branches"]):
+                branch["removable"] = value
+            for worktree, value in zip(item["worktrees"], removable["worktrees"]):
+                worktree["removable"] = value
+            item["removable_count"] = removable["removable_count"]
+    derived = models.derive_attention(document)
+    for group, free in zip(document["repositories"], derived["free_clones"]):
+        group["free_clones"] = free
+        for item in group["clones"]:
+            item["availability"] = derived["availability"][item["path"]]
+    document["attention"] = derived["attention"]
+    return redigest(document)
+
+
+def checkout_raw_variant(document, mutate):
+    """One re-digested capture with ``mutate`` applied, without the parser check."""
+    variant = copy.deepcopy(document)
+    mutate(variant)
+    return reseal_checkouts(variant)
+
+
+def checkout_variant(document, mutate):
+    """One re-digested capture with ``mutate`` applied; the parser must accept it."""
+    variant = checkout_raw_variant(document, mutate)
+    models.parse_checkouts(json.dumps(variant))
+    return variant
+
+
+def open_view_checkouts(launch, view_checkouts, document):
+    """Open the checkouts view over this fixture's catalog and ``document``."""
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(
+        launch,
+        SimpleNamespace(catalog=view_checkouts.catalog, revision=CHECKOUTS_REVISION),
+        double,
+    )
+    return page, double
+
+
+def serve_checkouts(page, double, document):
+    """Answer the next tick with ``document`` and let the view render it."""
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+
+def group_index(document, display_suffix):
+    """Where a group sits in the served repository order."""
+    for index, group in enumerate(document["repositories"]):
+        remote = group["remote"]
+        if remote is not None and str(remote["display"]).endswith(display_suffix):
+            return index
+    raise AssertionError(f"no group display ends with {display_suffix}")
+
+
+def relation_words(comparison):
+    """The relation words a served comparison renders, from the view's own block."""
+    template = checkout_words()["comparisonRelation"][comparison["relation"]]
+    return template.format(
+        a="" if comparison["ahead"] is None else comparison["ahead"],
+        b="" if comparison["behind"] is None else comparison["behind"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC-07: the one Checkout setup panel
+# ---------------------------------------------------------------------------
+
+
+def add_setup_problems(view_checkouts):
+    """A missing folder, a group whose lookup lost ``gh``, and one diagnostic."""
+    missing = str(view_checkouts.missing_folder)
+    diagnostic_path = str(view_checkouts.folder / "Not A Repo")
+
+    def mutate(document):
+        document["folders"] = [
+            {"path": str(view_checkouts.folder), "status": "ok"},
+            {"path": missing, "status": "missing"},
+        ]
+        document["github_lookup"] = "on"
+        group = checkout_group(document, "remote")
+        group["remote"]["key"] = "github.com/example/example"
+        group["remote"]["display"] = "example/example"
+        group["pr_lookup"] = {
+            "status": "unavailable", "reason": "gh_missing", "checked_at": None,
+        }
+        for other in document["repositories"]:
+            if other is not group:
+                other["pr_lookup"] = {
+                    "status": "off", "reason": "not_github", "checked_at": None,
+                }
+        document["diagnostics"] = [{"code": "not_a_repository", "path": diagnostic_path}]
+    return mutate
+
+
+def git_problem_variant(view_checkouts, version):
+    """A capture whose git is too old, with a missing folder and one diagnostic."""
+    diagnostic_path = str(view_checkouts.folder / "Not A Repo")
+
+    def mutate(document):
+        document["git"] = {"status": "too_old", "version": version}
+        document["folders"] = [
+            {"path": str(view_checkouts.folder), "status": "ok"},
+            {"path": str(view_checkouts.missing_folder), "status": "missing"},
+        ]
+        document["diagnostics"] = [{"code": "not_a_repository", "path": diagnostic_path}]
+    return checkout_variant(view_checkouts.document_no_git, mutate)
+
+
+def test_checkouts_setup_panel_names_the_setup_story_in_order(
+    open_page, view_checkouts
+):
+    """One panel names each setup problem with its words, in the one order (D-19)."""
+    page, double = open_view_checkouts(
+        open_page, view_checkouts, view_checkouts.document_built
+    )
+    body = page.locator("#checkouts-body")
+    # Lookup off is status-line words with no panel item at all.
+    assert "Pull request lookup off" in page.locator("#checkouts-status-line").inner_text()
+    assert body.locator(".checkouts-setup").count() == 0
+
+    document = checkout_variant(
+        view_checkouts.document_checked, add_setup_problems(view_checkouts)
+    )
+    serve_checkouts(page, double, document)
+    panel = body.locator(".checkouts-setup")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.locator("h2").inner_text() == "Checkout setup"
+    items = panel.locator(".checkouts-setup-item")
+    assert items.evaluate_all(
+        "items => items.map(item => item.dataset.setup)") == ["folder", "gh", "diagnostic"]
+    texts = items.all_inner_texts()
+    # A folder's words follow its path.
+    assert texts[0] == f"{view_checkouts.missing_folder} — does not exist"
+    assert texts[1] == (
+        "The GitHub CLI (gh) was not found; pull request states are not shown.")
+    assert texts[2] == (
+        f"{view_checkouts.folder / 'Not A Repo'} has a .git entry but is not the top "
+        "of its repository")
+    # A folder problem never suppresses the groups: the folder that is still
+    # readable keeps rendering its clones.
+    shown = body.locator(".checkouts-group")
+    assert shown.count() == 1
+    assert shown.locator(".checkouts-group-name").inner_text() == "example/example"
+    assert shown.locator("tr.checkouts-clone").count() == len(
+        checkout_group(document, "example/example")["clones"])
+    # The panel is not a live region, has no control, and never takes focus.
+    assert panel.locator(
+        "[aria-live], [role='status'], [role='alert'], input, button, select, "
+        "textarea, [tabindex]").count() == 0
+    page.locator("#view-board").focus()
+    serve_checkouts(page, double, document)
+    assert page.evaluate(
+        "() => !document.querySelector('.checkouts-setup')"
+        ".contains(document.activeElement)") is True
+
+    # A git problem comes first, before the missing folder and the diagnostic.
+    older = git_problem_variant(view_checkouts, "2.30.0")
+    serve_checkouts(page, double, older)
+    items = body.locator(".checkouts-setup .checkouts-setup-item")
+    assert items.evaluate_all(
+        "items => items.map(item => item.dataset.setup)") == ["git", "folder", "diagnostic"]
+    assert items.first.inner_text() == (
+        "Git 2.30.0 is older than Nyx supports (2.36)")
+
+    unreadable = git_problem_variant(view_checkouts, None)
+    serve_checkouts(page, double, unreadable)
+    assert body.locator(".checkouts-setup .checkouts-setup-item").first.inner_text() == (
+        "Git is older than Nyx supports (2.36), or its version could not be read")
+
+    # A capture taken with no git on PATH: the sentence, no groups, no failure panel.
+    serve_checkouts(page, double, view_checkouts.document_no_git)
+    setup = body.locator(".checkouts-setup")
+    assert "Git was not found, so Nyx cannot read checkouts." in setup.inner_text()
+    assert "on the PATH Nyx runs with" in setup.inner_text()
+    assert body.locator(".checkouts-group").count() == 0
+    assert body.locator(".checkouts-panel:not(.checkouts-setup)").count() == 0
+
+    # No configured folder: the guide section is named, and no control appears.
+    serve_checkouts(page, double, empty_checkouts_document())
+    setup = body.locator(".checkouts-setup")
+    sentence = setup.inner_text()
+    assert "No checkout folders are configured." in sentence
+    assert "Your specification workspace → Checkout folders" in sentence
+    assert setup.locator("input, button, select, textarea, [contenteditable]").count() == 0
+    assert body.locator(".checkouts-group").count() == 0
+
+
+# ---------------------------------------------------------------------------
+# AC-12: groups, rows, Work item branches and freshness
+# ---------------------------------------------------------------------------
+
+
+def test_checkouts_groups_rows_and_branches_follow_the_document(
+    open_page, view_checkouts
+):
+    """Groups, clone rows and Work item branches render the served order (R-05, D-18)."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    names = page.locator(".checkouts-group-name")
+    quiet = [
+        group for group in document["repositories"]
+        if str(group["remote"]["display"]).endswith("quiet")
+    ]
+    assert len(quiet) == 1
+    # The quiet repository has no group of its own while the box is checked.
+    assert names.all_inner_texts() == [
+        group["remote"]["display"] for group in document["repositories"] if group not in quiet]
+
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert names.all_inner_texts() == [
+        group["remote"]["display"] for group in document["repositories"]]
+    remote_index = group_index(document, "remote")
+    group = document["repositories"][remote_index]
+    remote_view = page.locator(".checkouts-group").nth(remote_index)
+
+    # The eight column headers, once per group table.
+    assert remote_view.locator(
+        "table.checkouts-clones thead th").all_inner_texts() == [
+        "Checkout", "Availability", "HEAD", "Default branch vs remote",
+        "Tree", "Branches", "Cleanup", "Package",
+    ]
+    # Clone rows follow the group's clones, and a linked worktree sits directly
+    # under the clone that owns it.
+    assert remote_view.locator("table.checkouts-clones tbody tr").evaluate_all(
+        "rows => rows.map(row => row.classList.contains('checkouts-worktree')"
+        " ? row.dataset.worktree : row.dataset.clone)") == [
+        "Repo Clone 2", "outside", "Repo Clone 3", "Repo Clone 10",
+    ]
+    assert [Path(clone["path"]).name for clone in group["clones"]] == [
+        "Repo Clone 2", "Repo Clone 3", "Repo Clone 10"]
+
+    # Work item branches follow the group's package_branches with their words.
+    entries = group["package_branches"]
+    branches = remote_view.locator("table.checkouts-package-branches tbody tr")
+    assert remote_view.locator(
+        "table.checkouts-package-branches caption").inner_text() == "Work item branches"
+    assert branches.evaluate_all(
+        "rows => rows.map(row => row.dataset.branch)") == [
+        entry["name"] for entry in entries]
+    by_name = {entry["name"]: entry for entry in entries}
+    topic_a = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (cached)"
+    assert topic_a.locator(".checkouts-verdict-words").inner_text() == "not merged"
+    # A merge verdict carries the basis of the clone's verdict base.
+    assert topic_a.locator(".checkouts-verdict .checkouts-basis").inner_text() == "cached"
+    assert topic_a.locator(".checkouts-work-items .checkouts-package-path").inner_text() == (
+        "Repo/Drafts/alpha")
+    assert topic_a.locator(".checkouts-work-items .checkouts-basis").inner_text() == (
+        "(Target repo)")
+    assert topic_a.locator("[data-show-on-board]").inner_text() == "Show on board"
+    assert by_name["topic-a"]["remote_verdict"] is None
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "unknown"
+
+    # Free clones come from the served list, in its order, with each distance.
+    free = group["free_clones"]
+    assert len(free) >= 2
+    expected = []
+    for path in free:
+        clone = next(item for item in group["clones"] if item["path"] == path)
+        local = clone["local_default"]
+        distance = local["vs_remote"] or local["vs_cached"]
+        expected.append(f"{Path(path).name} {relation_words(distance)}")
+    assert remote_view.locator(".checkouts-group-free").inner_text() == (
+        "Free clones: " + " · ".join(expected))
+
+    # A never-fetched clone reads cached on its value and names the age once.
+    clone_ten = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-relation").inner_text() == "up to date"
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
+    assert "cached, never fetched" in clone_ten.inner_text()
+    clone_two = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator(".checkouts-head").inner_text() == "trunk"
+    assert clone_two.locator(".checkouts-tree").inner_text() == "clean"
+    assert clone_two.locator(".checkouts-branches").inner_text() == "3 branches"
+    assert clone_two.locator(".checkouts-cleanup").inner_text().startswith(
+        "1 branch, 1 worktree removable")
+    assert clone_two.locator(".checkouts-cleanup").inner_text().endswith(
+        "topic-a (not merged)")
+    linked = remote_view.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator(".checkouts-head").inner_text() == "outside"
+    assert linked.locator(".checkouts-cleanup").inner_text() == "Removable"
+
+    # One remote check later, the same rows read the live answers: the branch
+    # no clone holds states why, and the branch nothing pushed is absent.
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    remote_index = group_index(checked, "remote")
+    remote_view = page.locator(".checkouts-group").nth(remote_index)
+    topic_d = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-d"]')
+    assert topic_d.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+    assert topic_d.locator(".checkouts-verdict-words").inner_text() == (
+        "merge state unknown — no clone holds its commits")
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+
+
+
+def test_checkouts_freshness_reads_cached_live_and_recorded(
+    open_page, view_checkouts
+):
+    """One value names its own basis; a failed latest check says so (D-06)."""
+    page, double = open_view_checkouts(
+        open_page, view_checkouts, view_checkouts.document_built
+    )
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
+
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    assert checkout_group(checked, "remote")["remote"]["check"]["status"] == "live"
+    assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "live"
+    assert "cached, never fetched" not in clone_ten.inner_text()
+
+    recorded = view_checkouts.document_recorded
+    serve_checkouts(page, double, recorded)
+    check = checkout_group(recorded, "remote")["remote"]["check"]
+    assert check["status"] == "recorded"
+    when = checkouts_local_time(check["checked_at"], recorded["observed_at"], seconds=False)
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == (
+        f"recorded {when}")
+    assert page.locator(".checkouts-group-check").first.inner_text() == f"recorded {when}"
+
+    renamed = view_checkouts.document_renamed
+    serve_checkouts(page, double, renamed)
+    check = checkout_group(renamed, "remote")["remote"]["check"]
+    when = checkouts_local_time(check["checked_at"], renamed["observed_at"], seconds=False)
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    note = clone_ten.locator(".checkouts-default .checkouts-note").inner_text()
+    assert note == "(latest check failed: remote repository not found)"
+    assert page.locator(".checkouts-group-check").first.inner_text() == (
+        f"recorded {when} (remote repository not found)")
+
+
+def test_checkouts_quiet_repositories_collapse_into_one_row(
+    open_page, view_checkouts
+):
+    """A quiet repository is one row while the box is checked, a group when not (D-07)."""
+    document = view_checkouts.document_built
+    quiet = checkout_group(document, "quiet")
+    quiet_display = quiet["remote"]["display"]
+    other_display = checkout_group(document, "remote")["remote"]["display"]
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+
+    def groups():
+        return page.locator(".checkouts-group-name").all_inner_texts()
+
+    assert groups() == [other_display]
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    playwright.expect(row).to_have_count(1)
+    assert row.locator("summary").inner_text() == "Quiet repositories (1)"
+    row.locator("summary").click()
+    assert row.locator("li").inner_text() == f"{quiet_display} Quiet Clone"
+
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+    # The unchecked state survives a reload.  The reload's own catalog and
+    # checkout requests must settle before a tick can answer, or the tick is
+    # dropped for a request still in flight.
+    page.reload()
+    page.wait_for_function(
+        "() => window.catalogResponses.length >= 1 && window.checkoutsResponses.length >= 1")
+    settle_frames(page)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#checkouts-body .checkouts-group').length === 2")
+    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert groups() == [quiet_display, other_display]
+
+    # Checked again, a stash makes the quiet clone ordinary: its own group, no row.
+    page.get_by_label("Hide quiet checkouts", exact=True).check()
+    assert groups() == [other_display]
+    serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+    # Two null comparisons prove nothing about equality, so it is not quiet.
+    def both_null(value):
+        _, clone = checkout_clone(value, "Quiet Clone")
+        clone["local_default"] = None
+
+    serve_checkouts(
+        page, double, checkout_variant(view_checkouts.document_built, both_null))
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+
+def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkouts):
+    """The shared search hides every group whose served names do not match (R-05)."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert page.locator(".checkouts-group").count() == len(document["repositories"])
+    page.fill("#filter", "topic-a")
+    visible = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    assert visible.all_inner_texts() == [
+        checkout_group(document, "remote")["remote"]["display"]]
+    page.fill("#filter", "")
+    assert page.locator(".checkouts-group:not([hidden])").count() == len(
+        document["repositories"])
+
+
+# ---------------------------------------------------------------------------
+# AC-04 in the browser: one assertion per word table
+# ---------------------------------------------------------------------------
+
+
+def mutate_check_failed(document):
+    """Every group's remote check failed with nothing saved to fall back on."""
+    document["remote_checks"] = "on"
+    for group in document["repositories"]:
+        group["remote"]["check"] = {"status": "failed", "reason": "not_found"}
+
+
+def mutate_clone_statuses(document):
+    """Two clones that could not be read, in the two ways the words name."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    set_clone_status(clone_three, "unsafe_ownership")
+    _, clone_ten = checkout_clone(document, "Repo Clone 10")
+    set_clone_status(clone_ten, "too_many_branches")
+
+
+def mutate_worktree_facts(document):
+    """A detached dirty main worktree in a rebase beside one locked worktree."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    main = next(item for item in clone_two["worktrees"] if item["main"])
+    linked = checkout_worktree(clone_two, "outside")
+    linked["locked"] = True
+    main["operations"] = ["rebase"]
+    main["changes"]["staged"] = 2
+    main["head"] = {"branch": None, "sha": main["head"]["sha"]}
+    main["verdict"] = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+
+
+def mutate_prunable_worktree(document):
+    """A linked worktree whose directory is gone."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    linked = checkout_worktree(clone_two, "outside")
+    linked["prunable"] = True
+    linked["status"] = "failed"
+    for field in ("head", "changes", "operations", "index_lock", "verdict"):
+        linked[field] = None
+
+
+def mutate_checkout_flags(document):
+    """One bare clone, one shallow clone and one partial clone."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    clone_three["bare"] = True
+    clone_three["worktrees"] = []
+    for branch in clone_three["branches"]:
+        branch["checked_out_in"] = []
+    _, clone_ten = checkout_clone(document, "Repo Clone 10")
+    clone_ten["shallow"] = True
+    clone_ten["containment"] = "incomplete"
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    clone_two["partial_clone"] = True
+    clone_two["containment"] = "incomplete"
+
+
+def mutate_containment(document):
+    """One clone whose branch folding ran out of time."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    clone_three["containment"] = "deadline"
+
+
+def mutate_assignment(document):
+    """A package assigned to another clone and one to a linked worktree."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    outside = checkout_worktree(clone_two, "outside")["path"]
+    packages = {item["package_path"]: item for item in document["packages"]}
+    alpha = packages["Repo/Drafts/alpha"]
+    alpha["target"] = {
+        "clone": clone_three["path"], "status": "clone", "worktree": None,
+        "within_folders": alpha["target"]["within_folders"],
+    }
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["packages"] = [{"package_path": "Repo/Drafts/alpha", "basis": "sibling_clone"}]
+    delta = packages["Repo/Drafts/delta"]
+    delta["target"] = {
+        "clone": clone_two["path"], "status": "worktree", "worktree": outside,
+        "within_folders": delta["target"]["within_folders"],
+    }
+
+
+def mutate_lookup_and_pull_requests(document):
+    """A live lookup with one open and one merged pull request on the branch."""
+    document["github_lookup"] = "on"
+    group = checkout_group(document, "remote")
+    group["remote"]["key"] = "github.com/example/example"
+    group["remote"]["display"] = "example/example"
+    group["pr_lookup"] = {"status": "live", "reason": None, "checked_at": None}
+    for other in document["repositories"]:
+        if other is not group:
+            other["pr_lookup"] = {
+                "status": "off", "reason": "not_github", "checked_at": None,
+            }
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["verdict"] = {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 7,
+    }
+    topic_a["pull_requests"] = [
+        {"number": 3, "state": "open", "head_matches": False},
+        {"number": 7, "state": "merged", "head_matches": True},
+    ]
+
+
+def mutate_merged_branch(document):
+    """The package branch proved merged because its tip is in the default branch."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["verdict"] = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+
+
+def test_checkouts_word_tables_show_their_served_values(
+    open_page, view_checkouts
+):
+    """Every word table renders a served value's words, from captures and variants."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    body = page.locator("#checkouts-body")
+
+    def clone_row(name):
+        return body.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+
+    def shows(text):
+        assert text in body.inner_text(), text
+
+    # The built capture: comparison relation and basis, availability state and
+    # reason, the assignment basis, status, remote copy, verdict state, the
+    # branch blocker, the branch package basis and the check/lookup words.
+    shows("up to date")
+    shows("cached")
+    shows("Free")
+    clone_two = clone_row("Repo Clone 2")
+    availability = clone_two.locator(".checkouts-availability").inner_text()
+    assert availability.startswith("In use")
+    assert "has linked worktrees" in availability
+    assert "Assigned: Repo/Drafts/alpha (Target repo)" in availability
+    shows("unknown")
+    shows("not merged")
+    shows("Repo/Drafts/alpha (Target repo)")
+    assert "topic-a (not merged)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
+    assert page.locator(".checkouts-group-lookup").first.inner_text() == (
+        "pull request lookup off")
+    # The default branch is named in the header as it is served.
+    assert body.locator(".checkouts-group-default").last.inner_text() == "trunk"
+
+    # One remote check later: the live basis and the present and absent copies.
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
+    shows("on the remote (live)")
+    shows("not on the remote")
+    shows("live")
+
+    # A saved check from a later local collection, and one that then failed.
+    recorded = view_checkouts.document_recorded
+    serve_checkouts(page, double, recorded)
+    check = checkout_group(recorded, "remote")["remote"]["check"]
+    shows(f"recorded {checkouts_local_time(check['checked_at'], recorded['observed_at'], seconds=False)}")
+    serve_checkouts(page, double, view_checkouts.document_renamed)
+    shows("(latest check failed: remote repository not found)")
+
+    # A check that failed with nothing saved falls back to nothing.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_check_failed))
+    assert page.locator(".checkouts-group-check").first.inner_text() == (
+        "check failed (remote repository not found)")
+
+    # Clone status words, and the Availability a clone without facts shows.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_clone_statuses))
+    shows("git refused it: ownership")
+    shows("more than 100 local branches; not examined")
+    assert clone_row("Repo Clone 3").locator(
+        ".checkouts-availability").inner_text() == "Unknown"
+
+    # Worktree facts: a detached, dirty main worktree in a rebase, and a locked
+    # linked worktree with its branch and worktree blockers.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_worktree_facts))
+    clone_two = clone_row("Repo Clone 2")
+    assert clone_two.locator(".checkouts-head").inner_text().startswith("detached at ")
+    shows("detached HEAD")
+    shows("2 staged")
+    shows("rebase in progress")
+    shows("git operation in progress")
+    assert "outside (locked)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    linked = body.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator(".checkouts-cleanup").inner_text() == "locked"
+
+    # A prunable linked worktree: the status words and the flag word.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_prunable_worktree))
+    shows("could not be read")
+    shows("directory is gone")
+
+    # Bare, shallow and partial clones name their facts once in the Checkout cell.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_checkout_flags))
+    bare = clone_row("Repo Clone 3")
+    assert bare.locator("td.checkouts-head").inner_text() == "bare repository"
+    assert bare.locator("td.checkouts-tree").inner_text() == "no working tree"
+    assert "shallow" in clone_row("Repo Clone 10").locator(
+        "th.checkouts-checkout").inner_text()
+    assert "partial" in clone_row("Repo Clone 2").locator(
+        "th.checkouts-checkout").inner_text()
+
+    # A clone whose branch folding did not finish says why, once.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_containment))
+    shows("Branches were not checked for folding: ran out of time")
+
+    # Another clone's assigned package and a linked worktree's, with both bases.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_assignment))
+    assigned = clone_row("Repo Clone 3").locator(".checkouts-availability").inner_text()
+    assert assigned.startswith("Assigned")
+    assert "Repo/Drafts/alpha (Target repo)" in assigned
+    assert "Repo/Drafts/delta (Target repo worktree)" in clone_row(
+        "Repo Clone 2").locator(".checkouts-availability").inner_text()
+    shows("same branch in another clone")
+
+    # A live lookup with served pull requests and a pull-request rung.
+    serve_checkouts(
+        page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    shows("pull requests live")
+    assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                        " .checkouts-verdict-words").inner_text() == (
+        "merged — pull request #7 merged")
+    pulls = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                         " .checkouts-pulls").inner_text()
+    assert pulls == "#3 open (different head) · #7 merged"
+    assert "Pull requests live" in page.locator("#checkouts-status-line").inner_text()
+
+    # A branch proved merged by its tip being in the default branch.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_merged_branch))
+    assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                        " .checkouts-verdict-words").inner_text() == "merged — tip is in trunk"
+
+
+def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
+    """A value newer than this page's words renders as itself and never throws."""
+    document = checkout_raw_variant(
+        view_checkouts.document_built,
+        lambda value: set_clone_status(
+            checkout_clone(value, "Repo Clone 10")[1], "future_status"),
+    )
+    # The value is one a newer collector would serve before this page learns its
+    # words, so the strict parser refuses it and only the provider double can
+    # answer with it; the page must still show it rather than break.
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(json.dumps(document))
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    body = page.locator("#checkouts-body")
+    assert "future_status" in body.inner_text()
+    # The rest of the view still renders.
+    assert body.locator("tr.checkouts-clone").count() == 3
+    assert "Repo Clone 2" in body.inner_text()
+
+
+def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts):
+    """Each work item's table action shows its card, or says why it cannot (D-08)."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+    topic_a = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    topic_a.locator('[data-show-on-board="Repo/Drafts/alpha"]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    card = page.locator('.card[data-package-path="Repo/Drafts/alpha"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert page.evaluate(
+        "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+    # A work item in a finished row the board is hiding says so and stays put.
+    show_checkouts_view(page)
+    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    topic_c.locator('[data-show-on-board="Repo/Shipped/gamma"]').click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
+
+
+def test_checkouts_status_line_names_a_scan_from_other_settings(
+    open_page, view_checkouts
+):
+    """A scan collected under other settings than the board shown says so once (D-03)."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    sentence = "Collected under different settings from the board shown."
+    line = page.locator("#checkouts-status-line")
+    assert sentence not in line.inner_text()
+
+    def other_settings(value):
+        value["configuration_revision"] = "3" * 64
+
+    serve_checkouts(page, double, checkout_variant(document, other_settings))
+    assert line.inner_text().endswith(sentence)
+    # The values are still rendered: the scan is its own dated answer.
+    assert page.locator("#checkouts-body .checkouts-group").count() >= 1
