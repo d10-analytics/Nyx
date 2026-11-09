@@ -536,8 +536,8 @@ exits 0.
 
 Checkout folders are set per workspace, in the account's configuration record;
 see [Your specification workspace](workspaces.md#checkout-folders) for the
-exact edit. A settings editor arrives with the Checkouts view; until then the
-record is edited by hand.
+exact edit. The **Checkouts** view shows these folders but cannot change them;
+until a settings editor arrives, the record is edited by hand.
 
 The `--json` document records the revision of the configuration the collection
 loaded as `configuration_revision`, or `null` when no record was loaded. It also
@@ -1298,7 +1298,67 @@ retains the last valid displayed board and browser-local preference.
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 A theme change follows other open tabs. The compact view (**Hide empty rows and
 columns**), **Hide terminal rows**, and **Click empty space to deselect** apply
-per tab until reload: another open tab keeps its current choice until it reloads.
+per tab until reload: another open tab keeps its current choice until it reloads. The chosen view and **Hide quiet checkouts** are remembered the same way.
+
+## Use the Checkouts view
+
+The board header has a **Board** and a **Checkouts** switch. **Checkouts** shows
+the same checkout state that `nyx checkouts` prints, read from Nyx's last
+successful checkout scan: the repositories under your configured checkout
+folders, their clones, branches and linked worktrees, and the work items whose
+`Target repo:` or `Branch:` names them. The view only shows this state. It
+never changes a repository or a specification file, and it cannot change the
+folders; see [Inspect checkouts](#inspect-checkouts) for what each value means,
+including the explanation of every code the view shows, which this section does
+not repeat. While **Checkouts** is shown, **Search** filters the repositories by
+their names, clones, branches and work items (the field's hint changes to match), and
+**Hide empty rows and columns** and **Hide terminal rows** give way to **Hide
+quiet checkouts**. Switching views never applies a waiting board update: the
+board keeps it, and the switch reads **Board (update waiting)** until you apply
+it on the board.
+
+The line under the heading says how current the page is: `Local state` with the
+time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
+`Last remote check failed` with its category and time), `Next check about` a
+time or `Next check at the next refresh`, and whether pull request lookup is
+live, recorded, off or unavailable. When the scan was made under different
+settings from the board shown, the line adds `Collected under different
+settings from the board shown.` **Check remotes now** asks Nyx to check every
+remote immediately instead of waiting for the next due check; it reads
+`Checking remotes…` while the check runs, and a note beside it says `Remote
+check finished.` or `Remote check failed:` with the category. Only one check
+runs at a time, and a server that does not offer remote checks says so.
+
+**Needs attention** comes first and lists, under a heading for each class
+(`Work only on this machine`, `Finished, not merged`, `Ready to clean up`, `Base
+moved`, `Setup problems`), one sentence per item. Selecting an item that names
+a clone, branch or worktree opens that clone's row and moves focus to it; an
+item that names work items has a **Show on board** button for each of them,
+which switches to the board and selects that card. If the work item is in a
+finished row the view says to uncheck **Hide terminal rows**, and if the board
+does not show it the view says to choose **Refresh view** on the board.
+
+Below the list each repository is a group named by its remote, with its default
+branch, the state of its remote check and pull request lookup, and its free
+clones. A group's table lists each clone with its availability, HEAD, default
+branch against the remote, working tree, branches, cleanup and package. **Details**
+opens a clone's row to show its path, branches, linked worktrees and work items;
+a branch that another branch contains is listed under **Folded branches**, which
+you open on demand. Repositories that need nothing are collected into one
+**Quiet repositories** row that you open to list them; clear **Hide quiet
+checkouts** to show each as a group of its own. The view refreshes in place on
+every scan: the rows, folds and quiet row you opened stay open, and focus and
+scroll position stay where they were. At a narrow width the tables stack, each
+cell labelled by its column, so the page needs no sideways scroll.
+
+When there is nothing to read, a panel explains why instead of a list: `This
+Nyx server does not serve checkout state.`; `Checkout state is unavailable:`
+with the category and when it clears; or, for a scan that ran, a **Checkout
+setup** panel listing a missing Git, a configured folder that does not exist,
+cannot be read or is not a folder, a GitHub CLI that was not found, and the
+scan's own diagnostics. With no folders configured the panel says `No checkout
+folders are configured.` and points to
+[Checkout folders](workspaces.md#checkout-folders), which holds the hand edit.
 
 ## Capture and review the fictional example
 

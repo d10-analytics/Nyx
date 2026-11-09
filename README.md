@@ -36,6 +36,13 @@ related specifications. Mark finished stages in **Board settings** and use
 **Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
 rows and their dependency connections.
 
+The **Checkouts** view, chosen with the switch in the header, shows the git
+state of your configured checkout folders beside the board: a **Needs
+attention** list, each repository's clones and branches, and a **Check remotes
+now** button. It reads the same state as `nyx checkouts`, changes no repository,
+and is described in [Use the Checkouts
+view](docs/running-nyx.md#use-the-checkouts-view).
+
 Your plans stay in files you can edit, keep in version control, and use with
 other tools. On Linux, Nyx runs locally as a background service and opens in
 your browser. On Windows and macOS it runs as a self-contained desktop
