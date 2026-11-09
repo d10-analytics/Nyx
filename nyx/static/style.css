@@ -219,6 +219,130 @@ button.pending {
   background: var(--surface);
 }
 .checkouts-panel p { margin: 0; }
+.checkouts-setup h2 {
+  margin: 0 0 .5rem;
+  color: var(--heading);
+  font-size: 1rem;
+}
+.checkouts-setup ul {
+  margin: 0;
+  padding-left: 1.15rem;
+}
+.checkouts-setup-item { margin: .2rem 0; }
+.checkouts-group {
+  display: grid;
+  gap: .6rem;
+  padding: 1rem 1.25rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-group[hidden] { display: none; }
+.checkouts-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .35rem 1rem;
+  margin: 0;
+  color: var(--heading);
+  font-size: 1.05rem;
+}
+.checkouts-group-name { font-weight: 700; overflow-wrap: anywhere; }
+.checkouts-group-default,
+.checkouts-group-check,
+.checkouts-group-lookup,
+.checkouts-group-free {
+  color: var(--muted);
+  font-size: .85rem;
+  font-weight: 400;
+}
+.checkouts-group-free { overflow-wrap: anywhere; }
+.checkouts-clones,
+.checkouts-package-branches {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .85rem;
+}
+.checkouts-package-branches caption {
+  padding-bottom: .35rem;
+  color: var(--heading);
+  font-weight: 700;
+  text-align: left;
+}
+.checkouts-clones th,
+.checkouts-clones td,
+.checkouts-package-branches th,
+.checkouts-package-branches td {
+  padding: .35rem .5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.checkouts-clones thead th,
+.checkouts-package-branches thead th {
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 700;
+  text-transform: none;
+  white-space: nowrap;
+}
+.checkouts-clones tbody th[scope="row"] { font-weight: 700; }
+.checkouts-clone[data-clone] th[scope="row"] { overflow-wrap: anywhere; }
+.checkouts-worktree th[scope="row"] { padding-left: 1.75rem; font-weight: 400; }
+.checkouts-worktree-name .checkouts-name::before {
+  content: "↳ ";
+  color: var(--muted);
+}
+.checkouts-checkout { min-width: 9rem; }
+.checkouts-name { display: block; }
+.checkouts-flags,
+.checkouts-freshness,
+.checkouts-caption,
+.checkouts-blocker,
+.checkouts-note,
+.checkouts-flag {
+  display: block;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 400;
+}
+.checkouts-basis,
+.checkouts-relation { white-space: nowrap; }
+.checkouts-basis { color: var(--muted); }
+.checkouts-basis time,
+.checkouts-group-check time,
+.checkouts-group-lookup time,
+.checkouts-default time { font-variant-numeric: tabular-nums; }
+.checkouts-empty { color: var(--muted); }
+.checkouts-package-path { overflow-wrap: anywhere; }
+.checkouts-quiet {
+  padding: .6rem .9rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-quiet summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.checkouts-quiet ul {
+  margin: .5rem 0 0;
+  padding-left: 1.15rem;
+}
+.checkouts-quiet-display { overflow-wrap: anywhere; }
+.checkouts-quiet-checkout { color: var(--muted); }
+.checkouts-work-item {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem;
+}
+.checkouts-verdict-words { font-weight: 600; }
+.checkouts-show-on-board {
+  padding: .05rem .4rem;
+  font-size: .75rem;
+  white-space: nowrap;
+}
 .board-empty { grid-column: 1 / -1; }
 .board-issues {
   grid-column: 1 / -1;
@@ -359,6 +483,8 @@ button.pending {
   .brand-name { font-size: 1.8rem; }
   #board { padding-left: 1rem; padding-right: 1rem; }
   #checkouts { padding-left: 1rem; padding-right: 1rem; }
+  /* The eight-column table scrolls rather than forcing the whole view wide. */
+  #checkouts .checkouts-group { overflow-x: auto; }
   #board {
     --card-min-width: 12rem;
     --label-min-width: 9rem;
