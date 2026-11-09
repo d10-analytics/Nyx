@@ -221,7 +221,8 @@ def test_the_pack_probe_sees_a_pack_when_the_remote_asks_for_one(tmp_path):
 
 # The whole second in which the last helper-run git command finished. A saved remote
 # check only yields to a tracking ref that moved at or after its own whole second, so a
-# networked collection waits for the next second before it takes its time.
+# test whose check must read earlier moves as older waits past this second first
+# (``wait_for_a_later_second``).
 LAST_GIT_SECOND = [0]
 
 
@@ -297,6 +298,12 @@ def clone(remote: Path | str, destination: Path, *options: str) -> Path:
     return destination
 
 
+def wait_for_a_later_second(second: int) -> None:
+    """A remote check taken afterwards has an ``at`` strictly later than every git command
+    that finished in ``second``."""
+    time.sleep(max(0.0, second + 1 - time.time()))
+
+
 def collect(
     folders: list[Path | str],
     *,
@@ -304,8 +311,6 @@ def collect(
     **options: Any,
 ) -> dict[str, Any]:
     """Run the real collector and return the parsed (strictly validated) document."""
-    if options.get("remote_checks"):
-        time.sleep(max(0.0, LAST_GIT_SECOND[0] + 1 - time.time()))
     text = checkouts.collect_checkouts(
         [str(folder) for folder in folders],
         deadline_ns=time.monotonic_ns() + int(seconds * 1e9),
@@ -10941,6 +10946,7 @@ class SavedWorld:
         self.fake = install_fake_gh(tmp_path, monkeypatch, stdout=self.answer)
         self.markers = [guard_remote(path, tmp_path) for path in (self.work, self.second)]
         self.shim, self.log = ls_remote_log(tmp_path)
+        wait_for_a_later_second(LAST_GIT_SECOND[0])
         with path_with(monkeypatch, self.shim):
             self.live = github_collect(self.folder)
         self.saved = saved_file(self.cache)["remote_checks"][GITHUB_KEY]
@@ -11723,7 +11729,7 @@ class PushedWorld:
         self.saved = saved_file(self.cache)
         [self.key] = self.saved["remote_checks"]
         self.at = self.saved["remote_checks"][self.key]["heads"]["at"]
-        time.sleep(1.1)
+        wait_for_a_later_second(self.at)
 
     def pushed(self) -> str:
         """``a`` pushes a new ``topic`` commit and ``b`` pushes a new branch ``fresh``."""
@@ -11913,7 +11919,7 @@ def test_a_tracking_ref_older_than_the_saved_check_keeps_the_recorded_value(
     git(a, "push", "-q", "-u", "origin", "topic")
     git(b, "fetch", "-q", "origin")
     git(b, "branch", "topic", "origin/topic")
-    time.sleep(1.1)
+    wait_for_a_later_second(LAST_GIT_SECOND[0])
     # Another clone pushes after B's fetch, and a networked run saves that tip.
     newer = push_from(a, "topic", "topic-two.txt")
     collect([folder], remote_checks=True)
