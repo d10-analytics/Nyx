@@ -7937,3 +7937,69 @@ def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
     for minutes, words in ((7, "7 min"), (125, "2 h"), (60 * 49, "2 d")):
         serve_checkouts(page, double, fetched(minutes))
         assert row.inner_text() == f"cached, fetched {words} ago"
+
+
+def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkouts):
+    """The Branches cell pluralizes the stash count it shows (D-21, "&lt;K&gt; stashes")."""
+
+    def stashed(count):
+        def mutate(document):
+            _, clone = checkout_clone(document, "Repo Clone 2")
+            clone["stash_count"] = count
+        return checkout_variant(view_checkouts.document_built, mutate)
+
+    page, double = open_view_checkouts(open_page, view_checkouts, stashed(1))
+    cell = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-branches')
+    assert cell.inner_text() == "3 branches · 1 stash"
+    assert "1 stashs" not in page.locator("#checkouts-body").inner_text()
+    serve_checkouts(page, double, stashed(2))
+    assert cell.inner_text() == "3 branches · 2 stashes"
+    assert "stashs" not in page.locator("#checkouts-body").inner_text()
+    # The singular of the cleanup counts reads the same way in the same table.
+    cleanup = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-cleanup')
+    assert cleanup.inner_text().startswith("1 branch, 1 worktree removable")
+
+
+def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkouts):
+    """A search survives the jump unless it is what hides the card (D-08)."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+
+    def show_button():
+        remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+        return remote_view.locator(
+            'table.checkouts-package-branches tr[data-branch="topic-a"] '
+            '[data-show-on-board="Repo/Drafts/alpha"]')
+
+    # A query that matches the card is kept across the jump.
+    page.fill("#filter", "alpha")
+    show_button().click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == "alpha"
+    assert page.locator('.card[data-package-path="Repo/Drafts/alpha"]').is_hidden() is False
+
+    # A query that hides the card is cleared before the jump.  The group stays
+    # listed by its other clone's name while this work item's card does not
+    # match, so the table row is reachable with the hiding query in place.
+    show_checkouts_view(page)
+    page.fill("#filter", "Repo Clone 10")
+    show_button().click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == ""
+    assert page.evaluate(
+        "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+
+def test_checkouts_git_problem_escapes_the_version_once(open_page, view_checkouts):
+    """A git version carrying markup is escaped exactly once in the setup panel."""
+    document = git_problem_variant(view_checkouts, "2.36&1")
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    item = page.locator('#checkouts-body [data-setup="git"]')
+    assert item.inner_text() == "Git 2.36&1 is older than Nyx supports (2.36)"
+    assert "&amp;" in item.inner_html()
+    assert "&amp;amp;" not in item.inner_html()
+    # The rest of the panel keeps its order and words.
+    kinds = page.locator("#checkouts-body .checkouts-setup-item").evaluate_all(
+        "items => items.map(item => item.dataset.setup)")
+    assert kinds == ["git", "folder", "diagnostic"]
