@@ -5535,3 +5535,375 @@ def test_checkouts_real_runtime_serves_the_collected_document(open_page, real_ch
     assert page.locator("#board-issues").count() == 0
     assert page.locator(".checkouts-issue-summary").count() == 0
 
+
+# ---------------------------------------------------------------------------
+# The card's Code Status line, its in-place updates and its documentation
+# ---------------------------------------------------------------------------
+
+# The Code Status text the captured D0 document holds for each package that has
+# one; delta and epsilon have none.  Stating them here makes a collector change
+# fail loudly rather than quietly redefining what the line must show.
+CHECKOUTS_CODE_STATUS_TEXTS = {
+    "Repo/Drafts/alpha": "in progress · pushed",
+    "Repo/Drafts/beta": "in progress · push state unknown · in Repo Clone 10",
+    "Repo/Shipped/gamma": "awaiting merge (no PR)",
+}
+CHECKOUTS_CARD_PATHS = {
+    "Repo/Drafts/alpha", "Repo/Drafts/beta", "Repo/Drafts/delta",
+    "Repo/Drafts/epsilon", "Repo/Shipped/gamma",
+}
+
+
+def package_text(document, path):
+    """The Code Status text one package of a captured document holds."""
+    package = next(item for item in document["packages"] if item["package_path"] == path)
+    assert package["code_status"] is not None, path
+    return package["code_status"]["text"]
+
+
+def checkouts_with_text(document, path, value):
+    """The envelope of one captured document with one package's text replaced.
+
+    The replacement is re-sealed, so the browser receives a valid document and
+    must show the served text rather than any text it could rebuild.
+    """
+    changed = copy.deepcopy(document)
+    package = next(item for item in changed["packages"] if item["package_path"] == path)
+    package["code_status"]["text"] = value
+    return checkouts_envelope(redigest(changed))
+
+
+def checkouts_with_revision(document, revision):
+    """The envelope of one captured document re-sealed under another revision."""
+    changed = copy.deepcopy(document)
+    changed["configuration_revision"] = revision
+    return checkouts_envelope(redigest(changed))
+
+
+def code_status_card(page, path):
+    """The card of one package path."""
+    return page.locator(f'.card[data-package-path="{path}"]')
+
+
+def code_status_line(page, path):
+    """One card's single Code Status line, or None when it holds none."""
+    lines = code_status_card(page, path).locator(".card-code-status")
+    return lines.inner_text() if lines.count() else None
+
+
+def visible_card_paths(page, query):
+    """The package paths a search leaves visible."""
+    page.fill("#filter", query)
+    return page.locator(".card:not([hidden])").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)"
+    )
+
+
+def open_code_status_page(launch, real_checkouts, double, *, client=None):
+    """Open the fixture board, settle its first scan and show every stage row."""
+    page = open_checkouts_page(launch, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    # Unchecking a display preference is a full render, so every finished-stage
+    # card is on the board before a proof reads its line.
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    return page
+
+
+def test_code_status_line_shows_the_served_document(open_page, real_checkouts):
+    """Each card shows the served text as one line after Filepath, and search reads it."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    assert set(card_paths(page)) == CHECKOUTS_CARD_PATHS
+    assert {
+        path: package_text(real_checkouts.document_zero, path)
+        for path in CHECKOUTS_CODE_STATUS_TEXTS
+    } == CHECKOUTS_CODE_STATUS_TEXTS
+    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
+        assert code_status_line(page, path) == f"Code Status: {expected}", path
+    # A package whose Code Status is null gets no line and no placeholder.
+    for path in ("Repo/Drafts/delta", "Repo/Drafts/epsilon"):
+        assert code_status_card(page, path).locator(".card-code-status").count() == 0, path
+        assert "Code Status" not in code_status_card(page, path).inner_text(), path
+    # The line follows Filepath inside the card's button and precedes its start
+    # text, exactly where Filepath and Target Folder are.
+    structure = page.locator(".card[data-package-path]").evaluate_all("""cards => cards.map(card => ({
+      path: card.dataset.packagePath,
+      tag: card.tagName,
+      lines: card.querySelectorAll('.card-code-status').length,
+      previous: card.querySelector('.card-code-status')?.previousElementSibling?.className,
+      next: card.querySelector('.card-code-status')?.nextElementSibling?.className,
+    }))""")
+    assert len(structure) == len(CHECKOUTS_CARD_PATHS)
+    for card in structure:
+        assert card["tag"] == "BUTTON", card
+        if card["path"] in CHECKOUTS_CODE_STATUS_TEXTS:
+            assert card["lines"] == 1, card
+            assert card["previous"] == "card-filepath", card
+            assert card["next"] == "visually-hidden card-start-text", card
+        else:
+            assert card["lines"] == 0, card
+    # The button's accessible name carries the line, as its other lines do.
+    alpha = code_status_card(page, "Repo/Drafts/alpha")
+    playwright.expect(alpha).to_have_accessible_name(
+        re.compile(re.escape(f"Code Status: {CHECKOUTS_CODE_STATUS_TEXTS['Repo/Drafts/alpha']}"))
+    )
+    # Nothing announces a Code Status: neither the line nor an ancestor is live.
+    assert page.locator(".card-code-status").evaluate_all(
+        "lines => lines.filter(line => line.closest("
+        "'[aria-live], [role=\"status\"], [role=\"alert\"]')).length"
+    ) == 0
+    # Search reads the line's text, which no other card's text holds.
+    page.fill("#filter", "")
+    assert visible_card_paths(page, "awaiting merge") == ["Repo/Shipped/gamma"]
+    assert visible_card_paths(page, "push state unknown") == ["Repo/Drafts/beta"]
+    assert visible_card_paths(page, "clone 10") == ["Repo/Drafts/beta"]
+    page.fill("#filter", "")
+
+
+@pytest.mark.parametrize("theme,card_color", [("light", LIGHT_CARD), ("dark", DARK_CARD)])
+def test_code_status_line_is_readable_on_every_card_surface(
+    open_page, real_checkouts, theme, card_color
+):
+    """The line keeps 4.5:1 contrast on the teal and the neutral card, in both themes."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    alpha = code_status_card(page, "Repo/Drafts/alpha")
+    beta = code_status_card(page, "Repo/Drafts/beta")
+    assert alpha.evaluate("card => getComputedStyle(card).backgroundColor") == NO_INCOMING_CARD
+    assert beta.evaluate("card => getComputedStyle(card).backgroundColor") == card_color
+    for card in (alpha, beta):
+        colors = card.evaluate("""card => ({
+          text: getComputedStyle(card.querySelector('.card-code-status')).color,
+          background: getComputedStyle(card).backgroundColor,
+        })""")
+        assert contrast_ratio(colors["text"], colors["background"]) >= 4.5, (theme, colors)
+
+
+def test_code_status_line_shows_the_text_it_is_served(open_page, real_checkouts):
+    """A re-sealed text is displayed verbatim, so nothing rebuilds it in the browser."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    double.serve(checkouts_with_text(real_checkouts.document_zero, "Repo/Drafts/alpha", "custom words"))
+    fire_checkouts_poll(page)
+    assert code_status_line(page, "Repo/Drafts/alpha") == "Code Status: custom words"
+    assert visible_card_paths(page, "custom words") == ["Repo/Drafts/alpha"]
+    page.fill("#filter", "")
+
+
+def test_code_status_long_checkout_name_wraps_inside_the_card(open_page, real_checkouts):
+    """A 300-character unbroken text breaks inside the column instead of overflowing it."""
+    token = "x" * 300
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    double.serve(checkouts_with_text(real_checkouts.document_zero, "Repo/Drafts/alpha", token))
+    fire_checkouts_poll(page)
+    alpha = code_status_card(page, "Repo/Drafts/alpha")
+    assert alpha.locator(".card-code-status").inner_text() == f"Code Status: {token}"
+    line = alpha.locator(".card-code-status").evaluate(
+        "line => ({scrollWidth: line.scrollWidth, clientWidth: line.clientWidth})"
+    )
+    assert line["scrollWidth"] <= line["clientWidth"] + 1, line
+    bounds = alpha.evaluate("""card => ({
+      right: card.getBoundingClientRect().right,
+      cellRight: card.closest('.cell').getBoundingClientRect().right,
+    })""")
+    assert bounds["right"] <= bounds["cellRight"] + 1, bounds
+
+
+def test_code_status_line_comes_from_the_real_runtime(open_page, real_checkouts):
+    """The admitted runtime's own get_checkouts serves a document the card renders."""
+    workers = CheckoutsWorkerStandIn(real_checkouts.document_zero_bytes)
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        settings=BrowserSettings(revision=real_checkouts.revision),
+        workers=workers,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert workers.fetch_calls >= 1
+    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
+        assert code_status_line(page, path) == f"Code Status: {expected}", path
+
+
+def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
+    """One tick rewrites one card's line on the same elements and keeps the board."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    assert page.locator(".rail-layer").count() == 1
+    alpha = code_status_card(page, "Repo/Drafts/alpha")
+    alpha.click()
+    playwright.expect(alpha).to_have_attribute("aria-pressed", "true")
+    alpha.focus()
+    page.set_viewport_size({"width": 900, "height": 320})
+    page.evaluate("() => window.scrollTo(0, 120)")
+    assert page.evaluate("window.scrollY") > 0
+    assert page.locator(
+        f'.connection[data-source="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]'
+        f'[data-dependent="{CHECKOUTS_PACKAGE_IDS["beta"]}"]'
+    ).count() == 1
+    rail_layer = page.locator(".rail-layer").element_handle()
+    card = alpha.element_handle()
+    line = alpha.locator(".card-code-status").element_handle()
+    height = page.locator("#board").evaluate("board => board.getBoundingClientRect().height")
+    offset = page.evaluate("window.scrollY")
+    observe_removed_cards(page)
+    arm_focus_sampler(page)
+    observe_refresh_status(page)
+    double.serve(checkouts_envelope(real_checkouts.document_one))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    # The same card and the same line element now hold the next scan's text.
+    assert line.evaluate("node => node.isConnected && node.textContent") == (
+        "Code Status: in progress · 1 unpushed"
+    )
+    assert card.evaluate(
+        "node => node.isConnected && "
+        "node === document.querySelector('.card[data-package-path=\"Repo/Drafts/alpha\"]')"
+    )
+    assert page.evaluate("window.removedCards") == 0
+    assert card.evaluate("node => node === document.activeElement")
+    assert card.get_attribute("aria-pressed") == "true"
+    assert_focus_sampler_clean(page)
+    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh.pending").count() == 0
+    assert page.evaluate("window.scrollY") == offset
+    assert page.evaluate("window.refreshStatusRecords") == 0
+    # The filter pass redrew the rails: the old layer is gone and a new one holds
+    # the same pair, while the board's height did not change.
+    assert not rail_layer.evaluate("node => node.isConnected")
+    assert page.locator(".rail-layer").count() == 1
+    assert page.locator(
+        f'.connection[data-source="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]'
+        f'[data-dependent="{CHECKOUTS_PACKAGE_IDS["beta"]}"]'
+    ).count() == 1
+    assert page.locator("#board").evaluate(
+        "board => board.getBoundingClientRect().height"
+    ) == height
+    # A filtered card leaves the board as soon as its new text stops matching,
+    # and its empty cell says so.
+    assert visible_card_paths(page, "1 unpushed") == ["Repo/Drafts/alpha"]
+    double.serve(checkouts_envelope(real_checkouts.document_two))
+    fire_checkouts_poll(page)
+    playwright.expect(alpha).to_be_hidden()
+    assert alpha.evaluate("node => node.closest('.cell').classList.contains('filtered-empty')")
+    page.fill("#filter", "")
+    assert code_status_line(page, "Repo/Drafts/alpha") == (
+        "Code Status: in progress · 3 unpushed"
+    )
+    # A full render keeps the line and the same searchable text.
+    page.get_by_label("Hide empty rows and columns", exact=True).uncheck()
+    assert code_status_line(page, "Repo/Drafts/alpha") == (
+        "Code Status: in progress · 3 unpushed"
+    )
+    assert visible_card_paths(page, "3 unpushed") == ["Repo/Drafts/alpha"]
+    page.fill("#filter", "")
+
+
+def test_checkouts_failure_hides_every_code_status_line(open_page, real_checkouts):
+    """A failed read removes the lines and their text from search, and a scan restores them."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    assert page.locator(".card-code-status").count() == len(CHECKOUTS_CODE_STATUS_TEXTS)
+    double.fail("checkouts_failed")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".card-code-status")).to_have_count(0)
+    assert visible_card_paths(page, "in progress") == []
+    page.fill("#filter", "")
+    playwright.expect(page.locator(".checkouts-issue-summary")).to_have_text(
+        "Code Status unavailable: checkouts_failed"
+    )
+    double.serve(checkouts_envelope(real_checkouts.document_zero))
+    fire_checkouts_poll(page)
+    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
+        assert code_status_line(page, path) == f"Code Status: {expected}", path
+    assert page.locator(".checkouts-issue-summary").count() == 0
+
+
+def test_apply_update_hides_the_lines_until_a_matching_scan(open_page, real_checkouts):
+    """A saved board revision keeps the displayed lines, and applying it hides them."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    settings = BrowserSettings(revision=real_checkouts.revision)
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        settings=settings,
+        checkouts=double,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert page.locator(".card-code-status").count() == len(CHECKOUTS_CODE_STATUS_TEXTS)
+    settings.revision = real_checkouts.revision_moved
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    # The displayed catalog is still the old revision, so its lines still match.
+    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
+        assert code_status_line(page, path) == f"Code Status: {expected}", path
+    page.locator("#refresh").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    settle_frames(page)
+    assert page.locator(".card-code-status").count() == 0
+    assert page.locator(".checkouts-issue-summary").count() == 0
+    assert page.locator("#board-issues").count() == 0
+    double.serve(
+        checkouts_with_revision(real_checkouts.document_zero, real_checkouts.revision_moved)
+    )
+    fire_checkouts_poll(page)
+    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
+        assert code_status_line(page, path) == f"Code Status: {expected}", path
+
+
+def test_null_configuration_revision_never_shows_a_line(open_page, real_checkouts):
+    """Null equals null is not a match, and no line or notice appears."""
+    catalog = copy.deepcopy(real_checkouts.catalog)
+    catalog["configuration_revision"] = None
+    _reseal(catalog)
+    document = copy.deepcopy(real_checkouts.document_zero)
+    document["configuration_revision"] = None
+    envelope = checkouts_envelope(redigest(document))
+    page = open_page(StaticClient(catalog), fake_clock=True, init_script=RESPONSE_RECORDER)
+    # The standalone server offers no checkouts route, so the page's own tick is
+    # answered with the revision-less document through the browser's router.
+    page.route(
+        "**/api/checkouts",
+        lambda route: route.fulfill(status=200, body=json.dumps(envelope)),
+    )
+    fire_poll(page)
+    wait_for_responses(page, "checkoutsResponses", 2)
+    settle_frames(page)
+    assert page.evaluate("window.checkoutsResponses") == [404, 200]
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    assert set(card_paths(page)) == CHECKOUTS_CARD_PATHS
+    assert page.locator(".card-code-status").count() == 0
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator(".checkouts-issue-summary").count() == 0
+
+
+def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts):
+    """A moved package has no line until its card is displayed, and then gets one."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([real_checkouts.catalog, real_checkouts.catalog_after_move])
+    page = open_code_status_page(open_page, real_checkouts, double, client=client)
+    assert "Repo/Drafts/alpha" in card_paths(page)
+    double.serve(checkouts_envelope(real_checkouts.document_three))
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    # The displayed card's path is absent from the served scan, so it has no
+    # line; the other packages keep theirs.
+    assert code_status_card(page, "Repo/Drafts/alpha").locator(".card-code-status").count() == 0
+    for path in ("Repo/Drafts/beta", "Repo/Shipped/gamma"):
+        assert code_status_line(page, path) == (
+            f"Code Status: {package_text(real_checkouts.document_three, path)}"
+        ), path
+    page.locator("#refresh").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    assert "Repo/Shipped/alpha" in card_paths(page)
+    assert code_status_line(page, "Repo/Shipped/alpha") == (
+        f"Code Status: {package_text(real_checkouts.document_three, 'Repo/Shipped/alpha')}"
+    )
