@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -638,21 +639,79 @@ class BrowserCheckouts:
         return outcome
 
 
+class RemoteCheckCheckouts(BrowserCheckouts):
+    """A provider double that also answers the remote-check route.
+
+    ``hold_remote_check`` keeps the next ``refresh_remote_checks`` call in
+    flight until the test releases it; ``serve_remote_check`` and
+    ``fail_remote_check`` queue the envelope, or the category the route turns
+    into a 502, that the call answers.
+    """
+
+    def __init__(self, document=None):
+        super().__init__(document)
+        self.remote_calls = 0
+        self.remote_queued = []
+        self.remote_gate = None
+        self.remote_entered = threading.Event()
+
+    def hold_remote_check(self):
+        """Hold the next remote check until the returned event is set."""
+        self.remote_gate = threading.Event()
+        self.remote_entered = threading.Event()
+        return self.remote_gate
+
+    def serve_remote_check(self, envelope):
+        """Answer the next remote check with ``envelope``."""
+        self.remote_queued.append(envelope)
+
+    def fail_remote_check(self, code):
+        """Answer the next remote check with the server's 502 for ``code``."""
+        self.remote_queued.append(CatalogError(code))
+
+    def refresh_remote_checks(self):
+        self.remote_calls += 1
+        self.remote_entered.set()
+        gate = self.remote_gate
+        if gate is not None:
+            gate.wait(timeout=10)
+        outcome = self.remote_queued.pop(0) if self.remote_queued else self.envelope()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
 class CheckoutsWorkerStandIn:
     """The worker manager a real-runtime page needs, answering captured bytes.
 
     The application collects through its worker boundary, so a page against the
     real provider stands this in for the subprocess: a collection returns the
     captured document, so nothing starts a child, contacts git or uses the
-    network.
+    network.  ``hold_network`` keeps the next networked collection in flight
+    until the test releases it, so a proof can hold the fetch the runtime waits
+    on for a requested remote check.
     """
 
     def __init__(self, document):
         self.document = document
         self.fetch_calls = 0
+        self.network_calls = 0
+        self.network_gate = None
+        self.network_entered = threading.Event()
+
+    def hold_network(self):
+        """Hold the next networked collection until the returned event is set."""
+        self.network_gate = threading.Event()
+        self.network_entered = threading.Event()
+        return self.network_gate
 
     def fetch_checkouts(self, *, network):
         self.fetch_calls += 1
+        if network:
+            self.network_calls += 1
+            self.network_entered.set()
+            if self.network_gate is not None:
+                self.network_gate.wait(timeout=10)
         return self.document
 
     def fetch_catalog(self):
@@ -732,8 +791,15 @@ def page_launcher(browser, launch_timeout_ms=15000):
             application.save_settings = settings.save_settings
             client.settings = settings
             if workers is None:
-                application.get_checkouts = (
-                    checkouts or BrowserCheckouts()).get_checkouts
+                double = checkouts or BrowserCheckouts()
+                application.get_checkouts = double.get_checkouts
+                # The routes ask the application for each provider method at
+                # request time.  An instance attribute that is None shadows the
+                # runtime's own method, so a double without a remote-check
+                # method answers the POST with 404.
+                application.refresh_remote_checks = getattr(
+                    double, "refresh_remote_checks", None
+                )
         context = None
         try:
             if application is not None:
@@ -851,11 +917,13 @@ def fire_poll(page):
 # ones its first load sends before a test can attach a listener.
 RESPONSE_RECORDER = """
 window.checkoutsResponses = [];
+window.remoteCheckResponses = [];
 window.catalogResponses = [];
 const nyxRecordFetch = window.fetch;
 window.fetch = function (...args) {
   const route = String(args[0]);
   return nyxRecordFetch(...args).then(function (response) {
+    if (route.includes("/api/checkouts/remote-check")) window.remoteCheckResponses.push(response.status);
     if (route.includes("/api/checkouts")) window.checkoutsResponses.push(response.status);
     if (route.includes("/api/catalog")) window.catalogResponses.push(response.status);
     return response;
@@ -2607,17 +2675,18 @@ def observe_removed_cards(page):
     }""")
 
 
-def observe_refresh_status(page):
-    assert page.locator("#refresh-status").count() == 1
-    page.evaluate("""() => {
+def observe_refresh_status(page, selector="#refresh-status"):
+    """Record each text change of one status region, ``#refresh-status`` by default."""
+    assert page.locator(selector).count() == 1
+    page.evaluate(f"""() => {{
       window.refreshStatusRecords = 0;
       window.refreshStatusTexts = [];
-      const status = document.querySelector('#refresh-status');
-      new MutationObserver(records => {
+      const status = document.querySelector({selector!r});
+      new MutationObserver(records => {{
         window.refreshStatusRecords += records.length;
         window.refreshStatusTexts.push(status.textContent);
-      }).observe(status, {childList: true, characterData: true, subtree: true});
-    }""")
+      }}).observe(status, {{childList: true, characterData: true, subtree: true}});
+    }}""")
 
 
 def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
@@ -5926,3 +5995,736 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
     assert code_status_line(page, "Repo/Shipped/alpha") == (
         f"Code Status: {package_text(real_checkouts.document_three, 'Repo/Shipped/alpha')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The checkouts view: view switch, status line, remote checks and panels
+# ---------------------------------------------------------------------------
+
+CHECKOUTS_VIEW_PLACEHOLDER = "Find a checkout, branch, or work item…"
+BOARD_SEARCH_PLACEHOLDER = "Find a work item, project, or program…"
+
+
+def checkouts_local_time(value, reference=None, *, seconds=True):
+    """The view's local label for one UTC timestamp, as D-06 states it."""
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    label = moment.strftime("%H:%M:%S" if seconds else "%H:%M")
+    if reference is not None:
+        observed = datetime.fromisoformat(reference.replace("Z", "+00:00")).astimezone()
+        if moment.date() != observed.date():
+            label = f"{moment:%Y-%m-%d} {label}"
+    return label
+
+
+def checkouts_remote_envelope(document, *, state="idle", next_due_at=None, last=None):
+    """One checkout envelope with the remote-check schedule a test states."""
+    envelope = checkouts_envelope(copy.deepcopy(document))
+    envelope["remote_checks"] = {
+        "state": state,
+        "interval_seconds": REMOTE_CHECK_INTERVAL,
+        "next_due_at": next_due_at,
+        "last": last,
+    }
+    return envelope
+
+
+def checkouts_remote_run(*, finished_at, outcome="completed"):
+    """One finished remote check of the shape the real runtime records."""
+    return {
+        "started_at": "2026-11-09T11:59:50Z",
+        "finished_at": finished_at,
+        "outcome": outcome,
+        "repositories": [],
+    }
+
+
+def show_checkouts_view(page):
+    """Press the Checkouts switch and wait for the two views to swap."""
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+
+
+def checkouts_view_page(launch, real_checkouts, double, *, client=None):
+    """Open one fake-clock application page and show the checkouts view."""
+    page = open_checkouts_page(launch, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page
+
+
+def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
+    open_page, real_checkouts
+):
+    """One view at a time, focus on the pressed switch, and the view is remembered."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    board_switch = page.locator("#view-board")
+    checkouts_switch = page.locator("#view-checkouts")
+    assert board_switch.get_attribute("aria-pressed") == "true"
+    assert checkouts_switch.get_attribute("aria-pressed") == "false"
+    assert page.locator("#checkouts").evaluate(
+        "view => getComputedStyle(view).display") == "none"
+    assert page.locator("#board").is_visible()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_visible()
+    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
+    # The existing preference keys keep their unset defaults; the view choice is
+    # its own key.
+    assert page.evaluate(
+        "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
+        " 'spec-tracker-deselect-on-empty-click', 'spec-tracker-theme']"
+        ".map(key => localStorage.getItem(key))"
+    ) == [None, None, None, None]
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") is None
+
+    checkouts_switch.click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert board_switch.get_attribute("aria-pressed") == "false"
+    assert checkouts_switch.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+    assert page.get_by_label("Hide terminal rows", exact=True).is_hidden()
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_hidden()
+    quiet = page.get_by_label("Hide quiet checkouts", exact=True)
+    assert quiet.is_visible()
+    assert quiet.is_checked()
+    assert page.locator("#filter").get_attribute("placeholder") == CHECKOUTS_VIEW_PLACEHOLDER
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "checkouts"
+    # The checkouts preference is its own key and does not disturb the others.
+    assert page.evaluate(
+        "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
+        " 'spec-tracker-deselect-on-empty-click', 'spec-tracker-theme']"
+        ".map(key => localStorage.getItem(key))"
+    ) == [None, None, None, None]
+    quiet.uncheck()
+    assert page.evaluate("localStorage.getItem('spec-tracker-hide-quiet-checkouts')") == "false"
+
+    # A reload starts in the remembered view.
+    page.reload()
+    page.wait_for_function("() => document.querySelectorAll('#board .card').length > 0")
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
+    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "board"
+    assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
+    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "init_script,expected",
+    [
+        ("localStorage.setItem('spec-tracker-view', 'checkouts');", "checkouts"),
+        ("localStorage.setItem('spec-tracker-view', 'somewhere-else');", "board"),
+        (
+            "Object.defineProperty(window, 'localStorage', {"
+            "get() { throw new DOMException('Blocked', 'SecurityError'); }});",
+            "board",
+        ),
+    ],
+    ids=["stored-checkouts", "unknown-value", "blocked-storage"],
+)
+def test_checkouts_view_starts_in_board_without_a_known_value(
+    open_page, real_checkouts, init_script, expected
+):
+    """A fresh browser, an unknown value and blocked storage fall back to Board."""
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        fake_clock=True,
+        init_script=init_script + RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    if expected == "checkouts":
+        playwright.expect(page.locator("#checkouts")).to_be_visible()
+        assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
+    else:
+        playwright.expect(page.locator("#board")).to_be_visible()
+        assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
+        assert page.locator("#checkouts").evaluate(
+            "view => getComputedStyle(view).display") == "none"
+    # Switching works in every case, including with storage unavailable.
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+
+
+def test_checkouts_view_keeps_a_waiting_catalog_update_for_the_board(
+    open_page, real_checkouts
+):
+    """A tick while Checkouts is shown offers the change to the board, not here."""
+    changed = copy.deepcopy(real_checkouts.catalog)
+    title = next(
+        entry for entry in changed["entries"] if entry["package_path"] == "Repo/Drafts/alpha"
+    )
+    title["declared"]["title"] = "Alpha renamed"
+    _reseal(changed)
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([real_checkouts.catalog, changed])
+    page = checkouts_view_page(open_page, real_checkouts, double, client=client)
+    fire_checkouts_poll(page)
+    # The board's update is offered on the board, never applied from here.
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    playwright.expect(page.locator("#view-board")).to_have_text("Board (update waiting)")
+    catalogs = page.evaluate("window.catalogResponses.length")
+    checkouts = page.evaluate("window.checkoutsResponses.length")
+    with page.expect_response("**/api/checkouts") as response:
+        page.locator("#refresh").click()
+    response.value.finished()
+    assert page.evaluate("window.checkoutsResponses.length") == checkouts + 1
+    assert page.evaluate("window.catalogResponses.length") == catalogs
+    assert "Alpha renamed" not in page.locator(".card-title").all_inner_texts()
+    # The waiting update is still waiting when the board is shown again.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    assert page.locator("#refresh.pending").count() == 1
+    assert page.locator("#view-board").inner_text() == "Board"
+    page.locator("#refresh").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    assert "Alpha renamed" in page.locator(".card-title").all_inner_texts()
+
+
+def test_checkouts_view_search_carries_back_to_the_board(open_page, real_checkouts):
+    """The one search box keeps its text across the switch and its rails redraw."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    page.fill("#filter", "alpha")
+    assert page.locator("#filter").input_value() == "alpha"
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator(".card:not([hidden])").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)") == ["Repo/Drafts/alpha"]
+    # With an empty query the board's dependent pair is drawn again after the
+    # switch back, and each rail meets its two cards.
+    page.locator("#view-checkouts").click()
+    page.fill("#filter", "")
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    settle_frames(page)
+    assert page.locator(
+        f'.connection[data-source="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]'
+        f'[data-dependent="{CHECKOUTS_PACKAGE_IDS["beta"]}"]'
+    ).count() == 1
+    assert_readable_arrows(page)
+
+
+def test_checkouts_view_uses_the_theme_colors(open_page, real_checkouts):
+    """The view's own text takes the theme's tokens in both themes."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    status_line = page.locator("#checkouts-status-line")
+    dark = status_line.evaluate("line => getComputedStyle(line).color")
+    assert dark == "rgb(230, 237, 243)"
+    page.get_by_label("Theme", exact=True).select_option("light")
+    light = status_line.evaluate("line => getComputedStyle(line).color")
+    assert light == "rgb(32, 36, 42)"
+    assert light != dark
+    assert page.locator("#checkouts").evaluate(
+        "view => getComputedStyle(view).color") == light
+
+
+def test_checkouts_status_line_shows_local_remote_and_lookup_state(
+    open_page, real_checkouts
+):
+    """The line dates the local state and names the check schedule and lookup."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    local = checkouts_local_time(observed)
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    status_line = page.locator("#checkouts-status-line")
+    assert status_line.inner_text() == (
+        f"Local state {local} · Remotes not checked yet"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+    assert status_line.locator("time").first.get_attribute("datetime") == observed
+    finished = "2026-11-09T12:00:00Z"
+    due = "2026-11-09T12:05:00Z"
+    double.serve(
+        checkouts_remote_envelope(
+            document, next_due_at=due,
+            last=checkouts_remote_run(finished_at=finished),
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Remotes checked {checkouts_local_time(finished, observed)}"
+        f" · Next check about {checkouts_local_time(due, observed)}"
+        " · Pull request lookup off"
+    )
+    # A check in flight while the envelope is served says so.
+    double.serve(
+        checkouts_remote_envelope(
+            document, state="running", last=checkouts_remote_run(finished_at=finished)
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Checking remotes… · Next check at the next refresh"
+        " · Pull request lookup off"
+    )
+    # A failed check keeps the document and states its category and time.
+    double.serve(
+        checkouts_remote_envelope(
+            document, next_due_at=None,
+            last=checkouts_remote_run(
+                finished_at=finished, outcome="checkouts_timeout"
+            ),
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Last remote check failed (checkouts_timeout) at "
+        f"{checkouts_local_time(finished, observed)}"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+
+
+def test_checkouts_check_remotes_now_sends_one_held_post_and_announces_once(
+    open_page, real_checkouts
+):
+    """One press while idle sends one POST, blocks repeats, and announces its result."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(
+            document, next_due_at="2026-11-09T12:05:00Z",
+            last=checkouts_remote_run(finished_at=finished),
+        )
+    )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    # The view's own network surface is the GET and the POST: no checkout
+    # settings request is made from here.
+    settings_requests = []
+    page.route(
+        "**/api/checkout-settings*",
+        lambda route: (
+            settings_requests.append(route.request.url),
+            route.fulfill(status=404, body="{}"),
+        ),
+    )
+    requests = []
+
+    def record_checkouts_request(request):
+        if "/api/checkouts" in request.url:
+            requests.append((request.method, request.url.rsplit("/api/", 1)[1]))
+
+    page.on("request", record_checkouts_request)
+    gate = double.hold_remote_check()
+    button = page.locator("#check-remotes")
+    button.focus()
+    button.click()
+    assert double.remote_entered.wait(timeout=10)
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    # aria-disabled leaves the button focusable and clickable; only the
+    # handler refuses the repeat.
+    assert button.get_attribute("disabled") is None
+    assert page.evaluate("document.activeElement.id") == "check-remotes"
+    assert "Checking remotes…" in page.locator("#checkouts-status-line").inner_text()
+    # Exactly one POST reached the provider; the read count did not grow.
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    # Two more presses and two ticks send nothing while it is held.
+    button.dispatch_event("click")
+    button.dispatch_event("click")
+    fire_poll(page)
+    fire_poll(page)
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    observe_refresh_status(page, "#checkouts-action-status")
+    gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    # One message, once, for the one check.
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.evaluate("window.refreshStatusTexts") == ["Remote check finished."]
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert button.inner_text() == "Check remotes now"
+    assert button.get_attribute("aria-disabled") is None
+    # The one POST was the only checkouts request while it was held, and no
+    # checkout-settings request was made.
+    assert requests == [("POST", "checkouts/remote-check")]
+    assert settings_requests == []
+    assert page.locator("#checkouts-status-line").inner_text() == (
+        f"Local state {checkouts_local_time(observed)}"
+        f" · Remotes checked {checkouts_local_time(finished, observed)}"
+        f" · Next check about {checkouts_local_time('2026-11-09T12:05:00Z', observed)}"
+        " · Pull request lookup off"
+    )
+
+
+def test_checkouts_check_remotes_now_waits_for_a_held_read(open_page, real_checkouts):
+    """A press during a held read is sent on that read's settle, not at a tick."""
+    document = real_checkouts.document_zero
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(document, last=checkouts_remote_run(finished_at=finished))
+    )
+    read_gate = double.hold()
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    assert double.entered.wait(timeout=10)
+    show_checkouts_view(page)
+    button = page.locator("#check-remotes")
+    button.click()
+    # The press is remembered, not sent during the read.
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    assert double.remote_calls == 0
+    assert page.evaluate("window.remoteCheckResponses") == []
+    read_gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert double.remote_calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    # No catalog tick fired between the read's settle and the POST.
+    assert page.evaluate("window.catalogResponses.length") == 1
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert button.inner_text() == "Check remotes now"
+
+
+def test_checkouts_remote_check_failed_outcome_writes_its_category(
+    open_page, real_checkouts
+):
+    """A 200 envelope with a failed check keeps the view and names the failure."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(
+            document,
+            last=checkouts_remote_run(finished_at=finished, outcome="checkouts_timeout"),
+        )
+    )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    observe_refresh_status(page, "#checkouts-action-status")
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "Remote check failed: checkouts_timeout."
+    )
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.locator("#checkouts-status-line").inner_text() == (
+        f"Local state {checkouts_local_time(observed)}"
+        f" · Last remote check failed (checkouts_timeout) at "
+        f"{checkouts_local_time(finished, observed)}"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+    # The document is still shown: a failed check does not blank the view.
+    assert page.locator(".checkouts-panel").count() == 0
+
+
+def test_checkouts_remote_check_502_installs_the_failed_panel(
+    open_page, real_checkouts
+):
+    """A 502 from the remote-check route installs its category as the failed panel."""
+    document = real_checkouts.document_zero
+    double = RemoteCheckCheckouts(document)
+    double.fail_remote_check("checkouts_timeout")
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [502]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "Remote check failed: checkouts_timeout."
+    )
+    assert page.locator(".checkouts-panel").inner_text() == (
+        "Checkout state is unavailable: checkouts_timeout."
+        " It clears when a later collection finishes in time."
+    )
+    assert page.locator("#board-issues .checkouts-issue-summary").inner_text() == (
+        "Code Status unavailable: checkouts_timeout"
+    )
+
+
+def test_checkouts_check_remotes_now_404_keeps_the_shown_outcome(
+    open_page, real_checkouts
+):
+    """A provider without the method answers 404, and the view is left as it was."""
+    document = real_checkouts.document_zero
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    before = page.locator("#checkouts-status-line").inner_text()
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [404]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This server does not offer remote checks."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == before
+    assert page.locator(".checkouts-panel").count() == 0
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator("#check-remotes").inner_text() == "Check remotes now"
+
+
+def checkouts_remote_check_mutations():
+    """Each remote-check mutation the browser must refuse as a protocol failure."""
+    run = checkouts_remote_run(finished_at="2026-11-09T12:00:00Z")
+
+    def missing_state(remote):
+        del remote["state"]
+
+    def extra_key(remote):
+        remote["unexpected"] = 1
+
+    def state_outside_the_set(remote):
+        remote["state"] = "paused"
+
+    def zero_interval(remote):
+        remote["interval_seconds"] = 0
+
+    def text_interval(remote):
+        remote["interval_seconds"] = "300"
+
+    def malformed_due(remote):
+        remote["next_due_at"] = "tomorrow"
+
+    def due_without_zone(remote):
+        remote["next_due_at"] = "2026-11-09T12:05:00"
+
+    def last_missing_key(remote):
+        last = dict(run)
+        del last["repositories"]
+        remote["last"] = last
+
+    def last_extra_key(remote):
+        last = dict(run)
+        last["unexpected"] = 1
+        remote["last"] = last
+
+    def last_bad_started(remote):
+        last = dict(run)
+        last["started_at"] = "yesterday"
+        remote["last"] = last
+
+    def last_bad_finished(remote):
+        last = dict(run)
+        last["finished_at"] = 7
+        remote["last"] = last
+
+    def outcome_outside_the_categories(remote):
+        last = dict(run)
+        last["outcome"] = "producer_timeout"
+        remote["last"] = last
+
+    def unknown_checkouts_category(remote):
+        last = dict(run)
+        last["outcome"] = "checkouts_surprise"
+        remote["last"] = last
+
+    def repositories_object(remote):
+        last = dict(run)
+        last["repositories"] = {}
+        remote["last"] = last
+
+    def last_text(remote):
+        remote["last"] = "completed"
+
+    return [
+        {"id": "missing-state", "mutate": missing_state},
+        {"id": "extra-key", "mutate": extra_key},
+        {"id": "state-outside-the-set", "mutate": state_outside_the_set},
+        {"id": "zero-interval", "mutate": zero_interval},
+        {"id": "text-interval", "mutate": text_interval},
+        {"id": "malformed-due", "mutate": malformed_due},
+        {"id": "due-without-zone", "mutate": due_without_zone},
+        {"id": "last-missing-key", "mutate": last_missing_key},
+        {"id": "last-extra-key", "mutate": last_extra_key},
+        {"id": "last-bad-started", "mutate": last_bad_started},
+        {"id": "last-bad-finished", "mutate": last_bad_finished},
+        {"id": "outcome-outside-the-categories", "mutate": outcome_outside_the_categories},
+        {"id": "unknown-checkouts-category", "mutate": unknown_checkouts_category},
+        {"id": "repositories-object", "mutate": repositories_object},
+        {"id": "last-text", "mutate": last_text},
+    ]
+
+
+def test_checkouts_view_refuses_each_malformed_remote_check_envelope(
+    open_page, real_checkouts
+):
+    """Every malformed remote-check shape shows the protocol panel, then clears."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    assert panel.count() == 0
+    for case in checkouts_remote_check_mutations():
+        envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
+        case["mutate"](envelope["remote_checks"])
+        double.serve(envelope)
+        fire_checkouts_poll(page)
+        playwright.expect(panel).to_have_count(1)
+        assert panel.inner_text() == (
+            "Checkout state is unavailable: checkouts_protocol_error."
+            " It clears when a later collection returns a valid document."
+        ), case["id"]
+        assert page.locator("#checkouts-status-line").inner_text() == "", case["id"]
+        # The next ready document clears it again.
+        fire_checkouts_poll(page)
+        playwright.expect(panel).to_have_count(0)
+
+
+def test_checkouts_check_remotes_now_uses_the_real_route(open_page, real_checkouts):
+    """The real runtime accepts the POST once its held network fetch is released."""
+    workers = CheckoutsWorkerStandIn(real_checkouts.document_zero_bytes)
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        settings=BrowserSettings(revision=real_checkouts.revision),
+        workers=workers,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    assert page.locator("#checkouts-status-line").inner_text().count("Remotes checked ") == 1
+    posted = []
+    page.on(
+        "request",
+        lambda request: posted.append(request)
+        if request.url.endswith("/api/checkouts/remote-check") else None,
+    )
+    gate = workers.hold_network()
+    page.locator("#check-remotes").click()
+    assert workers.network_entered.wait(timeout=10)
+    assert page.locator("#check-remotes").get_attribute("aria-disabled") == "true"
+    assert workers.network_calls == 2
+    assert page.evaluate("window.remoteCheckResponses") == []
+    assert [(request.method, request.headers.get("content-type"), request.post_data)
+            for request in posted] == [("POST", "application/json", "{}")]
+    gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    # The real route answered 200, so its envelope passed the extended validator.
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    assert page.locator(".checkouts-panel").count() == 0
+    status = page.locator("#checkouts-status-line").inner_text()
+    assert "Remotes checked " in status
+    assert "Last remote check failed" not in status
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert page.locator("#check-remotes").inner_text() == "Check remotes now"
+
+
+def test_checkouts_view_standalone_server_shows_only_the_unavailable_panel(
+    open_page, real_checkouts
+):
+    """A server without the checkouts route shows one panel and a usable switch."""
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    panel = page.locator(".checkouts-panel")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == "This Nyx server does not serve checkout state."
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-attention").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The switch stays usable while the panel is shown.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    # The next tick's ready document removes the panel.
+    page.route(
+        "**/api/checkouts",
+        lambda route: route.fulfill(
+            status=200,
+            body=json.dumps(checkouts_envelope(real_checkouts.document_zero)),
+        ),
+    )
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+def test_checkouts_view_failed_request_shows_the_clearing_panel(
+    open_page, real_checkouts
+):
+    """A 502 shows its category and clearing words, and leaves the board's part alone."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    double.fail("checkouts_timeout")
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == (
+        "Checkout state is unavailable: checkouts_timeout."
+        " It clears when a later collection finishes in time."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-attention").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The board's issues part keeps the existing failure part, unchanged.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator(".checkouts-issue-summary").inner_text() == (
+        "Code Status unavailable: checkouts_timeout"
+    )
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    # The next tick's ready document removes the panel.
+    double.serve(checkouts_envelope(real_checkouts.document_zero))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+def test_checkouts_view_malformed_body_shows_the_protocol_panel(
+    open_page, real_checkouts
+):
+    """A 200 body the client cannot validate shows the protocol panel until a valid tick."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    assert panel.count() == 0
+    page.route("**/api/checkouts", lambda route: route.fulfill(status=200, body="not json"))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == (
+        "Checkout state is unavailable: checkouts_protocol_error."
+        " It clears when a later collection returns a valid document."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The switch stays usable while the panel is shown.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    page.unroute("**/api/checkouts")
+    double.serve(checkouts_envelope(real_checkouts.document_zero))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
