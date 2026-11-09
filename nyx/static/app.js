@@ -2094,9 +2094,14 @@
     return last === "" ? String(path) : last;
   }
 
+  // The count and its noun in the plural: "es" after a sibilant, "ies" after a
+  // consonant and "y", else "s".  Every noun the view counts goes through here,
+  // so "stash" reads "2 stashes" and "branch" "2 branches".
   function plural(count, noun) {
-    const suffix = count === 1 ? "" : noun.endsWith("ch") ? "es" : "s";
-    return `${count} ${noun}${suffix}`;
+    if (count === 1) return `1 ${noun}`;
+    if (/[^aeiou]y$/.test(noun)) return `${count} ${noun.slice(0, -1)}ies`;
+    if (/(s|x|z|ch|sh)$/.test(noun)) return `${count} ${noun}es`;
+    return `${count} ${noun}s`;
   }
 
   // A whole unit rounded down against the document's own observation instant,
@@ -2195,7 +2200,7 @@
       const clone = group.clones.find((item) => item.path === path);
       const distance = clone === undefined ? null : defaultDistance(clone);
       return `<span class="checkouts-free-clone">${text(checkoutName(path))}` +
-        ` <span class="checkouts-relation">${text(comparisonWords(distance))}</span></span>`;
+        ` <span class="checkouts-relation">${comparisonWords(distance)}</span></span>`;
     });
     return parts.join('<span class="checkouts-separator"> · </span>');
   }
@@ -2263,7 +2268,7 @@
     if (git.status !== "too_old") return "";
     return git.version === null || git.version === undefined
       ? text(codeWords("gitStatus", "tooOldUnread"))
-      : text(wordText("gitStatus", "too_old", {version: git.version}));
+      : wordText("gitStatus", "too_old", {version: git.version});
   }
 
   function lookupMissing(document) {
@@ -2513,7 +2518,7 @@
       check === null || check === undefined ? null : check.checked_at);
     const failed = checkFailed(check === null || check === undefined ? null : check.reason);
     return '<td class="checkouts-default">' +
-      `<span class="checkouts-relation">${text(comparisonWords(distance))}</span>` +
+      `<span class="checkouts-relation">${comparisonWords(distance)}</span>` +
       (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`) +
       (failed ? ` <span class="checkouts-note">${wordText("text", "latestCheckFailed", {
         reason: codeWords("checkReason", check.reason),
@@ -2730,14 +2735,17 @@
       setCheckoutsActionStatus(codeWords("text", "showOnBoardFinished"));
       return;
     }
-    if (filter.value.trim() !== "") {
+    const card = [...board.querySelectorAll(".card")]
+      .find((item) => item.dataset.packagePath === path);
+    // The reader's search survives the jump unless it is what hides the card;
+    // the card's own search text decides that, so a query matching it stays.
+    const query = filter.value.trim().toLowerCase();
+    if (query !== "" && card !== undefined && !(card.dataset.search || "").includes(query)) {
       filter.value = "";
       applyFilter();
     }
     setShownView(VIEW_BOARD);
     if (selectedPath !== path) select(path);
-    const card = [...board.querySelectorAll(".card")]
-      .find((item) => item.dataset.packagePath === path);
     if (card === undefined) return;
     card.scrollIntoView({block: "nearest"});
     card.focus();
