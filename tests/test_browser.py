@@ -10367,3 +10367,33 @@ def test_checkout_folders_save_refusals_keep_focus_in_the_editor(
     save.press("Enter")
     playwright.expect(status).to_contain_text("changed elsewhere")
     assert focus_is_in_editor_and_operable()
+
+
+def test_checkout_folders_reload_after_a_refusal_leaves_no_stale_marks(
+    open_page, attention_checkouts
+):
+    """A failed reload shows the saved list unmarked, not the refused draft's marks."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/gone")
+    settings.folder_problems = [{"index": 0, "reason": "missing"}]
+    folders_save_button(page).click()
+    playwright.expect(page.locator(f"{FOLDERS_LIST_ITEMS}[aria-invalid]")).to_have_count(1)
+    # The same draft now meets a changed revision: the marks stay with the
+    # draft and Reload is offered.
+    settings.save_checkout_settings(settings.revision, ["/work/alpha"], False)
+    folders_save_button(page).click()
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    playwright.expect(reload_button).to_be_visible()
+    assert folder_marks(page)[0][0] == "true"
+
+    settings.fail_next_folder_load = True
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "Could not load checkout folders: settings_unavailable"
+    )
+    assert folder_paths(page) == ["/work/alpha"]
+    assert folder_marks(page) == [[None, None, False]]
