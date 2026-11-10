@@ -1315,9 +1315,13 @@ that match what you type, ignoring case, and hides the others (the field's hint
 changes to match). A repository matches by its name, default branch, any clone
 or linked worktree name or path, any branch name, the path of any work item it
 serves and that work item's Code Status text, the availability, HEAD and tree
-words of any clone row, and the HEAD words of a linked worktree. It searches the
-same words the rows show, so a phrase you read in a cell finds its repository.
-The **Quiet repositories** row stays where it is whatever you type. **Hide empty
+words of any clone row, the HEAD words of a linked worktree, and the status
+words of a clone or linked worktree that could not be read. No other column is
+searched: the default branch against the remote, the branch and stash counts,
+cleanup, merge verdicts, remote copies, pull requests and a linked worktree's
+tree words do not make a repository match. The **Quiet repositories** row stays
+where it is whatever you type, and the repositories collected in it are not
+searched until you clear **Hide quiet checkouts**. **Hide empty
 rows and columns** and **Hide terminal rows** give way to **Hide quiet
 checkouts**. Switching views never applies a waiting board update: the board
 keeps it, and the switch reads **Board (update waiting)** until you apply it on

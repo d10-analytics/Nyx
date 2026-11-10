@@ -93,10 +93,12 @@
   const QUIET_CHECKOUTS_STORAGE_KEY = "spec-tracker-hide-quiet-checkouts";
 
   // The words of the checkouts view.  Every enumerated value the view shows and
-  // every sentence it composes is read from this one block, so a value a newer
+  // the sentence built around it is read from this one block, so a value a newer
   // collector serves before this page learns its words still renders its raw
-  // code instead of throwing.  The block is JSON so a browserless test can read
-  // it between its markers and compare it with the collector's enumerations.
+  // code instead of throwing.  Counted nouns (plural), the cleanup count and
+  // fetch ages (ageWords) are composed in their helpers instead.  The block is
+  // JSON so a browserless test can read it between its markers and compare it
+  // with the collector's enumerations.
   // checkout words: begin
   const WORDS = {
     "attentionClass": {
