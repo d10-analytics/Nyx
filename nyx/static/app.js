@@ -1894,9 +1894,17 @@
     return foldersDraft !== null;
   }
 
-  // A save or a load in flight holds every editing control.
+  // With no revision and a reload offered (a refused save, a changed-elsewhere
+  // flag or a failed load) a draft could never be saved, so the editing
+  // controls refuse input until the reader reloads or cancels.
+  function foldersAwaitsReload() {
+    return foldersRevision === null && foldersReloadAvailable;
+  }
+
+  // A save or a load in flight, or a reload the reader must take, holds every
+  // editing control.
   function foldersHeld() {
-    return foldersBusy || foldersLoadSerial === foldersRequestSerial;
+    return foldersBusy || foldersLoadSerial === foldersRequestSerial || foldersAwaitsReload();
   }
 
   // A draft that equals the saved state is no draft.
@@ -1975,7 +1983,11 @@
     // order, so focus stays where the reader put it.
     controls().forEach((control) => {
       if (control.tagName === "SUMMARY") return;
-      if (foldersHeld() && !control.disabled) control.setAttribute("aria-disabled", "true");
+      // Cancel and Reload are the way out of a reload hold, so it leaves them operable.
+      const exit = control === foldersCancel || control === foldersReload;
+      const held = foldersHeld() && !(exit && !foldersBusy &&
+        foldersLoadSerial !== foldersRequestSerial);
+      if (held && !control.disabled) control.setAttribute("aria-disabled", "true");
       else control.removeAttribute("aria-disabled");
     });
     if (!priorKey) return;
