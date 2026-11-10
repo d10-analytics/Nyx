@@ -76,6 +76,9 @@
   ];
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
+  const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
+  const VIEW_BOARD = "board";
+  const VIEW_CHECKOUTS = "checkouts";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
   // The terminal-row preference mirrors the compact-view preference: it is a
   // browser-local display choice applied to the catalog already fetched.  It
@@ -83,6 +86,311 @@
   // makes finished stages eligible for display again.
   const TERMINAL_STORAGE_KEY = "spec-tracker-hide-terminal-rows";
   const DESELECT_STORAGE_KEY = "spec-tracker-deselect-on-empty-click";
+  // The shown view is a browser-local display choice stored like the other
+  // preferences: a fixed Board default, read and written in try/catch, and an
+  // unknown stored value falls back to Board.
+  const VIEW_STORAGE_KEY = "spec-tracker-view";
+  const QUIET_CHECKOUTS_STORAGE_KEY = "spec-tracker-hide-quiet-checkouts";
+
+  // The words of the checkouts view.  Every enumerated value the view shows and
+  // the sentence built around it is read from this one block, so a value a newer
+  // collector serves before this page learns its words still renders its raw
+  // code instead of throwing.  Counted nouns (plural), the cleanup count and
+  // fetch ages (ageWords) are composed in their helpers instead.  The block is
+  // JSON so a browserless test can read it between its markers and compare it
+  // with the collector's enumerations.
+  // checkout words: begin
+  const WORDS = {
+    "attentionClass": {
+      "unique_work": "Work only on this machine",
+      "awaiting_merge": "Finished, not merged",
+      "cleanup_ready": "Ready to clean up",
+      "base_moved": "Base moved",
+      "configuration": "Setup problems"
+    },
+    "attentionCode": {
+      "branch_unpushed": "{branch} in {clone} has {count} commits not on the remote",
+      "branch_not_pushed": "{branch} in {clone} has never been pushed",
+      "default_branch_ahead": "default branch {branch} in {clone} has {count} commits not on the remote",
+      "stash": "{clone} has {count} stashes",
+      "uncommitted_changes": "{worktree} has {count} uncommitted changes",
+      "awaiting_merge": "{branch} is finished but not merged",
+      "removable": "{clone} has {count} branches or worktrees ready to remove",
+      "base_moved": "the base of {workItem} moved {count} commits past its Baseline",
+      "target_repo_missing": "{workItem} names a Target repo that does not exist",
+      "target_repo_not_git": "{workItem} names a Target repo that is not a git checkout",
+      "branch_invalid": "{workItem} names a Branch that is not a branch name",
+      "upstream_mismatch": "{branch} in {clone} does not track the same-named branch of origin",
+      "never_fetched": "{clone} has never fetched",
+      "no_origin_remote": "{clone} has no origin remote",
+      "checkout_unavailable": "{clone} could not be read",
+      "finished_stages_not_configured": "No stage counts as finished; choose one under Counts as finished in Board settings",
+      "package_scan_incomplete": "Some work items could not be read",
+      "package_scan_unavailable": "Work items could not be read"
+    },
+    "attentionCodeOne": {
+      "branch_unpushed": "{branch} in {clone} has {count} commit not on the remote",
+      "default_branch_ahead": "default branch {branch} in {clone} has {count} commit not on the remote",
+      "stash": "{clone} has {count} stash",
+      "uncommitted_changes": "{worktree} has {count} uncommitted change",
+      "removable": "{clone} has {count} branch or worktree ready to remove",
+      "base_moved": "the base of {workItem} moved {count} commit past its Baseline"
+    },
+    "availabilityState": {
+      "free": "Free",
+      "assigned": "Assigned",
+      "occupied": "In use",
+      "unknown": "Unknown"
+    },
+    "availabilityReason": {
+      "not_on_default_branch": "not on the default branch",
+      "detached_head": "detached HEAD",
+      "linked_worktrees": "has linked worktrees",
+      "uncommitted_changes": "uncommitted changes",
+      "operation_in_progress": "git operation in progress"
+    },
+    "assignmentBasis": {
+      "target_repo": "Target repo",
+      "target_repo_worktree": "Target repo worktree"
+    },
+    "status": {
+      "ok": "",
+      "unsafe_ownership": "git refused it: ownership",
+      "failed": "could not be read",
+      "timed_out": "git did not answer in time",
+      "too_many_branches": "more than 100 local branches; not examined"
+    },
+    "comparisonRelation": {
+      "equal": "up to date",
+      "ahead": "{a} ahead",
+      "behind": "{b} behind",
+      "diverged": "{a} ahead, {b} behind",
+      "differs": "differs (not counted)",
+      "absent": "not on the remote",
+      "unknown": "unknown"
+    },
+    "comparisonBasis": {
+      "live": "live",
+      "recorded": "recorded {time}",
+      "cached": "cached"
+    },
+    "verdictState": {
+      "merged": "merged",
+      "not_merged": "not merged",
+      "unknown": "merge state unknown"
+    },
+    "verdictRung": {
+      "ancestor": "tip is in {default}",
+      "pull_request": "pull request #{n} merged",
+      "patch_equivalent": "every change is in {default}",
+      "squash_equivalent": "squash-merged into {default}",
+      "tree_equal": "{default} has the same files",
+      "none": ""
+    },
+    "verdictReason": {
+      "no_base": "no default branch to compare",
+      "incomplete_clone": "shallow or partial clone",
+      "git_too_old": "git too old for this check",
+      "history_limit": "history too long to check",
+      "deadline": "ran out of time",
+      "failed": "a git call failed",
+      "objects_missing": "no clone holds its commits",
+      "ambiguous_tip": "its history is ambiguous"
+    },
+    "branchBlocker": {
+      "not_merged": "not merged",
+      "verdict_unknown": "merge state unknown",
+      "checked_out_in_main_worktree": "checked out in the main worktree",
+      "worktree_not_clean": "its worktree has changes",
+      "worktree_locked": "its worktree is locked"
+    },
+    "worktreeBlocker": {
+      "not_merged": "not merged",
+      "verdict_unknown": "merge state unknown",
+      "not_clean": "has changes",
+      "locked": "locked"
+    },
+    "operation": {
+      "am": "applying patches",
+      "bisect": "bisect",
+      "cherry_pick": "cherry-pick",
+      "merge": "merge",
+      "rebase": "rebase",
+      "revert": "revert"
+    },
+    "changeKind": {
+      "staged": "staged",
+      "unstaged": "unstaged",
+      "untracked": "untracked",
+      "conflicted": "conflicted"
+    },
+    "folderStatus": {
+      "ok": "",
+      "missing": "does not exist",
+      "unreadable": "cannot be read",
+      "not_directory": "is not a folder"
+    },
+    "gitStatus": {
+      "available": "",
+      "missing": "Git was not found, so Nyx cannot read checkouts. Install Git and make sure it is on the PATH Nyx runs with (on macOS, the Command Line Tools).",
+      "too_old": "Git {version} is older than Nyx supports (2.36)",
+      "tooOldUnread": "Git is older than Nyx supports (2.36), or its version could not be read"
+    },
+    "checkStatus": {
+      "live": "checked live",
+      "recorded": "recorded {time}",
+      "failed": "check failed",
+      "off": "remote checks off"
+    },
+    "checkReason": {
+      "unreachable": "remote unreachable",
+      "not_found": "remote repository not found",
+      "authentication_failed": "authentication failed",
+      "timed_out": "timed out",
+      "failed": "failed",
+      "remote_checks_off": "remote checks are off"
+    },
+    "lookupStatus": {
+      "live": "pull requests live",
+      "recorded": "pull requests recorded {time}",
+      "off": "pull request lookup off",
+      "unavailable": "pull requests unavailable: {reason}"
+    },
+    "lookupReason": {
+      "gh_missing": "the GitHub CLI (gh) was not found",
+      "not_authenticated": "gh is not signed in",
+      "not_found": "not found on GitHub",
+      "rate_limited": "GitHub rate limit reached",
+      "timed_out": "timed out",
+      "failed": "failed",
+      "setting_off": "lookup is off for this workspace",
+      "not_github": "not a GitHub repository",
+      "remote_checks_off": "remote checks are off"
+    },
+    "remoteCopy": {
+      "present": "on the remote ({basis})",
+      "absent": "not on the remote",
+      "unknown": "unknown"
+    },
+    "pullRequestState": {
+      "open": "open",
+      "merged": "merged",
+      "closed": "closed",
+      "differentHead": "(different head)"
+    },
+    "branchPackageBasis": {
+      "target_clone": "Target repo",
+      "sibling_clone": "same branch in another clone",
+      "contained": "folded into this branch"
+    },
+    "containment": {
+      "complete": "",
+      "deadline": "ran out of time",
+      "failed": "failed",
+      "no_base": "no default branch",
+      "incomplete": "shallow or partial clone",
+      "git_too_old": "git too old"
+    },
+    "worktreeFlag": {
+      "prunable": "directory is gone",
+      "locked": "locked"
+    },
+    "diagnostic": {
+      "not_a_repository": "{path} has a .git entry but is not the top of its repository",
+      "unrepresentable_path": "a checkout under {path} (or under a configured folder) has a path that cannot be shown",
+      "checkout_cache_unreadable": "the saved verdict cache {path} could not be used and was treated as empty",
+      "checkout_cache_write_failed": "the saved verdict cache {path} could not be updated"
+    },
+    "clearing": {
+      "checkouts_unavailable": "It clears once Nyx serves checkout state again.",
+      "checkouts_cancelled": "It clears when Nyx starts again.",
+      "checkouts_failed": "It clears when a later collection publishes a document.",
+      "checkouts_timeout": "It clears when a later collection finishes in time.",
+      "checkouts_output_too_large": "It clears when a later collection's document fits.",
+      "checkouts_protocol_error": "It clears when a later collection returns a valid document."
+    },
+    "column": {
+      "checkout": "Checkout",
+      "availability": "Availability",
+      "head": "HEAD",
+      "default": "Default branch vs remote",
+      "tree": "Tree",
+      "branches": "Branches",
+      "cleanup": "Cleanup",
+      "package": "Package",
+      "status": "Status",
+      "branch": "Branch",
+      "remoteCopy": "Remote copy",
+      "verdict": "Verdict",
+      "pullRequests": "Pull requests",
+      "workItems": "Work items",
+      "checkedOutIn": "Checked out in",
+      "tip": "Tip",
+      "remoteState": "Remote"
+    },
+    "text": {
+      "localState": "Local state {time}",
+      "remotesNotChecked": "Remotes not checked yet",
+      "remotesChecked": "Remotes checked {time}",
+      "remoteCheckFailedAt": "Last remote check failed ({outcome}) at {time}",
+      "checkingRemotes": "Checking remotes…",
+      "checkRemotes": "Check remotes now",
+      "nextCheckAbout": "Next check about {time}",
+      "nextCheckAtRefresh": "Next check at the next refresh",
+      "lookupLive": "Pull requests live",
+      "lookupRecorded": "Pull requests recorded {time}",
+      "lookupOff": "Pull request lookup off",
+      "lookupUnavailable": "Pull requests unavailable: {reason}",
+      "notOffered": "This Nyx server does not serve checkout state.",
+      "unavailable": "Checkout state is unavailable: {category}.",
+      "clearsDefault": "It clears when a later collection succeeds.",
+      "doesNotOfferRemotes": "This server does not offer remote checks.",
+      "runCompleted": "Remote check finished.",
+      "runFailed": "Remote check failed: {category}.",
+      "noOriginRemote": "no origin remote",
+      "noFolders": "No checkout folders are configured. Add them to the workspace record; see the guide section Your specification workspace → Checkout folders.",
+      "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
+      "setupHeading": "Checkout setup",
+      "quietRow": "Quiet repositories ({count})",
+      "quietRowMatching": "Quiet repositories ({count}, {matching} matching)",
+      "freeClones": "Free clones: {clones}",
+      "workItemBranches": "Work item branches",
+      "attentionHeading": "Needs attention",
+      "detailsToggle": "Details",
+      "detailsToggleLabel": "Details of {clone}",
+      "clonePath": "Path",
+      "branchesHeading": "Branches",
+      "worktreesHeading": "Linked worktrees",
+      "workItemsHeading": "Work items",
+      "foldedBranches": "Folded branches ({count})",
+      "showOnBoard": "Show on board",
+      "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
+      "showOnBoardMissing": "This work item is not on the displayed board; choose Refresh view on the board.",
+      "uncommittedOperation": "{worktree} has an unfinished git operation",
+      "awaitingMergePullRequest": "(pull request #{n})",
+      "settingsDiffer": "Collected under different settings from the board shown.",
+      "shallow": "shallow",
+      "partial": "partial",
+      "neverFetched": "cached, never fetched",
+      "fetchedAgo": "cached, fetched {age} ago",
+      "latestCheckFailed": "(latest check failed: {reason})",
+      "clean": "clean",
+      "operationInProgress": "{operation} in progress",
+      "indexLock": "index lock present",
+      "bareRepository": "bare repository",
+      "noWorkingTree": "no working tree",
+      "detachedAt": "detached at {sha}",
+      "unborn": "unborn {branch}",
+      "assignedPrefix": "Assigned",
+      "noPackage": "—",
+      "nothingToRemove": "nothing to remove",
+      "removable": "Removable",
+      "foldingNotChecked": "Branches were not checked for folding: {reason}",
+      "folderProblem": "{path} — {problem}",
+      "unknownPath": "unknown path"
+    }
+  };
+  // checkout words: end
 
   const board = document.querySelector("#board");
   const toolbar = document.querySelector(".toolbar");
@@ -90,7 +398,21 @@
   const compactControl = document.querySelector("#compact-view");
   const terminalControl = document.querySelector("#hide-terminal-rows");
   const deselectControl = document.querySelector("#deselect-on-empty-click");
+  const quietCheckoutsControl = document.querySelector("#hide-quiet-checkouts");
+  const quietCheckoutsLabel = quietCheckoutsControl.closest("label");
+  const viewBoardButton = document.querySelector("#view-board");
+  const viewCheckoutsButton = document.querySelector("#view-checkouts");
+  const checkoutsView = document.querySelector("#checkouts");
+  const checkoutsStatusLine = document.querySelector("#checkouts-status-line");
+  const checkoutsActionStatus = document.querySelector("#checkouts-action-status");
+  const checkoutsBody = document.querySelector("#checkouts-body");
+  const checkoutsHeading = document.querySelector("#checkouts-heading");
+  // The view's own heading is the last place focus can go when everything it
+  // stood on has left.
+  checkoutsHeading.setAttribute("tabindex", "-1");
+  const checkRemotesButton = document.querySelector("#check-remotes");
   const refreshButton = document.querySelector("#refresh");
+
   const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
@@ -117,6 +439,8 @@
   let hideTerminalRows = true;
   let deselectOnEmptyClick = false;
   let refreshFailure = null;
+  let shownView = VIEW_BOARD;
+  let hideQuietCheckouts = true;
   let savedStageOrder = [];
   let savedCompletedStages = [];
   let editorStageOrder = [];
@@ -132,15 +456,54 @@
   // to the issues panel, and every settled outcome rewrites the cards' lines.
   let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
   let checkoutsBusy = false;
+  // One press at a time: a press while a request is in flight is remembered as
+  // the single queued POST and sent when that request settles.  The flag stays
+  // set from the press to the POST's settle, so further presses do nothing.
+  let checkoutsCheckRequested = false;
+  let checkoutsQueuedCheck = false;
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
   let renderedEntries = new Map();
+  // What the reader opened in the checkouts view.  It lives here rather than in
+  // the markup because a refresh replaces blocks: opened clone rows, unfolded
+  // branch lists and the opened quiet row are restored onto what is rendered,
+  // and survive a failed outcome until a ready one returns.
+  const openClones = new Set();
+  const openFolds = new Set();
+  let quietOpen = false;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
     return raw.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+
+  // The words of one enumerated value.  An unknown code renders as itself, so a
+  // value this page has no words for is still shown rather than thrown away.
+  function codeWords(table, code) {
+    const words = WORDS[table];
+    if (words === undefined || words === null) return String(code);
+    const found = words[code];
+    return found === undefined ? String(code) : found;
+  }
+
+  // One word entry with its placeholders filled; every value is escaped for
+  // markup unless the caller passes markup it built itself.
+  function fillWords(template, values, escape) {
+    return String(template).replace(/\{(\w+)\}/g, (match, key) => {
+      const value = values[key];
+      if (value === undefined || value === null) return "";
+      return escape(String(value));
+    });
+  }
+
+  function wordText(table, code, values = {}) {
+    return fillWords(codeWords(table, code), values, text);
+  }
+
+  function wordHtml(table, code, values = {}) {
+    return fillWords(codeWords(table, code), values, (value) => value);
   }
 
   function titleOf(entry) {
@@ -824,6 +1187,19 @@
 
   function applyFilter() {
     const query = filter.value.trim().toLowerCase();
+    // The one query applies to the shown view: a checkouts group stays while
+    // its served names, branches or work items match, and is hidden otherwise.
+    if (shownView === VIEW_CHECKOUTS) {
+      checkoutsBody.querySelectorAll(".checkouts-group").forEach((group) => {
+        const search = group.dataset.search || "";
+        const hide = Boolean(query) && !search.includes(query);
+        // An attribute write is a change even when it repeats the value, so an
+        // unchanged refresh writes nothing.
+        if (group.hidden !== hide) group.hidden = hide;
+      });
+      filterQuietRow(query);
+      return;
+    }
     board.querySelectorAll(".card").forEach((card) => {
       card.hidden = Boolean(query) && !card.dataset.search.includes(query);
     });
@@ -832,6 +1208,29 @@
       cell.classList.toggle("filtered-empty", cards.length > 0 && cards.every((card) => card.hidden));
     });
     drawRails();
+  }
+
+  // The quiet row is searched by the repositories it holds, with the same text
+  // a group of that repository would be searched by.  With a query it stays
+  // only while one of them matches, lists only those, and its summary counts
+  // them; with none it shows every repository and its plain count.
+  function filterQuietRow(query) {
+    const row = checkoutsBody.querySelector("details.checkouts-quiet");
+    if (row === null) return;
+    const items = [...row.querySelectorAll("li")];
+    let matching = 0;
+    items.forEach((item) => {
+      const hide = Boolean(query) && !(item.dataset.search || "").includes(query);
+      if (!hide) matching += 1;
+      if (item.hidden !== hide) item.hidden = hide;
+    });
+    const hideRow = Boolean(query) && matching === 0;
+    if (row.hidden !== hideRow) row.hidden = hideRow;
+    const summary = row.querySelector("summary");
+    const words = query
+      ? wordText("text", "quietRowMatching", {count: items.length, matching})
+      : wordText("text", "quietRow", {count: items.length});
+    if (summary.textContent !== words) summary.textContent = words;
   }
 
   // Every settled checkouts outcome reaches the rendered cards directly: only
@@ -959,14 +1358,20 @@
     board.append(svg);
   }
 
-  function select(path) {
-    selectedPath = selectedPath === path ? null : path;
+  // The one place the selection changes: a path selects it and null clears it.
+  // A card click toggles through select; Show on board never does.
+  function setSelection(path) {
+    selectedPath = path;
     board.querySelectorAll(".card").forEach((card) => {
       const selected = card.dataset.packagePath === selectedPath;
       card.classList.toggle("selected", selected);
       card.setAttribute("aria-pressed", String(selected));
     });
     drawRails();
+  }
+
+  function select(path) {
+    setSelection(selectedPath === path ? null : path);
   }
 
   function digestOf(snapshot) {
@@ -1198,7 +1603,83 @@
   function setPending(available) {
     refreshButton.dataset.pending = String(available);
     refreshButton.classList.toggle("pending", available);
-    refreshButton.textContent = available ? "Apply update" : "Refresh view";
+    syncViewLabels();
+  }
+
+  function readViewPreference() {
+    shownView = VIEW_BOARD;
+    try {
+      const value = window.localStorage.getItem(VIEW_STORAGE_KEY);
+      if (value === VIEW_BOARD || value === VIEW_CHECKOUTS) shownView = value;
+    } catch (_) {
+      // Board is the safe fallback when browser storage is unavailable.
+    }
+  }
+
+  function syncViewLabels() {
+    refreshButton.textContent = pending && shownView === VIEW_BOARD
+      ? "Apply update" : "Refresh view";
+    viewBoardButton.textContent = pending && shownView === VIEW_CHECKOUTS
+      ? "Board (update waiting)" : "Board";
+    viewBoardButton.setAttribute("aria-pressed", String(shownView === VIEW_BOARD));
+    viewCheckoutsButton.setAttribute("aria-pressed", String(shownView === VIEW_CHECKOUTS));
+  }
+
+  // Exactly one view is shown.  Switching keeps focus on the pressed switch
+  // button and never applies a waiting catalog: the board keeps its pending
+  // snapshot, and the switch names it while the checkouts view is shown.
+  function applyView() {
+    const checkoutsShown = shownView === VIEW_CHECKOUTS;
+    board.hidden = checkoutsShown;
+    checkoutsView.hidden = !checkoutsShown;
+    compactControl.closest("label").hidden = checkoutsShown;
+    terminalControl.closest("label").hidden = checkoutsShown;
+    quietCheckoutsLabel.hidden = !checkoutsShown;
+    filter.placeholder = checkoutsShown
+      ? "Find a checkout, branch, or work item…"
+      : "Find a work item, project, or program…";
+    syncViewLabels();
+    // Each view shows its own controls, so the toolbar can change height here;
+    // the sticky heads below it follow at once rather than a frame later, when
+    // a caller such as Show on board has already measured them.
+    syncToolbarHeight();
+    // The shown view applies the shared query; switching views re-runs it.  The
+    // checkouts view also draws the latest outcome, which its settles skipped
+    // while the board was shown.
+    if (checkoutsShown) renderCheckouts();
+    else applyFilter();
+  }
+
+  function syncToolbarHeight() {
+    document.documentElement.style.setProperty(
+      "--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
+  }
+
+  function setShownView(value) {
+    shownView = value;
+    try { window.localStorage.setItem(VIEW_STORAGE_KEY, value); } catch (_) { /* fallback is in-memory */ }
+    applyView();
+  }
+
+  function readQuietCheckoutsPreference() {
+    hideQuietCheckouts = true;
+    try {
+      const value = window.localStorage.getItem(QUIET_CHECKOUTS_STORAGE_KEY);
+      if (value === "true") hideQuietCheckouts = true;
+      if (value === "false") hideQuietCheckouts = false;
+    } catch (_) {
+      // A checked box is the safe fallback when browser storage is unavailable.
+    }
+    quietCheckoutsControl.checked = hideQuietCheckouts;
+  }
+
+  function setQuietCheckoutsPreference(value) {
+    hideQuietCheckouts = value;
+    try { window.localStorage.setItem(QUIET_CHECKOUTS_STORAGE_KEY, String(value)); } catch (_) { /* fallback is in-memory */ }
+    quietCheckoutsControl.checked = hideQuietCheckouts;
+    // The preference changes which groups the view shows, so the view follows
+    // it at once without waiting for the next tick.
+    renderCheckouts();
   }
 
   function settingsErrorMessage(error) {
@@ -1348,6 +1829,9 @@
       selectedPath = null;
     }
     renderBoard();
+    // The status line names how the scan and the board's settings differ, so a
+    // newly applied catalog re-renders it.
+    renderCheckoutsStatusLine();
     renderStageOrderEditor();
     if (!workspace || workspace.revision !== snapshot.configuration_revision) loadWorkspace();
     // Settings saved from another page change the catalog revision; an unsaved
@@ -1475,11 +1959,41 @@
     return SAFE_CATEGORIES.includes(code) && code.startsWith(prefix) ? code : fallback;
   }
 
-  // The card reads only the envelope shape, the document's identity and the
-  // package paths and Code Status text; every other subtree stays the
-  // server's, which parsed the whole document before serving it.
+  // A UTC timestamp in the one shape the collector and the runtime write.
+  function utcTimestamp(value) {
+    if (typeof value !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return false;
+    const parsed = new Date(value);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === `${value.slice(0, 19)}.000Z`;
+  }
+
+  // The schedule the status line reads: the check state, its interval, when the
+  // next check is due, and the last run's times, outcome and repositories.
+  function validateRemoteChecks(value) {
+    protocol(exactKeys(value, ["state", "interval_seconds", "next_due_at", "last"]));
+    protocol(["idle", "running"].includes(value.state));
+    protocol(typeof value.interval_seconds === "number" &&
+      Number.isFinite(value.interval_seconds) && value.interval_seconds > 0);
+    protocol(value.next_due_at === null || utcTimestamp(value.next_due_at));
+    protocol(value.last === null || exactKeys(value.last,
+      ["started_at", "finished_at", "outcome", "repositories"]));
+    if (value.last !== null) {
+      protocol(utcTimestamp(value.last.started_at) && utcTimestamp(value.last.finished_at));
+      protocol(value.last.outcome === "completed" ||
+        (typeof value.last.outcome === "string" &&
+          value.last.outcome.startsWith("checkouts_") &&
+          SAFE_CATEGORIES.includes(value.last.outcome)));
+      protocol(Array.isArray(value.last.repositories));
+    }
+  }
+
+  // The view reads the envelope shape, the document's identity, the package
+  // paths and Code Status text, and the remote-check schedule; every other
+  // subtree stays the server's, which parsed the whole document before
+  // serving it.
   async function validateCheckouts(payload) {
     protocol(exactKeys(payload, ["checkouts", "remote_checks"]));
+    validateRemoteChecks(payload.remote_checks);
     const document = payload.checkouts;
     protocol(exactKeys(document, CHECKOUTS_KEYS) &&
       document.schema_version === CHECKOUTS_SCHEMA_VERSION &&
@@ -1501,15 +2015,1565 @@
     return payload;
   }
 
-  // One checkouts request at most is in flight: a tick that finds one running
-  // is skipped rather than queued, because the server answers every request
-  // with the document it has and rescans at most once a minute.
-  function requestCheckouts() {
+  // The document's own settings record, so the status line can name the lookup
+  // state without re-deriving the collector's decisions.
+  function lookupReasonWords(reason) {
+    return codeWords("lookupReason", reason);
+  }
+
+  function utcDate(value) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function pad(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  function localDateKey(date) {
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  function clockText(date, seconds) {
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}` +
+      (seconds ? `:${pad(date.getSeconds())}` : "");
+  }
+
+  // A local time in a time element; the date is named when the value falls on
+  // another local day than the observation it belongs to.
+  function localTimeHtml(value, referenceValue, seconds = true) {
+    const date = utcDate(value);
+    if (date === null) return text(String(value));
+    const reference = utcDate(referenceValue);
+    const day = reference === null ? "" :
+      localDateKey(date) === localDateKey(reference) ? "" : `${localDateKey(date)} `;
+    return `<time datetime="${text(String(value))}">${text(day + clockText(date, seconds))}</time>`;
+  }
+
+  // The pull-request lookup state of the document: the settings record, then
+  // the most serious state any repository reached.
+  function lookupWords(document) {
+    if (document.github_lookup === "off") return codeWords("text", "lookupOff");
+    const lookups = document.repositories
+      .map((repository) => repository.pr_lookup)
+      .filter((lookup) => lookup !== null && lookup !== undefined);
+    const unavailable = lookups.find((lookup) => lookup.status === "unavailable");
+    if (unavailable) {
+      return wordText("text", "lookupUnavailable", {
+        reason: lookupReasonWords(unavailable.reason),
+      });
+    }
+    const recorded = lookups
+      .filter((lookup) => lookup.status === "recorded")
+      .sort((first, second) => String(second.checked_at).localeCompare(String(first.checked_at)))[0];
+    if (recorded) {
+      return wordHtml("text", "lookupRecorded", {
+        time: localTimeHtml(recorded.checked_at, document.observed_at, false),
+      });
+    }
+    if (lookups.some((lookup) => lookup.status === "live")) return codeWords("text", "lookupLive");
+    const off = lookups.find((lookup) => lookup.reason && lookup.reason !== "setting_off");
+    if (off) {
+      return wordText("text", "lookupUnavailable", {reason: lookupReasonWords(off.reason)});
+    }
+    return codeWords("text", "lookupOff");
+  }
+
+  function nextCheckWords(envelope) {
+    const next = envelope.remote_checks.next_due_at;
+    return next === null
+      ? codeWords("text", "nextCheckAtRefresh")
+      : wordHtml("text", "nextCheckAbout", {
+        time: localTimeHtml(next, envelope.checkouts.observed_at),
+      });
+  }
+
+  function remoteCheckWords(envelope) {
+    if (checkoutsCheckRequested || envelope.remote_checks.state === "running") {
+      return codeWords("text", "checkingRemotes");
+    }
+    const last = envelope.remote_checks.last;
+    if (last === null) return codeWords("text", "remotesNotChecked");
+    const when = localTimeHtml(last.finished_at, envelope.checkouts.observed_at);
+    return last.outcome === "completed"
+      ? wordHtml("text", "remotesChecked", {time: when})
+      : wordHtml("text", "remoteCheckFailedAt", {
+        outcome: text(last.outcome), time: when,
+      });
+  }
+
+  // The scan is its own dated answer, so a document collected under other
+  // settings than the board shown says so once instead of hiding a value.
+  function settingsSentence(document) {
+    const catalogRevision = displayed === null ? null : displayed.configuration_revision;
+    return catalogRevision === document.configuration_revision
+      ? "" : codeWords("text", "settingsDiffer");
+  }
+
+  function renderCheckoutsStatusLine() {
+    const envelope = checkoutsOutcome.state === "ready" ? checkoutsOutcome.envelope : null;
+    if (envelope === null) {
+      checkoutsStatusLine.innerHTML = "";
+      return;
+    }
+    const observed = envelope.checkouts.observed_at;
+    checkoutsStatusLine.innerHTML = [
+      wordHtml("text", "localState", {time: localTimeHtml(observed, observed)}),
+      remoteCheckWords(envelope),
+      nextCheckWords(envelope),
+      lookupWords(envelope.checkouts),
+      settingsSentence(envelope.checkouts),
+    ].filter(Boolean).join(" · ");
+  }
+
+  // One panel per unavailable state, before the groups.  A ready document
+  // shows no panel, and its own setup problems belong to the setup panel.
+  function checkoutsPanelHtml() {
+    if (checkoutsOutcome.state === "not_offered") {
+      return `<section class="checkouts-panel" data-key="${text(keyOf("panel"))}"><p>` +
+        `${text(codeWords("text", "notOffered"))}</p></section>`;
+    }
+    if (checkoutsOutcome.state === "failed") {
+      const category = checkoutsOutcome.failure;
+      // What the next successful collection does for this category, when the
+      // words know it.
+      const clearing = (WORDS.clearing || {})[category] ||
+        codeWords("text", "clearsDefault");
+      return `<section class="checkouts-panel" data-key="${text(keyOf("panel"))}"><p>` +
+        `${wordText("text", "unavailable", {category})} ${text(clearing)}` +
+        "</p></section>";
+    }
+    return "";
+  }
+
+  // ---------------------------------------------------------------------
+  // The ready view: the setup panel, the quiet row, groups and their tables
+  // ---------------------------------------------------------------------
+
+  const CHECK_FAILURE_REASONS = [
+    "unreachable", "not_found", "authentication_failed", "timed_out", "failed",
+  ];
+  const CHANGE_KINDS = ["staged", "unstaged", "untracked", "conflicted"];
+  const CLONE_COLUMNS = [
+    "checkout", "availability", "head", "default", "tree", "branches", "cleanup", "package",
+  ];
+  const PACKAGE_COLUMNS = ["branch", "remoteCopy", "verdict", "pullRequests", "workItems"];
+
+  function checkFailed(reason) {
+    return CHECK_FAILURE_REASONS.includes(reason);
+  }
+
+  // A block's identity across refreshes: one JSON array of the served values
+  // that name it.  A control inside a block carries the block's key and its own
+  // control name, so focus is restored to the same control of the same block.
+  function keyOf(...parts) {
+    return JSON.stringify(parts);
+  }
+
+  function blockAttrs(key) {
+    return `data-key="${text(key)}" data-block`;
+  }
+
+  function controlAttrs(key, control) {
+    return `data-key="${text(key)}" data-control="${text(control)}"`;
+  }
+
+  // The column name each cell carries for the stacked layout; the table's own
+  // column header names it at wider widths, where the label is not shown.
+  function cellLabelHtml(key) {
+    return `<span class="cell-label">${text(codeWords("column", key))}</span>`;
+  }
+
+  // Every table keeps its table semantics under explicit roles: the stacked
+  // layout changes how cells are displayed, and a browser drops the implicit
+  // roles of a table whose display changes.
+  function tableHtml(cls, caption, columns, rows) {
+    const head = columns.map((key) =>
+      `<th scope="col" role="columnheader">${text(codeWords("column", key))}</th>`).join("");
+    return `<table class="${cls}" role="table">` +
+      (caption === "" ? "" : `<caption>${caption}</caption>`) +
+      `<thead role="rowgroup"><tr role="row">${head}</tr></thead>` +
+      `<tbody role="rowgroup">${rows}</tbody></table>`;
+  }
+
+  function dashHtml() {
+    return '<span class="checkouts-empty">—</span>';
+  }
+
+  function checkoutName(path) {
+    const parts = String(path).split(/[\\/]/);
+    const last = parts[parts.length - 1];
+    return last === "" ? String(path) : last;
+  }
+
+  // The count and its noun in the plural: "es" after a sibilant, "ies" after a
+  // consonant and "y", else "s".  Every noun the view counts goes through here,
+  // so "stash" reads "2 stashes" and "branch" "2 branches".
+  function plural(count, noun) {
+    if (count === 1) return `1 ${noun}`;
+    if (/[^aeiou]y$/.test(noun)) return `${count} ${noun.slice(0, -1)}ies`;
+    if (/(s|x|z|ch|sh)$/.test(noun)) return `${count} ${noun}es`;
+    return `${count} ${noun}s`;
+  }
+
+  // A whole unit rounded down against the document's own observation instant,
+  // so two collections of one state show the same age.
+  function ageWords(value, observedAt) {
+    const moment = utcDate(value);
+    const observed = utcDate(observedAt);
+    if (moment === null || observed === null) return "";
+    const minutes = Math.floor(Math.max(0, observed.getTime() - moment.getTime()) / 60000);
+    if (minutes < 1) return "<1 min";
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} h`;
+    return `${Math.floor(hours / 24)} d`;
+  }
+
+  // The comparison a clone's default branch carries: the live or recorded
+  // answer, else the cached one.
+  function defaultDistance(clone) {
+    const local = clone.local_default;
+    if (local === null || local === undefined) return null;
+    return local.vs_remote || local.vs_cached || null;
+  }
+
+  function defaultBranchName(clone) {
+    if (clone.verdict_base !== null && clone.verdict_base !== undefined) {
+      return clone.verdict_base.name;
+    }
+    if (clone.local_default !== null && clone.local_default !== undefined) {
+      return clone.local_default.name;
+    }
+    return null;
+  }
+
+  function comparisonWords(comparison) {
+    if (comparison === null || comparison === undefined) {
+      return codeWords("comparisonRelation", "unknown");
+    }
+    return wordText("comparisonRelation", comparison.relation, {
+      a: comparison.ahead === null ? "" : comparison.ahead,
+      b: comparison.behind === null ? "" : comparison.behind,
+    });
+  }
+
+  // A recorded value is dated by the answer it was recorded from; pull-request
+  // values are dated by the lookup, remote values by the remote check.
+  function basisWords(document, basis, checkedAt) {
+    if (basis !== "recorded") return text(codeWords("comparisonBasis", basis));
+    if (checkedAt === null || checkedAt === undefined || checkedAt === "") {
+      return text(codeWords("comparisonBasis", "recorded"));
+    }
+    return wordHtml("comparisonBasis", "recorded", {
+      time: localTimeHtml(checkedAt, document.observed_at, false),
+    });
+  }
+
+  function remoteName(group) {
+    return group.remote === null ? codeWords("text", "noOriginRemote") : group.remote.display;
+  }
+
+  function checkWords(document, group) {
+    const check = group.remote === null ? null : group.remote.check;
+    if (check === null || check === undefined) return "";
+    if (check.status === "recorded") {
+      const words = wordHtml("checkStatus", "recorded", {
+        time: localTimeHtml(check.checked_at, document.observed_at, false),
+      });
+      return checkFailed(check.reason)
+        ? `${words} (${text(codeWords("checkReason", check.reason))})` : words;
+    }
+    if (check.status === "failed") {
+      return `${text(codeWords("checkStatus", "failed"))} ` +
+        `(${text(codeWords("checkReason", check.reason))})`;
+    }
+    return text(codeWords("checkStatus", check.status));
+  }
+
+  function groupLookupWords(document, group) {
+    const lookup = group.pr_lookup;
+    if (lookup === null || lookup === undefined) return "";
+    if (lookup.status === "unavailable") {
+      return wordText("lookupStatus", "unavailable", {
+        reason: lookupReasonWords(lookup.reason || "failed"),
+      });
+    }
+    if (lookup.status === "recorded") {
+      return wordHtml("lookupStatus", "recorded", {
+        time: localTimeHtml(lookup.checked_at, document.observed_at, false),
+      });
+    }
+    return text(codeWords("lookupStatus", lookup.status));
+  }
+
+  function freeClonesHtml(document, group) {
+    const parts = (group.free_clones || []).map((path) => {
+      const clone = group.clones.find((item) => item.path === path);
+      const distance = clone === undefined ? null : defaultDistance(clone);
+      return `<span class="checkouts-free-clone">${text(checkoutName(path))}` +
+        ` <span class="checkouts-relation">${comparisonWords(distance)}</span></span>`;
+    });
+    return parts.join('<span class="checkouts-separator"> · </span>');
+  }
+
+  function groupHeaderHtml(document, group) {
+    const defaultBranch = group.default_branch === null ? null : group.default_branch.name;
+    const free = freeClonesHtml(document, group);
+    return '<h2 class="checkouts-group-head" tabindex="-1" ' +
+      `${blockAttrs(keyOf("head", groupKey(group)))}>` +
+      `<span class="checkouts-group-name">${text(remoteName(group))}</span>` +
+      (defaultBranch === null ? "" :
+        `<span class="checkouts-group-default">${text(defaultBranch)}</span>`) +
+      `<span class="checkouts-group-check">${checkWords(document, group)}</span>` +
+      `<span class="checkouts-group-lookup">${groupLookupWords(document, group)}</span>` +
+      (free === "" ? "" : `<span class="checkouts-group-free">` +
+        `${wordHtml("text", "freeClones", {clones: free})}</span>`) +
+      "</h2>";
+  }
+
+  // A repository is quiet when its served facts say nothing about it needs a
+  // person.  Equality needs a served comparison: two null comparisons prove
+  // nothing, so such a repository is shown.
+  function isQuietRepository(document, group) {
+    if (group.clones.length !== 1) return false;
+    const clone = group.clones[0];
+    if (clone.status !== "ok") return false;
+    if (clone.availability === null || clone.availability === undefined ||
+      clone.availability.state !== "free") return false;
+    const distance = defaultDistance(clone);
+    if (distance === null || distance.relation !== "equal") return false;
+    if (clone.stash_count !== 0) return false;
+    if (clone.worktrees.some((worktree) => !worktree.main)) return false;
+    const base = defaultBranchName(clone);
+    if (clone.branches.some((branch) => branch.name !== base)) return false;
+    if ((group.package_branches || []).length) return false;
+    if (document.packages.some((item) =>
+      item.target !== null && item.target !== undefined && item.target.clone === clone.path)) {
+      return false;
+    }
+    const key = group.remote === null ? null : group.remote.key;
+    return !document.attention.some((item) => item.clone === clone.path ||
+      (key !== null && item.repository === key));
+  }
+
+  function quietRowHtml(document, quiet) {
+    const items = quiet.map((group) => {
+      const clone = group.clones[0];
+      return `<li data-search="${text(groupSearchText(document, group))}">` +
+        `<span class="checkouts-quiet-display">${text(remoteName(group))}</span> ` +
+        `<span class="checkouts-quiet-checkout">${text(checkoutName(clone.path))}</span></li>`;
+    }).join("");
+    const key = keyOf("quiet");
+    return `<details class="checkouts-quiet" ${blockAttrs(key)}>` +
+      `<summary ${controlAttrs(key, "summary")}>` +
+      `${wordText("text", "quietRow", {count: quiet.length})}</summary>` +
+      `<ul>${items}</ul></details>`;
+  }
+
+  function folderProblemWords(folder) {
+    return wordText("text", "folderProblem", {
+      path: folder.path, problem: codeWords("folderStatus", folder.status),
+    });
+  }
+
+  function gitProblemWords(git) {
+    if (git === null || git === undefined) return "";
+    if (git.status === "missing") return text(codeWords("gitStatus", "missing"));
+    if (git.status !== "too_old") return "";
+    return git.version === null || git.version === undefined
+      ? text(codeWords("gitStatus", "tooOldUnread"))
+      : wordText("gitStatus", "too_old", {version: git.version});
+  }
+
+  function lookupMissing(document) {
+    return document.github_lookup === "on" && document.repositories.some((group) =>
+      group.pr_lookup !== null && group.pr_lookup !== undefined &&
+      group.pr_lookup.reason === "gh_missing");
+  }
+
+  function diagnosticWords(diagnostic) {
+    const path = diagnostic.path === null || diagnostic.path === undefined
+      ? codeWords("text", "unknownPath") : diagnostic.path;
+    return wordText("diagnostic", diagnostic.code, {path});
+  }
+
+  // One setup panel for a ready document, in one order; a folder problem never
+  // suppresses a group, and the panel is neither a live region nor a focus
+  // target.
+  function checkoutSetupHtml(document) {
+    const items = [];
+    const git = gitProblemWords(document.git);
+    if (git !== "") items.push(["git", git, ""]);
+    if (!document.folders.length) {
+      items.push(["folders", text(codeWords("text", "noFolders")), ""]);
+    }
+    document.folders.forEach((folder) => {
+      if (folder.status === "ok") return;
+      items.push(["folder", folderProblemWords(folder), folder.path]);
+    });
+    if (lookupMissing(document)) {
+      items.push(["gh", text(codeWords("text", "ghMissing")), ""]);
+    }
+    document.diagnostics.forEach((diagnostic) => {
+      items.push(["diagnostic", diagnosticWords(diagnostic),
+        `${diagnostic.code} ${diagnostic.path === null ? "" : diagnostic.path}`]);
+    });
+    if (!items.length) return "";
+    return `<section class="checkouts-panel checkouts-setup" data-key="${text(keyOf("setup"))}">` +
+      `<h2>${text(codeWords("text", "setupHeading"))}</h2><ul>` +
+      items.map(([kind, html, id]) =>
+        `<li class="checkouts-setup-item" data-setup="${kind}" ` +
+        `${blockAttrs(keyOf("setup", kind, id))}>${html}</li>`).join("") +
+      "</ul></section>";
+  }
+
+  function localBranchOf(group, name) {
+    for (const clone of group.clones) {
+      if (clone.status !== "ok") continue;
+      const found = clone.branches.find((branch) => branch.name === name);
+      if (found !== undefined) return {clone, branch: found};
+    }
+    return null;
+  }
+
+  function firstReadableClone(group) {
+    return group.clones.find((clone) => clone.status === "ok") || null;
+  }
+
+  // A merge verdict carries the basis its verdict base was compared against.
+  function verdictBasisHtml(document, group, clone) {
+    if (clone === null || clone.verdict_base === null || clone.verdict_base === undefined) {
+      return "";
+    }
+    const check = group.remote === null ? null : group.remote.check;
+    const basis = basisWords(document, clone.verdict_base.basis,
+      check === null || check === undefined ? null : check.checked_at);
+    return ` <span class="checkouts-basis">${basis}</span>`;
+  }
+
+  // One merge verdict with its proof and the basis its verdict base was
+  // compared against.
+  function verdictHtml(document, group, verdict, clone) {
+    if (verdict === null || verdict === undefined) return dashHtml();
+    const state = text(codeWords("verdictState", verdict.state));
+    const base = group.default_branch === null || group.default_branch.name === null
+      ? "" : group.default_branch.name;
+    const basis = verdictBasisHtml(document, group, clone);
+    let words = state;
+    if (verdict.state === "merged" && verdict.rung !== null && verdict.rung !== undefined) {
+      const rung = wordText("verdictRung", verdict.rung, {
+        default: base,
+        n: verdict.pull_request === null || verdict.pull_request === undefined
+          ? "" : verdict.pull_request,
+      });
+      if (rung !== "") words = `${state} — ${rung}`;
+    } else if (verdict.state === "unknown" &&
+      verdict.reason !== null && verdict.reason !== undefined) {
+      words = `${state} — ${text(codeWords("verdictReason", verdict.reason))}`;
+    }
+    return `<span class="checkouts-verdict-words">${words}</span>${basis}`;
+  }
+
+  function verdictWords(document, group, entry) {
+    const remoteVerdict = entry.remote_verdict;
+    const local = localBranchOf(group, entry.name);
+    const verdict = remoteVerdict !== null && remoteVerdict !== undefined
+      ? remoteVerdict
+      : (local === null ? null : local.branch.verdict);
+    return verdictHtml(document, group, verdict,
+      local === null ? firstReadableClone(group) : local.clone);
+  }
+
+  function remoteCopyWords(document, group, copy) {
+    if (copy === null || copy === undefined) return dashHtml();
+    if (copy.state !== "present") return text(codeWords("remoteCopy", copy.state));
+    const check = group.remote === null ? null : group.remote.check;
+    const basis = basisWords(document, copy.basis,
+      check === null || check === undefined ? null : check.checked_at);
+    return wordHtml("remoteCopy", "present", {basis});
+  }
+
+  function pullRequestsWords(document, group, entry) {
+    const local = localBranchOf(group, entry.name);
+    const pulls = local === null ? null : local.branch.pull_requests;
+    if (pulls === null || pulls === undefined || !pulls.length) {
+      return dashHtml();
+    }
+    return pulls.map((pull) =>
+      `<span class="checkouts-pull">#${text(pull.number)} ` +
+      `${text(codeWords("pullRequestState", pull.state))}` +
+      (pull.head_matches ? "" :
+        ` ${text(codeWords("pullRequestState", "differentHead"))}`) +
+      "</span>").join(" · ");
+  }
+
+  // How the group's clones serve one work item: the basis each branch reference
+  // in the group carries for it.
+  function workItemBases(group, path) {
+    const bases = new Set();
+    group.clones.forEach((clone) => {
+      if (clone.status !== "ok") return;
+      (clone.branches || []).forEach((branch) => {
+        (branch.packages || []).forEach((reference) => {
+          if (reference.package_path === path) bases.add(reference.basis);
+        });
+      });
+    });
+    return [...bases].sort();
+  }
+
+  function showOnBoardButtonHtml(path, key) {
+    return '<button type="button" class="checkouts-show-on-board" ' +
+      `data-show-on-board="${text(path)}" ${controlAttrs(key, `show:${path}`)}>` +
+      `${text(codeWords("text", "showOnBoard"))}</button>`;
+  }
+
+  // Each work item names how the group serves it and its own board action.
+  function workItemsHtml(group, entry, key) {
+    return entry.packages.map((path) => {
+      const bases = workItemBases(group, path);
+      const suffix = bases.length
+        ? ` <span class="checkouts-basis">(${text(bases.map((basis) =>
+          codeWords("branchPackageBasis", basis)).join(", "))})</span>`
+        : "";
+      return '<span class="checkouts-work-item">' +
+        `<span class="checkouts-package-path">${text(path)}</span>${suffix} ` +
+        `${showOnBoardButtonHtml(path, key)}</span>`;
+    }).join(" · ");
+  }
+
+  function packageBranchesHtml(document, group) {
+    const entries = group.package_branches || [];
+    if (!entries.length) return "";
+    const rows = entries.map((entry) => {
+      const key = keyOf("package-branch", groupKey(group), entry.name);
+      return `<tr class="checkouts-branch" data-branch="${text(entry.name)}" tabindex="-1" ` +
+        `role="row" ${blockAttrs(key)}>` +
+        `<th scope="row" role="rowheader">${cellLabelHtml("branch")}${text(entry.name)}</th>` +
+        `<td class="checkouts-remote-copy" role="cell">${cellLabelHtml("remoteCopy")}` +
+        `${remoteCopyWords(document, group, entry.remote)}</td>` +
+        `<td class="checkouts-verdict" role="cell">${cellLabelHtml("verdict")}` +
+        `${verdictWords(document, group, entry)}</td>` +
+        `<td class="checkouts-pulls" role="cell">${cellLabelHtml("pullRequests")}` +
+        `${pullRequestsWords(document, group, entry)}</td>` +
+        `<td class="checkouts-work-items" role="cell">${cellLabelHtml("workItems")}` +
+        `${workItemsHtml(group, entry, key)}</td></tr>`;
+    }).join("");
+    return tableHtml("checkouts-package-branches", text(codeWords("text", "workItemBranches")),
+      PACKAGE_COLUMNS, rows);
+  }
+
+  function cloneFlagsHtml(document, clone) {
+    const flags = [];
+    if (clone.shallow) flags.push(text(codeWords("text", "shallow")));
+    if (clone.partial_clone) flags.push(text(codeWords("text", "partial")));
+    return flags.length
+      ? `<span class="checkouts-flags">${flags.join(", ")}</span>` : "";
+  }
+
+  // Once on the clone row: the fetch age a cached value was read from.
+  function freshnessHtml(document, clone) {
+    const distance = defaultDistance(clone);
+    if (distance === null || distance.basis !== "cached") return "";
+    const cached = clone.cached_default;
+    if (cached === null || cached === undefined) return "";
+    if (cached.fetched_since_clone === false ||
+      cached.last_fetched_at === null || cached.last_fetched_at === undefined) {
+      return `<span class="checkouts-freshness">${text(codeWords("text", "neverFetched"))}</span>`;
+    }
+    return `<span class="checkouts-freshness">` +
+      `${wordText("text", "fetchedAgo", {age: ageWords(cached.last_fetched_at, document.observed_at)})}` +
+      "</span>";
+  }
+
+  // A readable clone opens into its detail row; one that could not be read has
+  // no facts to open and so no toggle.
+  function cloneToggleHtml(clone) {
+    if (clone.status !== "ok") return "";
+    return '<button type="button" class="checkouts-toggle" aria-expanded="false" ' +
+      `${controlAttrs(keyOf("clone", clone.path), "toggle")} ` +
+      `aria-label="${wordText("text", "detailsToggleLabel", {clone: checkoutName(clone.path)})}">` +
+      `${text(codeWords("text", "detailsToggle"))}</button>`;
+  }
+
+  function checkoutCellHtml(document, clone) {
+    return '<th scope="row" class="checkouts-checkout" role="rowheader">' +
+      `${cellLabelHtml("checkout")}<span class="checkouts-name">${text(checkoutName(clone.path))}</span>` +
+      cloneFlagsHtml(document, clone) + freshnessHtml(document, clone) +
+      cloneToggleHtml(clone) +
+      "</th>";
+  }
+
+  function availabilityCellHtml(clone) {
+    if (clone.status !== "ok") return text(codeWords("availabilityState", "unknown"));
+    const availability = clone.availability || {state: "unknown", reasons: [], assigned_to: []};
+    const parts = [text(codeWords("availabilityState", availability.state))];
+    const reasons = (availability.reasons || []).map((reason) =>
+      text(codeWords("availabilityReason", reason)));
+    if (reasons.length) parts.push(`(${reasons.join(", ")})`);
+    const assigned = (availability.assigned_to || []).map((item) =>
+      `<span class="checkouts-assigned">${text(item.package_path)} ` +
+      `(${text(codeWords("assignmentBasis", item.basis))})</span>`).join(" · ");
+    if (assigned !== "") {
+      parts.push(`${text(codeWords("text", "assignedPrefix"))}: ${assigned}`);
+    }
+    return parts.join(" · ");
+  }
+
+  function headCellHtml(worktree) {
+    if (worktree === null || worktree.status !== "ok" || worktree.head === null) {
+      return dashHtml();
+    }
+    const head = worktree.head;
+    if (head.branch !== null && (head.sha === null || head.sha === undefined)) {
+      return wordText("text", "unborn", {branch: head.branch});
+    }
+    if (head.branch !== null) return text(head.branch);
+    return wordText("text", "detachedAt", {sha: String(head.sha).slice(0, 7)});
+  }
+
+  function treeCellHtml(worktree) {
+    if (worktree === null) return dashHtml();
+    if (worktree.status !== "ok") return text(codeWords("status", worktree.status));
+    const parts = [];
+    CHANGE_KINDS.forEach((kind) => {
+      const count = (worktree.changes || {})[kind];
+      if (!count) return;
+      parts.push(`${count} ${text(codeWords("changeKind", kind))}`);
+    });
+    if (!parts.length) parts.push(text(codeWords("text", "clean")));
+    (worktree.operations || []).forEach((operation) => {
+      parts.push(wordText("text", "operationInProgress", {
+        operation: codeWords("operation", operation),
+      }));
+    });
+    if (worktree.index_lock) parts.push(text(codeWords("text", "indexLock")));
+    return parts.join(" · ");
+  }
+
+  function defaultCellHtml(document, group, clone) {
+    const distance = defaultDistance(clone);
+    const check = group.remote === null ? null : group.remote.check;
+    const basis = distance === null ? "" : basisWords(document, distance.basis,
+      check === null || check === undefined ? null : check.checked_at);
+    const failed = checkFailed(check === null || check === undefined ? null : check.reason);
+    return '<td class="checkouts-default" role="cell">' + cellLabelHtml("default") +
+      `<span class="checkouts-relation">${comparisonWords(distance)}</span>` +
+      (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`) +
+      (failed ? ` <span class="checkouts-note">${wordText("text", "latestCheckFailed", {
+        reason: codeWords("checkReason", check.reason),
+      })}</span>` : "") +
+      "</td>";
+  }
+
+  function branchesCellHtml(clone) {
+    const parts = [plural(clone.branches.length, "branch")];
+    if (clone.stash_count > 0) parts.push(plural(clone.stash_count, "stash"));
+    if (clone.containment !== null && clone.containment !== undefined &&
+      clone.containment !== "complete") {
+      parts.push(`<span class="checkouts-caption">` +
+        `${wordText("text", "foldingNotChecked", {
+          reason: codeWords("containment", clone.containment),
+        })}</span>`);
+    }
+    return parts.join(" · ");
+  }
+
+  function blockersHtml(blockers, table) {
+    return blockers.map((code) => text(codeWords(table, code))).join(", ");
+  }
+
+  function cleanupCellHtml(clone) {
+    const count = clone.removable_count || {branches: 0, worktrees: 0};
+    const parts = [];
+    if (count.branches === 0 && count.worktrees === 0) {
+      parts.push(text(codeWords("text", "nothingToRemove")));
+    } else {
+      parts.push(`${plural(count.branches, "branch")}, ` +
+        `${plural(count.worktrees, "worktree")} removable`);
+    }
+    const blocked = [];
+    clone.branches.forEach((branch) => {
+      if (branch.removable === null || branch.removable === undefined ||
+        branch.removable.removable) return;
+      blocked.push(`<span class="checkouts-blocker">${text(branch.name)} ` +
+        `(${blockersHtml(branch.removable.blockers, "branchBlocker")})</span>`);
+    });
+    clone.worktrees.forEach((worktree) => {
+      if (worktree.main || worktree.removable === null ||
+        worktree.removable === undefined || worktree.removable.removable) return;
+      blocked.push(`<span class="checkouts-blocker">${text(checkoutName(worktree.path))} ` +
+        `(${blockersHtml(worktree.removable.blockers, "worktreeBlocker")})</span>`);
+    });
+    if (blocked.length) parts.push(blocked.join(" · "));
+    return parts.join(" · ");
+  }
+
+  function packageCellHtml(document, clone, worktree) {
+    const paths = document.packages
+      .filter((item) => {
+        const target = item.target;
+        if (target === null || target === undefined) return false;
+        if (worktree !== null) return target.worktree === worktree.path;
+        if (target.clone !== clone.path) return false;
+        return clone.status !== "ok" || target.worktree === null;
+      })
+      .map((item) => item.package_path);
+    return paths.length
+      ? paths.map((path) => `<span class="checkouts-package-path">${text(path)}</span>`).join(" · ")
+      : dashHtml();
+  }
+
+  // ---------------------------------------------------------------------
+  // The expanded clone row: path, branches with their folds, cleanup of linked
+  // worktrees and the work items the clone serves
+  // ---------------------------------------------------------------------
+
+  const BRANCH_COLUMNS = ["branch", "checkedOutIn", "tip", "remoteState", "verdict", "cleanup"];
+
+  function comparisonCellHtml(document, group, comparison) {
+    if (comparison === null || comparison === undefined) return dashHtml();
+    const check = group.remote === null ? null : group.remote.check;
+    const basis = basisWords(document, comparison.basis,
+      check === null || check === undefined ? null : check.checked_at);
+    return `<span class="checkouts-relation">${comparisonWords(comparison)}</span>` +
+      (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`);
+  }
+
+  function removableWordsHtml(removable, table) {
+    if (removable === null || removable === undefined) return dashHtml();
+    if (removable.removable) return text(codeWords("text", "removable"));
+    return blockersHtml(removable.blockers, table);
+  }
+
+  function branchRowHtml(document, group, clone, branch, parent, depth, folded) {
+    const key = keyOf("branch", clone.path, branch.name);
+    const fold = folded > 0
+      ? '<button type="button" class="checkouts-fold-toggle" aria-expanded="false" ' +
+        `${controlAttrs(key, "fold")} data-fold="${text(branch.name)}">` +
+        `${wordText("text", "foldedBranches", {count: folded})}</button>`
+      : "";
+    return '<tr class="checkouts-clone-branch" tabindex="-1" role="row" ' +
+      `${blockAttrs(key)} data-branch="${text(branch.name)}" data-depth="${depth}"` +
+      (parent === null ? "" : ` data-parent="${text(parent)}" hidden`) + ">" +
+      `<th scope="row" class="checkouts-branch-name" role="rowheader">${cellLabelHtml("branch")}` +
+      `${text(branch.name)}${fold}</th>` +
+      `<td role="cell">${cellLabelHtml("checkedOutIn")}${branch.checked_out_in === null ||
+        branch.checked_out_in === undefined || branch.checked_out_in.length === 0
+        ? dashHtml() : branch.checked_out_in.map((path) => text(checkoutName(path))).join(" · ")}</td>` +
+      `<td class="checkouts-tip" role="cell">${cellLabelHtml("tip")}` +
+      `${text(String(branch.sha).slice(0, 7))}</td>` +
+      `<td class="checkouts-remote-state" role="cell">${cellLabelHtml("remoteState")}` +
+      `${comparisonCellHtml(document, group, branch.vs_remote)}</td>` +
+      `<td class="checkouts-verdict" role="cell">${cellLabelHtml("verdict")}` +
+      `${verdictHtml(document, group, branch.verdict, clone)}</td>` +
+      `<td class="checkouts-branch-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
+      `${removableWordsHtml(branch.removable, "branchBlocker")}</td>` +
+      "</tr>";
+  }
+
+  // Branches follow the document's order; one whose tip another branch holds
+  // sits under that branch, behind its fold.
+  function branchTableHtml(document, group, clone) {
+    if (!clone.branches.length) return "";
+    const names = new Set(clone.branches.map((branch) => branch.name));
+    const children = new Map();
+    clone.branches.forEach((branch) => {
+      const parent = branch.contained_in !== null && branch.contained_in !== undefined &&
+        names.has(branch.contained_in) ? branch.contained_in : null;
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(branch);
+    });
+    const rows = [];
+    const walk = (parent, depth) => {
+      (children.get(parent) || []).forEach((branch) => {
+        rows.push(branchRowHtml(document, group, clone, branch, parent, depth,
+          (children.get(branch.name) || []).length));
+        walk(branch.name, depth + 1);
+      });
+    };
+    walk(null, 0);
+    return tableHtml("checkouts-branch-table", text(codeWords("text", "branchesHeading")),
+      BRANCH_COLUMNS, rows.join(""));
+  }
+
+  function linkedWorktreesHtml(clone) {
+    const linked = clone.worktrees.filter((worktree) => !worktree.main);
+    if (!linked.length) return "";
+    const rows = linked.map((worktree) => {
+      const status = text(codeWords("status", worktree.status));
+      return `<tr class="checkouts-detail-worktree" data-worktree="${text(checkoutName(worktree.path))}" ` +
+        `role="row" ${blockAttrs(keyOf("linked", clone.path, worktree.path))}>` +
+        `<th scope="row" role="rowheader">${cellLabelHtml("checkout")}` +
+        `${text(checkoutName(worktree.path))}</th>` +
+        `<td role="cell">${cellLabelHtml("head")}` +
+        `${worktree.status === "ok" ? headCellHtml(worktree) : status}</td>` +
+        `<td class="checkouts-worktree-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
+        `${worktree.status === "ok" ? worktreeCleanupHtml(worktree) : status}</td></tr>`;
+    }).join("");
+    return tableHtml("checkouts-detail-worktrees", text(codeWords("text", "worktreesHeading")),
+      ["checkout", "head", "cleanup"], rows);
+  }
+
+  // Every work item the clone serves: the packages a branch of it names and
+  // the packages that target it, each with how it matched.
+  function cloneWorkItems(document, clone) {
+    const bases = new Map();
+    const note = (path, words) => {
+      if (!bases.has(path)) bases.set(path, new Set());
+      bases.get(path).add(words);
+    };
+    clone.branches.forEach((branch) => {
+      (branch.packages || []).forEach((reference) => {
+        note(reference.package_path, codeWords("branchPackageBasis", reference.basis));
+      });
+    });
+    document.packages.forEach((item) => {
+      const target = item.target;
+      if (target === null || target === undefined || target.clone !== clone.path) return;
+      note(item.package_path, codeWords("assignmentBasis",
+        target.worktree === null || target.worktree === undefined
+          ? "target_repo" : "target_repo_worktree"));
+    });
+    return document.packages.filter((item) => bases.has(item.package_path))
+      .map((item) => ({item, bases: [...bases.get(item.package_path)]}));
+  }
+
+  function cloneWorkItemsHtml(document, clone) {
+    const served = cloneWorkItems(document, clone);
+    if (!served.length) return "";
+    const rows = served.map(({item, bases}) => {
+      const status = item.code_status === null || item.code_status === undefined
+        ? "" : `<span class="checkouts-code-status">${text(item.code_status.text)}</span>`;
+      const key = keyOf("clone-package", clone.path, item.package_path);
+      return `<li class="checkouts-clone-work-item" data-package="${text(item.package_path)}" ` +
+        `${blockAttrs(key)}>` +
+        `<span class="checkouts-package-path">${text(item.package_path)}</span> ` +
+        `<span class="checkouts-basis">(${text(bases.join(", "))})</span>` +
+        (status === "" ? "" : ` ${status}`) + ` ${showOnBoardButtonHtml(item.package_path, key)}</li>`;
+    }).join("");
+    return '<section class="checkouts-detail-work-items">' +
+      `<h3>${text(codeWords("text", "workItemsHeading"))}</h3><ul>${rows}</ul></section>`;
+  }
+
+  function cloneDetailHtml(document, group, clone) {
+    return `<tr class="checkouts-detail" data-detail-for="${text(clone.path)}" role="row" ` +
+      `data-key="${text(keyOf("detail", clone.path))}" hidden>` +
+      `<td colspan="${CLONE_COLUMNS.length}" role="cell">` +
+      '<p class="checkouts-clone-path">' +
+      `<span class="checkouts-clone-path-label">${text(codeWords("text", "clonePath"))}</span> ` +
+      `<span class="checkouts-clone-path-value">${text(clone.path)}</span></p>` +
+      branchTableHtml(document, group, clone) + linkedWorktreesHtml(clone) +
+      cloneWorkItemsHtml(document, clone) + "</td></tr>";
+  }
+
+  // A main worktree that could not be read shows its own status words in the
+  // HEAD and tree cells; it is never a nested row of its own.
+  function cloneMainWorktree(clone) {
+    return clone.worktrees.find((worktree) => worktree.main) || null;
+  }
+
+  function cloneHeadHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "bareRepository"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return headCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
+  function cloneTreeHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "noWorkingTree"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return treeCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
+  function cloneRowHtml(document, group, clone) {
+    const name = checkoutName(clone.path);
+    const cells = [checkoutCellHtml(document, clone),
+      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}` +
+      `${availabilityCellHtml(clone)}</td>`];
+    if (clone.status !== "ok") {
+      // A clone that could not be read keeps its Package cell and has no
+      // toggle; one cell spans the columns its facts would have filled.
+      cells.push(`<td class="checkouts-status" colspan="5" role="cell">` +
+        `${cellLabelHtml("status")}${text(codeWords("status", clone.status))}</td>`);
+      cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
+        `${packageCellHtml(document, clone, null)}</td>`);
+      return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
+        `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
+        `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>`;
+    }
+    cells.push(`<td class="checkouts-head" role="cell">${cellLabelHtml("head")}` +
+      `${cloneHeadHtml(clone)}</td>`);
+    cells.push(defaultCellHtml(document, group, clone));
+    cells.push(`<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
+      `${cloneTreeHtml(clone)}</td>`);
+    cells.push(`<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}` +
+      `${branchesCellHtml(clone)}</td>`);
+    cells.push(`<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
+      `${cleanupCellHtml(clone)}</td>`);
+    cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
+      `${packageCellHtml(document, clone, null)}</td>`);
+    return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
+      `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
+      `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>` +
+      cloneDetailHtml(document, group, clone);
+  }
+
+  function worktreeCleanupHtml(worktree) {
+    if (worktree.removable === null || worktree.removable === undefined) return dashHtml();
+    if (worktree.removable.removable) return text(codeWords("text", "removable"));
+    return blockersHtml(worktree.removable.blockers, "worktreeBlocker");
+  }
+
+  function worktreeRowHtml(document, clone, worktree) {
+    const name = checkoutName(worktree.path);
+    const flags = [];
+    if (worktree.prunable) flags.push(`<span class="checkouts-flag">` +
+      `${text(codeWords("worktreeFlag", "prunable"))}</span>`);
+    if (worktree.locked) flags.push(`<span class="checkouts-flag">` +
+      `${text(codeWords("worktreeFlag", "locked"))}</span>`);
+    const status = text(codeWords("status", worktree.status));
+    const cells = [
+      '<th scope="row" class="checkouts-checkout checkouts-worktree-name" role="rowheader">' +
+        `${cellLabelHtml("checkout")}<span class="checkouts-name">${text(name)}</span>` +
+        (flags.length ? `<span class="checkouts-flags">${flags.join(", ")}</span>` : "") +
+        "</th>",
+      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}${dashHtml()}</td>`,
+      `<td class="checkouts-head" role="cell">${cellLabelHtml("head")}` +
+        `${worktree.status === "ok" ? headCellHtml(worktree) : status}</td>`,
+      `<td class="checkouts-default" role="cell">${cellLabelHtml("default")}${dashHtml()}</td>`,
+      `<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
+        `${worktree.status === "ok" ? treeCellHtml(worktree) : status}</td>`,
+      `<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}${dashHtml()}</td>`,
+      `<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}${worktree.status === "ok"
+        ? worktreeCleanupHtml(worktree) : dashHtml()}</td>`,
+      `<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
+        `${packageCellHtml(document, clone, worktree)}</td>`,
+    ];
+    return `<tr class="checkouts-worktree" data-worktree="${text(name)}" ` +
+      `data-worktree-path="${text(worktree.path)}" tabindex="-1" role="row" ` +
+      `${blockAttrs(keyOf("worktree", worktree.path))}>${cells.join("")}</tr>`;
+  }
+
+  function cloneTableHtml(document, group) {
+    const rows = [];
+    group.clones.forEach((clone) => {
+      rows.push(cloneRowHtml(document, group, clone));
+      if (clone.status !== "ok") return;
+      clone.worktrees.forEach((worktree) => {
+        if (!worktree.main) rows.push(worktreeRowHtml(document, clone, worktree));
+      });
+    });
+    return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""));
+  }
+
+  // The words a cell shows, without its markup, so the search matches what the
+  // reader sees.
+  function wordsOf(html) {
+    const holder = document.createElement("template");
+    holder.innerHTML = html;
+    return holder.content.textContent;
+  }
+
+  function groupSearchText(document, group) {
+    const values = [remoteName(group)];
+    if (group.default_branch !== null && group.default_branch.name !== null) {
+      values.push(group.default_branch.name);
+    }
+    const served = new Map();
+    const notePackage = (item) => served.set(item.package_path, item);
+    group.clones.forEach((clone) => {
+      values.push(checkoutName(clone.path), clone.path);
+      values.push(wordsOf(availabilityCellHtml(clone)));
+      if (clone.status === "ok") {
+        values.push(wordsOf(cloneHeadHtml(clone)), wordsOf(cloneTreeHtml(clone)));
+        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
+      } else {
+        values.push(wordsOf(text(codeWords("status", clone.status))));
+      }
+      (clone.worktrees || []).forEach((worktree) => {
+        values.push(checkoutName(worktree.path), worktree.path);
+        values.push(wordsOf(worktree.status === "ok"
+          ? headCellHtml(worktree) : text(codeWords("status", worktree.status))));
+      });
+      (clone.branches || []).forEach((branch) => values.push(branch.name));
+    });
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    document.packages.forEach((item) => {
+      if (item.target !== null && item.target !== undefined &&
+        clonePaths.has(item.target.clone)) notePackage(item);
+    });
+    (group.package_branches || []).forEach((entry) => {
+      values.push(entry.name);
+      entry.packages.forEach((path) => {
+        values.push(path);
+        const item = document.packages.find((candidate) => candidate.package_path === path);
+        if (item !== undefined) notePackage(item);
+      });
+    });
+    served.forEach((item, path) => {
+      values.push(path);
+      if (item.code_status !== null && item.code_status !== undefined) {
+        values.push(item.code_status.text);
+      }
+    });
+    return values
+      .filter((value) => value !== null && value !== undefined && value !== "" &&
+        value !== "—")
+      .join(" ").toLowerCase();
+  }
+
+  function groupKey(group) {
+    return group.remote === null ? group.clones[0].path : group.remote.key;
+  }
+
+  function groupHtml(document, group) {
+    return `<section class="checkouts-group" data-checkouts-group="${text(groupKey(group))}" ` +
+      `data-key="${text(keyOf("group", groupKey(group)))}" ` +
+      `data-search="${text(groupSearchText(document, group))}">` +
+      groupHeaderHtml(document, group) +
+      packageBranchesHtml(document, group) +
+      cloneTableHtml(document, group) +
+      "</section>";
+  }
+
+  // ---------------------------------------------------------------------
+  // Needs attention: the document's items in its order, each in words
+  // ---------------------------------------------------------------------
+
+  function attentionWords(item) {
+    const values = {
+      branch: item.branch,
+      clone: item.clone === null ? "" : checkoutName(item.clone),
+      worktree: item.worktree === null ? "" : checkoutName(item.worktree),
+      count: item.count,
+      workItem: item.packages.length ? item.packages[0] : "",
+    };
+    let words = item.code === "uncommitted_changes" && item.count === 0
+      ? wordText("text", "uncommittedOperation", values)
+      : wordText(item.count === 1 && codeWords("attentionCodeOne", item.code) !== item.code
+        ? "attentionCodeOne" : "attentionCode", item.code, values);
+    if (item.code === "awaiting_merge" &&
+      item.pull_request !== null && item.pull_request !== undefined) {
+      words += ` ${wordText("text", "awaitingMergePullRequest", {n: item.pull_request})}`;
+    }
+    return words;
+  }
+
+  // The first destination an item names: a clone and branch, a clone and
+  // worktree, a clone, a repository and branch, work items, nothing.
+  function attentionKind(item) {
+    if (item.clone !== null && item.branch !== null) return "branch";
+    if (item.clone !== null && item.worktree !== null) return "worktree";
+    if (item.clone !== null) return "clone";
+    if (item.repository !== null && item.branch !== null) return "package-branch";
+    if (item.packages.length) return "work-items";
+    return "text";
+  }
+
+  // A count or pull request number changes the words, never the identity, so a
+  // changed count keeps the focus on the item.
+  function attentionKey(item) {
+    return keyOf("attention", item.class, item.code, item.repository, item.clone,
+      item.worktree, item.branch, item.packages);
+  }
+
+  function attentionItemHtml(item) {
+    const kind = attentionKind(item);
+    const words = attentionWords(item);
+    const key = attentionKey(item);
+    const head = '<li class="checkouts-attention-item" ' +
+      `data-code="${text(item.code)}" data-attention-kind="${kind}" ${blockAttrs(key)}>`;
+    if (kind === "text") return `${head}<span class="checkouts-attention-words">${words}</span></li>`;
+    if (kind === "work-items") {
+      return `${head}<span class="checkouts-attention-words">${words}</span> ` +
+        `${item.packages.map((path) => showOnBoardButtonHtml(path, key)).join(" ")}</li>`;
+    }
+    return `${head}<button type="button" class="checkouts-attention-go" ` +
+      `${controlAttrs(key, "go")}>${words}</button></li>`;
+  }
+
+  function attentionHtml(document) {
+    if (!document.attention.length) return "";
+    const parts = [];
+    let current = null;
+    document.attention.forEach((item) => {
+      if (item.class !== current) {
+        if (current !== null) parts.push("</ul>");
+        current = item.class;
+        parts.push('<h3 class="checkouts-attention-class" ' +
+          `data-class="${text(item.class)}">${text(codeWords("attentionClass", item.class))}</h3>` +
+          '<ul class="checkouts-attention-list">');
+      }
+      parts.push(attentionItemHtml(item));
+    });
+    parts.push("</ul>");
+    return `<section class="checkouts-attention" data-key="${text(keyOf("attention"))}">` +
+      `<h2>${text(codeWords("text", "attentionHeading"))}</h2>${parts.join("")}</section>`;
+  }
+
+  function cloneRowFor(path) {
+    return [...checkoutsBody.querySelectorAll("tr.checkouts-clone")]
+      .find((row) => row.dataset.clonePath === path) || null;
+  }
+
+  // A destination the search hides clears the search first.
+  function revealDestination(element) {
+    const group = element.closest(".checkouts-group");
+    if (group === null || !group.hidden) return;
+    filter.value = "";
+    applyFilter();
+  }
+
+  function focusDestination(element) {
+    element.scrollIntoView({block: "nearest"});
+    element.focus({preventScroll: true});
+  }
+
+  function setAttributeOnce(element, name, value) {
+    if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+  }
+
+  function paintCloneOpen(row, open) {
+    const toggle = row.querySelector(".checkouts-toggle");
+    const detail = row.nextElementSibling;
+    if (toggle === null || detail === null || !detail.classList.contains("checkouts-detail")) {
+      return null;
+    }
+    setAttributeOnce(toggle, "aria-expanded", String(open));
+    if (detail.hidden === open) detail.hidden = !open;
+    return detail;
+  }
+
+  function setCloneOpen(row, open) {
+    const detail = paintCloneOpen(row, open);
+    if (detail === null) return null;
+    if (open) openClones.add(row.dataset.clonePath);
+    else openClones.delete(row.dataset.clonePath);
+    return detail;
+  }
+
+  function foldKeyOf(toggle) {
+    const row = toggle.closest("tr.checkouts-clone-branch");
+    return JSON.stringify([row.closest("tr.checkouts-detail").dataset.detailFor,
+      row.dataset.branch]);
+  }
+
+  function setFoldOpen(toggle, open) {
+    setAttributeOnce(toggle, "aria-expanded", String(open));
+    if (open) openFolds.add(foldKeyOf(toggle));
+    else openFolds.delete(foldKeyOf(toggle));
+  }
+
+  // A folded row shows only while every fold above it is open.
+  function applyFolds(detail) {
+    const shown = new Map();
+    detail.querySelectorAll("tr.checkouts-clone-branch").forEach((row) => {
+      const parent = row.dataset.parent;
+      let visible = true;
+      if (parent !== undefined) {
+        const holder = shown.get(parent);
+        const toggle = detail.querySelector(
+          `tr.checkouts-clone-branch[data-branch="${CSS.escape(parent)}"] .checkouts-fold-toggle`);
+        visible = holder !== false && toggle !== null &&
+          toggle.getAttribute("aria-expanded") === "true";
+      }
+      shown.set(row.dataset.branch, visible);
+      if (row.hidden === visible) row.hidden = !visible;
+    });
+  }
+
+  // The item a control names by key, so a refresh that moves items never sends
+  // a press to the wrong destination.
+  function goToAttention(key) {
+    if (checkoutsOutcome.state !== "ready") return;
+    const item = checkoutsOutcome.envelope.checkouts.attention
+      .find((candidate) => attentionKey(candidate) === key);
+    if (item === undefined) return;
+    const kind = attentionKind(item);
+    if (kind === "package-branch") {
+      const group = [...checkoutsBody.querySelectorAll(".checkouts-group")]
+        .find((section) => section.dataset.checkoutsGroup === item.repository);
+      if (group === undefined) return;
+      revealDestination(group);
+      const row = [...group.querySelectorAll("table.checkouts-package-branches tr[data-branch]")]
+        .find((candidate) => candidate.dataset.branch === item.branch);
+      focusDestination(row === undefined ? group.querySelector(".checkouts-group-head") : row);
+      return;
+    }
+    const cloneRow = cloneRowFor(item.clone);
+    if (cloneRow === null) return;
+    revealDestination(cloneRow);
+    if (kind === "worktree") {
+      const nested = item.worktree === item.clone ? cloneRow
+        : [...checkoutsBody.querySelectorAll("tr.checkouts-worktree")]
+          .find((row) => row.dataset.worktreePath === item.worktree) || cloneRow;
+      focusDestination(nested);
+      return;
+    }
+    const toggle = cloneRow.querySelector(".checkouts-toggle");
+    if (kind === "branch" && toggle !== null) {
+      const detail = setCloneOpen(cloneRow, true);
+      const row = [...detail.querySelectorAll("tr.checkouts-clone-branch")]
+        .find((candidate) => candidate.dataset.branch === item.branch);
+      if (row !== undefined) {
+        // Every fold above the branch opens so its row is shown.
+        let parent = row.dataset.parent;
+        while (parent !== undefined) {
+          const above = detail.querySelector(
+            `tr.checkouts-clone-branch[data-branch="${CSS.escape(parent)}"]`);
+          setFoldOpen(above.querySelector(".checkouts-fold-toggle"), true);
+          parent = above.dataset.parent;
+        }
+        applyFolds(detail);
+        focusDestination(row);
+        return;
+      }
+    }
+    focusDestination(toggle === null ? cloneRow : toggle);
+  }
+
+  function checkoutsGroupsHtml(document) {
+    const quiet = document.repositories.filter((group) =>
+      isQuietRepository(document, group));
+    const shown = hideQuietCheckouts
+      ? document.repositories.filter((group) => !isQuietRepository(document, group))
+      : document.repositories;
+    return checkoutSetupHtml(document) + attentionHtml(document) +
+      (hideQuietCheckouts && quiet.length ? quietRowHtml(document, quiet) : "") +
+      shown.map((group) => groupHtml(document, group)).join("");
+  }
+
+  // ---------------------------------------------------------------------
+  // In-place refresh: every render builds the whole view's markup and replaces
+  // only the blocks whose markup changed
+  // ---------------------------------------------------------------------
+
+  // Attributes the reader's own actions or the search own; a refresh never
+  // copies them from the new markup onto a block that stays.
+  const STATE_ATTRIBUTES = new Set(["hidden", "open", "aria-expanded"]);
+
+  function isBlock(element) {
+    return element.hasAttribute("data-block") || element.querySelector("[data-block]") === null;
+  }
+
+  // A child's identity among its siblings: its key, else its tag and class.
+  // A repeated identity is told apart by its place among the repeats.
+  function childIdentities(parent) {
+    const seen = new Map();
+    return [...parent.children].map((child) => {
+      const base = child.hasAttribute("data-key") && !child.hasAttribute("data-control")
+        ? child.getAttribute("data-key")
+        : `~${child.tagName}.${child.getAttribute("class") || ""}`;
+      const count = seen.get(base) || 0;
+      seen.set(base, count + 1);
+      return {element: child, identity: `${base}#${count}`};
+    });
+  }
+
+  // What a block was last built from, so an unchanged block is left alone.
+  function stampBlock(element, markup) {
+    element.nyxMarkup = markup;
+    if (isBlock(element)) return;
+    [...element.children].forEach((child) => stampBlock(child, child.outerHTML));
+  }
+
+  // A block that enters the view takes the state the reader left it in.
+  function adoptBlock(element) {
+    stampBlock(element, element.outerHTML);
+    if (element.matches("details.checkouts-quiet") && quietOpen) element.open = true;
+  }
+
+  function syncAttributes(live, fresh) {
+    [...fresh.attributes].forEach((attribute) => {
+      if (!STATE_ATTRIBUTES.has(attribute.name)) {
+        setAttributeOnce(live, attribute.name, attribute.value);
+      }
+    });
+    [...live.attributes].forEach((attribute) => {
+      if (!STATE_ATTRIBUTES.has(attribute.name) && !fresh.hasAttribute(attribute.name)) {
+        live.removeAttribute(attribute.name);
+      }
+    });
+  }
+
+  function reconcileChildren(live, fresh) {
+    const liveChildren = new Map(childIdentities(live).map((item) => [item.identity, item.element]));
+    const freshChildren = childIdentities(fresh);
+    const keep = new Set(freshChildren.map((item) => item.identity));
+    liveChildren.forEach((element, identity) => {
+      if (!keep.has(identity)) element.remove();
+    });
+    let cursor = live.firstElementChild;
+    freshChildren.forEach(({element, identity}) => {
+      const existing = liveChildren.get(identity);
+      if (existing === undefined) {
+        live.insertBefore(element, cursor);
+        adoptBlock(element);
+        return;
+      }
+      if (existing === cursor) cursor = cursor.nextElementSibling;
+      else live.insertBefore(existing, cursor);
+      const markup = element.outerHTML;
+      if (existing.nyxMarkup === markup) return;
+      if (isBlock(element)) {
+        existing.replaceWith(element);
+        adoptBlock(element);
+        return;
+      }
+      syncAttributes(existing, element);
+      reconcileChildren(existing, element);
+      existing.nyxMarkup = markup;
+    });
+  }
+
+  // The reader's opened rows and folds are kept only while the document still
+  // has them; a failed outcome keeps them all for the ready one that follows.
+  function pruneCheckoutsState(fresh) {
+    const clones = new Set([...fresh.querySelectorAll("tr.checkouts-clone")]
+      .filter((row) => row.querySelector(".checkouts-toggle") !== null)
+      .map((row) => row.dataset.clonePath));
+    openClones.forEach((path) => {
+      if (!clones.has(path)) openClones.delete(path);
+    });
+    const folds = new Set([...fresh.querySelectorAll(".checkouts-fold-toggle")]
+      .map((toggle) => foldKeyOf(toggle)));
+    openFolds.forEach((key) => {
+      if (!folds.has(key)) openFolds.delete(key);
+    });
+    if (fresh.querySelector("details.checkouts-quiet") === null) quietOpen = false;
+  }
+
+  function applyCheckoutsState() {
+    checkoutsBody.querySelectorAll("tr.checkouts-clone").forEach((row) => {
+      paintCloneOpen(row, openClones.has(row.dataset.clonePath));
+    });
+    checkoutsBody.querySelectorAll("tr.checkouts-detail").forEach((detail) => {
+      detail.querySelectorAll(".checkouts-fold-toggle").forEach((toggle) => {
+        setAttributeOnce(toggle, "aria-expanded", String(openFolds.has(foldKeyOf(toggle))));
+      });
+      applyFolds(detail);
+    });
+  }
+
+  function findByKey(root, key, control) {
+    return [...root.querySelectorAll("[data-key]")].find((element) =>
+      element.getAttribute("data-key") === key &&
+      (control === null ? !element.hasAttribute("data-control")
+        : element.getAttribute("data-control") === control)) || null;
+  }
+
+  // Where focus stands before a render, and the controls it would move to if
+  // its own block goes: the toggles of the rows after it in its group.
+  function captureCheckoutsFocus() {
+    const active = document.activeElement;
+    if (active === null || active === document.body || !checkoutsBody.contains(active) ||
+      !active.hasAttribute("data-key")) {
+      return null;
+    }
+    const group = active.closest(".checkouts-group");
+    const next = group === null ? [] : [...group.querySelectorAll("button.checkouts-toggle")]
+      .filter((toggle) => toggle !== active &&
+        Boolean(active.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING))
+      .map((toggle) => ({key: toggle.getAttribute("data-key"),
+        control: toggle.getAttribute("data-control")}));
+    return {
+      element: active,
+      key: active.getAttribute("data-key"),
+      control: active.getAttribute("data-control"),
+      group: group === null ? null : group.getAttribute("data-key"),
+      next,
+    };
+  }
+
+  // The control it was on, else its block, else the next row's toggle in its
+  // group, else the group's heading, else the view's heading.
+  function restoreCheckoutsFocus(focus) {
+    if (focus === null || document.activeElement === focus.element) return;
+    let target = findByKey(checkoutsBody, focus.key, focus.control);
+    if (target === null && focus.control !== null) {
+      target = findByKey(checkoutsBody, focus.key, null);
+    }
+    for (let index = 0; target === null && index < focus.next.length; index += 1) {
+      target = findByKey(checkoutsBody, focus.next[index].key, focus.next[index].control);
+    }
+    if (target === null && focus.group !== null) {
+      const group = findByKey(checkoutsBody, focus.group, null);
+      target = group === null ? null : group.querySelector(".checkouts-group-head");
+    }
+    if (target === null) target = checkoutsHeading;
+    target.focus({preventScroll: true});
+  }
+
+  function renderCheckouts() {
+    renderCheckoutsStatusLine();
+    const fresh = document.createElement("template");
+    fresh.innerHTML = checkoutsPanelHtml() +
+      (checkoutsOutcome.state === "ready"
+        ? checkoutsGroupsHtml(checkoutsOutcome.envelope.checkouts) : "");
+    if (checkoutsOutcome.state === "ready") pruneCheckoutsState(fresh.content);
+    const focus = captureCheckoutsFocus();
+    reconcileChildren(checkoutsBody, fresh.content);
+    applyCheckoutsState();
+    applyFilter();
+    // The scroll position stays because the view takes no part in scroll
+    // anchoring (style.css) and focus moves without scrolling.
+    if (shownView === VIEW_CHECKOUTS) restoreCheckoutsFocus(focus);
+  }
+
+  // Show one work item on the board: the selection moves to it and is never
+  // toggled off, a search that hides its card is cleared first, and a work item
+  // the board cannot show says why and leaves the view where it is.
+  function showOnBoard(path) {
+    const known = displayed !== null &&
+      displayed.entries.some((entry) => entry.package_path === path);
+    if (!known) {
+      setCheckoutsActionStatus(codeWords("text", "showOnBoardMissing"));
+      return;
+    }
+    if (!renderedEntries.has(path)) {
+      setCheckoutsActionStatus(codeWords("text", "showOnBoardFinished"));
+      return;
+    }
+    const card = [...board.querySelectorAll(".card")]
+      .find((item) => item.dataset.packagePath === path);
+    // The reader's search survives the jump unless it is what hides the card;
+    // the card's own search text decides that, so a query matching it stays.
+    const query = filter.value.trim().toLowerCase();
+    if (query !== "" && card !== undefined && !(card.dataset.search || "").includes(query)) {
+      filter.value = "";
+      applyFilter();
+    }
+    setShownView(VIEW_BOARD);
+    setSelection(path);
+    if (card === undefined) return;
+    revealCard(card);
+    card.focus({preventScroll: true});
+  }
+
+  // Scroll just far enough that the card clears the sticky toolbar and column
+  // heads above it and the window's lower edge, so it is never covered.
+  function revealCard(card) {
+    let clearance = 0;
+    document.querySelectorAll(".toolbar, .board-corner, .column-head").forEach((head) => {
+      clearance = Math.max(clearance, head.getBoundingClientRect().bottom);
+    });
+    const rect = card.getBoundingClientRect();
+    const margin = 8;
+    if (rect.top < clearance + margin) {
+      window.scrollBy(0, rect.top - clearance - margin);
+    } else if (rect.bottom > window.innerHeight - margin) {
+      window.scrollBy(0, rect.bottom - window.innerHeight + margin);
+    }
+  }
+
+  checkoutsBody.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-show-on-board]");
+    if (button !== null) {
+      showOnBoard(button.dataset.showOnBoard);
+      return;
+    }
+    const attention = event.target.closest('[data-control="go"]');
+    if (attention !== null) {
+      goToAttention(attention.getAttribute("data-key"));
+      return;
+    }
+    const toggle = event.target.closest(".checkouts-toggle");
+    if (toggle !== null) {
+      const row = toggle.closest("tr.checkouts-clone");
+      setCloneOpen(row, toggle.getAttribute("aria-expanded") !== "true");
+      return;
+    }
+    const fold = event.target.closest(".checkouts-fold-toggle");
+    if (fold !== null) {
+      setFoldOpen(fold, fold.getAttribute("aria-expanded") !== "true");
+      applyFolds(fold.closest("tr.checkouts-detail"));
+    }
+  });
+  // The quiet row's own toggle event is the one record of whether it is open.
+  checkoutsBody.addEventListener("toggle", (event) => {
+    if (event.target.matches("details.checkouts-quiet")) quietOpen = event.target.open;
+  }, true);
+
+  // Every settle of a pressed check announces its result once, even when it is
+  // the same words as the previous one: one write per settle is one text
+  // change, so a repeated completion or failure is still announced.
+  function setCheckoutsActionStatus(message) {
+    const text = checkoutsActionStatus.firstChild;
+    if (text !== null && text === checkoutsActionStatus.lastChild &&
+      text.nodeType === Node.TEXT_NODE) {
+      text.data = message;
+    } else {
+      checkoutsActionStatus.textContent = message;
+    }
+  }
+
+  function remoteCheckMessage(outcome) {
+    if (outcome.state === "ready") {
+      const last = outcome.envelope.remote_checks.last;
+      if (last !== null && last.outcome === "completed") {
+        return codeWords("text", "runCompleted");
+      }
+      return wordText("text", "runFailed", {
+        category: last !== null ? last.outcome : "checkouts_failed",
+      });
+    }
+    if (outcome.state === "failed") {
+      return wordText("text", "runFailed", {category: outcome.failure});
+    }
+    return codeWords("text", "doesNotOfferRemotes");
+  }
+
+  // The button is written only when its state changes, so a refresh that finds
+  // nothing new changes nothing outside the status line.
+  function renderCheckRemotesButton() {
+    const label = codeWords("text", checkoutsCheckRequested ? "checkingRemotes" : "checkRemotes");
+    if (checkoutsCheckRequested) setAttributeOnce(checkRemotesButton, "aria-disabled", "true");
+    else if (checkRemotesButton.hasAttribute("aria-disabled")) {
+      checkRemotesButton.removeAttribute("aria-disabled");
+    }
+    if (checkRemotesButton.textContent !== label) checkRemotesButton.textContent = label;
+  }
+
+  // One press asks for one remote check.  It is sent at once when nothing is in
+  // flight, and otherwise as the single queued follow-up of the in-flight
+  // request; a second press before the answer does nothing.
+  function pressCheckRemotes() {
+    if (checkoutsCheckRequested) return;
+    checkoutsCheckRequested = true;
+    renderCheckRemotesButton();
+    renderCheckoutsStatusLine();
+    if (checkoutsBusy) {
+      checkoutsQueuedCheck = true;
+      return;
+    }
+    requestCheckouts("check");
+  }
+
+  // One checkouts request at most is in flight: a tick, or the view's refresh
+  // button, that finds one running is skipped rather than queued, because the
+  // server answers every request with the document it has and rescans at most
+  // once a minute.  A POST queued by the button is the one exception.
+  function requestCheckouts(kind = "read") {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
-    fetch(CHECKOUTS_ROUTE, {cache: "no-store"})
+    const checking = kind === "check";
+    fetch(checking ? REMOTE_CHECK_ROUTE : CHECKOUTS_ROUTE, checking ? {
+      method: "POST",
+      cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    } : {cache: "no-store"})
       .then(async (response) => {
-        if (response.status === 404) return {state: "not_offered", envelope: null, failure: null};
+        if (response.status === 404) {
+          // A 404 on the POST means this provider serves checkout state without
+          // a remote-check method, so the shown outcome stays as it is.
+          return checking
+            ? {state: "unchanged", envelope: null, failure: null}
+            : {state: "not_offered", envelope: null, failure: null};
+        }
         let payload = null;
         try {
           payload = JSON.parse(await response.text());
@@ -1535,13 +3599,36 @@
       .catch(() => ({state: "failed", envelope: null, failure: "checkouts_unavailable"}))
       .then((outcome) => {
         checkoutsBusy = false;
-        const changed = outcome.state !== checkoutsOutcome.state ||
-          outcome.failure !== checkoutsOutcome.failure;
-        checkoutsOutcome = outcome;
-        // The cards follow every settled outcome, including one that only
-        // rewrites the text they already show.
-        updateCardCodeStatus();
-        if (changed) syncBoardIssues();
+        if (outcome.state === "unchanged") {
+          setCheckoutsActionStatus(codeWords("text", "doesNotOfferRemotes"));
+        } else {
+          const changed = outcome.state !== checkoutsOutcome.state ||
+            outcome.failure !== checkoutsOutcome.failure;
+          checkoutsOutcome = outcome;
+          // The cards follow every settled outcome, including one that only
+          // rewrites the text they already show.
+          updateCardCodeStatus();
+          if (changed) syncBoardIssues();
+          if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
+        }
+        // The press state lasts from the press until the request that answers
+        // it settles.  A read hands the press to its queued POST and keeps the
+        // state, so the button and the status line still say a check is running
+        // while that POST is in flight; only a POST's own settle clears it.
+        const handOff = checkoutsQueuedCheck;
+        if (!handOff) {
+          checkoutsCheckRequested = false;
+          renderCheckRemotesButton();
+        }
+        // Only the shown view is drawn; switching to Checkouts draws the latest
+        // outcome, so a tick while the board is shown leaves the board alone.
+        if (shownView === VIEW_CHECKOUTS) renderCheckouts();
+        // The press that arrived while a read was in flight is sent now, on
+        // that read's settle, rather than at the next tick.
+        if (handOff) {
+          checkoutsQueuedCheck = false;
+          requestCheckouts("check");
+        }
       });
   }
 
@@ -1670,7 +3757,23 @@
       }
     });
   });
+  viewBoardButton.addEventListener("click", () => {
+    if (shownView !== VIEW_BOARD) setShownView(VIEW_BOARD);
+  });
+  viewCheckoutsButton.addEventListener("click", () => {
+    if (shownView !== VIEW_CHECKOUTS) setShownView(VIEW_CHECKOUTS);
+  });
+  checkRemotesButton.addEventListener("click", () => {
+    if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
+    pressCheckRemotes();
+  });
   refreshButton.addEventListener("click", () => {
+    // In the checkouts view the button asks for the latest served scan and
+    // never applies a waiting board catalog.
+    if (shownView === VIEW_CHECKOUTS) {
+      requestCheckouts("read");
+      return;
+    }
     if (pending) apply(pending);
     else request("manual");
   });
@@ -1719,11 +3822,11 @@
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));
   terminalControl.addEventListener("change", () => setTerminalPreference(terminalControl.checked));
   deselectControl.addEventListener("change", () => setDeselectPreference(deselectControl.checked));
+  quietCheckoutsControl.addEventListener("change", () =>
+    setQuietCheckoutsPreference(quietCheckoutsControl.checked));
   if (typeof ResizeObserver === "function") {
-    const updateToolbarHeight = () =>
-      document.documentElement.style.setProperty("--toolbar-height", `${toolbar.getBoundingClientRect().height}px`);
-    updateToolbarHeight();
-    new ResizeObserver(updateToolbarHeight).observe(toolbar);
+    syncToolbarHeight();
+    new ResizeObserver(syncToolbarHeight).observe(toolbar);
     let resizeFrame = null;
     new ResizeObserver(() => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
@@ -1737,6 +3840,10 @@
   readCompactPreference();
   readTerminalPreference();
   readDeselectPreference();
+  readViewPreference();
+  readQuietCheckoutsPreference();
+  applyView();
+  renderCheckRemotesButton();
   loadSettings();
   request("manual");
   requestCheckouts();

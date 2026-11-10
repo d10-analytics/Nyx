@@ -1,3 +1,4 @@
+import ast
 import copy
 import json
 import os
@@ -6,6 +7,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -638,21 +640,79 @@ class BrowserCheckouts:
         return outcome
 
 
+class RemoteCheckCheckouts(BrowserCheckouts):
+    """A provider double that also answers the remote-check route.
+
+    ``hold_remote_check`` keeps the next ``refresh_remote_checks`` call in
+    flight until the test releases it; ``serve_remote_check`` and
+    ``fail_remote_check`` queue the envelope, or the category the route turns
+    into a 502, that the call answers.
+    """
+
+    def __init__(self, document=None):
+        super().__init__(document)
+        self.remote_calls = 0
+        self.remote_queued = []
+        self.remote_gate = None
+        self.remote_entered = threading.Event()
+
+    def hold_remote_check(self):
+        """Hold the next remote check until the returned event is set."""
+        self.remote_gate = threading.Event()
+        self.remote_entered = threading.Event()
+        return self.remote_gate
+
+    def serve_remote_check(self, envelope):
+        """Answer the next remote check with ``envelope``."""
+        self.remote_queued.append(envelope)
+
+    def fail_remote_check(self, code):
+        """Answer the next remote check with the server's 502 for ``code``."""
+        self.remote_queued.append(CatalogError(code))
+
+    def refresh_remote_checks(self):
+        self.remote_calls += 1
+        self.remote_entered.set()
+        gate = self.remote_gate
+        if gate is not None:
+            gate.wait(timeout=10)
+        outcome = self.remote_queued.pop(0) if self.remote_queued else self.envelope()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
 class CheckoutsWorkerStandIn:
     """The worker manager a real-runtime page needs, answering captured bytes.
 
     The application collects through its worker boundary, so a page against the
     real provider stands this in for the subprocess: a collection returns the
     captured document, so nothing starts a child, contacts git or uses the
-    network.
+    network.  ``hold_network`` keeps the next networked collection in flight
+    until the test releases it, so a proof can hold the fetch the runtime waits
+    on for a requested remote check.
     """
 
     def __init__(self, document):
         self.document = document
         self.fetch_calls = 0
+        self.network_calls = 0
+        self.network_gate = None
+        self.network_entered = threading.Event()
+
+    def hold_network(self):
+        """Hold the next networked collection until the returned event is set."""
+        self.network_gate = threading.Event()
+        self.network_entered = threading.Event()
+        return self.network_gate
 
     def fetch_checkouts(self, *, network):
         self.fetch_calls += 1
+        if network:
+            self.network_calls += 1
+            self.network_entered.set()
+            if self.network_gate is not None:
+                self.network_gate.wait(timeout=10)
         return self.document
 
     def fetch_catalog(self):
@@ -732,8 +792,15 @@ def page_launcher(browser, launch_timeout_ms=15000):
             application.save_settings = settings.save_settings
             client.settings = settings
             if workers is None:
-                application.get_checkouts = (
-                    checkouts or BrowserCheckouts()).get_checkouts
+                double = checkouts or BrowserCheckouts()
+                application.get_checkouts = double.get_checkouts
+                # The routes ask the application for each provider method at
+                # request time.  An instance attribute that is None shadows the
+                # runtime's own method, so a double without a remote-check
+                # method answers the POST with 404.
+                application.refresh_remote_checks = getattr(
+                    double, "refresh_remote_checks", None
+                )
         context = None
         try:
             if application is not None:
@@ -851,11 +918,13 @@ def fire_poll(page):
 # ones its first load sends before a test can attach a listener.
 RESPONSE_RECORDER = """
 window.checkoutsResponses = [];
+window.remoteCheckResponses = [];
 window.catalogResponses = [];
 const nyxRecordFetch = window.fetch;
 window.fetch = function (...args) {
   const route = String(args[0]);
   return nyxRecordFetch(...args).then(function (response) {
+    if (route.includes("/api/checkouts/remote-check")) window.remoteCheckResponses.push(response.status);
     if (route.includes("/api/checkouts")) window.checkoutsResponses.push(response.status);
     if (route.includes("/api/catalog")) window.catalogResponses.push(response.status);
     return response;
@@ -2607,17 +2676,18 @@ def observe_removed_cards(page):
     }""")
 
 
-def observe_refresh_status(page):
-    assert page.locator("#refresh-status").count() == 1
-    page.evaluate("""() => {
+def observe_refresh_status(page, selector="#refresh-status"):
+    """Record each text change of one status region, ``#refresh-status`` by default."""
+    assert page.locator(selector).count() == 1
+    page.evaluate(f"""() => {{
       window.refreshStatusRecords = 0;
       window.refreshStatusTexts = [];
-      const status = document.querySelector('#refresh-status');
-      new MutationObserver(records => {
+      const status = document.querySelector({selector!r});
+      new MutationObserver(records => {{
         window.refreshStatusRecords += records.length;
         window.refreshStatusTexts.push(status.textContent);
-      }).observe(status, {childList: true, characterData: true, subtree: true});
-    }""")
+      }}).observe(status, {{childList: true, characterData: true, subtree: true}});
+    }}""")
 
 
 def test_failed_poll_updates_issues_in_place_and_keeps_card_focus(open_page):
@@ -5926,3 +5996,3546 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
     assert code_status_line(page, "Repo/Shipped/alpha") == (
         f"Code Status: {package_text(real_checkouts.document_three, 'Repo/Shipped/alpha')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The checkouts view: view switch, status line, remote checks and panels
+# ---------------------------------------------------------------------------
+
+CHECKOUTS_VIEW_PLACEHOLDER = "Find a checkout, branch, or work item…"
+BOARD_SEARCH_PLACEHOLDER = "Find a work item, project, or program…"
+
+
+def checkouts_local_time(value, reference=None, *, seconds=True):
+    """The view's local label for one UTC timestamp."""
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+    label = moment.strftime("%H:%M:%S" if seconds else "%H:%M")
+    if reference is not None:
+        observed = datetime.fromisoformat(reference.replace("Z", "+00:00")).astimezone()
+        if moment.date() != observed.date():
+            label = f"{moment:%Y-%m-%d} {label}"
+    return label
+
+
+def checkouts_remote_envelope(document, *, state="idle", next_due_at=None, last=None):
+    """One checkout envelope with the remote-check schedule a test states."""
+    envelope = checkouts_envelope(copy.deepcopy(document))
+    envelope["remote_checks"] = {
+        "state": state,
+        "interval_seconds": REMOTE_CHECK_INTERVAL,
+        "next_due_at": next_due_at,
+        "last": last,
+    }
+    return envelope
+
+
+def checkouts_remote_run(*, finished_at, outcome="completed"):
+    """One finished remote check of the shape the real runtime records."""
+    return {
+        "started_at": "2026-11-09T11:59:50Z",
+        "finished_at": finished_at,
+        "outcome": outcome,
+        "repositories": [],
+    }
+
+
+def show_checkouts_view(page):
+    """Press the Checkouts switch and wait for the two views to swap."""
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+
+
+def checkouts_view_page(launch, real_checkouts, double, *, client=None):
+    """Open one fake-clock application page and show the checkouts view."""
+    page = open_checkouts_page(launch, real_checkouts, double, client=client)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page
+
+
+def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
+    open_page, real_checkouts
+):
+    """One view at a time, focus on the pressed switch, and the view is remembered."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    board_switch = page.locator("#view-board")
+    checkouts_switch = page.locator("#view-checkouts")
+    assert board_switch.get_attribute("aria-pressed") == "true"
+    assert checkouts_switch.get_attribute("aria-pressed") == "false"
+    assert page.locator("#checkouts").evaluate(
+        "view => getComputedStyle(view).display") == "none"
+    assert page.locator("#board").is_visible()
+    assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_visible()
+    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
+    # The existing preference keys keep their unset defaults; the view choice is
+    # its own key.
+    assert page.evaluate(
+        "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
+        " 'spec-tracker-deselect-on-empty-click', 'spec-tracker-theme']"
+        ".map(key => localStorage.getItem(key))"
+    ) == [None, None, None, None]
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") is None
+
+    checkouts_switch.click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert board_switch.get_attribute("aria-pressed") == "false"
+    assert checkouts_switch.get_attribute("aria-pressed") == "true"
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+    assert page.get_by_label("Hide terminal rows", exact=True).is_hidden()
+    assert page.get_by_label("Hide empty rows and columns", exact=True).is_hidden()
+    quiet = page.get_by_label("Hide quiet checkouts", exact=True)
+    assert quiet.is_visible()
+    assert quiet.is_checked()
+    assert page.locator("#filter").get_attribute("placeholder") == CHECKOUTS_VIEW_PLACEHOLDER
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "checkouts"
+    # The checkouts preference is its own key and does not disturb the others.
+    assert page.evaluate(
+        "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
+        " 'spec-tracker-deselect-on-empty-click', 'spec-tracker-theme']"
+        ".map(key => localStorage.getItem(key))"
+    ) == [None, None, None, None]
+    quiet.uncheck()
+    assert page.evaluate("localStorage.getItem('spec-tracker-hide-quiet-checkouts')") == "false"
+
+    # A reload starts in the remembered view.
+    page.reload()
+    page.wait_for_function("() => document.querySelectorAll('#board .card').length > 0")
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
+    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
+    assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "board"
+    assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
+    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "init_script,expected",
+    [
+        ("localStorage.setItem('spec-tracker-view', 'checkouts');", "checkouts"),
+        ("localStorage.setItem('spec-tracker-view', 'somewhere-else');", "board"),
+        (
+            "Object.defineProperty(window, 'localStorage', {"
+            "get() { throw new DOMException('Blocked', 'SecurityError'); }});",
+            "board",
+        ),
+    ],
+    ids=["stored-checkouts", "unknown-value", "blocked-storage"],
+)
+def test_checkouts_view_starts_in_board_without_a_known_value(
+    open_page, real_checkouts, init_script, expected
+):
+    """A fresh browser, an unknown value and blocked storage fall back to Board."""
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        fake_clock=True,
+        init_script=init_script + RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    if expected == "checkouts":
+        playwright.expect(page.locator("#checkouts")).to_be_visible()
+        assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
+    else:
+        playwright.expect(page.locator("#board")).to_be_visible()
+        assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
+        assert page.locator("#checkouts").evaluate(
+            "view => getComputedStyle(view).display") == "none"
+    # Switching works in every case, including with storage unavailable.
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+
+
+def test_checkouts_view_keeps_a_waiting_catalog_update_for_the_board(
+    open_page, real_checkouts
+):
+    """A tick while Checkouts is shown offers the change to the board, not here."""
+    changed = copy.deepcopy(real_checkouts.catalog)
+    title = next(
+        entry for entry in changed["entries"] if entry["package_path"] == "Repo/Drafts/alpha"
+    )
+    title["declared"]["title"] = "Alpha renamed"
+    _reseal(changed)
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    client = SequenceClient([real_checkouts.catalog, changed])
+    page = checkouts_view_page(open_page, real_checkouts, double, client=client)
+    fire_checkouts_poll(page)
+    # The board's update is offered on the board, never applied from here.
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    playwright.expect(page.locator("#view-board")).to_have_text("Board (update waiting)")
+    catalogs = page.evaluate("window.catalogResponses.length")
+    checkouts = page.evaluate("window.checkoutsResponses.length")
+    with page.expect_response("**/api/checkouts") as response:
+        page.locator("#refresh").click()
+    response.value.finished()
+    assert page.evaluate("window.checkoutsResponses.length") == checkouts + 1
+    assert page.evaluate("window.catalogResponses.length") == catalogs
+    assert "Alpha renamed" not in page.locator(".card-title").all_inner_texts()
+    # The waiting update is still waiting when the board is shown again.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    assert page.locator("#refresh.pending").count() == 1
+    assert page.locator("#view-board").inner_text() == "Board"
+    page.locator("#refresh").click()
+    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    assert "Alpha renamed" in page.locator(".card-title").all_inner_texts()
+
+
+def test_checkouts_view_search_carries_back_to_the_board(open_page, real_checkouts):
+    """The one search box keeps its text across the switch and its rails redraw."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    page.fill("#filter", "alpha")
+    assert page.locator("#filter").input_value() == "alpha"
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator(".card:not([hidden])").evaluate_all(
+        "cards => cards.map(card => card.dataset.packagePath)") == ["Repo/Drafts/alpha"]
+    # With an empty query the board's dependent pair is drawn again after the
+    # switch back, and each rail meets its two cards.
+    page.locator("#view-checkouts").click()
+    page.fill("#filter", "")
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    settle_frames(page)
+    assert page.locator(
+        f'.connection[data-source="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]'
+        f'[data-dependent="{CHECKOUTS_PACKAGE_IDS["beta"]}"]'
+    ).count() == 1
+    assert_readable_arrows(page)
+
+
+def test_checkouts_view_uses_the_theme_colors(open_page, real_checkouts):
+    """The view's own text takes the theme's tokens in both themes."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    status_line = page.locator("#checkouts-status-line")
+    dark = status_line.evaluate("line => getComputedStyle(line).color")
+    assert dark == "rgb(230, 237, 243)"
+    page.get_by_label("Theme", exact=True).select_option("light")
+    light = status_line.evaluate("line => getComputedStyle(line).color")
+    assert light == "rgb(32, 36, 42)"
+    assert light != dark
+    assert page.locator("#checkouts").evaluate(
+        "view => getComputedStyle(view).color") == light
+
+
+def test_checkouts_status_line_shows_local_remote_and_lookup_state(
+    open_page, real_checkouts
+):
+    """The line dates the local state and names the check schedule and lookup."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    local = checkouts_local_time(observed)
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    status_line = page.locator("#checkouts-status-line")
+    assert status_line.inner_text() == (
+        f"Local state {local} · Remotes not checked yet"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+    assert status_line.locator("time").first.get_attribute("datetime") == observed
+    finished = "2026-11-09T12:00:00Z"
+    due = "2026-11-09T12:05:00Z"
+    double.serve(
+        checkouts_remote_envelope(
+            document, next_due_at=due,
+            last=checkouts_remote_run(finished_at=finished),
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Remotes checked {checkouts_local_time(finished, observed)}"
+        f" · Next check about {checkouts_local_time(due, observed)}"
+        " · Pull request lookup off"
+    )
+    # A check in flight while the envelope is served says so.
+    double.serve(
+        checkouts_remote_envelope(
+            document, state="running", last=checkouts_remote_run(finished_at=finished)
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Checking remotes… · Next check at the next refresh"
+        " · Pull request lookup off"
+    )
+    # A failed check keeps the document and states its category and time.
+    double.serve(
+        checkouts_remote_envelope(
+            document, next_due_at=None,
+            last=checkouts_remote_run(
+                finished_at=finished, outcome="checkouts_timeout"
+            ),
+        )
+    )
+    fire_checkouts_poll(page)
+    assert status_line.inner_text() == (
+        f"Local state {local} · Last remote check failed (checkouts_timeout) at "
+        f"{checkouts_local_time(finished, observed)}"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+
+
+def test_checkouts_check_remotes_now_sends_one_held_post_and_announces_once(
+    open_page, real_checkouts
+):
+    """One press while idle sends one POST, blocks repeats, and announces its result."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(
+            document, next_due_at="2026-11-09T12:05:00Z",
+            last=checkouts_remote_run(finished_at=finished),
+        )
+    )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    # The view's own network surface is the GET and the POST: no checkout
+    # settings request is made from here.
+    settings_requests = []
+    page.route(
+        "**/api/checkout-settings*",
+        lambda route: (
+            settings_requests.append(route.request.url),
+            route.fulfill(status=404, body="{}"),
+        ),
+    )
+    requests = []
+
+    def record_checkouts_request(request):
+        if "/api/checkouts" in request.url:
+            requests.append((request.method, request.url.rsplit("/api/", 1)[1]))
+
+    page.on("request", record_checkouts_request)
+    gate = double.hold_remote_check()
+    button = page.locator("#check-remotes")
+    button.focus()
+    button.click()
+    assert double.remote_entered.wait(timeout=10)
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    # aria-disabled leaves the button focusable and clickable; only the
+    # handler refuses the repeat.
+    assert button.get_attribute("disabled") is None
+    assert page.evaluate("document.activeElement.id") == "check-remotes"
+    assert "Checking remotes…" in page.locator("#checkouts-status-line").inner_text()
+    # Exactly one POST reached the provider; the read count did not grow.
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    # Two more presses and two ticks send nothing while it is held.
+    button.dispatch_event("click")
+    button.dispatch_event("click")
+    fire_poll(page)
+    fire_poll(page)
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    observe_refresh_status(page, "#checkouts-action-status")
+    gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    # One message, once, for the one check.
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.evaluate("window.refreshStatusTexts") == ["Remote check finished."]
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert button.inner_text() == "Check remotes now"
+    assert button.get_attribute("aria-disabled") is None
+    # The one POST was the only checkouts request while it was held, and no
+    # checkout-settings request was made.
+    assert requests == [("POST", "checkouts/remote-check")]
+    assert settings_requests == []
+    assert page.locator("#checkouts-status-line").inner_text() == (
+        f"Local state {checkouts_local_time(observed)}"
+        f" · Remotes checked {checkouts_local_time(finished, observed)}"
+        f" · Next check about {checkouts_local_time('2026-11-09T12:05:00Z', observed)}"
+        " · Pull request lookup off"
+    )
+
+
+def test_checkouts_check_remotes_now_waits_for_a_held_read(open_page, real_checkouts):
+    """A press during a held read is handed to a held POST and announced once."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(document, last=checkouts_remote_run(finished_at=finished))
+    )
+    read_gate = double.hold()
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    assert double.entered.wait(timeout=10)
+    show_checkouts_view(page)
+    button = page.locator("#check-remotes")
+    button.click()
+    # The press is remembered, not sent during the read.
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    assert double.remote_calls == 0
+    assert page.evaluate("window.remoteCheckResponses") == []
+    # Hold the queued POST too, so the hand-off itself is observed in flight.
+    post_gate = double.hold_remote_check()
+    read_gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    assert double.remote_entered.wait(timeout=10)
+    # The read's settle sent the POST immediately and kept the pressed state:
+    # the button and the status line both still say a check is running.
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert button.get_attribute("aria-disabled") == "true"
+    assert button.inner_text() == "Checking remotes…"
+    assert "Checking remotes…" in page.locator("#checkouts-status-line").inner_text()
+    assert page.evaluate("window.remoteCheckResponses") == []
+    # No catalog tick fired between the read's settle and the POST.
+    assert page.evaluate("window.catalogResponses.length") == 1
+    # Two further presses and two ticks send nothing while the POST is held.
+    button.dispatch_event("click")
+    button.dispatch_event("click")
+    fire_poll(page)
+    fire_poll(page)
+    assert double.remote_calls == 1
+    assert double.calls == 1
+    assert page.evaluate("window.remoteCheckResponses") == []
+    observe_refresh_status(page, "#checkouts-action-status")
+    post_gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    # One POST, one announcement, and the pressed state ends on the POST settle.
+    assert double.remote_calls == 1
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.evaluate("window.refreshStatusTexts") == ["Remote check finished."]
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert f"Remotes checked {checkouts_local_time(finished, observed)}" in (
+        page.locator("#checkouts-status-line").inner_text()
+    )
+    assert button.inner_text() == "Check remotes now"
+    assert button.get_attribute("aria-disabled") is None
+
+
+def test_checkouts_action_status_announces_each_completed_check(
+    open_page, real_checkouts
+):
+    """Each completed check is announced even when its words repeat."""
+    document = real_checkouts.document_zero
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    for _ in range(2):
+        double.serve_remote_check(
+            checkouts_remote_envelope(
+                document, last=checkouts_remote_run(finished_at=finished)
+            )
+        )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    observe_refresh_status(page, "#checkouts-action-status")
+    for expected in (1, 2):
+        page.locator("#check-remotes").click()
+        wait_for_responses(page, "remoteCheckResponses", expected)
+        settle_frames(page)
+        assert page.evaluate("window.refreshStatusRecords") == expected
+        assert page.evaluate("window.refreshStatusTexts") == (
+            ["Remote check finished."] * expected
+        )
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+
+
+def test_checkouts_remote_check_failed_outcome_writes_its_category(
+    open_page, real_checkouts
+):
+    """A 200 envelope with a failed check keeps the view and names the failure."""
+    document = real_checkouts.document_zero
+    observed = document["observed_at"]
+    finished = "2026-11-09T12:00:00Z"
+    double = RemoteCheckCheckouts(document)
+    double.serve_remote_check(
+        checkouts_remote_envelope(
+            document,
+            last=checkouts_remote_run(finished_at=finished, outcome="checkouts_timeout"),
+        )
+    )
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    observe_refresh_status(page, "#checkouts-action-status")
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "Remote check failed: checkouts_timeout."
+    )
+    assert page.evaluate("window.refreshStatusRecords") == 1
+    assert page.locator("#checkouts-status-line").inner_text() == (
+        f"Local state {checkouts_local_time(observed)}"
+        f" · Last remote check failed (checkouts_timeout) at "
+        f"{checkouts_local_time(finished, observed)}"
+        " · Next check at the next refresh · Pull request lookup off"
+    )
+    # The document is still shown: a failed check does not blank the view.
+    assert page.locator(".checkouts-panel").count() == 0
+
+
+def test_checkouts_remote_check_502_installs_the_failed_panel(
+    open_page, real_checkouts
+):
+    """A 502 from the remote-check route installs its category as the failed panel."""
+    document = real_checkouts.document_zero
+    double = RemoteCheckCheckouts(document)
+    double.fail_remote_check("checkouts_timeout")
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [502]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "Remote check failed: checkouts_timeout."
+    )
+    assert page.locator(".checkouts-panel").inner_text() == (
+        "Checkout state is unavailable: checkouts_timeout."
+        " It clears when a later collection finishes in time."
+    )
+    assert page.locator("#board-issues .checkouts-issue-summary").inner_text() == (
+        "Code Status unavailable: checkouts_timeout"
+    )
+
+
+def test_checkouts_check_remotes_now_404_keeps_the_shown_outcome(
+    open_page, real_checkouts
+):
+    """A provider without the method answers 404, and the view is left as it was."""
+    document = real_checkouts.document_zero
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    before = page.locator("#checkouts-status-line").inner_text()
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [404]
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This server does not offer remote checks."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == before
+    assert page.locator(".checkouts-panel").count() == 0
+    assert page.locator("#board-issues").count() == 0
+    assert page.locator("#check-remotes").inner_text() == "Check remotes now"
+
+
+def test_checkouts_check_remotes_404_says_what_the_words_block_says(
+    open_page, real_checkouts
+):
+    """The 404 sentence comes from the words block: editing one without the page fails."""
+    edited = "Remote checks are not part of this server."
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    entry = f'"doesNotOfferRemotes": {json.dumps(checkout_words()["text"]["doesNotOfferRemotes"])}'
+    assert source.count(entry) == 1
+    # Only the words entry is edited; any other copy of the sentence stays.
+    page_source = source.replace(entry, f'"doesNotOfferRemotes": {json.dumps(edited)}')
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = open_checkouts_page(open_page, real_checkouts, double)
+    page.route("**/static/app.js", lambda route: route.fulfill(
+        status=200, content_type="text/javascript", body=page_source))
+    page.reload()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    page.locator("#check-remotes").click()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    assert page.evaluate("window.remoteCheckResponses") == [404]
+    assert page.locator("#checkouts-action-status").inner_text() == edited
+
+
+def test_checkouts_settles_leave_the_board_alone_until_the_view_is_shown(
+    open_page, real_checkouts
+):
+    """Ticks while the board is shown touch no board node; switching shows the latest outcome."""
+    document = real_checkouts.document_zero
+    double = BrowserCheckouts(document)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    settle_frames(page)
+    rail_layer = page.locator(".rail-layer").element_handle()
+    page.evaluate("""() => {
+      window.boardRecords = [];
+      new MutationObserver((records) => window.boardRecords.push(...records.map(
+        (record) => record.type + ':' + (record.attributeName || ''))))
+        .observe(document.querySelector('#board'),
+          {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+    # An unchanged tick, then one whose outcome changes only the scan's time:
+    # neither re-filters the board or redraws its rails.
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    later = "2030-01-01T00:00:00Z"
+    double.serve(checkouts_envelope(with_observed_at(document, later)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("window.boardRecords") == []
+    assert rail_layer.evaluate("node => node.isConnected")
+
+    # A failure while the board is shown is still recorded for the view.
+    double.fail("checkouts_timeout")
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    double.serve(checkouts_envelope(with_observed_at(document, later)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    assert page.locator("#checkouts-status-line").inner_text().startswith(
+        f"Local state {checkouts_local_time(later, later)}")
+    assert page.locator(".checkouts-panel").count() == 0
+    assert page.locator(".checkouts-group").count() > 0
+
+
+def checkouts_remote_check_mutations():
+    """Each remote-check mutation the browser must refuse as a protocol failure."""
+    run = checkouts_remote_run(finished_at="2026-11-09T12:00:00Z")
+
+    def missing_state(remote):
+        del remote["state"]
+
+    def extra_key(remote):
+        remote["unexpected"] = 1
+
+    def state_outside_the_set(remote):
+        remote["state"] = "paused"
+
+    def zero_interval(remote):
+        remote["interval_seconds"] = 0
+
+    def text_interval(remote):
+        remote["interval_seconds"] = "300"
+
+    def malformed_due(remote):
+        remote["next_due_at"] = "tomorrow"
+
+    def due_without_zone(remote):
+        remote["next_due_at"] = "2026-11-09T12:05:00"
+
+    def last_missing_key(remote):
+        last = dict(run)
+        del last["repositories"]
+        remote["last"] = last
+
+    def last_extra_key(remote):
+        last = dict(run)
+        last["unexpected"] = 1
+        remote["last"] = last
+
+    def last_bad_started(remote):
+        last = dict(run)
+        last["started_at"] = "yesterday"
+        remote["last"] = last
+
+    def last_bad_finished(remote):
+        last = dict(run)
+        last["finished_at"] = 7
+        remote["last"] = last
+
+    def outcome_outside_the_categories(remote):
+        last = dict(run)
+        last["outcome"] = "producer_timeout"
+        remote["last"] = last
+
+    def unknown_checkouts_category(remote):
+        last = dict(run)
+        last["outcome"] = "checkouts_surprise"
+        remote["last"] = last
+
+    def repositories_object(remote):
+        last = dict(run)
+        last["repositories"] = {}
+        remote["last"] = last
+
+    def last_text(remote):
+        remote["last"] = "completed"
+
+    return [
+        {"id": "missing-state", "mutate": missing_state},
+        {"id": "extra-key", "mutate": extra_key},
+        {"id": "state-outside-the-set", "mutate": state_outside_the_set},
+        {"id": "zero-interval", "mutate": zero_interval},
+        {"id": "text-interval", "mutate": text_interval},
+        {"id": "malformed-due", "mutate": malformed_due},
+        {"id": "due-without-zone", "mutate": due_without_zone},
+        {"id": "last-missing-key", "mutate": last_missing_key},
+        {"id": "last-extra-key", "mutate": last_extra_key},
+        {"id": "last-bad-started", "mutate": last_bad_started},
+        {"id": "last-bad-finished", "mutate": last_bad_finished},
+        {"id": "outcome-outside-the-categories", "mutate": outcome_outside_the_categories},
+        {"id": "unknown-checkouts-category", "mutate": unknown_checkouts_category},
+        {"id": "repositories-object", "mutate": repositories_object},
+        {"id": "last-text", "mutate": last_text},
+    ]
+
+
+def test_checkouts_view_refuses_each_malformed_remote_check_envelope(
+    open_page, real_checkouts
+):
+    """Every malformed remote-check shape shows the protocol panel, then clears."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    assert panel.count() == 0
+    for case in checkouts_remote_check_mutations():
+        envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
+        case["mutate"](envelope["remote_checks"])
+        double.serve(envelope)
+        fire_checkouts_poll(page)
+        playwright.expect(panel).to_have_count(1)
+        assert panel.inner_text() == (
+            "Checkout state is unavailable: checkouts_protocol_error."
+            " It clears when a later collection returns a valid document."
+        ), case["id"]
+        assert page.locator("#checkouts-status-line").inner_text() == "", case["id"]
+        # The next ready document clears it again.
+        fire_checkouts_poll(page)
+        playwright.expect(panel).to_have_count(0)
+
+
+def test_checkouts_check_remotes_now_uses_the_real_route(open_page, real_checkouts):
+    """The real runtime accepts the POST once its held network fetch is released."""
+    workers = CheckoutsWorkerStandIn(real_checkouts.document_zero_bytes)
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        settings=BrowserSettings(revision=real_checkouts.revision),
+        workers=workers,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    assert page.locator("#checkouts-status-line").inner_text().count("Remotes checked ") == 1
+    posted = []
+    page.on(
+        "request",
+        lambda request: posted.append(request)
+        if request.url.endswith("/api/checkouts/remote-check") else None,
+    )
+    gate = workers.hold_network()
+    page.locator("#check-remotes").click()
+    assert workers.network_entered.wait(timeout=10)
+    assert page.locator("#check-remotes").get_attribute("aria-disabled") == "true"
+    assert workers.network_calls == 2
+    assert page.evaluate("window.remoteCheckResponses") == []
+    assert [(request.method, request.headers.get("content-type"), request.post_data)
+            for request in posted] == [("POST", "application/json", "{}")]
+    gate.set()
+    wait_for_responses(page, "remoteCheckResponses", 1)
+    settle_frames(page)
+    # The real route answered 200, so its envelope passed the extended validator.
+    assert page.evaluate("window.remoteCheckResponses") == [200]
+    assert page.locator(".checkouts-panel").count() == 0
+    status = page.locator("#checkouts-status-line").inner_text()
+    assert "Remotes checked " in status
+    assert "Last remote check failed" not in status
+    assert page.locator("#checkouts-action-status").inner_text() == "Remote check finished."
+    assert page.locator("#check-remotes").inner_text() == "Check remotes now"
+
+
+def test_checkouts_view_standalone_server_shows_only_the_unavailable_panel(
+    open_page, real_checkouts
+):
+    """A server without the checkouts route shows one panel and a usable switch."""
+    page = open_page(
+        StaticClient(real_checkouts.catalog),
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    panel = page.locator(".checkouts-panel")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == "This Nyx server does not serve checkout state."
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-attention").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The switch stays usable while the panel is shown.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    # The next tick's ready document removes the panel.
+    page.route(
+        "**/api/checkouts",
+        lambda route: route.fulfill(
+            status=200,
+            body=json.dumps(checkouts_envelope(real_checkouts.document_zero)),
+        ),
+    )
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+def test_checkouts_view_failed_request_shows_the_clearing_panel(
+    open_page, real_checkouts
+):
+    """A 502 shows its category and clearing words, and leaves the board's part alone."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    double.fail("checkouts_timeout")
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == (
+        "Checkout state is unavailable: checkouts_timeout."
+        " It clears when a later collection finishes in time."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-attention").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The board's issues part keeps the existing failure part, unchanged.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator(".checkouts-issue-summary").inner_text() == (
+        "Code Status unavailable: checkouts_timeout"
+    )
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    # The next tick's ready document removes the panel.
+    double.serve(checkouts_envelope(real_checkouts.document_zero))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+def test_checkouts_view_malformed_body_shows_the_protocol_panel(
+    open_page, real_checkouts
+):
+    """A 200 body the client cannot validate shows the protocol panel until a valid tick."""
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    page = checkouts_view_page(open_page, real_checkouts, double)
+    panel = page.locator(".checkouts-panel")
+    assert panel.count() == 0
+    page.route("**/api/checkouts", lambda route: route.fulfill(status=200, body="not json"))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(1)
+    assert panel.inner_text() == (
+        "Checkout state is unavailable: checkouts_protocol_error."
+        " It clears when a later collection returns a valid document."
+    )
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    assert page.locator("#checkouts .checkouts-group").count() == 0
+    assert page.locator("#checkouts .checkouts-setup").count() == 0
+    # The switch stays usable while the panel is shown.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    page.unroute("**/api/checkouts")
+    double.serve(checkouts_envelope(real_checkouts.document_zero))
+    fire_checkouts_poll(page)
+    playwright.expect(panel).to_have_count(0)
+    assert page.locator("#checkouts-status-line").inner_text().startswith("Local state ")
+
+
+# ---------------------------------------------------------------------------
+# The checkouts view: words, groups, rows and the Checkout setup panel
+# ---------------------------------------------------------------------------
+
+CHECKOUTS_WORDS_BEGIN = "// checkout words: begin"
+CHECKOUTS_WORDS_END = "// checkout words: end"
+
+
+def checkouts_view_source():
+    """The one browser file the view's words and rendering live in."""
+    return Path(__file__).resolve().parents[1] / "nyx" / "static" / "app.js"
+
+
+def checkout_words():
+    """The view's one words block, read between its markers as the JSON it must stay."""
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    assert source.count(CHECKOUTS_WORDS_BEGIN) == 1
+    assert source.count(CHECKOUTS_WORDS_END) == 1
+    block = source.split(CHECKOUTS_WORDS_BEGIN, 1)[1].split(CHECKOUTS_WORDS_END, 1)[0]
+    match = re.fullmatch(r"\s*const WORDS = (\{.*\});\s*", block, re.S)
+    assert match is not None, "the words block is not one `const WORDS = {…};` literal"
+    return json.loads(match.group(1))
+
+
+def _checkout_literal_strings(node):
+    """Every string a word-carrying expression names, however it nests."""
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    if isinstance(node, ast.IfExp):
+        return _checkout_literal_strings(node.body) | _checkout_literal_strings(node.orelse)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        found = set()
+        for element in node.elts:
+            found |= _checkout_literal_strings(element)
+        return found
+    return set()
+
+
+def checkout_function_literals(name):
+    """The string literals one collector function appends, returns or keys state/basis with."""
+    source = (Path(__file__).resolve().parents[1] / "nyx" / "models.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    [function] = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    found = {"appended": set(), "returned": set(), "named": set()}
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+                node.func.attr in ("append", "extend") and node.args:
+            found["appended"] |= _checkout_literal_strings(node.args[0])
+        if isinstance(node, ast.Return) and node.value is not None:
+            found["returned"] |= _checkout_literal_strings(node.value)
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and key.value in ("state", "basis"):
+                    found["named"] |= _checkout_literal_strings(value)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id in ("state", "basis"):
+                    found["named"] |= _checkout_literal_strings(node.value)
+    return found
+
+
+def checkout_word_requirements():
+    """Every value the view renders, paired with the tables that must name it."""
+    availability = checkout_function_literals("_clone_availability")
+    blockers = checkout_function_literals("derive_removable")["appended"] | \
+        checkout_function_literals("_verdict_blockers")["returned"]
+    attention_basis = checkout_function_literals("derive_attention")["named"]
+    return [
+        (("attentionClass",), {name for name, _ in models._ATTENTION_CODES}),
+        (("attentionCode",), {code for _, code in models._ATTENTION_CODES}),
+        (("availabilityState",), availability["named"]),
+        (("availabilityReason",), availability["appended"]),
+        (("assignmentBasis",), attention_basis),
+        (("status",), set(models._CLONE_STATUSES)),
+        (("comparisonRelation",), set(models._COMPARISON_RELATIONS)),
+        (("comparisonBasis",), set(models._COMPARISON_BASES)),
+        (("verdictState",), set(models._VERDICT_STATES)),
+        (("verdictRung",), set(models._VERDICT_MERGED_RUNGS) | {"none"}),
+        (("verdictReason",), set(models._REMOTE_VERDICT_UNKNOWN_REASONS)),
+        (("branchBlocker", "worktreeBlocker"), blockers),
+        (("operation",), set(models.OPERATIONS)),
+        (("changeKind",), set(models._CHANGE_KEYS)),
+        (("folderStatus",), set(models._FOLDER_STATUSES)),
+        (("gitStatus",), set(models._GIT_STATUSES)),
+        (("checkStatus",), set(models._CHECK_STATUSES)),
+        (("checkReason",), set(models._CHECK_FAILURE_REASONS)),
+        (("lookupStatus",), set(models._PR_LOOKUP_STATUSES)),
+        (("lookupReason",), set(models._PR_LOOKUP_FAILURE_REASONS)),
+        (("remoteCopy",), set(models._REMOTE_COPY_STATES)),
+        (("pullRequestState",), set(models._PULL_REQUEST_STATES)),
+        (("branchPackageBasis",), set(models._BRANCH_PACKAGE_BASES)),
+        (("containment",), set(models._CONTAINMENT_OUTCOMES)),
+        (("diagnostic",), set(models.CHECKOUTS_DIAGNOSTIC_CODES)),
+        (("lookupReason",), {"setting_off", "not_github", "remote_checks_off"}),
+        (("checkReason",), {"remote_checks_off"}),
+        (("containment",), {"no_base", "incomplete", "git_too_old"}),
+        (("verdictRung",), {"none"}),
+    ]
+
+
+def missing_checkout_words(words):
+    """Every value the words block does not name, as ``(table, value)`` pairs."""
+    missing = []
+    for tables, values in checkout_word_requirements():
+        for value in sorted(values):
+            if not any(value in (words.get(table) or {}) for table in tables):
+                missing.append((tables[0], value))
+    return missing
+
+
+def test_checkouts_words_cover_every_served_value():
+    """A collector value without browser words fails; one removed value fails too."""
+    words = checkout_words()
+    assert missing_checkout_words(words) == []
+
+    # Removing one value from a test-local copy fails the same comparison, so
+    # the test above cannot pass on an empty or stale word table.
+    broken = copy.deepcopy(words)
+    assert broken["comparisonRelation"].pop("diverged") == "{a} ahead, {b} behind"
+    assert missing_checkout_words(broken) == [("comparisonRelation", "diverged")]
+
+
+def test_checkouts_words_block_names_the_view_markers_once():
+    """The block is one JSON literal between the exact markers the test reads."""
+    source = checkouts_view_source().read_text(encoding="utf-8")
+    assert source.count(CHECKOUTS_WORDS_BEGIN) == 1
+    assert source.count(CHECKOUTS_WORDS_END) == 1
+    words = checkout_words()
+    # The rows, headers and setup sentences the view shows are in the block too.
+    assert words["text"]["noFolders"].startswith("No checkout folders are configured.")
+    assert words["column"]["default"] == "Default branch vs remote"
+    assert words["text"]["workItemBranches"] == "Work item branches"
+
+
+# ---------------------------------------------------------------------------
+# The view's real git world and the documents it captures once
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def view_checkouts(tmp_path_factory):
+    """One real checkout world and the documents every view proof reads.
+
+    A bare ``trunk`` remote is cloned three times into one folder: the second
+    clone carries a linked worktree outside the folder, the third is level with
+    the remote, and the tenth never fetched.  A second remote holds one clean
+    clone, and a clone outside the folder pushes a package branch no listed
+    clone holds.  The documents are captured as built, after a remote check
+    that follows a push from another clone, on the next local collection, with
+    the bare remote renamed, after one more commit on ``topic-a``, after a
+    second one, after that branch is deleted, after a stash in the quiet clone, with no finished
+    stage, and with no ``git`` on ``PATH``.  This world is separate from
+    ``real_checkouts`` so that fixture's pinned Code Status texts stay as they
+    are.
+    """
+    root = tmp_path_factory.mktemp("view-checkouts")
+    folder = root / "checkouts"
+    folder.mkdir()
+    served = root / "served"
+    served.mkdir()
+    (root / "home").mkdir()
+    # The saved remote check lives in ~/.nyx, so a later local collection can
+    # read the answer the check recorded.
+    (root / "home" / ".nyx").mkdir()
+    spec_root = root / "specification-root"
+    missing_folder = root / "missing-folder"
+    with pytest.MonkeyPatch.context() as patch:
+        isolate_git(patch, root / "home")
+        remote = make_remote(served)
+        quiet_remote = make_remote(served, "quiet.git")
+        clone_two = clone(remote.as_uri(), folder / "Repo Clone 2")
+        clone_three = clone(remote.as_uri(), folder / "Repo Clone 3")
+        clone(remote.as_uri(), folder / "Repo Clone 10")
+        quiet = clone(quiet_remote.as_uri(), folder / "Quiet Clone")
+        # The quiet clone and two others have fetched; the tenth has not, which
+        # is a freshness state of its own.
+        git(quiet, "fetch", "-q")
+        git(clone_two, "fetch", "-q")
+        git(clone_three, "fetch", "-q")
+        outside = root / "outside"
+        git(clone_two, "worktree", "add", "-q", str(outside), "-b", "outside")
+        # A clone outside the folder pushes a package branch no listed clone
+        # holds, so the group serves a remote-only verdict.
+        away = clone(remote.as_uri(), root / "away" / "Away Clone")
+        git(away, "checkout", "-q", "-b", "topic-d")
+        commit_file(away, "delta.txt", "delta one\n")
+        git(away, "push", "-q", "-u", "origin", "topic-d")
+        git(clone_two, "checkout", "-q", "-b", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-a")
+        git(clone_two, "checkout", "-q", "trunk")
+
+        target = [f"Target repo: {clone_two}"]
+        _package_spec(spec_root, "Drafts", "alpha", CHECKOUTS_PACKAGE_IDS["alpha"],
+                      ["Branch: topic-a", *target])
+        _package_spec(spec_root, "Drafts", "delta", CHECKOUTS_PACKAGE_IDS["delta"],
+                      ["Branch: topic-d", *target])
+        _package_spec(spec_root, "Shipped", "gamma", CHECKOUTS_PACKAGE_IDS["gamma"],
+                      ["Branch: topic-c", *target])
+
+        def collect(stages=("Shipped",), **options):
+            """One real collection of the fixture folder and package scan."""
+            return json.loads(collect_checkouts(
+                [str(folder)],
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+                package_scan=PackageScan(spec_root, stages),
+                configuration_revision=CHECKOUTS_REVISION,
+                **options,
+            ))
+
+        catalog = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+        document_built = collect()
+        # Another clone pushes a commit, so the first clone is behind and the
+        # third is level when the remote is checked.
+        commit_file(clone_three, "moved.txt", "moved\n")
+        git(clone_three, "push", "-q", "origin", "trunk")
+        document_checked = collect(remote_checks=True)
+        document_recorded = collect()
+        away_remote = remote.rename(served / "remote.away")
+        document_renamed = collect(remote_checks=True)
+        away_remote.rename(remote)
+        git(clone_two, "checkout", "-q", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha two\n")
+        document_topic_committed = collect()
+        commit_file(clone_two, "alpha.txt", "alpha three\n")
+        document_topic_recommitted = collect()
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "branch", "-D", "topic-a")
+        document_topic_deleted = collect()
+        (quiet / "file.txt").write_bytes(b"stashed\n")
+        git(quiet, "stash", "push", "-q")
+        document_quiet_stashed = collect()
+        document_no_finished = collect(stages=())
+        empty_bin = root / "empty-bin"
+        empty_bin.mkdir()
+        patch.setenv("PATH", str(empty_bin))
+        document_no_git = collect()
+    return SimpleNamespace(
+        folder=folder,
+        spec_root=spec_root,
+        missing_folder=missing_folder,
+        outside=outside,
+        document_built=document_built,
+        document_checked=document_checked,
+        document_recorded=document_recorded,
+        document_renamed=document_renamed,
+        document_topic_committed=document_topic_committed,
+        document_topic_recommitted=document_topic_recommitted,
+        document_topic_deleted=document_topic_deleted,
+        document_quiet_stashed=document_quiet_stashed,
+        document_no_finished=document_no_finished,
+        document_no_git=document_no_git,
+        catalog=catalog,
+    )
+
+
+def test_checkouts_view_fixture_captures_the_states_it_names(view_checkouts):
+    """Every capture parses, and each one carries the state its name claims."""
+    captures = {
+        "built": view_checkouts.document_built,
+        "checked": view_checkouts.document_checked,
+        "recorded": view_checkouts.document_recorded,
+        "renamed": view_checkouts.document_renamed,
+        "topic committed": view_checkouts.document_topic_committed,
+        "topic recommitted": view_checkouts.document_topic_recommitted,
+        "topic deleted": view_checkouts.document_topic_deleted,
+        "quiet stashed": view_checkouts.document_quiet_stashed,
+        "no finished stage": view_checkouts.document_no_finished,
+        "no git": view_checkouts.document_no_git,
+    }
+    for label, document in captures.items():
+        models.parse_checkouts(json.dumps(document))
+
+    def group(document, suffix):
+        return checkout_group(document, suffix)
+
+    def branch_names(document):
+        _, clone = checkout_clone(document, "Repo Clone 2")
+        return [branch["name"] for branch in clone["branches"]]
+
+    assert group(view_checkouts.document_built, "remote")["remote"]["check"]["status"] == "off"
+    assert group(view_checkouts.document_checked, "remote")["remote"]["check"]["status"] == "live"
+    assert group(view_checkouts.document_recorded, "remote")["remote"]["check"]["status"] == "recorded"
+    assert group(view_checkouts.document_renamed, "remote")["remote"]["check"] == {
+        "status": "recorded", "reason": "not_found",
+        "checked_at": group(view_checkouts.document_renamed, "remote")
+        ["remote"]["check"]["checked_at"],
+    }
+    assert "topic-a" not in branch_names(view_checkouts.document_topic_deleted)
+    assert "topic-a" in branch_names(view_checkouts.document_topic_committed)
+    assert checkout_clone(view_checkouts.document_quiet_stashed, "Quiet Clone")[1][
+        "stash_count"] == 1
+    assert view_checkouts.document_no_finished["package_scan"]["finished_policy"] == \
+        "not_configured"
+    assert view_checkouts.document_no_git["git"]["status"] == "missing"
+    assert view_checkouts.document_no_git["repositories"] == []
+
+
+# ---------------------------------------------------------------------------
+# Re-digested shape variants the parser must still accept
+# ---------------------------------------------------------------------------
+
+
+def checkout_group(document, display_suffix):
+    """The group whose served display name ends with ``display_suffix``."""
+    for group in document["repositories"]:
+        remote = group["remote"]
+        if remote is not None and str(remote["display"]).endswith(display_suffix):
+            return group
+    raise AssertionError(
+        f"no group display ends with {display_suffix}: "
+        f"{[group['remote'] for group in document['repositories']]}"
+    )
+
+
+def checkout_clone(document, name):
+    """The group and clone whose path is named ``name``."""
+    for group in document["repositories"]:
+        for item in group["clones"]:
+            if Path(item["path"]).name == name:
+                return group, item
+    raise AssertionError(f"no clone named {name}")
+
+
+def checkout_worktree(clone, name):
+    """The linked worktree of ``clone`` named ``name``."""
+    return next(
+        worktree for worktree in clone["worktrees"]
+        if not worktree["main"] and Path(worktree["path"]).name == name
+    )
+
+
+def set_clone_status(clone, status):
+    """Make one clone unreadable in one named way, leaving the facts it cannot hold."""
+    clone["status"] = status
+    for field in (
+        "bare", "partial_clone", "shallow", "cached_default", "local_default",
+        "cached_vs_remote", "stash_count", "worktrees", "branches",
+        "verdict_base", "containment", "removable_count",
+    ):
+        clone[field] = None
+
+
+CLONE_FACTS = (
+    "bare", "partial_clone", "shallow", "cached_default", "local_default",
+    "cached_vs_remote", "stash_count", "worktrees", "branches",
+    "verdict_base", "containment", "removable_count",
+)
+
+
+def reseal_checkouts(document):
+    """Recompute every derived value the parser checks, then re-digest."""
+    # Removable comes first: the attention list counts the items it decides.
+    for group in document["repositories"]:
+        for item in group["clones"]:
+            if item["status"] != "ok":
+                continue
+            removable = models.derive_removable(item)
+            for branch, value in zip(item["branches"], removable["branches"]):
+                branch["removable"] = value
+            for worktree, value in zip(item["worktrees"], removable["worktrees"]):
+                worktree["removable"] = value
+            item["removable_count"] = removable["removable_count"]
+    derived = models.derive_attention(document)
+    for group, free in zip(document["repositories"], derived["free_clones"]):
+        group["free_clones"] = free
+        for item in group["clones"]:
+            item["availability"] = derived["availability"][item["path"]]
+    document["attention"] = derived["attention"]
+    return redigest(document)
+
+
+def checkout_raw_variant(document, mutate):
+    """One re-digested capture with ``mutate`` applied, without the parser check."""
+    variant = copy.deepcopy(document)
+    mutate(variant)
+    return reseal_checkouts(variant)
+
+
+def checkout_variant(document, mutate):
+    """One re-digested capture with ``mutate`` applied; the parser must accept it."""
+    variant = checkout_raw_variant(document, mutate)
+    models.parse_checkouts(json.dumps(variant))
+    return variant
+
+
+def open_view_checkouts(launch, view_checkouts, document):
+    """Open the checkouts view over this fixture's catalog and ``document``."""
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(
+        launch,
+        SimpleNamespace(catalog=view_checkouts.catalog, revision=CHECKOUTS_REVISION),
+        double,
+    )
+    return page, double
+
+
+def serve_checkouts(page, double, document):
+    """Answer the next tick with ``document`` and let the view render it."""
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+
+def group_index(document, display_suffix):
+    """Where a group sits in the served repository order."""
+    for index, group in enumerate(document["repositories"]):
+        remote = group["remote"]
+        if remote is not None and str(remote["display"]).endswith(display_suffix):
+            return index
+    raise AssertionError(f"no group display ends with {display_suffix}")
+
+
+def relation_words(comparison):
+    """The relation words a served comparison renders, from the view's own block."""
+    template = checkout_words()["comparisonRelation"][comparison["relation"]]
+    return template.format(
+        a="" if comparison["ahead"] is None else comparison["ahead"],
+        b="" if comparison["behind"] is None else comparison["behind"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# The one Checkout setup panel
+# ---------------------------------------------------------------------------
+
+
+def add_setup_problems(view_checkouts):
+    """A missing folder, a group whose lookup lost ``gh``, and one diagnostic."""
+    missing = str(view_checkouts.missing_folder)
+    diagnostic_path = str(view_checkouts.folder / "Not A Repo")
+
+    def mutate(document):
+        document["folders"] = [
+            {"path": str(view_checkouts.folder), "status": "ok"},
+            {"path": missing, "status": "missing"},
+        ]
+        document["github_lookup"] = "on"
+        group = checkout_group(document, "remote")
+        group["remote"]["key"] = "github.com/example/example"
+        group["remote"]["display"] = "example/example"
+        group["pr_lookup"] = {
+            "status": "unavailable", "reason": "gh_missing", "checked_at": None,
+        }
+        for other in document["repositories"]:
+            if other is not group:
+                other["pr_lookup"] = {
+                    "status": "off", "reason": "not_github", "checked_at": None,
+                }
+        document["diagnostics"] = [{"code": "not_a_repository", "path": diagnostic_path}]
+    return mutate
+
+
+def git_problem_variant(view_checkouts, version):
+    """A capture whose git is too old, with a missing folder and one diagnostic."""
+    diagnostic_path = str(view_checkouts.folder / "Not A Repo")
+
+    def mutate(document):
+        document["git"] = {"status": "too_old", "version": version}
+        document["folders"] = [
+            {"path": str(view_checkouts.folder), "status": "ok"},
+            {"path": str(view_checkouts.missing_folder), "status": "missing"},
+        ]
+        document["diagnostics"] = [{"code": "not_a_repository", "path": diagnostic_path}]
+    return checkout_variant(view_checkouts.document_no_git, mutate)
+
+
+def test_checkouts_setup_panel_names_the_setup_story_in_order(
+    open_page, view_checkouts
+):
+    """One panel names each setup problem with its words, in the one order."""
+    page, double = open_view_checkouts(
+        open_page, view_checkouts, view_checkouts.document_built
+    )
+    body = page.locator("#checkouts-body")
+    # Lookup off is status-line words with no panel item at all.
+    assert "Pull request lookup off" in page.locator("#checkouts-status-line").inner_text()
+    assert body.locator(".checkouts-setup").count() == 0
+
+    document = checkout_variant(
+        view_checkouts.document_checked, add_setup_problems(view_checkouts)
+    )
+    serve_checkouts(page, double, document)
+    panel = body.locator(".checkouts-setup")
+    playwright.expect(panel).to_have_count(1)
+    assert panel.locator("h2").inner_text() == "Checkout setup"
+    items = panel.locator(".checkouts-setup-item")
+    assert items.evaluate_all(
+        "items => items.map(item => item.dataset.setup)") == ["folder", "gh", "diagnostic"]
+    texts = items.all_inner_texts()
+    # A folder's words follow its path.
+    assert texts[0] == f"{view_checkouts.missing_folder} — does not exist"
+    assert texts[1] == (
+        "The GitHub CLI (gh) was not found; pull request states are not shown.")
+    assert texts[2] == (
+        f"{view_checkouts.folder / 'Not A Repo'} has a .git entry but is not the top "
+        "of its repository")
+    # A folder problem never suppresses the groups: the folder that is still
+    # readable keeps rendering its clones.
+    shown = body.locator(".checkouts-group")
+    assert shown.count() == 1
+    assert shown.locator(".checkouts-group-name").inner_text() == "example/example"
+    assert shown.locator("tr.checkouts-clone").count() == len(
+        checkout_group(document, "example/example")["clones"])
+    # The panel is not a live region, has no control, and never takes focus.
+    assert panel.locator(
+        "[aria-live], [role='status'], [role='alert'], input, button, select, "
+        "textarea, [tabindex]").count() == 0
+    page.locator("#view-board").focus()
+    serve_checkouts(page, double, document)
+    assert page.evaluate(
+        "() => !document.querySelector('.checkouts-setup')"
+        ".contains(document.activeElement)") is True
+
+    # A git problem comes first, before the missing folder and the diagnostic.
+    older = git_problem_variant(view_checkouts, "2.30.0")
+    serve_checkouts(page, double, older)
+    items = body.locator(".checkouts-setup .checkouts-setup-item")
+    assert items.evaluate_all(
+        "items => items.map(item => item.dataset.setup)") == ["git", "folder", "diagnostic"]
+    assert items.first.inner_text() == (
+        "Git 2.30.0 is older than Nyx supports (2.36)")
+
+    unreadable = git_problem_variant(view_checkouts, None)
+    serve_checkouts(page, double, unreadable)
+    assert body.locator(".checkouts-setup .checkouts-setup-item").first.inner_text() == (
+        "Git is older than Nyx supports (2.36), or its version could not be read")
+
+    # A capture taken with no git on PATH: the sentence, no groups, no failure panel.
+    serve_checkouts(page, double, view_checkouts.document_no_git)
+    setup = body.locator(".checkouts-setup")
+    assert "Git was not found, so Nyx cannot read checkouts." in setup.inner_text()
+    assert "on the PATH Nyx runs with" in setup.inner_text()
+    assert body.locator(".checkouts-group").count() == 0
+    assert body.locator(".checkouts-panel:not(.checkouts-setup)").count() == 0
+
+    # No configured folder: the guide section is named, and no control appears.
+    serve_checkouts(page, double, empty_checkouts_document())
+    setup = body.locator(".checkouts-setup")
+    sentence = setup.inner_text()
+    assert "No checkout folders are configured." in sentence
+    assert "Your specification workspace → Checkout folders" in sentence
+    assert setup.locator("input, button, select, textarea, [contenteditable]").count() == 0
+    assert body.locator(".checkouts-group").count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Groups, rows, Work item branches and freshness
+# ---------------------------------------------------------------------------
+
+
+def test_checkouts_groups_rows_and_branches_follow_the_document(
+    open_page, view_checkouts
+):
+    """Groups, clone rows and Work item branches render the served order."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    names = page.locator(".checkouts-group-name")
+    quiet = [
+        group for group in document["repositories"]
+        if str(group["remote"]["display"]).endswith("quiet")
+    ]
+    assert len(quiet) == 1
+    # The quiet repository has no group of its own while the box is checked.
+    assert names.all_inner_texts() == [
+        group["remote"]["display"] for group in document["repositories"] if group not in quiet]
+
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert names.all_inner_texts() == [
+        group["remote"]["display"] for group in document["repositories"]]
+    remote_index = group_index(document, "remote")
+    group = document["repositories"][remote_index]
+    remote_view = page.locator(".checkouts-group").nth(remote_index)
+
+    # The eight column headers, once per group table.
+    assert remote_view.locator(
+        "table.checkouts-clones > thead th").all_inner_texts() == [
+        "Checkout", "Availability", "HEAD", "Default branch vs remote",
+        "Tree", "Branches", "Cleanup", "Package",
+    ]
+    # Clone rows follow the group's clones, and a linked worktree sits directly
+    # under the clone that owns it.
+    assert remote_view.locator(
+        "table.checkouts-clones > tbody > tr:not(.checkouts-detail)").evaluate_all(
+        "rows => rows.map(row => row.classList.contains('checkouts-worktree')"
+        " ? row.dataset.worktree : row.dataset.clone)") == [
+        "Repo Clone 2", "outside", "Repo Clone 3", "Repo Clone 10",
+    ]
+    assert [Path(clone["path"]).name for clone in group["clones"]] == [
+        "Repo Clone 2", "Repo Clone 3", "Repo Clone 10"]
+
+    # Work item branches follow the group's package_branches with their words.
+    entries = group["package_branches"]
+    branches = remote_view.locator("table.checkouts-package-branches tbody tr")
+    assert remote_view.locator(
+        "table.checkouts-package-branches caption").inner_text() == "Work item branches"
+    assert branches.evaluate_all(
+        "rows => rows.map(row => row.dataset.branch)") == [
+        entry["name"] for entry in entries]
+    by_name = {entry["name"]: entry for entry in entries}
+    topic_a = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (cached)"
+    assert topic_a.locator(".checkouts-verdict-words").inner_text() == "not merged"
+    # A merge verdict carries the basis of the clone's verdict base.
+    assert topic_a.locator(".checkouts-verdict .checkouts-basis").inner_text() == "cached"
+    assert topic_a.locator(".checkouts-work-items .checkouts-package-path").inner_text() == (
+        "Repo/Drafts/alpha")
+    assert topic_a.locator(".checkouts-work-items .checkouts-basis").inner_text() == (
+        "(Target repo)")
+    assert topic_a.locator("[data-show-on-board]").inner_text() == "Show on board"
+    assert by_name["topic-a"]["remote_verdict"] is None
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "unknown"
+
+    # Free clones come from the served list, in its order, with each distance.
+    free = group["free_clones"]
+    assert len(free) >= 2
+    expected = []
+    for path in free:
+        clone = next(item for item in group["clones"] if item["path"] == path)
+        local = clone["local_default"]
+        distance = local["vs_remote"] or local["vs_cached"]
+        expected.append(f"{Path(path).name} {relation_words(distance)}")
+    assert remote_view.locator(".checkouts-group-free").inner_text() == (
+        "Free clones: " + " · ".join(expected))
+
+    # A never-fetched clone reads cached on its value and names the age once.
+    clone_ten = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-relation").inner_text() == "up to date"
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
+    assert "cached, never fetched" in clone_ten.inner_text()
+    clone_two = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator(".checkouts-head").inner_text() == "trunk"
+    assert clone_two.locator(".checkouts-tree").inner_text() == "clean"
+    assert clone_two.locator(".checkouts-branches").inner_text() == "3 branches"
+    assert clone_two.locator(".checkouts-cleanup").inner_text().startswith(
+        "1 branch, 1 worktree removable")
+    assert clone_two.locator(".checkouts-cleanup").inner_text().endswith(
+        "topic-a (not merged)")
+    linked = remote_view.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator(".checkouts-head").inner_text() == "outside"
+    assert linked.locator(".checkouts-cleanup").inner_text() == "Removable"
+
+    # One remote check later, the same rows read the live answers: the branch
+    # no clone holds states why, and the branch nothing pushed is absent.
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    remote_index = group_index(checked, "remote")
+    remote_view = page.locator(".checkouts-group").nth(remote_index)
+    topic_d = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-d"]')
+    assert topic_d.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+    assert topic_d.locator(".checkouts-verdict-words").inner_text() == (
+        "merge state unknown — no clone holds its commits")
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+
+
+
+def test_checkouts_freshness_reads_cached_live_and_recorded(
+    open_page, view_checkouts
+):
+    """One value names its own basis; a failed latest check says so."""
+    page, double = open_view_checkouts(
+        open_page, view_checkouts, view_checkouts.document_built
+    )
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
+
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    assert checkout_group(checked, "remote")["remote"]["check"]["status"] == "live"
+    assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "live"
+    assert "cached, never fetched" not in clone_ten.inner_text()
+
+    recorded = view_checkouts.document_recorded
+    serve_checkouts(page, double, recorded)
+    check = checkout_group(recorded, "remote")["remote"]["check"]
+    assert check["status"] == "recorded"
+    when = checkouts_local_time(check["checked_at"], recorded["observed_at"], seconds=False)
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == (
+        f"recorded {when}")
+    assert page.locator(".checkouts-group-check").first.inner_text() == f"recorded {when}"
+
+    renamed = view_checkouts.document_renamed
+    serve_checkouts(page, double, renamed)
+    check = checkout_group(renamed, "remote")["remote"]["check"]
+    when = checkouts_local_time(check["checked_at"], renamed["observed_at"], seconds=False)
+    clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
+    note = clone_ten.locator(".checkouts-default .checkouts-note").inner_text()
+    assert note == "(latest check failed: remote repository not found)"
+    assert page.locator(".checkouts-group-check").first.inner_text() == (
+        f"recorded {when} (remote repository not found)")
+
+
+def test_checkouts_quiet_repositories_collapse_into_one_row(
+    open_page, view_checkouts
+):
+    """A quiet repository is one row while the box is checked, a group when not."""
+    document = view_checkouts.document_built
+    quiet = checkout_group(document, "quiet")
+    quiet_display = quiet["remote"]["display"]
+    other_display = checkout_group(document, "remote")["remote"]["display"]
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+
+    def groups():
+        return page.locator(".checkouts-group-name").all_inner_texts()
+
+    assert groups() == [other_display]
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    playwright.expect(row).to_have_count(1)
+    assert row.locator("summary").inner_text() == "Quiet repositories (1)"
+    row.locator("summary").click()
+    assert row.locator("li").inner_text() == f"{quiet_display} Quiet Clone"
+
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+    # The unchecked state survives a reload.  The reload's own catalog and
+    # checkout requests must settle before a tick can answer, or the tick is
+    # dropped for a request still in flight.
+    page.reload()
+    page.wait_for_function(
+        "() => window.catalogResponses.length >= 1 && window.checkoutsResponses.length >= 1")
+    settle_frames(page)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#checkouts-body .checkouts-group').length === 2")
+    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert groups() == [quiet_display, other_display]
+
+    # Checked again, a stash makes the quiet clone ordinary: its own group, no row.
+    page.get_by_label("Hide quiet checkouts", exact=True).check()
+    assert groups() == [other_display]
+    serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+    # Two null comparisons prove nothing about equality, so it is not quiet.
+    def both_null(value):
+        _, clone = checkout_clone(value, "Quiet Clone")
+        clone["local_default"] = None
+
+    serve_checkouts(
+        page, double, checkout_variant(view_checkouts.document_built, both_null))
+    assert groups() == [quiet_display, other_display]
+    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+
+
+def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkouts):
+    """The shared search hides every group whose served names do not match."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    assert page.locator(".checkouts-group").count() == len(document["repositories"])
+    page.fill("#filter", "topic-a")
+    visible = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    assert visible.all_inner_texts() == [
+        checkout_group(document, "remote")["remote"]["display"]]
+    page.fill("#filter", "")
+    assert page.locator(".checkouts-group:not([hidden])").count() == len(
+        document["repositories"])
+
+
+def test_checkouts_search_matches_the_repositories_in_the_quiet_row(
+    open_page, view_checkouts
+):
+    """The quiet row stays for a held repository that matches and goes when none do."""
+    document = view_checkouts.document_built
+    quiet = checkout_group(document, "quiet")
+    quiet_display = quiet["remote"]["display"]
+    other_display = checkout_group(document, "remote")["remote"]["display"]
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    summary = row.locator("summary")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1)"
+
+    # A quiet repository's name keeps the row, counts its match and hides the
+    # group that does not match.
+    page.fill("#filter", quiet_display)
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1, 1 matching)"
+    assert groups.all_inner_texts() == []
+
+    # The clone's folder name is searched as it is for a group.
+    page.fill("#filter", "quiet clone")
+    playwright.expect(row).to_be_visible()
+
+    # A name no quiet repository has hides the row; the group that has it stays.
+    page.fill("#filter", other_display)
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == [other_display]
+    page.fill("#filter", "no such words anywhere")
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == []
+
+    # Clearing the search restores the earlier state.
+    page.fill("#filter", "")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1)"
+    assert groups.all_inner_texts() == [other_display]
+
+
+def test_checkouts_search_can_match_a_group_and_the_quiet_row_together(
+    open_page, view_checkouts
+):
+    """A query both kinds hold keeps the group and the row; one kind alone keeps one."""
+    document = view_checkouts.document_built
+    quiet_group = checkout_group(document, "quiet")
+    other = checkout_group(document, "remote")
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    branch = quiet_group["default_branch"]["name"]
+    assert other["default_branch"]["name"] == branch
+
+    page.fill("#filter", branch)
+    playwright.expect(row).to_be_visible()
+    assert groups.all_inner_texts() == [other["remote"]["display"]]
+
+    # Words only the group holds hide the row; words only the row holds hide the group.
+    page.fill("#filter", "topic-a")
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == [other["remote"]["display"]]
+    page.fill("#filter", quiet_group["remote"]["display"])
+    playwright.expect(row).to_be_visible()
+    assert groups.all_inner_texts() == []
+
+    # The row, opened and filtered, keeps its listed repository.
+    row.locator("summary").click()
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
+
+
+def mutate_searchable_words(document):
+    """A quiet clone with a detached, edited tree and a detached linked worktree."""
+    verdict = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+    _, quiet = checkout_clone(document, "Quiet Clone")
+    main = next(item for item in quiet["worktrees"] if item["main"])
+    main["head"] = {"branch": None, "sha": "abc1234" + "0" * 33}
+    main["verdict"] = dict(verdict)
+    main["changes"]["unstaged"] = 3
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    linked = checkout_worktree(clone_two, "outside")
+    linked["head"] = {"branch": None, "sha": "fedcba9" + "0" * 33}
+    linked["verdict"] = dict(verdict)
+
+
+def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_checkouts):
+    """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
+    document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    remote = checkout_group(document, "remote")["remote"]["display"]
+    quiet = checkout_group(document, "quiet")["remote"]["display"]
+
+    def shown(query):
+        page.fill("#filter", query)
+        return page.locator(
+            ".checkouts-group:not([hidden]) .checkouts-group-name").all_inner_texts()
+
+    assert sorted(shown("")) == sorted([remote, quiet])
+    # The served Code Status text of a work item the group serves.
+    assert shown("in progress · pushed") == [remote]
+    # The availability words of a clone row.
+    assert shown("has linked worktrees") == [remote]
+    # The HEAD words of the quiet clone's main worktree, and its tree words.
+    assert shown("detached at abc1234") == [quiet]
+    assert shown("3 unstaged") == [quiet]
+    # A linked worktree's HEAD words.
+    assert shown("detached at fedcba9") == [remote]
+    assert shown("no such words anywhere") == []
+
+
+# ---------------------------------------------------------------------------
+# The browser: one assertion per word table
+# ---------------------------------------------------------------------------
+
+
+def mutate_check_failed(document):
+    """Every group's remote check failed with nothing saved to fall back on."""
+    document["remote_checks"] = "on"
+    for group in document["repositories"]:
+        group["remote"]["check"] = {"status": "failed", "reason": "not_found"}
+
+
+def mutate_clone_statuses(document):
+    """Two clones that could not be read, in the two ways the words name."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    set_clone_status(clone_three, "unsafe_ownership")
+    _, clone_ten = checkout_clone(document, "Repo Clone 10")
+    set_clone_status(clone_ten, "too_many_branches")
+
+
+def mutate_worktree_facts(document):
+    """A detached dirty main worktree in a rebase beside one locked worktree."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    main = next(item for item in clone_two["worktrees"] if item["main"])
+    linked = checkout_worktree(clone_two, "outside")
+    linked["locked"] = True
+    main["operations"] = ["rebase"]
+    main["changes"]["staged"] = 2
+    main["head"] = {"branch": None, "sha": main["head"]["sha"]}
+    main["verdict"] = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+
+
+def mutate_prunable_worktree(document):
+    """A linked worktree whose directory is gone."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    linked = checkout_worktree(clone_two, "outside")
+    linked["prunable"] = True
+    linked["status"] = "failed"
+    for field in ("head", "changes", "operations", "index_lock", "verdict"):
+        linked[field] = None
+
+
+def mutate_checkout_flags(document):
+    """One bare clone, one shallow clone and one partial clone."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    clone_three["bare"] = True
+    clone_three["worktrees"] = []
+    for branch in clone_three["branches"]:
+        branch["checked_out_in"] = []
+    _, clone_ten = checkout_clone(document, "Repo Clone 10")
+    clone_ten["shallow"] = True
+    clone_ten["containment"] = "incomplete"
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    clone_two["partial_clone"] = True
+    clone_two["containment"] = "incomplete"
+
+
+def mutate_containment(document):
+    """One clone whose branch folding ran out of time."""
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    clone_three["containment"] = "deadline"
+
+
+def mutate_assignment(document):
+    """A package assigned to another clone and one to a linked worktree."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    _, clone_three = checkout_clone(document, "Repo Clone 3")
+    outside = checkout_worktree(clone_two, "outside")["path"]
+    packages = {item["package_path"]: item for item in document["packages"]}
+    alpha = packages["Repo/Drafts/alpha"]
+    alpha["target"] = {
+        "clone": clone_three["path"], "status": "clone", "worktree": None,
+        "within_folders": alpha["target"]["within_folders"],
+    }
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["packages"] = [{"package_path": "Repo/Drafts/alpha", "basis": "sibling_clone"}]
+    delta = packages["Repo/Drafts/delta"]
+    delta["target"] = {
+        "clone": clone_two["path"], "status": "worktree", "worktree": outside,
+        "within_folders": delta["target"]["within_folders"],
+    }
+
+
+def mutate_lookup_and_pull_requests(document):
+    """A live lookup with one open and one merged pull request on the branch."""
+    document["github_lookup"] = "on"
+    group = checkout_group(document, "remote")
+    group["remote"]["key"] = "github.com/example/example"
+    group["remote"]["display"] = "example/example"
+    group["pr_lookup"] = {"status": "live", "reason": None, "checked_at": None}
+    for other in document["repositories"]:
+        if other is not group:
+            other["pr_lookup"] = {
+                "status": "off", "reason": "not_github", "checked_at": None,
+            }
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["verdict"] = {
+        "state": "merged", "rung": "pull_request", "reason": None, "pull_request": 7,
+    }
+    topic_a["pull_requests"] = [
+        {"number": 3, "state": "open", "head_matches": False},
+        {"number": 7, "state": "merged", "head_matches": True},
+    ]
+
+
+def mutate_merged_branch(document):
+    """The package branch proved merged because its tip is in the default branch."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    topic_a = next(branch for branch in clone_two["branches"] if branch["name"] == "topic-a")
+    topic_a["verdict"] = {
+        "state": "merged", "rung": "ancestor", "reason": None, "pull_request": None,
+    }
+
+
+def test_checkouts_word_tables_show_their_served_values(
+    open_page, view_checkouts
+):
+    """Every word table renders a served value's words, from captures and variants."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    body = page.locator("#checkouts-body")
+
+    def clone_row(name):
+        return body.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+
+    def shows(text):
+        assert text in body.inner_text(), text
+
+    # The built capture: comparison relation and basis, availability state and
+    # reason, the assignment basis, status, remote copy, verdict state, the
+    # branch blocker, the branch package basis and the check/lookup words.
+    shows("up to date")
+    shows("cached")
+    shows("Free")
+    clone_two = clone_row("Repo Clone 2")
+    availability = clone_two.locator(".checkouts-availability").inner_text()
+    assert availability.startswith("In use")
+    assert "has linked worktrees" in availability
+    assert "Assigned: Repo/Drafts/alpha (Target repo)" in availability
+    shows("unknown")
+    shows("not merged")
+    shows("Repo/Drafts/alpha (Target repo)")
+    assert "topic-a (not merged)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
+    assert page.locator(".checkouts-group-lookup").first.inner_text() == (
+        "pull request lookup off")
+    # The default branch is named in the header as it is served.
+    assert body.locator(".checkouts-group-default").last.inner_text() == "trunk"
+
+    # One remote check later: the live basis and the present and absent copies.
+    checked = view_checkouts.document_checked
+    serve_checkouts(page, double, checked)
+    assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
+    shows("on the remote (live)")
+    shows("not on the remote")
+    shows("live")
+
+    # A saved check from a later local collection, and one that then failed.
+    recorded = view_checkouts.document_recorded
+    serve_checkouts(page, double, recorded)
+    check = checkout_group(recorded, "remote")["remote"]["check"]
+    shows(f"recorded {checkouts_local_time(check['checked_at'], recorded['observed_at'], seconds=False)}")
+    serve_checkouts(page, double, view_checkouts.document_renamed)
+    shows("(latest check failed: remote repository not found)")
+
+    # A check that failed with nothing saved falls back to nothing.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_check_failed))
+    assert page.locator(".checkouts-group-check").first.inner_text() == (
+        "check failed (remote repository not found)")
+
+    # Clone status words, and the Availability a clone without facts shows.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_clone_statuses))
+    shows("git refused it: ownership")
+    shows("more than 100 local branches; not examined")
+    assert clone_row("Repo Clone 3").locator(
+        ".checkouts-availability").inner_text() == "Unknown"
+
+    # Worktree facts: a detached, dirty main worktree in a rebase, and a locked
+    # linked worktree with its branch and worktree blockers.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_worktree_facts))
+    clone_two = clone_row("Repo Clone 2")
+    assert clone_two.locator(".checkouts-head").inner_text().startswith("detached at ")
+    shows("detached HEAD")
+    shows("2 staged")
+    shows("rebase in progress")
+    shows("git operation in progress")
+    assert "outside (locked)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    linked = body.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator(".checkouts-cleanup").inner_text() == "locked"
+
+    # A prunable linked worktree: the status words and the flag word.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_prunable_worktree))
+    shows("could not be read")
+    shows("directory is gone")
+
+    # Bare, shallow and partial clones name their facts once in the Checkout cell.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_checkout_flags))
+    bare = clone_row("Repo Clone 3")
+    assert bare.locator("td.checkouts-head").inner_text() == "bare repository"
+    assert bare.locator("td.checkouts-tree").inner_text() == "no working tree"
+    assert "shallow" in clone_row("Repo Clone 10").locator(
+        "th.checkouts-checkout").inner_text()
+    assert "partial" in clone_row("Repo Clone 2").locator(
+        "th.checkouts-checkout").inner_text()
+
+    # A clone whose branch folding did not finish says why, once.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_containment))
+    shows("Branches were not checked for folding: ran out of time")
+
+    # Another clone's assigned package and a linked worktree's, with both bases.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_assignment))
+    assigned = clone_row("Repo Clone 3").locator(".checkouts-availability").inner_text()
+    assert assigned.startswith("Assigned")
+    assert "Repo/Drafts/alpha (Target repo)" in assigned
+    assert "Repo/Drafts/delta (Target repo worktree)" in clone_row(
+        "Repo Clone 2").locator(".checkouts-availability").inner_text()
+    shows("same branch in another clone")
+
+    # A live lookup with served pull requests and a pull-request rung.
+    serve_checkouts(
+        page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    shows("pull requests live")
+    assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                        " .checkouts-verdict-words").inner_text() == (
+        "merged — pull request #7 merged")
+    pulls = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                         " .checkouts-pulls").inner_text()
+    assert pulls == "#3 open (different head) · #7 merged"
+    assert "Pull requests live" in page.locator("#checkouts-status-line").inner_text()
+
+    # A branch proved merged by its tip being in the default branch.
+    serve_checkouts(
+        page, double, checkout_variant(document, mutate_merged_branch))
+    assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
+                        " .checkouts-verdict-words").inner_text() == "merged — tip is in trunk"
+
+
+def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
+    """A value newer than this page's words renders as itself and never throws."""
+    document = checkout_raw_variant(
+        view_checkouts.document_built,
+        lambda value: set_clone_status(
+            checkout_clone(value, "Repo Clone 10")[1], "future_status"),
+    )
+    # The value is one a newer collector would serve before this page learns its
+    # words, so the strict parser refuses it and only the provider double can
+    # answer with it; the page must still show it rather than break.
+    with pytest.raises(models.ProtocolError):
+        models.parse_checkouts(json.dumps(document))
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    body = page.locator("#checkouts-body")
+    assert "future_status" in body.inner_text()
+    # The rest of the view still renders.
+    assert body.locator("tr.checkouts-clone").count() == 3
+    assert "Repo Clone 2" in body.inner_text()
+
+
+def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts):
+    """Each work item's table action shows its card, or says why it cannot."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+    topic_a = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    topic_a.locator('[data-show-on-board="Repo/Drafts/alpha"]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    card = page.locator('.card[data-package-path="Repo/Drafts/alpha"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert page.evaluate(
+        "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+    # A work item in a finished row the board is hiding says so and stays put.
+    show_checkouts_view(page)
+    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+    topic_c = remote_view.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    topic_c.locator('[data-show-on-board="Repo/Shipped/gamma"]').click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
+
+
+def test_checkouts_status_line_names_a_scan_from_other_settings(
+    open_page, view_checkouts
+):
+    """A scan collected under other settings than the board shown says so once."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    sentence = "Collected under different settings from the board shown."
+    line = page.locator("#checkouts-status-line")
+    assert sentence not in line.inner_text()
+
+    def other_settings(value):
+        value["configuration_revision"] = "3" * 64
+
+    serve_checkouts(page, double, checkout_variant(document, other_settings))
+    assert line.inner_text().endswith(sentence)
+    # The values are still rendered: the scan is its own dated answer.
+    assert page.locator("#checkouts-body .checkouts-group").count() >= 1
+
+
+def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
+    open_page, view_checkouts
+):
+    """A main worktree git did not answer for fills HEAD and Tree and is never nested."""
+
+    def unanswered(worktree):
+        worktree["status"] = "timed_out"
+        for field in ("head", "changes", "operations", "index_lock", "verdict"):
+            worktree[field] = None
+
+    def mutate(document):
+        _, clone_two = checkout_clone(document, "Repo Clone 2")
+        unanswered(next(item for item in clone_two["worktrees"] if item["main"]))
+        unanswered(checkout_worktree(clone_two, "outside"))
+
+    document = checkout_variant(view_checkouts.document_built, mutate)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator("td.checkouts-head").inner_text() == "git did not answer in time"
+    assert clone_two.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
+    # The main worktree is never a nested row; the linked one shows the same words.
+    assert page.locator("tr.checkouts-worktree").evaluate_all(
+        "rows => rows.map(row => row.dataset.worktree)") == ["outside"]
+    linked = page.locator('tr.checkouts-worktree[data-worktree="outside"]')
+    assert linked.locator("td.checkouts-head").inner_text() == "git did not answer in time"
+    assert linked.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
+
+    # A linked worktree on a branch with no commit reads "unborn <branch>".
+    def unborn(value):
+        _, clone = checkout_clone(value, "Repo Clone 2")
+        checkout_worktree(clone, "outside")["head"] = {"branch": "outside", "sha": None}
+
+    served = checkout_raw_variant(view_checkouts.document_built, unborn)
+    page, _ = open_view_checkouts(open_page, view_checkouts, served)
+    assert page.locator(
+        'tr.checkouts-worktree[data-worktree="outside"] td.checkouts-head'
+    ).inner_text() == "unborn outside"
+
+
+def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
+    open_page, view_checkouts
+):
+    """A cached value names the clone's fetch age once, in whole units."""
+    document = view_checkouts.document_built
+    observed = datetime.fromisoformat(document["observed_at"].replace("Z", "+00:00"))
+
+    def fetched(minutes):
+        def mutate(value):
+            _, clone = checkout_clone(value, "Repo Clone 2")
+            moment = observed - timedelta(minutes=minutes, seconds=30)
+            clone["cached_default"]["last_fetched_at"] = moment.strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            clone["cached_default"]["fetched_since_clone"] = True
+        return checkout_variant(document, mutate)
+
+    page, double = open_view_checkouts(open_page, view_checkouts, fetched(0))
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-freshness')
+    assert row.inner_text() == "cached, fetched <1 min ago"
+    for minutes, words in ((7, "7 min"), (125, "2 h"), (60 * 49, "2 d")):
+        serve_checkouts(page, double, fetched(minutes))
+        assert row.inner_text() == f"cached, fetched {words} ago"
+
+
+def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkouts):
+    """The Branches cell pluralizes the stash count it shows ("&lt;K&gt; stashes")."""
+
+    def stashed(count):
+        def mutate(document):
+            _, clone = checkout_clone(document, "Repo Clone 2")
+            clone["stash_count"] = count
+        return checkout_variant(view_checkouts.document_built, mutate)
+
+    page, double = open_view_checkouts(open_page, view_checkouts, stashed(1))
+    cell = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-branches')
+    assert cell.inner_text() == "3 branches · 1 stash"
+    assert "1 stashs" not in page.locator("#checkouts-body").inner_text()
+    serve_checkouts(page, double, stashed(2))
+    assert cell.inner_text() == "3 branches · 2 stashes"
+    assert "stashs" not in page.locator("#checkouts-body").inner_text()
+    # The singular of the cleanup counts reads the same way in the same table.
+    cleanup = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-cleanup')
+    assert cleanup.inner_text().startswith("1 branch, 1 worktree removable")
+
+
+def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkouts):
+    """A search survives the jump unless it is what hides the card."""
+    document = view_checkouts.document_built
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+
+    def show_button():
+        remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
+        return remote_view.locator(
+            'table.checkouts-package-branches tr[data-branch="topic-a"] '
+            '[data-show-on-board="Repo/Drafts/alpha"]')
+
+    # A query that matches the card is kept across the jump.
+    page.fill("#filter", "alpha")
+    show_button().click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == "alpha"
+    assert page.locator('.card[data-package-path="Repo/Drafts/alpha"]').is_hidden() is False
+
+    # A query that hides the card is cleared before the jump.  The group stays
+    # listed by its other clone's name while this work item's card does not
+    # match, so the table row is reachable with the hiding query in place.
+    show_checkouts_view(page)
+    page.fill("#filter", "Repo Clone 10")
+    show_button().click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == ""
+    assert page.evaluate(
+        "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+
+def test_checkouts_git_problem_escapes_the_version_once(open_page, view_checkouts):
+    """A git version carrying markup is escaped exactly once in the setup panel."""
+    document = git_problem_variant(view_checkouts, "2.36&1")
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    item = page.locator('#checkouts-body [data-setup="git"]')
+    assert item.inner_text() == "Git 2.36&1 is older than Nyx supports (2.36)"
+    assert "&amp;" in item.inner_html()
+    assert "&amp;amp;" not in item.inner_html()
+    # The rest of the panel keeps its order and words.
+    kinds = page.locator("#checkouts-body .checkouts-setup-item").evaluate_all(
+        "items => items.map(item => item.dataset.setup)")
+    assert kinds == ["git", "folder", "diagnostic"]
+
+
+# ---------------------------------------------------------------------------
+# Needs attention, expanded rows, Show on board and the settings sentence
+# ---------------------------------------------------------------------------
+
+ATTENTION_PACKAGE_IDS = {
+    "alpha": "123e4567-e89b-42d3-a456-426614174b01",
+    "gamma": "123e4567-e89b-42d3-a456-426614174b03",
+    "zeta": "123e4567-e89b-42d3-a456-426614174b06",
+}
+
+
+@pytest.fixture(scope="module")
+def attention_checkouts(tmp_path_factory):
+    """One real checkout world that holds every attention code the view navigates.
+
+    A bare ``trunk`` remote is cloned three times into one folder.  ``Repo Clone 2``
+    holds ``topic-a`` (pushed, then one more local commit), ``topic-a-part`` (a
+    branch whose tip ``topic-a`` holds), ``topic-merged`` (merged with
+    ``--no-ff``), ``topic-squash`` (``merge --squash`` plus a commit), a pushed
+    finished-stage branch, and a linked worktree with a change.  ``Repo Clone 3``
+    holds a branch never pushed and a stash; ``Repo Clone 10`` never fetched.  One
+    work item has a Baseline trunk has moved past and one names a Target repo that
+    does not exist; ``catalog`` is built before that one is written, so a board
+    shown from it does not hold it, and ``catalog_all`` holds every work item.  The captures are the world as built and the same world
+    with no finished stage.
+    """
+    root = tmp_path_factory.mktemp("attention-checkouts")
+    folder = root / "checkouts"
+    folder.mkdir()
+    served = root / "served"
+    served.mkdir()
+    (root / "home").mkdir()
+    (root / "home" / ".nyx").mkdir()
+    spec_root = root / "specification-root"
+    with pytest.MonkeyPatch.context() as patch:
+        isolate_git(patch, root / "home")
+        remote = make_remote(served)
+        clone_two = clone(remote.as_uri(), folder / "Repo Clone 2")
+        clone_three = clone(remote.as_uri(), folder / "Repo Clone 3")
+        clone(remote.as_uri(), folder / "Repo Clone 10")
+        git(clone_two, "fetch", "-q")
+        git(clone_three, "fetch", "-q")
+        seed = git(clone_two, "rev-parse", "trunk").stdout.strip()
+
+        git(clone_two, "checkout", "-q", "-b", "topic-a")
+        commit_file(clone_two, "alpha.txt", "alpha one\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-a")
+        git(clone_two, "branch", "topic-a-part")
+        commit_file(clone_two, "alpha.txt", "alpha two\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "checkout", "-q", "-b", "topic-merged")
+        commit_file(clone_two, "merged.txt", "merged\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "merge", "-q", "--no-ff", "-m", "merge topic-merged", "topic-merged")
+        git(clone_two, "checkout", "-q", "-b", "topic-squash")
+        commit_file(clone_two, "squash.txt", "squash\n")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "merge", "-q", "--squash", "topic-squash")
+        git(clone_two, "commit", "-q", "-m", "squash topic-squash")
+        git(clone_two, "checkout", "-q", "-b", "topic-g", "trunk")
+        commit_file(clone_two, "gamma.txt", "gamma\n")
+        git(clone_two, "push", "-q", "-u", "origin", "topic-g")
+        git(clone_two, "checkout", "-q", "trunk")
+        git(clone_two, "push", "-q", "origin", "trunk")
+        git(clone_two, "worktree", "add", "-q", str(root / "linked"), "-b", "wt-branch")
+        (root / "linked" / "dirty.txt").write_bytes(b"dirty\n")
+
+        git(clone_three, "pull", "-q")
+        git(clone_three, "checkout", "-q", "-b", "local-only")
+        commit_file(clone_three, "local.txt", "local\n")
+        git(clone_three, "checkout", "-q", "trunk")
+        commit_file(clone_three, "stash.txt", "stash one\n")
+        git(clone_three, "reset", "-q", "--hard", "origin/trunk")
+        (clone_three / "file.txt").write_bytes(b"stashed\n")
+        git(clone_three, "stash", "push", "-q")
+
+        target = [f"Target repo: {clone_two}"]
+        _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"],
+                      ["Branch: topic-a", f"Baseline: {seed}", *target])
+        _package_spec(spec_root, "Shipped", "gamma", ATTENTION_PACKAGE_IDS["gamma"],
+                      ["Branch: topic-g", *target])
+        catalog = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+        _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"],
+                      ["Branch: topic-z", f"Target repo: {folder / 'Missing Clone'}"])
+        catalog_all = json.loads(scan_catalog(
+            spec_root,
+            completed_stage_names=["Shipped"],
+            configuration_revision=CHECKOUTS_REVISION,
+        ))
+
+        def collect(stages):
+            return json.loads(collect_checkouts(
+                [str(folder)],
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+                package_scan=PackageScan(spec_root, stages),
+                configuration_revision=CHECKOUTS_REVISION,
+            ))
+
+        document = collect(("Shipped",))
+        document_no_finished = collect(())
+    return SimpleNamespace(
+        folder=folder, spec_root=spec_root, linked=root / "linked", catalog=catalog,
+        catalog_all=catalog_all,
+        document=document, document_no_finished=document_no_finished,
+    )
+
+
+def test_checkouts_attention_fixture_holds_every_code_it_names(attention_checkouts):
+    """Both captures parse, and the world holds the codes the proofs navigate."""
+    for document in (attention_checkouts.document, attention_checkouts.document_no_finished):
+        models.parse_checkouts(json.dumps(document))
+    assert [item["code"] for item in attention_checkouts.document["attention"]] == [
+        "branch_unpushed", "branch_not_pushed", "stash", "uncommitted_changes",
+        "awaiting_merge", "removable", "base_moved", "target_repo_missing", "never_fetched",
+    ]
+    assert attention_checkouts.document_no_finished["attention"][-1]["code"] == \
+        "finished_stages_not_configured"
+    _, clone_two = checkout_clone(attention_checkouts.document, "Repo Clone 2")
+    branches = {branch["name"]: branch for branch in clone_two["branches"]}
+    assert branches["topic-a-part"]["contained_in"] == "topic-a"
+    assert branches["topic-merged"]["verdict"]["rung"] == "ancestor"
+    assert branches["topic-a"]["verdict"]["state"] == "not_merged"
+    assert branches["wt-branch"]["removable"]["blockers"] == ["worktree_not_clean"]
+
+
+def open_attention_checkouts(launch, attention_checkouts, document, *, catalog=None, client=None):
+    """Open the checkouts view over the attention world's board and ``document``."""
+    double = BrowserCheckouts(document)
+    page = checkouts_view_page(
+        launch,
+        SimpleNamespace(
+            catalog=attention_checkouts.catalog_all if catalog is None else catalog,
+            revision=CHECKOUTS_REVISION,
+        ),
+        double,
+        client=client,
+    )
+    return page, double
+
+
+def attention_words(item):
+    """The words one attention item must read, built from the view's own block."""
+    words = checkout_words()
+    values = {
+        "branch": item["branch"] or "",
+        "clone": Path(item["clone"]).name if item["clone"] else "",
+        "worktree": Path(item["worktree"]).name if item["worktree"] else "",
+        "count": "" if item["count"] is None else item["count"],
+        "workItem": item["packages"][0] if item["packages"] else "",
+    }
+    if item["code"] == "uncommitted_changes" and item["count"] == 0:
+        template = words["text"]["uncommittedOperation"]
+    elif item["count"] == 1 and item["code"] in words["attentionCodeOne"]:
+        template = words["attentionCodeOne"][item["code"]]
+    else:
+        template = words["attentionCode"][item["code"]]
+    sentence = template.format(**values)
+    if item["code"] == "awaiting_merge" and item["pull_request"] is not None:
+        sentence += " " + words["text"]["awaitingMergePullRequest"].format(n=item["pull_request"])
+    return sentence
+
+
+def focused_checkouts_target(page):
+    """What holds focus, described by the fields the view's rows carry."""
+    return page.evaluate("""() => {
+      const el = document.activeElement;
+      const row = el.closest('tr.checkouts-clone');
+      return {
+        tag: el.tagName,
+        cls: el.className,
+        branch: el.dataset.branch || null,
+        worktree: el.dataset.worktree || null,
+        clone: row === null ? null : row.dataset.clone,
+        packagePath: el.dataset.packagePath || null,
+        expanded: el.getAttribute('aria-expanded'),
+      };
+    }""")
+
+
+def focused_inside_viewport(page):
+    """Whether the focused element lies below the sticky toolbar and above the fold."""
+    box = page.evaluate("""() => {
+      const rect = document.activeElement.getBoundingClientRect();
+      return {
+        top: rect.top, bottom: rect.bottom, height: window.innerHeight,
+        bar: document.querySelector('.toolbar').getBoundingClientRect().bottom,
+      };
+    }""")
+    return box["top"] >= box["bar"] - 1 and box["bottom"] <= box["height"] + 1
+
+
+def test_checkouts_attention_list_follows_the_document(open_page, attention_checkouts):
+    """Items equal the served array in order, with class headings and served counts."""
+    document = attention_checkouts.document
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    items = page.locator("#checkouts-body .checkouts-attention li[data-code]")
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"]]
+    # A class heading appears exactly where the class changes in document order.
+    classes = []
+    for item in document["attention"]:
+        if not classes or classes[-1] != item["class"]:
+            classes.append(item["class"])
+    headings = page.locator("#checkouts-body .checkouts-attention .checkouts-attention-class")
+    assert headings.evaluate_all("nodes => nodes.map(node => node.dataset.class)") == classes
+    assert headings.all_inner_texts() == [
+        checkout_words()["attentionClass"][name] for name in classes]
+    assert page.locator(".checkouts-attention h2").inner_text() == "Needs attention"
+    # Each item reads its words with the served count.
+    texts = items.evaluate_all(
+        "rows => rows.map(row => row.querySelector("
+        "'button.checkouts-attention-go, .checkouts-attention-words').innerText)")
+    assert texts == [attention_words(item) for item in document["attention"]]
+    assert texts[0] == "topic-a in Repo Clone 2 has 1 commit not on the remote"
+    assert texts[4] == "topic-g is finished but not merged"
+    # Items that name a clone or repository are controls; one that names only a
+    # work item is text with that work item's Show on board.
+    kinds = items.evaluate_all("rows => rows.map(row => row.dataset.attentionKind)")
+    assert kinds == ["branch", "branch", "clone", "worktree", "package-branch", "clone",
+                     "clone", "work-items", "clone"]
+    missing = page.locator('li[data-code="target_repo_missing"]')
+    assert missing.locator("button.checkouts-attention-go").count() == 0
+    assert missing.locator("[data-show-on-board]").get_attribute("data-show-on-board") == \
+        "Repo/Drafts/zeta"
+
+
+def test_checkouts_attention_counts_read_singular_at_one_and_plural_otherwise(
+    open_page, attention_checkouts
+):
+    """Each counted code says "1 commit" at one and "2 commits" at two."""
+    document = copy.deepcopy(attention_checkouts.document)
+    by_code = {item["code"]: item for item in document["attention"]}
+    # The default-branch item has no row in this world; it reuses an item's destination.
+    by_code["default_branch_ahead"] = copy.deepcopy(by_code["branch_unpushed"])
+    by_code["default_branch_ahead"]["code"] = "default_branch_ahead"
+    expected = {
+        "branch_unpushed": ("topic-a in Repo Clone 2 has {} not on the remote",
+                            "commit"),
+        "default_branch_ahead": ("default branch topic-a in Repo Clone 2 has {} not on the remote",
+                                 "commit"),
+        "stash": ("Repo Clone 3 has {}", "stash"),
+        "uncommitted_changes": ("linked has {}", "uncommitted change"),
+        "removable": ("Repo Clone 2 has {} ready to remove", "branch or worktree"),
+        "base_moved": ("the base of Repo/Drafts/alpha moved {} past its Baseline", "commit"),
+    }
+    plurals = {"commit": "commits", "stash": "stashes",
+               "uncommitted change": "uncommitted changes",
+               "branch or worktree": "branches or worktrees"}
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    for count in (1, 2, 5):
+        variant = copy.deepcopy(document)
+        variant["attention"] = []
+        for code in expected:
+            item = copy.deepcopy(by_code[code])
+            item["count"] = count
+            variant["attention"].append(item)
+        serve_checkouts(page, double, redigest(variant))
+        for code, (template, noun) in expected.items():
+            phrase = f"1 {noun}" if count == 1 else f"{count} {plurals[noun]}"
+            sentence = page.locator(
+                f'li[data-code="{code}"]').first.inner_text()
+            assert sentence == template.format(phrase), (code, count)
+
+
+def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
+    open_page, attention_checkouts
+):
+    """A finished item with an open pull request names it."""
+    def open_pull_request(document):
+        package = next(item for item in document["packages"]
+                       if item["package_path"] == "Repo/Shipped/gamma")
+        status = package["code_status"]
+        status["state"] = "pr_open"
+        status["pull_request"] = 7
+        status["push"] = "pushed"
+        status["text"] = models.code_status_text(status)
+
+    document = checkout_variant(attention_checkouts.document, open_pull_request)
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    sentence = page.locator('li[data-code="awaiting_merge"] button').inner_text()
+    assert sentence == "topic-g is finished but not merged (pull request #7)"
+    assert sentence == attention_words(
+        next(item for item in document["attention"] if item["code"] == "awaiting_merge"))
+
+
+def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
+    open_page, attention_checkouts
+):
+    """Enter on an item opens, unfolds and focuses what it names, in view."""
+    document = attention_checkouts.document
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+
+    def press(code):
+        page.locator(f'li[data-code="{code}"] button').press("Enter")
+
+    press("branch_unpushed")
+    clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    assert page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]').is_visible()
+    assert focused_checkouts_target(page)["branch"] == "topic-a"
+    assert "checkouts-clone-branch" in focused_checkouts_target(page)["cls"]
+    assert focused_inside_viewport(page)
+
+    press("uncommitted_changes")
+    target = focused_checkouts_target(page)
+    assert (target["worktree"], target["cls"]) == ("linked", "checkouts-worktree")
+    assert focused_inside_viewport(page)
+
+    press("never_fetched")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"], target["expanded"]) == (
+        "Repo Clone 10", "checkouts-toggle", "false")
+    assert focused_inside_viewport(page)
+
+    press("awaiting_merge")
+    target = focused_checkouts_target(page)
+    assert (target["branch"], target["cls"]) == ("topic-g", "checkouts-branch")
+    assert page.evaluate("document.activeElement.closest('table').className") == \
+        "checkouts-package-branches"
+    assert focused_inside_viewport(page)
+
+    # A clone-only item focuses that clone's toggle without opening it.
+    for code, name in (("stash", "Repo Clone 3"), ("removable", "Repo Clone 2"),
+                       ("base_moved", "Repo Clone 2")):
+        press(code)
+        target = focused_checkouts_target(page)
+        assert (target["clone"], target["cls"]) == (name, "checkouts-toggle"), code
+
+    # An item that names only a work item moves nothing.
+    page.locator('li[data-code="target_repo_missing"] .checkouts-attention-words').click()
+    assert focused_checkouts_target(page)["cls"] != "checkouts-attention-go"
+    before = focused_checkouts_target(page)
+    page.locator('li[data-code="target_repo_missing"] .checkouts-attention-words').click()
+    assert focused_checkouts_target(page) == before
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+
+    # Without a finished stage, the policy item is words and no control.
+    serve_checkouts(page, double, attention_checkouts.document_no_finished)
+    policy = page.locator('li[data-code="finished_stages_not_configured"]')
+    assert policy.inner_text() == (
+        "No stage counts as finished; choose one under Counts as finished in Board settings")
+    assert policy.locator("button, a, [tabindex]").count() == 0
+
+
+def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
+    open_page, attention_checkouts
+):
+    """A clone that cannot be read, or a worktree at the clone's own path, focuses the clone row."""
+    page, double = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+
+    def unreadable(document):
+        _, clone = checkout_clone(document, "Repo Clone 10")
+        set_clone_status(clone, "failed")
+
+    serve_checkouts(page, double, checkout_variant(attention_checkouts.document, unreadable))
+    page.locator('li[data-code="checkout_unavailable"] button').press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"]) == ("Repo Clone 10", "checkouts-clone")
+    assert page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 10"] .checkouts-toggle').count() == 0
+
+    def own_worktree(document):
+        _, clone = checkout_clone(document, "Repo Clone 3")
+        main = next(worktree for worktree in clone["worktrees"] if worktree["main"])
+        main["changes"]["untracked"] = 2
+
+    variant = checkout_variant(attention_checkouts.document, own_worktree)
+    serve_checkouts(page, double, variant)
+    page.locator('li[data-code="uncommitted_changes"]').filter(
+        has_text="Repo Clone 3 has 2 uncommitted changes").locator("button").press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["clone"], target["cls"]) == ("Repo Clone 3", "checkouts-clone")
+
+
+def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
+    open_page, attention_checkouts
+):
+    """A branch behind a fold is shown, with its fold open, when an item names it."""
+    def mismatch(document):
+        _, clone = checkout_clone(document, "Repo Clone 2")
+        next(branch for branch in clone["branches"]
+             if branch["name"] == "topic-a-part")["upstream_mismatch"] = True
+
+    document = checkout_variant(attention_checkouts.document, mismatch)
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    page.locator('li[data-code="upstream_mismatch"] button').press("Enter")
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "topic-a-part"
+    assert page.locator('tr.checkouts-clone-branch[data-branch="topic-a"] '
+                        '.checkouts-fold-toggle').get_attribute("aria-expanded") == "true"
+    assert focused_inside_viewport(page)
+
+
+def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
+    open_page, attention_checkouts
+):
+    """Every item stays listed under a search; moving to a hidden destination clears it."""
+    document = attention_checkouts.document
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    page.fill("#filter", "zzz")
+    items = page.locator("#checkouts-body li[data-code]")
+    assert items.count() == len(document["attention"])
+    assert page.locator(".checkouts-group").evaluate_all(
+        "groups => groups.map(group => group.hidden)") == [True]
+    page.locator('li[data-code="branch_unpushed"] button').press("Enter")
+    assert page.locator("#filter").input_value() == ""
+    assert page.locator(".checkouts-group").evaluate_all(
+        "groups => groups.map(group => group.hidden)") == [False]
+    assert focused_checkouts_target(page)["branch"] == "topic-a"
+
+    # The package-branch destination clears it the same way.
+    page.fill("#filter", "zzz")
+    page.locator('li[data-code="awaiting_merge"] button').press("Enter")
+    assert page.locator("#filter").input_value() == ""
+    assert focused_checkouts_target(page)["branch"] == "topic-g"
+    assert items.count() == len(document["attention"])
+
+
+def share_a_branch_between_two_checkouts(document):
+    """``topic-merged`` held by the main worktree and the linked one."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    branch = next(item for item in clone_two["branches"] if item["name"] == "topic-merged")
+    branch["checked_out_in"] = [worktree["path"] for worktree in clone_two["worktrees"]]
+
+
+def open_clone_detail(page, name):
+    """Open one clone row from its toggle and return its detail row."""
+    row = page.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+    row.locator(".checkouts-toggle").click()
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    playwright.expect(detail).to_be_visible()
+    return detail
+
+
+def served_verdict_words(group, verdict):
+    """The words a served merge verdict must read, from the view's own block."""
+    words = checkout_words()
+    state = words["verdictState"][verdict["state"]]
+    if verdict["state"] == "merged" and verdict["rung"] not in (None, "none"):
+        rung = words["verdictRung"][verdict["rung"]].format(
+            default=group["default_branch"]["name"], n=verdict["pull_request"] or "")
+        return f"{state} — {rung}"
+    return state
+
+
+def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items(
+    open_page, attention_checkouts
+):
+    """An opened clone shows its path, branch table, folds, blockers and work items."""
+    document = attention_checkouts.document
+    group, clone = checkout_clone(document, "Repo Clone 2")
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    assert not detail.is_visible()
+    detail = open_clone_detail(page, "Repo Clone 2")
+    assert detail.locator(".checkouts-clone-path-value").inner_text() == clone["path"]
+
+    # The branch table follows the document's order; a branch another branch's
+    # tip holds is folded under it until the fold is opened.
+    rows = detail.locator("tr.checkouts-clone-branch")
+    assert rows.evaluate_all("rows => rows.map(row => row.dataset.branch)") == [
+        branch["name"] for branch in clone["branches"]]
+    assert detail.locator("th[scope=col]").all_inner_texts()[:6] == [
+        "Branch", "Checked out in", "Tip", "Remote", "Verdict", "Cleanup"]
+    part = detail.locator('tr[data-branch="topic-a-part"]')
+    assert not part.is_visible()
+    fold = detail.locator('tr[data-branch="topic-a"] .checkouts-fold-toggle')
+    assert fold.inner_text() == "Folded branches (1)"
+    fold.click()
+    assert part.is_visible()
+    assert fold.get_attribute("aria-expanded") == "true"
+    fold.click()
+    assert not part.is_visible()
+    assert fold.get_attribute("aria-expanded") == "false"
+
+    # "Checked out in" names every checkout that holds a branch, and a dash for none.
+    def holders(name):
+        return detail.locator(f'tr[data-branch="{name}"] td').first.evaluate(
+            "cell => [...cell.childNodes].filter(node => node.nodeType === 3 || "
+            "!node.classList.contains('cell-label')).map(node => node.textContent).join('')")
+
+    assert [holders(name) for name in ("topic-a", "trunk", "wt-branch")] == [
+        "—", "Repo Clone 2", "linked"]
+    assert all(holders(branch["name"]) == "—" for branch in clone["branches"]
+               if not branch["checked_out_in"])
+    shared = checkout_variant(document, share_a_branch_between_two_checkouts)
+    serve_checkouts(page, double, shared)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    assert holders("topic-merged") == "Repo Clone 2 · linked"
+    serve_checkouts(page, double, document)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+
+    # Each verdict reads the words of its served verdict, with its base's basis.
+    for branch in clone["branches"]:
+        cell = detail.locator(f'tr[data-branch="{branch["name"]}"] td.checkouts-verdict')
+        if branch["verdict"] is None:
+            assert cell.inner_text() == "—", branch["name"]
+            continue
+        assert cell.locator(".checkouts-verdict-words").inner_text() == \
+            served_verdict_words(group, branch["verdict"]), branch["name"]
+        assert cell.locator(".checkouts-basis").inner_text() == checkout_words()[
+            "comparisonBasis"][clone["verdict_base"]["basis"]], branch["name"]
+    words_of = {
+        name: detail.locator(f'tr[data-branch="{name}"] .checkouts-verdict-words').inner_text()
+        for name in ("topic-a", "topic-merged", "topic-squash")
+    }
+    assert words_of == {
+        "topic-a": "not merged",
+        "topic-merged": "merged — tip is in trunk",
+        "topic-squash": "merged — every change is in trunk",
+    }
+
+    # Cleanup names what blocks a branch or linked worktree, and Removable otherwise.
+    cleanup = {
+        name: detail.locator(f'tr[data-branch="{name}"] .checkouts-branch-cleanup').inner_text()
+        for name in ("topic-a", "topic-merged", "wt-branch")
+    }
+    assert cleanup == {
+        "topic-a": "not merged", "topic-merged": "Removable",
+        "wt-branch": "its worktree has changes",
+    }
+    assert detail.locator(
+        'tr.checkouts-detail-worktree[data-worktree="linked"] .checkouts-worktree-cleanup'
+    ).inner_text() == "has changes"
+
+    # The work items the clone serves: how each matched, its served Code Status text.
+    served = {item["package_path"]: item for item in document["packages"]}
+    items = detail.locator("li.checkouts-clone-work-item")
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.package)") == [
+        "Repo/Drafts/alpha", "Repo/Shipped/gamma"]
+    alpha = detail.locator('li[data-package="Repo/Drafts/alpha"]')
+    assert alpha.locator(".checkouts-basis").inner_text() == \
+        "(Target repo, folded into this branch)"
+    assert alpha.locator(".checkouts-code-status").inner_text() == \
+        served["Repo/Drafts/alpha"]["code_status"]["text"]
+    gamma = detail.locator('li[data-package="Repo/Shipped/gamma"]')
+    assert gamma.locator(".checkouts-basis").inner_text() == "(Target repo)"
+    assert gamma.locator(".checkouts-code-status").inner_text() == "awaiting merge (no PR)"
+
+
+def test_checkouts_show_on_board_selects_without_toggling_and_a_card_click_still_toggles(
+    open_page, attention_checkouts
+):
+    """The expanded row's action selects, focuses and shows the card; repeating keeps it."""
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('li[data-package="Repo/Drafts/alpha"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    card = page.locator('.card[data-package-path="Repo/Drafts/alpha"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/alpha"
+    assert focused_inside_viewport(page)
+
+    # Doing it again leaves the card selected.
+    show_checkouts_view(page)
+    page.locator('tr.checkouts-detail li[data-package="Repo/Drafts/alpha"] '
+                 '[data-show-on-board]').click()
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert card.get_attribute("aria-pressed") == "true"
+
+    # The card's own click keeps its toggle.
+    card.click()
+    assert card.get_attribute("aria-pressed") == "false"
+    assert "selected" not in (card.get_attribute("class") or "").split()
+    card.click()
+    assert card.get_attribute("aria-pressed") == "true"
+
+
+def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
+    open_page, attention_checkouts
+):
+    """A search that hides the work item's card is cleared before the board shows."""
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document)
+    page.fill("#filter", "zzz")
+    page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.locator("#filter").input_value() == ""
+    card = page.locator('.card[data-package-path="Repo/Drafts/zeta"]')
+    playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
+    assert card.is_visible()
+    assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/zeta"
+
+
+def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
+    open_page, attention_checkouts
+):
+    """Where the card cannot be shown the view stays and says why; the preference is left alone."""
+    document = attention_checkouts.document
+    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    key = "spec-tracker-hide-terminal-rows"
+    stored = page.evaluate("key => window.localStorage.getItem(key)", key)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('li[data-package="Repo/Shipped/gamma"] [data-show-on-board]').click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    playwright.expect(page.locator("#board")).to_be_hidden()
+    assert page.locator("#checkouts-action-status").inner_text() == (
+        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
+    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
+    assert page.evaluate("key => window.localStorage.getItem(key)", key) == stored
+
+    # A work item the displayed catalog does not hold.
+    other, _ = open_attention_checkouts(
+        open_page, attention_checkouts, document, catalog=attention_checkouts.catalog)
+    stored = other.evaluate("key => window.localStorage.getItem(key)", key)
+    other.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+    playwright.expect(other.locator("#checkouts")).to_be_visible()
+    playwright.expect(other.locator("#board")).to_be_hidden()
+    assert other.locator("#checkouts-action-status").inner_text() == (
+        "This work item is not on the displayed board; choose Refresh view on the board.")
+    assert other.evaluate("key => window.localStorage.getItem(key)", key) == stored
+
+
+class HexRevisionSettings(BrowserSettings):
+    """Board settings whose saved revision is one a checkout document can carry."""
+
+    def save_settings(self, revision, order, completed):
+        result = super().save_settings(revision, order, completed)
+        if result["outcome"] == "success":
+            self.revision = result["revision"] = "2" * 64
+        return result
+
+
+SETTINGS_SENTENCE = "Collected under different settings from the board shown."
+
+
+def open_settings_checkouts(launch, attention_checkouts, document, *, client=None, settings=None):
+    """Open the checkouts view over a board whose settings the page can save."""
+    double = BrowserCheckouts(document)
+    settings = settings or HexRevisionSettings(completed=["Shipped"], revision=CHECKOUTS_REVISION)
+    page = launch(
+        client or StaticClient(attention_checkouts.catalog_all),
+        settings=settings, checkouts=double, fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page, double, settings
+
+
+def test_checkouts_settings_sentence_follows_a_board_settings_save(
+    open_page, attention_checkouts
+):
+    """A save changes the board's revision, not the scan: the scan stays and says so."""
+    document = attention_checkouts.document
+    page, double, settings = open_settings_checkouts(open_page, attention_checkouts, document)
+    line = page.locator("#checkouts-status-line")
+    items = page.locator("#checkouts-body li[data-code]")
+    groups = page.locator("#checkouts-body .checkouts-group")
+    assert SETTINGS_SENTENCE not in line.inner_text()
+    assert items.count() == len(document["attention"])
+    assert groups.count() == 1
+    local_state = line.locator("time").first.inner_text()
+
+    page.locator("#stage-order-editor summary").click()
+    page.get_by_role("checkbox", name="Counts as finished: Shipped").uncheck()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
+    assert settings.revision == "2" * 64
+    playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
+    assert line.inner_text().count(SETTINGS_SENTENCE) == 1
+    assert items.count() == len(document["attention"])
+    assert groups.count() == 1
+    assert line.locator("time").first.inner_text() == local_state
+
+    # The next tick still serves the old document, so the sentence stays.
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert line.inner_text().count(SETTINGS_SENTENCE) == 1
+    assert items.count() == len(document["attention"])
+    assert line.locator("time").first.inner_text() == local_state
+
+    # A capture collected under the new revision clears it.
+    double.serve(checkouts_with_revision(document, "2" * 64))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert SETTINGS_SENTENCE not in line.inner_text()
+    assert items.count() == len(document["attention"])
+
+
+def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
+    open_page, attention_checkouts
+):
+    """With no catalog displayed there is no revision to match, and the scan still renders."""
+    document = attention_checkouts.document
+    client = SequenceClient([CatalogError("producer_unavailable")])
+    page, _, _ = open_settings_checkouts(
+        open_page, attention_checkouts, document, client=client)
+    line = page.locator("#checkouts-status-line")
+    playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
+    assert page.locator("#checkouts-body li[data-code]").count() == len(document["attention"])
+    assert page.locator("#checkouts-body .checkouts-group").count() == 1
+
+
+def covered_card_clearance(page):
+    """How far the focused card's edges lie outside the area the sticky heads leave."""
+    return page.evaluate("""() => {
+      const rect = document.activeElement.getBoundingClientRect();
+      let covered = 0;
+      document.querySelectorAll('.toolbar, .board-corner, .column-head').forEach((head) => {
+        covered = Math.max(covered, head.getBoundingClientRect().bottom);
+      });
+      return {top: rect.top, bottom: rect.bottom, covered, height: window.innerHeight,
+              scrolled: window.scrollY, path: document.activeElement.dataset.packagePath};
+    }""")
+
+
+def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
+    open_page, attention_checkouts, tmp_path
+):
+    """Whether the card lies above or below the window, it ends fully below the heads."""
+    spec_root = tmp_path / "tall-root"
+    _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
+    _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
+    for number in range(60):
+        _package_spec(spec_root, "Drafts", f"filler-{number:02d}",
+                      f"123e4567-e89b-42d3-a456-4266141750{number:02d}", [])
+    catalog = json.loads(scan_catalog(
+        spec_root, completed_stage_names=["Shipped"],
+        configuration_revision=CHECKOUTS_REVISION,
+    ))
+    page, _ = open_attention_checkouts(
+        open_page, attention_checkouts, attention_checkouts.document, catalog=catalog)
+    page.locator("#view-board").click()
+    assert page.evaluate("document.documentElement.scrollHeight") > 3 * 720
+
+    for target, scroll_to in (("Repo/Drafts/alpha", "bottom"), ("Repo/Drafts/zeta", "top")):
+        page.locator("#view-board").click()
+        page.evaluate(
+            "where => window.scrollTo(0, where === 'bottom' ? document.documentElement.scrollHeight : 0)",
+            scroll_to)
+        show_checkouts_view(page)
+        if target == "Repo/Drafts/zeta":
+            page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
+        else:
+            detail = open_clone_detail(page, "Repo Clone 2")
+            detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
+        playwright.expect(page.locator("#board")).to_be_visible()
+        # The checkouts toolbar is shorter than the board's, so the heads settle
+        # lower once the switch is painted; the card must clear where they end.
+        settle_frames(page)
+        box = covered_card_clearance(page)
+        assert box["path"] == target
+        assert box["top"] >= box["covered"], (target, box)
+        assert box["bottom"] <= box["height"], (target, box)
+
+
+# ---------------------------------------------------------------------------
+# In-place refresh, the narrow layout and accessibility
+# ---------------------------------------------------------------------------
+
+
+def folded_variant(document):
+    """The capture with the ``outside`` branch of Repo Clone 2 folded under ``topic-a``."""
+    def fold(value):
+        _, clone = checkout_clone(value, "Repo Clone 2")
+        next(branch for branch in clone["branches"]
+             if branch["name"] == "outside")["contained_in"] = "topic-a"
+
+    return checkout_variant(document, fold)
+
+
+def with_observed_at(document, observed_at):
+    """The same capture with one observation time; the digest does not cover it."""
+    changed = copy.deepcopy(document)
+    changed["observed_at"] = observed_at
+    return changed
+
+
+def observe_checkouts_mutations(page):
+    """Record every DOM change inside ``#checkouts`` with the keyed blocks it touches.
+
+    A change to a node's own text or attributes belongs to the block it sits in;
+    a node added or removed is itself the block.  The status line and the
+    action status are told apart, because only the status line may change.
+    """
+    page.evaluate("""() => {
+      window.checkoutsRecords = [];
+      const status = document.querySelector('#checkouts-status-line');
+      const action = document.querySelector('#checkouts-action-status');
+      const own = (node) => {
+        const element = node.nodeType === 1 ? node : node.parentElement;
+        if (element === null) return null;
+        const block = element.closest('[data-key]');
+        return block === null ? null : block.getAttribute('data-key');
+      };
+      new MutationObserver((records) => {
+        for (const record of records) {
+          const moved = [...record.addedNodes, ...record.removedNodes];
+          window.checkoutsRecords.push({
+            status: status.contains(record.target),
+            action: action.contains(record.target),
+            attribute: record.type === 'attributes' ? record.attributeName : null,
+            keys: record.type === 'childList' ? moved.map(own) : [own(record.target)],
+          });
+        }
+      }).observe(document.querySelector('#checkouts'),
+        {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+
+def checkouts_records(page, *, with_attribute=False):
+    """The records seen since the last call, as ``(status, action, keys)`` tuples.
+
+    ``with_attribute`` appends the changed attribute's name (None for a text or
+    node change) as a fourth item.
+    """
+    records = page.evaluate(
+        "() => window.checkoutsRecords.splice(0, window.checkoutsRecords.length)")
+    if with_attribute:
+        return [(item["status"], item["action"], item["keys"], item["attribute"])
+                for item in records]
+    return [(item["status"], item["action"], item["keys"]) for item in records]
+
+
+def checkouts_focus(page):
+    """The focused element's key and control, or None outside a keyed block."""
+    return page.evaluate("""() => {
+      const el = document.activeElement;
+      return {key: el.getAttribute('data-key'), control: el.getAttribute('data-control'),
+              tag: el.tagName, cls: el.className, id: el.id};
+    }""")
+
+
+def open_clone_two_state(page):
+    """Open the quiet row, Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
+
+    Returns the toggle's key and control.
+    """
+    page.set_viewport_size({"width": 1280, "height": 600})
+    page.locator("details.checkouts-quiet > summary").click()
+    detail = open_clone_detail(page, "Repo Clone 2")
+    fold = detail.locator(".checkouts-fold-toggle")
+    assert fold.count() == 1
+    fold.click()
+    assert fold.get_attribute("aria-expanded") == "true"
+    toggle = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-toggle')
+    toggle.focus()
+    page.evaluate("window.scrollTo(0, 200)")
+    assert page.evaluate("window.scrollY") == 200
+    return checkouts_focus(page)
+
+
+def assert_clone_two_state_kept(page, focus, scroll=200):
+    """The quiet row, the row, its fold, the focus and the scroll are as they were."""
+    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    assert detail.evaluate("el => el.hidden") is False
+    fold = detail.locator(".checkouts-fold-toggle")
+    assert fold.get_attribute("aria-expanded") == "true"
+    assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
+    assert checkouts_focus(page) == focus
+    assert page.evaluate("window.scrollY") == scroll
+
+
+def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
+    open_page, view_checkouts
+):
+    """A tick replaces only the blocks that changed and keeps what the reader did."""
+    before = folded_variant(view_checkouts.document_topic_committed)
+    after = with_observed_at(
+        folded_variant(view_checkouts.document_topic_recommitted), before["observed_at"])
+    clone_path = checkout_clone(before, "Repo Clone 2")[1]["path"]
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    focus = open_clone_two_state(page)
+    assert focus["control"] == "toggle" and json.loads(focus["key"]) == ["clone", clone_path]
+    held = page.evaluate_handle("document.activeElement")
+    arm_focus_sampler(page)
+    observe_checkouts_mutations(page)
+    pushed = page.locator("#checkouts-action-status").inner_text()
+
+    # Two ticks over an unchanged document change nothing but the status line.
+    for _ in range(2):
+        serve_checkouts(page, double, before)
+        records = checkouts_records(page)
+        assert records and all(status for status, _, _ in records), records
+        assert held.evaluate("node => node === document.activeElement")
+        assert_clone_two_state_kept(page, focus)
+
+    # One more commit on topic-a updates Repo Clone 2's blocks alone.
+    row = page.locator('tr.checkouts-clone-branch[data-branch="topic-a"]')
+    assert "1 ahead" in row.locator(".checkouts-remote-state").inner_text()
+    old_tip = row.locator(".checkouts-tip").inner_text()
+    serve_checkouts(page, double, after)
+    records = checkouts_records(page, with_attribute=True)
+    outside = [(keys, attribute) for status, _, keys, attribute in records if not status]
+    assert outside, "the new commit changed no block"
+    # The group's search words follow the served Code Status text and HEAD
+    # words, so its own search attribute is the one write a group block takes;
+    # every other change sits in a block of Repo Clone 2.
+    assert all(
+        keys and all(
+            key is not None and (clone_path in json.loads(key) or (
+                json.loads(key)[0] == "group" and attribute == "data-search"))
+            for key in keys)
+        for keys, attribute in outside), outside
+    assert "2 ahead" in row.locator(".checkouts-remote-state").inner_text()
+    assert row.locator(".checkouts-tip").inner_text() != old_tip
+    assert_clone_two_state_kept(page, focus)
+    assert page.locator("#checkouts-action-status").inner_text() == pushed
+    assert all(not action for _, action, _, _ in records)
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
+    open_page, view_checkouts
+):
+    """A removed row hands focus to the next row toggle, else the group heading."""
+    before = view_checkouts.document_topic_committed
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    detail = open_clone_detail(page, "Repo Clone 2")
+    detail.locator('tr[data-branch="topic-a"]').focus()
+    arm_focus_sampler(page)
+
+    # The tick that deletes the focused branch row moves focus to the next row
+    # toggle in the group, Repo Clone 3's.
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator('tr[data-branch="topic-a"].checkouts-clone-branch').count() == 0
+    focus = checkouts_focus(page)
+    assert focus["control"] == "toggle"
+    assert json.loads(focus["key"]) == ["clone", checkout_clone(before, "Repo Clone 3")[1]["path"]]
+    assert_focus_sampler_clean(page)
+
+    # The tick that removes the group's last row moves it to the group heading.
+    page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 10"] .checkouts-toggle').focus()
+
+    def without_last_clone(document):
+        group = checkout_group(document, "remote")
+        group["clones"] = [item for item in group["clones"]
+                           if not item["path"].endswith("Repo Clone 10")]
+
+    serve_checkouts(page, double, checkout_variant(before, without_last_clone))
+    assert page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]').count() == 0
+    focus = page.evaluate("""() => ({
+      head: document.activeElement.classList.contains('checkouts-group-head'),
+      group: document.activeElement.closest('.checkouts-group').dataset.checkoutsGroup,
+    })""")
+    assert focus["head"] is True
+    assert focus["group"] == checkout_group(before, "remote")["remote"]["key"]
+    assert_focus_sampler_clean(page)
+
+    # With no group left the view's own heading takes it.
+    serve_checkouts(page, double, view_checkouts.document_no_git)
+    assert page.evaluate("document.activeElement.id") == "checkouts-heading"
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failure(
+    open_page, view_checkouts
+):
+    """The mismatch sentence comes and goes, and a failed outcome returns, with state kept."""
+    before = folded_variant(view_checkouts.document_topic_committed)
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    focus = open_clone_two_state(page)
+    sentence = "Collected under different settings from the board shown."
+    line = page.locator("#checkouts-status-line")
+    # The status row straddles the window's top edge, so its line is the first
+    # thing fully in view; the sentence wraps the row and moves that line up.
+    scroll = page.evaluate("""() => {
+      const row = document.querySelector('.checkouts-status').getBoundingClientRect();
+      window.scrollTo(0, Math.ceil(row.top + window.scrollY) + 4);
+      return window.scrollY;
+    }""")
+    line_top = line.evaluate("el => el.getBoundingClientRect().top")
+    assert 0 <= line_top < 20
+    arm_focus_sampler(page)
+    observe_checkouts_mutations(page)
+
+    # A revision that differs from the board's adds the sentence; the same
+    # revision clears it.  Neither touches a block.
+    double.serve(checkouts_with_revision(before, "2" * 64))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert sentence in line.inner_text()
+    assert_clone_two_state_kept(page, focus, scroll)
+    assert line.evaluate("el => el.getBoundingClientRect().top") < line_top
+    serve_checkouts(page, double, before)
+    assert sentence not in line.inner_text()
+    assert_clone_two_state_kept(page, focus, scroll)
+    assert all(status for status, _, _ in checkouts_records(page))
+
+    # A failed outcome shows the failed panel in place of the view; the next
+    # ready one restores the open row, its fold and the quiet row.
+    double.fail("checkouts_timeout")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert page.locator(".checkouts-group").count() == 0
+    assert page.locator("details.checkouts-quiet").count() == 0
+    assert page.evaluate("document.activeElement.id") == "checkouts-heading"
+    serve_checkouts(page, double, before)
+    assert page.locator(".checkouts-panel").count() == 0
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    detail = row.locator("xpath=following-sibling::tr[1]")
+    assert detail.evaluate("el => el.hidden") is False
+    assert detail.locator(".checkouts-fold-toggle").get_attribute("aria-expanded") == "true"
+    assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
+    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
+    open_page, view_checkouts
+):
+    """A row the document drops is not reopened if it returns later."""
+    before = view_checkouts.document_topic_committed
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    open_clone_detail(page, "Repo Clone 3")
+
+    def without_clone_three(document):
+        group = checkout_group(document, "remote")
+        group["clones"] = [item for item in group["clones"]
+                           if not item["path"].endswith("Repo Clone 3")]
+
+    serve_checkouts(page, double, checkout_variant(before, without_clone_three))
+    assert page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]').count() == 0
+    serve_checkouts(page, double, before)
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]')
+    assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "false"
+    assert row.locator("xpath=following-sibling::tr[1]").evaluate("el => el.hidden") is True
+
+
+def long_name_variant(view_checkouts):
+    """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
+    document = view_checkouts.document_topic_committed
+    clone_ten = checkout_clone(document, "Repo Clone 10")[1]["path"]
+    long_path = str(Path(clone_ten).with_name("RepoClone" + "x" * 291))
+    rendered = json.dumps(document).replace(json.dumps(clone_ten), json.dumps(long_path))
+    rendered = rendered.replace('"topic-a"', json.dumps("p" * 300))
+    variant = reseal_checkouts(json.loads(rendered))
+    models.parse_checkouts(json.dumps(variant))
+    return variant
+
+
+def open_every_clone_row(page):
+    """Open each clone row's detail from its toggle."""
+    for toggle in page.locator("#checkouts-body .checkouts-toggle").all():
+        toggle.click()
+
+
+def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
+    open_page, view_checkouts
+):
+    """Stacked at 360 px, tabular from 701 px, with table roles throughout."""
+    document = long_name_variant(view_checkouts)
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
+               "Tree", "Branches", "Cleanup", "Package"]
+    for theme in ("dark", "light"):
+        page.get_by_label("Theme", exact=True).select_option(theme)
+
+        page.set_viewport_size({"width": 360, "height": 800})
+        open_every_clone_row(page)
+        settle_frames(page)
+        assert page.evaluate("""() => [document.documentElement.scrollWidth,
+          document.documentElement.clientWidth]""") == [360, 360]
+        row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        labels = row.evaluate("""el => [...el.children].map(cell => {
+          const label = cell.firstElementChild;
+          const value = document.createRange();
+          value.setStartAfter(label);
+          value.setEnd(cell, cell.childNodes.length);
+          const shown = getComputedStyle(label);
+          return {
+            text: label.textContent, label: label.className, display: shown.display,
+            visibility: shown.visibility, before: label.getBoundingClientRect().bottom,
+            value: value.getBoundingClientRect().top,
+            hasValue: cell.textContent.trim().length > label.textContent.trim().length,
+          };
+        })""")
+        assert [item["text"] for item in labels] == columns
+        for item in labels:
+            assert item["label"] == "cell-label" and item["display"] == "block"
+            assert item["visibility"] == "visible"
+            assert item["hasValue"] and item["before"] <= item["value"] + 1, item
+        for role, count in (("table", 1), ("row", 1), ("columnheader", 8), ("cell", 1)):
+            assert page.get_by_role(role).count() >= count, role
+        assert page.get_by_role("columnheader", name="Default branch vs remote").count() >= 1
+        assert page.get_by_role("cell").filter(has_text="3 branches").count() >= 1
+
+        # The long names wrap inside their cells instead of widening the view.
+        inside = page.evaluate("""() => [...document.querySelectorAll('#checkouts td, #checkouts th')]
+          .filter(cell => /p{300}|x{291}/.test(cell.textContent))
+          .map(cell => ({tag: cell.tagName, scroll: cell.scrollWidth, client: cell.clientWidth,
+                         right: cell.getBoundingClientRect().right}))""")
+        assert len(inside) >= 4, inside
+        assert all(item["scroll"] <= item["client"] + 1 and item["right"] <= 360.5
+                   for item in inside), inside
+
+        # At 701 px the names are visually hidden and the rows are tabular.
+        page.set_viewport_size({"width": 701, "height": 800})
+        settle_frames(page)
+        assert page.evaluate("""() => [...document.querySelectorAll('#checkouts .cell-label')]
+          .every(label => getComputedStyle(label).display === 'none')""") is True
+        assert page.evaluate("""() => document.querySelectorAll('#checkouts .cell-label').length""") > 0
+        assert row.evaluate("el => getComputedStyle(el).display") == "table-row"
+        assert row.evaluate("el => getComputedStyle(el.closest('table')).display") == "table"
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
+
+        # At 1600 px the same roles resolve and nothing scrolls sideways.
+        page.set_viewport_size({"width": 1600, "height": 900})
+        settle_frames(page)
+        for role in ("table", "row", "columnheader", "cell"):
+            assert page.get_by_role(role).count() >= 1, role
+        assert page.get_by_role("columnheader", name="Cleanup").count() >= 1
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
+
+
+CHECKOUTS_TEXT_SAMPLES = {
+    "status line": "#checkouts-status-line",
+    "column headers": "#checkouts th[scope=col]",
+    "cell values": (
+        "#checkouts-body td, #checkouts-body th[scope=row], .checkouts-basis, "
+        ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
+        ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
+        ".checkouts-quiet summary, .checkouts-quiet li"),
+    "attention items": (
+        ".checkouts-attention h2, .checkouts-attention-class, "
+        ".checkouts-attention-item, .checkouts-attention-go"),
+    "freshness words": ".checkouts-freshness",
+    "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
+}
+
+
+def checkouts_text_colors(page):
+    """Each sample's text color over the first opaque background behind it."""
+    return page.evaluate("""(samples) => {
+      const backdrop = (node) => {
+        for (let el = node; el; el = el.parentElement) {
+          const color = getComputedStyle(el).backgroundColor;
+          const channels = color.match(/[\\d.]+/g).map(Number);
+          if (channels.length === 3 || channels[3] === 1) return color;
+        }
+        return getComputedStyle(document.documentElement).backgroundColor;
+      };
+      const found = {};
+      for (const [name, selector] of Object.entries(samples)) {
+        const pairs = new Map();
+        for (const el of document.querySelectorAll(selector)) {
+          if (!el.getClientRects().length || !el.textContent.trim()) continue;
+          const color = getComputedStyle(el).color;
+          pairs.set(color + '|' + backdrop(el), el.textContent.trim().slice(0, 30));
+        }
+        found[name] = [...pairs].map(([pair, text]) => [...pair.split('|'), text]);
+      }
+      return found;
+    }""", CHECKOUTS_TEXT_SAMPLES)
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_checkouts_text_and_focus_rings_have_readable_contrast(
+    open_page, view_checkouts, theme
+):
+    """Text keeps 4.5:1 and every control's focus ring 3:1 in both themes."""
+    cached = folded_variant(view_checkouts.document_built)
+    setup = checkout_variant(
+        folded_variant(view_checkouts.document_checked), add_setup_problems(view_checkouts))
+    page, double = open_view_checkouts(open_page, view_checkouts, cached)
+    page.set_viewport_size({"width": 1600, "height": 1200})
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    open_every_clone_row(page)
+    detail = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]').locator(
+        "xpath=following-sibling::tr[1]")
+    detail.locator(".checkouts-fold-toggle").click()
+    # The cached capture shows the freshness words; the setup capture its panel.
+    shown = {}
+    for document in (cached, setup):
+        if document is setup:
+            serve_checkouts(page, double, setup)
+        settle_frames(page)
+        for name, pairs in checkouts_text_colors(page).items():
+            shown.setdefault(name, []).extend(pairs)
+    for name, pairs in shown.items():
+        assert pairs, f"nothing is shown for {name}"
+        for color, background, sample in pairs:
+            ratio = contrast_ratio(color, background)
+            assert ratio >= 4.5, (name, sample, color, background, ratio)
+
+    rings = {
+        "view switch": "#view-checkouts",
+        "row toggle": 'tr.checkouts-clone[data-clone="Repo Clone 3"] .checkouts-toggle',
+        "fold": ".checkouts-fold-toggle",
+        "attention item": ".checkouts-attention-go",
+        "Check remotes now": "#check-remotes",
+        "Show on board": ".checkouts-show-on-board",
+    }
+    for name, selector in rings.items():
+        # A key press makes the next script focus show as keyboard focus.
+        page.keyboard.press("Shift")
+        assert_focus_indicator(page.locator(selector).first), name
+
+
+def tab_until(page, probe):
+    """Press Tab, then Shift+Tab, until ``probe`` holds for the focused element."""
+    for key, limit in (("Tab", 80), ("Shift+Tab", 160)):
+        for _ in range(limit):
+            if page.evaluate(probe):
+                return
+            page.keyboard.press(key)
+    raise AssertionError(f"keyboard never reached {probe}")
+
+
+def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkouts):
+    """Tab, Shift+Tab, Enter and Space reach and operate each control."""
+    document = folded_variant(view_checkouts.document_topic_committed)
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    clone_two = checkout_clone(document, "Repo Clone 2")[1]["path"]
+    clone_three = checkout_clone(document, "Repo Clone 3")[1]["path"]
+    page.evaluate("document.activeElement.blur()")
+
+    # The view switch: Enter returns to the board and Space shows the view again,
+    # with focus staying on the pressed switch.
+    tab_until(page, "document.activeElement.id === 'view-board'")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#board")).to_be_visible()
+    tab_until(page, "document.activeElement.id === 'view-checkouts'")
+    page.keyboard.press("Space")
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    assert page.evaluate("document.activeElement.id") == "view-checkouts"
+
+    # Check remotes now: this provider has no remote check, and says so.
+    tab_until(page, "document.activeElement.id === 'check-remotes'")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#checkouts-action-status")).to_have_text(
+        "This server does not offer remote checks.")
+
+    # A row toggle opens with Enter and closes with Space.
+    toggle_probe = f"""(() => {{
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'toggle' &&
+        JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_two)};
+    }})()"""
+    tab_until(page, toggle_probe)
+    row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    toggle = row.locator(".checkouts-toggle")
+    page.keyboard.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+    page.keyboard.press("Space")
+    assert toggle.get_attribute("aria-expanded") == "false"
+    page.keyboard.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+
+    # The fold in its detail opens with Space and closes with Enter.
+    tab_until(page, "document.activeElement.getAttribute('data-control') === 'fold'")
+    fold = page.locator(".checkouts-fold-toggle")
+    outside = page.locator('tr.checkouts-clone-branch[data-branch="outside"]')
+    page.keyboard.press("Space")
+    assert fold.get_attribute("aria-expanded") == "true"
+    assert outside.evaluate("el => el.hidden") is False
+    page.keyboard.press("Enter")
+    assert fold.get_attribute("aria-expanded") == "false"
+    assert outside.evaluate("el => el.hidden") is True
+
+    # Another row's toggle is reached after the open detail's controls.
+    tab_until(page, f"""(() => {{
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'toggle' &&
+        JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_three)};
+    }})()""")
+
+    # An attention item moves focus to the row it names.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'go' &&
+        el.closest('li').dataset.code === 'branch_unpushed';
+    })()""")
+    page.keyboard.press("Enter")
+    assert page.evaluate("""() => document.activeElement.dataset.branch + ' ' +
+      document.activeElement.className""") == "topic-a checkouts-clone-branch"
+
+    # Show on board shows the board with the work item's card selected and focused.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.getAttribute('data-control') === 'show:Repo/Drafts/alpha' &&
+        el.closest('tr').classList.contains('checkouts-branch');
+    })()""")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#board")).to_be_visible()
+    assert page.evaluate("document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
+
+
+def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_checkouts):
+    """Refreshed content is never announced; the action status is the one region."""
+    ready = view_checkouts.document_topic_committed
+    setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
+    page, double = open_view_checkouts(open_page, view_checkouts, ready)
+    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    observe_checkouts_mutations(page)
+    live = """() => [...document.querySelectorAll(
+      '#checkouts [aria-live], #checkouts [role=status], #checkouts [role=alert], #checkouts output')]
+      .map(el => el.id)"""
+    for step in (ready, setup, view_checkouts.document_topic_recommitted, "failed"):
+        if step == "failed":
+            double.fail("checkouts_unavailable")
+            fire_checkouts_poll(page)
+            playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+        else:
+            serve_checkouts(page, double, step)
+        assert page.evaluate(live) == ["checkouts-action-status"]
+        # A tick never writes the action status.
+        assert all(not action for _, action, _ in checkouts_records(page))
+        assert page.locator("#checkouts-action-status").inner_text() == ""
+
+
+def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
+    open_page, view_checkouts
+):
+    """With two quiet repositories a query lists and counts only the one it matches."""
+    document = copy.deepcopy(view_checkouts.document_built)
+    quiet = checkout_group(document, "quiet")
+    twin = copy.deepcopy(quiet)
+    twin["remote"]["display"] = "example.test/twin-repository"
+    twin["remote"]["key"] = "example.test/twin-repository"
+    for item in twin["clones"]:
+        item["path"] = item["path"].replace("quiet", "twinclone")
+        for tree in item["worktrees"]:
+            tree["path"] = tree["path"].replace("quiet", "twinclone")
+    document["repositories"].append(twin)
+    page, _ = open_view_checkouts(open_page, view_checkouts, redigest(document))
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    summary = row.locator("summary")
+    assert summary.inner_text() == "Quiet repositories (2)"
+
+    page.fill("#filter", "twin-repository")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (2, 1 matching)"
+    row.locator("summary").click()
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
+    assert "twin-repository" in row.locator("li:not([hidden])").inner_text()
+
+    page.fill("#filter", "")
+    assert summary.inner_text() == "Quiet repositories (2)"
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)

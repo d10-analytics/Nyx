@@ -112,6 +112,14 @@ h1, h2, h3, p { margin-top: 0; }
 .compact-controls { display: flex; flex-direction: column; align-items: flex-start; gap: .3rem; }
 .compact-control { display: inline-flex; align-items: center; gap: .35rem; color: var(--toolbar-text); }
 .compact-control input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--emphasis); }
+/* A label's own display rule would otherwise win over the browser's [hidden]. */
+.compact-control[hidden] { display: none; }
+.view-switch { display: inline-flex; gap: .3rem; }
+.view-switch button[aria-pressed="true"] {
+  border-color: var(--emphasis);
+  background: var(--emphasis);
+  color: var(--page);
+}
 .stage-order-editor {
   min-width: 0;
   max-width: 42rem;
@@ -181,6 +189,261 @@ button.pending {
   gap: .5rem 1.5rem;
   align-items: start;
   padding: 1.5rem 2rem 1rem;
+}
+/* The grid and flex display rules would otherwise win over [hidden]. */
+#board[hidden], #checkouts[hidden] { display: none; }
+/* A refresh never moves the page: without this, a line that changes above
+   the reader's place (the status row wrapping, say) would make the browser
+   shift the scroll position to follow whatever it chose as the anchor. */
+#checkouts {
+  min-height: 70vh;
+  padding: 1.5rem 2rem 1rem;
+  color: var(--text);
+  overflow-anchor: none;
+}
+#checkouts h1 {
+  margin: 0 0 1rem;
+  color: var(--heading);
+  font-size: 1.5rem;
+}
+.checkouts-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .6rem;
+  margin-bottom: 1rem;
+}
+.checkouts-status-line { margin: 0; }
+.checkouts-action-status { min-height: 1.25em; margin: 0; color: var(--muted); }
+#checkouts-body { display: grid; gap: 1rem; }
+.checkouts-panel {
+  padding: 1.25rem;
+  border: 1px dashed var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-panel p { margin: 0; }
+.checkouts-setup h2 {
+  margin: 0 0 .5rem;
+  color: var(--heading);
+  font-size: 1rem;
+}
+.checkouts-setup ul {
+  margin: 0;
+  padding-left: 1.15rem;
+}
+.checkouts-setup-item { margin: .2rem 0; }
+.checkouts-group {
+  display: grid;
+  gap: .6rem;
+  padding: 1rem 1.25rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-group[hidden] { display: none; }
+.checkouts-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .35rem 1rem;
+  margin: 0;
+  color: var(--heading);
+  font-size: 1.05rem;
+}
+.checkouts-group-name { font-weight: 700; overflow-wrap: anywhere; }
+.checkouts-group-default,
+.checkouts-group-check,
+.checkouts-group-lookup,
+.checkouts-group-free {
+  color: var(--muted);
+  font-size: .85rem;
+  font-weight: 400;
+}
+.checkouts-group-free { overflow-wrap: anywhere; }
+.checkouts-clones,
+.checkouts-package-branches {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .85rem;
+}
+.checkouts-package-branches caption {
+  padding-bottom: .35rem;
+  color: var(--heading);
+  font-weight: 700;
+  text-align: left;
+}
+.checkouts-clones th,
+.checkouts-clones td,
+.checkouts-package-branches th,
+.checkouts-package-branches td {
+  padding: .35rem .5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.checkouts-clones thead th,
+.checkouts-package-branches thead th {
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 700;
+  text-transform: none;
+}
+.checkouts-clones tbody th[scope="row"] { font-weight: 700; }
+.checkouts-clone[data-clone] th[scope="row"] { overflow-wrap: anywhere; }
+.checkouts-worktree th[scope="row"] { padding-left: 1.75rem; font-weight: 400; }
+.checkouts-worktree-name .checkouts-name::before {
+  content: "↳ ";
+  color: var(--muted);
+}
+.checkouts-checkout { min-width: 9rem; }
+.checkouts-name { display: block; }
+.checkouts-flags,
+.checkouts-freshness,
+.checkouts-caption,
+.checkouts-blocker,
+.checkouts-note,
+.checkouts-flag {
+  display: block;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 400;
+}
+.checkouts-basis,
+.checkouts-relation { white-space: nowrap; }
+.checkouts-basis { color: var(--muted); }
+.checkouts-basis time,
+.checkouts-group-check time,
+.checkouts-group-lookup time,
+.checkouts-default time { font-variant-numeric: tabular-nums; }
+.checkouts-empty { color: var(--muted); }
+/* The column header names each cell at wider widths; the stacked layout shows
+   the name before the value instead. */
+.cell-label { display: none; }
+/* A long unbroken name wraps inside its cell at every width. */
+#checkouts th,
+#checkouts td { overflow-wrap: anywhere; }
+#checkouts { max-width: 100vw; }
+#checkouts-body { grid-template-columns: minmax(0, 1fr); }
+.checkouts-group { min-width: 0; grid-template-columns: minmax(0, 1fr); }
+.checkouts-package-path { overflow-wrap: anywhere; }
+.checkouts-quiet {
+  padding: .6rem .9rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-quiet summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.checkouts-quiet ul {
+  margin: .5rem 0 0;
+  padding-left: 1.15rem;
+}
+.checkouts-quiet-display { overflow-wrap: anywhere; }
+.checkouts-quiet-checkout { color: var(--muted); }
+.checkouts-work-item {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem;
+}
+.checkouts-verdict-words { font-weight: 600; }
+.checkouts-attention {
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: .45rem;
+  background: var(--surface);
+}
+.checkouts-attention h2 {
+  margin: 0 0 .4rem;
+  color: var(--heading);
+  font-size: 1.05rem;
+}
+.checkouts-attention-class {
+  margin: .6rem 0 .2rem;
+  color: var(--muted);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-attention-list {
+  margin: 0;
+  padding-left: 1.15rem;
+}
+.checkouts-attention-item { margin: .2rem 0; overflow-wrap: anywhere; }
+.checkouts-attention-go {
+  padding: .1rem .35rem;
+  font: inherit;
+  font-size: .9rem;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.checkouts-toggle,
+.checkouts-fold-toggle {
+  display: block;
+  margin-top: .25rem;
+  padding: .05rem .4rem;
+  font-size: .75rem;
+  font-weight: 400;
+  white-space: normal;
+}
+.checkouts-detail > td {
+  padding: .6rem .75rem .9rem 1.75rem;
+  background: var(--page);
+}
+.checkouts-detail[hidden],
+.checkouts-clone-branch[hidden] { display: none; }
+.checkouts-clone-path { margin: 0 0 .6rem; overflow-wrap: anywhere; }
+.checkouts-clone-path-label { color: var(--muted); font-weight: 700; }
+.checkouts-branch-table,
+.checkouts-detail-worktrees {
+  width: 100%;
+  margin-bottom: .6rem;
+  border-collapse: collapse;
+  font-size: .85rem;
+}
+.checkouts-branch-table caption,
+.checkouts-detail-worktrees caption {
+  padding-bottom: .3rem;
+  color: var(--heading);
+  font-weight: 700;
+  text-align: left;
+}
+.checkouts-branch-table th,
+.checkouts-branch-table td,
+.checkouts-detail-worktrees th,
+.checkouts-detail-worktrees td {
+  padding: .3rem .5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.checkouts-branch-table thead th,
+.checkouts-detail-worktrees thead th {
+  color: var(--muted);
+  font-size: .78rem;
+  white-space: nowrap;
+}
+.checkouts-branch-name { overflow-wrap: anywhere; }
+.checkouts-clone-branch[data-depth="1"] .checkouts-branch-name { padding-left: 1.5rem; }
+.checkouts-clone-branch[data-depth="2"] .checkouts-branch-name { padding-left: 2.5rem; }
+.checkouts-detail-work-items h3 {
+  margin: 0 0 .3rem;
+  color: var(--heading);
+  font-size: .9rem;
+}
+.checkouts-detail-work-items ul { margin: 0; padding-left: 1.15rem; }
+.checkouts-clone-work-item { margin: .25rem 0; overflow-wrap: anywhere; }
+.checkouts-code-status { color: var(--muted); }
+/* Attention destinations take focus programmatically; the sticky toolbar must
+   not cover them once they scroll into view. */
+#checkouts [tabindex="-1"] { scroll-margin: 8rem 0 2rem; }
+#checkouts [tabindex="-1"]:focus { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.checkouts-show-on-board {
+  padding: .05rem .4rem;
+  font-size: .75rem;
+  white-space: nowrap;
 }
 .board-empty { grid-column: 1 / -1; }
 .board-issues {
@@ -321,6 +584,35 @@ button.pending {
   .brand-logo { width: 48px; height: 48px; }
   .brand-name { font-size: 1.8rem; }
   #board { padding-left: 1rem; padding-right: 1rem; }
+  #checkouts { padding-left: 1rem; padding-right: 1rem; }
+  /* Each table row stacks its values, each under its column name, so the view
+     never needs a sideways scroll.  The explicit roles in the markup keep the
+     table semantics the display change would otherwise drop. */
+  #checkouts :is(table, thead, tbody, tr, th, td, caption) { display: block; }
+  #checkouts thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  #checkouts tr { padding: .35rem 0; border-bottom: 1px solid var(--border); }
+  #checkouts th,
+  #checkouts td { padding: .15rem .5rem; border-bottom: 0; }
+  #checkouts .cell-label {
+    display: block;
+    color: var(--muted);
+    font-size: .78rem;
+    font-weight: 700;
+  }
+  #checkouts .checkouts-checkout { min-width: 0; }
+  #checkouts .checkouts-worktree th[scope="row"] { padding-left: .5rem; }
+  #checkouts .checkouts-basis,
+  #checkouts .checkouts-relation { white-space: normal; }
+  #checkouts .checkouts-detail > td { padding-left: .5rem; }
+  #checkouts .checkouts-group { padding: .75rem; }
+  #checkouts [hidden] { display: none; }
   #board {
     --card-min-width: 12rem;
     --label-min-width: 9rem;
@@ -331,4 +623,14 @@ button.pending {
   .stage-order-item { align-items: stretch; flex-wrap: wrap; }
   .stage-order-name { flex-basis: 100%; }
   .stage-completed { margin-left: 0; }
+}
+
+/* Below this width the view switch costs a whole toolbar row, and the sticky
+   toolbar must stay short enough to leave the board reachable. */
+@media (max-width: 520px) {
+  .toolbar { gap: .25rem; padding: .35rem .5rem; }
+  .toolbar input, .toolbar button, .toolbar select { padding: .25rem .45rem; }
+  .brand-logo { width: 36px; height: 36px; }
+  .brand-name { font-size: 1.5rem; }
+  .brand-attribution { font-size: .7rem; }
 }

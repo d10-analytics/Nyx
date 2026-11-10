@@ -40,6 +40,10 @@
           </div>
         </details>
         <div class="controls">
+          <div class="view-switch" role="group" aria-label="View">
+            <button id="view-board" type="button" aria-pressed="true">Board</button>
+            <button id="view-checkouts" type="button" aria-pressed="false">Checkouts</button>
+          </div>
           <label for="theme">Theme</label>
           <select id="theme">
             <option value="system">System</option>
@@ -58,11 +62,24 @@
               Hide terminal rows
             </label>
           </div>
+          <label class="compact-control checkouts-control" for="hide-quiet-checkouts" hidden>
+            <input id="hide-quiet-checkouts" type="checkbox" checked>
+            Hide quiet checkouts
+          </label>
           <button id="refresh" type="button">Refresh view</button>
         </div>
       </div>
     </header>
     <main id="board"></main>
+    <main id="checkouts" aria-labelledby="checkouts-heading" hidden>
+      <h1 id="checkouts-heading">Checkouts</h1>
+      <div class="checkouts-status">
+        <p id="checkouts-status-line" class="checkouts-status-line"></p>
+        <button id="check-remotes" type="button">Check remotes now</button>
+        <p id="checkouts-action-status" class="checkouts-action-status" role="status" aria-atomic="true"></p>
+      </div>
+      <div id="checkouts-body"></div>
+    </main>
     <p id="refresh-status" class="visually-hidden" role="status" aria-atomic="true"></p>
     <p id="copy-status" role="status" aria-live="polite"></p>
     <script src="/static/app.js" defer></script>

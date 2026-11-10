@@ -94,7 +94,14 @@ README is narrative only.
 
 ## Outside this boundary
 
-- Fetching, writing or locking a repository. The board renders the served
+- Fetching, writing or locking a repository. The board's Checkouts view renders
+  the served document as it stands (the status line, the attention list, the
+  groups and, for folder problems, git availability and diagnostics, a setup
+  panel) and edits nothing: it shows the folders and cannot change them. It
+  takes every fact and attention item from the document; the only things it
+  decides itself are presentation: which repositories the quiet row collects,
+  which pull-request lookup state the status line names, where each attention
+  item sends focus, and which of the words it shows the search matches. The board renders the served
   document's Code Status as a card line and never derives, rescans or ages it:
   the line holds the text `nyx checkouts --json` gives from the last successful
   scan, refreshed about once a minute by `application-serving` and updated in
