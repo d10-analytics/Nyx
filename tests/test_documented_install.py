@@ -305,8 +305,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "The **Checkouts** view shows these folders but cannot change them; until a "
-        "settings editor arrives, the record is edited by hand",
+        "The **Checkouts** view of the board has a **Checkout folders** editor that "
+        "changes them and the GitHub lookup",
+        "The same record can be edited by hand when no board is running",
         "cannot be combined with `--setup`, `--stop` or `--status`",
         "exits 1 with one line only when the configuration is unavailable, the document "
         "exceeds 2 MiB, or a temporary file or directory it needs cannot be made",
@@ -599,8 +600,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         '"github_lookup": false',
         "`github_lookup` is the workspace's switch for the optional GitHub pull-request "
         "lookup of `nyx checkouts`",
-        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
-        "settings editor arrives, it is edited by hand like the folders",
+        "The **Checkout folders** editor changes it with the folders; with no folders "
+        "it is off",
+        "### Without the board",
         "The key under `checkout_settings` is the record's own `specification_root` value",
         "Each entry in `folders` must be an absolute path, and the list must be sorted",
         "write each backslash as `\\\\` in JSON",
@@ -1269,24 +1271,67 @@ def test_desktop_guide_states_the_macos_command_line_tools_requirement():
         assert marker in section, marker
 
 
-def test_the_checkout_guide_says_the_view_does_not_edit_folders():
+def test_the_checkout_guides_describe_the_folder_editor():
     guide = _normalized("docs/running-nyx.md")
-    assert (
-        "The **Checkouts** view shows these folders but cannot change them; until a "
-        "settings editor arrives, the record is edited by hand"
-    ) in guide
-    assert "**Checkout settings**" not in guide
-    for promise in ("checkout settings editor", "folder editor", "edit your checkout folders"):
-        assert promise not in guide.lower(), promise
-    # The workspace guide keeps its own hand-edit instruction and its own
-    # statement that the view cannot change the lookup.
     workspaces = _normalized("docs/workspaces.md")
+    readme = _normalized("README.md")
+    board_web = _normalized("docs/systems/board-web/README.md")
+    checkouts = _normalized("docs/systems/checkouts/README.md")
+    for marker in (
+        "The **Checkout folders** control beside the status line opens an editor for the "
+        "active workspace's checkout folders and its GitHub lookup",
+        "until you choose **Save checkout folders**",
+        "(`Add /home/me/code (3 work items)`)",
+        "A folder it refuses stays in the draft with its reason beside it",
+        "Saving an empty list stores no folders and turns the lookup off",
+        "`Save not applied: the checkout folders changed elsewhere.`",
+        "**Reload checkout folders**, which replaces the draft with the saved folders",
+        "The first folder save writes a schema 4 record",
+        "A Windows or macOS desktop application built before this version refuses a "
+        "schema 4 record",
+        "its only changes are to the checkout folders and GitHub lookup of the active "
+        "workspace",
+        "A checkout folder save on the same page keeps it hidden only until that save's "
+        "own checkouts read answers with a scan of the new folders",
+        "Choose Checkout folders above to add one.`",
+        "also describes the hand edit for use without the board",
+        "configure the clones' parent folder through the **Checkout folders** editor",
+    ):
+        assert guide.count(marker) == 1, marker
+    assert "Without the board" in workspaces
+    for name, text in (
+        ("docs/running-nyx.md", guide),
+        ("docs/workspaces.md", workspaces),
+        ("README.md", readme),
+        ("docs/systems/board-web/README.md", board_web),
+        ("docs/systems/checkouts/README.md", checkouts),
+    ):
+        for stale in (
+            "until a settings editor arrives",
+            "Until the settings editor exists",
+            "cannot change them",
+            "it cannot change the folders",
+            "which holds the hand edit",
+            "documented hand edit",
+            "arrives with the Checkouts view",
+            "the one write it can cause",
+            "It never edits the folders",
+            "edits nothing: it shows the folders",
+        ):
+            assert stale not in text, (name, stale)
     assert (
-        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
-        "settings editor arrives, it is edited by hand like the folders"
-    ) in workspaces
-    for name, text in (("docs/running-nyx.md", guide), ("docs/workspaces.md", workspaces)):
-        assert "arrives with the Checkouts view" not in text, name
+        "The **Checkouts** view of the board has a **Checkout folders** editor" in guide
+    )
+    for text in (readme, board_web, checkouts):
+        assert "checkout settings `PUT`" in text
+    assert "change the active workspace's checkout folders and GitHub lookup" in readme
+    # The board-web README names both writes of the Checkouts view.
+    assert "(a request for a remote check through `application-serving`)" in board_web
+    assert "whose save is the view's other write (the checkout settings `PUT`)" in board_web
+    assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
+    assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
+    assert "never through this system" in checkouts
+    assert "a checkout folder save on the same page requests answers with a scan" in checkouts
 
 
 def test_checkout_system_readme_states_the_developer_tools_check():
