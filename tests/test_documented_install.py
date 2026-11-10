@@ -1283,7 +1283,12 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "until you choose **Save checkout folders**",
         "(`Add /home/me/code (3 work items)`)",
         "A folder it refuses stays in the draft with its reason beside it",
-        "Saving an empty list stores no folders and turns the lookup off",
+        "Saving an empty list stores no folders and turns the lookup off; when the "
+        "lookup was on before the save, the editor adds `With no folders the "
+        "pull-request lookup is off.` to its saved message",
+        "until the checkouts read that a checkout folder save on the same page requests "
+        "answers with a scan of the new folders, and, after a configuration change saved "
+        "elsewhere, until you press **Apply update**",
         "`Save not applied: the checkout folders changed elsewhere.`",
         "**Reload checkout folders**, which replaces the draft with the saved folders",
         "The first folder save writes a schema 4 record",
@@ -1324,6 +1329,28 @@ def test_the_checkout_guides_describe_the_folder_editor():
     )
     for text in (readme, board_web, checkouts):
         assert "checkout settings `PUT`" in text
+    assert (
+        "and a **Checkout folders** editor that changes the active workspace's checkout "
+        "folders and GitHub lookup, and the header search"
+    ) in readme
+    assert (
+        "its editor writes only the checkout settings, through the checkout settings `PUT`"
+    ) in readme
+    assert workspaces.count(
+        "lists. Set them in the browser: choose **Checkouts**, open **Checkout folders**, "
+        "add or remove folders and the GitHub lookup, and choose **Save checkout folders**."
+    ) == 1
+    assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
+    assert (
+        "changes board settings and the active workspace's checkout folders and GitHub "
+        "lookup, through `application-serving`'s HTTP routes: the board-settings `PUT` and "
+        "the checkout settings `PUT`"
+    ) in board_web
+    assert (
+        "a checkout folder save on the same page hides them only until its own checkouts "
+        "read answers with a scan of the new folders, and the page installs the new "
+        "catalog itself"
+    ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
     # The board-web README names both writes of the Checkouts view.
     assert "(a request for a remote check through `application-serving`)" in board_web
