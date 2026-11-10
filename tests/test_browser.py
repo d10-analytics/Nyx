@@ -10323,3 +10323,47 @@ def test_checkout_folders_save_in_flight_keeps_focus_on_save(open_page, attentio
     playwright.expect(page.locator("#checkout-folders-github")).to_be_focused()
     assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
     assert_focus_sampler_clean(page)
+
+
+def test_checkout_folders_save_refusals_keep_focus_in_the_editor(
+    open_page, attention_checkouts
+):
+    """After each refusal focus is on Save, or on another operable editor control when
+    Save is not operable, never the body."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    save = folders_save_button(page)
+    status = page.locator(FOLDERS_STATUS)
+
+    def focus_is_in_editor_and_operable():
+        return page.evaluate(
+            """([selector]) => {
+              const active = document.activeElement;
+              const editor = document.querySelector(selector);
+              return !!editor && editor.contains(active) && active !== editor &&
+                !active.disabled;
+            }""",
+            [FOLDERS_EDITOR],
+        )
+
+    add_folder(page, "/work/beta")
+    save.focus()
+    settings.fail_next = True
+    save.press("Enter")
+    playwright.expect(status).to_have_text("Save failed: the checkout folders were not saved.")
+    playwright.expect(save).to_be_focused()
+
+    settings.folder_problems = [{"index": 0, "reason": "missing"}]
+    save.press("Enter")
+    playwright.expect(status).to_contain_text("were not saved. Fix the marked folders")
+    playwright.expect(save).to_be_focused()
+    assert folder_marks(page)[0][0] == "true"
+
+    # A conflict disables Save until a reload; focus must not fall to the body.
+    settings.revision = "e" * 64
+    save.press("Enter")
+    playwright.expect(status).to_contain_text("changed elsewhere")
+    assert focus_is_in_editor_and_operable()
