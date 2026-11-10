@@ -76,6 +76,7 @@
   ];
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
+  const CHECKOUT_SETTINGS_ROUTE = "/api/checkout-settings";
   const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
   const VIEW_BOARD = "board";
   const VIEW_CHECKOUTS = "checkouts";
@@ -348,7 +349,7 @@
       "runCompleted": "Remote check finished.",
       "runFailed": "Remote check failed: {category}.",
       "noOriginRemote": "no origin remote",
-      "noFolders": "No checkout folders are configured. Add them to the workspace record; see the guide section Your specification workspace → Checkout folders.",
+      "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
       "quietRow": "Quiet repositories ({count})",
@@ -387,7 +388,29 @@
       "removable": "Removable",
       "foldingNotChecked": "Branches were not checked for folding: {reason}",
       "folderProblem": "{path} — {problem}",
-      "unknownPath": "unknown path"
+      "unknownPath": "unknown path",
+      "foldersLoading": "Loading checkout folders…",
+      "foldersLoaded": "Current checkout folders loaded.",
+      "foldersLoadFailed": "Could not load checkout folders: {code}",
+      "foldersDraftChanged": "Unsaved checkout folder changes.",
+      "foldersDraftCancelled": "Unsaved checkout folder changes cancelled.",
+      "foldersDraftMatches": "The checkout folders match the saved list.",
+      "foldersSaving": "Saving checkout folders…",
+      "foldersSaved": "Checkout folders saved.",
+      "foldersLookupOff": "With no folders the pull-request lookup is off.",
+      "foldersInvalid": "The checkout folders were not saved. Fix the marked folders and save again.",
+      "foldersConflict": "Save not applied: the checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft and try again.",
+      "foldersChangedElsewhere": "The checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft.",
+      "foldersReloadNeeded": "Save not applied: the saved checkout folders are not available to compare. Reload checkout folders to replace this unsaved draft and try again.",
+      "foldersFailure": "Save failed: the checkout folders were not saved.",
+      "foldersSaveError": "Save failed: {code}"
+    },
+    "folderReason": {
+      "invalid_path": "This is not a usable path.",
+      "not_absolute": "This path is not absolute.",
+      "missing": "This folder does not exist.",
+      "unreadable": "This folder cannot be read.",
+      "not_directory": "This path is not a folder."
     }
   };
   // checkout words: end
@@ -412,6 +435,16 @@
   checkoutsHeading.setAttribute("tabindex", "-1");
   const checkRemotesButton = document.querySelector("#check-remotes");
   const refreshButton = document.querySelector("#refresh");
+  const foldersEditor = document.querySelector("#checkout-folders-editor");
+  const foldersList = document.querySelector("#checkout-folders-list");
+  const foldersLookup = document.querySelector("#checkout-folders-github");
+  const foldersReload = document.querySelector("#checkout-folders-reload");
+  const foldersStatus = document.querySelector("#checkout-folders-status");
+  const foldersPath = document.querySelector("#checkout-folders-path");
+  const foldersAdd = document.querySelector("#checkout-folders-add");
+  const foldersSuggestions = document.querySelector("#checkout-folders-suggestions");
+  const foldersSave = document.querySelector("#checkout-folders-save");
+  const foldersCancel = document.querySelector("#checkout-folders-cancel");
 
   const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
@@ -451,6 +484,27 @@
   let settingsBusy = false;
   let settingsRequestSerial = 0;
   let queuedSettingsRefresh = null;
+  // The checkout folders editor.  The saved state is what the last load
+  // served; a draft is null until the reader changes something, and an open
+  // with a draft held shows it instead of loading.  The auto-open is page
+  // memory only.
+  let foldersSaved = {folders: [], github_lookup: false};
+  let foldersDraft = null;
+  let foldersReloadAvailable = false;
+  let foldersRequestSerial = 0;
+  // The serial of the load in flight, until its answer or a later request
+  // supersedes it; the controls refuse edits while it is current, since a
+  // draft must start from the saved folders.
+  let foldersLoadSerial = null;
+  // The revision the last served read or save answered; a save sends it back.
+  let foldersRevision = null;
+  let foldersBusy = false;
+  // The refused folders of the last save, by their submitted index.
+  let foldersProblems = new Map();
+  // What the editor last drew from the served document, so a tick that
+  // settles the same suggestions leaves the editor untouched.
+  let foldersSuggestionKey = null;
+  let foldersAutoOpened = false;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
   // envelope, or "failed" with its category.  "failed" adds a Code Status part
   // to the issues panel, and every settled outcome rewrites the cards' lines.
@@ -1760,28 +1814,37 @@
       });
   }
 
+  // Sends one settings PUT and returns its parsed outcome, or throws the error
+  // code. `parse(payload, true)` is the caller's exact-key parser; `inspect`
+  // sees the status and body before the outcome is classified.
+  async function putSettings(route, body, parse, inspect = null) {
+    const response = await fetch(route, {
+      method: "PUT",
+      cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { /* handled below */ }
+    if (inspect) inspect(response.status, payload);
+    if (!payload || payload.error) {
+      throw new Error((payload && payload.error) || "settings_unavailable");
+    }
+    const outcome = parse(payload, true);
+    if (!response.ok && !["conflict", "failure", "reload-needed"].includes(outcome.outcome)) {
+      throw new Error("settings_unavailable");
+    }
+    return outcome;
+  }
+
   function saveStageOrder(order, completed) {
     if (!settingsAvailable || !settingsRevision || settingsBusy) return;
     settingsBusy = true;
     settingsStatus("Saving board settings…");
     renderStageOrderEditor();
-    fetch(SETTINGS_ROUTE, {
-      method: "PUT",
-      cache: "no-store",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({revision: settingsRevision, order, completed}),
-    }).then(async (response) => {
-      let payload = null;
-      try { payload = await response.json(); } catch (_) { /* handled below */ }
-      if (!payload || payload.error) {
-        throw new Error((payload && payload.error) || "settings_unavailable");
-      }
-      const outcome = parseSettings(payload, true);
-      if (!response.ok && !["conflict", "failure", "reload-needed"].includes(outcome.outcome)) {
-        throw new Error("settings_unavailable");
-      }
-      return outcome;
-    }).then((payload) => {
+    const sentRevision = settingsRevision;
+    putSettings(SETTINGS_ROUTE, {revision: sentRevision, order, completed}, parseSettings)
+    .then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
           ? `Save not applied: ${payload.outcome}. Reload board settings to replace this unsaved draft and try again.`
@@ -1794,6 +1857,7 @@
         settingsStatus(message, true);
         return;
       }
+      advanceEditorRevisions(sentRevision, payload.revision);
       savedStageOrder = [...payload.order];
       savedCompletedStages = [...payload.completed];
       settingsRevision = payload.revision;
@@ -1809,6 +1873,335 @@
       settingsBusy = false;
       renderStageOrderEditor();
     });
+  }
+
+  function foldersEditorStatus(message, isError = false) {
+    foldersStatus.textContent = message;
+    foldersStatus.classList.toggle("error", isError);
+  }
+
+  function foldersShown() {
+    return foldersDraft === null ? foldersSaved : foldersDraft;
+  }
+
+  // The unconfigured parents the shown ready document offers.
+  function foldersSuggestionList() {
+    if (checkoutsOutcome.state !== "ready") return [];
+    return checkoutsOutcome.envelope.checkouts.folder_suggestions;
+  }
+
+  function foldersDirty() {
+    return foldersDraft !== null;
+  }
+
+  // With no revision and a reload offered (a refused save, a changed-elsewhere
+  // flag or a failed load) a draft could never be saved, so the editing
+  // controls refuse input until the reader reloads or cancels.
+  function foldersAwaitsReload() {
+    return foldersRevision === null && foldersReloadAvailable;
+  }
+
+  // A save or a load in flight, or a reload the reader must take, holds every
+  // editing control.
+  function foldersHeld() {
+    return foldersBusy || foldersLoadSerial === foldersRequestSerial || foldersAwaitsReload();
+  }
+
+  // A draft that equals the saved state is no draft.
+  function setFoldersDraft(draft) {
+    const same = draft.github_lookup === foldersSaved.github_lookup &&
+      JSON.stringify(draft.folders) === JSON.stringify(foldersSaved.folders);
+    foldersDraft = same ? null : draft;
+  }
+
+  function editedFolders() {
+    const shown = foldersShown();
+    return {folders: [...shown.folders], github_lookup: shown.github_lookup};
+  }
+
+  function renderFoldersEditor() {
+    const controls = () => [...foldersEditor.querySelectorAll("summary, input, button")];
+    const focused = document.activeElement;
+    const prior = controls();
+    const priorIndex = prior.indexOf(focused);
+    const keyOf = (control) => control.dataset.folder !== undefined
+      ? [control.dataset.role, control.dataset.folder] : [control.id];
+    const priorKey = priorIndex >= 0 ? keyOf(focused) : null;
+    const roleList = (list, role) => list.filter((control) => control.dataset.role === role);
+    const priorRoleIndex = priorKey && priorKey.length === 2
+      ? roleList(prior, priorKey[0]).indexOf(focused) : -1;
+    const shown = foldersShown();
+    const present = new Set(shown.folders);
+    foldersList.replaceChildren(...shown.folders.map((path, index) => {
+      const item = document.createElement("li");
+      item.className = "checkout-folders-item";
+      const name = document.createElement("span");
+      name.className = "checkout-folders-path";
+      name.textContent = path;
+      // Marks belong to the draft that was refused, never to the saved list.
+      if (foldersDraft !== null && foldersProblems.has(index)) {
+        const problem = document.createElement("span");
+        problem.className = "checkout-folders-problem";
+        problem.id = `checkout-folders-problem-${index}`;
+        problem.textContent = codeWords("folderReason", foldersProblems.get(index));
+        name.setAttribute("aria-invalid", "true");
+        name.setAttribute("aria-describedby", problem.id);
+        item.append(name, problem);
+      } else {
+        item.append(name);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "checkout-folders-remove";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", `Remove checkout folder ${path}`);
+      remove.dataset.role = "remove";
+      remove.dataset.folder = path;
+      item.append(remove);
+      return item;
+    }));
+    const offered = foldersSuggestionList().filter((entry) => !present.has(entry.path));
+    foldersSuggestions.replaceChildren(...offered.map((entry) => {
+      const item = document.createElement("li");
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "checkout-folders-suggestion";
+      add.textContent = `Add ${entry.path} (${plural(entry.package_count, "work item")})`;
+      add.dataset.role = "suggest";
+      add.dataset.folder = entry.path;
+      item.append(add);
+      return item;
+    }));
+    foldersSuggestions.hidden = offered.length === 0;
+    foldersSuggestionKey = checkoutsOutcome.state === "ready"
+      ? JSON.stringify(foldersSuggestionList()) : null;
+    foldersLookup.checked = shown.github_lookup;
+    foldersSave.disabled = !foldersDirty() || foldersRevision === null;
+    foldersCancel.disabled = !foldersDirty();
+    foldersReload.hidden = !foldersReloadAvailable;
+    // A request in flight dims every control without removing it from the tab
+    // order, so focus stays where the reader put it.
+    controls().forEach((control) => {
+      if (control.tagName === "SUMMARY") return;
+      // Cancel and Reload are the way out of a reload hold, so it leaves them operable.
+      const exit = control === foldersCancel || control === foldersReload;
+      const held = foldersHeld() && !(exit && !foldersBusy &&
+        foldersLoadSerial !== foldersRequestSerial);
+      if (held && !control.disabled) control.setAttribute("aria-disabled", "true");
+      else control.removeAttribute("aria-disabled");
+    });
+    if (!priorKey) return;
+    // Focus goes back to the same control; a removed folder or a taken
+    // suggestion hands it to the next of its kind, else the previous, else the
+    // path input; any other control that stopped being operable hands it to the
+    // next operable control, else the previous, else the summary.
+    const current = controls();
+    const operable = (control) => control?.isConnected && !control.disabled &&
+      !control.closest("[hidden]");
+    const same = current.find((control) =>
+      JSON.stringify(keyOf(control)) === JSON.stringify(priorKey) && operable(control));
+    let successor = same;
+    if (!successor && priorRoleIndex >= 0) {
+      const peers = roleList(current, priorKey[0]).filter(operable);
+      successor = peers[priorRoleIndex] || peers[priorRoleIndex - 1] || foldersPath;
+    }
+    successor = successor || current.slice(priorIndex + 1).find(operable) ||
+      current.slice(0, priorIndex).reverse().find(operable) ||
+      foldersEditor.querySelector("summary");
+    successor.focus();
+  }
+
+  function foldersEdited(draft) {
+    // The marks name submitted positions, which an edit moves.
+    foldersProblems = new Map();
+    setFoldersDraft(draft);
+    foldersEditorStatus(codeWords("text", foldersDirty() ? "foldersDraftChanged" : "foldersDraftMatches"));
+    renderFoldersEditor();
+  }
+
+  // The only client checks are an empty entry and an exact repeat; the
+  // server's rule is the authority on everything else.
+  function addFolder(path) {
+    if (foldersHeld()) return false;
+    const draft = editedFolders();
+    if (path === "" || draft.folders.includes(path)) return false;
+    draft.folders.push(path);
+    foldersEdited(draft);
+    return true;
+  }
+
+  // A read carries `{folders, github_lookup, revision}` with a non-empty
+  // revision.  A save answer adds the outcome, and only an answer with an
+  // outcome may carry a null revision: `reload-needed` is the null state.
+  function parseFolderSettings(payload, allowOutcome = false) {
+    protocol(exactKeys(payload, allowOutcome
+      ? ["folders", "github_lookup", "outcome", "revision"]
+      : ["folders", "github_lookup", "revision"]));
+    protocol(Array.isArray(payload.folders) &&
+      payload.folders.every((path) => typeof path === "string"));
+    protocol(typeof payload.github_lookup === "boolean");
+    protocol((allowOutcome && payload.revision === null) ||
+      (typeof payload.revision === "string" && payload.revision.length > 0));
+    if (allowOutcome) {
+      protocol(["success", "conflict", "failure", "reload-needed"].includes(payload.outcome));
+    }
+    return payload;
+  }
+
+  // The 400 answer that names each refused folder by its submitted index.
+  function refusedFolders(status, payload) {
+    if (status !== 400 || !payload || payload.error !== "invalid_checkout_folders") return;
+    protocol(exactKeys(payload, ["error", "problems"]) && Array.isArray(payload.problems) &&
+      payload.problems.every((problem) => exactKeys(problem, ["index", "reason"]) &&
+        Number.isInteger(problem.index) && problem.index >= 0 &&
+        typeof problem.reason === "string"));
+    const error = new Error("invalid_checkout_folders");
+    error.problems = payload.problems;
+    throw error;
+  }
+
+  function saveFolders() {
+    if (foldersBusy || !foldersDirty() || foldersRevision === null) return;
+    const body = {
+      revision: foldersRevision,
+      folders: [...foldersDraft.folders],
+      github_lookup: foldersDraft.github_lookup,
+    };
+    foldersBusy = true;
+    foldersEditorStatus(codeWords("text", "foldersSaving"));
+    renderFoldersEditor();
+    putSettings(CHECKOUT_SETTINGS_ROUTE, body, parseFolderSettings, refusedFolders)
+      .then((answer) => {
+        if (answer.outcome === "success") {
+          advanceEditorRevisions(body.revision, answer.revision);
+          foldersRequestSerial += 1;
+          foldersSaved = {folders: [...answer.folders], github_lookup: answer.github_lookup};
+          foldersRevision = answer.revision;
+          foldersDraft = null;
+          foldersProblems = new Map();
+          foldersReloadAvailable = false;
+          const saved = codeWords("text", "foldersSaved");
+          foldersEditorStatus(answer.github_lookup === body.github_lookup ? saved
+            : `${saved} ${codeWords("text", "foldersLookupOff")}`);
+          // The view follows the save now, not at the next tick: a fresh catalog
+          // installs the new revision, and the one checkouts read (skipped when
+          // one is in flight) shows the new folders.
+          request("manual");
+          requestCheckouts("read");
+        } else if (answer.outcome === "failure") {
+          foldersEditorStatus(codeWords("text", "foldersFailure"), true);
+        } else {
+          // Neither answer is the record's state to adopt; the draft stays and
+          // a reload replaces it with what is served.
+          foldersRevision = null;
+          foldersReloadAvailable = true;
+          foldersEditorStatus(codeWords("text",
+            answer.outcome === "conflict" ? "foldersConflict" : "foldersReloadNeeded"), true);
+        }
+      })
+      .catch((error) => {
+        if (error.problems) {
+          foldersProblems = new Map(error.problems.map((problem) => [problem.index, problem.reason]));
+          foldersEditorStatus(codeWords("text", "foldersInvalid"), true);
+          return;
+        }
+        foldersEditorStatus(fillWords(codeWords("text", "foldersSaveError"),
+          {code: settingsErrorMessage(error)}, (value) => value), true);
+      })
+      .finally(() => {
+        foldersBusy = false;
+        renderFoldersEditor();
+      });
+  }
+
+  // Each open with no draft asks for the saved folders; an answer that arrives
+  // after a later open's request is discarded.
+  function loadFolders() {
+    const serial = ++foldersRequestSerial;
+    foldersLoadSerial = serial;
+    foldersReloadAvailable = false;
+    foldersEditorStatus(codeWords("text", "foldersLoading"));
+    renderFoldersEditor();
+    fetch(CHECKOUT_SETTINGS_ROUTE, {cache: "no-store"})
+      .then(async (response) => {
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { /* handled below */ }
+        if (!response.ok || !payload || payload.error) {
+          throw new Error((payload && payload.error) || "settings_unavailable");
+        }
+        return parseFolderSettings(payload);
+      })
+      .then((payload) => {
+        if (serial !== foldersRequestSerial) return;
+        foldersLoadSerial = null;
+        foldersSaved = {folders: [...payload.folders], github_lookup: payload.github_lookup};
+        foldersRevision = payload.revision;
+        foldersProblems = new Map();
+        foldersReloadAvailable = false;
+        foldersEditorStatus(codeWords("text", "foldersLoaded"));
+        renderFoldersEditor();
+      })
+      .catch((error) => {
+        if (serial !== foldersRequestSerial) return;
+        foldersLoadSerial = null;
+        foldersReloadAvailable = true;
+        foldersEditorStatus(fillWords(
+          codeWords("text", "foldersLoadFailed"),
+          {code: settingsErrorMessage(error)}, (value) => value,
+        ), true);
+        renderFoldersEditor();
+      });
+  }
+
+  // The editor is shown for a ready or failed outcome and hidden otherwise.
+  // The attribute is written only when it changes, so a tick that settles the
+  // same outcome leaves the editor alone.  The first time a ready document has
+  // no folders the panel opens itself, once.
+  function syncFoldersEditor() {
+    const available = checkoutsOutcome.state === "ready" || checkoutsOutcome.state === "failed";
+    if (foldersEditor.hidden === available) foldersEditor.hidden = !available;
+    const key = checkoutsOutcome.state === "ready"
+      ? JSON.stringify(foldersSuggestionList()) : null;
+    if (available && key !== foldersSuggestionKey) renderFoldersEditor();
+    if (!available || foldersAutoOpened || checkoutsOutcome.state !== "ready" ||
+      checkoutsOutcome.envelope.checkouts.folders.length > 0) return;
+    foldersAutoOpened = true;
+    foldersEditor.open = true;
+  }
+
+  // Both editors read and write the record's one revision, and each save leaves
+  // the other editor's fields unchanged, so a successful save moves every
+  // editor still on the revision it sent.  A conflict or failure calls nothing.
+  function advanceEditorRevisions(sentRevision, nextRevision) {
+    if (settingsRevision === sentRevision) settingsRevision = nextRevision;
+    if (foldersRevision === sentRevision) foldersRevision = nextRevision;
+  }
+
+  // An installed catalog whose revision differs from an editor's: with no draft
+  // the editor reloads quietly, with a draft it keeps the draft and says so.
+  function reconcileEditorRevisions(snapshot, retainStageDraft) {
+    const revision = snapshot.configuration_revision;
+    if (revision === null) return;
+    if (foldersRevision !== null && !foldersBusy && revision !== foldersRevision) {
+      if (foldersDirty()) {
+        foldersRevision = null;
+        foldersReloadAvailable = true;
+        foldersEditorStatus(codeWords("text", "foldersChangedElsewhere"), true);
+        renderFoldersEditor();
+      } else {
+        loadFolders();
+      }
+    }
+    if (settingsRevision === null || settingsBusy || revision === settingsRevision) return;
+    if (!retainStageDraft) {
+      loadSettings();
+      return;
+    }
+    settingsAvailable = false;
+    settingsReloadAvailable = true;
+    settingsRevision = null;
+    settingsStatus("Board settings changed elsewhere. Reload board settings to replace this unsaved draft.", true);
+    renderStageOrderEditor();
   }
 
   function apply(snapshot) {
@@ -1836,17 +2229,7 @@
     if (!workspace || workspace.revision !== snapshot.configuration_revision) loadWorkspace();
     // Settings saved from another page change the catalog revision; an unsaved
     // draft is kept and must be replaced explicitly rather than discarded.
-    if (snapshot.configuration_revision === null || settingsRevision === null || settingsBusy ||
-      snapshot.configuration_revision === settingsRevision) return;
-    if (!retainDraft) {
-      loadSettings();
-      return;
-    }
-    settingsAvailable = false;
-    settingsReloadAvailable = true;
-    settingsRevision = null;
-    settingsStatus("Board settings changed elsewhere. Reload board settings to replace this unsaved draft.", true);
-    renderStageOrderEditor();
+    reconcileEditorRevisions(snapshot, retainDraft);
   }
 
   function loadWorkspace() {
@@ -3609,6 +3992,7 @@
           // rewrites the text they already show.
           updateCardCodeStatus();
           if (changed) syncBoardIssues();
+          syncFoldersEditor();
           if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
         }
         // The press state lasts from the press until the request that answers
@@ -3817,6 +4201,53 @@
   stageOrderReset.addEventListener("click", () => saveStageOrder([], []));
   stageOrderReload.addEventListener("click", () => {
     if (!settingsBusy) loadSettings();
+  });
+  foldersEditor.addEventListener("toggle", () => {
+    if (!foldersEditor.open) return;
+    if (foldersDraft === null) loadFolders();
+    else renderFoldersEditor();
+  });
+  foldersAdd.addEventListener("click", () => {
+    if (addFolder(foldersPath.value)) foldersPath.value = "";
+  });
+  foldersPath.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (addFolder(foldersPath.value)) foldersPath.value = "";
+  });
+  foldersList.addEventListener("click", (event) => {
+    const remove = event.target.closest(".checkout-folders-remove");
+    if (!remove || foldersHeld()) return;
+    const draft = editedFolders();
+    draft.folders = draft.folders.filter((path) => path !== remove.dataset.folder);
+    foldersEdited(draft);
+  });
+  foldersSuggestions.addEventListener("click", (event) => {
+    const add = event.target.closest(".checkout-folders-suggestion");
+    if (add) addFolder(add.dataset.folder);
+  });
+  foldersLookup.addEventListener("change", () => {
+    if (foldersHeld()) {
+      renderFoldersEditor();
+      return;
+    }
+    const draft = editedFolders();
+    draft.github_lookup = foldersLookup.checked;
+    foldersEdited(draft);
+  });
+  foldersSave.addEventListener("click", saveFolders);
+  foldersCancel.addEventListener("click", () => {
+    if (foldersBusy || !foldersDirty()) return;
+    foldersDraft = null;
+    foldersProblems = new Map();
+    foldersEditorStatus(codeWords("text", "foldersDraftCancelled"));
+    renderFoldersEditor();
+  });
+  foldersReload.addEventListener("click", () => {
+    if (foldersBusy) return;
+    foldersDraft = null;
+    foldersProblems = new Map();
+    loadFolders();
   });
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));

@@ -305,8 +305,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "The **Checkouts** view shows these folders but cannot change them; until a "
-        "settings editor arrives, the record is edited by hand",
+        "The **Checkouts** view of the board has a **Checkout folders** editor that "
+        "changes them and the GitHub lookup",
+        "The same record can be edited by hand when no board is running",
         "cannot be combined with `--setup`, `--stop` or `--status`",
         "exits 1 with one line only when the configuration is unavailable, the document "
         "exceeds 2 MiB, or a temporary file or directory it needs cannot be made",
@@ -599,8 +600,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         '"github_lookup": false',
         "`github_lookup` is the workspace's switch for the optional GitHub pull-request "
         "lookup of `nyx checkouts`",
-        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
-        "settings editor arrives, it is edited by hand like the folders",
+        "The **Checkout folders** editor changes it with the folders; with no folders "
+        "it is off",
+        "### Without the board",
         "The key under `checkout_settings` is the record's own `specification_root` value",
         "Each entry in `folders` must be an absolute path, and the list must be sorted",
         "write each backslash as `\\\\` in JSON",
@@ -1269,24 +1271,115 @@ def test_desktop_guide_states_the_macos_command_line_tools_requirement():
         assert marker in section, marker
 
 
-def test_the_checkout_guide_says_the_view_does_not_edit_folders():
+def test_the_checkout_guides_describe_the_folder_editor():
     guide = _normalized("docs/running-nyx.md")
-    assert (
-        "The **Checkouts** view shows these folders but cannot change them; until a "
-        "settings editor arrives, the record is edited by hand"
-    ) in guide
-    assert "**Checkout settings**" not in guide
-    for promise in ("checkout settings editor", "folder editor", "edit your checkout folders"):
-        assert promise not in guide.lower(), promise
-    # The workspace guide keeps its own hand-edit instruction and its own
-    # statement that the view cannot change the lookup.
     workspaces = _normalized("docs/workspaces.md")
+    readme = _normalized("README.md")
+    board_web = _normalized("docs/systems/board-web/README.md")
+    checkouts = _normalized("docs/systems/checkouts/README.md")
+    for marker in (
+        "The **Checkout folders** control beside the status line opens an editor for the "
+        "active workspace's checkout folders and its GitHub lookup",
+        "until you choose **Save checkout folders**",
+        "(`Add /home/me/code (3 work items)`)",
+        "A folder it refuses stays in the draft with its reason beside it",
+        "Saving an empty list stores no folders and turns the lookup off; when the "
+        "lookup was on before the save, the editor adds `With no folders the "
+        "pull-request lookup is off.` to its saved message",
+        "until the checkouts read that a checkout folder save on the same page requests "
+        "answers with a scan of the new folders (or, when a checkouts read was already in "
+        "flight at the save, until the next ten-second check), and, after a configuration "
+        "change saved elsewhere, until you press **Apply update**",
+        "When a checkouts read is already in flight at the save, the page sends no read of "
+        "its own, and the line follows at the next ten-second check instead",
+        "When a checkouts read is already in flight at the save, that read answers with the "
+        "folders as they were, the page sends no second read, and the view shows the new "
+        "folders at the next ten-second check",
+        "When the record changed after the editor loaded it, such as a save from another "
+        "page, the save is not applied.",
+        "A running board does not notice a hand edit of the record, and a save from the "
+        "editor overwrites it; stop Nyx before editing by hand",
+        "While that reload is offered, the list, the path field, the suggestions and the "
+        "checkbox take no edits; **Cancel checkout folder changes** still drops the draft",
+        "`Save not applied: the checkout folders changed elsewhere.`",
+        "**Reload checkout folders**, which replaces the draft with the saved folders",
+        "The first folder save writes a schema 4 record",
+        "A Windows or macOS desktop application built before this version refuses a "
+        "schema 4 record",
+        "its only changes are to the checkout folders and GitHub lookup of the active "
+        "workspace",
+        "A checkout folder save on the same page keeps it hidden only until that save's "
+        "own checkouts read answers with a scan of the new folders",
+        "Choose Checkout folders above to add one.`",
+        "also describes the hand edit for use without the board",
+        "configure the clones' parent folder through the **Checkout folders** editor",
+    ):
+        assert guide.count(marker) == 1, marker
+    assert "Without the board" in workspaces
+    for name, text in (
+        ("docs/running-nyx.md", guide),
+        ("docs/workspaces.md", workspaces),
+        ("README.md", readme),
+        ("docs/systems/board-web/README.md", board_web),
+        ("docs/systems/checkouts/README.md", checkouts),
+    ):
+        for stale in (
+            "until a settings editor arrives",
+            "Until the settings editor exists",
+            "cannot change them",
+            "it cannot change the folders",
+            "which holds the hand edit",
+            "documented hand edit",
+            "arrives with the Checkouts view",
+            "the one write it can cause",
+            "It never edits the folders",
+            "edits nothing: it shows the folders",
+            "or an edit by hand, the save is not applied",
+        ):
+            assert stale not in text, (name, stale)
     assert (
-        "The **Checkouts** view shows the lookup's state but cannot change it; until a "
-        "settings editor arrives, it is edited by hand like the folders"
-    ) in workspaces
-    for name, text in (("docs/running-nyx.md", guide), ("docs/workspaces.md", workspaces)):
-        assert "arrives with the Checkouts view" not in text, name
+        "The **Checkouts** view of the board has a **Checkout folders** editor" in guide
+    )
+    for text in (readme, board_web, checkouts):
+        assert "checkout settings `PUT`" in text
+    assert (
+        "and a **Checkout folders** editor that changes the active workspace's checkout "
+        "folders and GitHub lookup, and the header search"
+    ) in readme
+    assert (
+        "its editor writes only the checkout settings, through the checkout settings `PUT`"
+    ) in readme
+    assert workspaces.count(
+        "lists. Set them in the browser: choose **Checkouts**, open **Checkout folders**, "
+        "add or remove folders and the GitHub lookup, and choose **Save checkout folders**."
+    ) == 1
+    assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
+    assert (
+        "changes board settings and the active workspace's checkout folders and GitHub "
+        "lookup, through `application-serving`'s HTTP routes: the board-settings `PUT` and "
+        "the checkout settings `PUT`"
+    ) in board_web
+    assert (
+        "a checkout folder save on the same page hides them only until its own checkouts "
+        "read answers with a scan of the new folders, and the page installs the new "
+        "catalog itself (with a checkouts read already in flight at the save, it sends no "
+        "read of its own and the lines follow at the next tick)"
+    ) in board_web
+    assert (
+        "asks for a checkouts read at once, unless one is already in flight, when the next "
+        "tick shows the new folders"
+    ) in board_web
+    assert "change the active workspace's checkout folders and GitHub lookup" in readme
+    # The board-web README names both writes of the Checkouts view.
+    assert "(a request for a remote check through `application-serving`)" in board_web
+    assert "whose save is the view's other write (the checkout settings `PUT`)" in board_web
+    assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
+    assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
+    assert "never through this system" in checkouts
+    assert (
+        "a checkout folder save on the same page requests answers with a scan of the new "
+        "folders (or the next tick, when a read was already in flight at the save)"
+    ) in checkouts
 
 
 def test_checkout_system_readme_states_the_developer_tools_check():

@@ -24,7 +24,12 @@ from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
 from nyx.catalog import scan_catalog
 from nyx.checkouts import PackageScan, collect_checkouts
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
-from nyx.server import CatalogError, _create_application_server, create_server
+from nyx.server import (
+    CatalogError,
+    InvalidCheckoutFolders,
+    _create_application_server,
+    create_server,
+)
 
 playwright = pytest.importorskip("playwright.sync_api")
 
@@ -520,6 +525,30 @@ class BrowserSettings:
         self.fail_next_load = False
         self.gate = gate
         self.entered = threading.Event()
+        self.folders = []
+        self.github_lookup = False
+        self.folder_gets = 0
+        self.fail_next_folder_load = False
+        self.folder_calls = []
+        # Queued answers for the next folder save: refused folders (a list of
+        # ``{index, reason}``), the runtime's null-state outcome, or an error code.
+        self.folder_problems = None
+        self.folder_reload_needed = False
+        self.folder_save_error = None
+        # The page's checkouts double, when a test attaches it: a folder save
+        # then switches that double's document to one listing the saved folders.
+        self.checkouts = None
+
+    def get_checkout_settings(self):
+        self.folder_gets += 1
+        if self.fail_next_folder_load:
+            self.fail_next_folder_load = False
+            raise CatalogError("settings_unavailable")
+        return {
+            "folders": list(self.folders),
+            "github_lookup": self.github_lookup,
+            "revision": self.revision,
+        }
 
     def get_settings(self):
         self.get_calls += 1
@@ -550,6 +579,43 @@ class BrowserSettings:
         self.completed = list(completed)
         self.revision = f"revision-{len(self.calls) + 1}"
         return {"order": list(self.order), "completed": list(self.completed), "revision": self.revision, "outcome": "success"}
+
+
+    def _folder_answer(self, outcome):
+        return {
+            "folders": list(self.folders), "github_lookup": self.github_lookup,
+            "revision": self.revision, "outcome": outcome,
+        }
+
+    def save_checkout_settings(self, revision, folders, github_lookup):
+        self.folder_calls.append(
+            {"revision": revision, "folders": list(folders), "github_lookup": github_lookup}
+        )
+        if self.folder_save_error is not None:
+            code, self.folder_save_error = self.folder_save_error, None
+            raise CatalogError(code)
+        if self.folder_problems is not None:
+            problems, self.folder_problems = self.folder_problems, None
+            raise InvalidCheckoutFolders(problems)
+        if self.folder_reload_needed:
+            self.folder_reload_needed = False
+            # The runtime's null state: no record to compare, so no revision.
+            return {"folders": [], "github_lookup": False, "revision": None,
+                    "outcome": "reload-needed"}
+        if self.fail_next:
+            self.fail_next = False
+            return self._folder_answer("failure")
+        if revision != self.revision:
+            return self._folder_answer("conflict")
+        self.folders = sorted(set(folders))
+        self.github_lookup = github_lookup and bool(self.folders)
+        # One revision for both kinds of save, never one an earlier save made.
+        self.revision = f"{0xF0000 + len(self.folder_calls) + len(self.calls):064x}"
+        if self.checkouts is not None:
+            self.checkouts.document = checkouts_listing_folders(
+                self.checkouts.document, self.folders, self.revision
+            )
+        return self._folder_answer("success")
 
 
 class RootSwitchSettings(BrowserSettings):
@@ -593,6 +659,16 @@ def checkouts_envelope(document):
             "last": None,
         },
     }
+
+
+def checkouts_listing_folders(document, folders, revision):
+    """One document re-sealed to list ``folders`` under ``revision``."""
+    changed = copy.deepcopy(document)
+    changed["configuration_revision"] = revision
+    changed["folders"] = sorted(
+        ({"path": path, "status": "ok"} for path in folders), key=models.folder_sort_key
+    )
+    return redigest(changed)
 
 
 class BrowserCheckouts:
@@ -789,7 +865,9 @@ def page_launcher(browser, launch_timeout_ms=15000):
             )
             application.get_settings = settings.get_settings
             application.get_workspace = settings.get_workspace
+            application.get_checkout_settings = settings.get_checkout_settings
             application.save_settings = settings.save_settings
+            application.save_checkout_settings = settings.save_checkout_settings
             client.settings = settings
             if workers is None:
                 double = checkouts or BrowserCheckouts()
@@ -2315,6 +2393,49 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
         "Under_Development",
     ]
     assert winning_page.get_by_role("button", name="Save").is_enabled()
+
+
+def test_stage_order_save_reports_an_error_code_then_reload_needed(open_page):
+    class QueuedAnswerSettings(BrowserSettings):
+        def __init__(self):
+            super().__init__()
+            self.answers = []
+
+        def save_settings(self, revision, order, completed):
+            if not self.answers:
+                return super().save_settings(revision, order, completed)
+            self.calls.append((revision, list(order), list(completed)))
+            answer = self.answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    settings = QueuedAnswerSettings()
+    settings.answers = [
+        CatalogError("settings_unavailable"),
+        {"order": [], "completed": [], "revision": None, "outcome": "reload-needed"},
+    ]
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
+    page.get_by_role("button", name="Move Under Development up").click()
+    draft = ["Under_Development", "Queue"]
+    save = page.get_by_role("button", name="Save")
+
+    save.click()
+    page.get_by_text("Save failed: settings_unavailable", exact=True).wait_for()
+    assert stage_editor_order(page) == draft
+    assert save.is_enabled()
+
+    save.click()
+    page.get_by_text(
+        "Save not applied: reload-needed. Reload board settings to replace this unsaved draft and try again.",
+        exact=True,
+    ).wait_for()
+    assert stage_editor_order(page) == draft
+    assert page.get_by_role("button", name="Reload board settings").is_visible()
+    assert save.is_disabled()
+    assert [call[1] for call in settings.calls] == [draft, draft]
 
 
 CHANGED_ELSEWHERE = (
@@ -6945,6 +7066,9 @@ def checkout_word_requirements():
         (("operation",), set(models.OPERATIONS)),
         (("changeKind",), set(models._CHANGE_KEYS)),
         (("folderStatus",), set(models._FOLDER_STATUSES)),
+        # Every reason a save can refuse a folder for: the collector's problem
+        # statuses, which the save reuses, and the two it checks before reading.
+        (("folderReason",), (set(models._FOLDER_STATUSES) - {"ok"}) | {"invalid_path", "not_absolute"}),
         (("gitStatus",), set(models._GIT_STATUSES)),
         (("checkStatus",), set(models._CHECK_STATUSES)),
         (("checkReason",), set(models._CHECK_FAILURE_REASONS)),
@@ -6982,6 +7106,10 @@ def test_checkouts_words_cover_every_served_value():
     broken = copy.deepcopy(words)
     assert broken["comparisonRelation"].pop("diverged") == "{a} ahead, {b} behind"
     assert missing_checkout_words(broken) == [("comparisonRelation", "diverged")]
+    # A save reason without words fails the same way.
+    reasons = copy.deepcopy(words)
+    reasons["folderReason"].pop("not_absolute")
+    assert missing_checkout_words(reasons) == [("folderReason", "not_absolute")]
 
 
 def test_checkouts_words_block_names_the_view_markers_once():
@@ -6991,7 +7119,9 @@ def test_checkouts_words_block_names_the_view_markers_once():
     assert source.count(CHECKOUTS_WORDS_END) == 1
     words = checkout_words()
     # The rows, headers and setup sentences the view shows are in the block too.
-    assert words["text"]["noFolders"].startswith("No checkout folders are configured.")
+    assert words["text"]["noFolders"] == (
+        "No checkout folders are configured. Choose Checkout folders above to add one."
+    )
     assert words["column"]["default"] == "Default branch vs remote"
     assert words["text"]["workItemBranches"] == "Work item branches"
 
@@ -7405,9 +7535,10 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     # No configured folder: the guide section is named, and no control appears.
     serve_checkouts(page, double, empty_checkouts_document())
     setup = body.locator(".checkouts-setup")
-    sentence = setup.inner_text()
-    assert "No checkout folders are configured." in sentence
-    assert "Your specification workspace → Checkout folders" in sentence
+    sentence = setup.locator(".checkouts-setup-item").inner_text()
+    assert sentence == (
+        "No checkout folders are configured. Choose Checkout folders above to add one."
+    )
     assert setup.locator("input, button, select, textarea, [contenteditable]").count() == 0
     assert body.locator(".checkouts-group").count() == 0
 
@@ -9250,6 +9381,10 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    add_folder(page, "/" + "q" * 299)
     columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
                "Tree", "Branches", "Cleanup", "Package"]
     for theme in ("dark", "light"):
@@ -9260,6 +9395,13 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
         settle_frames(page)
         assert page.evaluate("""() => [document.documentElement.scrollWidth,
           document.documentElement.clientWidth]""") == [360, 360]
+        editor_rights = page.evaluate("""() => [...document.querySelectorAll(
+          '#checkout-folders-editor summary, #checkout-folders-editor input, ' +
+          '#checkout-folders-editor button, #checkout-folders-editor .checkout-folders-path')]
+          .filter(node => node.getClientRects().length)
+          .map(node => [node.id || node.className, node.getBoundingClientRect().right])""")
+        assert len(editor_rights) >= 7, editor_rights
+        assert all(right <= 360.5 for _, right in editor_rights), editor_rights
         row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
         labels = row.evaluate("""el => [...el.children].map(cell => {
           const label = cell.firstElementChild;
@@ -9327,6 +9469,10 @@ CHECKOUTS_TEXT_SAMPLES = {
         ".checkouts-attention-item, .checkouts-attention-go"),
     "freshness words": ".checkouts-freshness",
     "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
+    "folders editor": (
+        "#checkout-folders-editor summary, #checkout-folders-editor label, "
+        ".checkout-folders-path, .checkout-folders-status, "
+        "#checkout-folders-editor button"),
 }
 
 
@@ -9366,6 +9512,11 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     page, double = open_view_checkouts(open_page, view_checkouts, cached)
     page.set_viewport_size({"width": 1600, "height": 1200})
     page.get_by_label("Theme", exact=True).select_option(theme)
+    # An open editor with one draft folder shows every control it has.
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    add_folder(page, "/work/draft")
     open_every_clone_row(page)
     detail = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]').locator(
         "xpath=following-sibling::tr[1]")
@@ -9391,6 +9542,13 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
         "attention item": ".checkouts-attention-go",
         "Check remotes now": "#check-remotes",
         "Show on board": ".checkouts-show-on-board",
+        "folders summary": "#checkout-folders-editor summary",
+        "folders path": "#checkout-folders-path",
+        "folders Add": "#checkout-folders-add",
+        "folders Remove": ".checkout-folders-remove",
+        "folders checkbox": "#checkout-folders-github",
+        "folders Save": "#checkout-folders-save",
+        "folders Cancel": "#checkout-folders-cancel",
     }
     for name, selector in rings.items():
         # A key press makes the next script focus show as keyboard focus.
@@ -9431,6 +9589,43 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     page.keyboard.press("Enter")
     playwright.expect(page.locator("#checkouts-action-status")).to_have_text(
         "This server does not offer remote checks.")
+
+    # The folders editor: Enter on its summary opens it, a path is typed and
+    # added with Enter, and Space on a Remove drops that folder.  Focus goes to
+    # the next folder's Remove, else the previous one, else the path input.
+    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    tab_until(page, "document.activeElement.id === 'checkout-folders-path'")
+    for name in ("code", "docs", "site"):
+        page.keyboard.type(name)
+        page.keyboard.press("Enter")
+    assert folder_paths(page) == ["code", "docs", "site"]
+    focus_label = "document.activeElement.getAttribute('aria-label')"
+    tab_until(page, f"{focus_label} === 'Remove checkout folder docs'")
+    page.keyboard.press("Space")
+    assert folder_paths(page) == ["code", "site"]
+    assert page.evaluate(focus_label) == "Remove checkout folder site"
+    page.keyboard.press("Space")
+    assert folder_paths(page) == ["code"]
+    assert page.evaluate(focus_label) == "Remove checkout folder code"
+    page.keyboard.press("Space")
+    assert folder_paths(page) == []
+    assert page.evaluate("document.activeElement.id") == "checkout-folders-path"
+    # The checkbox takes Space, and Cancel takes Enter, then focus stays in the panel.
+    tab_until(page, "document.activeElement.id === 'checkout-folders-github'")
+    page.keyboard.press("Space")
+    assert page.locator("#checkout-folders-github").is_checked()
+    tab_until(page, "document.activeElement.id === 'checkout-folders-save'")
+    tab_until(page, "document.activeElement.id === 'checkout-folders-cancel'")
+    page.keyboard.press("Enter")
+    assert not page.locator("#checkout-folders-github").is_checked()
+    assert page.evaluate(
+        "document.activeElement.closest('#checkout-folders-editor') !== null")
+    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+    page.keyboard.press("Enter")
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
 
     # A row toggle opens with Enter and closes with Space.
     toggle_probe = f"""(() => {{
@@ -9504,10 +9699,11 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
             playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
         else:
             serve_checkouts(page, double, step)
-        assert page.evaluate(live) == ["checkouts-action-status"]
-        # A tick never writes the action status.
+        assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+        # A tick never writes either region.
         assert all(not action for _, action, _ in checkouts_records(page))
         assert page.locator("#checkouts-action-status").inner_text() == ""
+        assert page.locator("#checkout-folders-status").inner_text() == ""
 
 
 def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
@@ -9539,3 +9735,1114 @@ def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
     page.fill("#filter", "")
     assert summary.inner_text() == "Quiet repositories (2)"
     playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)
+
+
+# ---------------------------------------------------------------------------
+# The checkout folders editor: host, load and the one auto-open
+# ---------------------------------------------------------------------------
+
+FOLDERS_EDITOR = "#checkout-folders-editor"
+FOLDERS_LIST_ITEMS = "#checkout-folders-list .checkout-folders-path"
+
+
+def folder_paths(page):
+    """The folder paths the editor lists, in shown order."""
+    return page.locator(FOLDERS_LIST_ITEMS).evaluate_all(
+        "items => items.map(item => item.textContent)"
+    )
+
+
+def toggle_folders_editor(page):
+    """Press the editor's summary and let its toggle event run."""
+    page.locator(f"{FOLDERS_EDITOR} summary").click()
+    settle_frames(page)
+
+
+def open_folders_page(launch, attention_checkouts, settings, double=None):
+    """Open the checkouts view over a document that collects one folder."""
+    double = double or BrowserCheckouts(attention_checkouts.document)
+    page = launch(
+        StaticClient(attention_checkouts.catalog_all),
+        settings=settings, checkouts=double, fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page, double
+
+
+def test_checkout_folders_editor_sits_in_the_status_row_for_ready_and_failed_outcomes(
+    open_page, attention_checkouts
+):
+    """Only a settled ready or failed outcome shows the editor, beside the check button."""
+    double = BrowserCheckouts(attention_checkouts.document)
+    gate = double.hold()
+    page = open_page(
+        StaticClient(attention_checkouts.catalog_all),
+        settings=BrowserSettings(revision=CHECKOUTS_REVISION), checkouts=double,
+        fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    assert double.entered.wait(timeout=10)
+    show_checkouts_view(page)
+    editor = page.locator(FOLDERS_EDITOR)
+    # Nothing has settled, so the held first request leaves the editor hidden.
+    playwright.expect(editor).to_be_hidden()
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    playwright.expect(editor).to_be_visible()
+    assert page.evaluate("""() => {
+      const editor = document.querySelector('#checkout-folders-editor');
+      const check = document.querySelector('#check-remotes');
+      return editor.tagName === 'DETAILS' &&
+        editor.parentElement.classList.contains('checkouts-status') &&
+        editor.parentElement === check.parentElement &&
+        Boolean(check.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+        editor.closest('#checkouts-status-line, #checkouts-body') === null &&
+        editor.querySelector('summary').textContent === 'Checkout folders';
+    }""")
+    page.evaluate("document.querySelector('#checkout-folders-editor').dataset.mark = 'same'")
+
+    # A failed outcome keeps it, and the node a tick leaves is the one marked.
+    double.fail("checkouts_unavailable")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    playwright.expect(editor).to_be_visible()
+    assert editor.get_attribute("data-mark") == "same"
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    playwright.expect(editor).to_be_visible()
+    assert editor.get_attribute("data-mark") == "same"
+
+    # The standalone server has no checkouts route, so the editor stays hidden.
+    plain = open_page(
+        StaticClient(attention_checkouts.catalog_all), fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(plain, "checkoutsResponses", 1)
+    assert plain.evaluate("window.checkoutsResponses") == [404]
+    settle_frames(plain)
+    show_checkouts_view(plain)
+    playwright.expect(plain.locator(FOLDERS_EDITOR)).to_be_hidden()
+
+
+def test_checkout_folders_editor_loads_the_saved_folders_on_every_open_without_a_draft(
+    open_page, attention_checkouts
+):
+    """Each open asks again, so a record changed between two opens shows its new folders."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha", "/work/beta"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    assert settings.folder_gets == 0
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_count(2)
+    assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+    assert not page.locator("#checkout-folders-github").is_checked()
+    assert settings.folder_gets == 1
+
+    toggle_folders_editor(page)
+    settings.folders = ["/work/gamma", "/work/alpha"]
+    settings.github_lookup = True
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-github")).to_be_checked()
+    assert folder_paths(page) == ["/work/gamma", "/work/alpha"]
+    assert settings.folder_gets == 2
+
+
+def test_checkout_folders_editor_discards_an_earlier_load_answer(
+    open_page, attention_checkouts
+):
+    """An answer to the first open that arrives after the second open's answer is dropped."""
+
+    class FirstLoadHeld(HexRevisionSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.first_gate = threading.Event()
+            self.first_entered = threading.Event()
+
+        def get_checkout_settings(self):
+            answer = super().get_checkout_settings()
+            if self.folder_gets == 1:
+                self.first_entered.set()
+                self.first_gate.wait(timeout=10)
+            return answer
+
+    settings = FirstLoadHeld(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/old"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    assert settings.first_entered.wait(timeout=10)
+    toggle_folders_editor(page)
+    settings.folders = ["/work/new"]
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/new"])
+    with page.expect_response("**/api/checkout-settings") as late:
+        settings.first_gate.set()
+    late.value.finished()
+    settle_frames(page)
+    assert settings.folder_gets == 2
+    assert folder_paths(page) == ["/work/new"]
+
+
+def test_checkout_folders_editor_load_failure_offers_reload_and_keeps_the_view(
+    open_page, attention_checkouts
+):
+    """A failed load names its code, leaves the groups, and Reload loads."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    settings.fail_next_folder_load = True
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    playwright.expect(reload_button).to_be_hidden()
+    toggle_folders_editor(page)
+    status = page.locator("#checkout-folders-status")
+    playwright.expect(status).to_have_text(
+        "Could not load checkout folders: settings_unavailable"
+    )
+    playwright.expect(reload_button).to_be_visible()
+    assert page.locator("#checkouts-body .checkouts-group").count() == 1
+    assert folder_paths(page) == []
+    refuse_folder_edits(page, "Could not load checkout folders: settings_unavailable", [])
+
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    playwright.expect(reload_button).to_be_hidden()
+    assert settings.folder_gets == 2
+    assert "Could not load" not in status.inner_text()
+
+
+def test_checkout_folders_edits_are_ignored_while_the_saved_folders_load(
+    open_page, attention_checkouts
+):
+    """A load in flight holds every edit, so a draft always starts from the saved folders."""
+
+    class HeldLoad(BrowserSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.load_gate = threading.Event()
+            self.load_entered = threading.Event()
+
+        def get_checkout_settings(self):
+            answer = super().get_checkout_settings()
+            self.load_entered.set()
+            self.load_gate.wait(timeout=10)
+            return answer
+
+        def hold_next_load(self):
+            self.load_gate = threading.Event()
+            self.load_entered = threading.Event()
+
+    def held_controls():
+        return page.locator(
+            f"{FOLDERS_EDITOR} button:visible:not([disabled]), {FOLDERS_EDITOR} input:visible"
+        )
+
+    def release_load():
+        with page.expect_response("**/api/checkout-settings") as answered:
+            settings.load_gate.set()
+        answered.value.finished()
+        settle_frames(page)
+
+    document = suggestion_document(attention_checkouts, [{"path": "/work/aaa", "package_count": 1}])
+    settings = HeldLoad(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha", "/work/beta"]
+    settings.github_lookup = True
+    page, _ = open_folders_page(
+        open_page, attention_checkouts, settings, BrowserCheckouts(document))
+    save = folders_save_button(page)
+    path_input = page.locator("#checkout-folders-path")
+    lookup = page.locator("#checkout-folders-github")
+    try:
+        # The first open: nothing is served yet, and no attempt builds a draft.
+        toggle_folders_editor(page)
+        assert settings.load_entered.wait(timeout=5)
+        controls = held_controls()
+        # Path input, Add, the suggestion and the checkbox; Save and Cancel are disabled.
+        assert controls.count() == 4
+        for index in range(controls.count()):
+            assert controls.nth(index).get_attribute("aria-disabled") == "true"
+        # Playwright treats aria-disabled as not actionable, so each attempt is forced.
+        path_input.fill("/work/new", force=True)
+        page.get_by_role("button", name="Add", exact=True).click(force=True)
+        path_input.press("Enter")
+        page.get_by_role("button", name="Add /work/aaa (1 work item)", exact=True).click(force=True)
+        lookup.click(force=True)
+        assert folder_paths(page) == []
+        assert not lookup.is_checked()
+        playwright.expect(save).to_be_disabled()
+        # The dimmed control keeps the focus the reader gave it.
+        playwright.expect(lookup).to_be_focused()
+        release_load()
+        assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+        playwright.expect(lookup).to_be_checked()
+        playwright.expect(save).to_be_disabled()
+        playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Current checkout folders loaded.")
+        assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
+
+        # A reopen shows the last served list while it loads; Remove is held too.
+        toggle_folders_editor(page)
+        settings.folders = ["/work/alpha"]
+        settings.hold_next_load()
+        toggle_folders_editor(page)
+        assert settings.load_entered.wait(timeout=5)
+        remove = page.get_by_role("button", name="Remove checkout folder /work/beta", exact=True)
+        playwright.expect(remove).to_have_attribute("aria-disabled", "true")
+        remove.click(force=True)
+        assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+        release_load()
+        assert folder_paths(page) == ["/work/alpha"]
+        playwright.expect(save).to_be_disabled()
+    finally:
+        settings.load_gate.set()
+
+    # A failed load releases the controls, so the reader can still edit.
+    toggle_folders_editor(page)
+    settings.fail_next_folder_load = True
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "Could not load checkout folders: settings_unavailable")
+    assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
+    add_folder(page, "/work/new")
+    assert folder_paths(page) == ["/work/alpha", "/work/new"]
+    assert settings.folder_calls == []
+
+
+def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
+    open_page, attention_checkouts
+):
+    """A ready document with no folders opens the editor once; the reader's close sticks."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    double = BrowserCheckouts()
+    page = open_page(
+        StaticClient(attention_checkouts.catalog_all), settings=settings, checkouts=double,
+        fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    editor = page.locator(FOLDERS_EDITOR)
+    # The view is still the board; the panel opens itself and loads once.
+    playwright.expect(editor).to_have_attribute("open", "")
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    assert settings.folder_gets == 1
+    show_checkouts_view(page)
+    toggle_folders_editor(page)
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    page.locator("#view-board").click()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+    assert settings.folder_gets == 1
+
+    # A document with a folder never opens it.
+    other = BrowserSettings(revision=CHECKOUTS_REVISION)
+    full, _ = open_folders_page(open_page, attention_checkouts, other)
+    fire_checkouts_poll(full)
+    settle_frames(full)
+    assert full.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+    assert other.folder_gets == 0
+
+
+def folder_buttons(page, role):
+    """The visible text of each of the editor's folder buttons of one role."""
+    return page.locator(f'{FOLDERS_EDITOR} button[data-role="{role}"]').evaluate_all(
+        "buttons => buttons.map(button => button.textContent)"
+    )
+
+
+def add_folder(page, path):
+    """Type ``path`` in the editor's input and press its Add button."""
+    page.locator("#checkout-folders-path").fill(path)
+    page.get_by_role("button", name="Add", exact=True).click()
+
+
+def refuse_folder_edits(page, status_text, expected_paths):
+    """Every edit control is held; each attempt leaves the draft, status, Save and Reload as they were."""
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    lookup = page.locator("#checkout-folders-github")
+    path_input = page.locator("#checkout-folders-path")
+    status = page.locator(FOLDERS_STATUS)
+    held = [path_input, page.get_by_role("button", name="Add", exact=True), lookup]
+    held += [
+        page.get_by_role("button", name=f"Remove checkout folder {path}", exact=True)
+        for path in expected_paths
+    ]
+    for control in held:
+        playwright.expect(control).to_have_attribute("aria-disabled", "true")
+    playwright.expect(reload_button).not_to_have_attribute("aria-disabled", "true")
+    checked = lookup.is_checked()
+    path_input.fill("/work/refused", force=True)
+    page.get_by_role("button", name="Add", exact=True).click(force=True)
+    path_input.press("Enter")
+    lookup.click(force=True)
+    for path in expected_paths:
+        page.get_by_role("button", name=f"Remove checkout folder {path}", exact=True).click(force=True)
+    settle_frames(page)
+    assert folder_paths(page) == expected_paths
+    assert lookup.is_checked() == checked
+    playwright.expect(status).to_have_text(status_text)
+    playwright.expect(folders_save_button(page)).to_be_disabled()
+    playwright.expect(reload_button).to_be_visible()
+
+
+def test_checkout_folders_draft_adds_removes_and_cancels(open_page, attention_checkouts):
+    """The draft takes exactly what is typed; only empty and repeated entries are refused."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    save = page.get_by_role("button", name="Save checkout folders", exact=True)
+    cancel = page.get_by_role("button", name="Cancel checkout folder changes", exact=True)
+    path_input = page.locator("#checkout-folders-path")
+    lookup = page.get_by_label("Look up pull requests with the GitHub CLI (gh)")
+    playwright.expect(save).to_be_disabled()
+    playwright.expect(cancel).to_be_disabled()
+
+    # Add keeps a relative path as typed and clears the input.
+    add_folder(page, "code")
+    assert folder_paths(page) == ["/work/alpha", "code"]
+    assert path_input.input_value() == ""
+    playwright.expect(save).to_be_enabled()
+    playwright.expect(cancel).to_be_enabled()
+    # Enter in the input adds too.
+    path_input.fill("/work/beta")
+    path_input.press("Enter")
+    assert folder_paths(page) == ["/work/alpha", "code", "/work/beta"]
+    # An empty entry and an exact repeat are ignored.
+    page.get_by_role("button", name="Add", exact=True).click()
+    add_folder(page, "code")
+    path_input.press("Enter")
+    assert folder_paths(page) == ["/work/alpha", "code", "/work/beta"]
+
+    # Remove drops its own folder.
+    page.get_by_role("button", name="Remove checkout folder /work/alpha").click()
+    assert folder_paths(page) == ["code", "/work/beta"]
+    lookup.check()
+    assert settings.folder_gets == 1
+
+    # Cancel restores the saved list and the checkbox, and both buttons go quiet.
+    cancel.click()
+    assert folder_paths(page) == ["/work/alpha"]
+    assert not lookup.is_checked()
+    playwright.expect(save).to_be_disabled()
+    playwright.expect(cancel).to_be_disabled()
+
+    # The checkbox alone is a draft, and undoing it by hand is no draft.
+    lookup.check()
+    playwright.expect(save).to_be_enabled()
+    lookup.uncheck()
+    playwright.expect(save).to_be_disabled()
+    # Removing and re-adding the same folder restores the saved state.
+    page.get_by_role("button", name="Remove checkout folder /work/alpha").click()
+    playwright.expect(save).to_be_enabled()
+    add_folder(page, "/work/alpha")
+    playwright.expect(save).to_be_disabled()
+    assert settings.folder_gets == 1
+
+
+def suggestion_document(attention_checkouts, suggestions):
+    """The attention capture with ``suggestions`` as its parent-folder suggestions."""
+    return checkout_variant(
+        attention_checkouts.document,
+        lambda document: document.__setitem__("folder_suggestions", suggestions),
+    )
+
+
+def test_checkout_folders_suggestions_offer_unconfigured_parents_with_their_counts(
+    open_page, attention_checkouts
+):
+    """A ready document's suggestions are Add buttons; a draft folder or a failure hides them."""
+    document = suggestion_document(attention_checkouts, [
+        {"path": "/work/aaa", "package_count": 1},
+        {"path": "/work/zzz", "package_count": 3},
+    ])
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    page, double = open_folders_page(
+        open_page, attention_checkouts, settings, BrowserCheckouts(document))
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    assert folder_buttons(page, "suggest") == [
+        "Add /work/aaa (1 work item)", "Add /work/zzz (3 work items)"]
+
+    # A path already in the draft is not offered.
+    add_folder(page, "/work/zzz")
+    assert folder_buttons(page, "suggest") == ["Add /work/aaa (1 work item)"]
+    # Adding a suggestion appends its path and takes its button away.
+    page.get_by_role("button", name="Add /work/aaa (1 work item)").click()
+    assert folder_paths(page) == ["/work/zzz", "/work/aaa"]
+    assert folder_buttons(page, "suggest") == []
+    # Removing a folder offers its suggestion again.
+    page.get_by_role("button", name="Remove checkout folder /work/zzz").click()
+    assert folder_buttons(page, "suggest") == ["Add /work/zzz (3 work items)"]
+
+    # A failed collection shows none, and the draft stays.
+    double.fail("checkouts_unavailable")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert folder_buttons(page, "suggest") == []
+    assert folder_paths(page) == ["/work/aaa"]
+    # The next ready document brings them back.
+    serve_checkouts(page, double, document)
+    assert folder_buttons(page, "suggest") == ["Add /work/zzz (3 work items)"]
+
+
+def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switches(
+    open_page, attention_checkouts
+):
+    """Nothing the view redraws touches an open editor, its draft or the focus in it."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/draft")
+    path_input = page.locator("#checkout-folders-path")
+    path_input.fill("typed")
+    path_input.focus()
+    page.evaluate("""() => {
+      window.editorRecords = [];
+      new MutationObserver((records) => window.editorRecords.push(...records.map(
+        (record) => record.type + ':' + record.target.nodeName)))
+        .observe(document.querySelector('#checkout-folders-editor'),
+          {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+    def intact():
+        assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+        assert folder_paths(page) == ["/work/alpha", "/work/draft"]
+        assert path_input.input_value() == "typed"
+        playwright.expect(path_input).to_be_focused()
+        assert page.locator("#checkouts-body .checkouts-group").count() == 1
+
+    fire_checkouts_poll(page)
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("window.editorRecords") == []
+    intact()
+
+    # Installing a catalog from the board's Refresh view leaves the editor alone.
+    page.locator("#view-board").click()
+    with page.expect_response("**/api/catalog"):
+        page.get_by_role("button", name="Refresh view", exact=True).click()
+    settle_frames(page)
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    settle_frames(page)
+    assert page.evaluate("window.editorRecords") == []
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+    assert folder_paths(page) == ["/work/alpha", "/work/draft"]
+    assert path_input.input_value() == "typed"
+    assert settings.folder_gets == 1
+    path_input.focus()
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    intact()
+
+
+# ---------------------------------------------------------------------------
+# The checkout folders editor: Save, its outcomes and the folder problems
+# ---------------------------------------------------------------------------
+
+FOLDERS_SAVE_BUTTON = "Save checkout folders"
+FOLDERS_STATUS = "#checkout-folders-status"
+
+
+def folders_save_button(page):
+    return page.get_by_role("button", name=FOLDERS_SAVE_BUTTON, exact=True)
+
+
+def folder_marks(page):
+    """Each listed folder's ``(aria-invalid, words of its description)`` pair."""
+    return page.locator("#checkout-folders-list > li").evaluate_all("""items => items.map((item) => {
+      const name = item.querySelector('.checkout-folders-path');
+      const id = name.getAttribute('aria-describedby');
+      const described = id ? document.getElementById(id) : null;
+      return [name.getAttribute('aria-invalid'), described ? described.textContent : null,
+        id !== null && item.contains(described)];
+    })""")
+
+
+def test_checkout_folders_save_sends_the_draft_and_shows_the_servers_answer(
+    open_page, attention_checkouts
+):
+    """The editor shows the response, in its order and with its checkbox, not the draft."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/zeta"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/zeta"])
+    lookup = page.get_by_label("Look up pull requests with the GitHub CLI (gh)")
+    status = page.locator(FOLDERS_STATUS)
+
+    add_folder(page, "/work/alpha")
+    add_folder(page, "/work/mid")
+    lookup.check()
+    folders_save_button(page).click()
+    # The double sorts, so a page that kept its draft would show another order.
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(
+        ["/work/alpha", "/work/mid", "/work/zeta"]
+    )
+    assert settings.folder_calls == [{
+        "revision": CHECKOUTS_REVISION,
+        "folders": ["/work/zeta", "/work/alpha", "/work/mid"],
+        "github_lookup": True,
+    }]
+    playwright.expect(status).to_have_text("Checkout folders saved.")
+    assert lookup.is_checked()
+    playwright.expect(folders_save_button(page)).to_be_disabled()
+    first = settings.revision
+    assert first != CHECKOUTS_REVISION
+
+    # Clearing every folder with the box checked: the answer unchecks it, and
+    # the message says why; the page does not predict that itself.
+    for path in ("/work/alpha", "/work/mid", "/work/zeta"):
+        page.get_by_role("button", name=f"Remove checkout folder {path}").click()
+    assert lookup.is_checked()
+    folders_save_button(page).click()
+    playwright.expect(status).to_have_text(
+        "Checkout folders saved. With no folders the pull-request lookup is off."
+    )
+    assert folder_paths(page) == []
+    assert not lookup.is_checked()
+    assert settings.folder_calls[1] == {
+        "revision": first, "folders": [], "github_lookup": True,
+    }
+    assert settings.revision not in (CHECKOUTS_REVISION, first)
+
+
+def test_checkout_folders_save_marks_each_refused_folder_with_its_problem(
+    open_page, attention_checkouts
+):
+    """Each problem's submitted index marks its own row, and an edit clears the marks."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Current checkout folders loaded.")
+    add_folder(page, "/gone")
+    add_folder(page, "/work/fine")
+    add_folder(page, "relative")
+    settings.folder_problems = [
+        {"index": 0, "reason": "missing"}, {"index": 2, "reason": "not_absolute"},
+    ]
+    folders_save_button(page).click()
+    reasons = checkout_words()["folderReason"]
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "The checkout folders were not saved. Fix the marked folders and save again."
+    )
+    assert folder_marks(page) == [
+        ["true", reasons["missing"], True],
+        [None, None, False],
+        ["true", reasons["not_absolute"], True],
+    ]
+    assert reasons["missing"] != reasons["not_absolute"]
+    assert folder_paths(page) == ["/gone", "/work/fine", "relative"]
+    assert settings.folder_calls[0]["folders"] == ["/gone", "/work/fine", "relative"]
+
+    # An edit moves the positions the marks name, so it clears them.
+    page.get_by_role("button", name="Remove checkout folder /gone").click()
+    assert folder_marks(page) == [[None, None, False], [None, None, False]]
+
+
+def test_checkout_folders_save_keeps_the_draft_through_each_refusal(
+    open_page, attention_checkouts
+):
+    """Failure, an error code, reload-needed and conflict each keep the draft."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    status = page.locator(FOLDERS_STATUS)
+    save = folders_save_button(page)
+    cancel = page.get_by_role("button", name="Cancel checkout folder changes", exact=True)
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    draft = ["/work/alpha", "/work/beta"]
+    add_folder(page, "/work/beta")
+
+    settings.fail_next = True
+    save.click()
+    playwright.expect(status).to_have_text("Save failed: the checkout folders were not saved.")
+    assert folder_paths(page) == draft
+    playwright.expect(reload_button).to_be_hidden()
+    assert settings.folders == ["/work/alpha"]
+
+    settings.folder_save_error = "settings_unavailable"
+    save.click()
+    playwright.expect(status).to_have_text("Save failed: settings_unavailable")
+    assert folder_paths(page) == draft
+
+    # The runtime's null state is neither the saved list nor a protocol error.
+    settings.folder_reload_needed = True
+    save.click()
+    playwright.expect(status).to_have_text(
+        "Save not applied: the saved checkout folders are not available to compare. "
+        "Reload checkout folders to replace this unsaved draft and try again."
+    )
+    assert folder_paths(page) == draft
+    playwright.expect(reload_button).to_be_visible()
+    playwright.expect(cancel).to_be_enabled()
+    playwright.expect(cancel).not_to_have_attribute("aria-disabled", "true")
+    refuse_folder_edits(page, status.inner_text(), draft)
+    cancel.click()
+    assert folder_paths(page) == ["/work/alpha"]
+    playwright.expect(reload_button).to_be_visible()
+    settings.folders = ["/work/alpha", "/work/served"]
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(
+        ["/work/alpha", "/work/served"]
+    )
+    playwright.expect(reload_button).to_be_hidden()
+
+    # A save by someone else moves the revision this draft was made under.
+    add_folder(page, "/work/gamma")
+    outside = settings.save_checkout_settings(settings.revision, ["/work/outside"], False)
+    assert outside["outcome"] == "success"
+    save.click()
+    playwright.expect(status).to_have_text(
+        "Save not applied: the checkout folders changed elsewhere. "
+        "Reload checkout folders to replace this unsaved draft and try again."
+    )
+    assert folder_paths(page) == ["/work/alpha", "/work/served", "/work/gamma"]
+    refuse_folder_edits(
+        page, status.inner_text(), ["/work/alpha", "/work/served", "/work/gamma"])
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/outside"])
+    assert [call["folders"] for call in settings.folder_calls] == [
+        draft, draft, draft, ["/work/outside"], ["/work/alpha", "/work/served", "/work/gamma"],
+    ]
+
+
+def test_checkout_folders_save_in_flight_keeps_focus_on_save(open_page, attention_checkouts):
+    """While the save is held every control is aria-disabled and focus stays on Save."""
+
+    class HeldFolderSave(BrowserSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.save_gate = threading.Event()
+            self.save_entered = threading.Event()
+
+        def save_checkout_settings(self, revision, folders, github_lookup):
+            self.save_entered.set()
+            self.save_gate.wait(timeout=10)
+            return super().save_checkout_settings(revision, folders, github_lookup)
+
+    settings = HeldFolderSave(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/beta")
+    save = folders_save_button(page)
+    save.focus()
+    arm_focus_sampler(page)
+    try:
+        save.press("Enter")
+        assert settings.save_entered.wait(timeout=5)
+        playwright.expect(save).to_be_focused()
+        controls = page.locator(
+            f"{FOLDERS_EDITOR} button:visible, {FOLDERS_EDITOR} input:visible"
+        )
+        assert controls.count() >= 6
+        for index in range(controls.count()):
+            control = controls.nth(index)
+            assert control.get_attribute("aria-disabled") == "true"
+            assert control.get_attribute("disabled") is None
+        measurement = assert_focus_indicator(save)
+        assert 0 < measurement["opacity"] < 1, measurement
+        # A dimmed control does nothing: the draft is untouched by its click.
+        # Playwright treats aria-disabled as not actionable, so the click is forced.
+        page.get_by_role("button", name="Remove checkout folder /work/beta").click(force=True)
+        assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+        assert len(settings.folder_calls) == 0
+        save.focus()
+        assert_focus_sampler_clean(page)
+    finally:
+        settings.save_gate.set()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
+    playwright.expect(save).to_be_disabled()
+    # Save has nothing left to save, so focus moved to the nearest operable control.
+    playwright.expect(page.locator("#checkout-folders-github")).to_be_focused()
+    assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
+    assert_focus_sampler_clean(page)
+
+
+def test_checkout_folders_save_refusals_keep_focus_in_the_editor(
+    open_page, attention_checkouts
+):
+    """After each refusal focus is on Save, or on another operable editor control when
+    Save is not operable, never the body."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    save = folders_save_button(page)
+    status = page.locator(FOLDERS_STATUS)
+
+    def focus_is_in_editor_and_operable():
+        return page.evaluate(
+            """([selector]) => {
+              const active = document.activeElement;
+              const editor = document.querySelector(selector);
+              return !!editor && editor.contains(active) && active !== editor &&
+                !active.disabled;
+            }""",
+            [FOLDERS_EDITOR],
+        )
+
+    add_folder(page, "/work/beta")
+    save.focus()
+    settings.fail_next = True
+    save.press("Enter")
+    playwright.expect(status).to_have_text("Save failed: the checkout folders were not saved.")
+    playwright.expect(save).to_be_focused()
+
+    settings.folder_problems = [{"index": 0, "reason": "missing"}]
+    save.press("Enter")
+    playwright.expect(status).to_contain_text("were not saved. Fix the marked folders")
+    playwright.expect(save).to_be_focused()
+    assert folder_marks(page)[0][0] == "true"
+
+    # A conflict disables Save until a reload; focus must not fall to the body.
+    settings.revision = "e" * 64
+    save.press("Enter")
+    playwright.expect(status).to_contain_text("changed elsewhere")
+    assert focus_is_in_editor_and_operable()
+
+
+def test_checkout_folders_reload_after_a_refusal_leaves_no_stale_marks(
+    open_page, attention_checkouts
+):
+    """A failed reload shows the saved list unmarked, not the refused draft's marks."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/gone")
+    settings.folder_problems = [{"index": 0, "reason": "missing"}]
+    folders_save_button(page).click()
+    playwright.expect(page.locator(f"{FOLDERS_LIST_ITEMS}[aria-invalid]")).to_have_count(1)
+    # The same draft now meets a changed revision: the marks stay with the
+    # draft and Reload is offered.
+    settings.save_checkout_settings(settings.revision, ["/work/alpha"], False)
+    folders_save_button(page).click()
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    playwright.expect(reload_button).to_be_visible()
+    assert folder_marks(page)[0][0] == "true"
+
+    settings.fail_next_folder_load = True
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "Could not load checkout folders: settings_unavailable"
+    )
+    assert folder_paths(page) == ["/work/alpha"]
+    assert folder_marks(page) == [[None, None, False]]
+
+
+# ---------------------------------------------------------------------------
+# The checkout folders editor: one revision for both editors, the refresh after a save
+# ---------------------------------------------------------------------------
+
+BOARD_SAVE_BUTTON = "Save"
+FOLDERS_CHANGED_ELSEWHERE = (
+    "The checkout folders changed elsewhere. Reload checkout folders to replace this "
+    "unsaved draft."
+)
+NO_FOLDERS_WORDS = "No checkout folders are configured."
+
+
+def board_save_button(page):
+    return page.get_by_role("button", name=BOARD_SAVE_BUTTON, exact=True)
+
+
+def move_second_stage_up(page):
+    """Draft a Board settings change: the second stage row moves up."""
+    open_stage_editor(page)
+    page.locator("#stage-order-list .stage-order-item").nth(1).get_by_role(
+        "button", name=re.compile(r"^Move .* up$")
+    ).click()
+    playwright.expect(board_save_button(page)).to_be_enabled()
+
+
+def open_two_editors(open_page, attention_checkouts, settings, double=None):
+    """Open the checkouts view with the folder editor open beside the Board settings."""
+    double = double or BrowserCheckouts(attention_checkouts.document)
+    settings.checkouts = double
+    page, double = open_folders_page(open_page, attention_checkouts, settings, double)
+    playwright.expect(page.locator("#stage-order-status")).to_contain_text("board settings loaded")
+    toggle_folders_editor(page)
+    return page, double
+
+
+def wait_for_catalog_installs(page, count):
+    """Wait for the page's ``count``-th catalog response and let it install."""
+    wait_for_responses(page, "catalogResponses", count)
+    settle_frames(page)
+
+
+def test_checkout_folders_save_keeps_a_board_settings_draft_current(
+    open_page, attention_checkouts
+):
+    """The reader's own folder save is not a change made elsewhere to the Board settings."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    move_second_stage_up(page)
+    draft = stage_editor_order(page)
+    add_folder(page, "/work/beta")
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
+    wait_for_catalog_installs(page, 2)
+    saved_revision = settings.revision
+    assert saved_revision != CHECKOUTS_REVISION
+
+    status = page.locator("#stage-order-status")
+    assert status.inner_text() != CHANGED_ELSEWHERE
+    assert stage_editor_order(page) == draft
+    playwright.expect(board_save_button(page)).to_be_enabled()
+    board_save_button(page).click()
+    playwright.expect(status).to_have_text("Board settings saved.")
+    assert [call[0] for call in settings.calls] == [saved_revision]
+
+
+def test_board_settings_save_keeps_a_checkout_folders_draft_current(
+    open_page, attention_checkouts
+):
+    """The reader's own Board settings save is not a change made elsewhere to the folders."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/beta")
+    status = page.locator(FOLDERS_STATUS)
+    playwright.expect(status).to_have_text("Unsaved checkout folder changes.")
+    move_second_stage_up(page)
+    board_save_button(page).click()
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Board settings saved.")
+    wait_for_catalog_installs(page, 2)
+    saved_revision = settings.revision
+    assert saved_revision != CHECKOUTS_REVISION
+
+    assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+    playwright.expect(status).to_have_text("Unsaved checkout folder changes.")
+    assert settings.folder_gets == 1
+    assert page.get_by_role("button", name="Reload checkout folders", exact=True).is_hidden()
+    folders_save_button(page).click()
+    playwright.expect(status).to_have_text("Checkout folders saved.")
+    assert [call["revision"] for call in settings.folder_calls] == [saved_revision]
+
+
+def test_checkout_folders_failed_save_advances_no_revision(open_page, attention_checkouts):
+    """A failed folder save leaves the Board settings on the revision it holds."""
+
+    class FailureNamesOtherRevision(HexRevisionSettings):
+        def save_checkout_settings(self, revision, folders, github_lookup):
+            if not self.fail_next:
+                return super().save_checkout_settings(revision, folders, github_lookup)
+            self.fail_next = False
+            self.folder_calls.append(
+                {"revision": revision, "folders": list(folders), "github_lookup": github_lookup}
+            )
+            return {"folders": [], "github_lookup": False, "revision": "9" * 64,
+                    "outcome": "failure"}
+
+    settings = FailureNamesOtherRevision(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    add_folder(page, "/work/beta")
+    settings.fail_next = True
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "Save failed: the checkout folders were not saved."
+    )
+    assert len(settings.folder_calls) == 1
+    move_second_stage_up(page)
+    board_save_button(page).click()
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Board settings saved.")
+    assert [call[0] for call in settings.calls] == [CHECKOUTS_REVISION]
+    # The folder draft is untouched, and its next save still sends the revision.
+    assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+
+
+@pytest.mark.parametrize("board_loads", [True, False], ids=["board-loaded", "board-load-failed"])
+def test_checkout_folders_editor_follows_a_record_changed_elsewhere(
+    open_page, attention_checkouts, board_loads
+):
+    """An installed catalog reloads an idle folder editor and flags a drafted one."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    settings.fail_next_load = not board_loads
+    double = BrowserCheckouts(attention_checkouts.document)
+    settings.checkouts = double
+    page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    status = page.locator(FOLDERS_STATUS)
+    installs = [1]
+
+    def refresh_board_view():
+        installs[0] += 1
+        page.locator("#view-board").click()
+        page.get_by_role("button", name="Refresh view", exact=True).click()
+        wait_for_catalog_installs(page, installs[0])
+        page.locator("#view-checkouts").click()
+        playwright.expect(page.locator("#checkouts")).to_be_visible()
+
+    # No draft: the editor shows the other page's folders, with no message.
+    settings.save_checkout_settings(settings.revision, ["/work/alpha", "/work/other"], False)
+    refresh_board_view()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(
+        ["/work/alpha", "/work/other"]
+    )
+    playwright.expect(status).to_have_text("Current checkout folders loaded.")
+    assert page.get_by_role("button", name="Reload checkout folders", exact=True).is_hidden()
+
+    # A draft: kept, named as changed elsewhere, and replaced by Reload.
+    add_folder(page, "/work/draft")
+    settings.save_checkout_settings(settings.revision, ["/work/alpha", "/work/third"], False)
+    refresh_board_view()
+    playwright.expect(status).to_have_text(FOLDERS_CHANGED_ELSEWHERE)
+    assert folder_paths(page) == ["/work/alpha", "/work/other", "/work/draft"]
+    playwright.expect(folders_save_button(page)).to_be_disabled()
+    page.get_by_role("button", name="Reload checkout folders", exact=True).click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(
+        ["/work/alpha", "/work/third"]
+    )
+    playwright.expect(status).to_have_text("Current checkout folders loaded.")
+
+
+def test_checkout_folders_save_refreshes_the_catalog_and_reads_the_new_folders(
+    open_page, attention_checkouts
+):
+    """With no tick, a save installs a catalog and one read shows the new folders."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    double = BrowserCheckouts()
+    settings.checkouts = double
+    page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
+    body = page.locator("#checkouts-body")
+    playwright.expect(body).to_contain_text(NO_FOLDERS_WORDS)
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
+    catalogs = page.evaluate("window.catalogResponses.length")
+    reads = page.evaluate("window.checkoutsResponses.length")
+    calls = double.calls
+    order, completed = list(settings.order), list(settings.completed)
+    add_folder(page, "/work/alpha")
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
+    wait_for_responses(page, "catalogResponses", catalogs + 1)
+    wait_for_responses(page, "checkoutsResponses", reads + 1)
+    settle_frames(page)
+
+    assert page.evaluate("window.catalogResponses.length") == catalogs + 1
+    assert page.evaluate("window.checkoutsResponses.length") == reads + 1
+    assert double.calls == calls + 1
+    assert page.locator("#refresh").get_attribute("data-pending") == "false"
+    playwright.expect(body).not_to_contain_text(NO_FOLDERS_WORDS)
+    assert SETTINGS_SENTENCE not in page.locator("#checkouts-status-line").inner_text()
+    assert (settings.order, settings.completed) == (order, completed)
+    assert settings.calls == []
+
+
+def test_checkout_folders_save_refresh_clears_an_update_marked_by_a_poll(
+    open_page, attention_checkouts
+):
+    """A tick between the save's commit and its refresh leaves no waiting update."""
+
+    class HeldCommit(HexRevisionSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.committed = threading.Event()
+            self.release = threading.Event()
+
+        def save_checkout_settings(self, revision, folders, github_lookup):
+            answer = super().save_checkout_settings(revision, folders, github_lookup)
+            self.committed.set()
+            self.release.wait(timeout=10)
+            return answer
+
+    settings = HeldCommit(revision=CHECKOUTS_REVISION)
+    double = BrowserCheckouts()
+    settings.checkouts = double
+    page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
+    add_folder(page, "/work/alpha")
+    refresh = page.locator("#refresh")
+    try:
+        folders_save_button(page).click()
+        assert settings.committed.wait(timeout=5)
+        fire_poll(page)
+        playwright.expect(refresh).to_have_attribute("data-pending", "true")
+    finally:
+        settings.release.set()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
+    playwright.expect(refresh).to_have_attribute("data-pending", "false")
+
+
+def test_checkout_folders_save_sends_no_second_checkouts_request_while_one_is_in_flight(
+    open_page, attention_checkouts
+):
+    """The save's read honors the one in-flight slot; the next tick shows the folders."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    double = BrowserCheckouts()
+    settings.checkouts = double
+    page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
+    add_folder(page, "/work/alpha")
+    calls = double.calls
+    gate = double.hold()
+    fire_poll(page)
+    assert double.entered.wait(timeout=5)
+    assert double.calls == calls + 1
+    catalogs = page.evaluate("window.catalogResponses.length")
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
+    wait_for_catalog_installs(page, catalogs + 1)
+    # The refresh's catalog is in, and still only the tick's read has reached the double.
+    assert double.calls == calls + 1
+    reads = page.evaluate("window.checkoutsResponses.length")
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", reads + 1)
+    settle_frames(page)
+    assert double.calls == calls + 1
+    double.gate = None
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    playwright.expect(page.locator("#checkouts-body")).not_to_contain_text(NO_FOLDERS_WORDS)
+
+
+def test_board_settings_save_leaves_a_flagged_checkout_folders_draft_unsaveable(
+    open_page, attention_checkouts
+):
+    """A folder draft already named as changed elsewhere holds no revision to advance."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/draft")
+    settings.save_checkout_settings(settings.revision, ["/work/alpha", "/work/third"], False)
+    outside_saves = len(settings.folder_calls)
+    page.locator("#view-board").click()
+    page.get_by_role("button", name="Refresh view", exact=True).click()
+    wait_for_catalog_installs(page, 2)
+    page.locator("#view-checkouts").click()
+    status = page.locator(FOLDERS_STATUS)
+    playwright.expect(status).to_have_text(FOLDERS_CHANGED_ELSEWHERE)
+    playwright.expect(page.locator("#stage-order-status")).to_have_text(
+        "Current board settings loaded."
+    )
+
+    move_second_stage_up(page)
+    board_save_button(page).click()
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Board settings saved.")
+    wait_for_catalog_installs(page, 3)
+
+    # A further edit redraws the editor; the save must still be refused for lack of a revision.
+    refuse_folder_edits(page, FOLDERS_CHANGED_ELSEWHERE, ["/work/alpha", "/work/draft"])
+    assert len(settings.folder_calls) == outside_saves

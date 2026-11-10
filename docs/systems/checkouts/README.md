@@ -97,7 +97,9 @@ README is narrative only.
 - Fetching, writing or locking a repository. The board's Checkouts view renders
   the served document as it stands (the status line, the attention list, the
   groups and, for folder problems, git availability and diagnostics, a setup
-  panel) and edits nothing: it shows the folders and cannot change them. It
+  panel) and changes no repository: it shows the folders, and its folder editor
+saves them through the checkout settings `PUT` served by `application-serving`,
+never through this system. It
   takes every fact and attention item from the document; the only things it
   decides itself are presentation: which repositories the quiet row collects,
   which pull-request lookup state the status line names, where each attention
@@ -108,9 +110,11 @@ README is narrative only.
   place on its own without **Apply update**, searchable with the card's other
   text, and hidden while the served document's `configuration_revision` differs
   from the displayed catalog's, which adds no entry and lasts for up to about
-  75 seconds after a Board settings save on the same page, or, after a
-  configuration change saved elsewhere, until **Apply update** installs the new
-  catalog; while no document can be served the
+  75 seconds after a Board settings save on the same page, until the checkouts
+  read that a checkout folder save on the same page requests answers with a scan
+  of the new folders (or the next tick, when a read was already in flight at the
+  save), or, after a configuration change saved elsewhere, until
+  **Apply update** installs the new catalog; while no document can be served the
   issues panel says `Code Status unavailable`.
 
 ## Collaborators

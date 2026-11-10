@@ -77,6 +77,28 @@
         <p id="checkouts-status-line" class="checkouts-status-line"></p>
         <button id="check-remotes" type="button">Check remotes now</button>
         <p id="checkouts-action-status" class="checkouts-action-status" role="status" aria-atomic="true"></p>
+        <details id="checkout-folders-editor" class="checkout-folders-editor" hidden>
+          <summary>Checkout folders</summary>
+          <div class="checkout-folders-content">
+            <ul id="checkout-folders-list" class="checkout-folders-list" aria-label="Checkout folders"></ul>
+            <div class="checkout-folders-add">
+              <label for="checkout-folders-path">Checkout folder path</label>
+              <input id="checkout-folders-path" type="text" autocomplete="off" spellcheck="false">
+              <button id="checkout-folders-add" type="button">Add</button>
+            </div>
+            <ul id="checkout-folders-suggestions" class="checkout-folders-suggestions" aria-label="Suggested checkout folders"></ul>
+            <label class="compact-control" for="checkout-folders-github">
+              <input id="checkout-folders-github" type="checkbox">
+              Look up pull requests with the GitHub CLI (gh)
+            </label>
+            <div class="checkout-folders-actions">
+              <button id="checkout-folders-save" type="button" aria-disabled="true">Save checkout folders</button>
+              <button id="checkout-folders-cancel" type="button" aria-disabled="true">Cancel checkout folder changes</button>
+              <button id="checkout-folders-reload" type="button" hidden>Reload checkout folders</button>
+            </div>
+            <p id="checkout-folders-status" class="checkout-folders-status" role="status" aria-live="polite"></p>
+          </div>
+        </details>
       </div>
       <div id="checkouts-body"></div>
     </main>

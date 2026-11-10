@@ -274,7 +274,17 @@ every host can store both spellings.
 ## Checkout folders
 
 Nyx records, per workspace, the folders whose git checkouts `nyx checkouts`
-lists. Until the settings editor exists, set them by editing the account's
+lists. Set them in the browser: choose **Checkouts**, open **Checkout folders**,
+add or remove folders and the GitHub lookup, and choose **Save checkout
+folders**. The editor offers the parent folders that would bring a package's
+`Target repo:` checkout into view and shows what the server refused beside each
+folder; see [Use the Checkouts view](running-nyx.md#use-the-checkouts-view). It
+saves the account's configuration record for the active workspace.
+
+### Without the board
+
+With no board running, such as for `nyx checkouts` alone, set the folders by
+editing the account's
 configuration record by hand: `~/.nyx/config/config.json` on Linux and macOS,
 `%USERPROFILE%\.nyx\config\config.json` on Windows. A record with checkout
 folders uses schema 4:
@@ -301,9 +311,8 @@ folders uses schema 4:
   `true`, without quotes; both keys of an entry are required. With `true`, a
   networked run asks GitHub about the pull requests of each GitHub repository
   among the checkouts, through an authenticated `gh` on `PATH`; see
-  [Inspect checkouts](running-nyx.md#inspect-checkouts). The **Checkouts** view
-  shows the lookup's state but cannot change it; until a settings editor
-  arrives, it is edited by hand like the folders.
+  [Inspect checkouts](running-nyx.md#inspect-checkouts). The **Checkout
+  folders** editor changes it with the folders; with no folders it is off.
 - Each entry in `folders` must be an absolute path, and the list must be sorted
   by character code, with no duplicates and at least one entry. Write each path
   already normalized in the host's own separators, with no trailing separator
