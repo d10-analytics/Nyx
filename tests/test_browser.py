@@ -6007,7 +6007,7 @@ BOARD_SEARCH_PLACEHOLDER = "Find a work item, project, or program…"
 
 
 def checkouts_local_time(value, reference=None, *, seconds=True):
-    """The view's local label for one UTC timestamp, as D-06 states it."""
+    """The view's local label for one UTC timestamp."""
     moment = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
     label = moment.strftime("%H:%M:%S" if seconds else "%H:%M")
     if reference is not None:
@@ -7289,7 +7289,7 @@ def relation_words(comparison):
 
 
 # ---------------------------------------------------------------------------
-# AC-07: the one Checkout setup panel
+# The one Checkout setup panel
 # ---------------------------------------------------------------------------
 
 
@@ -7336,7 +7336,7 @@ def git_problem_variant(view_checkouts, version):
 def test_checkouts_setup_panel_names_the_setup_story_in_order(
     open_page, view_checkouts
 ):
-    """One panel names each setup problem with its words, in the one order (D-19)."""
+    """One panel names each setup problem with its words, in the one order."""
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
@@ -7413,14 +7413,14 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
 
 
 # ---------------------------------------------------------------------------
-# AC-12: groups, rows, Work item branches and freshness
+# Groups, rows, Work item branches and freshness
 # ---------------------------------------------------------------------------
 
 
 def test_checkouts_groups_rows_and_branches_follow_the_document(
     open_page, view_checkouts
 ):
-    """Groups, clone rows and Work item branches render the served order (R-05, D-18)."""
+    """Groups, clone rows and Work item branches render the served order."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     names = page.locator(".checkouts-group-name")
@@ -7532,7 +7532,7 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
 def test_checkouts_freshness_reads_cached_live_and_recorded(
     open_page, view_checkouts
 ):
-    """One value names its own basis; a failed latest check says so (D-06)."""
+    """One value names its own basis; a failed latest check says so."""
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
@@ -7571,7 +7571,7 @@ def test_checkouts_freshness_reads_cached_live_and_recorded(
 def test_checkouts_quiet_repositories_collapse_into_one_row(
     open_page, view_checkouts
 ):
-    """A quiet repository is one row while the box is checked, a group when not (D-07)."""
+    """A quiet repository is one row while the box is checked, a group when not."""
     document = view_checkouts.document_built
     quiet = checkout_group(document, "quiet")
     quiet_display = quiet["remote"]["display"]
@@ -7623,7 +7623,7 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
 
 
 def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkouts):
-    """The shared search hides every group whose served names do not match (R-05)."""
+    """The shared search hides every group whose served names do not match."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
@@ -7751,7 +7751,7 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
 
 
 # ---------------------------------------------------------------------------
-# AC-04 in the browser: one assertion per word table
+# The browser: one assertion per word table
 # ---------------------------------------------------------------------------
 
 
@@ -8018,7 +8018,7 @@ def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
 
 
 def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts):
-    """Each work item's table action shows its card, or says why it cannot (D-08)."""
+    """Each work item's table action shows its card, or says why it cannot."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
@@ -8048,7 +8048,7 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
 def test_checkouts_status_line_names_a_scan_from_other_settings(
     open_page, view_checkouts
 ):
-    """A scan collected under other settings than the board shown says so once (D-03)."""
+    """A scan collected under other settings than the board shown says so once."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     sentence = "Collected under different settings from the board shown."
@@ -8067,7 +8067,7 @@ def test_checkouts_status_line_names_a_scan_from_other_settings(
 def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
     open_page, view_checkouts
 ):
-    """A main worktree git did not answer for fills HEAD and Tree and is never nested (D-20)."""
+    """A main worktree git did not answer for fills HEAD and Tree and is never nested."""
 
     def unanswered(worktree):
         worktree["status"] = "timed_out"
@@ -8106,7 +8106,7 @@ def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
 def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
     open_page, view_checkouts
 ):
-    """A cached value names the clone's fetch age once, in whole units (D-06)."""
+    """A cached value names the clone's fetch age once, in whole units."""
     document = view_checkouts.document_built
     observed = datetime.fromisoformat(document["observed_at"].replace("Z", "+00:00"))
 
@@ -8128,7 +8128,7 @@ def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
 
 
 def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkouts):
-    """The Branches cell pluralizes the stash count it shows (D-21, "&lt;K&gt; stashes")."""
+    """The Branches cell pluralizes the stash count it shows ("&lt;K&gt; stashes")."""
 
     def stashed(count):
         def mutate(document):
@@ -8149,7 +8149,7 @@ def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkou
 
 
 def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkouts):
-    """A search survives the jump unless it is what hides the card (D-08)."""
+    """A search survives the jump unless it is what hides the card."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
@@ -8389,7 +8389,7 @@ def focused_inside_viewport(page):
 
 
 def test_checkouts_attention_list_follows_the_document(open_page, attention_checkouts):
-    """Items equal the served array in order, with class headings and served counts (R-04, D-21)."""
+    """Items equal the served array in order, with class headings and served counts."""
     document = attention_checkouts.document
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
     items = page.locator("#checkouts-body .checkouts-attention li[data-code]")
@@ -8464,7 +8464,7 @@ def test_checkouts_attention_counts_read_singular_at_one_and_plural_otherwise(
 def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
     open_page, attention_checkouts
 ):
-    """A finished item with an open pull request names it (D-21)."""
+    """A finished item with an open pull request names it."""
     def open_pull_request(document):
         package = next(item for item in document["packages"]
                        if item["package_path"] == "Repo/Shipped/gamma")
@@ -8485,7 +8485,7 @@ def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
 def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     open_page, attention_checkouts
 ):
-    """Enter on an item opens, unfolds and focuses what it names, in view (D-18, R-04)."""
+    """Enter on an item opens, unfolds and focuses what it names, in view."""
     document = attention_checkouts.document
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
 
@@ -8575,7 +8575,7 @@ def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
 def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
     open_page, attention_checkouts
 ):
-    """A branch behind a fold is shown, with its fold open, when an item names it (D-18)."""
+    """A branch behind a fold is shown, with its fold open, when an item names it."""
     def mismatch(document):
         _, clone = checkout_clone(document, "Repo Clone 2")
         next(branch for branch in clone["branches"]
@@ -8594,7 +8594,7 @@ def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
 def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
     open_page, attention_checkouts
 ):
-    """Every item stays listed under a search; moving to a hidden destination clears it (R-04)."""
+    """Every item stays listed under a search; moving to a hidden destination clears it."""
     document = attention_checkouts.document
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
     page.fill("#filter", "zzz")
@@ -8646,7 +8646,7 @@ def served_verdict_words(group, verdict):
 def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items(
     open_page, attention_checkouts
 ):
-    """An opened clone shows its path, branch table, folds, blockers and work items (R-08, AC-05)."""
+    """An opened clone shows its path, branch table, folds, blockers and work items."""
     document = attention_checkouts.document
     group, clone = checkout_clone(document, "Repo Clone 2")
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
@@ -8741,7 +8741,7 @@ def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items
 def test_checkouts_show_on_board_selects_without_toggling_and_a_card_click_still_toggles(
     open_page, attention_checkouts
 ):
-    """The expanded row's action selects, focuses and shows the card; repeating keeps it (D-08, F-06)."""
+    """The expanded row's action selects, focuses and shows the card; repeating keeps it."""
     page, _ = open_attention_checkouts(
         open_page, attention_checkouts, attention_checkouts.document)
     detail = open_clone_detail(page, "Repo Clone 2")
@@ -8771,7 +8771,7 @@ def test_checkouts_show_on_board_selects_without_toggling_and_a_card_click_still
 def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
     open_page, attention_checkouts
 ):
-    """A search that hides the work item's card is cleared before the board shows (D-08)."""
+    """A search that hides the work item's card is cleared before the board shows."""
     page, _ = open_attention_checkouts(
         open_page, attention_checkouts, attention_checkouts.document)
     page.fill("#filter", "zzz")
@@ -8787,7 +8787,7 @@ def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
 def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
     open_page, attention_checkouts
 ):
-    """Where the card cannot be shown the view stays and says why; the preference is left alone (D-08)."""
+    """Where the card cannot be shown the view stays and says why; the preference is left alone."""
     document = attention_checkouts.document
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
     key = "spec-tracker-hide-terminal-rows"
@@ -8843,7 +8843,7 @@ def open_settings_checkouts(launch, attention_checkouts, document, *, client=Non
 def test_checkouts_settings_sentence_follows_a_board_settings_save(
     open_page, attention_checkouts
 ):
-    """A save changes the board's revision, not the scan: the scan stays and says so (D-03)."""
+    """A save changes the board's revision, not the scan: the scan stays and says so."""
     document = attention_checkouts.document
     page, double, settings = open_settings_checkouts(open_page, attention_checkouts, document)
     line = page.locator("#checkouts-status-line")
@@ -8883,7 +8883,7 @@ def test_checkouts_settings_sentence_follows_a_board_settings_save(
 def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
     open_page, attention_checkouts
 ):
-    """With no catalog displayed there is no revision to match, and the scan still renders (D-03)."""
+    """With no catalog displayed there is no revision to match, and the scan still renders."""
     document = attention_checkouts.document
     client = SequenceClient([CatalogError("producer_unavailable")])
     page, _, _ = open_settings_checkouts(
@@ -8910,7 +8910,7 @@ def covered_card_clearance(page):
 def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
     open_page, attention_checkouts, tmp_path
 ):
-    """Whether the card lies above or below the window, it ends fully below the heads (D-08)."""
+    """Whether the card lies above or below the window, it ends fully below the heads."""
     spec_root = tmp_path / "tall-root"
     _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
     _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
@@ -8948,7 +8948,7 @@ def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
 
 
 # ---------------------------------------------------------------------------
-# AC-08 and AC-09: in-place refresh, the narrow layout and accessibility
+# In-place refresh, the narrow layout and accessibility
 # ---------------------------------------------------------------------------
 
 
@@ -9060,7 +9060,7 @@ def assert_clone_two_state_kept(page, focus, scroll=200):
 def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     open_page, view_checkouts
 ):
-    """A tick replaces only the blocks that changed and keeps what the reader did (R-11, D-11)."""
+    """A tick replaces only the blocks that changed and keeps what the reader did."""
     before = folded_variant(view_checkouts.document_topic_committed)
     after = with_observed_at(
         folded_variant(view_checkouts.document_topic_recommitted), before["observed_at"])
@@ -9109,7 +9109,7 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
 def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     open_page, view_checkouts
 ):
-    """A removed row hands focus to the next row toggle, else the group heading (D-11)."""
+    """A removed row hands focus to the next row toggle, else the group heading."""
     before = view_checkouts.document_topic_committed
     page, double = open_view_checkouts(open_page, view_checkouts, before)
     detail = open_clone_detail(page, "Repo Clone 2")
@@ -9153,7 +9153,7 @@ def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
 def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failure(
     open_page, view_checkouts
 ):
-    """The mismatch sentence comes and goes, and a failed outcome returns, with state kept (D-03)."""
+    """The mismatch sentence comes and goes, and a failed outcome returns, with state kept."""
     before = folded_variant(view_checkouts.document_topic_committed)
     page, double = open_view_checkouts(open_page, view_checkouts, before)
     focus = open_clone_two_state(page)
@@ -9207,7 +9207,7 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
 def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
     open_page, view_checkouts
 ):
-    """A row the document drops is not reopened if it returns later (D-11)."""
+    """A row the document drops is not reopened if it returns later."""
     before = view_checkouts.document_topic_committed
     page, double = open_view_checkouts(open_page, view_checkouts, before)
     open_clone_detail(page, "Repo Clone 3")
@@ -9246,7 +9246,7 @@ def open_every_clone_row(page):
 def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     open_page, view_checkouts
 ):
-    """Stacked at 360 px, tabular from 701 px, with table roles throughout (R-12, D-12)."""
+    """Stacked at 360 px, tabular from 701 px, with table roles throughout."""
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
@@ -9359,7 +9359,7 @@ def checkouts_text_colors(page):
 def test_checkouts_text_and_focus_rings_have_readable_contrast(
     open_page, view_checkouts, theme
 ):
-    """Text keeps 4.5:1 and every control's focus ring 3:1 in both themes (R-12)."""
+    """Text keeps 4.5:1 and every control's focus ring 3:1 in both themes."""
     cached = folded_variant(view_checkouts.document_built)
     setup = checkout_variant(
         folded_variant(view_checkouts.document_checked), add_setup_problems(view_checkouts))
@@ -9409,7 +9409,7 @@ def tab_until(page, probe):
 
 
 def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkouts):
-    """Tab, Shift+Tab, Enter and Space reach and operate each control (R-12)."""
+    """Tab, Shift+Tab, Enter and Space reach and operate each control."""
     document = folded_variant(view_checkouts.document_topic_committed)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     clone_two = checkout_clone(document, "Repo Clone 2")[1]["path"]
@@ -9488,7 +9488,7 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
 
 
 def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_checkouts):
-    """Refreshed content is never announced; the action status is the one region (R-12, D-11)."""
+    """Refreshed content is never announced; the action status is the one region."""
     ready = view_checkouts.document_topic_committed
     setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, ready)

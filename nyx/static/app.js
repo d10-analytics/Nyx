@@ -3062,7 +3062,7 @@
     return words;
   }
 
-  // The first destination an item names (D-18): a clone and branch, a clone and
+  // The first destination an item names: a clone and branch, a clone and
   // worktree, a clone, a repository and branch, work items, nothing.
   function attentionKind(item) {
     if (item.clone !== null && item.branch !== null) return "branch";
