@@ -352,6 +352,7 @@
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
       "quietRow": "Quiet repositories ({count})",
+      "quietRowMatching": "Quiet repositories ({count}, {matching} matching)",
       "freeClones": "Free clones: {clones}",
       "workItemBranches": "Work item branches",
       "attentionHeading": "Needs attention",
@@ -1196,6 +1197,7 @@
         // unchanged refresh writes nothing.
         if (group.hidden !== hide) group.hidden = hide;
       });
+      filterQuietRow(query);
       return;
     }
     board.querySelectorAll(".card").forEach((card) => {
@@ -1206,6 +1208,29 @@
       cell.classList.toggle("filtered-empty", cards.length > 0 && cards.every((card) => card.hidden));
     });
     drawRails();
+  }
+
+  // The quiet row is searched by the repositories it holds, with the same text
+  // a group of that repository would be searched by.  With a query it stays
+  // only while one of them matches, lists only those, and its summary counts
+  // them; with none it shows every repository and its plain count.
+  function filterQuietRow(query) {
+    const row = checkoutsBody.querySelector("details.checkouts-quiet");
+    if (row === null) return;
+    const items = [...row.querySelectorAll("li")];
+    let matching = 0;
+    items.forEach((item) => {
+      const hide = Boolean(query) && !(item.dataset.search || "").includes(query);
+      if (!hide) matching += 1;
+      if (item.hidden !== hide) item.hidden = hide;
+    });
+    const hideRow = Boolean(query) && matching === 0;
+    if (row.hidden !== hideRow) row.hidden = hideRow;
+    const summary = row.querySelector("summary");
+    const words = query
+      ? wordText("text", "quietRowMatching", {count: items.length, matching})
+      : wordText("text", "quietRow", {count: items.length});
+    if (summary.textContent !== words) summary.textContent = words;
   }
 
   // Every settled checkouts outcome reaches the rendered cards directly: only
@@ -2335,7 +2360,7 @@
   function quietRowHtml(document, quiet) {
     const items = quiet.map((group) => {
       const clone = group.clones[0];
-      return "<li>" +
+      return `<li data-search="${text(groupSearchText(document, group))}">` +
         `<span class="checkouts-quiet-display">${text(remoteName(group))}</span> ` +
         `<span class="checkouts-quiet-checkout">${text(checkoutName(clone.path))}</span></li>`;
     }).join("");
