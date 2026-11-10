@@ -10685,3 +10685,38 @@ def test_checkout_folders_save_sends_no_second_checkouts_request_while_one_is_in
     fire_checkouts_poll(page)
     settle_frames(page)
     playwright.expect(page.locator("#checkouts-body")).not_to_contain_text(NO_FOLDERS_WORDS)
+
+
+def test_board_settings_save_leaves_a_flagged_checkout_folders_draft_unsaveable(
+    open_page, attention_checkouts
+):
+    """A folder draft already named as changed elsewhere holds no revision to advance."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/draft")
+    settings.save_checkout_settings(settings.revision, ["/work/alpha", "/work/third"], False)
+    outside_saves = len(settings.folder_calls)
+    page.locator("#view-board").click()
+    page.get_by_role("button", name="Refresh view", exact=True).click()
+    wait_for_catalog_installs(page, 2)
+    page.locator("#view-checkouts").click()
+    status = page.locator(FOLDERS_STATUS)
+    playwright.expect(status).to_have_text(FOLDERS_CHANGED_ELSEWHERE)
+    playwright.expect(page.locator("#stage-order-status")).to_have_text(
+        "Current board settings loaded."
+    )
+
+    move_second_stage_up(page)
+    board_save_button(page).click()
+    playwright.expect(page.locator("#stage-order-status")).to_have_text("Board settings saved.")
+    wait_for_catalog_installs(page, 3)
+
+    # A further edit redraws the editor; the save must still be refused for lack of a revision.
+    add_folder(page, "/work/more")
+    playwright.expect(folders_save_button(page)).to_be_disabled()
+    playwright.expect(
+        page.get_by_role("button", name="Reload checkout folders", exact=True)
+    ).to_be_visible()
+    assert len(settings.folder_calls) == outside_saves
