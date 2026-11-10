@@ -9312,6 +9312,10 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
     page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    add_folder(page, "/" + "q" * 299)
     columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
                "Tree", "Branches", "Cleanup", "Package"]
     for theme in ("dark", "light"):
@@ -9322,6 +9326,13 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
         settle_frames(page)
         assert page.evaluate("""() => [document.documentElement.scrollWidth,
           document.documentElement.clientWidth]""") == [360, 360]
+        editor_rights = page.evaluate("""() => [...document.querySelectorAll(
+          '#checkout-folders-editor summary, #checkout-folders-editor input, ' +
+          '#checkout-folders-editor button, #checkout-folders-editor .checkout-folders-path')]
+          .filter(node => node.getClientRects().length)
+          .map(node => [node.id || node.className, node.getBoundingClientRect().right])""")
+        assert len(editor_rights) >= 7, editor_rights
+        assert all(right <= 360.5 for _, right in editor_rights), editor_rights
         row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
         labels = row.evaluate("""el => [...el.children].map(cell => {
           const label = cell.firstElementChild;
@@ -9389,6 +9400,10 @@ CHECKOUTS_TEXT_SAMPLES = {
         ".checkouts-attention-item, .checkouts-attention-go"),
     "freshness words": ".checkouts-freshness",
     "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
+    "folders editor": (
+        "#checkout-folders-editor summary, #checkout-folders-editor label, "
+        ".checkout-folders-path, .checkout-folders-status, "
+        "#checkout-folders-editor button"),
 }
 
 
@@ -9428,6 +9443,11 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     page, double = open_view_checkouts(open_page, view_checkouts, cached)
     page.set_viewport_size({"width": 1600, "height": 1200})
     page.get_by_label("Theme", exact=True).select_option(theme)
+    # An open editor with one draft folder shows every control it has.
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    add_folder(page, "/work/draft")
     open_every_clone_row(page)
     detail = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]').locator(
         "xpath=following-sibling::tr[1]")
@@ -9453,6 +9473,13 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
         "attention item": ".checkouts-attention-go",
         "Check remotes now": "#check-remotes",
         "Show on board": ".checkouts-show-on-board",
+        "folders summary": "#checkout-folders-editor summary",
+        "folders path": "#checkout-folders-path",
+        "folders Add": "#checkout-folders-add",
+        "folders Remove": ".checkout-folders-remove",
+        "folders checkbox": "#checkout-folders-github",
+        "folders Save": "#checkout-folders-save",
+        "folders Cancel": "#checkout-folders-cancel",
     }
     for name, selector in rings.items():
         # A key press makes the next script focus show as keyboard focus.
@@ -9493,6 +9520,43 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     page.keyboard.press("Enter")
     playwright.expect(page.locator("#checkouts-action-status")).to_have_text(
         "This server does not offer remote checks.")
+
+    # The folders editor: Enter on its summary opens it, a path is typed and
+    # added with Enter, and Space on a Remove drops that folder.  Focus goes to
+    # the next folder's Remove, else the previous one, else the path input.
+    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+    page.keyboard.press("Enter")
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    tab_until(page, "document.activeElement.id === 'checkout-folders-path'")
+    for name in ("code", "docs", "site"):
+        page.keyboard.type(name)
+        page.keyboard.press("Enter")
+    assert folder_paths(page) == ["code", "docs", "site"]
+    focus_label = "document.activeElement.getAttribute('aria-label')"
+    tab_until(page, f"{focus_label} === 'Remove checkout folder docs'")
+    page.keyboard.press("Space")
+    assert folder_paths(page) == ["code", "site"]
+    assert page.evaluate(focus_label) == "Remove checkout folder site"
+    page.keyboard.press("Space")
+    assert folder_paths(page) == ["code"]
+    assert page.evaluate(focus_label) == "Remove checkout folder code"
+    page.keyboard.press("Space")
+    assert folder_paths(page) == []
+    assert page.evaluate("document.activeElement.id") == "checkout-folders-path"
+    # The checkbox takes Space, and Cancel takes Enter, then focus stays in the panel.
+    tab_until(page, "document.activeElement.id === 'checkout-folders-github'")
+    page.keyboard.press("Space")
+    assert page.locator("#checkout-folders-github").is_checked()
+    tab_until(page, "document.activeElement.id === 'checkout-folders-save'")
+    tab_until(page, "document.activeElement.id === 'checkout-folders-cancel'")
+    page.keyboard.press("Enter")
+    assert not page.locator("#checkout-folders-github").is_checked()
+    assert page.evaluate(
+        "document.activeElement.closest('#checkout-folders-editor') !== null")
+    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+    page.keyboard.press("Enter")
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
 
     # A row toggle opens with Enter and closes with Space.
     toggle_probe = f"""(() => {{
@@ -9609,7 +9673,7 @@ def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
 # ---------------------------------------------------------------------------
 
 FOLDERS_EDITOR = "#checkout-folders-editor"
-FOLDERS_LIST_ITEMS = "#checkout-folders-list li"
+FOLDERS_LIST_ITEMS = "#checkout-folders-list .checkout-folders-path"
 
 
 def folder_paths(page):
@@ -9815,3 +9879,172 @@ def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
     settle_frames(full)
     assert full.evaluate("document.querySelector('#checkout-folders-editor').open") is False
     assert other.folder_gets == 0
+
+
+def folder_buttons(page, role):
+    """The visible text of each of the editor's folder buttons of one role."""
+    return page.locator(f'{FOLDERS_EDITOR} button[data-role="{role}"]').evaluate_all(
+        "buttons => buttons.map(button => button.textContent)"
+    )
+
+
+def add_folder(page, path):
+    """Type ``path`` in the editor's input and press its Add button."""
+    page.locator("#checkout-folders-path").fill(path)
+    page.get_by_role("button", name="Add", exact=True).click()
+
+
+def test_checkout_folders_draft_adds_removes_and_cancels(open_page, attention_checkouts):
+    """The draft takes exactly what is typed; only empty and repeated entries are refused."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    save = page.get_by_role("button", name="Save checkout folders", exact=True)
+    cancel = page.get_by_role("button", name="Cancel checkout folder changes", exact=True)
+    path_input = page.locator("#checkout-folders-path")
+    lookup = page.get_by_label("Look up pull requests with the GitHub CLI (gh)")
+    playwright.expect(save).to_be_disabled()
+    playwright.expect(cancel).to_be_disabled()
+
+    # Add keeps a relative path as typed and clears the input.
+    add_folder(page, "code")
+    assert folder_paths(page) == ["/work/alpha", "code"]
+    assert path_input.input_value() == ""
+    playwright.expect(save).to_be_enabled()
+    playwright.expect(cancel).to_be_enabled()
+    # Enter in the input adds too.
+    path_input.fill("/work/beta")
+    path_input.press("Enter")
+    assert folder_paths(page) == ["/work/alpha", "code", "/work/beta"]
+    # An empty entry and an exact repeat are ignored.
+    page.get_by_role("button", name="Add", exact=True).click()
+    add_folder(page, "code")
+    path_input.press("Enter")
+    assert folder_paths(page) == ["/work/alpha", "code", "/work/beta"]
+
+    # Remove drops its own folder.
+    page.get_by_role("button", name="Remove checkout folder /work/alpha").click()
+    assert folder_paths(page) == ["code", "/work/beta"]
+    lookup.check()
+    assert settings.folder_gets == 1
+
+    # Cancel restores the saved list and the checkbox, and both buttons go quiet.
+    cancel.click()
+    assert folder_paths(page) == ["/work/alpha"]
+    assert not lookup.is_checked()
+    playwright.expect(save).to_be_disabled()
+    playwright.expect(cancel).to_be_disabled()
+
+    # The checkbox alone is a draft, and undoing it by hand is no draft.
+    lookup.check()
+    playwright.expect(save).to_be_enabled()
+    lookup.uncheck()
+    playwright.expect(save).to_be_disabled()
+    # Removing and re-adding the same folder restores the saved state.
+    page.get_by_role("button", name="Remove checkout folder /work/alpha").click()
+    playwright.expect(save).to_be_enabled()
+    add_folder(page, "/work/alpha")
+    playwright.expect(save).to_be_disabled()
+    assert settings.folder_gets == 1
+
+
+def suggestion_document(attention_checkouts, suggestions):
+    """The attention capture with ``suggestions`` as its parent-folder suggestions."""
+    return checkout_variant(
+        attention_checkouts.document,
+        lambda document: document.__setitem__("folder_suggestions", suggestions),
+    )
+
+
+def test_checkout_folders_suggestions_offer_unconfigured_parents_with_their_counts(
+    open_page, attention_checkouts
+):
+    """A ready document's suggestions are Add buttons; a draft folder or a failure hides them."""
+    document = suggestion_document(attention_checkouts, [
+        {"path": "/work/aaa", "package_count": 1},
+        {"path": "/work/zzz", "package_count": 3},
+    ])
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    page, double = open_folders_page(
+        open_page, attention_checkouts, settings, BrowserCheckouts(document))
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
+        "Current checkout folders loaded.")
+    assert folder_buttons(page, "suggest") == [
+        "Add /work/aaa (1 work item)", "Add /work/zzz (3 work items)"]
+
+    # A path already in the draft is not offered.
+    add_folder(page, "/work/zzz")
+    assert folder_buttons(page, "suggest") == ["Add /work/aaa (1 work item)"]
+    # Adding a suggestion appends its path and takes its button away.
+    page.get_by_role("button", name="Add /work/aaa (1 work item)").click()
+    assert folder_paths(page) == ["/work/zzz", "/work/aaa"]
+    assert folder_buttons(page, "suggest") == []
+    # Removing a folder offers its suggestion again.
+    page.get_by_role("button", name="Remove checkout folder /work/zzz").click()
+    assert folder_buttons(page, "suggest") == ["Add /work/zzz (3 work items)"]
+
+    # A failed collection shows none, and the draft stays.
+    double.fail("checkouts_unavailable")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert folder_buttons(page, "suggest") == []
+    assert folder_paths(page) == ["/work/aaa"]
+    # The next ready document brings them back.
+    serve_checkouts(page, double, document)
+    assert folder_buttons(page, "suggest") == ["Add /work/zzz (3 work items)"]
+
+
+def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switches(
+    open_page, attention_checkouts
+):
+    """Nothing the view redraws touches an open editor, its draft or the focus in it."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    add_folder(page, "/work/draft")
+    path_input = page.locator("#checkout-folders-path")
+    path_input.fill("typed")
+    path_input.focus()
+    page.evaluate("""() => {
+      window.editorRecords = [];
+      new MutationObserver((records) => window.editorRecords.push(...records.map(
+        (record) => record.type + ':' + record.target.nodeName)))
+        .observe(document.querySelector('#checkout-folders-editor'),
+          {subtree: true, childList: true, attributes: true, characterData: true});
+    }""")
+
+    def intact():
+        assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+        assert folder_paths(page) == ["/work/alpha", "/work/draft"]
+        assert path_input.input_value() == "typed"
+        playwright.expect(path_input).to_be_focused()
+        assert page.locator("#checkouts-body .checkouts-group").count() == 1
+
+    fire_checkouts_poll(page)
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("window.editorRecords") == []
+    intact()
+
+    # Installing a catalog from the board's Refresh view leaves the editor alone.
+    page.locator("#view-board").click()
+    with page.expect_response("**/api/catalog"):
+        page.get_by_role("button", name="Refresh view", exact=True).click()
+    settle_frames(page)
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    settle_frames(page)
+    assert page.evaluate("window.editorRecords") == []
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+    assert folder_paths(page) == ["/work/alpha", "/work/draft"]
+    assert path_input.input_value() == "typed"
+    assert settings.folder_gets == 1
+    path_input.focus()
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    intact()
