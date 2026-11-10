@@ -2317,6 +2317,49 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     assert winning_page.get_by_role("button", name="Save").is_enabled()
 
 
+def test_stage_order_save_reports_an_error_code_then_reload_needed(open_page):
+    class QueuedAnswerSettings(BrowserSettings):
+        def __init__(self):
+            super().__init__()
+            self.answers = []
+
+        def save_settings(self, revision, order, completed):
+            if not self.answers:
+                return super().save_settings(revision, order, completed)
+            self.calls.append((revision, list(order), list(completed)))
+            answer = self.answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    settings = QueuedAnswerSettings()
+    settings.answers = [
+        CatalogError("settings_unavailable"),
+        {"order": [], "completed": [], "revision": None, "outcome": "reload-needed"},
+    ]
+    page = open_page(StaticClient(board_payload()), settings=settings)
+    page.locator("#stage-order-editor").wait_for()
+    open_stage_editor(page)
+    page.get_by_role("button", name="Move Under Development up").click()
+    draft = ["Under_Development", "Queue"]
+    save = page.get_by_role("button", name="Save")
+
+    save.click()
+    page.get_by_text("Save failed: settings_unavailable", exact=True).wait_for()
+    assert stage_editor_order(page) == draft
+    assert save.is_enabled()
+
+    save.click()
+    page.get_by_text(
+        "Save not applied: reload-needed. Reload board settings to replace this unsaved draft and try again.",
+        exact=True,
+    ).wait_for()
+    assert stage_editor_order(page) == draft
+    assert page.get_by_role("button", name="Reload board settings").is_visible()
+    assert save.is_disabled()
+    assert [call[1] for call in settings.calls] == [draft, draft]
+
+
 CHANGED_ELSEWHERE = (
     "Board settings changed elsewhere. Reload board settings to replace this unsaved draft."
 )
