@@ -1375,8 +1375,9 @@ the marked folders and save again.`; nothing was saved. A folder that is already
 saved is not refused for being missing, so a list keeps saving while one of its
 drives is away. The saved list is sorted and keeps each folder once, so the list
 shown after a save can differ in order from the draft. Saving an empty list
-stores no folders and turns the lookup off, and the editor says `With no folders
-the pull-request lookup is off.`
+stores no folders and turns the lookup off; when the lookup was on before the
+save, the editor adds `With no folders the pull-request lookup is off.` to its
+saved message.
 
 When the record changed after the editor loaded it, such as a save from another
 page or an edit by hand, the save is not applied. Your draft stays, and the status
