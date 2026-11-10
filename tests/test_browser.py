@@ -7637,6 +7637,77 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
         document["repositories"])
 
 
+def test_checkouts_search_matches_the_repositories_in_the_quiet_row(
+    open_page, view_checkouts
+):
+    """The quiet row stays for a held repository that matches and goes when none do."""
+    document = view_checkouts.document_built
+    quiet = checkout_group(document, "quiet")
+    quiet_display = quiet["remote"]["display"]
+    other_display = checkout_group(document, "remote")["remote"]["display"]
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    summary = row.locator("summary")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1)"
+
+    # A quiet repository's name keeps the row, counts its match and hides the
+    # group that does not match.
+    page.fill("#filter", quiet_display)
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1, 1 matching)"
+    assert groups.all_inner_texts() == []
+
+    # The clone's folder name is searched as it is for a group.
+    page.fill("#filter", "quiet clone")
+    playwright.expect(row).to_be_visible()
+
+    # A name no quiet repository has hides the row; the group that has it stays.
+    page.fill("#filter", other_display)
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == [other_display]
+    page.fill("#filter", "no such words anywhere")
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == []
+
+    # Clearing the search restores the earlier state.
+    page.fill("#filter", "")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (1)"
+    assert groups.all_inner_texts() == [other_display]
+
+
+def test_checkouts_search_can_match_a_group_and_the_quiet_row_together(
+    open_page, view_checkouts
+):
+    """A query both kinds hold keeps the group and the row; one kind alone keeps one."""
+    document = view_checkouts.document_built
+    quiet_group = checkout_group(document, "quiet")
+    other = checkout_group(document, "remote")
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    branch = quiet_group["default_branch"]["name"]
+    assert other["default_branch"]["name"] == branch
+
+    page.fill("#filter", branch)
+    playwright.expect(row).to_be_visible()
+    assert groups.all_inner_texts() == [other["remote"]["display"]]
+
+    # Words only the group holds hide the row; words only the row holds hide the group.
+    page.fill("#filter", "topic-a")
+    playwright.expect(row).to_be_hidden()
+    assert groups.all_inner_texts() == [other["remote"]["display"]]
+    page.fill("#filter", quiet_group["remote"]["display"])
+    playwright.expect(row).to_be_visible()
+    assert groups.all_inner_texts() == []
+
+    # The row, opened and filtered, keeps its listed repository.
+    row.locator("summary").click()
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
+
+
 def mutate_searchable_words(document):
     """A quiet clone with a detached, edited tree and a detached linked worktree."""
     verdict = {
