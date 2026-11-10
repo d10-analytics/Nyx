@@ -9508,3 +9508,34 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
         # A tick never writes the action status.
         assert all(not action for _, action, _ in checkouts_records(page))
         assert page.locator("#checkouts-action-status").inner_text() == ""
+
+
+def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
+    open_page, view_checkouts
+):
+    """With two quiet repositories a query lists and counts only the one it matches."""
+    document = copy.deepcopy(view_checkouts.document_built)
+    quiet = checkout_group(document, "quiet")
+    twin = copy.deepcopy(quiet)
+    twin["remote"]["display"] = "example.test/twin-repository"
+    twin["remote"]["key"] = "example.test/twin-repository"
+    for item in twin["clones"]:
+        item["path"] = item["path"].replace("quiet", "twinclone")
+        for tree in item["worktrees"]:
+            tree["path"] = tree["path"].replace("quiet", "twinclone")
+    document["repositories"].append(twin)
+    page, _ = open_view_checkouts(open_page, view_checkouts, redigest(document))
+    row = page.locator("#checkouts-body .checkouts-quiet")
+    summary = row.locator("summary")
+    assert summary.inner_text() == "Quiet repositories (2)"
+
+    page.fill("#filter", "twin-repository")
+    playwright.expect(row).to_be_visible()
+    assert summary.inner_text() == "Quiet repositories (2, 1 matching)"
+    row.locator("summary").click()
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
+    assert "twin-repository" in row.locator("li:not([hidden])").inner_text()
+
+    page.fill("#filter", "")
+    assert summary.inner_text() == "Quiet repositories (2)"
+    playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)
