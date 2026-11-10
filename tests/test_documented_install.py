@@ -1287,8 +1287,20 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "lookup was on before the save, the editor adds `With no folders the "
         "pull-request lookup is off.` to its saved message",
         "until the checkouts read that a checkout folder save on the same page requests "
-        "answers with a scan of the new folders, and, after a configuration change saved "
-        "elsewhere, until you press **Apply update**",
+        "answers with a scan of the new folders (or, when a checkouts read was already in "
+        "flight at the save, until the next ten-second check), and, after a configuration "
+        "change saved elsewhere, until you press **Apply update**",
+        "When a checkouts read is already in flight at the save, the page sends no read of "
+        "its own, and the line follows at the next ten-second check instead",
+        "When a checkouts read is already in flight at the save, that read answers with the "
+        "folders as they were, the page sends no second read, and the view shows the new "
+        "folders at the next ten-second check",
+        "When the record changed after the editor loaded it, such as a save from another "
+        "page, the save is not applied.",
+        "A running board does not notice a hand edit of the record, and a save from the "
+        "editor overwrites it; stop Nyx before editing by hand",
+        "While that reload is offered, the list, the path field, the suggestions and the "
+        "checkbox take no edits; **Cancel checkout folder changes** still drops the draft",
         "`Save not applied: the checkout folders changed elsewhere.`",
         "**Reload checkout folders**, which replaces the draft with the saved folders",
         "The first folder save writes a schema 4 record",
@@ -1322,6 +1334,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
             "the one write it can cause",
             "It never edits the folders",
             "edits nothing: it shows the folders",
+            "or an edit by hand, the save is not applied",
         ):
             assert stale not in text, (name, stale)
     assert (
@@ -1349,7 +1362,12 @@ def test_the_checkout_guides_describe_the_folder_editor():
     assert (
         "a checkout folder save on the same page hides them only until its own checkouts "
         "read answers with a scan of the new folders, and the page installs the new "
-        "catalog itself"
+        "catalog itself (with a checkouts read already in flight at the save, it sends no "
+        "read of its own and the lines follow at the next tick)"
+    ) in board_web
+    assert (
+        "asks for a checkouts read at once, unless one is already in flight, when the next "
+        "tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
     # The board-web README names both writes of the Checkouts view.
@@ -1358,7 +1376,10 @@ def test_the_checkout_guides_describe_the_folder_editor():
     assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
     assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
     assert "never through this system" in checkouts
-    assert "a checkout folder save on the same page requests answers with a scan" in checkouts
+    assert (
+        "a checkout folder save on the same page requests answers with a scan of the new "
+        "folders (or the next tick, when a read was already in flight at the save)"
+    ) in checkouts
 
 
 def test_checkout_system_readme_states_the_developer_tools_check():
