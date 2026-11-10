@@ -1918,7 +1918,8 @@
       const name = document.createElement("span");
       name.className = "checkout-folders-path";
       name.textContent = path;
-      if (foldersProblems.has(index)) {
+      // Marks belong to the draft that was refused, never to the saved list.
+      if (foldersDraft !== null && foldersProblems.has(index)) {
         const problem = document.createElement("span");
         problem.className = "checkout-folders-problem";
         problem.id = `checkout-folders-problem-${index}`;
@@ -4188,6 +4189,7 @@
   foldersReload.addEventListener("click", () => {
     if (foldersBusy) return;
     foldersDraft = null;
+    foldersProblems = new Map();
     loadFolders();
   });
   filter.addEventListener("input", applyFilter);
