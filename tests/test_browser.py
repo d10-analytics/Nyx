@@ -9902,6 +9902,7 @@ def test_checkout_folders_editor_load_failure_offers_reload_and_keeps_the_view(
     playwright.expect(reload_button).to_be_visible()
     assert page.locator("#checkouts-body .checkouts-group").count() == 1
     assert folder_paths(page) == []
+    refuse_folder_edits(page, "Could not load checkout folders: settings_unavailable", [])
 
     reload_button.click()
     playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
@@ -10057,6 +10058,35 @@ def add_folder(page, path):
     """Type ``path`` in the editor's input and press its Add button."""
     page.locator("#checkout-folders-path").fill(path)
     page.get_by_role("button", name="Add", exact=True).click()
+
+
+def refuse_folder_edits(page, status_text, expected_paths):
+    """Every edit control is held; each attempt leaves the draft, status, Save and Reload as they were."""
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    lookup = page.locator("#checkout-folders-github")
+    path_input = page.locator("#checkout-folders-path")
+    status = page.locator(FOLDERS_STATUS)
+    held = [path_input, page.get_by_role("button", name="Add", exact=True), lookup]
+    held += [
+        page.get_by_role("button", name=f"Remove checkout folder {path}", exact=True)
+        for path in expected_paths
+    ]
+    for control in held:
+        playwright.expect(control).to_have_attribute("aria-disabled", "true")
+    playwright.expect(reload_button).not_to_have_attribute("aria-disabled", "true")
+    checked = lookup.is_checked()
+    path_input.fill("/work/refused", force=True)
+    page.get_by_role("button", name="Add", exact=True).click(force=True)
+    path_input.press("Enter")
+    lookup.click(force=True)
+    for path in expected_paths:
+        page.get_by_role("button", name=f"Remove checkout folder {path}", exact=True).click(force=True)
+    settle_frames(page)
+    assert folder_paths(page) == expected_paths
+    assert lookup.is_checked() == checked
+    playwright.expect(status).to_have_text(status_text)
+    playwright.expect(folders_save_button(page)).to_be_disabled()
+    playwright.expect(reload_button).to_be_visible()
 
 
 def test_checkout_folders_draft_adds_removes_and_cancels(open_page, attention_checkouts):
@@ -10357,6 +10387,8 @@ def test_checkout_folders_save_keeps_the_draft_through_each_refusal(
     assert folder_paths(page) == draft
     playwright.expect(reload_button).to_be_visible()
     playwright.expect(cancel).to_be_enabled()
+    playwright.expect(cancel).not_to_have_attribute("aria-disabled", "true")
+    refuse_folder_edits(page, status.inner_text(), draft)
     cancel.click()
     assert folder_paths(page) == ["/work/alpha"]
     playwright.expect(reload_button).to_be_visible()
@@ -10377,6 +10409,8 @@ def test_checkout_folders_save_keeps_the_draft_through_each_refusal(
         "Reload checkout folders to replace this unsaved draft and try again."
     )
     assert folder_paths(page) == ["/work/alpha", "/work/served", "/work/gamma"]
+    refuse_folder_edits(
+        page, status.inner_text(), ["/work/alpha", "/work/served", "/work/gamma"])
     reload_button.click()
     playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/outside"])
     assert [call["folders"] for call in settings.folder_calls] == [
@@ -10810,9 +10844,5 @@ def test_board_settings_save_leaves_a_flagged_checkout_folders_draft_unsaveable(
     wait_for_catalog_installs(page, 3)
 
     # A further edit redraws the editor; the save must still be refused for lack of a revision.
-    add_folder(page, "/work/more")
-    playwright.expect(folders_save_button(page)).to_be_disabled()
-    playwright.expect(
-        page.get_by_role("button", name="Reload checkout folders", exact=True)
-    ).to_be_visible()
+    refuse_folder_edits(page, FOLDERS_CHANGED_ELSEWHERE, ["/work/alpha", "/work/draft"])
     assert len(settings.folder_calls) == outside_saves
