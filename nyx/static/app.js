@@ -1760,28 +1760,36 @@
       });
   }
 
+  // Sends one settings PUT and returns its parsed outcome, or throws the error
+  // code. `parse(payload, true)` is the caller's exact-key parser; `inspect`
+  // sees the status and body before the outcome is classified.
+  async function putSettings(route, body, parse, inspect = null) {
+    const response = await fetch(route, {
+      method: "PUT",
+      cache: "no-store",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { /* handled below */ }
+    if (inspect) inspect(response.status, payload);
+    if (!payload || payload.error) {
+      throw new Error((payload && payload.error) || "settings_unavailable");
+    }
+    const outcome = parse(payload, true);
+    if (!response.ok && !["conflict", "failure", "reload-needed"].includes(outcome.outcome)) {
+      throw new Error("settings_unavailable");
+    }
+    return outcome;
+  }
+
   function saveStageOrder(order, completed) {
     if (!settingsAvailable || !settingsRevision || settingsBusy) return;
     settingsBusy = true;
     settingsStatus("Saving board settings…");
     renderStageOrderEditor();
-    fetch(SETTINGS_ROUTE, {
-      method: "PUT",
-      cache: "no-store",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({revision: settingsRevision, order, completed}),
-    }).then(async (response) => {
-      let payload = null;
-      try { payload = await response.json(); } catch (_) { /* handled below */ }
-      if (!payload || payload.error) {
-        throw new Error((payload && payload.error) || "settings_unavailable");
-      }
-      const outcome = parseSettings(payload, true);
-      if (!response.ok && !["conflict", "failure", "reload-needed"].includes(outcome.outcome)) {
-        throw new Error("settings_unavailable");
-      }
-      return outcome;
-    }).then((payload) => {
+    putSettings(SETTINGS_ROUTE, {revision: settingsRevision, order, completed}, parseSettings)
+    .then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
           ? `Save not applied: ${payload.outcome}. Reload board settings to replace this unsaved draft and try again.`
