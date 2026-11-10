@@ -534,10 +534,12 @@ a temporary file or directory it needs cannot be made, which it reports as
 With no folders configured it says `no checkout folders are configured` and
 exits 0.
 
-Checkout folders are set per workspace, in the account's configuration record;
-see [Your specification workspace](workspaces.md#checkout-folders) for the
-exact edit. The **Checkouts** view shows these folders but cannot change them;
-until a settings editor arrives, the record is edited by hand.
+Checkout folders are set per workspace, in the account's configuration record.
+The **Checkouts** view of the board has a **Checkout folders** editor that
+changes them and the GitHub lookup; see [Use the Checkouts
+view](#use-the-checkouts-view). The same record can be edited by hand when no
+board is running; see [Your specification
+workspace](workspaces.md#checkout-folders).
 
 The `--json` document records the revision of the configuration the collection
 loaded as `configuration_revision`, or `null` when no record was loaded. It also
@@ -821,10 +823,12 @@ search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
 A Board settings save on the same page keeps it hidden until a scan under the
-new configuration arrives, up to about 75 seconds. After a configuration change
-saved elsewhere, such as a checkout settings save or settings saved from another
-page, the scan arrives first and the line stays hidden until **Apply update**
-installs the new catalog.
+new configuration arrives, up to about 75 seconds. A checkout folder save on the
+same page keeps it hidden only until that save's own checkouts read answers with
+a scan of the new folders, which the page requests at once, and the page installs
+the new catalog itself. After a configuration change saved elsewhere, such as
+settings saved from another page, the scan arrives first and the line stays
+hidden until **Apply update** installs the new catalog.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
 When every package that names a branch in its repository is finished and reads
@@ -1261,8 +1265,9 @@ minute while a board page is open, so the line updates on its own, without
 shows a line and the issues panel says `Code Status unavailable`. The lines are
 also hidden, with no message, while the board displays a configuration other
 than the one the scan was made under: for up to about 75 seconds after a Board
-settings save on the same page, and, after a configuration change saved
-elsewhere, until you press **Apply update**.
+settings save on the same page, until the checkouts read that a checkout folder
+save on the same page requests answers with a scan of the new folders, and,
+after a configuration change saved elsewhere, until you press **Apply update**.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that
@@ -1306,9 +1311,10 @@ The board header has a **Board** and a **Checkouts** switch. **Checkouts** shows
 the same checkout state that `nyx checkouts` prints, read from Nyx's last
 successful checkout scan: the repositories under your configured checkout
 folders, their clones, branches and linked worktrees, and the work items whose
-`Target repo:` or `Branch:` names them. The view only shows this state. It
-never changes a repository or a specification file, and it cannot change the
-folders; see [Inspect checkouts](#inspect-checkouts) for what each value means,
+`Target repo:` or `Branch:` names them. The view shows this state. It never
+changes a repository or a specification file; its only changes are to the
+checkout folders and GitHub lookup of the active workspace, through the **Checkout
+folders** editor described below. See [Inspect checkouts](#inspect-checkouts) for what each value means,
 including the explanation of every code the view shows, which this section does
 not repeat. While **Checkouts** is shown, **Search** keeps the repositories
 that match what you type, ignoring case, and hides the others (the field's hint
@@ -1345,6 +1351,50 @@ for the next due one. It reads `Checking remotes…` while the check runs, and a
 note beside it says `Remote check finished.` or `Remote check failed:` with the
 category. Only one check runs at a time, and a server that does not offer remote
 checks says `This server does not offer remote checks.`
+
+The **Checkout folders** control beside the status line opens an editor for the
+active workspace's checkout folders and its GitHub lookup. It appears whenever
+the view shows a scan or a failed collection, and it is closed unless no folder is
+configured, when it opens itself once. Opening it loads the saved folders, each
+listed with a remove button. Type an absolute path in **Checkout folder path**
+and choose **Add** (or press **Enter**); the list changes only as a draft until
+you choose **Save checkout folders**, and **Cancel checkout folder changes**
+drops the draft. Under the path field, **Add** buttons offer the parent folders
+that would bring a package's unseen `Target repo:` checkout into view, each with
+the number of work items it would reveal (`Add /home/me/code (3 work items)`);
+these are the `folder_suggestions` of the document, and a folder already in the
+list is not offered. The checkbox **Look up pull requests with the GitHub CLI
+(gh)** is the workspace's lookup switch described under [Inspect
+checkouts](#inspect-checkouts).
+
+A save is checked by the server. A folder it refuses stays in the draft with its
+reason beside it (`This folder does not exist.`, `This path is not absolute.`,
+`This path is not a folder.`, `This folder cannot be read.` or `This is not a
+usable path.`) and the status line says `The checkout folders were not saved. Fix
+the marked folders and save again.`; nothing was saved. A folder that is already
+saved is not refused for being missing, so a list keeps saving while one of its
+drives is away. The saved list is sorted and keeps each folder once, so the list
+shown after a save can differ in order from the draft. Saving an empty list
+stores no folders and turns the lookup off, and the editor says `With no folders
+the pull-request lookup is off.`
+
+When the record changed after the editor loaded it, such as a save from another
+page or an edit by hand, the save is not applied. Your draft stays, and the status
+says `Save not applied: the checkout folders changed elsewhere.` (or, when the
+saved folders cannot be compared, `the saved checkout folders are not available
+to compare`) beside **Reload checkout folders**, which replaces the draft with
+the saved folders. An editor with no draft reloads quietly when it sees a
+changed record, and one with a draft says `The checkout folders changed elsewhere.`
+and offers the same reload. The Board settings editor and this editor share one
+record revision, so a Board settings save never marks a folder draft as changed
+elsewhere, and a folder save never marks a Board settings draft.
+
+A successful save installs the new catalog on the page and asks at once for a
+scan of the new folders, so the view shows them without waiting for the next
+scan. The first folder save writes a schema 4 record. A Windows or macOS desktop
+application built before this version refuses a schema 4 record, so rebuild the
+desktop application at this version before the first save there; see [Your
+specification workspace](workspaces.md#checkout-folders).
 
 The view marks how fresh a value is only where it can be old. A comparison with a
 remote says whether it is `live`, `recorded` with the time (`recorded 14:05`) of
@@ -1404,8 +1454,10 @@ with the category and when it clears; or, for a scan that ran, a **Checkout
 setup** panel listing a missing Git, a configured folder that does not exist,
 cannot be read or is not a folder, a GitHub CLI that was not found, and the
 scan's own diagnostics. With no folders configured the panel says `No checkout
-folders are configured.` and points to
-[Checkout folders](workspaces.md#checkout-folders), which holds the hand edit.
+folders are configured. Choose Checkout folders above to add one.` and the
+**Checkout folders** editor above the panel opens itself once; the panel holds no
+control of its own. [Checkout folders](workspaces.md#checkout-folders) also
+describes the hand edit for use without the board.
 
 ## Capture and review the fictional example
 
@@ -1483,10 +1535,12 @@ without pushing. Run `git fetch` once in each of the three clones before Nyx
 starts: a fresh clone writes no `FETCH_HEAD`, and Nyx would then report it as
 never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixture`
 (a path under your home directory would show your username).
-With the isolated instance stopped, configure the clones' parent folder by the
-documented hand edit (see [Checkout folders](workspaces.md#checkout-folders)) in
-the isolated account home's configuration record, with `"github_lookup": false`;
-a Board settings save keeps that entry. Then start Nyx and save the Board
+Start the isolated instance, choose **Checkouts**, and configure the clones'
+parent folder through the **Checkout folders** editor (see [Use the Checkouts
+view](#use-the-checkouts-view)): add the parent folder, leave the GitHub lookup
+unchecked, and choose **Save checkout folders**; a Board settings save keeps
+that entry. Close the editor again before the capture so only its summary shows.
+Then save the Board
 settings described above, which also clears the
 `finished_stages_not_configured` attention item. If the owner's instance holds
 the control port, run the isolated instance on another free port rather than
