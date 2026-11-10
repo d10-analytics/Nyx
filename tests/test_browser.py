@@ -520,6 +520,21 @@ class BrowserSettings:
         self.fail_next_load = False
         self.gate = gate
         self.entered = threading.Event()
+        self.folders = []
+        self.github_lookup = False
+        self.folder_gets = 0
+        self.fail_next_folder_load = False
+
+    def get_checkout_settings(self):
+        self.folder_gets += 1
+        if self.fail_next_folder_load:
+            self.fail_next_folder_load = False
+            raise CatalogError("settings_unavailable")
+        return {
+            "folders": list(self.folders),
+            "github_lookup": self.github_lookup,
+            "revision": self.revision,
+        }
 
     def get_settings(self):
         self.get_calls += 1
@@ -789,6 +804,7 @@ def page_launcher(browser, launch_timeout_ms=15000):
             )
             application.get_settings = settings.get_settings
             application.get_workspace = settings.get_workspace
+            application.get_checkout_settings = settings.get_checkout_settings
             application.save_settings = settings.save_settings
             client.settings = settings
             if workers is None:
@@ -7034,7 +7050,9 @@ def test_checkouts_words_block_names_the_view_markers_once():
     assert source.count(CHECKOUTS_WORDS_END) == 1
     words = checkout_words()
     # The rows, headers and setup sentences the view shows are in the block too.
-    assert words["text"]["noFolders"].startswith("No checkout folders are configured.")
+    assert words["text"]["noFolders"] == (
+        "No checkout folders are configured. Choose Checkout folders above to add one."
+    )
     assert words["column"]["default"] == "Default branch vs remote"
     assert words["text"]["workItemBranches"] == "Work item branches"
 
@@ -7448,9 +7466,10 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     # No configured folder: the guide section is named, and no control appears.
     serve_checkouts(page, double, empty_checkouts_document())
     setup = body.locator(".checkouts-setup")
-    sentence = setup.inner_text()
-    assert "No checkout folders are configured." in sentence
-    assert "Your specification workspace → Checkout folders" in sentence
+    sentence = setup.locator(".checkouts-setup-item").inner_text()
+    assert sentence == (
+        "No checkout folders are configured. Choose Checkout folders above to add one."
+    )
     assert setup.locator("input, button, select, textarea, [contenteditable]").count() == 0
     assert body.locator(".checkouts-group").count() == 0
 
@@ -9547,10 +9566,11 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
             playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
         else:
             serve_checkouts(page, double, step)
-        assert page.evaluate(live) == ["checkouts-action-status"]
-        # A tick never writes the action status.
+        assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+        # A tick never writes either region.
         assert all(not action for _, action, _ in checkouts_records(page))
         assert page.locator("#checkouts-action-status").inner_text() == ""
+        assert page.locator("#checkout-folders-status").inner_text() == ""
 
 
 def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
@@ -9582,3 +9602,216 @@ def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
     page.fill("#filter", "")
     assert summary.inner_text() == "Quiet repositories (2)"
     playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)
+
+
+# ---------------------------------------------------------------------------
+# The checkout folders editor: host, load and the one auto-open
+# ---------------------------------------------------------------------------
+
+FOLDERS_EDITOR = "#checkout-folders-editor"
+FOLDERS_LIST_ITEMS = "#checkout-folders-list li"
+
+
+def folder_paths(page):
+    """The folder paths the editor lists, in shown order."""
+    return page.locator(FOLDERS_LIST_ITEMS).evaluate_all(
+        "items => items.map(item => item.textContent)"
+    )
+
+
+def toggle_folders_editor(page):
+    """Press the editor's summary and let its toggle event run."""
+    page.locator(f"{FOLDERS_EDITOR} summary").click()
+    settle_frames(page)
+
+
+def open_folders_page(launch, attention_checkouts, settings, double=None):
+    """Open the checkouts view over a document that collects one folder."""
+    double = double or BrowserCheckouts(attention_checkouts.document)
+    page = launch(
+        StaticClient(attention_checkouts.catalog_all),
+        settings=settings, checkouts=double, fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    show_checkouts_view(page)
+    return page, double
+
+
+def test_checkout_folders_editor_sits_in_the_status_row_for_ready_and_failed_outcomes(
+    open_page, attention_checkouts
+):
+    """Only a settled ready or failed outcome shows the editor, beside the check button."""
+    double = BrowserCheckouts(attention_checkouts.document)
+    gate = double.hold()
+    page = open_page(
+        StaticClient(attention_checkouts.catalog_all),
+        settings=BrowserSettings(revision=CHECKOUTS_REVISION), checkouts=double,
+        fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    assert double.entered.wait(timeout=10)
+    show_checkouts_view(page)
+    editor = page.locator(FOLDERS_EDITOR)
+    # Nothing has settled, so the held first request leaves the editor hidden.
+    playwright.expect(editor).to_be_hidden()
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    playwright.expect(editor).to_be_visible()
+    assert page.evaluate("""() => {
+      const editor = document.querySelector('#checkout-folders-editor');
+      const check = document.querySelector('#check-remotes');
+      return editor.tagName === 'DETAILS' &&
+        editor.parentElement.classList.contains('checkouts-status') &&
+        editor.parentElement === check.parentElement &&
+        Boolean(check.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+        editor.closest('#checkouts-status-line, #checkouts-body') === null &&
+        editor.querySelector('summary').textContent === 'Checkout folders';
+    }""")
+    page.evaluate("document.querySelector('#checkout-folders-editor').dataset.mark = 'same'")
+
+    # A failed outcome keeps it, and the node a tick leaves is the one marked.
+    double.fail("checkouts_unavailable")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
+    assert page.locator("#checkouts-status-line").inner_text() == ""
+    playwright.expect(editor).to_be_visible()
+    assert editor.get_attribute("data-mark") == "same"
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    playwright.expect(editor).to_be_visible()
+    assert editor.get_attribute("data-mark") == "same"
+
+    # The standalone server has no checkouts route, so the editor stays hidden.
+    plain = open_page(
+        StaticClient(attention_checkouts.catalog_all), fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(plain, "checkoutsResponses", 1)
+    assert plain.evaluate("window.checkoutsResponses") == [404]
+    settle_frames(plain)
+    show_checkouts_view(plain)
+    playwright.expect(plain.locator(FOLDERS_EDITOR)).to_be_hidden()
+
+
+def test_checkout_folders_editor_loads_the_saved_folders_on_every_open_without_a_draft(
+    open_page, attention_checkouts
+):
+    """Each open asks again, so a record changed between two opens shows its new folders."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha", "/work/beta"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    assert settings.folder_gets == 0
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_count(2)
+    assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+    assert not page.locator("#checkout-folders-github").is_checked()
+    assert settings.folder_gets == 1
+
+    toggle_folders_editor(page)
+    settings.folders = ["/work/gamma", "/work/alpha"]
+    settings.github_lookup = True
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-github")).to_be_checked()
+    assert folder_paths(page) == ["/work/gamma", "/work/alpha"]
+    assert settings.folder_gets == 2
+
+
+def test_checkout_folders_editor_discards_an_earlier_load_answer(
+    open_page, attention_checkouts
+):
+    """An answer to the first open that arrives after the second open's answer is dropped."""
+
+    class FirstLoadHeld(HexRevisionSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.first_gate = threading.Event()
+            self.first_entered = threading.Event()
+
+        def get_checkout_settings(self):
+            answer = super().get_checkout_settings()
+            if self.folder_gets == 1:
+                self.first_entered.set()
+                self.first_gate.wait(timeout=10)
+            return answer
+
+    settings = FirstLoadHeld(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/old"]
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    toggle_folders_editor(page)
+    assert settings.first_entered.wait(timeout=10)
+    toggle_folders_editor(page)
+    settings.folders = ["/work/new"]
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/new"])
+    with page.expect_response("**/api/checkout-settings") as late:
+        settings.first_gate.set()
+    late.value.finished()
+    settle_frames(page)
+    assert settings.folder_gets == 2
+    assert folder_paths(page) == ["/work/new"]
+
+
+def test_checkout_folders_editor_load_failure_offers_reload_and_keeps_the_view(
+    open_page, attention_checkouts
+):
+    """A failed load names its code, leaves the groups, and Reload loads."""
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    settings.fail_next_folder_load = True
+    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    reload_button = page.get_by_role("button", name="Reload checkout folders", exact=True)
+    playwright.expect(reload_button).to_be_hidden()
+    toggle_folders_editor(page)
+    status = page.locator("#checkout-folders-status")
+    playwright.expect(status).to_have_text(
+        "Could not load checkout folders: settings_unavailable"
+    )
+    playwright.expect(reload_button).to_be_visible()
+    assert page.locator("#checkouts-body .checkouts-group").count() == 1
+    assert folder_paths(page) == []
+
+    reload_button.click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    playwright.expect(reload_button).to_be_hidden()
+    assert settings.folder_gets == 2
+    assert "Could not load" not in status.inner_text()
+
+
+def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
+    open_page, attention_checkouts
+):
+    """A ready document with no folders opens the editor once; the reader's close sticks."""
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha"]
+    double = BrowserCheckouts()
+    page = open_page(
+        StaticClient(attention_checkouts.catalog_all), settings=settings, checkouts=double,
+        fake_clock=True, init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    editor = page.locator(FOLDERS_EDITOR)
+    # The view is still the board; the panel opens itself and loads once.
+    playwright.expect(editor).to_have_attribute("open", "")
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    assert settings.folder_gets == 1
+    show_checkouts_view(page)
+    toggle_folders_editor(page)
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    page.locator("#view-board").click()
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+    assert settings.folder_gets == 1
+
+    # A document with a folder never opens it.
+    other = BrowserSettings(revision=CHECKOUTS_REVISION)
+    full, _ = open_folders_page(open_page, attention_checkouts, other)
+    fire_checkouts_poll(full)
+    settle_frames(full)
+    assert full.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+    assert other.folder_gets == 0
