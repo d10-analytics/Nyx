@@ -126,6 +126,14 @@
       "package_scan_incomplete": "Some work items could not be read",
       "package_scan_unavailable": "Work items could not be read"
     },
+    "attentionCodeOne": {
+      "branch_unpushed": "{branch} in {clone} has {count} commit not on the remote",
+      "default_branch_ahead": "default branch {branch} in {clone} has {count} commit not on the remote",
+      "stash": "{clone} has {count} stash",
+      "uncommitted_changes": "{worktree} has {count} uncommitted change",
+      "removable": "{clone} has {count} branch or worktree ready to remove",
+      "base_moved": "the base of {workItem} moved {count} commit past its Baseline"
+    },
     "availabilityState": {
       "free": "Free",
       "assigned": "Assigned",
@@ -2725,8 +2733,8 @@
       `<th scope="row" class="checkouts-branch-name" role="rowheader">${cellLabelHtml("branch")}` +
       `${text(branch.name)}${fold}</th>` +
       `<td role="cell">${cellLabelHtml("checkedOutIn")}${branch.checked_out_in === null ||
-        branch.checked_out_in === undefined
-        ? dashHtml() : text(checkoutName(branch.checked_out_in))}</td>` +
+        branch.checked_out_in === undefined || branch.checked_out_in.length === 0
+        ? dashHtml() : branch.checked_out_in.map((path) => text(checkoutName(path))).join(" · ")}</td>` +
       `<td class="checkouts-tip" role="cell">${cellLabelHtml("tip")}` +
       `${text(String(branch.sha).slice(0, 7))}</td>` +
       `<td class="checkouts-remote-state" role="cell">${cellLabelHtml("remoteState")}` +
@@ -3018,7 +3026,8 @@
     };
     let words = item.code === "uncommitted_changes" && item.count === 0
       ? wordText("text", "uncommittedOperation", values)
-      : wordText("attentionCode", item.code, values);
+      : wordText(item.count === 1 && codeWords("attentionCodeOne", item.code) !== item.code
+        ? "attentionCodeOne" : "attentionCode", item.code, values);
     if (item.code === "awaiting_merge" &&
       item.pull_request !== null && item.pull_request !== undefined) {
       words += ` ${wordText("text", "awaitingMergePullRequest", {n: item.pull_request})}`;
