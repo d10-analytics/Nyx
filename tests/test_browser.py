@@ -9910,6 +9910,102 @@ def test_checkout_folders_editor_load_failure_offers_reload_and_keeps_the_view(
     assert "Could not load" not in status.inner_text()
 
 
+def test_checkout_folders_edits_are_ignored_while_the_saved_folders_load(
+    open_page, attention_checkouts
+):
+    """A load in flight holds every edit, so a draft always starts from the saved folders."""
+
+    class HeldLoad(BrowserSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.load_gate = threading.Event()
+            self.load_entered = threading.Event()
+
+        def get_checkout_settings(self):
+            answer = super().get_checkout_settings()
+            self.load_entered.set()
+            self.load_gate.wait(timeout=10)
+            return answer
+
+        def hold_next_load(self):
+            self.load_gate = threading.Event()
+            self.load_entered = threading.Event()
+
+    def held_controls():
+        return page.locator(
+            f"{FOLDERS_EDITOR} button:visible:not([disabled]), {FOLDERS_EDITOR} input:visible"
+        )
+
+    def release_load():
+        with page.expect_response("**/api/checkout-settings") as answered:
+            settings.load_gate.set()
+        answered.value.finished()
+        settle_frames(page)
+
+    document = suggestion_document(attention_checkouts, [{"path": "/work/aaa", "package_count": 1}])
+    settings = HeldLoad(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha", "/work/beta"]
+    settings.github_lookup = True
+    page, _ = open_folders_page(
+        open_page, attention_checkouts, settings, BrowserCheckouts(document))
+    save = folders_save_button(page)
+    path_input = page.locator("#checkout-folders-path")
+    lookup = page.locator("#checkout-folders-github")
+    try:
+        # The first open: nothing is served yet, and no attempt builds a draft.
+        toggle_folders_editor(page)
+        assert settings.load_entered.wait(timeout=5)
+        controls = held_controls()
+        # Path input, Add, the suggestion and the checkbox; Save and Cancel are disabled.
+        assert controls.count() == 4
+        for index in range(controls.count()):
+            assert controls.nth(index).get_attribute("aria-disabled") == "true"
+        # Playwright treats aria-disabled as not actionable, so each attempt is forced.
+        path_input.fill("/work/new", force=True)
+        page.get_by_role("button", name="Add", exact=True).click(force=True)
+        path_input.press("Enter")
+        page.get_by_role("button", name="Add /work/aaa (1 work item)", exact=True).click(force=True)
+        lookup.click(force=True)
+        assert folder_paths(page) == []
+        assert not lookup.is_checked()
+        playwright.expect(save).to_be_disabled()
+        # The dimmed control keeps the focus the reader gave it.
+        playwright.expect(lookup).to_be_focused()
+        release_load()
+        assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+        playwright.expect(lookup).to_be_checked()
+        playwright.expect(save).to_be_disabled()
+        playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Current checkout folders loaded.")
+        assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
+
+        # A reopen shows the last served list while it loads; Remove is held too.
+        toggle_folders_editor(page)
+        settings.folders = ["/work/alpha"]
+        settings.hold_next_load()
+        toggle_folders_editor(page)
+        assert settings.load_entered.wait(timeout=5)
+        remove = page.get_by_role("button", name="Remove checkout folder /work/beta", exact=True)
+        playwright.expect(remove).to_have_attribute("aria-disabled", "true")
+        remove.click(force=True)
+        assert folder_paths(page) == ["/work/alpha", "/work/beta"]
+        release_load()
+        assert folder_paths(page) == ["/work/alpha"]
+        playwright.expect(save).to_be_disabled()
+    finally:
+        settings.load_gate.set()
+
+    # A failed load releases the controls, so the reader can still edit.
+    toggle_folders_editor(page)
+    settings.fail_next_folder_load = True
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text(
+        "Could not load checkout folders: settings_unavailable")
+    assert page.locator(f"{FOLDERS_EDITOR} [aria-disabled]").count() == 0
+    add_folder(page, "/work/new")
+    assert folder_paths(page) == ["/work/alpha", "/work/new"]
+    assert settings.folder_calls == []
+
+
 def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
     open_page, attention_checkouts
 ):
