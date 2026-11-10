@@ -2137,7 +2137,6 @@
         foldersSaved = {folders: [...payload.folders], github_lookup: payload.github_lookup};
         foldersRevision = payload.revision;
         foldersProblems = new Map();
-        if (foldersDraft !== null) setFoldersDraft(foldersDraft);
         foldersReloadAvailable = false;
         foldersEditorStatus(codeWords("text", "foldersLoaded"));
         renderFoldersEditor();
