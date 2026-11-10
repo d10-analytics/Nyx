@@ -8278,6 +8278,8 @@ def attention_words(item):
     }
     if item["code"] == "uncommitted_changes" and item["count"] == 0:
         template = words["text"]["uncommittedOperation"]
+    elif item["count"] == 1 and item["code"] in words["attentionCodeOne"]:
+        template = words["attentionCodeOne"][item["code"]]
     else:
         template = words["attentionCode"][item["code"]]
     sentence = template.format(**values)
@@ -8337,7 +8339,7 @@ def test_checkouts_attention_list_follows_the_document(open_page, attention_chec
         "rows => rows.map(row => row.querySelector("
         "'button.checkouts-attention-go, .checkouts-attention-words').innerText)")
     assert texts == [attention_words(item) for item in document["attention"]]
-    assert texts[0] == "topic-a in Repo Clone 2 has 1 commits not on the remote"
+    assert texts[0] == "topic-a in Repo Clone 2 has 1 commit not on the remote"
     assert texts[4] == "topic-g is finished but not merged"
     # Items that name a clone or repository are controls; one that names only a
     # work item is text with that work item's Show on board.
@@ -8348,6 +8350,44 @@ def test_checkouts_attention_list_follows_the_document(open_page, attention_chec
     assert missing.locator("button.checkouts-attention-go").count() == 0
     assert missing.locator("[data-show-on-board]").get_attribute("data-show-on-board") == \
         "Repo/Drafts/zeta"
+
+
+def test_checkouts_attention_counts_read_singular_at_one_and_plural_otherwise(
+    open_page, attention_checkouts
+):
+    """Each counted code says "1 commit" at one and "2 commits" at two."""
+    document = copy.deepcopy(attention_checkouts.document)
+    by_code = {item["code"]: item for item in document["attention"]}
+    # The default-branch item has no row in this world; it reuses an item's destination.
+    by_code["default_branch_ahead"] = copy.deepcopy(by_code["branch_unpushed"])
+    by_code["default_branch_ahead"]["code"] = "default_branch_ahead"
+    expected = {
+        "branch_unpushed": ("topic-a in Repo Clone 2 has {} not on the remote",
+                            "commit"),
+        "default_branch_ahead": ("default branch topic-a in Repo Clone 2 has {} not on the remote",
+                                 "commit"),
+        "stash": ("Repo Clone 3 has {}", "stash"),
+        "uncommitted_changes": ("linked has {}", "uncommitted change"),
+        "removable": ("Repo Clone 2 has {} ready to remove", "branch or worktree"),
+        "base_moved": ("the base of Repo/Drafts/alpha moved {} past its Baseline", "commit"),
+    }
+    plurals = {"commit": "commits", "stash": "stashes",
+               "uncommitted change": "uncommitted changes",
+               "branch or worktree": "branches or worktrees"}
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    for count in (1, 2, 5):
+        variant = copy.deepcopy(document)
+        variant["attention"] = []
+        for code in expected:
+            item = copy.deepcopy(by_code[code])
+            item["count"] = count
+            variant["attention"].append(item)
+        serve_checkouts(page, double, redigest(variant))
+        for code, (template, noun) in expected.items():
+            phrase = f"1 {noun}" if count == 1 else f"{count} {plurals[noun]}"
+            sentence = page.locator(
+                f'li[data-code="{code}"]').first.inner_text()
+            assert sentence == template.format(phrase), (code, count)
 
 
 def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
@@ -8505,6 +8545,13 @@ def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
     assert items.count() == len(document["attention"])
 
 
+def share_a_branch_between_two_checkouts(document):
+    """``topic-merged`` held by the main worktree and the linked one."""
+    _, clone_two = checkout_clone(document, "Repo Clone 2")
+    branch = next(item for item in clone_two["branches"] if item["name"] == "topic-merged")
+    branch["checked_out_in"] = [worktree["path"] for worktree in clone_two["worktrees"]]
+
+
 def open_clone_detail(page, name):
     """Open one clone row from its toggle and return its detail row."""
     row = page.locator(f'tr.checkouts-clone[data-clone="{name}"]')
@@ -8531,7 +8578,7 @@ def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items
     """An opened clone shows its path, branch table, folds, blockers and work items (R-08, AC-05)."""
     document = attention_checkouts.document
     group, clone = checkout_clone(document, "Repo Clone 2")
-    page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
+    page, double = open_attention_checkouts(open_page, attention_checkouts, document)
     detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
     assert not detail.is_visible()
     detail = open_clone_detail(page, "Repo Clone 2")
@@ -8554,6 +8601,23 @@ def test_checkouts_expanded_row_shows_its_branches_folds_blockers_and_work_items
     fold.click()
     assert not part.is_visible()
     assert fold.get_attribute("aria-expanded") == "false"
+
+    # "Checked out in" names every checkout that holds a branch, and a dash for none.
+    def holders(name):
+        return detail.locator(f'tr[data-branch="{name}"] td').first.evaluate(
+            "cell => [...cell.childNodes].filter(node => node.nodeType === 3 || "
+            "!node.classList.contains('cell-label')).map(node => node.textContent).join('')")
+
+    assert [holders(name) for name in ("topic-a", "trunk", "wt-branch")] == [
+        "—", "Repo Clone 2", "linked"]
+    assert all(holders(branch["name"]) == "—" for branch in clone["branches"]
+               if not branch["checked_out_in"])
+    shared = checkout_variant(document, share_a_branch_between_two_checkouts)
+    serve_checkouts(page, double, shared)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    assert holders("topic-merged") == "Repo Clone 2 · linked"
+    serve_checkouts(page, double, document)
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
 
     # Each verdict reads the words of its served verdict, with its base's basis.
     for branch in clone["branches"]:
