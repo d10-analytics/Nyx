@@ -1523,7 +1523,8 @@ panel. Each board image shows the **Board** and **Checkouts** switch in the
 toolbar with **Board** selected.
 
 The fourth image is dark, 1600 × 1200, with **Checkouts** selected and **Hide
-quiet checkouts** checked. It shows the status line with **Check remotes now**,
+quiet checkouts** checked. It shows the status line with **Check remotes now** and the closed
+**Checkout folders** control,
 the **Needs attention** list with its one item, the **Quiet repositories** row,
 and the repository with two clones, with the second clone's **Details** open.
 Create its fictional fixture outside the repository, beside the workspace
