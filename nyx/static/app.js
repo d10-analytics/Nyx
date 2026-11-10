@@ -391,7 +391,10 @@
       "unknownPath": "unknown path",
       "foldersLoading": "Loading checkout folders…",
       "foldersLoaded": "Current checkout folders loaded.",
-      "foldersLoadFailed": "Could not load checkout folders: {code}"
+      "foldersLoadFailed": "Could not load checkout folders: {code}",
+      "foldersDraftChanged": "Unsaved checkout folder changes.",
+      "foldersDraftCancelled": "Unsaved checkout folder changes cancelled.",
+      "foldersDraftMatches": "The checkout folders match the saved list."
     }
   };
   // checkout words: end
@@ -421,6 +424,11 @@
   const foldersLookup = document.querySelector("#checkout-folders-github");
   const foldersReload = document.querySelector("#checkout-folders-reload");
   const foldersStatus = document.querySelector("#checkout-folders-status");
+  const foldersPath = document.querySelector("#checkout-folders-path");
+  const foldersAdd = document.querySelector("#checkout-folders-add");
+  const foldersSuggestions = document.querySelector("#checkout-folders-suggestions");
+  const foldersSave = document.querySelector("#checkout-folders-save");
+  const foldersCancel = document.querySelector("#checkout-folders-cancel");
 
   const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
@@ -468,6 +476,9 @@
   let foldersDraft = null;
   let foldersReloadAvailable = false;
   let foldersRequestSerial = 0;
+  // What the editor last drew from the served document, so a tick that
+  // settles the same suggestions leaves the editor untouched.
+  let foldersSuggestionKey = null;
   let foldersAutoOpened = false;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
   // envelope, or "failed" with its category.  "failed" adds a Code Status part
@@ -1842,16 +1853,117 @@
     foldersStatus.classList.toggle("error", isError);
   }
 
+  function foldersShown() {
+    return foldersDraft === null ? foldersSaved : foldersDraft;
+  }
+
+  // The unconfigured parents the shown ready document offers.
+  function foldersSuggestionList() {
+    if (checkoutsOutcome.state !== "ready") return [];
+    return checkoutsOutcome.envelope.checkouts.folder_suggestions;
+  }
+
+  function foldersDirty() {
+    return foldersDraft !== null;
+  }
+
+  // A draft that equals the saved state is no draft.
+  function setFoldersDraft(draft) {
+    const same = draft.github_lookup === foldersSaved.github_lookup &&
+      JSON.stringify(draft.folders) === JSON.stringify(foldersSaved.folders);
+    foldersDraft = same ? null : draft;
+  }
+
+  function editedFolders() {
+    const shown = foldersShown();
+    return {folders: [...shown.folders], github_lookup: shown.github_lookup};
+  }
+
   function renderFoldersEditor() {
-    const shown = foldersDraft === null ? foldersSaved : foldersDraft;
+    const controls = () => [...foldersEditor.querySelectorAll("summary, input, button")];
+    const focused = document.activeElement;
+    const prior = controls();
+    const priorIndex = prior.indexOf(focused);
+    const keyOf = (control) => control.dataset.folder !== undefined
+      ? [control.dataset.role, control.dataset.folder] : [control.id];
+    const priorKey = priorIndex >= 0 ? keyOf(focused) : null;
+    const roleList = (list, role) => list.filter((control) => control.dataset.role === role);
+    const priorRoleIndex = priorKey && priorKey.length === 2
+      ? roleList(prior, priorKey[0]).indexOf(focused) : -1;
+    const shown = foldersShown();
+    const present = new Set(shown.folders);
     foldersList.replaceChildren(...shown.folders.map((path) => {
       const item = document.createElement("li");
       item.className = "checkout-folders-item";
-      item.textContent = path;
+      const name = document.createElement("span");
+      name.className = "checkout-folders-path";
+      name.textContent = path;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "checkout-folders-remove";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", `Remove checkout folder ${path}`);
+      remove.dataset.role = "remove";
+      remove.dataset.folder = path;
+      item.append(name, remove);
       return item;
     }));
+    const offered = foldersSuggestionList().filter((entry) => !present.has(entry.path));
+    foldersSuggestions.replaceChildren(...offered.map((entry) => {
+      const item = document.createElement("li");
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "checkout-folders-suggestion";
+      add.textContent = `Add ${entry.path} (${plural(entry.package_count, "work item")})`;
+      add.dataset.role = "suggest";
+      add.dataset.folder = entry.path;
+      item.append(add);
+      return item;
+    }));
+    foldersSuggestions.hidden = offered.length === 0;
+    foldersSuggestionKey = checkoutsOutcome.state === "ready"
+      ? JSON.stringify(foldersSuggestionList()) : null;
     foldersLookup.checked = shown.github_lookup;
+    foldersSave.disabled = !foldersDirty();
+    foldersCancel.disabled = !foldersDirty();
+    foldersSave.removeAttribute("aria-disabled");
+    foldersCancel.removeAttribute("aria-disabled");
     foldersReload.hidden = !foldersReloadAvailable;
+    if (!priorKey) return;
+    // Focus goes back to the same control; a removed folder or a taken
+    // suggestion hands it to the next of its kind, else the previous, else the
+    // path input; any other control that stopped being operable hands it to the
+    // next operable control, else the previous, else the summary.
+    const current = controls();
+    const operable = (control) => control?.isConnected && !control.disabled &&
+      !control.closest("[hidden]");
+    const same = current.find((control) =>
+      JSON.stringify(keyOf(control)) === JSON.stringify(priorKey) && operable(control));
+    let successor = same;
+    if (!successor && priorRoleIndex >= 0) {
+      const peers = roleList(current, priorKey[0]).filter(operable);
+      successor = peers[priorRoleIndex] || peers[priorRoleIndex - 1] || foldersPath;
+    }
+    successor = successor || current.slice(priorIndex + 1).find(operable) ||
+      current.slice(0, priorIndex).reverse().find(operable) ||
+      foldersEditor.querySelector("summary");
+    successor.focus();
+  }
+
+  function foldersEdited(draft) {
+    setFoldersDraft(draft);
+    foldersEditorStatus(codeWords("text", foldersDirty() ? "foldersDraftChanged" : "foldersDraftMatches"));
+    renderFoldersEditor();
+  }
+
+  // The only client checks are an empty entry and an exact repeat; the
+  // server's rule is the authority on everything else.
+  function addFolder(path) {
+    const draft = editedFolders();
+    if (path === "" || draft.folders.includes(path)) return false;
+    draft.folders.push(path);
+    foldersEdited(draft);
+    return true;
   }
 
   // Each open with no draft asks for the saved folders; an answer that arrives
@@ -1877,7 +1989,7 @@
       .then((payload) => {
         if (serial !== foldersRequestSerial) return;
         foldersSaved = {folders: [...payload.folders], github_lookup: payload.github_lookup};
-        foldersDraft = null;
+        if (foldersDraft !== null) setFoldersDraft(foldersDraft);
         foldersReloadAvailable = false;
         foldersEditorStatus(codeWords("text", "foldersLoaded"));
         renderFoldersEditor();
@@ -1900,6 +2012,9 @@
   function syncFoldersEditor() {
     const available = checkoutsOutcome.state === "ready" || checkoutsOutcome.state === "failed";
     if (foldersEditor.hidden === available) foldersEditor.hidden = !available;
+    const key = checkoutsOutcome.state === "ready"
+      ? JSON.stringify(foldersSuggestionList()) : null;
+    if (available && key !== foldersSuggestionKey) renderFoldersEditor();
     if (!available || foldersAutoOpened || checkoutsOutcome.state !== "ready" ||
       checkoutsOutcome.envelope.checkouts.folders.length > 0) return;
     foldersAutoOpened = true;
@@ -3918,6 +4033,36 @@
     if (!foldersEditor.open) return;
     if (foldersDraft === null) loadFolders();
     else renderFoldersEditor();
+  });
+  foldersAdd.addEventListener("click", () => {
+    if (addFolder(foldersPath.value)) foldersPath.value = "";
+  });
+  foldersPath.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (addFolder(foldersPath.value)) foldersPath.value = "";
+  });
+  foldersList.addEventListener("click", (event) => {
+    const remove = event.target.closest(".checkout-folders-remove");
+    if (!remove) return;
+    const draft = editedFolders();
+    draft.folders = draft.folders.filter((path) => path !== remove.dataset.folder);
+    foldersEdited(draft);
+  });
+  foldersSuggestions.addEventListener("click", (event) => {
+    const add = event.target.closest(".checkout-folders-suggestion");
+    if (add) addFolder(add.dataset.folder);
+  });
+  foldersLookup.addEventListener("change", () => {
+    const draft = editedFolders();
+    draft.github_lookup = foldersLookup.checked;
+    foldersEdited(draft);
+  });
+  foldersCancel.addEventListener("click", () => {
+    if (!foldersDirty()) return;
+    foldersDraft = null;
+    foldersEditorStatus(codeWords("text", "foldersDraftCancelled"));
+    renderFoldersEditor();
   });
   foldersReload.addEventListener("click", () => {
     foldersDraft = null;
