@@ -34,7 +34,9 @@ README is narrative only.
   names, work item paths and Code Status text, the availability, HEAD and tree
   words of its clone rows, the HEAD words of its linked worktrees, or the status
   words of an unreadable clone or worktree match; no other column is searched,
-  and the repositories in the quiet row are not searched while it collects them.
+  and the quiet row is searched by the repositories it holds with the same text:
+  it stays while one matches, listing and counting only those, and is hidden when
+  none do.
   Every enumerated code the view shows and the sentence built around it come
   from one words block, so an unknown code renders raw; served failure
   categories are shown as their raw `checkouts_*` code. The view itself decides

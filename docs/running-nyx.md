@@ -1319,9 +1319,12 @@ words of any clone row, the HEAD words of a linked worktree, and the status
 words of a clone or linked worktree that could not be read. No other column is
 searched: the default branch against the remote, the branch and stash counts,
 cleanup, merge verdicts, remote copies, pull requests and a linked worktree's
-tree words do not make a repository match. The **Quiet repositories** row stays
-where it is whatever you type, and the repositories collected in it are not
-searched until you clear **Hide quiet checkouts**. **Hide empty
+tree words do not make a repository match. The **Quiet repositories** row is
+searched by the repositories it holds, by the same words a repository's own group
+would be: it stays while at least one of them matches, lists only those, and
+reads how many match (for example "Quiet repositories (3, 1 matching)"). It is
+hidden when none match, and shows every repository again when you clear the
+search. **Hide empty
 rows and columns** and **Hide terminal rows** give way to **Hide quiet
 checkouts**. Switching views never applies a waiting board update: the board
 keeps it, and the switch reads **Board (update waiting)** until you apply it on
