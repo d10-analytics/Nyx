@@ -76,6 +76,7 @@
   ];
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
+  const CHECKOUT_SETTINGS_ROUTE = "/api/checkout-settings";
   const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
   const VIEW_BOARD = "board";
   const VIEW_CHECKOUTS = "checkouts";
@@ -348,7 +349,7 @@
       "runCompleted": "Remote check finished.",
       "runFailed": "Remote check failed: {category}.",
       "noOriginRemote": "no origin remote",
-      "noFolders": "No checkout folders are configured. Add them to the workspace record; see the guide section Your specification workspace → Checkout folders.",
+      "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
       "quietRow": "Quiet repositories ({count})",
@@ -387,7 +388,10 @@
       "removable": "Removable",
       "foldingNotChecked": "Branches were not checked for folding: {reason}",
       "folderProblem": "{path} — {problem}",
-      "unknownPath": "unknown path"
+      "unknownPath": "unknown path",
+      "foldersLoading": "Loading checkout folders…",
+      "foldersLoaded": "Current checkout folders loaded.",
+      "foldersLoadFailed": "Could not load checkout folders: {code}"
     }
   };
   // checkout words: end
@@ -412,6 +416,11 @@
   checkoutsHeading.setAttribute("tabindex", "-1");
   const checkRemotesButton = document.querySelector("#check-remotes");
   const refreshButton = document.querySelector("#refresh");
+  const foldersEditor = document.querySelector("#checkout-folders-editor");
+  const foldersList = document.querySelector("#checkout-folders-list");
+  const foldersLookup = document.querySelector("#checkout-folders-github");
+  const foldersReload = document.querySelector("#checkout-folders-reload");
+  const foldersStatus = document.querySelector("#checkout-folders-status");
 
   const copyStatus = document.querySelector("#copy-status");
   const stageOrderControls = document.querySelector("#stage-order-controls");
@@ -451,6 +460,15 @@
   let settingsBusy = false;
   let settingsRequestSerial = 0;
   let queuedSettingsRefresh = null;
+  // The checkout folders editor.  The saved state is what the last load
+  // served; a draft is null until the reader changes something, and an open
+  // with a draft held shows it instead of loading.  The auto-open is page
+  // memory only.
+  let foldersSaved = {folders: [], github_lookup: false};
+  let foldersDraft = null;
+  let foldersReloadAvailable = false;
+  let foldersRequestSerial = 0;
+  let foldersAutoOpened = false;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
   // envelope, or "failed" with its category.  "failed" adds a Code Status part
   // to the issues panel, and every settled outcome rewrites the cards' lines.
@@ -1817,6 +1835,75 @@
       settingsBusy = false;
       renderStageOrderEditor();
     });
+  }
+
+  function foldersEditorStatus(message, isError = false) {
+    foldersStatus.textContent = message;
+    foldersStatus.classList.toggle("error", isError);
+  }
+
+  function renderFoldersEditor() {
+    const shown = foldersDraft === null ? foldersSaved : foldersDraft;
+    foldersList.replaceChildren(...shown.folders.map((path) => {
+      const item = document.createElement("li");
+      item.className = "checkout-folders-item";
+      item.textContent = path;
+      return item;
+    }));
+    foldersLookup.checked = shown.github_lookup;
+    foldersReload.hidden = !foldersReloadAvailable;
+  }
+
+  // Each open with no draft asks for the saved folders; an answer that arrives
+  // after a later open's request is discarded.
+  function loadFolders() {
+    const serial = ++foldersRequestSerial;
+    foldersReloadAvailable = false;
+    foldersEditorStatus(codeWords("text", "foldersLoading"));
+    renderFoldersEditor();
+    fetch(CHECKOUT_SETTINGS_ROUTE, {cache: "no-store"})
+      .then(async (response) => {
+        let payload = null;
+        try { payload = await response.json(); } catch (_) { /* handled below */ }
+        if (!response.ok || !payload || payload.error) {
+          throw new Error((payload && payload.error) || "settings_unavailable");
+        }
+        protocol(exactKeys(payload, ["folders", "github_lookup", "revision"]));
+        protocol(Array.isArray(payload.folders) &&
+          payload.folders.every((path) => typeof path === "string"));
+        protocol(typeof payload.github_lookup === "boolean");
+        return payload;
+      })
+      .then((payload) => {
+        if (serial !== foldersRequestSerial) return;
+        foldersSaved = {folders: [...payload.folders], github_lookup: payload.github_lookup};
+        foldersDraft = null;
+        foldersReloadAvailable = false;
+        foldersEditorStatus(codeWords("text", "foldersLoaded"));
+        renderFoldersEditor();
+      })
+      .catch((error) => {
+        if (serial !== foldersRequestSerial) return;
+        foldersReloadAvailable = true;
+        foldersEditorStatus(fillWords(
+          codeWords("text", "foldersLoadFailed"),
+          {code: settingsErrorMessage(error)}, (value) => value,
+        ), true);
+        renderFoldersEditor();
+      });
+  }
+
+  // The editor is shown for a ready or failed outcome and hidden otherwise.
+  // The attribute is written only when it changes, so a tick that settles the
+  // same outcome leaves the editor alone.  The first time a ready document has
+  // no folders the panel opens itself, once.
+  function syncFoldersEditor() {
+    const available = checkoutsOutcome.state === "ready" || checkoutsOutcome.state === "failed";
+    if (foldersEditor.hidden === available) foldersEditor.hidden = !available;
+    if (!available || foldersAutoOpened || checkoutsOutcome.state !== "ready" ||
+      checkoutsOutcome.envelope.checkouts.folders.length > 0) return;
+    foldersAutoOpened = true;
+    foldersEditor.open = true;
   }
 
   function apply(snapshot) {
@@ -3617,6 +3704,7 @@
           // rewrites the text they already show.
           updateCardCodeStatus();
           if (changed) syncBoardIssues();
+          syncFoldersEditor();
           if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
         }
         // The press state lasts from the press until the request that answers
@@ -3825,6 +3913,15 @@
   stageOrderReset.addEventListener("click", () => saveStageOrder([], []));
   stageOrderReload.addEventListener("click", () => {
     if (!settingsBusy) loadSettings();
+  });
+  foldersEditor.addEventListener("toggle", () => {
+    if (!foldersEditor.open) return;
+    if (foldersDraft === null) loadFolders();
+    else renderFoldersEditor();
+  });
+  foldersReload.addEventListener("click", () => {
+    foldersDraft = null;
+    loadFolders();
   });
   filter.addEventListener("input", applyFilter);
   compactControl.addEventListener("change", () => setCompactPreference(compactControl.checked));

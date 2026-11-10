@@ -215,6 +215,19 @@ button.pending {
 }
 .checkouts-status-line { margin: 0; }
 .checkouts-action-status { min-height: 1.25em; margin: 0; color: var(--muted); }
+.checkout-folders-editor { flex: 0 1 auto; }
+.checkout-folders-editor[hidden] { display: none; }
+.checkout-folders-editor[open] { flex-basis: 100%; max-width: 40rem; }
+.checkout-folders-editor summary { cursor: pointer; font-weight: 700; }
+.checkout-folders-content { display: grid; gap: .5rem; margin-top: .55rem; }
+.checkout-folders-list, .checkout-folders-suggestions { margin: 0; padding-left: 1.15rem; }
+.checkout-folders-item { overflow-wrap: anywhere; }
+.checkout-folders-add { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.checkout-folders-add input { flex: 1 1 14rem; min-width: 0; }
+.checkout-folders-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.checkout-folders-editor [aria-disabled="true"] { opacity: .85; cursor: not-allowed; }
+.checkout-folders-status { min-height: 1.25em; margin: 0; color: var(--muted); }
+.checkout-folders-status.error { color: var(--warning); }
 #checkouts-body { display: grid; gap: 1rem; }
 .checkouts-panel {
   padding: 1.25rem;
