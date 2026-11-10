@@ -826,7 +826,9 @@ A Board settings save on the same page keeps it hidden until a scan under the
 new configuration arrives, up to about 75 seconds. A checkout folder save on the
 same page keeps it hidden only until that save's own checkouts read answers with
 a scan of the new folders, which the page requests at once, and the page installs
-the new catalog itself. After a configuration change saved elsewhere, such as
+the new catalog itself. When a checkouts read is already in flight at the save,
+the page sends no read of its own, and the line follows at the next ten-second
+check instead. After a configuration change saved elsewhere, such as
 settings saved from another page, the scan arrives first and the line stays
 hidden until **Apply update** installs the new catalog.
 
@@ -1266,8 +1268,10 @@ shows a line and the issues panel says `Code Status unavailable`. The lines are
 also hidden, with no message, while the board displays a configuration other
 than the one the scan was made under: for up to about 75 seconds after a Board
 settings save on the same page, until the checkouts read that a checkout folder
-save on the same page requests answers with a scan of the new folders, and,
-after a configuration change saved elsewhere, until you press **Apply update**.
+save on the same page requests answers with a scan of the new folders (or, when
+a checkouts read was already in flight at the save, until the next ten-second
+check), and, after a configuration change saved elsewhere, until you press
+**Apply update**.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that
@@ -1380,19 +1384,26 @@ save, the editor adds `With no folders the pull-request lookup is off.` to its
 saved message.
 
 When the record changed after the editor loaded it, such as a save from another
-page or an edit by hand, the save is not applied. Your draft stays, and the status
+page, the save is not applied. (A running board does not notice a hand edit of
+the record, and a save from the editor overwrites it; stop Nyx before editing by
+hand, as [Without the board](workspaces.md#without-the-board) says.) Your draft
+stays, and the status
 says `Save not applied: the checkout folders changed elsewhere.` (or, when the
 saved folders cannot be compared, `the saved checkout folders are not available
 to compare`) beside **Reload checkout folders**, which replaces the draft with
 the saved folders. An editor with no draft reloads quietly when it sees a
 changed record, and one with a draft says `The checkout folders changed elsewhere.`
-and offers the same reload. The Board settings editor and this editor share one
+and offers the same reload. While that reload is offered, the list, the path
+field, the suggestions and the checkbox take no edits; **Cancel checkout folder
+changes** still drops the draft. The Board settings editor and this editor share one
 record revision, so a Board settings save never marks a folder draft as changed
 elsewhere, and a folder save never marks a Board settings draft.
 
 A successful save installs the new catalog on the page and asks at once for a
 scan of the new folders, so the view shows them without waiting for the next
-scan. The first folder save writes a schema 4 record. A Windows or macOS desktop
+scan. When a checkouts read is already in flight at the save, that read answers
+with the folders as they were, the page sends no second read, and the view shows
+the new folders at the next ten-second check. The first folder save writes a schema 4 record. A Windows or macOS desktop
 application built before this version refuses a schema 4 record, so rebuild the
 desktop application at this version before the first save there; see [Your
 specification workspace](workspaces.md#checkout-folders).

@@ -22,7 +22,8 @@ README is narrative only.
   saved elsewhere hides them until **Apply update** installs the new catalog;
   a checkout folder save on the same page hides them only until its own
   checkouts read answers with a scan of the new folders, and the page installs
-  the new catalog itself; while no document can be served it shows no
+  the new catalog itself (with a checkouts read already in flight at the save,
+  it sends no read of its own and the lines follow at the next tick); while no document can be served it shows no
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
@@ -59,7 +60,8 @@ README is narrative only.
   answer for each outcome, offers the document's `folder_suggestions`, shows the
   folders the server refused beside them and shares one configuration revision
   with the Board settings editor. A successful save installs a fresh catalog and
-  asks for a checkouts read at once; the view changes no repository.
+  asks for a checkouts read at once, unless one is already in flight, when the
+  next tick shows the new folders; the view changes no repository.
 
 ## Outside this boundary
 

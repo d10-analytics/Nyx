@@ -112,7 +112,8 @@ never through this system. It
   from the displayed catalog's, which adds no entry and lasts for up to about
   75 seconds after a Board settings save on the same page, until the checkouts
   read that a checkout folder save on the same page requests answers with a scan
-  of the new folders, or, after a configuration change saved elsewhere, until
+  of the new folders (or the next tick, when a read was already in flight at the
+  save), or, after a configuration change saved elsewhere, until
   **Apply update** installs the new catalog; while no document can be served the
   issues panel says `Code Status unavailable`.
 
