@@ -400,6 +400,7 @@
       "foldersLookupOff": "With no folders the pull-request lookup is off.",
       "foldersInvalid": "The checkout folders were not saved. Fix the marked folders and save again.",
       "foldersConflict": "Save not applied: the checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft and try again.",
+      "foldersChangedElsewhere": "The checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft.",
       "foldersReloadNeeded": "Save not applied: the saved checkout folders are not available to compare. Reload checkout folders to replace this unsaved draft and try again.",
       "foldersFailure": "Save failed: the checkout folders were not saved.",
       "foldersSaveError": "Save failed: {code}"
@@ -1837,7 +1838,8 @@
     settingsBusy = true;
     settingsStatus("Saving board settings…");
     renderStageOrderEditor();
-    putSettings(SETTINGS_ROUTE, {revision: settingsRevision, order, completed}, parseSettings)
+    const sentRevision = settingsRevision;
+    putSettings(SETTINGS_ROUTE, {revision: sentRevision, order, completed}, parseSettings)
     .then((payload) => {
       if (payload.outcome !== "success") {
         const message = payload.outcome === "conflict" || payload.outcome === "reload-needed"
@@ -1851,6 +1853,7 @@
         settingsStatus(message, true);
         return;
       }
+      advanceEditorRevisions(sentRevision, payload.revision);
       savedStageOrder = [...payload.order];
       savedCompletedStages = [...payload.completed];
       settingsRevision = payload.revision;
@@ -2049,6 +2052,7 @@
     putSettings(CHECKOUT_SETTINGS_ROUTE, body, parseFolderSettings, refusedFolders)
       .then((answer) => {
         if (answer.outcome === "success") {
+          advanceEditorRevisions(body.revision, answer.revision);
           foldersRequestSerial += 1;
           foldersSaved = {folders: [...answer.folders], github_lookup: answer.github_lookup};
           foldersRevision = answer.revision;
@@ -2058,6 +2062,11 @@
           const saved = codeWords("text", "foldersSaved");
           foldersEditorStatus(answer.github_lookup === body.github_lookup ? saved
             : `${saved} ${codeWords("text", "foldersLookupOff")}`);
+          // The view follows the save now, not at the next tick: a fresh catalog
+          // installs the new revision, and the one checkouts read (skipped when
+          // one is in flight) shows the new folders.
+          request("manual");
+          requestCheckouts("read");
         } else if (answer.outcome === "failure") {
           foldersEditorStatus(codeWords("text", "foldersFailure"), true);
         } else {
@@ -2137,6 +2146,41 @@
     foldersEditor.open = true;
   }
 
+  // Both editors read and write the record's one revision, and each save leaves
+  // the other editor's fields unchanged, so a successful save moves every
+  // editor still on the revision it sent.  A conflict or failure calls nothing.
+  function advanceEditorRevisions(sentRevision, nextRevision) {
+    if (settingsRevision === sentRevision) settingsRevision = nextRevision;
+    if (foldersRevision === sentRevision) foldersRevision = nextRevision;
+  }
+
+  // An installed catalog whose revision differs from an editor's: with no draft
+  // the editor reloads quietly, with a draft it keeps the draft and says so.
+  function reconcileEditorRevisions(snapshot, retainStageDraft) {
+    const revision = snapshot.configuration_revision;
+    if (revision === null) return;
+    if (foldersRevision !== null && !foldersBusy && revision !== foldersRevision) {
+      if (foldersDirty()) {
+        foldersRevision = null;
+        foldersReloadAvailable = true;
+        foldersEditorStatus(codeWords("text", "foldersChangedElsewhere"), true);
+        renderFoldersEditor();
+      } else {
+        loadFolders();
+      }
+    }
+    if (settingsRevision === null || settingsBusy || revision === settingsRevision) return;
+    if (!retainStageDraft) {
+      loadSettings();
+      return;
+    }
+    settingsAvailable = false;
+    settingsReloadAvailable = true;
+    settingsRevision = null;
+    settingsStatus("Board settings changed elsewhere. Reload board settings to replace this unsaved draft.", true);
+    renderStageOrderEditor();
+  }
+
   function apply(snapshot) {
     const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
     const retainDraft = priorEditor.length > 0 && hasUnsavedStageOrder();
@@ -2162,17 +2206,7 @@
     if (!workspace || workspace.revision !== snapshot.configuration_revision) loadWorkspace();
     // Settings saved from another page change the catalog revision; an unsaved
     // draft is kept and must be replaced explicitly rather than discarded.
-    if (snapshot.configuration_revision === null || settingsRevision === null || settingsBusy ||
-      snapshot.configuration_revision === settingsRevision) return;
-    if (!retainDraft) {
-      loadSettings();
-      return;
-    }
-    settingsAvailable = false;
-    settingsReloadAvailable = true;
-    settingsRevision = null;
-    settingsStatus("Board settings changed elsewhere. Reload board settings to replace this unsaved draft.", true);
-    renderStageOrderEditor();
+    reconcileEditorRevisions(snapshot, retainDraft);
   }
 
   function loadWorkspace() {
