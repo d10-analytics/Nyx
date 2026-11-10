@@ -492,6 +492,10 @@
   let foldersDraft = null;
   let foldersReloadAvailable = false;
   let foldersRequestSerial = 0;
+  // The serial of the load in flight, until its answer or a later request
+  // supersedes it; the controls refuse edits while it is current, since a
+  // draft must start from the saved folders.
+  let foldersLoadSerial = null;
   // The revision the last served read or save answered; a save sends it back.
   let foldersRevision = null;
   let foldersBusy = false;
@@ -1890,6 +1894,11 @@
     return foldersDraft !== null;
   }
 
+  // A save or a load in flight holds every editing control.
+  function foldersHeld() {
+    return foldersBusy || foldersLoadSerial === foldersRequestSerial;
+  }
+
   // A draft that equals the saved state is no draft.
   function setFoldersDraft(draft) {
     const same = draft.github_lookup === foldersSaved.github_lookup &&
@@ -1966,7 +1975,7 @@
     // order, so focus stays where the reader put it.
     controls().forEach((control) => {
       if (control.tagName === "SUMMARY") return;
-      if (foldersBusy && !control.disabled) control.setAttribute("aria-disabled", "true");
+      if (foldersHeld() && !control.disabled) control.setAttribute("aria-disabled", "true");
       else control.removeAttribute("aria-disabled");
     });
     if (!priorKey) return;
@@ -2001,7 +2010,7 @@
   // The only client checks are an empty entry and an exact repeat; the
   // server's rule is the authority on everything else.
   function addFolder(path) {
-    if (foldersBusy) return false;
+    if (foldersHeld()) return false;
     const draft = editedFolders();
     if (path === "" || draft.folders.includes(path)) return false;
     draft.folders.push(path);
@@ -2097,6 +2106,7 @@
   // after a later open's request is discarded.
   function loadFolders() {
     const serial = ++foldersRequestSerial;
+    foldersLoadSerial = serial;
     foldersReloadAvailable = false;
     foldersEditorStatus(codeWords("text", "foldersLoading"));
     renderFoldersEditor();
@@ -2111,6 +2121,7 @@
       })
       .then((payload) => {
         if (serial !== foldersRequestSerial) return;
+        foldersLoadSerial = null;
         foldersSaved = {folders: [...payload.folders], github_lookup: payload.github_lookup};
         foldersRevision = payload.revision;
         foldersProblems = new Map();
@@ -2121,6 +2132,7 @@
       })
       .catch((error) => {
         if (serial !== foldersRequestSerial) return;
+        foldersLoadSerial = null;
         foldersReloadAvailable = true;
         foldersEditorStatus(fillWords(
           codeWords("text", "foldersLoadFailed"),
@@ -4194,7 +4206,7 @@
   });
   foldersList.addEventListener("click", (event) => {
     const remove = event.target.closest(".checkout-folders-remove");
-    if (!remove || foldersBusy) return;
+    if (!remove || foldersHeld()) return;
     const draft = editedFolders();
     draft.folders = draft.folders.filter((path) => path !== remove.dataset.folder);
     foldersEdited(draft);
@@ -4204,7 +4216,7 @@
     if (add) addFolder(add.dataset.folder);
   });
   foldersLookup.addEventListener("change", () => {
-    if (foldersBusy) {
+    if (foldersHeld()) {
       renderFoldersEditor();
       return;
     }
