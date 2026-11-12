@@ -1884,7 +1884,7 @@ def test_long_unbroken_names_wrap_within_their_column(open_page):
     beta = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert alpha.locator(".card-title").inner_text() == token
     assert alpha.locator(".card-project").get_attribute("aria-label") == f"Target Folder: {token}"
-    assert alpha.locator(".card-project").inner_text() == f"Target: {token}"
+    assert alpha.locator(".card-project").inner_text() == token
     assert alpha.locator(".card-filepath").get_attribute("aria-label") == f"Filepath: Alpha/Queue/{token}"
     assert alpha.locator(".card-filepath").inner_text() == token
     assert alpha.locator(".card-rail-text").all_text_contents() == [f"needs: {token} (Beta)"]
@@ -5775,8 +5775,8 @@ def test_checkouts_real_runtime_serves_the_collected_document(open_page, real_ch
 # one; delta and epsilon have none.  Stating them here makes a collector change
 # fail loudly rather than quietly redefining what the line must show.
 CHECKOUTS_CODE_STATUS_TEXTS = {
-    "Repo/Drafts/alpha": "in progress · pushed",
-    "Repo/Drafts/beta": "in progress · push state unknown · in Repo Clone 10",
+    "Repo/Drafts/alpha": "pushed",
+    "Repo/Drafts/beta": "push state unknown · in Repo Clone 10",
     "Repo/Shipped/gamma": "awaiting merge (no PR)",
 }
 CHECKOUTS_CARD_PATHS = {
@@ -6013,9 +6013,9 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     settle_frames(page)
     # The same card and the same line element now hold the next scan's text.
     assert line.evaluate("node => node.isConnected && node.getAttribute('aria-label')") == (
-        "Code Status: in progress · 1 unpushed"
+        "Code Status: 1 unpushed"
     )
-    assert line.evaluate("node => node.textContent") == "in progress · 1 unpushed"
+    assert line.evaluate("node => node.textContent") == "1 unpushed"
     assert card.evaluate(
         "node => node.isConnected && "
         "node === document.querySelector('.card[data-package-path=\"Repo/Drafts/alpha\"]')"
@@ -6048,12 +6048,12 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     assert alpha.evaluate("node => node.closest('.cell').classList.contains('filtered-empty')")
     page.fill("#filter", "")
     assert code_status_line(page, "Repo/Drafts/alpha") == (
-        "Code Status: in progress · 3 unpushed"
+        "Code Status: 3 unpushed"
     )
     # A full render keeps the line and the same searchable text.
     page.get_by_label("Hide empty rows and columns", exact=True).uncheck()
     assert code_status_line(page, "Repo/Drafts/alpha") == (
-        "Code Status: in progress · 3 unpushed"
+        "Code Status: 3 unpushed"
     )
     assert visible_card_paths(page, "3 unpushed") == ["Repo/Drafts/alpha"]
     page.fill("#filter", "")
@@ -7954,7 +7954,7 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
 
     assert sorted(shown("")) == sorted([remote, quiet])
     # The served Code Status text of a work item the group serves.
-    assert shown("in progress · pushed") == [remote]
+    assert shown("pushed") == [remote]
     # The availability words of a clone row.
     assert shown("has linked worktrees") == [remote]
     # The HEAD words of the quiet clone's main worktree, and its tree words.

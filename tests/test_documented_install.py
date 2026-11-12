@@ -1002,11 +1002,11 @@ CODE_STATUS_MARKERS = (
     "a branch deleted on the remote stays present at the tip of any clone that has "
     "not pruned it, so a deleted branch reads by the verdict of the clone that still "
     "holds its tip: the deletion shows only once a networked run answers.",
-    "a branch that was never pushed reads `in progress · push state unknown`; until "
+    "a branch that was never pushed reads `push state unknown`; until "
     "a networked run answers.",
     "the package has a well-formed `Superseded By:` header, whether or not its "
     "successor exists: `superseded · branch retained`;",
-    "`in progress · ` followed by the push state.",
+    "- otherwise: the push state.",
     "4. Any other case, because a copy could not be judged: `merge state unknown`.",
     "The push state is `not pushed` when the remote copy is absent; `N unpushed`",
     "`pushed` when every local copy equals or is behind its remote copy; and "
@@ -1020,12 +1020,12 @@ CODE_STATUS_MARKERS = (
     "even when a local copy is ahead of, behind or diverged from it.",
     "0. At least one local copy exists, every local copy is a branch with no commit of "
     "its own, and the remote copy, if there is one, is at the commit of one of them: "
-    "`in progress · no commits yet`.",
+    "`no commits yet`.",
     "its reflog holds exactly one entry, the branch's creation "
     "(`branch: Created from ...`), and its tip is among the latest 5,000 commits of the "
     "default branch's first-parent history.",
     "so a finished or superseded package whose branch has no commit reads "
-    "`in progress · no commits yet` too. Rules 1 to 4 keep their numbers.",
+    "`no commits yet` too. Rules 1 to 4 keep their numbers.",
     "did not run, because its reflog read or its first-parent listing was cut by the "
     "time limit or failed, or because the branch moved during the run, that copy counts "
     "as unknown in rules 1 to 4 and can never make the package read "
@@ -1037,7 +1037,7 @@ CODE_STATUS_MARKERS = (
     "`git branch -f`, or fast-forwarded to a newer default head) reads "
     "`merged · cleanup pending ...`, like a branch that was merged.",
     "A branch checked out from a remote branch that was fast-forward merged reads "
-    "`in progress · no commits yet`.",
+    "`no commits yet`.",
     "A clone with no branch reflog, such as a bare repository or one with "
     "`core.logAllRefUpdates=false`, or whose reflog has expired, reads "
     "`merged · cleanup pending ...` for such a branch.",
@@ -1068,7 +1068,7 @@ CODE_STATUS_MARKERS = (
     "If the whole text with every name written out would be longer than 1,024 UTF-16 "
     "code units, it says",
     "Several packages can name the same branch of the same repository",
-    "An archived package therefore reads `in progress`, not `awaiting merge`, while a "
+    "An archived package therefore reads its push state, not `awaiting merge`, while a "
     "package that names the same branch is still unfinished.",
     "A package counts as finished only when its stage folder is one of the stages "
     "selected under **Counts as finished** for the workspace",
@@ -2050,11 +2050,10 @@ def test_checkout_guide_texts_equal_the_texts_the_code_builds():
         build("no_commits_yet"),
         pull_request,
         unpushed_pull_request[len(pull_request):],
-        build("in_progress", push="pushed")[: -len("pushed")],
-        build("in_progress", push="not_pushed")[len("in progress \u00b7 "):],
-        build("in_progress", push="pushed")[len("in progress \u00b7 "):],
-        build("in_progress", push="unknown")[len("in progress \u00b7 "):],
-        build("in_progress", push="unpushed", unpushed="N")[len("in progress \u00b7 "):],
+        build("in_progress", push="not_pushed"),
+        build("in_progress", push="pushed"),
+        build("in_progress", push="unknown"),
+        build("in_progress", push="unpushed", unpushed="N"),
         build("merged", cleanup={"worktrees": 2, "branches": 0}).replace(
             "2 worktrees", "N worktrees"
         ),

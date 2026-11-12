@@ -919,11 +919,11 @@ decides the text, and the order matters:
 
 0. At least one local copy exists, every local copy is a branch with no commit of its
    own, and the remote copy, if there is one, is at the commit of one of them:
-   `in progress · no commits yet`. A local copy has no commit of its own when its
+   `no commits yet`. A local copy has no commit of its own when its
    reflog holds exactly one entry, the branch's creation (`branch: Created from ...`),
    and its tip is among the latest 5,000 commits of the default branch's first-parent
    history. This rule comes before rule 3, so a finished or superseded package whose
-   branch has no commit reads `in progress · no commits yet` too. Rules 1 to 4 keep
+   branch has no commit reads `no commits yet` too. Rules 1 to 4 keep
    their numbers.
 1. Every copy is merged: `merged · cleanup pending (N worktrees)`, where N counts
    the distinct checkouts that have the branch checked out, the package's own
@@ -942,10 +942,10 @@ decides the text, and the order matters:
      never matches;
    - otherwise, the package has a well-formed `Superseded By:` header, whether or
      not its successor exists: `superseded · branch retained`;
-   - otherwise: `in progress · ` followed by the push state.
+   - otherwise: the push state.
 4. Any other case, because a copy could not be judged: `merge state unknown`.
 
-An archived package therefore reads `in progress`, not `awaiting merge`, while a
+An archived package therefore reads its push state, not `awaiting merge`, while a
 package that names the same branch is still unfinished.
 
 The push state is `not pushed` when the remote copy is absent; `N unpushed`, with
@@ -972,7 +972,7 @@ worktrees` instead. The `--json` document keeps every path.
   `git branch -f`, or fast-forwarded to a newer default head) reads
   `merged · cleanup pending ...`, like a branch that was merged.
 - A branch checked out from a remote branch that was fast-forward merged reads
-  `in progress · no commits yet`.
+  `no commits yet`.
 - A clone with no branch reflog, such as a bare repository or one with
   `core.logAllRefUpdates=false`, or whose reflog has expired, reads
   `merged · cleanup pending ...` for such a branch.
@@ -991,7 +991,7 @@ worktrees` instead. The `--json` document keeps every path.
   reads by the verdict of the clone that still holds its tip: the deletion shows
   only once a networked run answers.
 - With no live or saved remote answer, a branch that was never pushed reads
-  `in progress · push state unknown`; until a networked run answers.
+  `push state unknown`; until a networked run answers.
 
 ## Choose board row order
 

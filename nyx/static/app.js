@@ -1060,7 +1060,7 @@
       `aria-label="${text(`Filepath: ${entry.package_path}`)}">${text(folderNameOf(entry.package_path))}</span>` +
       '<span class="card-tags">' +
       (targetProject ? `<span class="card-project" ` +
-        `aria-label="${text(`Target Folder: ${targetProject}`)}">Target: ${text(targetProject)}</span>` : "") +
+        `aria-label="${text(`Target Folder: ${targetProject}`)}">${text(targetProject)}</span>` : "") +
       `<span class="card-facts">${facts}</span></span>` +
       '<span class="visually-hidden card-start-text"></span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
