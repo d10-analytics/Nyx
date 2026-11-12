@@ -609,22 +609,26 @@ button.pending {
 .card-tags:has(> :not(:empty)) { margin-top: .4rem; }
 .card-facts { display: contents; }
 /* The tags keep the page's own colours on every card, so they read the same on
-   a plain card and on a brand-teal one. */
+   a plain card and on a brand-teal one. Each tag is a soft wash of its --tone
+   over the card surface, with the tone as its border; --ink is the text colour. */
 .card-project, .card-code-status, .card-attention {
+  --tone: var(--control-border);
+  --ink: var(--tone);
   display: inline-block;
   padding: .05rem .5rem;
-  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--tone) 55%, var(--surface));
   border-radius: 999px;
-  background: var(--page);
-  color: var(--text);
+  background: color-mix(in srgb, var(--tone) 20%, var(--surface));
+  color: var(--ink);
   font-size: .78rem;
   font-weight: 600;
 }
-.card-code-status { border-color: var(--state-progress); border-left-width: .5rem; }
-.card-code-status:is([data-state="awaiting_merge"], [data-state="pr_open"]) { border-color: var(--state-waiting); }
-.card-code-status[data-state="merged"] { border-color: var(--state-done); }
-.card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { border-color: var(--control-border); }
-.card-attention { border-color: var(--state-waiting); border-style: dashed; }
+.card-project, .card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --ink: var(--text); }
+.card-code-status { --tone: var(--state-progress); border-left-width: .5rem; }
+.card-code-status:is([data-state="awaiting_merge"], [data-state="pr_open"]) { --tone: var(--state-waiting); }
+.card-code-status[data-state="merged"] { --tone: var(--state-done); }
+.card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --tone: var(--control-border); }
+.card-attention { --tone: var(--state-waiting); border-style: dashed; }
 .connection.overflow .rail { stroke-dasharray: 7 4; }
 
 .work-item-panel {
