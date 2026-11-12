@@ -628,7 +628,7 @@ button.pending {
 .card-code-status:is([data-state="awaiting_merge"], [data-state="pr_open"]) { --tone: var(--state-waiting); }
 .card-code-status[data-state="merged"] { --tone: var(--state-done); }
 .card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --tone: var(--control-border); }
-.card-attention { --tone: var(--state-waiting); border-style: dashed; }
+.card-attention { --tone: var(--state-waiting); }
 .connection.overflow .rail { stroke-dasharray: 7 4; }
 
 .work-item-panel {
