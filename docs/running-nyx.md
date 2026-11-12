@@ -813,8 +813,8 @@ means a package may exist that the list does not show; rule 3 below never conclu
 `awaiting merge (no PR)` on an `incomplete` scan. `package_scan.finished_policy` is
 `configured` or `not_configured`, as described below.
 
-**On the board.** A card whose package has a Code Status shows one
-`Code Status:` line directly after its filepath, holding exactly the text
+**On the board.** A card whose package has a Code Status shows it as a
+tag under its folder name, holding exactly the text
 `nyx checkouts --json` gives for that package; the browser shows what it is
 served and rebuilds nothing. That text comes from Nyx's last successful checkout
 scan: while a board page is open Nyx rescans about once a minute, and the line
@@ -919,11 +919,11 @@ decides the text, and the order matters:
 
 0. At least one local copy exists, every local copy is a branch with no commit of its
    own, and the remote copy, if there is one, is at the commit of one of them:
-   `in progress · no commits yet`. A local copy has no commit of its own when its
+   `no commits yet`. A local copy has no commit of its own when its
    reflog holds exactly one entry, the branch's creation (`branch: Created from ...`),
    and its tip is among the latest 5,000 commits of the default branch's first-parent
    history. This rule comes before rule 3, so a finished or superseded package whose
-   branch has no commit reads `in progress · no commits yet` too. Rules 1 to 4 keep
+   branch has no commit reads `no commits yet` too. Rules 1 to 4 keep
    their numbers.
 1. Every copy is merged: `merged · cleanup pending (N worktrees)`, where N counts
    the distinct checkouts that have the branch checked out, the package's own
@@ -942,10 +942,10 @@ decides the text, and the order matters:
      never matches;
    - otherwise, the package has a well-formed `Superseded By:` header, whether or
      not its successor exists: `superseded · branch retained`;
-   - otherwise: `in progress · ` followed by the push state.
+   - otherwise: the push state.
 4. Any other case, because a copy could not be judged: `merge state unknown`.
 
-An archived package therefore reads `in progress`, not `awaiting merge`, while a
+An archived package therefore reads its push state, not `awaiting merge`, while a
 package that names the same branch is still unfinished.
 
 The push state is `not pushed` when the remote copy is absent; `N unpushed`, with
@@ -972,7 +972,7 @@ worktrees` instead. The `--json` document keeps every path.
   `git branch -f`, or fast-forwarded to a newer default head) reads
   `merged · cleanup pending ...`, like a branch that was merged.
 - A branch checked out from a remote branch that was fast-forward merged reads
-  `in progress · no commits yet`.
+  `no commits yet`.
 - A clone with no branch reflog, such as a bare repository or one with
   `core.logAllRefUpdates=false`, or whose reflog has expired, reads
   `merged · cleanup pending ...` for such a branch.
@@ -991,7 +991,7 @@ worktrees` instead. The `--json` document keeps every path.
   reads by the verdict of the clone that still holds its tip: the deletion shows
   only once a networked run answers.
 - With no live or saved remote answer, a branch that was never pushed reads
-  `in progress · push state unknown`; until a networked run answers.
+  `push state unknown`; until a networked run answers.
 
 ## Choose board row order
 
@@ -1248,19 +1248,39 @@ values. A difference is a finding to file, not a documentation change.
 ## Read and refresh the board
 
 Use **Search** to search card metadata, including work item titles, projects,
-and program names. Cards show prerequisite and dependent links; selecting a card
-highlights its connections to other displayed cards. To see a provider in a
+and program names. Arrows show prerequisite and dependent links; selecting a card
+highlights its connections to other displayed cards, draws every one of them,
+and marks the cards at their other ends. To see a provider in a
 finished row, uncheck **Hide terminal rows**.
 Right-click a card to copy the full directory path of its work item. Nyx shows
 a brief confirmation beside the card when the copy succeeds.
+
+Each card shows its title, the name of its folder (the column and the row
+already name its project and stage; hover for the whole filepath) and, as tags,
+a target folder that differs from its project, its Code Status, and one tag for
+each **Needs attention** item that names it, such as `base moved 8`.
+
+The **work item panel** on the left shows the selected card in full. A left or
+right click on a card fills it; a left click on the selected card clears it,
+and a right click never does. The panel lists the work item's stage, project,
+whole filepath, target folder, status, program, every reported field and its
+Package ID; then **Needs** and **Blocks**, each relationship a link that
+selects the card it names; then, under **Code**, what the last checkout scan
+says of the work item: its Code Status, the attention items that name it, its
+target repo, branch, the branch's remote copy, merge verdict and pull requests,
+and its Baseline with how far the base has moved past it. The **Code** part
+follows the same rule as the Code Status tag below and is absent while that tag
+is hidden. **Hide details** collapses the panel to a strip and **Details**
+opens it again; the choice is remembered in this browser like the other display
+preferences. The panel belongs to the board and is not shown in **Checkouts**.
 
 Nyx checks for changed information every ten seconds. **Apply update** loads the
 waiting snapshot; **Refresh view** requests an immediate check when no update is
 waiting. Catalog changes are not applied automatically while you are reading a
 snapshot.
 
-A card whose package has a Code Status shows a `Code Status:` line under its
-filepath, holding the same text `nyx checkouts --json` gives for that package.
+A card whose package has a Code Status shows a Code Status tag under its
+folder name, holding the same text `nyx checkouts --json` gives for that package.
 Nyx reads it from its last successful checkout scan, and it rescans about once a
 minute while a board page is open, so the line updates on its own, without
 **Apply update**; **Search** covers it. While Nyx has no scan to serve, no card
@@ -1293,12 +1313,14 @@ changing setup, the catalog, or the saved completion policy.
 
 Search filters cards and their visible dependency rails without changing the
 project and stage axes. Compact view does not override **Hide terminal rows**.
-Each project column reserves at most eight arrow lanes. Cross-project
-relationships, and same-project relationships that get no arrow lane, are
-written on their cards as visible `needs:` or `blocks:` text, including for
-cards that share a Package ID. Same-project relationships drawn as arrows are
-also written on their cards as screen-reader text, which search does not
-remove.
+Each project column reserves at most eight arrow lanes. A relationship that
+gets no arrow lane is drawn, dashed, while either of its cards is selected, and
+the work item panel lists every relationship of the selected card by name.
+Cards do not print their relationships; each carries them as `needs:` and
+`blocks:` screen-reader text, which search does not remove. Only a relationship
+that can never be an arrow is written on its card: a prerequisite Nyx could not
+resolve, as `needs: unresolved target`, and the relationships of cards that
+share a Package ID, as visible `needs:` or `blocks:` text.
 Incomplete or unavailable dimensions remain visible with an
 `incomplete / unavailable` notice; Nyx does not compact them as if they were
 empty. If a refresh returns malformed data, Nyx reports the refresh failure and
@@ -1307,7 +1329,7 @@ retains the last valid displayed board and browser-local preference.
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 A theme change follows other open tabs. The compact view (**Hide empty rows and
 columns**), **Hide terminal rows**, and **Click empty space to deselect** apply
-per tab until reload: another open tab keeps its current choice until it reloads. The chosen view and **Hide quiet checkouts** are remembered the same way.
+per tab until reload: another open tab keeps its current choice until it reloads. The chosen view, **Hide quiet checkouts** and whether the work item panel is open are remembered the same way.
 
 ## Use the Checkouts view
 
@@ -1438,7 +1460,13 @@ Below the list each repository is a group named by its remote, with its default
 branch, the state of its remote check and pull request lookup, and its free
 clones, listed best place to start first, each with how its default branch
 compares with the remote's (the ranking is in [Inspect checkouts](#inspect-checkouts)).
-When work items name branches of the repository, a **Work item branches** table
+The view leaves out every work item that is finished and has nothing left to
+act on: a work item in a stage that counts as finished appears only while it
+has a Code Status, which then names a merge still to make or a branch or
+worktree still to remove. Such a work item adds no branch row, no package name
+and no search text, and does not keep its repository out of the **Quiet
+repositories** row. When the remaining work items name branches of the
+repository, a **Work item branches** table
 comes first: one row for each such branch with its remote copy, its merge
 verdict, its pull requests and the work items that name it, each with **Show on
 board**, even when no listed clone holds the branch. A group's table lists each

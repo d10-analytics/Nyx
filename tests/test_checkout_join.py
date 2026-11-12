@@ -130,7 +130,7 @@ def test_packages_with_a_target_or_branch_are_listed_in_path_order(world):
     assert_target(first["target"], "clone", real(repository))
     assert second["target"]["status"] == "absent"
     # `spec/alpha` was created at the default head with no commit of its own.
-    assert first["code_status"]["text"] == f"in progress {DOT} no commits yet"
+    assert first["code_status"]["text"] == "no commits yet"
     assert second["code_status"] is None
     assert [r["clones"][0]["path"] for r in document["repositories"]] == [real(repository)]
 
@@ -1487,7 +1487,7 @@ def test_with_no_record_a_clone_that_pushed_without_ever_fetching_answers(
         "control: B holds no origin/x"
     )
     assert_remote(remote_of(document, world.a, "x"), "present", pushed, "cached")
-    assert_status(document, "x", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "x", "pushed", "in_progress", push="pushed")
 
 
 def test_with_no_record_a_narrow_fetch_does_not_make_its_clone_the_answer(
@@ -1529,7 +1529,7 @@ def test_with_no_record_a_clone_that_keeps_no_reflog_pushes_and_its_ref_answers(
     assert last_fetched(document, pusher) is None, "control: it never fetched"
     assert last_fetched(document, world.b) is not None, "control: B fetched"
     assert_remote(remote_of(document, world.a, "x"), "present", pushed, "cached")
-    assert_status(document, "x", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "x", "pushed", "in_progress", push="pushed")
 
 
 def test_with_no_record_an_undated_ref_ranks_below_a_dated_one(
@@ -1629,7 +1629,7 @@ def test_with_no_record_a_branch_one_clone_pruned_and_another_holds_is_present(
     ), "control: the pruning clone fetched later"
     assert_remote(remote_of(document, world.a), "present", held, "cached")
     assert_status(
-        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+        document, "topic", "push state unknown", "in_progress", push="unknown"
     )
 
 
@@ -1644,7 +1644,7 @@ def test_with_no_record_and_no_clone_ever_fetched_the_pusher_ref_answers(
     for member in (world.a, world.b):
         assert last_fetched(document, member) is None, "control: no clone ever fetched"
     assert_remote(remote_of(document, world.a), "present", world.tracking(world.a), "cached")
-    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "topic", "pushed", "in_progress", push="pushed")
 
 
 def test_with_no_record_a_branch_no_clone_holds_is_unknown_never_absent(
@@ -1664,7 +1664,7 @@ def test_with_no_record_a_branch_no_clone_holds_is_unknown_never_absent(
         assert not (member / ".git" / "refs" / "remotes" / "origin" / "solo").exists()
     assert_remote(remote_of(document, world.a, "solo"), "unknown")
     assert_status(
-        document, "solo", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+        document, "solo", "push state unknown", "in_progress", push="unknown"
     )
 
 
@@ -1999,27 +1999,27 @@ def status_fields(state, **given):
         (status_fields("pr_open", pull_request=7, push="not_pushed"), "PR #7 open"),
         (status_fields("awaiting_merge"), "awaiting merge (no PR)"),
         (status_fields("superseded"), f"superseded {DOT} branch retained"),
-        (status_fields("in_progress", push="pushed"), f"in progress {DOT} pushed"),
+        (status_fields("in_progress", push="pushed"), "pushed"),
         (
             status_fields("in_progress", push="unpushed", unpushed=2),
-            f"in progress {DOT} 2 unpushed",
+            "2 unpushed",
         ),
-        (status_fields("in_progress", push="not_pushed"), f"in progress {DOT} not pushed"),
+        (status_fields("in_progress", push="not_pushed"), "not pushed"),
         (
             status_fields("in_progress", push="unknown"),
-            f"in progress {DOT} push state unknown",
+            "push state unknown",
         ),
         (status_fields("unknown"), "merge state unknown"),
-        (status_fields("no_commits_yet"), f"in progress {DOT} no commits yet"),
+        (status_fields("no_commits_yet"), "no commits yet"),
         (
             status_fields("no_commits_yet", checked_out_elsewhere=["/w/Solo"]),
-            f"in progress {DOT} no commits yet {DOT} in Solo",
+            f"no commits yet {DOT} in Solo",
         ),
         (
             status_fields(
                 "no_commits_yet", checked_out_elsewhere=["/w/Repo Clone 10", "C:\\w\\Repo Clone 9"]
             ),
-            f"in progress {DOT} no commits yet {DOT} in Repo Clone 9, Repo Clone 10",
+            f"no commits yet {DOT} in Repo Clone 9, Repo Clone 10",
         ),
     ],
 )
@@ -2241,13 +2241,13 @@ def test_each_push_state_and_package_state_reads_its_own_text(status_world):
 
     document = w.collect()
 
-    assert_status(document, "pushed", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "pushed", "pushed", "in_progress", push="pushed")
     assert_status(
-        document, "ahead", f"in progress {DOT} 2 unpushed", "in_progress",
+        document, "ahead", "2 unpushed", "in_progress",
         push="unpushed", unpushed=2,
     )
     assert_status(
-        document, "never", f"in progress {DOT} not pushed", "in_progress", push="not_pushed"
+        document, "never", "not pushed", "in_progress", push="not_pushed"
     )
     assert_status(
         document, "waiting", "awaiting merge (no PR)", "awaiting_merge", stage="Shipped"
@@ -2271,7 +2271,7 @@ def test_a_local_copy_behind_the_remote_copy_reads_pushed(status_world):
 
     assert relation_of(document, w.a, "topic") == ("behind", 0, 1), "control"
     assert relation_of(document, w.b, "topic") == ("equal", 0, 0), "control"
-    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "topic", "pushed", "in_progress", push="pushed")
 
 
 def test_a_diverged_local_copy_counts_its_own_commits_as_unpushed(status_world):
@@ -2288,7 +2288,7 @@ def test_a_diverged_local_copy_counts_its_own_commits_as_unpushed(status_world):
 
     assert relation_of(document, w.a, "topic") == ("diverged", 2, 1), "control"
     assert_status(
-        document, "topic", f"in progress {DOT} 2 unpushed", "in_progress",
+        document, "topic", "2 unpushed", "in_progress",
         push="unpushed", unpushed=2,
     )
 
@@ -2310,7 +2310,7 @@ def test_the_largest_unpushed_count_of_the_local_copies_is_shown(status_world):
     assert relation_of(document, w.b, "first-small") == ("ahead", 3, 0), "control"
     for name in ("first-small", "first-large"):
         assert_status(
-            document, name, f"in progress {DOT} 3 unpushed", "in_progress",
+            document, name, "3 unpushed", "in_progress",
             push="unpushed", unpushed=3,
         )
 
@@ -2325,7 +2325,7 @@ def test_a_commit_no_configured_clone_has_fetched_leaves_the_push_state_unknown(
 
     assert relation_of(document, w.a, "topic")[0] == "differs", "control"
     assert_status(
-        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+        document, "topic", "push state unknown", "in_progress", push="unknown"
     )
 
 
@@ -2346,7 +2346,7 @@ def test_a_branch_checked_out_in_another_checkout_names_it(status_world, tmp_pat
 
     document = w.collect()
 
-    pushed = f"in progress {DOT} pushed"
+    pushed = "pushed"
     assert_status(document, "here", pushed, "in_progress", push="pushed")
     assert_status(
         document, "there", f"{pushed} {DOT} in Repo Clone B", "in_progress",
@@ -3628,7 +3628,7 @@ def test_a_squash_merged_local_copy_behind_an_extended_remote_reads_pushed(holde
     assert_status(
         w.extra,
         "squash-then-extended",
-        f"in progress {DOT} pushed",
+        "pushed",
         "in_progress",
         push="pushed",
     )
@@ -3764,7 +3764,7 @@ def test_work_squash_merged_in_one_clone_and_extended_in_another_is_in_progress(
     }
     assert verdicts == {w.a: "merged", w.b: "not_merged"}, "control"
     assert_status(
-        document, "done", f"in progress {DOT} 1 unpushed", "in_progress",
+        document, "done", "1 unpushed", "in_progress",
         push="unpushed", unpushed=1,
     )
 
@@ -3776,7 +3776,7 @@ def test_a_branch_at_the_default_head_with_no_commit_reads_no_commits_yet(status
 
     document = w.collect()
 
-    assert_status(document, "zero", f"in progress {DOT} no commits yet", "no_commits_yet")
+    assert_status(document, "zero", "no commits yet", "no_commits_yet")
 
 
 def test_the_only_copy_in_a_shallow_clone_has_an_unknown_merge_state(status_world):
@@ -3852,7 +3852,7 @@ def test_a_sibling_with_too_many_branches_changes_no_code_status(status_world):
 
     assert clone_at(counted, sibling)["status"] == "ok", "control"
     assert_status(
-        counted, "topic", f"in progress {DOT} 1 unpushed", "in_progress", push="unpushed",
+        counted, "topic", "1 unpushed", "in_progress", push="unpushed",
         unpushed=1,
     ), "control: the sibling's extra commit is seen while its branches are readable"
 
@@ -3896,7 +3896,7 @@ def test_without_any_remote_answer_the_push_state_is_unknown_and_not_not_pushed(
     assert remote_of(document, w.a, "topic")["state"] == "unknown", "control"
     assert relation_of_or_none(document, w.a, "topic") == "absent", "control"
     assert_status(
-        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+        document, "topic", "push state unknown", "in_progress", push="unknown"
     )
 
 
@@ -3906,7 +3906,7 @@ def test_packages_sharing_a_branch_each_read_the_branch_facts(status_world):
     w.package("old", "topic", stage="Shelf")
     w.package("new", "topic")
 
-    pushed = f"in progress {DOT} pushed"
+    pushed = "pushed"
     document = w.collect()
 
     assert_status(document, "old", pushed, "in_progress", stage="Shelf", push="pushed")
@@ -3964,7 +3964,7 @@ def test_work_pushed_since_a_networked_check_is_pushed_for_every_package(status_
         copy = remote_of(document, w.a, name)
         assert_remote(copy, "present", rev(w.a, f"refs/remotes/origin/{name}"), "cached")
         assert_status(
-            document, name, f"in progress {DOT} pushed", "in_progress", push="pushed"
+            document, name, "pushed", "in_progress", push="pushed"
         )
 
 
@@ -4182,7 +4182,7 @@ def test_one_copy_whose_comparison_is_undecided_leaves_the_push_state_unknown(st
     assert relation_of(document, w.a, "topic")[0] == "equal", "control"
     assert relation_of(document, shallow, "topic")[0] == "differs", "control"
     assert_status(
-        document, "topic", f"in progress {DOT} push state unknown", "in_progress", push="unknown"
+        document, "topic", "push state unknown", "in_progress", push="unknown"
     )
 
 
@@ -4200,7 +4200,7 @@ def test_a_merged_pull_request_is_not_an_open_one(status_world, tmp_path, monkey
         "control"
     )
     assert branch["verdict"]["state"] == "not_merged", "control"
-    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "topic", "pushed", "in_progress", push="pushed")
 
 
 @posix_only
@@ -4227,14 +4227,14 @@ def test_an_unreadable_package_keeps_a_finished_package_from_awaiting_its_merge(
     assert old["finished"] is True, "control"
     assert old["code_status"]["state"] != "awaiting_merge"
     assert_status(
-        document, "old", f"in progress {DOT} pushed", "in_progress", stage="Shipped", push="pushed"
+        document, "old", "pushed", "in_progress", stage="Shipped", push="pushed"
     )
 
     complete = w.collect()
 
     assert complete["package_scan"]["status"] == "complete"
     assert_status(
-        complete, "old", f"in progress {DOT} pushed", "in_progress", stage="Shipped", push="pushed"
+        complete, "old", "pushed", "in_progress", stage="Shipped", push="pushed"
     )
     (w.root / "Fictional" / "Drafts" / "new" / "spec.md").unlink()
     (w.root / "Fictional" / "Drafts" / "new").rmdir()
@@ -4258,7 +4258,7 @@ def test_a_pushed_branch_reads_pushed_from_its_tracking_ref_without_a_remote_ans
     assert rev(w.a, "refs/remotes/origin/topic") == tip, "control"
     assert_remote(remote_of(document, w.a, "topic"), "present", tip, "cached")
     assert relation_of(document, w.a, "topic")[0] == "equal", "control"
-    assert_status(document, "topic", f"in progress {DOT} pushed", "in_progress", push="pushed")
+    assert_status(document, "topic", "pushed", "in_progress", push="pushed")
 
 
 # ---------------------------------------------------------------------------
@@ -4536,7 +4536,7 @@ def give_no_commits(name: str):
             cleanup=None,
             checked_out_elsewhere=[],
         )
-        status["text"] = f"in progress {DOT} no commits yet"
+        status["text"] = "no commits yet"
 
     return change
 
@@ -4553,7 +4553,7 @@ def test_schema_9_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(stat
     document = doc_copy(status_document)
     give_no_commits("ahead")(document)
     parsed = models.parse_checkouts(json.dumps(redigest(document)))
-    assert code_status_of(parsed, "ahead")["text"] == f"in progress {DOT} no commits yet"
+    assert code_status_of(parsed, "ahead")["text"] == "no commits yet"
     assert code_status_of(parsed, "ahead")["state"] == "no_commits_yet"
 
     index = package_index(status_document, "ahead")
@@ -4776,7 +4776,7 @@ def test_the_parser_refuses_a_remote_only_reason_on_a_worktree_verdict(tmp_path)
 # Branches with no commit of their own
 # ---------------------------------------------------------------------------
 
-NO_COMMITS = f"in progress {DOT} no commits yet"
+NO_COMMITS = "no commits yet"
 
 
 def assert_no_commits(
@@ -4935,7 +4935,7 @@ def test_pushing_a_branch_with_no_commit_keeps_it_and_a_pushed_commit_makes_it_u
     assert_no_commits(first, "pushed")
     assert_status(first, "moved", "merge state unknown", "unknown")
     assert_status(
-        first, "split", f"in progress {DOT} not pushed", "in_progress", push="not_pushed"
+        first, "split", "not pushed", "in_progress", push="not_pushed"
     )
 
     git(w.outside, "checkout", "-q", "trunk")

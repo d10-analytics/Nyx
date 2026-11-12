@@ -33,6 +33,10 @@
   --pending-text: #fff1bf;
   --shadow: #00000030;
   --selected-shadow: #00000050;
+  --state-progress: #76b7ff;
+  --state-waiting: #ffd18c;
+  --state-done: #7fd49b;
+  --panel-space: 0px;
   font: 16px/1.45 system-ui, sans-serif;
   color: var(--text);
   background: var(--page);
@@ -63,7 +67,12 @@
   --pending-text: #172b4d;
   --shadow: #172b4d18;
   --selected-shadow: #172b4d30;
+  --state-progress: #164f91;
+  --state-waiting: #825000;
+  --state-done: #1c6b3a;
 }
+body.panel-open { --panel-space: 22rem; }
+body.panel-collapsed { --panel-space: 2.6rem; }
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 100%; width: max-content; }
 .toolbar {
@@ -183,7 +192,8 @@ button.pending {
   --board-horizontal-padding: 4rem;
   --label-width: minmax(9rem, 13rem);
   position: relative;
-  width: max(100vw, var(--board-min-width, 100vw));
+  margin-left: var(--panel-space);
+  width: max(100vw - var(--panel-space), var(--board-min-width, 100vw));
   display: grid;
   grid-template-columns: var(--label-width) var(--column-tracks, minmax(18rem, 1fr));
   gap: .5rem 1.5rem;
@@ -507,7 +517,7 @@ button.pending {
   z-index: 20;
   background: var(--page);
 }
-.board-corner { left: 0; z-index: 25; }
+.board-corner { left: var(--panel-space); z-index: 25; }
 .board-row { display: contents; }
 .board-row + .board-row::before {
   content: "";
@@ -531,7 +541,7 @@ button.pending {
 }
 .row-head {
   position: sticky;
-  left: 0;
+  left: var(--panel-space);
   z-index: 10;
   align-self: stretch;
   background: var(--page);
@@ -589,9 +599,88 @@ button.pending {
 .card:hover, .card:focus { border-color: var(--focus-border); outline: 2px solid var(--focus-ring); }
 .card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--selected-ring), 0 2px 5px var(--selected-shadow); }
 .card-title { display: block; font-weight: 700; margin-bottom: .25rem; }
-.card-project { display: block; color: var(--muted); font-size: .88rem; }
-.card-filepath { display: block; color: var(--muted); font-size: .88rem; }
-.card-code-status { display: block; color: var(--muted); font-size: .88rem; }
+.card.related { border-color: var(--emphasis); border-style: dashed; box-shadow: 0 0 0 1px var(--emphasis); }
+.card-filepath, .panel-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+}
+.card-filepath { display: block; color: var(--muted); }
+.card-tags { display: flex; flex-wrap: wrap; gap: .3rem; }
+.card-tags:has(> :not(:empty)) { margin-top: .4rem; }
+.card-facts { display: contents; }
+/* The tags keep the page's own colours on every card, so they read the same on
+   a plain card and on a brand-teal one. Each tag is a soft wash of its --tone
+   over the card surface, with the tone as its border; --ink is the text colour. */
+.card-project, .card-code-status, .card-attention {
+  --tone: var(--control-border);
+  --ink: var(--tone);
+  display: inline-block;
+  padding: .05rem .5rem;
+  border: 1px solid color-mix(in srgb, var(--tone) 55%, var(--surface));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tone) 20%, var(--surface));
+  color: var(--ink);
+  font-size: .78rem;
+  font-weight: 600;
+}
+.card-project, .card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --ink: var(--text); }
+.card-code-status { --tone: var(--state-progress); border-left-width: .5rem; }
+.card-code-status:is([data-state="awaiting_merge"], [data-state="pr_open"]) { --tone: var(--state-waiting); }
+.card-code-status[data-state="merged"] { --tone: var(--state-done); }
+.card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --tone: var(--control-border); }
+.card-attention { --tone: var(--state-waiting); }
+.connection.overflow .rail { stroke-dasharray: 7 4; }
+
+.work-item-panel {
+  position: fixed;
+  top: var(--toolbar-height, 0px);
+  bottom: 0;
+  left: 0;
+  z-index: 27;
+  width: var(--panel-space);
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+.work-item-panel[hidden] { display: none; }
+#work-item-panel-toggle { align-self: flex-end; margin: .5rem; white-space: nowrap; }
+body.panel-collapsed #work-item-panel-toggle {
+  align-self: center;
+  margin: .5rem 0;
+  padding: .5rem .15rem;
+  writing-mode: vertical-rl;
+}
+#work-item-panel-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 1rem 1rem; overflow-wrap: anywhere; }
+#work-item-panel-body[hidden] { display: none; }
+.panel-title { margin: 0 0 .75rem; color: var(--heading); font-size: 1.1rem; }
+.panel-title:focus { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.panel-empty { color: var(--empty); font-style: italic; }
+.panel-section { margin: 0 0 1rem; }
+.panel-section h3 {
+  margin: 0 0 .35rem;
+  padding-bottom: .2rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--heading);
+  font-size: .9rem;
+}
+.work-item-panel dl { margin-top: 0; }
+.panel-row { display: grid; grid-template-columns: 7.5rem 1fr; gap: .5rem; padding: .2rem 0; font-size: .88rem; }
+.panel-row dt { color: var(--muted); font-weight: 600; }
+.panel-row dd { margin: 0; min-width: 0; }
+.panel-links ul { margin: 0; padding-left: 1.1rem; font-size: .88rem; }
+.panel-links li { margin: .25rem 0; }
+.panel-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--link);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+}
+.panel-link-project, .work-item-panel .link.unresolved { color: var(--warning); }
 .card-links { display: block; margin-top: .4rem; color: var(--link); font-size: .82rem; }
 .card-links .link { display: inline; }
 .card-links .link.cross em { font-style: normal; color: var(--warning); }
@@ -605,6 +694,9 @@ button.pending {
   .brand-name { font-size: 1.8rem; }
   #board { padding-left: 1rem; padding-right: 1rem; }
   #checkouts { padding-left: 1rem; padding-right: 1rem; }
+  /* An open panel lies over a narrow board rather than squeezing it. */
+  body.panel-open { --panel-space: 2.6rem; }
+  body.panel-open .work-item-panel { width: min(22rem, 88vw); box-shadow: .4rem 0 1rem var(--shadow); }
   /* Each table row stacks its values, each under its column name, so the view
      never needs a sideways scroll.  The explicit roles in the markup keep the
      table semantics the display change would otherwise drop. */

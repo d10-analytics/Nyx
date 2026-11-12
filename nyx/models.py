@@ -1054,9 +1054,9 @@ def code_status_text(fields: Mapping[str, Any]) -> str:
             "not_pushed": "not pushed",
             "unpushed": f"{fields['unpushed']} unpushed",
         }.get(push, "push state unknown")
-        text = f"in progress \u00b7 {fragment}"
+        text = fragment
     elif state == "no_commits_yet":
-        text = "in progress \u00b7 no commits yet"
+        text = "no commits yet"
     else:
         text = "merge state unknown"
     paths = fields["checked_out_elsewhere"]

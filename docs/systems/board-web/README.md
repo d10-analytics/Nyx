@@ -11,8 +11,24 @@ README is narrative only.
   the active workspace's checkout folders and GitHub lookup, through
   `application-serving`'s HTTP routes: the board-settings `PUT` and the
   checkout settings `PUT`.
+- Shows each card's title, folder name and tags, and draws relationships as
+  arrows only: a card prints only a relationship that can never be an arrow (an
+  unresolved prerequisite, or any relationship of a card that shares its
+  Package ID), and carries the rest as screen-reader text. Each column plans at most eight arrow
+  lanes; a relationship left without one is drawn while either of its cards is
+  selected, and the cards at the other end of the selected card's relationships
+  are marked.
+- Shows the work item panel beside the board, filled by a left or right click
+  on a card (a right click also copies the directory path and never clears the
+  selection): the selected entry's declared and reported fields, its
+  relationships as links that select the card they name, and its checkout
+  facts from the served document (Code Status, attention items, target repo,
+  branch, remote copy, verdict, pull requests and Baseline drift), absent
+  whenever the card's Code Status tag is hidden. The panel is written only when
+  its markup changes, and whether it is open is a browser-local preference.
 - Reads the checkouts document those routes serve, and shows each card's
-  `Code Status:` line: the text `nyx checkouts --json` gives, searchable with
+  Code Status tag and one tag per attention item naming the card (all but an
+  awaiting merge, which the Code Status states): the text `nyx checkouts --json` gives, searchable with
   the card's other text and rewritten in place on each scan, without **Apply
   update**. The text is Nyx's last successful checkout scan, and Nyx rescans
   about once a minute while a board page is open.
@@ -42,7 +58,9 @@ README is narrative only.
   words of an unreadable clone or worktree match; no other column is searched,
   and the quiet row is searched by the repositories it holds with the same text:
   it stays while one matches, listing and counting only those, and is hidden when
-  none do.
+  none do. A finished work item with no Code Status is not shown: it adds no
+  **Work item branches** row, Package or Details entry, or search text, and
+  never keeps a repository out of the quiet row.
   Every enumerated code the view shows and the sentence built around it come
   from one words block, so an unknown code renders raw; served failure
   categories are shown as their raw `checkouts_*` code. The view itself decides

@@ -5370,7 +5370,7 @@ _BOARD_JSON_SNAPSHOT_SCRIPT = """
     result.refreshIssue = document.querySelector('#board-issues summary')?.textContent || '';
     result.titles = [...document.querySelectorAll('.card-title')].map((node) => String(node.textContent));
     result.rows = [...document.querySelectorAll('.board-row')].map((node) => String(node.dataset.lifecycle));
-    result.links = [...document.querySelectorAll('.card-links')].map((node) => String(node.textContent));
+    result.links = [...document.querySelectorAll('.card-links, .card-rail-text')].map((node) => String(node.textContent));
     result.compact = document.querySelector('#compact-view') ? !!document.querySelector('#compact-view').checked : null;
     result.stored = window.localStorage.getItem('spec-tracker-compact-view');
   } catch (error) {

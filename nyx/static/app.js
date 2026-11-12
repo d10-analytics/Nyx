@@ -92,6 +92,9 @@
   // unknown stored value falls back to Board.
   const VIEW_STORAGE_KEY = "spec-tracker-view";
   const QUIET_CHECKOUTS_STORAGE_KEY = "spec-tracker-hide-quiet-checkouts";
+  // Whether the work item panel beside the board is open is a browser-local
+  // display choice stored like the other preferences; it starts open.
+  const PANEL_STORAGE_KEY = "spec-tracker-work-item-panel";
 
   // The words of the checkouts view.  Every enumerated value the view shows and
   // the sentence built around it is read from this one block, so a value a newer
@@ -279,6 +282,38 @@
       "closed": "closed",
       "differentHead": "(different head)"
     },
+    "packageTargetStatus": {
+      "clone": "{clone}",
+      "worktree": "{worktree}, a worktree of {clone}",
+      "missing": "does not exist",
+      "not_git": "not a git checkout",
+      "outside_folders": "outside the checkout folders",
+      "invalid": "not a usable path",
+      "absent": "not declared",
+      "unchecked": "not checked: git is unavailable"
+    },
+    "packageBranchStatus": {
+      "declared": "{name}",
+      "default_branch": "the default branch",
+      "not_applicable": "not applicable",
+      "invalid": "not a branch name",
+      "absent": "not declared"
+    },
+    "baselineStatus": {
+      "declared": "{sha}",
+      "invalid": "not a commit id",
+      "absent": "not declared"
+    },
+    "baselineDrift": {
+      "equal": "the base has not moved",
+      "behind": "the base moved {b} commits past it"
+    },
+    "cardBadge": {
+      "base_moved": "base moved {count}",
+      "target_repo_missing": "Target repo missing",
+      "target_repo_not_git": "Target repo not a git checkout",
+      "branch_invalid": "Branch name invalid"
+    },
     "branchPackageBasis": {
       "target_clone": "Target repo",
       "sibling_clone": "same branch in another clone",
@@ -364,6 +399,12 @@
       "worktreesHeading": "Linked worktrees",
       "workItemsHeading": "Work items",
       "foldedBranches": "Folded branches ({count})",
+      "panelCodeHeading": "Code",
+      "panelCodeStatus": "Code Status",
+      "panelAttention": "Needs attention",
+      "panelTarget": "Target repo",
+      "panelBaseline": "Baseline",
+      "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
       "showOnBoardMissing": "This work item is not on the displayed board; choose Refresh view on the board.",
@@ -447,6 +488,9 @@
   const foldersCancel = document.querySelector("#checkout-folders-cancel");
 
   const copyStatus = document.querySelector("#copy-status");
+  const workItemPanel = document.querySelector("#work-item-panel");
+  const workItemPanelToggle = document.querySelector("#work-item-panel-toggle");
+  const workItemPanelBody = document.querySelector("#work-item-panel-body");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
@@ -460,6 +504,24 @@
   let busy = false;
   let queued = null;
   let selectedPath = null;
+  let panelOpen = true;
+  // At a narrow width an open panel lies over the board, so it opens only when
+  // asked to on this page and the stored choice is left alone.
+  const narrowPanel = window.matchMedia("(max-width: 700px)");
+  let narrowPanelOpen = false;
+  // The panel markup last written, so a refresh that changes nothing the panel
+  // shows leaves its focus and scroll position alone.
+  let panelMarkup = null;
+  // The interactive index of the rendered board, kept for the panel's
+  // relationship lists.
+  let boardById = new Map();
+  let boardDependents = new Map();
+  // The prerequisite and dependent pairs the board can draw as arrows.
+  let railPairs = new Set();
+  let cardAttention = new Map();
+  // The facts markup each rendered card holds, by path, so a settled outcome
+  // rewrites only the cards whose facts changed.
+  let cardFactsMarkup = new Map();
   let workspace = null;
   let workspaceRequest = 0;
   let copyAttempt = 0;
@@ -839,67 +901,129 @@
     });
   }
 
-  // Keep names visible for long arrows or missing lanes, and available to
-  // screen readers when a same-project arrow supplies the visual connection.
-  function needsHtml(entry, byId) {
-    const railNames = [];
-    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
-    const parts = prerequisiteTargets(entry, byId).map(({edge, target}) => {
+  // Arrows and the work item panel show a card's relationships; the card
+  // itself names them only for screen readers.  A relationship that can never
+  // be an arrow stays written on the card: an unresolved target, and any
+  // relationship of a card that shares its Package ID with another.
+  function relatedLabel(entry, other) {
+    return columnKeyOf(other) === columnKeyOf(entry)
+      ? titleOf(other) : `${titleOf(other)} (${projectOf(other)})`;
+  }
+
+  function hasArrow(entry, source, dependent) {
+    return boardById.get(entry.package_id) === entry &&
+      railPairs.has(`${source.package_id}>${dependent.package_id}`);
+  }
+
+  function writtenLinkHtml(entry, other) {
+    return columnKeyOf(other) === columnKeyOf(entry)
+      ? `<span class="link">${text(titleOf(other))}</span>`
+      : `<span class="link cross">${text(titleOf(other))} <em>${text(projectOf(other))}</em></span>`;
+  }
+
+  function relationshipHtml(word, written, spoken) {
+    return (written.length ? `<span class="card-links">${word}: ${written.join(" · ")}</span>` : "") +
+      (spoken.length ? `<span class="visually-hidden card-rail-text">${text(`${word}: ${spoken.join(" · ")}`)}</span>` : "");
+  }
+
+  function prerequisiteLinks(entry, byId) {
+    const links = [];
+    prerequisiteTargets(entry, byId).forEach(({edge, target}) => {
       if (!target) {
         // A valid edge may point to a target in a gated finished row. It is
         // absent from the interactive index, but it is not an unresolved target.
-        if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return "";
-        return '<span class="link unresolved">unresolved target</span>';
+        if (edge.target_package_id && !UNRESOLVED_EDGE_REASONS.has(edge.reason)) return;
+        links.push(null);
+        return;
       }
-      if (target.package_id === entry.package_id) return "";
-      if (columnKeyOf(target) === columnKeyOf(entry)) {
-        if (lanes?.has(`${target.package_id}>${entry.package_id}`)) {
-          railNames.push(titleOf(target));
-          return "";
-        }
-        return `<span class="link">${text(titleOf(target))}</span>`;
-      }
-      return `<span class="link cross">${text(titleOf(target))} ` +
-        `<em>${text(projectOf(target))}</em></span>`;
-    }).filter(Boolean);
-    return (parts.length ? `<span class="card-links">needs: ${parts.join(" · ")}</span>` : "") +
-      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`needs: ${railNames.join(" · ")}`)}</span>` : "");
+      if (target.package_id !== entry.package_id) links.push(target);
+    });
+    return links;
+  }
+
+  function dependentLinks(entry, dependentsOf) {
+    return (dependentsOf.get(entry.package_id) || [])
+      .filter((dependent) => dependent.package_id !== entry.package_id);
+  }
+
+  function needsHtml(entry, byId) {
+    const written = [];
+    const spoken = [];
+    prerequisiteLinks(entry, byId).forEach((target) => {
+      if (target === null) written.push('<span class="link unresolved">unresolved target</span>');
+      else if (hasArrow(entry, target, entry)) spoken.push(relatedLabel(entry, target));
+      else written.push(writtenLinkHtml(entry, target));
+    });
+    return relationshipHtml("needs", written, spoken);
   }
 
   function blocksHtml(entry, dependentsOf) {
-    const railNames = [];
-    const lanes = railPlan.get(columnKeyOf(entry))?.lanes;
-    const parts = (dependentsOf.get(entry.package_id) || [])
-      .map((dependent) => {
-        if (dependent.package_id === entry.package_id) return "";
-        if (columnKeyOf(dependent) === columnKeyOf(entry)) {
-          if (lanes?.has(`${entry.package_id}>${dependent.package_id}`)) {
-            railNames.push(titleOf(dependent));
-            return "";
-          }
-          return `<span class="link">${text(titleOf(dependent))}</span>`;
-        }
-        return `<span class="link cross">${text(titleOf(dependent))} ` +
-          `<em>${text(projectOf(dependent))}</em></span>`;
-      }).filter(Boolean);
-    return (parts.length ? `<span class="card-links">blocks: ${parts.join(" · ")}</span>` : "") +
-      (railNames.length ? `<span class="visually-hidden card-rail-text">${text(`blocks: ${railNames.join(" · ")}`)}</span>` : "");
+    const written = [];
+    const spoken = [];
+    dependentLinks(entry, dependentsOf).forEach((dependent) => {
+      if (hasArrow(entry, entry, dependent)) spoken.push(relatedLabel(entry, dependent));
+      else written.push(writtenLinkHtml(entry, dependent));
+    });
+    return relationshipHtml("blocks", written, spoken);
   }
 
-  // The line map every card reads: empty unless the last outcome is "ready" and
-  // its document was scanned under the configuration the board is showing.  A
-  // text computed under another configuration is wrong rather than late, so it
-  // is hidden; a null catalog revision never matches.
+  // The checkouts document the board reads: null unless the last outcome is
+  // "ready" and its document was scanned under the configuration the board is
+  // showing.  A fact computed under another configuration is wrong rather than
+  // late, so it is hidden; a null catalog revision never matches.
+  function servedCheckoutsDocument() {
+    const revision = displayed?.configuration_revision;
+    if (!revision || checkoutsOutcome.state !== "ready") return null;
+    const document = checkoutsOutcome.envelope.checkouts;
+    return document.configuration_revision === revision ? document : null;
+  }
+
+  // The Code Status every card reads, by work item path.
   function codeStatusLineMap() {
     const lines = new Map();
-    const revision = displayed?.configuration_revision;
-    if (!revision || checkoutsOutcome.state !== "ready") return lines;
-    const document = checkoutsOutcome.envelope.checkouts;
-    if (document.configuration_revision !== revision) return lines;
+    const document = servedCheckoutsDocument();
+    if (document === null) return lines;
     document.packages.forEach((item) => {
-      if (item.code_status) lines.set(item.package_path, item.code_status.text);
+      if (item.code_status) lines.set(item.package_path, item.code_status);
     });
     return lines;
+  }
+
+  // The attention items that name each work item.  An item awaiting its merge
+  // is left out: the Code Status of its card already says so.
+  function cardAttentionMap() {
+    const items = new Map();
+    const document = servedCheckoutsDocument();
+    if (document === null) return items;
+    document.attention.forEach((item) => {
+      if (item.class === "awaiting_merge") return;
+      item.packages.forEach((path) => {
+        if (!items.has(path)) items.set(path, []);
+        items.get(path).push(item);
+      });
+    });
+    return items;
+  }
+
+  function codeStatusPillHtml(status) {
+    return `<span class="card-code-status" data-state="${text(status.state)}" ` +
+      `aria-label="${text(`Code Status: ${status.text}`)}">${text(status.text)}</span>`;
+  }
+
+  function attentionBadgeHtml(item) {
+    const words = codeWords("cardBadge", item.code) === item.code
+      ? text(codeWords("attentionClass", item.class))
+      : wordText("cardBadge", item.code, {count: item.count});
+    return `<span class="card-attention" data-code="${text(item.code)}" ` +
+      `title="${attentionWords(item)}">${words}</span>`;
+  }
+
+  // The checkout facts a card carries: its Code Status and one badge per
+  // attention item that names it.
+  function cardFactsHtml(path) {
+    const status = cardCodeStatus.get(path);
+    return (status === undefined ? "" : codeStatusPillHtml(status)) +
+      (cardAttention.get(path) || []).map(attentionBadgeHtml).join("");
   }
 
   function searchText(entry, line) {
@@ -911,6 +1035,13 @@
     ].filter((value) => value !== null && value !== undefined).join(" ").toLowerCase();
   }
 
+  // The folder name is what tells one card's path from its neighbours': the
+  // column and the row already name the project and the stage.
+  function folderNameOf(path) {
+    const parts = String(path).split("/");
+    return parts[parts.length - 1] || String(path);
+  }
+
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
     const idAttribute = entry.package_id
@@ -918,15 +1049,19 @@
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
     const codeStatus = cardCodeStatus.get(entry.package_path);
+    const facts = cardFactsHtml(entry.package_path);
+    cardFactsMarkup.set(entry.package_path, facts);
     return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
-      `${idAttribute} data-search="${text(searchText(entry, codeStatus))}">` +
+      `${idAttribute} data-search="${text(searchText(entry, codeStatus?.text))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
-      (targetProject ? `<span class="card-project">Target Folder: ${text(targetProject)}</span>` : "") +
-      `<span class="card-filepath">Filepath: ${text(entry.package_path)}</span>` +
-      (codeStatus === undefined ? "" :
-        `<span class="card-code-status">Code Status: ${text(codeStatus)}</span>`) +
+      `<span class="card-filepath" title="${text(entry.package_path)}" ` +
+      `aria-label="${text(`Filepath: ${entry.package_path}`)}">${text(folderNameOf(entry.package_path))}</span>` +
+      '<span class="card-tags">' +
+      (targetProject ? `<span class="card-project" ` +
+        `aria-label="${text(`Target Folder: ${targetProject}`)}">${text(targetProject)}</span>` : "") +
+      `<span class="card-facts">${facts}</span></span>` +
       '<span class="visually-hidden card-start-text"></span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
@@ -1106,6 +1241,11 @@
   }
 
   function renderBoard() {
+    renderBoardGrid();
+    renderWorkItemPanel();
+  }
+
+  function renderBoardGrid() {
     // Finished rows the reader is hiding are removed from the working entry set
     // (not just from the axes) so dependency edges, rail planning, and column
     // depths treat them as absent, exactly like an entry outside the board.
@@ -1115,10 +1255,14 @@
       : [];
     const byId = indexByPackageId(entries);
     const dependentsOf = indexDependents(entries, byId);
+    boardById = byId;
+    boardDependents = dependentsOf;
     // A render shows the current lines for the snapshot it is given, so a
     // catalog change and the checkouts outcome never disagree about them.
     renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
     cardCodeStatus = codeStatusLineMap();
+    cardAttention = cardAttentionMap();
+    cardFactsMarkup = new Map();
     // Keyed by path so cards sharing a package identity keep their own relationships.
     cardPrerequisites = new Map(entries.map((entry) => [
       entry.package_path,
@@ -1133,6 +1277,7 @@
     railColumns = columns.map(([key]) => key);
     railPlan = new Map();
     railEdges = [];
+    railPairs = new Set();
     const setBoardColumns = (gutters) => {
       const widths = gutters.map((gutter) => `calc(var(--card-min-width) + ${gutter}px)`);
       board.style.setProperty("--column-tracks", widths.map((width) =>
@@ -1157,6 +1302,7 @@
       return;
     }
     railEdges = planEdges(entries, byId);
+    railPairs = new Set(railEdges.map((edge) => `${edge.source}>${edge.dependent}`));
     const plans = new Map(columns.map(([key]) => {
       const columnEntries = entries.filter((entry) => columnKeyOf(entry) === key);
       const depth = depthForColumn(columnEntries, railEdges);
@@ -1287,39 +1433,53 @@
     if (summary.textContent !== words) summary.textContent = words;
   }
 
+  // A card's tags are rewritten in place while the new facts have the same
+  // tags in the same order, so a tag whose words change stays the same element;
+  // only a tag that appears or goes replaces the row.
+  function rewriteCardFacts(facts, html) {
+    const holder = document.createElement("template");
+    holder.innerHTML = html;
+    const next = [...holder.content.children];
+    const current = [...facts.children];
+    const sameTags = next.length === current.length && next.every((tag, index) =>
+      tag.className === current[index].className &&
+      tag.dataset.code === current[index].dataset.code);
+    if (!sameTags) {
+      facts.replaceChildren(...next);
+      return;
+    }
+    next.forEach((tag, index) => {
+      const shown = current[index];
+      [...tag.attributes].forEach((attribute) => {
+        if (shown.getAttribute(attribute.name) !== attribute.value) {
+          shown.setAttribute(attribute.name, attribute.value);
+        }
+      });
+      if (shown.textContent !== tag.textContent) shown.textContent = tag.textContent;
+    });
+  }
+
   // Every settled checkouts outcome reaches the rendered cards directly: only
-  // each card's Code Status line and search text change, so keyboard focus,
-  // selection, the issues panel's open state and the scroll position stay, and
-  // one filter pass redraws the rails.  Rebuilding the board here would lose
-  // all four, and a line that no card's path holds is simply absent.
+  // each card's checkout facts (its Code Status and attention badges) and
+  // search text change, so keyboard focus, selection, the issues panel's open
+  // state and the scroll position stay, and one filter pass redraws the rails.
+  // Rebuilding the board here would lose all four, and a fact that no card's
+  // path holds is simply absent.  The work item panel follows the same outcome.
   function updateCardCodeStatus() {
     cardCodeStatus = codeStatusLineMap();
+    cardAttention = cardAttentionMap();
     let changed = false;
     board.querySelectorAll(".card[data-package-path]").forEach((card) => {
       const path = card.dataset.packagePath;
-      const value = cardCodeStatus.get(path);
-      const shown = card.querySelector(".card-code-status");
-      if (value === undefined) {
-        if (shown) {
-          shown.remove();
-          changed = true;
-        }
-      } else if (shown) {
-        const label = `Code Status: ${value}`;
-        if (shown.textContent !== label) {
-          shown.textContent = label;
-          changed = true;
-        }
-      } else {
-        const line = document.createElement("span");
-        line.className = "card-code-status";
-        line.textContent = `Code Status: ${value}`;
-        card.querySelector(".card-filepath").after(line);
+      const html = cardFactsHtml(path);
+      if (cardFactsMarkup.get(path) !== html) {
+        cardFactsMarkup.set(path, html);
+        rewriteCardFacts(card.querySelector(".card-facts"), html);
         changed = true;
       }
       const entry = renderedEntries.get(path);
       if (entry) {
-        const search = searchText(entry, value);
+        const search = searchText(entry, cardCodeStatus.get(path)?.text);
         if (card.dataset.search !== search) {
           card.dataset.search = search;
           changed = true;
@@ -1327,6 +1487,7 @@
       }
     });
     if (changed) applyFilter();
+    renderWorkItemPanel();
   }
 
   function drawRails() {
@@ -1348,16 +1509,48 @@
       card.classList.toggle("no-incoming-arrow", noIncoming);
       card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
     });
-    const drawnEdges = visibleEdges.filter((edge) => edge.drawn);
-    if (!drawnEdges.length) return;
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
     const selectedId = selected?.dataset.packageId;
     const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
+    // The cards at the other end of the selected card's connections are marked,
+    // whether or not a lane was free to draw the connection.
+    const relatedIds = new Set();
+    if (selectedId) {
+      visibleEdges.filter(related).forEach((edge) =>
+        relatedIds.add(edge.source === selectedId ? edge.dependent : edge.source));
+    }
+    board.querySelectorAll(".card").forEach((card) => {
+      card.classList.toggle("related", !card.hidden && relatedIds.has(card.dataset.packageId));
+    });
+    // A connection that found no free lane is drawn only while one of its cards
+    // is selected, over the lanes the gutter already has, so the selected card
+    // always shows every connection it has.
+    const overflowEdges = selectedId
+      ? visibleEdges.filter((edge) => !edge.drawn && related(edge)) : [];
+    const drawnEdges = [...visibleEdges.filter((edge) => edge.drawn), ...overflowEdges];
+    if (!drawnEdges.length) return;
     const bands = new Map([...board.querySelectorAll(".board-row")].map((row) =>
       [row.dataset.lifecycle, row.querySelector(".connection-band")]));
+    const rowHeads = new Map([...board.querySelectorAll(".board-row")].map((row) =>
+      [row.dataset.lifecycle, row.querySelector(".row-head")]));
+    // A column that gave the connection no lane has every lane in use, so the
+    // overflow connection borrows one of them by its own index.
     const laneX = (key, edge) => {
       const columnLeft = heads[railColumns.indexOf(key)].offsetLeft;
-      return columnLeft + (railPlan.get(key).lanes.get(`${edge.source}>${edge.dependent}`) + .5) * RAIL_PITCH;
+      const planned = railPlan.get(key).lanes.get(`${edge.source}>${edge.dependent}`);
+      const lane = planned === undefined
+        ? overflowEdges.indexOf(edge) % RAIL_LANE_CAP : planned;
+      return columnLeft + (lane + .5) * RAIL_PITCH;
+    };
+    // The height a connection crosses columns at: its lane in the row's band,
+    // or, for an overflow connection, the band's first lane or the row's top.
+    const bandYOf = (edge) => {
+      const band = bands.get(edge.row);
+      if (band) {
+        return band.getBoundingClientRect().top - boardRect.top +
+          RAIL_INSET / 2 + ((edge.bandLane ?? 0) + .5) * RAIL_PITCH;
+      }
+      return rowHeads.get(edge.row).getBoundingClientRect().top - boardRect.top - 3;
     };
     const port = (id, edge) => {
       const rect = cards.get(id).getBoundingClientRect();
@@ -1388,15 +1581,14 @@
       const dependentX = laneX(edge.dependentColumn, edge);
       let route = `M ${start.x - 1} ${start.y} H ${sourceX}`;
       if (edge.sourceColumn !== edge.dependentColumn) {
-        const bandY = bands.get(edge.row).getBoundingClientRect().top - boardRect.top +
-          RAIL_INSET / 2 + (edge.bandLane + .5) * RAIL_PITCH;
-        route += ` V ${bandY} H ${dependentX}`;
+        route += ` V ${bandYOf(edge)} H ${dependentX}`;
       }
       route += ` V ${end.y} H ${end.x - 5}`;
       const emphasized = selectedId && related(edge);
       const group = document.createElementNS(SVG_NS, "g");
       group.setAttribute("class", "connection" +
-        (selectedId ? emphasized ? " emphasized" : " muted" : ""));
+        (selectedId ? emphasized ? " emphasized" : " muted" : "") +
+        (edge.drawn ? "" : " overflow"));
       group.dataset.source = edge.source;
       group.dataset.dependent = edge.dependent;
       const halo = document.createElementNS(SVG_NS, "path");
@@ -1421,6 +1613,190 @@
       card.classList.toggle("selected", selected);
       card.setAttribute("aria-pressed", String(selected));
     });
+    drawRails();
+    renderWorkItemPanel();
+  }
+
+  // ---------------------------------------------------------------------
+  // The work item panel: the selected card's declared fields, relationships
+  // and checkout facts, beside the board
+  // ---------------------------------------------------------------------
+
+  function panelRowHtml(label, value, cls = "") {
+    return `<div class="panel-row${cls === "" ? "" : ` ${cls}`}"><dt>${text(label)}</dt><dd>${value}</dd></div>`;
+  }
+
+  function panelLinksHtml(entry, heading, links) {
+    if (!links.length) return "";
+    const items = links.map((other) => other === null
+      ? '<li><span class="link unresolved">unresolved target</span></li>'
+      : `<li><button type="button" class="panel-link" data-select-path="${text(other.package_path)}">` +
+        `${text(titleOf(other))}</button>` +
+        (columnKeyOf(other) === columnKeyOf(entry) ? ""
+          : ` <span class="panel-link-project">${text(projectOf(other))}</span>`) + "</li>").join("");
+    return `<section class="panel-section panel-links" data-relation="${text(heading.toLowerCase())}">` +
+      `<h3>${text(heading)}</h3><ul>${items}</ul></section>`;
+  }
+
+  function packageTargetWords(target) {
+    return wordText("packageTargetStatus", target.status, {
+      clone: target.clone === null || target.clone === undefined ? "" : checkoutName(target.clone),
+      worktree: target.worktree === null || target.worktree === undefined
+        ? "" : checkoutName(target.worktree),
+    });
+  }
+
+  // The drift is counted against the target clone's verdict base, so a recorded
+  // count is dated by that repository's remote check.
+  function baselineWords(document, item) {
+    const baseline = item.baseline;
+    const words = wordText("baselineStatus", baseline.status, {
+      sha: baseline.sha === null || baseline.sha === undefined ? "" : String(baseline.sha).slice(0, 7),
+    });
+    const drift = baseline.drift;
+    if (drift === null || drift === undefined) return words;
+    const moved = codeWords("baselineDrift", drift.relation) === drift.relation
+      ? comparisonWords(drift)
+      : wordText("baselineDrift", drift.relation, {a: drift.ahead, b: drift.behind});
+    const group = document.repositories.find((candidate) =>
+      candidate.clones.some((clone) => clone.path === item.target.clone));
+    const check = group === undefined || group.remote === null ? null : group.remote.check;
+    const checkedAt = check === null || check === undefined ? null : check.checked_at;
+    const basis = drift.basis === "recorded" && (checkedAt === null || checkedAt === undefined)
+      ? "" : ` <span class="checkouts-basis">${basisWords(document, drift.basis, checkedAt)}</span>`;
+    return `${words} · <span class="checkouts-relation">${moved}</span>${basis}`;
+  }
+
+  // The repository and work item branch entry that name one work item.
+  function packageBranchOf(document, path) {
+    for (const group of document.repositories) {
+      const entry = (group.package_branches || []).find((candidate) =>
+        candidate.packages.includes(path));
+      if (entry !== undefined) return {group, entry};
+    }
+    return null;
+  }
+
+  // The checkout facts of one work item, read from the served document as the
+  // Checkouts view reads them; nothing while no document can be shown.
+  function panelCodeHtml(entry) {
+    const document = servedCheckoutsDocument();
+    if (document === null) return "";
+    const item = document.packages.find((candidate) =>
+      candidate.package_path === entry.package_path);
+    if (item === undefined) return "";
+    const rows = [];
+    if (item.code_status !== null && item.code_status !== undefined) {
+      rows.push(panelRowHtml(codeWords("text", "panelCodeStatus"),
+        codeStatusPillHtml(item.code_status), "panel-code-status"));
+    }
+    const attention = document.attention.filter((candidate) =>
+      candidate.packages.includes(entry.package_path));
+    if (attention.length) {
+      rows.push(panelRowHtml(codeWords("text", "panelAttention"),
+        attention.map((candidate) =>
+          `<span class="panel-attention" data-code="${text(candidate.code)}">${attentionWords(candidate)}</span>`)
+          .join("<br>"), "panel-attention-row"));
+    }
+    rows.push(panelRowHtml(codeWords("text", "panelTarget"), packageTargetWords(item.target),
+      "panel-target"));
+    rows.push(panelRowHtml(codeWords("column", "branch"),
+      wordText("packageBranchStatus", item.branch.status, {name: item.branch.name}), "panel-branch"));
+    const served = packageBranchOf(document, entry.package_path);
+    if (served !== null) {
+      rows.push(panelRowHtml(codeWords("column", "remoteCopy"),
+        remoteCopyWords(document, served.group, served.entry.remote), "panel-remote-copy"));
+      rows.push(panelRowHtml(codeWords("column", "verdict"),
+        verdictWords(document, served.group, served.entry), "panel-verdict"));
+      rows.push(panelRowHtml(codeWords("column", "pullRequests"),
+        pullRequestsWords(document, served.group, served.entry), "panel-pulls"));
+    }
+    rows.push(panelRowHtml(codeWords("text", "panelBaseline"),
+      baselineWords(document, item), "panel-baseline"));
+    const elsewhere = item.code_status === null || item.code_status === undefined
+      ? [] : item.code_status.checked_out_elsewhere;
+    if (elsewhere.length) {
+      rows.push(panelRowHtml(codeWords("text", "panelElsewhere"),
+        elsewhere.map((path) => text(checkoutName(path))).join(" · "), "panel-elsewhere"));
+    }
+    return '<section class="panel-section panel-code">' +
+      `<h3>${text(codeWords("text", "panelCodeHeading"))}</h3><dl>${rows.join("")}</dl></section>`;
+  }
+
+  function panelHtml(entry) {
+    const rows = [
+      panelRowHtml("Stage", text(stageLabelOf(entry.stage))),
+      panelRowHtml("Project", text(projectOf(entry))),
+      panelRowHtml("Filepath", `<span class="panel-path">${text(entry.package_path)}</span>`,
+        "panel-filepath"),
+    ];
+    if (entry.declared.target_project) {
+      rows.push(panelRowHtml("Target Folder", text(entry.declared.target_project), "panel-project"));
+    }
+    if (entry.declared.status) rows.push(panelRowHtml("Status", text(entry.declared.status)));
+    if (entry.relationship.program.title) {
+      rows.push(panelRowHtml("Program", text(entry.relationship.program.title)));
+    }
+    entry.reported_fields.forEach((field) => {
+      rows.push(panelRowHtml(field.name, text(field.value), "panel-reported"));
+    });
+    if (entry.package_id) {
+      rows.push(panelRowHtml("Package ID", `<span class="panel-path">${text(entry.package_id)}</span>`));
+    }
+    return `<h2 id="work-item-panel-heading" class="panel-title" tabindex="-1">${text(titleOf(entry))}</h2>` +
+      `<dl class="panel-section panel-fields">${rows.join("")}</dl>` +
+      panelLinksHtml(entry, "Needs", prerequisiteLinks(entry, boardById)) +
+      panelLinksHtml(entry, "Blocks", dependentLinks(entry, boardDependents)) +
+      panelCodeHtml(entry);
+  }
+
+  // The panel shows the selected card, or says how to fill it.  It is written
+  // only when its markup changes.
+  function renderWorkItemPanel() {
+    const entry = selectedPath === null ? undefined : renderedEntries.get(selectedPath);
+    const html = entry === undefined
+      ? '<p id="work-item-panel-heading" class="panel-empty">Click a work item to show its details here.</p>'
+      : panelHtml(entry);
+    if (html === panelMarkup) return;
+    panelMarkup = html;
+    workItemPanelBody.innerHTML = html;
+  }
+
+  // The panel belongs to the board: it is shown with it, and the board keeps
+  // clear of the width the panel takes, open or collapsed.
+  function workItemPanelOpen() {
+    return narrowPanel.matches ? narrowPanelOpen : panelOpen;
+  }
+
+  function applyWorkItemPanel() {
+    const shown = shownView === VIEW_BOARD;
+    const open = workItemPanelOpen();
+    workItemPanel.hidden = !shown;
+    document.body.classList.toggle("panel-open", shown && open);
+    document.body.classList.toggle("panel-collapsed", shown && !open);
+    workItemPanelBody.hidden = !open;
+    workItemPanelToggle.setAttribute("aria-expanded", String(open));
+    workItemPanelToggle.textContent = open ? "Hide details" : "Details";
+  }
+
+  function readPanelPreference() {
+    panelOpen = true;
+    try {
+      if (window.localStorage.getItem(PANEL_STORAGE_KEY) === "collapsed") panelOpen = false;
+    } catch (_) {
+      // An open panel is the fallback when browser storage is unavailable.
+    }
+  }
+
+  function setPanelOpen(value) {
+    if (narrowPanel.matches) {
+      narrowPanelOpen = value;
+    } else {
+      panelOpen = value;
+      try { window.localStorage.setItem(PANEL_STORAGE_KEY, value ? "open" : "collapsed"); } catch (_) { /* fallback is in-memory */ }
+    }
+    applyWorkItemPanel();
+    // The board's width follows the panel, so its cards and connections move.
     drawRails();
   }
 
@@ -1693,6 +2069,7 @@
       ? "Find a checkout, branch, or work item…"
       : "Find a work item, project, or program…";
     syncViewLabels();
+    applyWorkItemPanel();
     // Each view shows its own controls, so the toolbar can change height here;
     // the sticky heads below it follow at once rather than a frame later, when
     // a caller such as Show on board has already measured them.
@@ -2715,6 +3092,34 @@
       "</h2>";
   }
 
+  // A work item the view still has something to say about: one that is not
+  // finished, or a finished one whose Code Status names work that is left (a
+  // merge to make, a branch or worktree to remove).  Every other finished work
+  // item is left out of the branch rows, the Package cells, the Details list
+  // and the search, and never keeps a repository out of the quiet row.
+  function isLivePackage(item) {
+    return !item.finished || (item.code_status !== null && item.code_status !== undefined);
+  }
+
+  const livePathsByDocument = new WeakMap();
+
+  function livePackagePaths(document) {
+    let paths = livePathsByDocument.get(document);
+    if (paths === undefined) {
+      paths = new Set(document.packages.filter(isLivePackage).map((item) => item.package_path));
+      livePathsByDocument.set(document, paths);
+    }
+    return paths;
+  }
+
+  // The work item branches a repository still shows: those naming a live work
+  // item.
+  function livePackageBranches(document, group) {
+    const live = livePackagePaths(document);
+    return (group.package_branches || []).filter((entry) =>
+      entry.packages.some((path) => live.has(path)));
+  }
+
   // A repository is quiet when its served facts say nothing about it needs a
   // person.  Equality needs a served comparison: two null comparisons prove
   // nothing, so such a repository is shown.
@@ -2730,8 +3135,8 @@
     if (clone.worktrees.some((worktree) => !worktree.main)) return false;
     const base = defaultBranchName(clone);
     if (clone.branches.some((branch) => branch.name !== base)) return false;
-    if ((group.package_branches || []).length) return false;
-    if (document.packages.some((item) =>
+    if (livePackageBranches(document, group).length) return false;
+    if (document.packages.some((item) => isLivePackage(item) &&
       item.target !== null && item.target !== undefined && item.target.clone === clone.path)) {
       return false;
     }
@@ -2913,8 +3318,9 @@
   }
 
   // Each work item names how the group serves it and its own board action.
-  function workItemsHtml(group, entry, key) {
-    return entry.packages.map((path) => {
+  function workItemsHtml(document, group, entry, key) {
+    const live = livePackagePaths(document);
+    return entry.packages.filter((path) => live.has(path)).map((path) => {
       const bases = workItemBases(group, path);
       const suffix = bases.length
         ? ` <span class="checkouts-basis">(${text(bases.map((basis) =>
@@ -2927,7 +3333,7 @@
   }
 
   function packageBranchesHtml(document, group) {
-    const entries = group.package_branches || [];
+    const entries = livePackageBranches(document, group);
     if (!entries.length) return "";
     const rows = entries.map((entry) => {
       const key = keyOf("package-branch", groupKey(group), entry.name);
@@ -2941,7 +3347,7 @@
         `<td class="checkouts-pulls" role="cell">${cellLabelHtml("pullRequests")}` +
         `${pullRequestsWords(document, group, entry)}</td>` +
         `<td class="checkouts-work-items" role="cell">${cellLabelHtml("workItems")}` +
-        `${workItemsHtml(group, entry, key)}</td></tr>`;
+        `${workItemsHtml(document, group, entry, key)}</td></tr>`;
     }).join("");
     return tableHtml("checkouts-package-branches", text(codeWords("text", "workItemBranches")),
       PACKAGE_COLUMNS, rows);
@@ -3097,7 +3503,7 @@
     const paths = document.packages
       .filter((item) => {
         const target = item.target;
-        if (target === null || target === undefined) return false;
+        if (!isLivePackage(item) || target === null || target === undefined) return false;
         if (worktree !== null) return target.worktree === worktree.path;
         if (target.clone !== clone.path) return false;
         return clone.status !== "ok" || target.worktree === null;
@@ -3219,7 +3625,8 @@
         target.worktree === null || target.worktree === undefined
           ? "target_repo" : "target_repo_worktree"));
     });
-    return document.packages.filter((item) => bases.has(item.package_path))
+    return document.packages
+      .filter((item) => isLivePackage(item) && bases.has(item.package_path))
       .map((item) => ({item, bases: [...bases.get(item.package_path)]}));
   }
 
@@ -3385,13 +3792,13 @@
     });
     const clonePaths = new Set(group.clones.map((clone) => clone.path));
     document.packages.forEach((item) => {
-      if (item.target !== null && item.target !== undefined &&
+      if (isLivePackage(item) && item.target !== null && item.target !== undefined &&
         clonePaths.has(item.target.clone)) notePackage(item);
     });
-    (group.package_branches || []).forEach((entry) => {
+    const live = livePackagePaths(document);
+    livePackageBranches(document, group).forEach((entry) => {
       values.push(entry.name);
-      entry.packages.forEach((path) => {
-        values.push(path);
+      entry.packages.filter((path) => live.has(path)).forEach((path) => {
         const item = document.packages.find((candidate) => candidate.package_path === path);
         if (item !== undefined) notePackage(item);
       });
@@ -4113,10 +4520,29 @@
     if (card) select(card.dataset.packagePath);
     else if (deselectOnEmptyClick && selectedPath && !event.target.closest(".board-issues")) select(null);
   });
+  workItemPanelToggle.addEventListener("click", () => setPanelOpen(!workItemPanelOpen()));
+  narrowPanel.addEventListener("change", () => {
+    applyWorkItemPanel();
+    drawRails();
+  });
+  // A relationship in the panel selects the card it names and brings it into
+  // view; focus stays in the panel, on the new heading.
+  workItemPanelBody.addEventListener("click", (event) => {
+    const link = event.target.closest("[data-select-path]");
+    if (link === null) return;
+    const path = link.dataset.selectPath;
+    setSelection(path);
+    const card = [...board.querySelectorAll(".card")]
+      .find((item) => item.dataset.packagePath === path);
+    if (card !== undefined && !card.hidden) revealCard(card);
+    workItemPanelBody.querySelector("#work-item-panel-heading")?.focus({preventScroll: true});
+  });
   board.addEventListener("contextmenu", (event) => {
     const card = event.target.closest(".card[data-package-path]");
     if (!card) return;
     event.preventDefault();
+    // A right click fills the panel like a left click, and never clears it.
+    if (selectedPath !== card.dataset.packagePath) setSelection(card.dataset.packagePath);
     const attempt = ++copyAttempt;
     const anchor = card.getBoundingClientRect();
     if (copyStatusTimer !== null) window.clearTimeout(copyStatusTimer);
@@ -4271,6 +4697,7 @@
   readCompactPreference();
   readTerminalPreference();
   readDeselectPreference();
+  readPanelPreference();
   readViewPreference();
   readQuietCheckoutsPreference();
   applyView();

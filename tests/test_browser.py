@@ -1123,10 +1123,10 @@ def test_card_right_click_copies_windows_root_in_windows_format(
     copied = page.evaluate("navigator.clipboard.readText()")
     assert copied == expected_path
     assert "/" not in copied
-    assert card.get_attribute("aria-pressed") == "false"
+    assert card.get_attribute("aria-pressed") == "true"
 
 
-def test_card_right_click_copies_full_directory_without_changing_selection(open_page, tmp_path):
+def test_card_right_click_copies_full_directory_and_selects_without_toggling(open_page, tmp_path):
     # The pytest tmp_path root is POSIX on Linux and macOS and drive-letter on
     # Windows.
     root = tmp_path / "spec workspace"
@@ -1149,7 +1149,7 @@ def test_card_right_click_copies_full_directory_without_changing_selection(open_
     assert relative == "Alpha/Under_Development/step-one"
     copied = page.evaluate("navigator.clipboard.readText()")
     assert copied == str(root / relative)
-    assert card.get_attribute("aria-pressed") == "false"
+    assert card.get_attribute("aria-pressed") == "true"
     playwright.expect(page.locator("#copy-status")).to_be_hidden(timeout=3500)
     page.set_viewport_size({"width": 480, "height": 320})
     card.click(button="right")
@@ -1159,8 +1159,10 @@ def test_card_right_click_copies_full_directory_without_changing_selection(open_
     assert popup_box["x"] >= 0 and popup_box["y"] >= 0
     assert popup_box["x"] + popup_box["width"] <= 480
     assert popup_box["y"] + popup_box["height"] <= 320
-    card.click()
+    # A second right click never clears the selection; a left click does.
     assert card.get_attribute("aria-pressed") == "true"
+    card.click()
+    assert card.get_attribute("aria-pressed") == "false"
 
 
 def test_card_copy_failure_shows_error_beside_card(open_page, tmp_path):
@@ -1388,12 +1390,15 @@ def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(
     page.get_by_text("Board settings saved.", exact=True).wait_for()
 
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    assert "blocks:" in step_two.locator(".card-links").inner_text()
-    assert "loose package" in step_two.locator(".card-links").inner_text()
+    # The refreshed board arrives after the save message, so wait for its text.
+    playwright.expect(step_two.locator(".card-rail-text").last).to_have_text(
+        re.compile(r"^blocks: .*loose package \(Beta\)"))
+    assert step_two.locator(".card-links").count() == 0
     loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
-    assert "needs: Dependent step" in loose.locator(".card-links").inner_text()
+    assert loose.locator(".card-links").count() == 0
+    assert loose.locator(".card-rail-text").all_text_contents() == ["needs: Dependent step (Alpha)"]
     assert loose.get_attribute("aria-pressed") == "true"
-    assert loose.locator(".card-filepath").inner_text() == "Filepath: Beta/Under_Development/loose"
+    assert loose.locator(".card-filepath").get_attribute("aria-label") == "Filepath: Beta/Under_Development/loose"
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
 
 
@@ -1405,8 +1410,9 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
 
     source = page.locator(f'.card[data-package-id="{source_id}"]')
     target = page.locator(f'.card[data-package-id="{target_id}"]')
-    assert "needs: Target Alpha" in source.inner_text()
-    assert "blocks: Dependent Beta" in target.inner_text()
+    assert source.locator(".card-rail-text").all_text_contents() == ["needs: Target (Alpha)"]
+    assert target.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent (Beta)"]
+    assert page.locator(".card-links").count() == 0
     assert connection_pairs(page) == {(target_id, source_id)}
     before = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
                   if entry["package_id"] == source_id)
@@ -1740,14 +1746,15 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
             const cell = [...document.querySelectorAll('.board-row .cell')].at(-1).getBoundingClientRect();
             const offset = parseFloat(getComputedStyle(document.documentElement)
                 .getPropertyValue('--toolbar-height'));
+            const panel = document.querySelector('#work-item-panel').getBoundingClientRect();
             if (!Number.isFinite(offset) || window.scrollX <= 400 || window.scrollY <= 300 ||
                 Math.abs(offset - toolbar.height) >= 2 ||
                 Math.abs(toolbar.x) >= 2 || Math.abs(toolbar.y) >= 2 ||
-                Math.abs(column.y - toolbar.height) >= 2 || Math.abs(row.x) >= 2) {
+                Math.abs(column.y - toolbar.height) >= 2 || Math.abs(row.x - panel.right) >= 2) {
                 return false;
             }
             return {toolbar: toolbar.toJSON(), column: column.toJSON(),
-                    row: row.toJSON(), cell: cell.toJSON()};
+                    row: row.toJSON(), cell: cell.toJSON(), panel: panel.toJSON()};
         }""", timeout=5000)
         try:
             return snapshot.json_value()
@@ -1779,7 +1786,11 @@ def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
     toolbar, column, row = (geometry[key] for key in ("toolbar", "column", "row"))
     assert abs(toolbar["x"]) < 2 and abs(toolbar["y"]) < 2
     assert abs(column["y"] - toolbar["height"]) < 2
-    assert abs(row["x"]) < 2
+    # The row labels stick beside the work item panel, which stays at the left
+    # edge under the toolbar however far the board scrolls.
+    panel = geometry["panel"]
+    assert abs(panel["x"]) < 2 and abs(panel["y"] - toolbar["height"]) < 2
+    assert panel["width"] > 0 and abs(row["x"] - panel["right"]) < 2
     assert row["height"] >= geometry["cell"]["height"]
     assert page.locator(".row-head").last.evaluate("element => getComputedStyle(element).backgroundColor") != "rgba(0, 0, 0, 0)"
 
@@ -1872,14 +1883,17 @@ def test_long_unbroken_names_wrap_within_their_column(open_page):
     alpha = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     beta = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert alpha.locator(".card-title").inner_text() == token
-    assert alpha.locator(".card-project").inner_text() == f"Target Folder: {token}"
-    assert alpha.locator(".card-filepath").inner_text() == f"Filepath: Alpha/Queue/{token}"
-    assert alpha.locator(".card-links").inner_text() == f"needs: {token} Beta"
-    assert beta.locator(".card-links").inner_text() == f"blocks: {token} Alpha"
+    assert alpha.locator(".card-project").get_attribute("aria-label") == f"Target Folder: {token}"
+    assert alpha.locator(".card-project").inner_text() == token
+    assert alpha.locator(".card-filepath").get_attribute("aria-label") == f"Filepath: Alpha/Queue/{token}"
+    assert alpha.locator(".card-filepath").inner_text() == token
+    assert alpha.locator(".card-rail-text").all_text_contents() == [f"needs: {token} (Beta)"]
+    assert beta.locator(".card-rail-text").all_text_contents() == [f"blocks: {token} (Alpha)"]
+    assert page.locator(".card-links").count() == 0
     assert page.locator(".column-head").all_text_contents() == projects
 
     measurements = page.locator(
-        ".card-title, .card-project, .card-filepath, .card-links, .column-head"
+        ".card-title, .card-project, .card-filepath, .column-head"
     ).evaluate_all("""nodes => nodes.map(node => ({
       kind: node.className, text: node.textContent,
       scrollWidth: node.scrollWidth, clientWidth: node.clientWidth,
@@ -1904,11 +1918,11 @@ def test_minimal_item_omits_repeated_target_context_but_keeps_distinct_target(op
     foundation = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
     assert foundation.locator(".card-project").count() == 0
-    assert loose.locator(".card-project").inner_text() == "Target Folder: Declared target"
-    assert foundation.locator(".card-filepath").inner_text() == (
+    assert loose.locator(".card-project").get_attribute("aria-label") == "Target Folder: Declared target"
+    assert foundation.locator(".card-filepath").get_attribute("aria-label") == (
         "Filepath: Alpha/Under_Development/step-one"
     )
-    assert loose.locator(".card-filepath").inner_text() == (
+    assert loose.locator(".card-filepath").get_attribute("aria-label") == (
         "Filepath: Beta/Under_Development/loose"
     )
 
@@ -3113,11 +3127,12 @@ def test_same_project_relationship_text_is_available_to_screen_readers(open_page
     page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
     expected = {
         STEP_TWO: ["needs: Foundation step", "blocks: Gate step"],
-        STEP_ONE: ["blocks: Dependent step"],
+        STEP_ONE: [f"blocks: Dependent step · {XSS_TITLE} (Beta)"],
         GATE: ["needs: Dependent step"],
-        LOOSE: [],
+        LOOSE: ["needs: Foundation step (Alpha)"],
     }
-    visible = {STEP_ONE: 1, LOOSE: 1, STEP_TWO: 0, GATE: 0}
+    # Every relationship here has an arrow, so no card prints one.
+    visible = {STEP_ONE: 0, LOOSE: 0, STEP_TWO: 0, GATE: 0}
     for package_id, texts in expected.items():
         card = page.locator(f'.card[data-package-id="{package_id}"]')
         spans = card.locator(".card-rail-text")
@@ -3127,12 +3142,7 @@ def test_same_project_relationship_text_is_available_to_screen_readers(open_page
             assert span.evaluate("node => node.childNodes.length === 1 && node.firstChild.nodeType === Node.TEXT_NODE")
             box = span.bounding_box()
             assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
-    assert page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-links').inner_text() == (
-        f"blocks: {XSS_TITLE} Beta"
-    )
-    assert page.locator(f'.card[data-package-id="{LOOSE}"] .card-links').inner_text() == (
-        "needs: Foundation step Alpha"
-    )
+    assert page.locator("#board img").count() == 0
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
     playwright.expect(page.locator(f'.card[data-package-id="{LOOSE}"]')).not_to_have_accessible_name(
@@ -3184,8 +3194,10 @@ def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_
         assert dependent.locator(".card-links").count() == 0
         assert source.locator(".card-links").count() == 0
     else:
-        assert dependent.locator(".card-links").all_text_contents() == ["needs: Foundation step Beta"]
-        assert source.locator(".card-links").all_text_contents() == ["blocks: Dependent step Alpha"]
+        assert dependent.locator(".card-rail-text").all_text_contents() == ["needs: Foundation step (Beta)"]
+        assert source.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent step (Alpha)"]
+        assert dependent.locator(".card-links").count() == 0
+        assert source.locator(".card-links").count() == 0
     playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
     assert dependent.text_content().count("Foundation step") == 1
     assert source.text_content().count("Dependent step") == 1
@@ -3623,7 +3635,7 @@ def test_chained_rails_reuse_two_lanes(open_page):
     assert_readable_arrows(page)
 
 
-def test_rail_lanes_are_capped_and_overflow_is_written_on_cards(open_page):
+def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_page):
     ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 113)]
     value = json.loads(board_payload())
     value["entries"] = [_entry(ids[0], "Alpha/Queue/00-hub", "queue", "Hub", "Alpha")] + [
@@ -3636,23 +3648,42 @@ def test_rail_lanes_are_capped_and_overflow_is_written_on_cards(open_page):
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:9]}
     for index, package_id in enumerate(ids[1:], start=1):
         card = page.locator(f'.card[data-package-id="{package_id}"]')
-        if index <= 8:
-            assert card.locator(".card-rail-text").all_text_contents() == ["needs: Hub"]
-        else:
-            assert card.locator(".card-links").all_text_contents() == ["needs: Hub"]
-            assert card.locator(".card-links em").count() == 0
+        # With or without a lane, the relationship is screen-reader text only.
+        assert card.locator(".card-rail-text").all_text_contents() == ["needs: Hub"]
+        assert card.locator(".card-links").count() == 0
+        if index > 8:
             assert "no-incoming-arrow" not in card.get_attribute("class").split()
             assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
             assert card.locator(".card-start-text").text_content() == ""
     hub = page.locator(f'.card[data-package-id="{ids[0]}"]')
-    assert hub.locator(".card-links").all_text_contents() == [
-        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(9, 13))
-    ]
+    assert hub.locator(".card-links").count() == 0
     assert hub.locator(".card-rail-text").all_text_contents() == [
-        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(1, 9))
+        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(1, 13))
     ]
     assert_readable_arrows(page)
     assert_rail_lanes_do_not_overlap(page)
+
+    # Selecting a card whose connection found no lane draws it, dashed, and
+    # marks the card at its other end; clearing the selection removes both.
+    planned = {(ids[0], dependent) for dependent in ids[1:9]}
+    overflow = page.locator(f'.card[data-package-id="{ids[10]}"]')
+    overflow.click()
+    assert connection_pairs(page) == planned | {(ids[0], ids[10])}
+    assert page.locator(".connection.overflow").evaluate_all(
+        "groups => groups.map(g => [g.dataset.source, g.dataset.dependent, g.classList.contains('emphasized')])"
+    ) == [[ids[0], ids[10], True]]
+    assert page.locator(".connection.overflow .rail").evaluate(
+        "rail => getComputedStyle(rail).strokeDasharray") != "none"
+    assert page.locator(".card.related").evaluate_all(
+        "cards => cards.map(card => card.dataset.packageId)") == [ids[0]]
+    overflow.click()
+    assert connection_pairs(page) == planned
+    assert page.locator(".card.related").count() == 0
+    # The hub shows every connection it has, and every dependent is marked.
+    hub.click()
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
+    assert page.locator(".connection.overflow").count() == 4
+    assert page.locator(".card.related").count() == 12
 
 
 def test_upward_edge_rails_use_separate_lanes(open_page):
@@ -3710,13 +3741,20 @@ def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
     ) == ["132px", "132px"]
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
     card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    assert card.locator(".card-links").all_text_contents() == ["needs: S Beta"]
-    assert card.locator(".card-links em").inner_text() == "Beta"
+    assert card.locator(".card-rail-text").all_text_contents() == ["needs: S (Beta)"]
+    assert card.locator(".card-links").count() == 0
     assert "no-incoming-arrow" not in card.get_attribute("class").split()
     assert card.locator(".card-start-text").text_content() == ""
     assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
     assert_readable_arrows(page)
     assert_rail_lanes_do_not_overlap(page)
+    # Selected, the card shows the cross-project connection it had no lane for,
+    # without a band being added to the row.
+    card.click()
+    assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]} | {(STEP_TWO, STEP_ONE)}
+    assert page.locator(".connection.overflow.emphasized").count() == 1
+    assert page.locator(f'.card[data-package-id="{STEP_TWO}"]').get_attribute("class").split().count("related") == 1
+    assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
 
 
 def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_filter(open_page):
@@ -3786,7 +3824,9 @@ def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
     assert page.locator(".rail").count() == 3
     source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    assert source.locator(".card-links .link.cross").count() == 1
+    assert source.locator(".card-links").count() == 0
+    [blocks] = source.locator(".card-rail-text").all_text_contents()
+    assert blocks.count("(Beta)") == 1
     assert_readable_arrows(page)
 
 
@@ -5735,8 +5775,8 @@ def test_checkouts_real_runtime_serves_the_collected_document(open_page, real_ch
 # one; delta and epsilon have none.  Stating them here makes a collector change
 # fail loudly rather than quietly redefining what the line must show.
 CHECKOUTS_CODE_STATUS_TEXTS = {
-    "Repo/Drafts/alpha": "in progress · pushed",
-    "Repo/Drafts/beta": "in progress · push state unknown · in Repo Clone 10",
+    "Repo/Drafts/alpha": "pushed",
+    "Repo/Drafts/beta": "push state unknown · in Repo Clone 10",
     "Repo/Shipped/gamma": "awaiting merge (no PR)",
 }
 CHECKOUTS_CARD_PATHS = {
@@ -5777,23 +5817,32 @@ def code_status_card(page, path):
 
 
 def code_status_line(page, path):
-    """One card's single Code Status line, or None when it holds none."""
+    """One card's single Code Status tag by its label, or None when it holds none.
+
+    The tag shows the served text alone; its label names it for a screen reader.
+    """
     lines = code_status_card(page, path).locator(".card-code-status")
-    return lines.inner_text() if lines.count() else None
+    if not lines.count():
+        return None
+    label = lines.get_attribute("aria-label")
+    assert label == f"Code Status: {lines.inner_text()}"
+    return label
 
 
 def card_code_status_structure(page):
     """Each card's line count and the class names of the elements around its line.
 
-    A line a full render writes and a line an update inserts in place must agree
-    on both neighbours, which is where Filepath and the start text sit.
+    A tag a full render writes and a tag an update inserts in place must agree
+    on where it sits: inside the card's facts, after the folder name and before
+    the start text.
     """
     return page.locator(".card[data-package-path]").evaluate_all("""cards => cards.map(card => ({
       path: card.dataset.packagePath,
       tag: card.tagName,
       lines: card.querySelectorAll('.card-code-status').length,
-      previous: card.querySelector('.card-code-status')?.previousElementSibling?.className,
-      next: card.querySelector('.card-code-status')?.nextElementSibling?.className,
+      holder: card.querySelector('.card-code-status')?.parentElement?.className,
+      previous: card.querySelector('.card-tags').previousElementSibling?.className,
+      next: card.querySelector('.card-tags').nextElementSibling?.className,
     }))""")
 
 
@@ -5839,6 +5888,7 @@ def test_code_status_line_shows_the_served_document(open_page, real_checkouts):
         assert card["tag"] == "BUTTON", card
         if card["path"] in CHECKOUTS_CODE_STATUS_TEXTS:
             assert card["lines"] == 1, card
+            assert card["holder"] == "card-facts", card
             assert card["previous"] == "card-filepath", card
             assert card["next"] == "visually-hidden card-start-text", card
         else:
@@ -5874,9 +5924,10 @@ def test_code_status_line_is_readable_on_every_card_surface(
     assert alpha.evaluate("card => getComputedStyle(card).backgroundColor") == NO_INCOMING_CARD
     assert beta.evaluate("card => getComputedStyle(card).backgroundColor") == card_color
     for card in (alpha, beta):
+        # The tag carries its own surface, so it reads the same on both cards.
         colors = card.evaluate("""card => ({
           text: getComputedStyle(card.querySelector('.card-code-status')).color,
-          background: getComputedStyle(card).backgroundColor,
+          background: getComputedStyle(card.querySelector('.card-code-status')).backgroundColor,
         })""")
         assert contrast_ratio(colors["text"], colors["background"]) >= 4.5, (theme, colors)
 
@@ -5900,7 +5951,7 @@ def test_code_status_long_checkout_name_wraps_inside_the_card(open_page, real_ch
     double.serve(checkouts_with_text(real_checkouts.document_zero, "Repo/Drafts/alpha", token))
     fire_checkouts_poll(page)
     alpha = code_status_card(page, "Repo/Drafts/alpha")
-    assert alpha.locator(".card-code-status").inner_text() == f"Code Status: {token}"
+    assert alpha.locator(".card-code-status").get_attribute("aria-label") == f"Code Status: {token}"
     line = alpha.locator(".card-code-status").evaluate(
         "line => ({scrollWidth: line.scrollWidth, clientWidth: line.clientWidth})"
     )
@@ -5961,9 +6012,10 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     fire_checkouts_poll(page)
     settle_frames(page)
     # The same card and the same line element now hold the next scan's text.
-    assert line.evaluate("node => node.isConnected && node.textContent") == (
-        "Code Status: in progress · 1 unpushed"
+    assert line.evaluate("node => node.isConnected && node.getAttribute('aria-label')") == (
+        "Code Status: 1 unpushed"
     )
+    assert line.evaluate("node => node.textContent") == "1 unpushed"
     assert card.evaluate(
         "node => node.isConnected && "
         "node === document.querySelector('.card[data-package-path=\"Repo/Drafts/alpha\"]')"
@@ -5996,12 +6048,12 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     assert alpha.evaluate("node => node.closest('.cell').classList.contains('filtered-empty')")
     page.fill("#filter", "")
     assert code_status_line(page, "Repo/Drafts/alpha") == (
-        "Code Status: in progress · 3 unpushed"
+        "Code Status: 3 unpushed"
     )
     # A full render keeps the line and the same searchable text.
     page.get_by_label("Hide empty rows and columns", exact=True).uncheck()
     assert code_status_line(page, "Repo/Drafts/alpha") == (
-        "Code Status: in progress · 3 unpushed"
+        "Code Status: 3 unpushed"
     )
     assert visible_card_paths(page, "3 unpushed") == ["Repo/Drafts/alpha"]
     page.fill("#filter", "")
@@ -7051,6 +7103,9 @@ def checkout_word_requirements():
         checkout_function_literals("_verdict_blockers")["returned"]
     attention_basis = checkout_function_literals("derive_attention")["named"]
     return [
+        (("packageTargetStatus",), set(models._PACKAGE_TARGET_STATUSES)),
+        (("packageBranchStatus",), set(models._PACKAGE_BRANCH_STATUSES)),
+        (("baselineStatus",), set(models._BASELINE_STATUSES)),
         (("attentionClass",), {name for name, _ in models._ATTENTION_CODES}),
         (("attentionCode",), {code for _, code in models._ATTENTION_CODES}),
         (("availabilityState",), availability["named"]),
@@ -7382,6 +7437,19 @@ def checkout_variant(document, mutate):
     return variant
 
 
+def with_unfinished(document, path):
+    """One capture with ``path`` served as unfinished, so the view lists it.
+
+    The view leaves out a finished work item that has no Code Status; a proof
+    about the words of such an item's branch row serves it unfinished instead.
+    The parser's cross-field rules are not the subject, so it is not consulted.
+    """
+    def mutate(variant):
+        package = next(item for item in variant["packages"] if item["package_path"] == path)
+        package["finished"] = False
+    return checkout_raw_variant(document, mutate)
+
+
 def open_view_checkouts(launch, view_checkouts, document):
     """Open the checkouts view over this fixture's catalog and ``document``."""
     double = BrowserCheckouts(document)
@@ -7593,9 +7661,16 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     branches = remote_view.locator("table.checkouts-package-branches tbody tr")
     assert remote_view.locator(
         "table.checkouts-package-branches caption").inner_text() == "Work item branches"
+    # A finished work item with no Code Status adds no row for its branch.
+    live = {
+        item["package_path"] for item in document["packages"]
+        if not item["finished"] or item["code_status"] is not None
+    }
+    assert [entry["name"] for entry in entries] == ["topic-a", "topic-c", "topic-d"]
     assert branches.evaluate_all(
         "rows => rows.map(row => row.dataset.branch)") == [
-        entry["name"] for entry in entries]
+        entry["name"] for entry in entries if live & set(entry["packages"])
+    ] == ["topic-a", "topic-d"]
     by_name = {entry["name"]: entry for entry in entries}
     topic_a = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-a"]')
@@ -7609,9 +7684,16 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
         "(Target repo)")
     assert topic_a.locator("[data-show-on-board]").inner_text() == "Show on board"
     assert by_name["topic-a"]["remote_verdict"] is None
+    # The finished work item has no Code Status, so its served branch adds no
+    # row until it is served as unfinished.
     topic_c = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-c"]')
+    assert by_name["topic-c"]["packages"] == ["Repo/Shipped/gamma"]
+    assert topic_c.count() == 0
+    serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
     assert topic_c.locator(".checkouts-remote-copy").inner_text() == "unknown"
+    serve_checkouts(page, double, document)
+    playwright.expect(topic_c).to_have_count(0)
 
     # Free clones come from the served list, in its order, with each distance.
     free = group["free_clones"]
@@ -7655,8 +7737,10 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
         "merge state unknown — no clone holds its commits")
     topic_c = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-c"]')
-    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    assert topic_c.count() == 0
     assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+    serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
+    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
 
 
 
@@ -7870,7 +7954,7 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
 
     assert sorted(shown("")) == sorted([remote, quiet])
     # The served Code Status text of a work item the group serves.
-    assert shown("in progress · pushed") == [remote]
+    assert shown("pushed") == [remote]
     # The availability words of a clone row.
     assert shown("has linked worktrees") == [remote]
     # The HEAD words of the quiet clone's main worktree, and its tree words.
@@ -8038,6 +8122,7 @@ def test_checkouts_word_tables_show_their_served_values(
     serve_checkouts(page, double, checked)
     assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
     shows("on the remote (live)")
+    serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
     shows("not on the remote")
     shows("live")
 
@@ -8166,6 +8251,7 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
 
     # A work item in a finished row the board is hiding says so and stays put.
     show_checkouts_view(page)
+    serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
     topic_c = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-c"]')
@@ -10846,3 +10932,349 @@ def test_board_settings_save_leaves_a_flagged_checkout_folders_draft_unsaveable(
     # A further edit redraws the editor; the save must still be refused for lack of a revision.
     refuse_folder_edits(page, FOLDERS_CHANGED_ELSEWHERE, ["/work/alpha", "/work/draft"])
     assert len(settings.folder_calls) == outside_saves
+
+
+# ---------------------------------------------------------------------------
+# The work item panel, the card tags and the finished work items the
+# checkouts view leaves out
+# ---------------------------------------------------------------------------
+
+PANEL_EMPTY_WORDS = "Click a work item to show its details here."
+
+
+def panel_rows(page):
+    """The panel's field rows as ``{label: words}``, in the order shown."""
+    return dict(page.locator("#work-item-panel-body .panel-fields .panel-row").evaluate_all(
+        "rows => rows.map(row => [row.querySelector('dt').textContent,"
+        " row.querySelector('dd').textContent])"))
+
+
+def panel_code_rows(page):
+    """The panel's Code rows as ``{label: words}``."""
+    return dict(page.locator("#work-item-panel-body .panel-code .panel-row").evaluate_all(
+        "rows => rows.map(row => [row.querySelector('dt').textContent,"
+        " row.querySelector('dd').innerText])"))
+
+
+def panel_links(page, relation):
+    """The link words one relationship list of the panel shows."""
+    return page.locator(
+        f'#work-item-panel-body .panel-links[data-relation="{relation}"] li'
+    ).all_inner_texts()
+
+
+def test_work_item_panel_follows_left_and_right_clicks(open_page):
+    """A click of either button fills the panel; only a left click on the selection clears it."""
+    value = json.loads(board_payload())
+    value["entries"][3]["declared"]["target_project"] = "Declared target"
+    value["entries"][3]["declared"]["status"] = "drafting"
+    value["entries"][3]["reported_fields"] = [{"name": "Owner", "value": "Robin"}]
+    _reseal(value)
+    page = open_page(StaticClient(value))
+    body = page.locator("#work-item-panel-body")
+    assert body.inner_text() == PANEL_EMPTY_WORDS
+    assert page.locator("#work-item-panel").get_attribute("aria-labelledby") == (
+        "work-item-panel-heading")
+
+    loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
+    loose.click()
+    assert body.locator(".panel-title").inner_text() == XSS_TITLE
+    assert body.locator("img").count() == 0
+    assert panel_rows(page) == {
+        "Stage": "Under Development",
+        "Project": "Beta",
+        "Filepath": "Beta/Under_Development/loose",
+        "Target Folder": "Declared target",
+        "Status": "drafting",
+        "Owner": "Robin",
+        "Package ID": LOOSE,
+    }
+    # The relationship an arrow draws is named here, with the other project.
+    assert panel_links(page, "needs") == ["Foundation step Alpha"]
+    assert body.locator('.panel-links[data-relation="blocks"]').count() == 0
+    # No checkout document is served, so the panel has no Code part.
+    assert body.locator(".panel-code").count() == 0
+
+    # A second left click clears the selection and the panel.
+    loose.click()
+    assert loose.get_attribute("aria-pressed") == "false"
+    assert body.inner_text() == PANEL_EMPTY_WORDS
+
+    # A right click fills it, and a second right click never clears it.
+    step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
+    step_two.click(button="right")
+    assert step_two.get_attribute("aria-pressed") == "true"
+    assert body.locator(".panel-title").inner_text() == "Dependent step"
+    assert panel_links(page, "needs") == ["Foundation step"]
+    assert panel_links(page, "blocks") == ["Gate step"]
+    step_two.click(button="right")
+    assert step_two.get_attribute("aria-pressed") == "true"
+    assert body.locator(".panel-title").inner_text() == "Dependent step"
+
+    # A relationship link selects the card it names and keeps focus in the panel.
+    body.get_by_role("button", name="Foundation step", exact=True).click()
+    step_one = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    assert step_one.get_attribute("aria-pressed") == "true"
+    assert step_two.get_attribute("aria-pressed") == "false"
+    assert body.locator(".panel-title").inner_text() == "Foundation step"
+    assert panel_links(page, "blocks") == ["Dependent step", f"{XSS_TITLE} Beta"]
+    assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
+
+
+def test_work_item_panel_collapses_and_remembers_the_choice(open_page):
+    """The panel starts open, gives its width back when collapsed, and the choice is stored."""
+    page = open_page(StaticClient(board_payload()))
+    # Wide enough that the board's own minimum width fits beside the open panel.
+    page.set_viewport_size({"width": 1600, "height": 900})
+    panel = page.locator("#work-item-panel")
+    toggle = page.locator("#work-item-panel-toggle")
+    body = page.locator("#work-item-panel-body")
+
+    def geometry():
+        return page.evaluate("""() => ({
+          panel: document.querySelector('#work-item-panel').getBoundingClientRect().width,
+          board: document.querySelector('#board').getBoundingClientRect().left,
+          row: document.querySelector('.row-head').getBoundingClientRect().left,
+          overflow: document.documentElement.scrollWidth - window.innerWidth,
+        })""")
+
+    opened = geometry()
+    assert toggle.get_attribute("aria-expanded") == "true"
+    assert toggle.inner_text() == "Hide details"
+    playwright.expect(body).to_be_visible()
+    # The board starts where the panel ends, and the page gains no sideways scroll.
+    assert opened["panel"] > 300
+    assert abs(opened["board"] - opened["panel"]) < 1
+    assert opened["row"] >= opened["panel"]
+    assert opened["overflow"] <= 0
+
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    rails = page.locator(".rail").count()
+    toggle.click()
+    collapsed = geometry()
+    assert toggle.get_attribute("aria-expanded") == "false"
+    assert toggle.inner_text() == "Details"
+    playwright.expect(body).to_be_hidden()
+    assert 0 < collapsed["panel"] < 60
+    assert abs(collapsed["board"] - collapsed["panel"]) < 1
+    assert page.evaluate("window.localStorage.getItem('spec-tracker-work-item-panel')") == "collapsed"
+    # The selection and its connections survive, redrawn for the wider board.
+    assert page.locator(".card.selected").count() == 1
+    assert page.locator(".rail").count() == rails
+
+    # A collapsed panel is still filled, so opening it shows the selection.
+    page.reload()
+    page.locator("#board .card").first.wait_for()
+    assert toggle.get_attribute("aria-expanded") == "false"
+    page.locator(f'.card[data-package-id="{GATE}"]').click()
+    toggle.click()
+    assert body.locator(".panel-title").inner_text() == "Gate step"
+    assert page.evaluate("window.localStorage.getItem('spec-tracker-work-item-panel')") == "open"
+
+    # The panel belongs to the board.
+    page.locator("#view-checkouts").click()
+    playwright.expect(panel).to_be_hidden()
+    assert page.evaluate(
+        "getComputedStyle(document.body).getPropertyValue('--panel-space').trim()") == "0px"
+    page.locator("#view-board").click()
+    playwright.expect(panel).to_be_visible()
+
+
+def test_work_item_panel_starts_collapsed_on_a_narrow_page(open_page):
+    """At a narrow width the open panel would cover the board, so it opens only when asked."""
+    page = open_page(StaticClient(board_payload()))
+    page.set_viewport_size({"width": 480, "height": 640})
+    toggle = page.locator("#work-item-panel-toggle")
+    playwright.expect(toggle).to_have_attribute("aria-expanded", "false")
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    card.click()
+    assert card.get_attribute("aria-pressed") == "true"
+    toggle.click()
+    assert page.locator("#work-item-panel-body .panel-title").inner_text() == "Foundation step"
+    # Opening it here is for this page only; the stored choice is not written.
+    assert page.evaluate("window.localStorage.getItem('spec-tracker-work-item-panel')") is None
+
+
+def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkouts):
+    """The Code part reads the served document and goes when the document cannot be shown."""
+    document = real_checkouts.document_zero
+    double = BrowserCheckouts(document)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    body = page.locator("#work-item-panel-body")
+    code_status_card(page, "Repo/Drafts/alpha").click()
+    package = next(
+        item for item in document["packages"] if item["package_path"] == "Repo/Drafts/alpha")
+    rows = panel_code_rows(page)
+    assert list(rows) == [
+        "Code Status", "Target repo", "Branch", "Remote copy", "Verdict", "Pull requests",
+        "Baseline",
+    ]
+    assert rows["Code Status"] == CHECKOUTS_CODE_STATUS_TEXTS["Repo/Drafts/alpha"]
+    assert rows["Target repo"] == Path(package["target"]["clone"]).name
+    assert rows["Branch"] == package["branch"]["name"]
+    assert rows["Remote copy"].startswith("on the remote (")
+    assert rows["Verdict"].startswith("not merged")
+    assert rows["Pull requests"] == "—"
+    assert panel_links(page, "blocks") == ["Beta"]
+
+    # A work item with no Code Status still shows what the scan knows of it.
+    code_status_card(page, "Repo/Drafts/delta").click()
+    delta = next(
+        item for item in document["packages"] if item["package_path"] == "Repo/Drafts/delta")
+    assert delta["code_status"] is None
+    rows = panel_code_rows(page)
+    assert "Code Status" not in rows
+    assert set(rows) >= {"Target repo", "Branch", "Baseline"}
+
+    # A tick that changes the selected work item rewrites the panel; one that
+    # changes nothing it shows leaves the same elements in place.
+    code_status_card(page, "Repo/Drafts/alpha").click()
+    heading = body.locator(".panel-title").element_handle()
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert heading.evaluate("node => node.isConnected")
+    double.serve(checkouts_with_text(document, "Repo/Drafts/alpha", "custom words"))
+    fire_checkouts_poll(page)
+    playwright.expect(body.locator(".panel-code-status dd")).to_have_text("custom words")
+
+    # A failed read removes the Code part with the card tags.
+    double.fail("checkouts_failed")
+    fire_checkouts_poll(page)
+    playwright.expect(body.locator(".panel-code")).to_have_count(0)
+    assert body.locator(".panel-title").inner_text() == "Alpha"
+
+
+def with_moved_base(document, path, count):
+    """One capture whose ``path`` reads ``count`` commits behind its base.
+
+    The attention list is derived again from the changed drift, so the item the
+    card and the panel show is the one the collector's own rule produces.
+    """
+    def mutate(variant):
+        package = next(item for item in variant["packages"] if item["package_path"] == path)
+        package["baseline"]["drift"] = {
+            "ahead": 0, "behind": count, "relation": "behind", "basis": "cached",
+            "objects_from": None,
+        }
+    return checkout_raw_variant(document, mutate)
+
+
+def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_checkouts):
+    """A card carries one tag per attention item naming it, and the panel the sentence."""
+    document = real_checkouts.document_zero
+    path = "Repo/Drafts/alpha"
+    moved = with_moved_base(document, path, 3)
+    assert [item["code"] for item in moved["attention"] if path in item["packages"]] == ["base_moved"]
+    double = BrowserCheckouts(document)
+    page = open_code_status_page(open_page, real_checkouts, double)
+    card = code_status_card(page, path)
+    assert card.locator(".card-attention").count() == 0
+    status = card.locator(".card-code-status").element_handle()
+
+    double.serve(checkouts_envelope(moved))
+    fire_checkouts_poll(page)
+    tag = card.locator(".card-attention")
+    playwright.expect(tag).to_have_text("base moved 3")
+    sentence = f"the base of {path} moved 3 commits past its Baseline"
+    assert tag.get_attribute("title") == sentence
+    assert tag.get_attribute("data-code") == "base_moved"
+    # The tag sits beside the Code Status, which was not replaced to add it.
+    assert card.locator(".card-facts > *").evaluate_all(
+        "tags => tags.map(tag => tag.className)") == ["card-code-status", "card-attention"]
+    assert page.locator(".card-attention").count() == 1
+
+    card.click()
+    rows = panel_code_rows(page)
+    assert rows["Needs attention"] == sentence
+    assert "the base moved 3 commits past it" in rows["Baseline"]
+
+    # The next scan without the drift removes the tag and the panel row.
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
+    playwright.expect(tag).to_have_count(0)
+    assert "Needs attention" not in panel_code_rows(page)
+    assert card.locator(".card-code-status").count() == 1
+    del status
+
+
+def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
+    open_page, view_checkouts
+):
+    """A finished work item with no Code Status adds no row, package name or search text."""
+    document = view_checkouts.document_built
+    gamma = next(
+        item for item in document["packages"] if item["package_path"] == "Repo/Shipped/gamma")
+    assert gamma["finished"] is True and gamma["code_status"] is None
+    assert gamma["target"]["status"] == "clone"
+    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    body = page.locator("#checkouts-body")
+    clone_name = Path(gamma["target"]["clone"]).name
+    group = page.locator(".checkouts-group").filter(
+        has=page.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]'))
+    clone_row = group.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]')
+
+    def gamma_shown():
+        return {
+            "branch": group.locator(
+                'table.checkouts-package-branches tr[data-branch="topic-c"]').count(),
+            "package": "Repo/Shipped/gamma" in clone_row.locator(".checkouts-package").inner_text(),
+            "detail": group.locator(
+                '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count(),
+            "anywhere": "Repo/Shipped/gamma" in body.inner_text(),
+            "search": "repo/shipped/gamma" in group.get_attribute("data-search"),
+        }
+
+    assert gamma_shown() == {
+        "branch": 0, "package": False, "detail": 0, "anywhere": False, "search": False,
+    }
+    # The unfinished work items of the same clone are still listed.
+    assert "Repo/Drafts/alpha" in clone_row.locator(".checkouts-package").inner_text()
+    page.fill("#filter", "gamma")
+    playwright.expect(group).to_be_hidden()
+    page.fill("#filter", "")
+
+    # Served as unfinished, the same work item is listed everywhere again.
+    serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
+    assert gamma_shown() == {
+        "branch": 1, "package": True, "detail": 1, "anywhere": True, "search": True,
+    }
+    page.fill("#filter", "gamma")
+    playwright.expect(group).to_be_visible()
+
+
+def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
+    open_page, view_checkouts
+):
+    """Only a work item the view still lists makes its target's repository a group."""
+    document = view_checkouts.document_built
+    [quiet] = [
+        group for group in document["repositories"]
+        if str(group["remote"]["display"]).endswith("quiet")
+    ]
+    quiet_clone = quiet["clones"][0]["path"]
+
+    def retarget(finished):
+        def mutate(variant):
+            package = next(
+                item for item in variant["packages"]
+                if item["package_path"] == "Repo/Shipped/gamma")
+            package["target"] = {
+                "status": "clone", "clone": quiet_clone, "worktree": None,
+                "within_folders": None,
+            }
+            package["finished"] = finished
+        return checkout_raw_variant(document, mutate)
+
+    page, double = open_view_checkouts(open_page, view_checkouts, retarget(True))
+    quiet_items = page.locator("details.checkouts-quiet li")
+    quiet_group = page.locator(".checkouts-group").filter(
+        has=page.locator(f'tr.checkouts-clone[data-clone="{Path(quiet_clone).name}"]'))
+    # The finished work item targets the quiet clone and changes nothing.
+    assert quiet_items.count() == 1
+    assert quiet_group.count() == 0
+
+    # The same work item, unfinished, gives the repository a group of its own.
+    serve_checkouts(page, double, retarget(False))
+    playwright.expect(quiet_group).to_have_count(1)
+    assert quiet_items.count() == 0
+    assert "Repo/Shipped/gamma" in quiet_group.locator(".checkouts-package").inner_text()
