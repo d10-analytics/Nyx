@@ -101,10 +101,12 @@ README is narrative only.
 saves them through the checkout settings `PUT` served by `application-serving`,
 never through this system. It
   takes every fact and attention item from the document; the only things it
-  decides itself are presentation: which repositories the quiet row collects,
+  decides itself are presentation: which finished work items it leaves out
+  (those with no Code Status), which repositories the quiet row collects,
   which pull-request lookup state the status line names, where each attention
   item sends focus, and which of the words it shows the search matches. The board renders the served
-  document's Code Status as a card line and never derives, rescans or ages it:
+  document's Code Status as a card tag, and the work item's other served facts
+  in its work item panel, and never derives, rescans or ages them:
   the line holds the text `nyx checkouts --json` gives from the last successful
   scan, refreshed about once a minute by `application-serving` and updated in
   place on its own without **Apply update**, searchable with the card's other
