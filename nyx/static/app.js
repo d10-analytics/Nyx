@@ -1034,9 +1034,11 @@
     // the colours and the search can never disagree.  A cached basis is named.
     const counted = (comparison, tone, subject) => {
       const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
-      return (tone === "grey" || comparison.behind === null
+      const behind = comparison.behind === null && comparison.relation === "equal"
+        ? 0 : comparison.behind;
+      return (tone === "grey" || behind === null
         ? `${subject} unknown against main`
-        : `${subject} ${comparison.behind} behind main`) + named;
+        : `${subject} ${behind} behind main`) + named;
     };
     const words = [
       {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
