@@ -2561,3 +2561,98 @@ def test_baseline_header_does_not_reach_the_catalog_wire(tmp_path) -> None:
         assert catalog.scan_catalog(root) == rendered
     entries = {entry["package_path"]: entry for entry in json.loads(rendered)["entries"]}
     assert {"name": "Baseline", "value": HEX40} in entries["Fictional/Drafts/plain"]["reported_fields"]
+
+
+def _edges_by_target(root: Path, dependent_path: str) -> dict[str | None, dict]:
+    entries = {entry["package_path"]: entry for entry in json.loads(catalog.scan_catalog(root))["entries"]}
+    return {
+        edge["target_package_id"]: edge
+        for edge in entries[dependent_path]["relationship"]["prerequisites"]
+        if edge["kind"] == "completion"
+    }
+
+
+def test_package_heads_resolve_completion_rows_as_the_catalog_edges_do(tmp_path) -> None:
+    dependent_id = "10000000-0000-4000-8000-000000000001"
+    resolved_id = "10000000-0000-4000-8000-000000000002"
+    missing_id = "10000000-0000-4000-8000-000000000003"
+    shared_id = "10000000-0000-4000-8000-000000000004"
+    root = tmp_path / "specs"
+    package(
+        root, "Drafts", "dependent",
+        f"# Dependent\nPackage ID: {dependent_id}\n"
+        f"Completion Prerequisite: {resolved_id}\n"
+        f"Completion Prerequisite: {missing_id}\n"
+        f"Completion Prerequisite: {shared_id}\n"
+        f"Completion Prerequisite: {dependent_id}\n"
+        "Completion Prerequisite: not-an-id\n"
+        f"Prerequisite: {resolved_id} | handoff\n",
+    )
+    package(root, "Done", "resolved", f"# Resolved\nPackage ID: {resolved_id}\n")
+    package(root, "Done", "shared-a", f"# A\nPackage ID: {shared_id}\n")
+    package(root, "Shelf", "shared-b", f"# B\nPackage ID: {shared_id}\n")
+    path = "Fictional/Drafts/dependent"
+
+    edges = _edges_by_target(root, path)
+    head = _heads_by_name(catalog.scan_package_heads(root))["dependent"]
+    rows = head.completion_prerequisites
+
+    assert [row.target_package_id for row in rows] == [
+        resolved_id, missing_id, shared_id, dependent_id, None,
+    ]
+    assert [row.reason for row in rows] == [
+        None, "missing_target", "duplicate_target", "self_edge", "invalid_prerequisite",
+    ]
+    assert rows[0].target_path == "Fictional/Done/resolved"
+    assert all(row.target_path is None for row in rows[1:])
+    for row in rows:
+        edge = edges[row.target_package_id]
+        if row.reason is None:
+            assert edge["reason"].startswith("completion_")
+        else:
+            assert edge["reason"] == row.reason
+
+
+def test_package_heads_match_edges_when_identity_coverage_is_incomplete(tmp_path) -> None:
+    dependent_id = "20000000-0000-4000-8000-000000000001"
+    target_id = "20000000-0000-4000-8000-000000000002"
+    absent_id = "20000000-0000-4000-8000-000000000003"
+    root = tmp_path / "specs"
+    package(
+        root, "Drafts", "dependent",
+        f"# Dependent\nPackage ID: {dependent_id}\n"
+        f"Completion Prerequisite: {target_id}\n"
+        f"Completion Prerequisite: {absent_id}\n",
+    )
+    package(root, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
+    unreadable = package(root, "Queue", "unreadable", V1)
+    anchor = unreadable / "spec.md"
+    if sys.platform == "win32":
+        original_open = catalog.Path.open
+
+        def deny_unreadable(path, *args, **kwargs):
+            if path == anchor:
+                raise PermissionError("injected unreadable anchor")
+            return original_open(path, *args, **kwargs)
+
+        open_patch = patch.object(
+            catalog.Path, "open", autospec=True, side_effect=deny_unreadable
+        )
+    else:
+        anchor.chmod(0)
+        open_patch = nullcontext()
+    try:
+        with open_patch:
+            edges = _edges_by_target(root, "Fictional/Drafts/dependent")
+            heads = catalog.scan_package_heads(root)
+    finally:
+        if sys.platform != "win32":
+            anchor.chmod(0o600)
+
+    assert heads.status == "incomplete"
+    rows = _heads_by_name(heads)["dependent"].completion_prerequisites
+    assert [row.target_package_id for row in rows] == [target_id, absent_id]
+    for row in rows:
+        assert row.reason == "identity_coverage_incomplete"
+        assert row.target_path is None
+        assert edges[row.target_package_id]["reason"] == row.reason
