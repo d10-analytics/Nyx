@@ -736,9 +736,10 @@ wording. The five states, in the order they are decided:
   belongs to another repository.
 
 A call is made only for a merged prerequisite, and none is made for any other.
-The pill is recomputed on every run and never saved; when time runs short, merged
-prerequisites read unknown first and a prerequisite already known not merged
-still reads `not_merged`.
+The pill is recomputed on every run and never saved; when time runs short, the
+`in_checkout` fact of a merged prerequisite reads `unknown` first while its
+`merged_on_main` can still read `merged`, and a prerequisite already known not
+merged still reads `not_merged`.
 
 ### Availability
 
