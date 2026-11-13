@@ -1788,8 +1788,6 @@
     return null;
   }
 
-  // The checkout facts of one work item, read from the served document as the
-  // Checkouts view reads them; nothing while no document can be shown.
   // The legend of the baseline line, one entry per convention the strip uses.
   const BASELINE_LEGEND = [
     ["B", "the Baseline"],
@@ -1812,6 +1810,8 @@
       `<ul class="panel-baseline-legend">${legend}</ul>`;
   }
 
+  // The checkout facts of one work item, read from the served document as the
+  // Checkouts view reads them; nothing while no document can be shown.
   function panelCodeHtml(entry) {
     const document = servedCheckoutsDocument();
     if (document === null) return "";
