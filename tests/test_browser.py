@@ -11197,6 +11197,297 @@ def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_check
     del status
 
 
+BASELINE_LINE_CARDS = (
+    "Repo/Drafts/alpha", "Repo/Drafts/beta", "Repo/Drafts/delta", "Repo/Drafts/epsilon",
+)
+BASELINE_LINE_SHA = "b" * 40
+BASELINE_LINE_TONE_COLORS = {
+    "green": "--state-done", "yellow": "--state-waiting", "red": "--state-failed",
+    "grey": "--control-border",
+}
+
+
+def comparison(relation, ahead=None, behind=None):
+    """One served comparison, shaped as the collector writes it."""
+    return {
+        "basis": "cached", "relation": relation, "ahead": ahead, "behind": behind,
+        "objects_from": None,
+    }
+
+
+def with_baseline_facts(document, states):
+    """One capture where each path in ``states`` has a declared Baseline and checkout.
+
+    ``states`` maps a package path to ``(drift, vs_baseline, vs_base)``, or to
+    ``None`` for a package served without a checkout.  The variant is served
+    unparsed: the line reads only the document, and the collector's own proof
+    of the document is its own.
+    """
+    def mutate(variant):
+        for package in variant["packages"]:
+            if package["package_path"] not in states:
+                continue
+            state = states[package["package_path"]]
+            if state is None:
+                package["baseline"]["drift"] = None
+                package["baseline"]["checkout"] = None
+                continue
+            drift, versus, against = state
+            package["baseline"]["status"] = "declared"
+            package["baseline"]["sha"] = BASELINE_LINE_SHA
+            package["baseline"]["drift"] = drift
+            package["baseline"]["checkout"] = {
+                "sha": "c" * 40, "vs_baseline": versus, "vs_base": against,
+            }
+    return checkout_raw_variant(document, mutate)
+
+
+def serve_baseline_states(page, double, states):
+    """Deliver one poll whose packages carry ``states`` and let the cards settle."""
+    double.serve(checkouts_envelope(with_baseline_facts(double.document, states)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+
+BASELINE_LINE_READ = """card => {
+  const rect = (node) => {
+    const box = node.getBoundingClientRect();
+    return {x: box.x, y: box.y, width: box.width, height: box.height,
+            cx: box.x + box.width / 2, cy: box.y + box.height / 2, right: box.right};
+  };
+  const lines = card.querySelectorAll('.card-baseline');
+  const line = lines[0];
+  if (!line) return {count: 0};
+  const base = rect(line);
+  const point = (name) => {
+    const node = line.querySelector(`.baseline-point[data-point="${name}"]`);
+    const box = rect(node);
+    const style = getComputedStyle(node);
+    return {
+      tone: node.dataset.tone, form: node.dataset.form || null, fork: 'fork' in node.dataset,
+      check: node.querySelector('.baseline-check') !== null,
+      cx: box.cx - base.x, cy: box.cy - base.y, width: box.width, height: box.height,
+      right: box.right - base.x, background: style.backgroundColor,
+      color: node.querySelector('.baseline-check')
+        ? getComputedStyle(node.querySelector('.baseline-check')).color : null,
+    };
+  };
+  const link = line.querySelector('.baseline-link[data-link="main"]');
+  const added = line.querySelector('.baseline-added');
+  const behind = line.querySelector('.baseline-behind');
+  return {
+    count: lines.length, surface: getComputedStyle(line).backgroundColor,
+    B: point('B'), C: point('C'), M: point('M'),
+    link: {tone: link.dataset.tone, line: link.dataset.line || null,
+           style: getComputedStyle(link).borderTopStyle},
+    fork: line.querySelector('.baseline-link[data-link="fork"]') !== null,
+    added: added ? added.textContent : null,
+    behind: behind ? behind.textContent : null,
+    behindLeft: behind ? rect(behind).x - base.x : null,
+  };
+}"""
+
+
+def baseline_line(page, path):
+    """What one card's baseline line draws, by its markup and its rendered boxes."""
+    return code_status_card(page, path).evaluate(BASELINE_LINE_READ)
+
+
+def baseline_token_color(page, name):
+    """The computed colour of one theme token."""
+    return page.evaluate(
+        """name => {
+          const probe = document.createElement('span');
+          probe.style.color = `var(${name})`;
+          document.body.append(probe);
+          const color = getComputedStyle(probe).color;
+          probe.remove();
+          return color;
+        }""",
+        name,
+    )
+
+
+def baseline_line_cases(page, double, cases):
+    """Serve ``cases`` four at a time, one per card, and yield each case with its line."""
+    for start in range(0, len(cases), len(BASELINE_LINE_CARDS)):
+        chunk = cases[start:start + len(BASELINE_LINE_CARDS)]
+        padded = chunk + [chunk[0]] * (len(BASELINE_LINE_CARDS) - len(chunk))
+        serve_baseline_states(
+            page, double, {path: case[0] for path, case in zip(BASELINE_LINE_CARDS, padded)})
+        for path, case in zip(BASELINE_LINE_CARDS, chunk):
+            yield case, baseline_line(page, path)
+
+
+def baseline_line_page(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    return open_code_status_page(open_page, real_checkouts, double), double
+
+
+EQUAL = comparison("equal")
+BASELINE_VS_MAIN_CASES = [
+    ("equal", EQUAL, "green"),
+    ("ahead", comparison("ahead", 2, 0), "green"),
+    ("behind 3", comparison("behind", 0, 3), "yellow"),
+    ("behind 58", comparison("behind", 0, 58), "yellow"),
+    ("diverged", comparison("diverged", 1, 4), "yellow"),
+    ("differs", comparison("differs"), "grey"),
+    ("unknown", comparison("unknown"), "grey"),
+]
+
+
+def test_baseline_line_tones_follow_the_one_rule(
+    open_page, real_checkouts
+):
+    """Each fact's tone is the rule's result: no count makes red, and unknown is grey."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    versus_cases = [
+        ((EQUAL, comparison(relation, ahead, behind), EQUAL), tone)
+        for relation, ahead, behind, tone in [
+            ("equal", None, None, "green"), ("ahead", 5, 0, "yellow"),
+            ("behind", 0, 2, "red"), ("diverged", 1, 2, "red"),
+            ("differs", None, None, "red"), ("unknown", None, None, "grey"),
+        ]
+    ]
+    for (state, tone), line in baseline_line_cases(page, double, versus_cases):
+        assert line["count"] == 1
+        assert line["C"]["tone"] == tone, (state[1]["relation"], line["C"])
+        assert (line["C"]["check"]) is (tone == "green")
+    against_cases = [((EQUAL, EQUAL, against), tone) for _, against, tone in BASELINE_VS_MAIN_CASES]
+    for (state, tone), line in baseline_line_cases(page, double, against_cases):
+        assert line["M"]["tone"] == tone, (state[2], line["M"])
+        assert line["link"]["tone"] == tone and line["link"]["line"] is None
+    drift_cases = [((drift, EQUAL, EQUAL), tone) for _, drift, tone in BASELINE_VS_MAIN_CASES]
+    for (state, tone), line in baseline_line_cases(page, double, drift_cases):
+        assert line["B"]["tone"] == tone, (state[0], line["B"])
+    # The same tone in the 3-behind and 58-behind cases: no count sets a colour.
+    assert BASELINE_VS_MAIN_CASES[2][2] == BASELINE_VS_MAIN_CASES[3][2] == "yellow"
+    # Main unknown is the one red M, and the line to it is dashed grey.
+    (_, line), = baseline_line_cases(
+        page, double, [((comparison("absent"), EQUAL, comparison("absent")), "red")])
+    assert line["M"]["tone"] == "red"
+    assert line["link"] == {"tone": "grey", "line": "dashed", "style": "dashed"}
+    assert line["C"]["tone"] == "green" and not line["C"]["check"]
+    # One marker per tone is drawn in its token's computed colour.
+    for tone, token in BASELINE_LINE_TONE_COLORS.items():
+        expected = baseline_token_color(page, token)
+        relation = {"green": EQUAL, "yellow": comparison("behind", 0, 3),
+                    "red": comparison("absent"), "grey": comparison("unknown")}[tone]
+        (_, line), = baseline_line_cases(page, double, [((EQUAL, EQUAL, relation), tone)])
+        assert line["M"]["tone"] == tone
+        assert line["M"]["background"] == expected, (tone, line["M"])
+
+
+def test_baseline_line_markers_place_the_checkout_by_order_alone(
+    open_page, real_checkouts
+):
+    """Ring, plus count, fork, side, dotted form and the count beside M, never a distance."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    behind = comparison("behind", 0, 3)
+    cases = [
+        ((EQUAL, EQUAL, EQUAL), "equal"),
+        ((behind, comparison("ahead", 5, 0), EQUAL), "forked"),
+        ((EQUAL, comparison("ahead", 5, 0), EQUAL), "plain"),
+        ((EQUAL, comparison("behind", 0, 2), EQUAL), "left"),
+        ((EQUAL, comparison("diverged", 1, 2), EQUAL), "diverged"),
+        ((EQUAL, comparison("differs"), EQUAL), "differs"),
+        ((EQUAL, EQUAL, behind), "behind3"),
+        ((EQUAL, EQUAL, comparison("behind", 0, 58)), "behind58"),
+    ]
+    lines = {tag: line for (_, tag), line in baseline_line_cases(page, double, cases)}
+    assert lines["equal"]["C"]["form"] == "ring"
+    assert abs(lines["equal"]["C"]["cx"] - lines["equal"]["B"]["cx"]) < 1
+    assert lines["equal"]["added"] is None and lines["equal"]["C"]["check"] is True
+    for tag in ("forked", "plain"):
+        assert lines[tag]["added"] == "+5"
+        assert lines[tag]["C"]["cx"] > lines[tag]["B"]["cx"] + 4
+        assert lines[tag]["C"]["check"] is False
+    assert lines["forked"]["fork"] and lines["forked"]["C"]["fork"]
+    assert lines["forked"]["C"]["cy"] < lines["forked"]["B"]["cy"] - 3
+    assert not lines["plain"]["fork"] and not lines["plain"]["C"]["fork"]
+    assert abs(lines["plain"]["C"]["cy"] - lines["plain"]["B"]["cy"]) < 1
+    assert lines["left"]["C"]["cx"] < lines["left"]["B"]["cx"] - 4
+    assert lines["left"]["added"] is None
+    for tag in ("diverged", "differs"):
+        assert lines[tag]["C"]["form"] == "dotted"
+        assert lines[tag]["C"]["cy"] < lines[tag]["B"]["cy"] - 3
+    assert lines["behind3"]["behind"] == "3" and lines["behind58"]["behind"] == "58"
+    for tag in ("behind3", "behind58"):
+        assert lines[tag]["behindLeft"] >= lines[tag]["M"]["right"] - 1
+    assert lines["equal"]["behind"] is None
+    for name in ("B", "C", "M"):
+        three, fifty_eight = lines["behind3"][name], lines["behind58"][name]
+        for key in ("cx", "cy", "width", "height"):
+            assert three[key] == pytest.approx(fifty_eight[key], abs=0.5), (name, key)
+    # The check mark needs three green tones.
+    assert lines["equal"]["C"]["check"] and lines["equal"]["M"]["tone"] == "green"
+    for tag in ("behind3", "forked", "left", "diverged"):
+        assert lines[tag]["C"]["check"] is False
+
+
+def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_checkout(
+    open_page, real_checkouts
+):
+    """One line per card with a checkout, grey when all unknown, none when none is served."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    unknown = comparison("unknown")
+    gamma = "Repo/Shipped/gamma"
+    assert page.locator(".card-baseline").count() == 0
+    serve_baseline_states(page, double, {
+        BASELINE_LINE_CARDS[0]: (unknown, unknown, unknown),
+        BASELINE_LINE_CARDS[1]: (EQUAL, EQUAL, EQUAL),
+        BASELINE_LINE_CARDS[2]: None,
+    })
+    line = baseline_line(page, BASELINE_LINE_CARDS[0])
+    assert line["count"] == 1
+    assert [line[name]["tone"] for name in "BCM"] == ["grey"] * 3
+    assert line["C"]["check"] is False
+    assert baseline_line(page, BASELINE_LINE_CARDS[1])["C"]["check"] is True
+    for path in (BASELINE_LINE_CARDS[2], BASELINE_LINE_CARDS[3], gamma):
+        assert baseline_line(page, path)["count"] == 0, path
+    # Several polls changing the facts in place still leave one line per card.
+    for state in [(EQUAL, comparison("ahead", 5, 0), comparison("behind", 0, 3)),
+                  (comparison("absent"), EQUAL, comparison("absent")), (EQUAL, EQUAL, EQUAL)]:
+        serve_baseline_states(page, double, {path: state for path in BASELINE_LINE_CARDS})
+        assert [baseline_line(page, path)["count"] for path in BASELINE_LINE_CARDS] == [1] * 4
+        assert baseline_line(page, gamma)["count"] == 0
+    assert page.locator(".card-baseline").count() == 4
+    # A poll back to a null checkout removes the line; a failed read hides the rest.
+    serve_baseline_states(page, double, {
+        BASELINE_LINE_CARDS[0]: None, BASELINE_LINE_CARDS[1]: (EQUAL, EQUAL, EQUAL)})
+    assert baseline_line(page, BASELINE_LINE_CARDS[0])["count"] == 0
+    assert page.locator(".card-baseline").count() == 1
+    double.fail("checkouts_failed")
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.locator(".card-baseline").count() == 0
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_baseline_line_is_readable_on_every_card_surface(
+    open_page, real_checkouts, theme
+):
+    """Red reads 4.5:1 on the line's surface on both cards; the check reads 3:1 on its green."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    teal, neutral = BASELINE_LINE_CARDS[0], BASELINE_LINE_CARDS[1]
+    assert code_status_card(page, teal).evaluate(
+        "card => getComputedStyle(card).backgroundColor") == NO_INCOMING_CARD
+    serve_baseline_states(page, double, {
+        path: (comparison("absent"), EQUAL, comparison("absent")) for path in (teal, neutral)})
+    for path in (teal, neutral):
+        line = baseline_line(page, path)
+        assert line["M"]["tone"] == "red"
+        assert contrast_ratio(line["M"]["background"], line["surface"]) >= 4.5, (theme, path, line)
+    serve_baseline_states(page, double, {path: (EQUAL, EQUAL, EQUAL) for path in (teal, neutral)})
+    for path in (teal, neutral):
+        line = baseline_line(page, path)
+        assert line["C"]["check"]
+        assert contrast_ratio(line["C"]["color"], line["C"]["background"]) >= 3, (theme, line)
+        expected = "rgb(255, 255, 255)" if theme == "light" else "rgb(17, 24, 33)"
+        assert line["C"]["color"] == expected
+
+
 def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     open_page, view_checkouts
 ):
