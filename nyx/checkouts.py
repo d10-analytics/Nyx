@@ -3850,8 +3850,15 @@ def _prerequisite_targets(
 
 # The rungs whose evidence tip is a commit that reaches the base itself, so a tip a checkout
 # lacks is evidence the work is not there: an equivalence verdict says the work landed by
-# other commits. A ``pull_request`` rung's evidence tip is the request's merge commit.
+# other commits. A ``pull_request`` entry stands for the whole pull-request pair below.
 _CONTAINMENT_RUNGS = frozenset({"ancestor", "pull_request"})
+# A prerequisite decided through a pull request carries two evidence entries, the branch or
+# request tip (rung ``pull_head``) immediately followed by the request's merge commit (rung
+# ``pull_request``). Either one in the checkout shows the work is there; a squash or rebase
+# merge leaves the tip outside the base, and a checkout stacked on the branch holds the tip
+# but not the merge commit.
+_PULL_TIP = "pull_head"
+_PULL_MERGE = "pull_request"
 
 
 def _clone_in_checkout(
@@ -3863,16 +3870,19 @@ def _clone_in_checkout(
     """Decide ``yes``, ``no`` or ``unknown`` for each request of one clone.
 
     A request is (key, checked-out commit C, evidence tips with their verdict rungs); a
-    null C reads ``unknown`` with no call. A tip of the ``pull_request`` rung is the
-    request's merge commit, ``None`` when GitHub named none; a null tip reads ``unknown``
-    and so does a merge commit the clone lacks. Each distinct tip takes one presence probe in
-    the clone; a tip a complete clone lacks is not in C, and every other tip takes one
-    ``merge-base --is-ancestor`` against C, memoised on ``("contains", C, tip)``, run
-    under the verdict overlay with no alternate object directory. An incomplete clone
-    makes no call. A tip not in C reads ``no`` when its verdict came from ancestry or a
-    pull request and ``unknown`` otherwise; a failed or cut call reads ``unknown``. One
-    tip known missing decides ``no`` whatever the others say, and ``yes`` needs every tip
-    in C.
+    null C reads ``unknown`` with no call. A pull-request verdict is two consecutive
+    entries, the branch or request tip (rung ``pull_head``) and the request's merge commit
+    (rung ``pull_request``; ``None`` when GitHub named none, and for a request rebuilt from
+    a saved record). That pair reads ``yes`` when either commit is in C, ``no`` only when
+    the merge commit is present in the clone and not in C and the tip is present and not
+    in C, and ``unknown`` otherwise, including a tip or merge commit the clone lacks.
+    Each distinct tip takes one presence probe in the clone; a tip a complete clone lacks
+    is not in C, and every other tip takes one ``merge-base --is-ancestor`` against C,
+    memoised on ``("contains", C, tip)``, run under the verdict overlay with no alternate
+    object directory. An incomplete clone makes no call. A tip not in C reads ``no`` when
+    its verdict came from ancestry and ``unknown`` otherwise; a failed or cut call reads
+    ``unknown``. One entry known not in C decides ``no`` whatever the others say, and
+    ``yes`` needs every entry (every pull-request pair) in C.
     """
     complete = context is not None and not context.partial and not context.shallow
     tips = sorted(
@@ -3914,20 +3924,37 @@ def _clone_in_checkout(
                     memo[key] = {0: True, 1: False}.get(outcome.code)
         return memo[key]
 
+    def held_in(commit: str, tip: str | None) -> bool | None:
+        """Whether the tip is in ``commit``; ``None`` when the clone lacks it or cannot say."""
+        return None if present.get(tip or "") == "missing" else contains(commit, tip)
+
+    def pull_pair(commit: str, tip: str | None, merge: str | None) -> bool | None:
+        """The pair's reading: ``True`` when either commit is in ``commit``, ``False`` when
+        both are known not to be, else ``None``."""
+        by_tip = held_in(commit, tip)
+        by_merge = held_in(commit, merge)
+        if by_tip is True or by_merge is True:
+            return True
+        return False if by_tip is False and by_merge is False else None
+
     result: dict[Any, str] = {}
     for key, commit, pairs in requests:
         if commit is None:
             result[key] = "unknown"
             continue
-        found = [
-            (
-                None
-                if rung == "pull_request" and present.get(tip or "") == "missing"
-                else contains(commit, tip),
-                rung,
-            )
-            for tip, rung in pairs
-        ]
+        found: list[tuple[bool | None, str | None]] = []
+        index = 0
+        while index < len(pairs):
+            tip, rung = pairs[index]
+            if rung == _PULL_TIP:
+                merge = None
+                if index + 1 < len(pairs) and pairs[index + 1][1] == _PULL_MERGE:
+                    merge = pairs[index + 1][0]
+                    index += 1
+                found.append((pull_pair(commit, tip, merge), _PULL_MERGE))
+            else:
+                found.append((contains(commit, tip), rung))
+            index += 1
         if any(held is False and rung in _CONTAINMENT_RUNGS for held, rung in found):
             result[key] = "no"
         elif found and all(held is True for held, _ in found):
@@ -3957,10 +3984,9 @@ def _assign_in_checkout(
     A prerequisite is merged under the rule the Code Status gives (the same
     ``branch_evidence`` decision, ``no_commits_yet`` first) or, with no Code Status, by the
     highest-numbered merged request. A tip decided through a pull request is evidenced by
-    that request's merge commit, never by its head, which a squash or rebase merge leaves
-    outside the base. Only a prerequisite
-    of the dependent's own repository group, merged, with a checked-out commit known takes
-    part; every other item keeps ``unknown`` and no call is made for it. One job per
+    the tip and that request's merge commit together (see ``_clone_in_checkout``). Only a
+    prerequisite of the dependent's own repository group, merged, with a checked-out commit
+    known takes part; every other item keeps ``unknown`` and no call is made for it. One job per
     dependent clone decides its requests, and nothing is written or cached here.
     """
     rows = {
@@ -4013,15 +4039,18 @@ def _assign_in_checkout(
             if found is None:
                 request = _latest_merged_request(pulls, repository, entry.name)
                 if request is not None:
-                    tips = [(request.merge, "pull_request")]
+                    tips = [(request.head, _PULL_TIP), (request.merge, _PULL_MERGE)]
             elif found.merged:
                 numbers = dict(found.pull_requests)
-                tips = [
-                    (merge_commit(remote and remote["key"], numbers.get(tip)), rung)
-                    if rung == "pull_request"
-                    else (tip, rung)
-                    for tip, rung in found.tips
-                ]
+                tips = []
+                for tip, rung in found.tips:
+                    if rung == "pull_request":
+                        tips.append((tip, _PULL_TIP))
+                        tips.append(
+                            (merge_commit(remote and remote["key"], numbers.get(tip)), _PULL_MERGE)
+                        )
+                    else:
+                        tips.append((tip, rung))
         evidence[id(target)] = tips
         return tips
 
