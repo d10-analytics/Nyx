@@ -1063,6 +1063,11 @@
       `<span class="baseline-point" data-point="${name}" data-tone="${tone}"${extra}>${inner}</span>`;
     const link = (name, tone, extra) =>
       `<span class="baseline-link" data-link="${name}" data-tone="${tone}"${extra}></span>`;
+    // The fork runs corner to corner of its box as an anti-aliased stroke.
+    const forkLink = (tone) =>
+      `<span class="baseline-link" data-link="fork" data-tone="${tone}">` +
+      '<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' +
+      '<line x1="0" y1="100" x2="100" y2="0" vector-effect="non-scaling-stroke"/></svg></span>';
     const form = model.place === "equal" ? "ring"
       : model.place === "off" || model.place === "unplaced" ? "dotted" : "solid";
     const words = text(model.words.join(", "));
@@ -1071,7 +1076,7 @@
       (model.forked || (model.place !== "left" && model.place !== "right")
         ? "" : link("checkout", model.tones.checkout, "")) +
       link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
-      (model.forked ? link("fork", model.tones.checkout, "") : "") +
+      (model.forked ? forkLink(model.tones.checkout) : "") +
       point("B", model.tones.baseline, "", "") +
       point("C", model.tones.checkout,
         ` data-form="${form}"${model.forked ? " data-fork" : ""}`,

@@ -652,7 +652,7 @@ button.pending {
 .card-baseline[data-place="right"] { --b: 12%; --c: 40%; }
 .card-baseline[data-place="left"] { --b: 40%; --c: 12%; }
 .card-baseline[data-place="off"], .card-baseline[data-place="unplaced"] { --b: 40%; --c: 12%; --c-top: .55rem; }
-.baseline-point[data-fork] { --c-top: .5rem; }
+.card-baseline:has(.baseline-point[data-fork]) { --c-top: .5rem; }
 .baseline-point, .baseline-link, .baseline-added, .baseline-behind { position: absolute; }
 .baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
 .baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
@@ -690,11 +690,22 @@ button.pending {
 .card-baseline[data-place="right"]:has(.baseline-point[data-fork]) .baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
 .baseline-link[data-link="checkout"] { left: min(var(--b), var(--c)); width: 28%; }
 .baseline-link[data-link="fork"] {
+  /* The box spans B (bottom left) to the raised C (top right), so its
+     diagonal runs centre to centre; an SVG stroke paints it anti-aliased. */
   left: var(--b);
-  top: .9rem;
-  width: 1.4rem;
-  transform-origin: left center;
-  transform: rotate(-26deg);
+  top: var(--c-top);
+  width: calc(var(--c) - var(--b));
+  height: calc(1.3rem - var(--c-top));
+  border-top: 0;
+}
+.baseline-link[data-link="fork"] svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  stroke: var(--tone);
+  stroke-width: 2px;
+  stroke-linecap: round;
 }
 .baseline-added, .baseline-behind {
   top: .35rem;
