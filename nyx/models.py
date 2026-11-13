@@ -2689,7 +2689,8 @@ def _check_prerequisites(
 def _check_prerequisite_facts(packages: Sequence[Mapping[str, Any]]) -> None:
     """Check every pill item's main fact against the one listed package it names.
 
-    A ``merged`` or ``not_merged`` fact must agree with that package's Code Status. With
+    A ``merged`` or ``not_merged`` fact needs exactly one listed package and must agree with
+    its Code Status. With
     no Code Status the package is merged only through a declared branch on a clone or
     worktree target, and is never ``not_merged``. An ``unknown`` fact stands whatever
     the package's Code Status, since a row that did not resolve stays unknown.
@@ -2705,9 +2706,11 @@ def _check_prerequisite_facts(packages: Sequence[Mapping[str, Any]]) -> None:
         for position, item in enumerate(pill["items"]):
             fact = item["merged_on_main"]
             named = listed.get(item["target_package_id"], [])
-            if fact == "unknown" or len(named) != 1:
+            if fact == "unknown":
                 continue
             label = f"packages[{index}].prerequisites.items[{position}].merged_on_main"
+            if len(named) != 1:
+                raise ProtocolError(f"{label} names no one listed package")
             target = named[0]
             status = target["code_status"]
             if status is not None:
