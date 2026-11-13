@@ -3601,20 +3601,21 @@ def _clone_checkouts(
     is keyed by ``("baseline", C, Baseline)`` and ``("base", C, M)``.
     """
     memo: dict[tuple[str, str, str], dict[str, Any]] = {}
-    present: dict[str, str] = {}
     complete = context is not None and not context.partial and not context.shallow
+    probed = sorted(
+        {baseline for commit, baseline in commits if commit is not None and commit != baseline}
+    )
+    present: dict[str, str] = (
+        _present_objects(runner, context, probed, overlay=settings.overlay, pinned=settings.pinned)
+        if context is not None and complete and probed
+        else {}
+    )
 
     def against_baseline(commit: str, baseline: str) -> dict[str, Any]:
         if commit == baseline:
             return _comparison("equal", 0, 0)
         if context is None or not complete:
             return _comparison("unknown")
-        if baseline not in present:
-            present.update(
-                _present_objects(
-                    runner, context, [baseline], overlay=settings.overlay, pinned=settings.pinned
-                )
-            )
         state = present.get(baseline)
         if state == "missing":
             return _comparison("differs")
