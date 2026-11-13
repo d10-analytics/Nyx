@@ -718,16 +718,22 @@ wording. The five states, in the order they are decided:
 - `in_checkout` takes `yes`, `no` or `unknown`: it is `unknown` unless the
   prerequisite is `merged` and C is known. Its evidence is every branch tip Code
   Status counted for the prerequisite; a tip decided through a pull request, or the
-  prerequisite's merged request when no Code Status exists, is evidenced by that
-  request's merge commit, the commit GitHub made on the base, not by the branch tip,
-  which a squash or rebase merge never lands. It is `yes` when each evidence commit
-  is an ancestor of C, with one read-only `merge-base --is-ancestor` call per
-  commit and C. It is `no` when an evidence commit is not in C and the merge verdict
-  came from ancestry or a pull request. It is `unknown` when the verdict came from a
-  patch, squash or tree equivalence, when GitHub named no merge commit for the
-  request, when the merge commit is not in the clone or the answer was saved by an
-  earlier run, when the clone is shallow, partial or unreadable, when a call failed
-  or ran out of time, and when the prerequisite belongs to another repository.
+  prerequisite's merged request when no Code Status exists, is evidenced by the
+  branch or request tip and that request's merge commit, the commit GitHub made on
+  the base, together. A squash or rebase merge never lands the tip, and a checkout
+  stacked on the branch holds the tip but not the merge commit. It is `yes` when
+  each evidence commit is an ancestor of C, or, for a pull-request tip, when either
+  its tip or its merge commit is, with one read-only `merge-base --is-ancestor`
+  call per commit and C. It is `no` when an evidence commit is not in C and the
+  merge verdict came from ancestry; for a pull-request tip it is `no` only when
+  the merge commit is in the clone and not in C and the tip is also in the clone
+  and not in C. It is `unknown` when the verdict came from a patch, squash or tree
+  equivalence, when a pull-request tip is in neither C nor known absent from it
+  because GitHub named no merge commit, the merge commit or the tip is not in the
+  clone, or the answer was saved by an earlier run (which keeps no merge commit,
+  so only the tip can show `yes`), when the clone is shallow, partial or
+  unreadable, when a call failed or ran out of time, and when the prerequisite
+  belongs to another repository.
 
 A call is made only for a merged prerequisite, and none is made for any other.
 The pill is recomputed on every run and never saved; when time runs short, merged

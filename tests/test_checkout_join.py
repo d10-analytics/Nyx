@@ -7680,7 +7680,7 @@ def test_every_pill_state_has_its_own_exact_wording():
 PW_NAMES = (
     "pre-a pre-e pre-open pre-empty pre-pull pre-deleted on-trunk no-target "
     "dep-stale dep-equivalent dep-nobaseline dep-open dep-unresolved dep-finished "
-    "dep-missing dep-github dep-deleted dep-cross dep-squashed"
+    "dep-missing dep-github dep-deleted dep-cross dep-squashed dep-stacked"
 ).split()
 PW_IDS = {
     name: f"{number:08d}-0000-4000-8000-{number:012d}"
@@ -7759,6 +7759,10 @@ def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
     git(w.g, "fetch", "-q", "origin")
     w.squashed_tree = w.trees / "dep-squashed"
     git(w.g, "worktree", "add", "-q", "--detach", str(w.squashed_tree), w.merge["pre-pull"])
+    # A checkout stacked on the prerequisite's own branch holds its commits, not the squash.
+    w.stacked_tree = w.trees / "dep-stacked"
+    git(w.g, "worktree", "add", "-q", "--detach", str(w.stacked_tree), w.tip["pre-pull"])
+    commit_file(w.stacked_tree, "stacked.txt", "stacked\n")
     w.deleted_tree = w.trees / "dep-deleted"
     git(w.g, "worktree", "add", "-q", "-b", "deleted-work", str(w.deleted_tree), w.merge["pre-deleted"])
     commit_file(w.deleted_tree, "after.txt", "after\n")
@@ -7807,6 +7811,7 @@ def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
     declare("dep-github", "Drafts", f"Target repo: {w.g}", *needs("pre-pull"))
     declare("dep-deleted", "Drafts", f"Target repo: {w.deleted_tree}", *needs("pre-deleted"))
     declare("dep-squashed", "Drafts", f"Target repo: {w.squashed_tree}", *needs("pre-pull"))
+    declare("dep-stacked", "Drafts", f"Target repo: {w.stacked_tree}", *needs("pre-pull"))
     declare("dep-cross", "Drafts", f"Target repo: {w.cross_tree}", *needs("pre-a"))
     return w
 
@@ -7948,6 +7953,9 @@ def test_prerequisites_read_the_code_status_of_each_prerequisite_not_its_stage(p
     # A squash merge leaves the branch tip outside the checkout that holds the work.
     assert pw_facts(document, "dep-squashed") == {"pre-pull": ("merged", "yes")}
     assert pw_pill(document, "dep-squashed")["state"] == "met"
+    # A checkout stacked on the branch holds the work though it lacks the squashed commit.
+    assert pw_facts(document, "dep-stacked") == {"pre-pull": ("merged", "yes")}
+    assert pw_pill(document, "dep-stacked")["state"] == "met"
     # The highest-numbered merged request decides a prerequisite no clone holds.
     assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
     assert pw_facts(document, "dep-cross") == {"pre-a": ("merged", "unknown")}
@@ -8303,6 +8311,11 @@ def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clon
         (w.tip["pre-e"], pw_c(w.c1, "dep-equivalent")): w.l,
         (w.merge["pre-pull"], pw_c(w.c1, "dep-github")): w.g,
         (w.merge["pre-pull"], pw_c(w.c1, "dep-squashed")): w.g,
+        (w.tip["pre-pull"], pw_c(w.c1, "dep-github")): w.g,
+        (w.tip["pre-pull"], pw_c(w.c1, "dep-squashed")): w.g,
+        (w.tip["pre-pull"], pw_c(w.c1, "dep-stacked")): w.g,
+        (w.merge["pre-pull"], pw_c(w.c1, "dep-stacked")): w.g,
+        (w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
         (w.merge["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
     }
     assert sorted(ours) == sorted(list(pair) for pair in expected_clone)
@@ -8372,6 +8385,8 @@ def containment_repository(tmp_path_factory):
         head = commit_file(repo, "b.txt", "b\n")
         git(repo, "checkout", "-q", "-b", "side", first)
         side = commit_file(repo, "c.txt", "c\n")
+        git(repo, "checkout", "-q", "-b", "other", first)
+        other = commit_file(repo, "d.txt", "d\n")
         git(repo, "checkout", "-q", "trunk")
         scratch = directory / "scratch"
         scratch.mkdir()
@@ -8380,6 +8395,7 @@ def containment_repository(tmp_path_factory):
             "first": first,
             "head": head,
             "side": side,
+            "other": other,
             "settings": checkouts._verdict_settings(str(scratch), real_git_version_text()),
         }
 
@@ -8467,15 +8483,26 @@ def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missin
     w = containment_repository
     recorded = RecordedGit(monkeypatch)
     absent = "e" * 40
+
+    def pull(tip: str | None, merge: str | None) -> list[tuple[str | None, str]]:
+        return [(tip, "pull_head"), (merge, "pull_request")]
+
     requests = [
         ("held", w["head"], [(w["first"], "ancestor")]),
         ("outside", w["head"], [(w["side"], "ancestor")]),
-        ("outside-merge", w["head"], [(w["side"], "pull_request")]),
-        ("held-merge", w["head"], [(w["first"], "pull_request")]),
-        ("absent-merge", w["head"], [(absent, "pull_request")]),
-        ("no-merge", w["head"], [(None, "pull_request")]),
-        ("held-no-merge", w["head"], [(w["first"], "ancestor"), (None, "pull_request")]),
-        ("outside-no-merge", w["head"], [(w["side"], "ancestor"), (None, "pull_request")]),
+        # A pull-request pair is the tip then the merge commit.
+        ("outside-pair", w["head"], pull(w["side"], w["other"])),
+        ("held-tip", w["head"], pull(w["first"], w["side"])),
+        ("held-merge", w["head"], pull(w["side"], w["first"])),
+        ("held-tip-absent-merge", w["head"], pull(w["first"], absent)),
+        ("held-tip-no-merge", w["head"], pull(w["first"], None)),
+        ("outside-absent-merge", w["head"], pull(w["side"], absent)),
+        ("outside-no-merge", w["head"], pull(w["side"], None)),
+        ("absent-tip-outside-merge", w["head"], pull(absent, w["side"])),
+        ("absent-tip-held-merge", w["head"], pull(absent, w["first"])),
+        ("absent-tip-no-merge", w["head"], pull(absent, None)),
+        ("held-and-unknown-pair", w["head"], [(w["first"], "ancestor"), *pull(w["side"], None)]),
+        ("outside-and-unknown-pair", w["head"], [(w["side"], "ancestor"), *pull(w["side"], None)]),
         ("outside-equivalent", w["head"], [(w["side"], "patch_equivalent")]),
         ("absent-ancestry", w["head"], [(absent, "ancestor")]),
         ("absent-equivalent", w["head"], [(absent, "patch_equivalent")]),
@@ -8491,12 +8518,18 @@ def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missin
     assert decided == {
         "held": "yes",
         "outside": "no",
-        "outside-merge": "no",
+        "outside-pair": "no",
+        "held-tip": "yes",
         "held-merge": "yes",
-        "absent-merge": "unknown",
-        "no-merge": "unknown",
-        "held-no-merge": "unknown",
-        "outside-no-merge": "no",
+        "held-tip-absent-merge": "yes",
+        "held-tip-no-merge": "yes",
+        "outside-absent-merge": "unknown",
+        "outside-no-merge": "unknown",
+        "absent-tip-outside-merge": "unknown",
+        "absent-tip-held-merge": "yes",
+        "absent-tip-no-merge": "unknown",
+        "held-and-unknown-pair": "unknown",
+        "outside-and-unknown-pair": "no",
         "outside-equivalent": "unknown",
         "absent-ancestry": "no",
         "absent-equivalent": "unknown",
@@ -8504,11 +8537,12 @@ def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missin
         "mixed-unknown": "unknown",
         "no-commit": "unknown",
     }
-    # One presence probe for the three distinct tips, and one ancestry call each for the
-    # two present ones; the absent tip is read from the probe and never asked of git.
+    # One presence probe for the distinct tips, and one ancestry call each for the three
+    # present ones however many requests name them; the absent tip is read from the probe
+    # and never asked of git.
     assert len(recorded.probes()) == 1
     assert sorted(recorded.ancestry()) == sorted(
-        [[w["first"], w["head"]], [w["side"], w["head"]]]
+        [[w["first"], w["head"]], [w["side"], w["head"]], [w["other"], w["head"]]]
     )
 
 
