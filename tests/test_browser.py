@@ -11160,41 +11160,36 @@ def with_moved_base(document, path, count):
 
 
 def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_checkouts):
-    """A card carries one tag per attention item naming it, and the panel the sentence."""
+    """A moved base is drawn by the card's baseline line, not a tag; the panel keeps its sentence."""
     document = real_checkouts.document_zero
     path = "Repo/Drafts/alpha"
-    moved = with_moved_base(document, path, 3)
+    declared = with_baseline_facts(document, {path: (comparison("behind", 0, 3), EQUAL, EQUAL)})
+    moved = with_moved_base(declared, path, 3)
     assert [item["code"] for item in moved["attention"] if path in item["packages"]] == ["base_moved"]
     double = BrowserCheckouts(document)
     page = open_code_status_page(open_page, real_checkouts, double)
     card = code_status_card(page, path)
     assert card.locator(".card-attention").count() == 0
-    status = card.locator(".card-code-status").element_handle()
 
     double.serve(checkouts_envelope(moved))
     fire_checkouts_poll(page)
-    tag = card.locator(".card-attention")
-    playwright.expect(tag).to_have_text("base moved 3")
-    sentence = f"the base of {path} moved 3 commits past its Baseline"
-    assert tag.get_attribute("title") == sentence
-    assert tag.get_attribute("data-code") == "base_moved"
-    # The tag sits beside the Code Status, which was not replaced to add it.
-    assert card.locator(".card-facts > *").evaluate_all(
-        "tags => tags.map(tag => tag.className)") == ["card-code-status", "card-attention"]
-    assert page.locator(".card-attention").count() == 1
+    settle_frames(page)
+    assert card.locator(".card-baseline").count() == 1
+    assert page.locator('.card-attention[data-code="base_moved"]').count() == 0
+    assert "base moved" not in card.inner_text()
 
     card.click()
     rows = panel_code_rows(page)
+    sentence = f"the base of {path} moved 3 commits past its Baseline"
     assert rows["Needs attention"] == sentence
     assert "the base moved 3 commits past it" in rows["Baseline"]
 
-    # The next scan without the drift removes the tag and the panel row.
+    # The next scan without the drift removes the panel row; the line stays off the tag.
     double.serve(checkouts_envelope(document))
     fire_checkouts_poll(page)
-    playwright.expect(tag).to_have_count(0)
     assert "Needs attention" not in panel_code_rows(page)
+    assert page.locator('.card-attention[data-code="base_moved"]').count() == 0
     assert card.locator(".card-code-status").count() == 1
-    del status
 
 
 BASELINE_LINE_CARDS = (
