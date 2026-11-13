@@ -11580,3 +11580,79 @@ def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
     playwright.expect(quiet_group).to_have_count(1)
     assert quiet_items.count() == 0
     assert "Repo/Shipped/gamma" in quiet_group.locator(".checkouts-package").inner_text()
+
+
+def live(relation, ahead=None, behind=None):
+    """A comparison counted against a live remote check."""
+    return {**comparison(relation, ahead, behind), "basis": "live"}
+
+
+def baseline_line_words(page, path):
+    """The accessible name and tooltip of one card's baseline line."""
+    return code_status_card(page, path).locator(".card-baseline").evaluate(
+        "line => ({name: line.getAttribute('aria-label'), title: line.title, "
+        "role: line.getAttribute('role'), hidden: line.hasAttribute('aria-hidden')})")
+
+
+def baseline_line_words_cases():
+    """(drift, vs_baseline, vs_base) with the phrases each must give."""
+    equal = live("equal", 0, 0)
+    return [
+        ((equal, equal, equal),
+         "Baseline synced, Checkout 0 behind main, Baseline 0 behind main"),
+        ((live("behind", 0, 3), live("ahead", 2, 0), live("behind", 0, 3)),
+         "Baseline not synced, Checkout 3 behind main, Baseline 3 behind main"),
+        ((live("behind", 0, 58), live("behind", 0, 2), live("behind", 0, 58)),
+         "Baseline not synced, Checkout 58 behind main, Baseline 58 behind main"),
+        ((equal, live("diverged", 1, 2), live("diverged", 1, 4)),
+         "Baseline not synced, Checkout 4 behind main, Baseline 0 behind main"),
+        ((live("ahead", 1, 0), live("differs"), live("differs")),
+         "Baseline not synced, Checkout unknown against main, Baseline 0 behind main"),
+        ((live("unknown"), live("unknown"), live("unknown")),
+         "Baseline unknown, Checkout unknown against main, Baseline unknown against main"),
+        ((live("absent"), equal, live("absent")),
+         "Baseline synced, Main unknown, Baseline unknown against main"),
+        ((comparison("behind", 0, 3), equal, equal),
+         "Baseline synced, Checkout 0 behind main, Baseline 3 behind main (cached)"),
+        ((equal, equal, comparison("behind", 0, 3)),
+         "Baseline synced, Checkout 3 behind main (cached), Baseline 0 behind main"),
+    ]
+
+
+def test_baseline_line_words_state_every_fact_in_the_approved_phrases(
+    open_page, real_checkouts
+):
+    """The line's name and tooltip are the same words, built from the tone rule's facts."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    cases = baseline_line_words_cases()
+    for start in range(0, len(cases), len(BASELINE_LINE_CARDS)):
+        chunk = cases[start:start + len(BASELINE_LINE_CARDS)]
+        padded = chunk + [chunk[0]] * (len(BASELINE_LINE_CARDS) - len(chunk))
+        serve_baseline_states(
+            page, double, {path: case[0] for path, case in zip(BASELINE_LINE_CARDS, padded)})
+        for path, (_, expected) in zip(BASELINE_LINE_CARDS, chunk):
+            shown = baseline_line_words(page, path)
+            assert shown == {"name": expected, "title": expected, "role": "img",
+                             "hidden": False}, shown
+
+
+def test_baseline_line_words_search_follows_the_facts_after_a_poll(open_page, real_checkouts):
+    """A search for the words finds the cards stating them, before and after a refresh."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta = BASELINE_LINE_CARDS[:3]
+    equal = live("equal", 0, 0)
+
+    def against(count):
+        return (equal, equal, live("behind", 0, count))
+
+    serve_baseline_states(page, double, {
+        alpha: against(3), beta: against(58), delta: against(3)})
+    query = "Checkout 3 behind main"
+    assert sorted(visible_card_paths(page, query)) == [alpha, delta]
+    assert sorted(visible_card_paths(page, "baseline synced")) == [alpha, beta, delta]
+    serve_baseline_states(page, double, {
+        alpha: against(3), beta: against(3), delta: against(4)})
+    assert sorted(visible_card_paths(page, query)) == [alpha, beta]
+    # The refreshed search text is the first render's: a reload of the same facts agrees.
+    page.fill("#filter", "")
+    assert page.locator(".card[hidden]").count() == 0
