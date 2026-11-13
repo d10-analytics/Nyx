@@ -715,7 +715,7 @@ wording. The five states, in the order they are decided:
   with no Code Status because its branch is deleted everywhere is `merged` when
   the highest-numbered merged request into the repository's base names that branch,
   and `unknown` otherwise.
-- `in_checkout` takes `yes`, `no` or `unknown`, and is `unknown` unless the
+- `in_checkout` takes `yes`, `no` or `unknown`: it is `unknown` unless the
   prerequisite is `merged` and C is known. Its evidence is every branch tip Code
   Status counted for the prerequisite, or the head of the merged request. It is
   `yes` when each tip is an ancestor of C, with one read-only `merge-base
