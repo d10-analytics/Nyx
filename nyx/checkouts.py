@@ -3840,22 +3840,23 @@ _CONTAINMENT_RUNGS = frozenset({"ancestor", "pull_request"})
 def _clone_in_checkout(
     runner: _GitRunner,
     context: _CloneContext | None,
-    requests: Sequence[tuple[Any, str, Sequence[tuple[str, str | None]]]],
+    requests: Sequence[tuple[Any, str | None, Sequence[tuple[str, str | None]]]],
     settings: _VerdictSettings,
 ) -> dict[Any, str]:
     """Decide ``yes``, ``no`` or ``unknown`` for each request of one clone.
 
-    A request is (key, checked-out commit C, evidence tips with their verdict rungs).
-    Each distinct tip takes one presence probe in the clone; a tip a complete clone lacks
-    is not in C, and every other tip takes one ``merge-base --is-ancestor`` against C,
-    memoised on ``("contains", C, tip)``, run under the verdict overlay with no alternate
-    object directory. An incomplete clone makes no call. A tip not in C reads ``no`` when
-    its verdict came from ancestry or a pull request and ``unknown`` otherwise; a failed
-    or cut call reads ``unknown``. One tip known missing decides ``no`` whatever the
-    others say, and ``yes`` needs every tip in C.
+    A request is (key, checked-out commit C, evidence tips with their verdict rungs); a
+    null C reads ``unknown`` with no call. Each distinct tip takes one presence probe in
+    the clone; a tip a complete clone lacks is not in C, and every other tip takes one
+    ``merge-base --is-ancestor`` against C, memoised on ``("contains", C, tip)``, run
+    under the verdict overlay with no alternate object directory. An incomplete clone
+    makes no call. A tip not in C reads ``no`` when its verdict came from ancestry or a
+    pull request and ``unknown`` otherwise; a failed or cut call reads ``unknown``. One
+    tip known missing decides ``no`` whatever the others say, and ``yes`` needs every tip
+    in C.
     """
     complete = context is not None and not context.partial and not context.shallow
-    tips = sorted({tip for _, _, pairs in requests for tip, _ in pairs})
+    tips = sorted({tip for _, commit, pairs in requests if commit is not None for tip, _ in pairs})
     present: dict[str, str] = (
         _present_objects(runner, context, tips, overlay=settings.overlay, pinned=settings.pinned)
         if context is not None and complete and tips
@@ -3886,6 +3887,9 @@ def _clone_in_checkout(
 
     result: dict[Any, str] = {}
     for key, commit, pairs in requests:
+        if commit is None:
+            result[key] = "unknown"
+            continue
         found = [(contains(commit, tip), rung) for tip, rung in pairs]
         if any(held is False and rung in _CONTAINMENT_RUNGS for held, rung in found):
             result[key] = "no"
@@ -3962,11 +3966,11 @@ def _assign_in_checkout(
         evidence[id(target)] = tips
         return tips
 
-    jobs: dict[str, list[tuple[Any, str, Sequence[tuple[str, str | None]]]]] = {}
+    jobs: dict[str, list[tuple[Any, str | None, Sequence[tuple[str, str | None]]]]] = {}
     for position, package in enumerate(packages):
-        commit = checked_out.get(position)
-        if commit is None:
+        if position not in checked_out:
             continue
+        commit = checked_out[position]
         own = repository_of.get(package["target"]["clone"])
         for target_id, target in _prerequisite_targets(
             rows.get(package["package_path"], ()), by_path

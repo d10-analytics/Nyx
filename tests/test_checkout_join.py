@@ -7901,14 +7901,14 @@ def test_prerequisites_read_the_code_status_of_each_prerequisite_not_its_stage(p
     assert open_package["finished"] is True
     assert open_package["code_status"]["state"] not in ("merged", "unknown")
 
-    assert pw_facts(document, "dep-nobaseline") == {"pre-a": ("merged", "unknown")}
+    assert pw_facts(document, "dep-nobaseline") == {"pre-a": ("merged", "yes")}
     assert pw_facts(document, "dep-equivalent") == {"pre-e": ("merged", "unknown")}
-    assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "unknown")}
+    assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "no")}
     # The highest-numbered merged request decides a prerequisite no clone holds.
-    assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
+    assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
     assert pw_facts(document, "dep-cross") == {"pre-a": ("merged", "unknown")}
     assert pw_facts(document, "dep-open") == {
-        "pre-a": ("merged", "unknown"),
+        "pre-a": ("merged", "yes"),
         "pre-open": ("not_merged", "unknown"),
         "pre-empty": ("not_merged", "unknown"),
     }
@@ -7918,7 +7918,7 @@ def test_prerequisites_read_the_code_status_of_each_prerequisite_not_its_stage(p
     # pre-open, yet dep-nobaseline holds one item and no state of pre-a's.
     assert pw_pill(document, "pre-a")["state"] == "not_in_main"
     nobaseline = pw_pill(document, "dep-nobaseline")
-    assert nobaseline["state"] == "unknown" != "not_in_main"
+    assert nobaseline["state"] == "met"
     assert len(nobaseline["items"]) == 1
 
 
@@ -7966,8 +7966,8 @@ def test_a_deleted_prerequisite_is_unknown_without_a_lookup_and_merged_with_one(
     assert w.c0["github_lookup"] == "off"
     assert pw_facts(w.c0, "dep-deleted") == {"pre-deleted": ("unknown", "unknown")}
     assert pw_pill(w.c0, "dep-deleted")["state"] == "unknown"
-    assert pw_facts(w.c1, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
-    assert pw_facts(w.c2, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
+    assert pw_facts(w.c1, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
+    assert pw_facts(w.c2, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
 
 
 @posix_only
@@ -8028,7 +8028,8 @@ def merged_but_in_progress(document):
 
 
 def not_merged_without_a_status(document):
-    pw_item(document, "dep-deleted", "pre-deleted")["merged_on_main"] = "not_merged"
+    item = pw_item(document, "dep-deleted", "pre-deleted")
+    item["merged_on_main"], item["in_checkout"] = "not_merged", "unknown"
     retext_pill(document, "dep-deleted")
 
 
@@ -8166,9 +8167,9 @@ def test_the_parser_accepts_an_unknown_main_fact_whatever_its_package_code_statu
     document = doc_copy(w.c1)
     assert pw_package(document, "pre-a")["code_status"]["state"] == "merged"
     assert pw_package(document, "pre-open")["code_status"]["state"] == "awaiting_merge"
-    pw_item(document, "dep-open", "pre-a")["merged_on_main"] = "unknown"
-    pw_item(document, "dep-open", "pre-open")["merged_on_main"] = "unknown"
-    pw_item(document, "dep-open", "pre-empty")["merged_on_main"] = "unknown"
+    for target in ("pre-a", "pre-open", "pre-empty"):
+        item = pw_item(document, "dep-open", target)
+        item["merged_on_main"], item["in_checkout"] = "unknown", "unknown"
     retext_pill(document, "dep-open")
 
     assert pw_pill(document, "dep-open")["state"] == "unknown"
