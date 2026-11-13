@@ -11425,6 +11425,17 @@ def test_baseline_line_markers_place_the_checkout_by_order_alone(
         assert lines[tag]["C"]["check"] is False
 
 
+def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
+    open_page, real_checkouts
+):
+    """C and M green with B yellow is not all green, so no check mark is drawn."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    cases = [((comparison("behind", 0, 3), EQUAL, EQUAL), "yellow")]
+    (_, line), = baseline_line_cases(page, double, cases)
+    assert [line[name]["tone"] for name in "BCM"] == ["yellow", "green", "green"]
+    assert line["C"]["check"] is False
+
+
 def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_checkout(
     open_page, real_checkouts
 ):
