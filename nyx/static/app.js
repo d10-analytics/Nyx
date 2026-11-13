@@ -1030,8 +1030,23 @@
     const place = {
       equal: "equal", ahead: "right", behind: "left", diverged: "off", differs: "off",
     }[versus.relation] || "unplaced";
+    // The same facts in words, decided from the tones above so that the words,
+    // the colours and the search can never disagree.  A cached basis is named.
+    const counted = (comparison, tone, subject) => {
+      const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
+      return (tone === "grey" || comparison.behind === null
+        ? `${subject} unknown against main`
+        : `${subject} ${comparison.behind} behind main`) + named;
+    };
+    const words = [
+      {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
+        grey: "Baseline unknown"}[baselineTone],
+      mainUnknown ? "Main unknown" : counted(against, tones.main, "Checkout"),
+      drift ? counted(drift, tones.baseline, "Baseline") : "Baseline unknown against main",
+    ];
     return {
       tones,
+      words,
       place,
       forked: place === "right" && drift !== null && drift.relation === "behind",
       added: place === "right" ? versus.ahead : null,
@@ -1050,7 +1065,9 @@
       `<span class="baseline-link" data-link="${name}" data-tone="${tone}"${extra}></span>`;
     const form = model.place === "equal" ? "ring"
       : model.place === "off" || model.place === "unplaced" ? "dotted" : "solid";
-    return `<span class="card-baseline" data-place="${model.place}" aria-hidden="true">` +
+    const words = text(model.words.join(", "));
+    return `<span class="card-baseline" data-place="${model.place}" role="img" ` +
+      `aria-label="${words}" title="${words}">` +
       (model.forked || (model.place !== "left" && model.place !== "right")
         ? "" : link("checkout", model.tones.checkout, "")) +
       link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
@@ -1103,6 +1120,15 @@
       baselineLineHtml(cardBaseline.get(path));
   }
 
+  // The one search text of a card: its work item's fields, its Code Status and
+  // the words of its baseline line.  Both render paths read it from here.
+  function cardSearchText(entry) {
+    const model = baselineLineModel(cardBaseline.get(entry.package_path));
+    return searchText(entry, [
+      cardCodeStatus.get(entry.package_path)?.text, ...(model === null ? [] : model.words),
+    ].filter((value) => value !== null && value !== undefined).join(" "));
+  }
+
   function searchText(entry, line) {
     return [
       entry.package_path, entry.package_id, entry.stage, entry.relationship.program.title,
@@ -1125,13 +1151,12 @@
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
-    const codeStatus = cardCodeStatus.get(entry.package_path);
     const facts = cardFactsHtml(entry.package_path);
     cardFactsMarkup.set(entry.package_path, facts);
     return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
-      `${idAttribute} data-search="${text(searchText(entry, codeStatus?.text))}">` +
+      `${idAttribute} data-search="${text(cardSearchText(entry))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
       `<span class="card-filepath" title="${text(entry.package_path)}" ` +
       `aria-label="${text(`Filepath: ${entry.package_path}`)}">${text(folderNameOf(entry.package_path))}</span>` +
@@ -1562,7 +1587,7 @@
       }
       const entry = renderedEntries.get(path);
       if (entry) {
-        const search = searchText(entry, cardCodeStatus.get(path)?.text);
+        const search = cardSearchText(entry);
         if (card.dataset.search !== search) {
           card.dataset.search = search;
           changed = true;
