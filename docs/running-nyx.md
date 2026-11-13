@@ -656,6 +656,23 @@ target clone lacks the Baseline commit, a sibling clone of the same remote may
 lend it, named in `objects_from`. Drift is computed on every run and never saved.
 The `basis` is the base's: `live`, `recorded` or `cached`.
 
+`checkout` places the checkout itself against the same two commits. It holds
+`sha`, `vs_baseline` and `vs_base`, and is null exactly when `drift` is.
+`sha` is the commit C: the head of the worktree the target names, or of the
+clone's main worktree when the target is the clone, and it is null when that head
+cannot be read (a missing or unreadable worktree, or no commit yet), in which case
+`vs_baseline` is `unknown` and `vs_base` is `unknown` or, with no base, `absent`.
+`vs_baseline` compares C with the Baseline and takes the relation `equal` (C is
+the Baseline), `ahead` (C holds commits the Baseline lacks), `behind`,
+`diverged`, `differs` (the clone is shallow or partial, or lacks the Baseline
+commit) or `unknown` (a call failed or ran out of time); it is never `absent`,
+and its basis is always `cached`. `vs_base` compares C with the base the clone
+judges its verdicts against and takes any of those relations, with `absent` exactly
+when the clone has no base; it carries the base's basis (`live`, `recorded` or
+`cached`). Neither comparison has an `objects_from`. Each count is one read-only
+call per distinct commit and Baseline, or commit and base, and is recomputed on every run
+and never saved.
+
 ### Availability
 
 Every clone line starts, right after its path, with an availability element, and
@@ -1257,8 +1274,17 @@ a brief confirmation beside the card when the copy succeeds.
 
 Each card shows its title, the name of its folder (the column and the row
 already name its project and stage; hover for the whole filepath) and, as tags,
-a target folder that differs from its project, its Code Status, and one tag for
-each **Needs attention** item that names it, such as `base moved 8`.
+a target folder that differs from its project, its Code Status, one tag for
+each **Needs attention** item that names it (except an item awaiting its merge,
+which the Code Status states, and a moved base, which the baseline line draws),
+and, when the checkout can be placed, a baseline line. The line is a small strip of three
+points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
+the remote main head. Colour carries the meaning and no count decides it: `C` is
+green at the Baseline, yellow when it holds commits of its own and red when it
+lacks the Baseline; `C` and `B` against main are green when none behind, yellow
+when behind and grey when unknown. A ring on `C` marks a checkout at the Baseline,
+and a check mark a line that is green throughout. The base-moved item is not a
+tag; it still shows in the work item panel and in **Checkouts**.
 
 The **work item panel** on the left shows the selected card in full. A left or
 right click on a card fills it; a left click on the selected card clears it,
@@ -1268,7 +1294,10 @@ Package ID; then **Needs** and **Blocks**, each relationship a link that
 selects the card it names; then, under **Code**, what the last checkout scan
 says of the work item: its Code Status, the attention items that name it, its
 target repo, branch, the branch's remote copy, merge verdict and pull requests,
-and its Baseline with how far the base has moved past it. The **Code** part
+and its Baseline with how far the base has moved past it, then the baseline
+line itself with its words and a legend naming `B`, `C`, `M`, the ring, the fork
+(commits of the checkout's own, `+N`, beside a Baseline that has moved on) and the
+count beside `M` (commits the checkout is behind main). The **Code** part
 follows the same rule as the Code Status tag below and is absent while that tag
 is hidden. **Hide details** collapses the panel to a strip and **Details**
 opens it again; the choice is remembered in this browser like the other display

@@ -76,7 +76,12 @@ README is narrative only.
   to the target clone's verdict base, with one read-only `rev-list --left-right
   --count` per distinct clone and Baseline, using the verdict settings' pinned
   git options; a sibling clone of the same remote may lend the Baseline commit
-  read-only. Drift is recomputed on every run and never saved. A package target
+  read-only. Drift is recomputed on every run and never saved.
+- Compares each such package's checked-out commit C with its Baseline and with the
+  verdict base M (the package's `baseline.checkout`), with one read-only
+  `rev-list --left-right --count` per distinct (C, B) and (C, M), reusing the clone's
+  git runner and run after the drift pass under the same deadline; the
+  comparisons are null exactly when the drift is and are never saved. A package target
   that is missing or not a git checkout also records `within_folders`, true when
   its path lies in or under a configured checkout folder.
 - Calls `derive_attention` after the join and stores the clone availability,
