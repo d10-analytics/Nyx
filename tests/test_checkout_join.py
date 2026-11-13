@@ -43,10 +43,12 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     rederive,
     redigest,
     refusal_of,
+    repill,
     repository_fingerprint,
     rev,
     shared_world_build,
     stand_in,
+    target_head_of,
 )
 
 from nyx import checkout_join, checkouts, cli, models
@@ -4542,10 +4544,10 @@ def give_no_commits(name: str):
     return change
 
 
-def test_schema_10_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(status_document):
+def test_the_current_schema_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(status_document):
     """One collection serves every proof: each case mutates its own copy."""
-    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 10
-    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 10
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 11
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 11
 
     old = doc_copy(status_document)
     old["schema_version"] = 8
@@ -6386,6 +6388,7 @@ def test_only_an_unfinished_package_assigns_a_clone(world_w):
     assert availability_of(document, w.c["C"])["state"] == "free"
 
     package["finished"] = False
+    repill(document)
     derived = models.derive_attention(document)["availability"][real(w.c["C"])]
     assert derived == {
         "state": "assigned",
@@ -7586,3 +7589,568 @@ def test_collection_inputs_carry_the_loaded_configuration_revision(tmp_path):
         folders=(), github_lookup=False, package_scan=None
     )
     assert absent.configuration_revision is None
+
+
+# ---------------------------------------------------------------------------
+# The prerequisites pill: the pure derivation, the collected facts and the parser
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "fact"),
+    [
+        ("merged", "merged"),
+        ("in_progress", "not_merged"),
+        ("pr_open", "not_merged"),
+        ("awaiting_merge", "not_merged"),
+        ("no_commits_yet", "not_merged"),
+        ("superseded", "not_merged"),
+        ("unknown", "unknown"),
+    ],
+)
+def test_each_code_status_state_gives_its_main_fact(state, fact):
+    assert models.prerequisite_main_fact(state) == fact
+
+
+def test_the_main_fact_mapping_is_checked_for_every_code_status_state():
+    cases = {
+        "merged", "in_progress", "pr_open", "awaiting_merge", "no_commits_yet",
+        "superseded", "unknown",
+    }
+    assert cases == models._CODE_STATUS_STATES
+    assert {models.prerequisite_main_fact(state) for state in cases} == (
+        models.PREREQUISITE_MAIN_FACTS
+    )
+
+
+def pill_item(main: str, held: str, target: str | None = ID_A) -> dict[str, Any]:
+    return {"target_package_id": target, "merged_on_main": main, "in_checkout": held}
+
+
+@pytest.mark.parametrize(
+    ("items", "state", "text"),
+    [
+        ([], "none", "No prerequisites"),
+        (
+            [pill_item("merged", "yes", ID_A), pill_item("merged", "yes", ID_B)],
+            "met",
+            "Prerequisites met",
+        ),
+        (
+            [
+                pill_item("not_merged", "unknown", ID_A),
+                pill_item("merged", "no", ID_B),
+                pill_item("unknown", "unknown", ID_C),
+            ],
+            "not_in_main",
+            "Prerequisites not met in main",
+        ),
+        (
+            [pill_item("merged", "no", ID_A), pill_item("unknown", "unknown", ID_B)],
+            "not_in_checkout",
+            "Prerequisites not met in checkout",
+        ),
+        ([pill_item("merged", "unknown")], "unknown", "Prerequisites unknown"),
+        ([pill_item("unknown", "unknown")], "unknown", "Prerequisites unknown"),
+        (
+            [pill_item("merged", "yes", ID_A), pill_item("unknown", "unknown", ID_B)],
+            "unknown",
+            "Prerequisites unknown",
+        ),
+    ],
+)
+def test_the_worst_definite_problem_decides_the_pill_state_and_its_wording(items, state, text):
+    derived = models.derive_prerequisites(items)
+
+    assert derived == state
+    assert models.prerequisites_text(derived) == text
+
+
+def test_every_pill_state_has_its_own_exact_wording():
+    assert models.PREREQUISITE_TEXTS == {
+        "none": "No prerequisites",
+        "not_in_main": "Prerequisites not met in main",
+        "not_in_checkout": "Prerequisites not met in checkout",
+        "unknown": "Prerequisites unknown",
+        "met": "Prerequisites met",
+    }
+    assert models.PREREQUISITE_STATES == frozenset(models.PREREQUISITE_TEXTS)
+
+
+PW_NAMES = (
+    "pre-a pre-e pre-open pre-empty pre-pull pre-deleted on-trunk no-target "
+    "dep-stale dep-equivalent dep-nobaseline dep-open dep-unresolved dep-finished "
+    "dep-missing dep-github dep-deleted dep-cross"
+).split()
+PW_IDS = {
+    name: f"{number:08d}-0000-4000-8000-{number:012d}"
+    for number, name in enumerate(PW_NAMES, start=1)
+}
+PW_NAME_OF = {value: key for key, value in PW_IDS.items()}
+PW_MISSING_ID = "99999999-0000-4000-8000-999999999999"
+PW_STAGES = ("Shipped",)
+
+
+class PrerequisiteWorld:
+    """Two repositories, their dependents and three collections of them."""
+
+
+def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
+    w = PrerequisiteWorld()
+    w.folder = base / "folder"
+    w.folder.mkdir()
+    w.trees = base / "trees"
+    w.trees.mkdir()
+    w.tip: dict[str, str] = {}
+    # Repository L: a plain remote, one clone, and an outside clone that merges on the remote.
+    remote = make_remote(base, "l-remote.git")
+    w.l = clone(remote, w.folder / "L")
+    outside = clone(remote, base / "l-outside")
+    w.old = rev(w.l, "trunk")
+    w.stale_tree = w.trees / "dep-stale"
+    git(w.l, "worktree", "add", "-q", "--detach", str(w.stale_tree), w.old)
+
+    def publish(name: str) -> None:
+        git(outside, "checkout", "-q", "-b", name, "trunk")
+        w.tip[name] = commit_file(outside, f"{name}.txt", f"{name}\n")
+        git(outside, "push", "-q", "origin", name)
+        git(outside, "checkout", "-q", "trunk")
+
+    publish("pre-a")
+    git(outside, "merge", "-q", "--no-ff", "-m", "merge pre-a", "pre-a")
+    git(outside, "push", "-q", "origin", "trunk")
+    publish("pre-e")
+    commit_file(outside, "elsewhere.txt", "elsewhere\n")
+    git(outside, "cherry-pick", "pre-e")
+    git(outside, "push", "-q", "origin", "trunk")
+    publish("pre-open")
+    git(w.l, "fetch", "-q", "origin")
+    for name in ("pre-a", "pre-e", "pre-open"):
+        git(w.l, "branch", "-q", name, f"origin/{name}")
+    git(w.l, "merge", "-q", "--ff-only", "origin/trunk")
+    git(w.l, "branch", "-q", "pre-empty", "trunk")
+    w.trunk = rev(w.l, "trunk")
+    w.equivalent_tree = w.trees / "dep-equivalent"
+    git(w.l, "worktree", "add", "-q", "--detach", str(w.equivalent_tree), "trunk")
+    w.nobaseline_tree = w.trees / "dep-nobaseline"
+    git(w.l, "worktree", "add", "-q", "-b", "nobaseline-work", str(w.nobaseline_tree), "trunk")
+    w.nobaseline_head = commit_file(w.nobaseline_tree, "local.txt", "local\n")
+    # Repository G: a GitHub-named clone and an outside clone that merges on the remote.
+    g_remote = make_remote(base, "g-remote.git")
+    w.g = clone(g_remote, w.folder / "G")
+    point_origin_at(w.g, g_remote, GITHUB_URL)
+    g_outside = clone(g_remote, base / "g-outside")
+    for name in ("pre-pull", "pre-deleted"):
+        git(w.g, "checkout", "-q", "-b", name, "trunk")
+        w.tip[name] = commit_file(w.g, f"{name}.txt", f"{name}\n")
+        git(w.g, "push", "-q", "origin", name)
+        git(w.g, "checkout", "-q", "trunk")
+        git(g_outside, "fetch", "-q", "origin")
+        git(g_outside, "merge", "-q", "--no-ff", "-m", f"merge {name}", f"origin/{name}")
+        git(g_outside, "push", "-q", "origin", "trunk")
+    git(w.g, "push", "-q", "origin", "--delete", "pre-deleted")
+    git(w.g, "branch", "-q", "-D", "pre-deleted")
+    w.deleted_tree = w.trees / "dep-deleted"
+    git(w.g, "worktree", "add", "-q", "-b", "deleted-work", str(w.deleted_tree), w.tip["pre-deleted"])
+    commit_file(w.deleted_tree, "after.txt", "after\n")
+    w.cross_tree = w.trees / "dep-cross"
+    git(w.g, "worktree", "add", "-q", "-b", "cross-work", str(w.cross_tree), "trunk")
+    commit_file(w.cross_tree, "cross.txt", "cross\n")
+    w.nowhere = base / "nowhere"
+    w.root = base / "spec"
+
+    def declare(name: str, stage: str, *lines: str) -> None:
+        make_package(w.root, stage, name, f"Package ID: {PW_IDS[name]}\n" + "".join(
+            f"{line}\n" for line in lines
+        ))
+
+    def needs(*names: str) -> list[str]:
+        return [f"Completion Prerequisite: {PW_IDS[name]}" for name in names]
+
+    declare("pre-a", "Drafts", f"Target repo: {w.l}", "Branch: pre-a", *needs("pre-open"))
+    declare("pre-e", "Drafts", f"Target repo: {w.l}", "Branch: pre-e")
+    declare("pre-open", "Shipped", f"Target repo: {w.l}", "Branch: pre-open")
+    declare("pre-empty", "Drafts", f"Target repo: {w.l}", "Branch: pre-empty")
+    declare("pre-pull", "Drafts", f"Target repo: {w.g}", "Branch: pre-pull")
+    declare("pre-deleted", "Drafts", f"Target repo: {w.g}", "Branch: pre-deleted")
+    declare("on-trunk", "Drafts", f"Target repo: {w.l}", "Branch: trunk")
+    declare("no-target", "Drafts")
+    declare("dep-stale", "Drafts", f"Target repo: {w.stale_tree}", f"Baseline: {w.old}", *needs("pre-a"))
+    declare("dep-equivalent", "Drafts", f"Target repo: {w.equivalent_tree}", *needs("pre-e"))
+    declare("dep-nobaseline", "Drafts", f"Target repo: {w.nobaseline_tree}", *needs("pre-a"))
+    declare(
+        "dep-open",
+        "Drafts",
+        f"Target repo: {w.nobaseline_tree}",
+        *needs("pre-a", "pre-open", "pre-empty"),
+    )
+    declare(
+        "dep-unresolved",
+        "Drafts",
+        f"Target repo: {w.l}",
+        f"Completion Prerequisite: {PW_MISSING_ID}",
+        "Completion Prerequisite: not-an-identifier",
+        *needs("on-trunk", "no-target"),
+        f"Prerequisite: {PW_IDS['pre-a']} | released",
+    )
+    declare("dep-finished", "Shipped", f"Target repo: {w.l}", *needs("pre-a"))
+    declare("dep-missing", "Drafts", f"Target repo: {w.nowhere}", *needs("pre-a"))
+    declare("dep-github", "Drafts", f"Target repo: {w.g}", *needs("pre-pull"))
+    declare("dep-deleted", "Drafts", f"Target repo: {w.deleted_tree}", *needs("pre-deleted"))
+    declare("dep-cross", "Drafts", f"Target repo: {w.cross_tree}", *needs("pre-a"))
+    return w
+
+
+def g_branch_names(document: dict[str, Any], w: PrerequisiteWorld) -> list[str]:
+    """The names the collector asks GitHub about for repository G."""
+    names = {branch["name"] for branch in clone_at(document, w.g)["branches"]}
+    return sorted(names | {"pre-pull", "pre-deleted"})
+
+
+@pytest.fixture(scope="module")
+def prerequisite_world(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "prerequisites") as (directory, home, patch):
+        w = build_prerequisite_world(directory)
+        w.cache = nyx_home(home)
+        fake = install_fake_gh(directory, patch)
+        w.c0 = collect_packages(
+            [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=False
+        )
+        w.calls = {"c0": len(fake.calls())}
+        # A merged request into the base names each prerequisite G no longer holds, and a
+        # lower-numbered one for a deleted prerequisite names a commit no clone has.
+        fake.replay(
+            stdout=pr_answer(
+                g_branch_names(w.c0, w),
+                {
+                    "pre-pull": [pr_node(11, "merged", w.tip["pre-pull"])],
+                    "pre-deleted": [
+                        pr_node(21, "merged", "d" * 40),
+                        pr_node(22, "merged", w.tip["pre-deleted"]),
+                    ],
+                },
+            )
+        )
+        recorded = RecordedRuns(patch)
+        recorded.active = True
+        w.c1 = collect_packages(
+            [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=True
+        )
+        w.calls["c1"] = len(fake.calls())
+        w.heads1 = {
+            name: rev(tree, "HEAD")
+            for name, tree in {
+                "dep-stale": w.stale_tree,
+                "dep-equivalent": w.equivalent_tree,
+                "dep-nobaseline": w.nobaseline_tree,
+                "dep-deleted": w.deleted_tree,
+                "dep-cross": w.cross_tree,
+                "dep-github": w.g,
+                "dep-unresolved": w.l,
+            }.items()
+        }
+        git(w.stale_tree, "merge", "-q", "--ff-only", w.trunk)
+        w.head2 = rev(w.stale_tree, "HEAD")
+        w.c2 = collect_packages(
+            [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=True
+        )
+        recorded.active = False
+        w.calls["c2"] = len(fake.calls())
+        w.git_calls = recorded.calls
+    return w
+
+
+def pw_package(document: dict[str, Any], name: str) -> dict[str, Any]:
+    (found,) = [p for p in document["packages"] if p["package_id"] == PW_IDS[name]]
+    return found
+
+
+def pw_pill(document: dict[str, Any], name: str) -> dict[str, Any] | None:
+    return pw_package(document, name)["prerequisites"]
+
+
+def pw_facts(document: dict[str, Any], name: str) -> dict[str | None, tuple[str, str]]:
+    """The pill's facts of one dependent by prerequisite name (``None`` for a null ID)."""
+    return {
+        PW_NAME_OF.get(item["target_package_id"], item["target_package_id"]): (
+            item["merged_on_main"],
+            item["in_checkout"],
+        )
+        for item in pw_pill(document, name)["items"]
+    }
+
+
+def verdict_rung(document: dict[str, Any], member: Path, branch: str) -> str | None:
+    (found,) = [b for b in clone_at(document, member)["branches"] if b["name"] == branch]
+    return None if found["verdict"] is None else found["verdict"]["rung"]
+
+
+@posix_only
+def test_prerequisites_read_the_code_status_of_each_prerequisite_not_its_stage(prerequisite_world):
+    w = prerequisite_world
+    document = w.c1
+
+    # Controls: the statuses the main facts follow come from the clones' real history.
+    assert pw_package(document, "pre-pull")["code_status"]["state"] == "merged"
+    assert verdict_rung(document, w.g, "pre-pull") == "pull_request"
+    assert pw_package(document, "pre-e")["code_status"]["state"] == "merged"
+    assert verdict_rung(document, w.l, "pre-e") == "patch_equivalent"
+    assert pw_package(document, "pre-empty")["code_status"]["state"] == "no_commits_yet"
+    assert pw_package(document, "pre-deleted")["code_status"] is None
+    open_package = pw_package(document, "pre-open")
+    assert open_package["finished"] is True
+    assert open_package["code_status"]["state"] not in ("merged", "unknown")
+
+    assert pw_facts(document, "dep-nobaseline") == {"pre-a": ("merged", "unknown")}
+    assert pw_facts(document, "dep-equivalent") == {"pre-e": ("merged", "unknown")}
+    assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "unknown")}
+    # The highest-numbered merged request decides a prerequisite no clone holds.
+    assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
+    assert pw_facts(document, "dep-cross") == {"pre-a": ("merged", "unknown")}
+    assert pw_facts(document, "dep-open") == {
+        "pre-a": ("merged", "unknown"),
+        "pre-open": ("not_merged", "unknown"),
+        "pre-empty": ("not_merged", "unknown"),
+    }
+    assert pw_pill(document, "dep-open")["state"] == "not_in_main"
+    assert pw_pill(document, "dep-open")["text"] == "Prerequisites not met in main"
+    # A prerequisite's own prerequisites never reach its dependents: pre-a waits for
+    # pre-open, yet dep-nobaseline holds one item and no state of pre-a's.
+    assert pw_pill(document, "pre-a")["state"] == "not_in_main"
+    nobaseline = pw_pill(document, "dep-nobaseline")
+    assert nobaseline["state"] == "unknown" != "not_in_main"
+    assert len(nobaseline["items"]) == 1
+
+
+@posix_only
+def test_an_unresolved_row_or_a_prerequisite_with_no_usable_branch_stays_unknown(
+    prerequisite_world,
+):
+    w = prerequisite_world
+    pill = pw_pill(w.c1, "dep-unresolved")
+
+    assert [item["target_package_id"] for item in pill["items"]] == [
+        PW_IDS["on-trunk"],
+        PW_IDS["no-target"],
+        PW_MISSING_ID,
+        None,
+    ]
+    assert {
+        (item["merged_on_main"], item["in_checkout"]) for item in pill["items"]
+    } == {("unknown", "unknown")}
+    # The claim row names pre-a and adds no item.
+    assert PW_IDS["pre-a"] not in {item["target_package_id"] for item in pill["items"]}
+    assert len(pill["items"]) == 4
+    assert (pill["state"], pill["text"]) == ("unknown", "Prerequisites unknown")
+    assert pw_package(w.c1, "on-trunk")["branch"]["status"] == "default_branch"
+    assert not [p for p in w.c1["packages"] if p["package_id"] == PW_IDS["no-target"]]
+
+
+@posix_only
+def test_no_pill_sits_on_a_finished_package_or_a_target_outside_the_clones(prerequisite_world):
+    w = prerequisite_world
+    for document in (w.c0, w.c1, w.c2):
+        assert pw_package(document, "dep-finished")["finished"] is True
+        assert pw_pill(document, "dep-finished") is None
+        assert pw_package(document, "dep-missing")["target"]["status"] == "missing"
+        assert pw_pill(document, "dep-missing") is None
+        assert pw_pill(document, "dep-open") is not None
+
+
+@posix_only
+def test_a_deleted_prerequisite_is_unknown_without_a_lookup_and_merged_with_one(
+    prerequisite_world,
+):
+    w = prerequisite_world
+
+    assert w.c0["github_lookup"] == "off"
+    assert pw_facts(w.c0, "dep-deleted") == {"pre-deleted": ("unknown", "unknown")}
+    assert pw_pill(w.c0, "dep-deleted")["state"] == "unknown"
+    assert pw_facts(w.c1, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
+    assert pw_facts(w.c2, "dep-deleted") == {"pre-deleted": ("merged", "unknown")}
+
+
+@posix_only
+def test_the_checkout_commit_is_the_worktrees_head_with_or_without_a_baseline(prerequisite_world):
+    w = prerequisite_world
+    for name, head in w.heads1.items():
+        assert pw_pill(w.c1, name)["checkout_sha"] == head, name
+    assert w.heads1["dep-github"] == rev(w.g, "trunk")
+    nobaseline = pw_package(w.c1, "dep-nobaseline")
+    assert nobaseline["baseline"]["status"] == "absent"
+    assert nobaseline["baseline"]["checkout"] is None
+    assert pw_pill(w.c1, "dep-nobaseline")["checkout_sha"] == w.nobaseline_head
+    stale = pw_package(w.c1, "dep-stale")
+    assert stale["baseline"]["checkout"]["sha"] == w.old == pw_pill(w.c1, "dep-stale")["checkout_sha"]
+    moved = pw_package(w.c2, "dep-stale")
+    assert moved["baseline"]["checkout"]["sha"] == w.head2 == pw_pill(w.c2, "dep-stale")["checkout_sha"]
+    assert w.head2 == w.trunk != w.old
+
+
+@posix_only
+def test_the_collection_asks_github_once_and_the_pill_makes_no_further_call(prerequisite_world):
+    w = prerequisite_world
+
+    assert w.calls == {"c0": 0, "c1": 1, "c2": 2}
+    assert repository_of(w.c1, w.g)["pr_lookup"]["status"] == "live"
+    assert repository_of(w.c0, w.g)["pr_lookup"]["status"] != "live"
+
+
+def mutated_pill(w: PrerequisiteWorld, change) -> str:
+    document = doc_copy(w.c1)
+    change(document)
+    return refusal_of(document)
+
+
+def retext_pill(document: dict[str, Any], name: str) -> None:
+    pill = pw_pill(document, name)
+    pill["state"] = models.derive_prerequisites(pill["items"])
+    pill["text"] = models.prerequisites_text(pill["state"])
+
+
+def pw_item(document: dict[str, Any], name: str, target: str | None) -> dict[str, Any]:
+    wanted = None if target is None else PW_IDS.get(target, target)
+    (found,) = [i for i in pw_pill(document, name)["items"] if i["target_package_id"] == wanted]
+    return found
+
+
+def change_state(document):
+    pw_pill(document, "dep-open")["state"] = "met"
+
+
+def change_text(document):
+    pw_pill(document, "dep-open")["text"] = "Prerequisites met"
+
+
+def merged_but_in_progress(document):
+    pw_item(document, "dep-open", "pre-open")["merged_on_main"] = "merged"
+    retext_pill(document, "dep-open")
+
+
+def not_merged_without_a_status(document):
+    pw_item(document, "dep-deleted", "pre-deleted")["merged_on_main"] = "not_merged"
+    retext_pill(document, "dep-deleted")
+
+
+def merged_on_the_default_branch(document):
+    pw_item(document, "dep-unresolved", "on-trunk")["merged_on_main"] = "merged"
+    retext_pill(document, "dep-unresolved")
+
+
+def merged_for_a_package_with_no_branch_at_all(document):
+    pw_item(document, "dep-unresolved", "no-target")["merged_on_main"] = "merged"
+    retext_pill(document, "dep-unresolved")
+
+
+def other_sha_than_baseline_checkout(document):
+    pw_pill(document, "dep-stale")["checkout_sha"] = "e" * 40
+
+
+def other_sha_than_head(document):
+    pw_pill(document, "dep-nobaseline")["checkout_sha"] = "e" * 40
+
+
+def finished_with_a_pill(document):
+    pw_package(document, "dep-finished")["prerequisites"] = doc_copy(pw_pill(document, "dep-open"))
+
+
+def unfinished_with_none(document):
+    pw_package(document, "dep-open")["prerequisites"] = None
+
+
+def in_checkout_of_an_unmerged_item(document):
+    pw_item(document, "dep-open", "pre-open")["in_checkout"] = "yes"
+
+
+def in_checkout_without_a_checkout_commit(document):
+    tree = real(document_target_worktree(document, "dep-nobaseline"))
+    for item in all_clones_of(document):
+        for listed in item["worktrees"]:
+            if listed["path"] == tree:
+                listed["status"] = "timed_out"
+                for field in ("head", "changes", "operations", "index_lock", "verdict"):
+                    listed[field] = None
+    rederive(document)
+    pill = pw_pill(document, "dep-nobaseline")
+    assert pill["checkout_sha"] is None, "control"
+    pill["items"][0]["in_checkout"] = "yes"
+
+
+def document_target_worktree(document: dict[str, Any], name: str) -> str:
+    return pw_package(document, name)["target"]["worktree"]
+
+
+def all_clones_of(document: dict[str, Any]) -> list[dict[str, Any]]:
+    return [c for r in document["repositories"] for c in r["clones"]]
+
+
+def duplicated_item(document):
+    items = pw_pill(document, "dep-open")["items"]
+    items.append(dict(items[0]))
+
+
+def unsorted_items(document):
+    pw_pill(document, "dep-open")["items"].reverse()
+
+
+def null_identifier_before_another(document):
+    items = pw_pill(document, "dep-unresolved")["items"]
+    items.insert(0, items.pop())
+
+
+def extra_key_in_the_pill(document):
+    pw_pill(document, "dep-open")["extra"] = 1
+
+
+def extra_key_in_an_item(document):
+    pw_pill(document, "dep-open")["items"][0]["extra"] = 1
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("change", "fragment"),
+    [
+        (change_state, "state contradicts"),
+        (change_text, "text contradicts"),
+        (merged_but_in_progress, "contradicts the Code Status"),
+        (not_merged_without_a_status, "no Code Status"),
+        (merged_on_the_default_branch, "no declared branch"),
+        (merged_for_a_package_with_no_branch_at_all, "names no one listed package"),
+        (other_sha_than_baseline_checkout, "checkout_sha"),
+        (other_sha_than_head, "checkout_sha"),
+        (finished_with_a_pill, "is set exactly"),
+        (unfinished_with_none, "is set exactly"),
+        (in_checkout_of_an_unmerged_item, "in_checkout is unknown unless"),
+        (in_checkout_without_a_checkout_commit, "in_checkout is unknown unless"),
+        (duplicated_item, "unique and in canonical order"),
+        (unsorted_items, "unique and in canonical order"),
+        (null_identifier_before_another, "unique and in canonical order"),
+        (extra_key_in_the_pill, "invalid shape"),
+        (extra_key_in_an_item, "invalid shape"),
+    ],
+    ids=lambda value: value.__name__ if callable(value) else value,
+)
+def test_the_parser_refuses_a_pill_the_collected_facts_contradict(
+    prerequisite_world, change, fragment
+):
+    w = prerequisite_world
+    assert models.parse_checkouts(json.dumps(w.c1)), "control: the collected document parses"
+
+    message = mutated_pill(w, change)
+
+    assert message.startswith("packages["), message
+    assert "prerequisites" in message, message
+    assert fragment in message, message
+
+
+@posix_only
+def test_the_parser_accepts_each_collected_pill_and_refuses_the_stale_schema(prerequisite_world):
+    w = prerequisite_world
+    for document in (w.c0, w.c1, w.c2):
+        assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 11
+        assert models.parse_checkouts(json.dumps(document))
+    stale = doc_copy(w.c1)
+    stale["schema_version"] = 10
+    for package in stale["packages"]:
+        del package["prerequisites"]
+    assert refusal_of(stale) == "unsupported schema version"

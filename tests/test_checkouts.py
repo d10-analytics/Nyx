@@ -1535,8 +1535,9 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def rederive(document: dict[str, Any]) -> dict[str, Any]:
-    """Give every ``ok`` clone the Removable fields its present facts derive, then the
-    availability, free clones and attention list the whole document derives.
+    """Give every ``ok`` clone the Removable fields its present facts derive, every package
+    the prerequisites pill they derive, then the availability, free clones and attention
+    list the whole document derives.
 
     A clone whose facts the derivation cannot read (a mutation that broke their
     shape) keeps its fields: the structural checks refuse it before they matter.
@@ -1554,6 +1555,7 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
             worktree["removable"] = verdict
         item["removable_count"] = derived["removable_count"]
     try:
+        repill(document)
         derived = models.derive_attention(document)
     except (KeyError, TypeError):
         return document
@@ -1562,6 +1564,52 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
         for item in repository["clones"]:
             item["availability"] = derived["availability"][item["path"]]
     document["attention"] = derived["attention"]
+    return document
+
+
+def target_head_of(document: dict[str, Any], package: dict[str, Any]) -> str | None:
+    """The head commit of the worktree a package targets (the clone's main worktree for a
+    clone target), ``None`` when the document lists no readable head for it."""
+    target = package["target"]
+    for item in all_clones(document):
+        if item["path"] != target["clone"]:
+            continue
+        for listed in item["worktrees"] or []:
+            found = (
+                listed["path"] == target["worktree"]
+                if target["worktree"] is not None
+                else listed["main"]
+            )
+            if found:
+                head = listed["head"]
+                return head["sha"] if listed["status"] == "ok" and head is not None else None
+    return None
+
+
+def repill(document: dict[str, Any]) -> dict[str, Any]:
+    """Give every package the prerequisites pill its present facts derive.
+
+    A package that is finished or whose target is not a clone or worktree gets none, an
+    eligible one keeps its items (an empty list when it had none) with ``checkout_sha`` the
+    target worktree's head, ``in_checkout`` unknown wherever the facts allow no more, and the
+    state and text the models functions give.
+    """
+    for package in document["packages"]:
+        if package["finished"] or package["target"]["status"] not in ("clone", "worktree"):
+            package["prerequisites"] = None
+            continue
+        pill = package["prerequisites"] or {"items": []}
+        sha = target_head_of(document, package)
+        for item in pill["items"]:
+            if item["merged_on_main"] != "merged" or sha is None:
+                item["in_checkout"] = "unknown"
+        state = models.derive_prerequisites(pill["items"])
+        package["prerequisites"] = {
+            "state": state,
+            "text": models.prerequisites_text(state),
+            "checkout_sha": sha,
+            "items": pill["items"],
+        }
     return document
 
 
@@ -3009,7 +3057,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 10
+    assert document["schema_version"] == 11
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3606,7 +3654,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 10
+    assert first["schema_version"] == 11
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7405,7 +7453,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 10 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 11 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
@@ -7416,9 +7464,9 @@ def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sa
         models.parse_checkouts(redigest(previous))
     # The immediately previous schema is refused too: no reader for it remains.
     stale = doc_copy(document)
-    stale["schema_version"] = 9
+    stale["schema_version"] = 10
     for package in stale["packages"]:
-        del package["baseline"]["checkout"]
+        del package["prerequisites"]
     with pytest.raises(models.ProtocolError, match="unsupported schema version"):
         models.parse_checkouts(redigest(stale))
 

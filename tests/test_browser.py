@@ -16,7 +16,15 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
-from test_checkouts import clone, commit_file, git, isolate_git, make_remote, redigest
+from test_checkouts import (
+    clone,
+    commit_file,
+    git,
+    isolate_git,
+    make_remote,
+    redigest,
+    repill,
+)
 from test_server import embedded_put, raw_catalog, reported_contract_cases
 
 from nyx import models
@@ -7431,8 +7439,15 @@ def checkout_raw_variant(document, mutate):
 
 
 def checkout_variant(document, mutate):
-    """One re-digested capture with ``mutate`` applied; the parser must accept it."""
-    variant = checkout_raw_variant(document, mutate)
+    """One re-digested capture with ``mutate`` applied; the parser must accept it.
+
+    A mutation of a targeted worktree's head or status, or of a package's target or
+    finished flag, changes what each pill derives, so every pill is recomputed from the
+    mutated facts (``repill``) before the document is sealed and parsed.
+    """
+    variant = copy.deepcopy(document)
+    mutate(variant)
+    variant = reseal_checkouts(repill(variant))
     models.parse_checkouts(json.dumps(variant))
     return variant
 
