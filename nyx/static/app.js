@@ -1018,7 +1018,7 @@
     const baselineTone = {
       equal: "green", ahead: "yellow", behind: "red", diverged: "red", differs: "red",
     }[versus.relation] || "grey";
-    const mainTone = (comparison) => (comparison && {
+    const mainTone = (comparison) => ({
       equal: "green", ahead: "green", behind: "yellow", diverged: "yellow",
     }[comparison.relation]) || "grey";
     const mainUnknown = against.relation === "absent";
@@ -1034,23 +1034,21 @@
     // the colours and the search can never disagree.  A cached basis is named.
     const counted = (comparison, tone, subject) => {
       const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
-      const behind = comparison.behind === null && comparison.relation === "equal"
-        ? 0 : comparison.behind;
-      return (tone === "grey" || behind === null
+      return (tone === "grey"
         ? `${subject} unknown against main`
-        : `${subject} ${behind} behind main`) + named;
+        : `${subject} ${comparison.behind} behind main`) + named;
     };
     const words = [
       {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
         grey: "Baseline unknown"}[baselineTone],
       mainUnknown ? "Main unknown" : counted(against, tones.main, "Checkout"),
-      drift ? counted(drift, tones.baseline, "Baseline") : "Baseline unknown against main",
+      counted(drift, tones.baseline, "Baseline"),
     ];
     return {
       tones,
       words,
       place,
-      forked: place === "right" && drift !== null && drift.relation === "behind",
+      forked: place === "right" && drift.relation === "behind",
       added: place === "right" ? versus.ahead : null,
       behind: against.behind > 0 ? against.behind : null,
       link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
