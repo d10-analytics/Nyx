@@ -665,10 +665,10 @@ cannot be read (a missing or unreadable worktree, or no commit yet), in which ca
 `vs_baseline` compares C with the Baseline and takes the relation `equal` (C is
 the Baseline), `ahead` (C holds commits the Baseline lacks), `behind`,
 `diverged`, `differs` (the clone is shallow or partial, or lacks the Baseline
-commit) or `unknown` (a call failed or ran out of time); it is never `absent`,
+commit) or `unknown` (a call failed or ran out of time); it never takes the relation absent,
 and its basis is always `cached`. `vs_base` compares C with the base the clone
-judges its verdicts against and takes any of those relations, with `absent` exactly
-when the clone has no base; it carries the base's basis (`live`, `recorded` or
+judges its verdicts against and takes `equal`, `ahead`, `behind`, `diverged`,
+`differs` or `unknown` as above, or `absent` exactly when the clone has no base; it carries the base's basis (`live`, `recorded` or
 `cached`). Neither comparison has an `objects_from`. Each count is one read-only
 call per distinct commit and Baseline, or commit and base, and is recomputed on every run
 and never saved.
