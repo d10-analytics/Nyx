@@ -1288,12 +1288,18 @@ each **Needs attention** item that names it (except an item awaiting its merge,
 which the Code Status states, and a moved base, which the baseline line draws),
 and, when the checkout can be placed, a baseline line. The line is a small strip of three
 points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
-the remote main head. Colour carries the meaning and no count decides it: `C` is
-green at the Baseline, yellow when it holds commits of its own and red when it
-lacks the Baseline; `C` and `B` against main are green when none behind, yellow
-when behind and grey when unknown. With no base, main is unknown: `M` is red and
-its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
-and a check mark a line that is green throughout. The base-moved item is not a
+the remote main head. Colour carries the meaning and no count decides it. `C` takes its colour from the
+checkout against its Baseline alone: green when it is at the Baseline, yellow when it
+holds commits of its own, red when it lacks the Baseline and grey when that cannot be
+computed; the link between `B` and `C` and the `+N` count of the checkout's own
+commits carry the same colour. `M` and the line to it take their colour from the
+checkout against main: green when it is none behind, yellow when it is behind and grey
+when that cannot be computed. `B` takes its colour from the Baseline against main in
+the same way: green, yellow or grey, never red. With no base, main is unknown: `M` is
+red and its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
+a dotted `C` one that has diverged from the Baseline, differs from it or cannot be
+placed against it, and a check
+mark in `C` a line whose `C`, `M` and `B` are all green. The base-moved item is not a
 tag; it still shows in the work item panel and in **Checkouts**.
 
 The **work item panel** on the left shows the selected card in full. A left or
