@@ -2084,3 +2084,31 @@ def test_checkout_guide_promises_plain_merged_nowhere_else():
 def test_workspace_guide_says_counts_as_finished_decides_checkout_packages():
     workspaces = _normalized("docs/workspaces.md")
     _assert_unique_markers(workspaces, WORKSPACE_FINISHED_MARKERS, "docs/workspaces.md")
+
+
+def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
+    guide = _normalized("docs/running-nyx.md")
+    guide_markers = (
+        "`checkout` places the checkout itself against the same two commits.",
+        "and, when the checkout can be placed, a baseline line.",
+        "The base-moved item is not a tag; it still shows in the work item panel and in "
+        "**Checkouts**.",
+        "then the baseline line itself with its words and a legend naming `B`, `C`, `M`",
+    )
+    _assert_unique_markers(guide, guide_markers, "docs/running-nyx.md")
+    assert "base moved 8" not in guide
+    checkouts = _normalized("docs/systems/checkouts/README.md")
+    _assert_unique_markers(
+        checkouts,
+        ("with one read-only `rev-list --left-right --count` per distinct (C, B) and (C, M)",),
+        "docs/systems/checkouts/README.md",
+    )
+    board = _normalized("docs/systems/board-web/README.md")
+    _assert_unique_markers(
+        board,
+        (
+            "and a moved base, which the baseline line draws",
+            "Baseline drift and a row with the baseline line and its legend",
+        ),
+        "docs/systems/board-web/README.md",
+    )
