@@ -615,7 +615,7 @@ button.pending {
 /* The tags keep the page's own colours on every card, so they read the same on
    a plain card and on a brand-teal one. Each tag is a soft wash of its --tone
    over the card surface, with the tone as its border; --ink is the text colour. */
-.card-project, .card-code-status, .card-attention {
+.card-project, .card-code-status, .card-attention, .card-prerequisites {
   --tone: var(--control-border);
   --ink: var(--tone);
   display: inline-block;
@@ -633,6 +633,9 @@ button.pending {
 .card-code-status[data-state="merged"] { --tone: var(--state-done); }
 .card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --tone: var(--control-border); }
 .card-attention { --tone: var(--state-waiting); }
+.card-prerequisites[data-tone="green"] { --tone: var(--state-done); }
+.card-prerequisites[data-tone="red"] { --tone: var(--state-failed); }
+.card-prerequisites[data-tone="grey"] { --tone: var(--control-border); --ink: var(--text); }
 /* The baseline line: three markers on one horizontal line, drawn on the tag
    surface so it reads the same on a plain card and on a brand-teal one. Places
    are ordinal; a count is printed beside M and never sets a distance. */
@@ -718,6 +721,7 @@ button.pending {
 .baseline-behind { left: calc(70% + .7rem); top: 1.3rem; margin-top: -.45rem; }
 .panel-baseline-line .card-baseline { flex: none; display: block; width: 100%; max-width: 14rem; }
 .panel-baseline-words { display: block; margin-top: .3rem; }
+.panel-prerequisite-items { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .85rem; }
 .panel-baseline-legend { margin: .3rem 0 0; padding: 0; list-style: none; font-size: .8rem; color: var(--muted); }
 .panel-baseline-legend b { color: var(--text); }
 .connection.overflow .rail { stroke-dasharray: 7 4; }

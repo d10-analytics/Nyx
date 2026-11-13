@@ -70,6 +70,11 @@
     "package_path", "package_id", "finished", "superseded", "target", "branch",
     "baseline", "code_status", "prerequisites",
   ];
+  const CHECKOUTS_PREREQUISITES_KEYS = ["state", "text", "checkout_sha", "items"];
+  const CHECKOUTS_PREREQUISITE_ITEM_KEYS = ["target_package_id", "merged_on_main", "in_checkout"];
+  const PREREQUISITE_STATES = ["none", "not_in_main", "not_in_checkout", "unknown", "met"];
+  const PREREQUISITE_MAIN_FACTS = ["merged", "not_merged", "unknown"];
+  const PREREQUISITE_CHECKOUT_FACTS = ["yes", "no", "unknown"];
   const CHECKOUTS_CODE_STATUS_KEYS = [
     "state", "text", "pull_request", "push", "unpushed", "cleanup",
     "checked_out_elsewhere",
@@ -403,6 +408,8 @@
       "panelAttention": "Needs attention",
       "panelTarget": "Target repo",
       "panelBaseline": "Baseline",
+      "panelPrerequisites": "Prerequisites",
+      "prerequisiteUnreadable": "A prerequisite that cannot be read",
       "panelBaselineLine": "Baseline line",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
@@ -445,6 +452,16 @@
       "foldersReloadNeeded": "Save not applied: the saved checkout folders are not available to compare. Reload checkout folders to replace this unsaved draft and try again.",
       "foldersFailure": "Save failed: the checkout folders were not saved.",
       "foldersSaveError": "Save failed: {code}"
+    },
+    "prerequisiteMain": {
+      "merged": "merged on main",
+      "not_merged": "not merged on main",
+      "unknown": "merge on main unknown"
+    },
+    "prerequisiteCheckout": {
+      "yes": "in this checkout",
+      "no": "not in this checkout",
+      "unknown": "checkout unknown"
     },
     "folderReason": {
       "invalid_path": "This is not a usable path.",
@@ -582,6 +599,8 @@
   let cardCodeStatus = new Map();
   // The baseline of each rendered card whose served package has a checkout.
   let cardBaseline = new Map();
+  // The prerequisites pill of each rendered card whose served package has one.
+  let cardPill = new Map();
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
@@ -1002,6 +1021,29 @@
     return baselines;
   }
 
+  // The prerequisites pill every card reads, by work item path.
+  function prerequisitesPillMap() {
+    const pills = new Map();
+    const document = servedCheckoutsDocument();
+    if (document === null) return pills;
+    document.packages.forEach((item) => {
+      if (item.prerequisites) pills.set(item.package_path, item.prerequisites);
+    });
+    return pills;
+  }
+
+  // The one colour of a pill, decided from its state alone.
+  function prerequisitesTone(pill) {
+    return {none: "green", met: "green", not_in_main: "red", not_in_checkout: "red"}[pill.state] ||
+      "grey";
+  }
+
+  function prerequisitesPillHtml(pill) {
+    return `<span class="card-prerequisites" data-state="${text(pill.state)}" ` +
+      `data-tone="${prerequisitesTone(pill)}" aria-label="${text(pill.text)}">` +
+      `${text(pill.text)}</span>`;
+  }
+
   // The one place the colours of the baseline line are decided, and no commit
   // count decides any of them.  The checkout against its Baseline is green when
   // equal, yellow when it holds commits of its own, red when it lacks the
@@ -1009,7 +1051,9 @@
   // against main are green at none behind, yellow behind and grey when
   // unknown, never red; with main unknown M is red and the line to it dashed
   // grey.  Positions are ordinal: the count printed beside M is never a distance.
-  function baselineLineModel(baseline) {
+  // The check mark also needs the card's prerequisites pill, when it has one, to
+  // be green.
+  function baselineLineModel(baseline, pill) {
     const checkout = baseline && baseline.checkout;
     if (!checkout) return null;
     const versus = checkout.vs_baseline;
@@ -1052,12 +1096,13 @@
       added: place === "right" ? versus.ahead : null,
       behind: against.behind > 0 ? against.behind : null,
       link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
-      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green",
+      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green" &&
+        (pill === null || pill === undefined || prerequisitesTone(pill) === "green"),
     };
   }
 
-  function baselineLineHtml(baseline) {
-    const model = baselineLineModel(baseline);
+  function baselineLineHtml(baseline, pill) {
+    const model = baselineLineModel(baseline, pill);
     if (model === null) return "";
     const point = (name, tone, extra, inner) =>
       `<span class="baseline-point" data-point="${name}" data-tone="${tone}"${extra}>${inner}</span>`;
@@ -1117,21 +1162,26 @@
       `title="${attentionWords(item)}">${words}</span>`;
   }
 
-  // The checkout facts a card carries: its Code Status and one badge per
-  // attention item that names it.
+  // The checkout facts a card carries: its Code Status, its prerequisites pill
+  // and one badge per attention item that names it.
   function cardFactsHtml(path) {
     const status = cardCodeStatus.get(path);
+    const pill = cardPill.get(path);
     return (status === undefined ? "" : codeStatusPillHtml(status)) +
+      (pill === undefined ? "" : prerequisitesPillHtml(pill)) +
       (cardAttention.get(path) || []).map(attentionBadgeHtml).join("") +
-      baselineLineHtml(cardBaseline.get(path));
+      baselineLineHtml(cardBaseline.get(path), pill);
   }
 
   // The one search text of a card: its work item's fields, its Code Status and
-  // the words of its baseline line.  Both render paths read it from here.
+  // its prerequisites pill and the words of its baseline line.  Both render
+  // paths read it from here.
   function cardSearchText(entry) {
-    const model = baselineLineModel(cardBaseline.get(entry.package_path));
+    const pill = cardPill.get(entry.package_path);
+    const model = baselineLineModel(cardBaseline.get(entry.package_path), pill);
     return searchText(entry, [
-      cardCodeStatus.get(entry.package_path)?.text, ...(model === null ? [] : model.words),
+      cardCodeStatus.get(entry.package_path)?.text, pill?.text,
+      ...(model === null ? [] : model.words),
     ].filter((value) => value !== null && value !== undefined).join(" "));
   }
 
@@ -1370,6 +1420,7 @@
     renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
+    cardPill = prerequisitesPillMap();
     cardAttention = cardAttentionMap();
     cardFactsMarkup = new Map();
     // Keyed by path so cards sharing a package identity keep their own relationships.
@@ -1581,6 +1632,7 @@
   function updateCardCodeStatus() {
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
+    cardPill = prerequisitesPillMap();
     cardAttention = cardAttentionMap();
     let changed = false;
     board.querySelectorAll(".card[data-package-path]").forEach((card) => {
@@ -1804,13 +1856,30 @@
   // The baseline line of one work item as the card draws it, with its words
   // and its legend; nothing when the checkout cannot be placed.
   function panelBaselineLineHtml(item) {
-    const model = baselineLineModel(item.baseline);
+    const model = baselineLineModel(item.baseline, item.prerequisites);
     if (model === null) return "";
     const legend = BASELINE_LEGEND.map(([name, meaning]) =>
       `<li><b>${text(name)}</b> ${text(meaning)}</li>`).join("");
-    return `${baselineLineHtml(item.baseline)}` +
+    return `${baselineLineHtml(item.baseline, item.prerequisites)}` +
       `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>` +
       `<ul class="panel-baseline-legend">${legend}</ul>`;
+  }
+
+  // One line per prerequisite: the title of the one catalog entry with its
+  // Package ID, else the ID, then its two facts in words.
+  function panelPrerequisiteItemsHtml(pill) {
+    if (!pill.items.length) return "";
+    const lines = pill.items.map((item) => {
+      const id = item.target_package_id;
+      if (id === null) {
+        return `<li>${text(codeWords("text", "prerequisiteUnreadable"))}</li>`;
+      }
+      const named = displayed.entries.filter((candidate) => candidate.package_id === id);
+      const name = named.length === 1 ? titleOf(named[0]) : id;
+      return `<li>${text(name)}: ${text(codeWords("prerequisiteMain", item.merged_on_main))}, ` +
+        `${text(codeWords("prerequisiteCheckout", item.in_checkout))}</li>`;
+    });
+    return `<ul class="panel-prerequisite-items">${lines.join("")}</ul>`;
   }
 
   // The checkout facts of one work item, read from the served document as the
@@ -1825,6 +1894,11 @@
     if (item.code_status !== null && item.code_status !== undefined) {
       rows.push(panelRowHtml(codeWords("text", "panelCodeStatus"),
         codeStatusPillHtml(item.code_status), "panel-code-status"));
+    }
+    if (item.prerequisites !== null && item.prerequisites !== undefined) {
+      rows.push(panelRowHtml(codeWords("text", "panelPrerequisites"),
+        prerequisitesPillHtml(item.prerequisites) + panelPrerequisiteItemsHtml(item.prerequisites),
+        "panel-prerequisites"));
     }
     const attention = document.attention.filter((candidate) =>
       candidate.packages.includes(entry.package_path));
@@ -2911,6 +2985,14 @@
       const status = item.code_status;
       protocol(status === null ||
         (exactKeys(status, CHECKOUTS_CODE_STATUS_KEYS) && safeText(status.text)));
+      const pill = item.prerequisites;
+      protocol(pill === null ||
+        (exactKeys(pill, CHECKOUTS_PREREQUISITES_KEYS) &&
+          PREREQUISITE_STATES.includes(pill.state) && safeText(pill.text) &&
+          Array.isArray(pill.items) &&
+          pill.items.every((entry) => exactKeys(entry, CHECKOUTS_PREREQUISITE_ITEM_KEYS) &&
+            PREREQUISITE_MAIN_FACTS.includes(entry.merged_on_main) &&
+            PREREQUISITE_CHECKOUT_FACTS.includes(entry.in_checkout))));
     });
     await authenticate(document, "checkouts_digest", CHECKOUTS_DIGEST_OMITTED);
     return payload;
