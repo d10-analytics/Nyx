@@ -11319,7 +11319,7 @@ def baseline_line_page(open_page, real_checkouts):
     return open_code_status_page(open_page, real_checkouts, double), double
 
 
-EQUAL = comparison("equal")
+EQUAL = comparison("equal", 0, 0)
 BASELINE_VS_MAIN_CASES = [
     ("equal", EQUAL, "green"),
     ("ahead", comparison("ahead", 2, 0), "green"),
