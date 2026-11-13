@@ -7833,6 +7833,20 @@ def prerequisite_world(tmp_path_factory):
         )
         recorded = RecordedRuns(patch)
         recorded.active = True
+        # The git calls each containment step makes, in collection order: the step is
+        # the one section that runs after the ladder's last call, so its calls are those
+        # recorded between its start and its end.
+        w.step_calls = []
+        step = checkouts._assign_in_checkout
+
+        def recorded_step(*arguments, **options):
+            before = len(recorded.calls)
+            try:
+                return step(*arguments, **options)
+            finally:
+                w.step_calls.append(recorded.calls[before:])
+
+        patch.setattr(checkouts, "_assign_in_checkout", recorded_step)
         w.c1 = collect_packages(
             [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=True
         )
@@ -8232,33 +8246,13 @@ def test_each_merged_prerequisite_reads_whether_its_commits_reached_the_checkout
     assert models.parse_checkouts(json.dumps(w.c2))
 
 
-def ancestry_calls(w: PrerequisiteWorld, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The recorded ``merge-base --is-ancestor`` calls whose last argument is a
-    dependent's checked-out commit: one no clone's verdict base names and no listed
-    request head is, as the ladder's own calls end with a base or a request head."""
-    bases = {
-        clone["verdict_base"]["sha"]
-        for document in (w.c1, w.c2)
-        for repository in document["repositories"]
-        for clone in repository["clones"]
-        if clone["verdict_base"] is not None
-    }
-    heads = {"d" * 40, w.tip["pre-pull"], w.tip["pre-deleted"]}
-    return [
-        call
-        for call in calls
-        if "merge-base" in call["arguments"]
-        and "--is-ancestor" in call["arguments"]
-        and call["arguments"][-1] not in bases | heads
-    ]
-
-
 @posix_only
 def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clone(
     prerequisite_world,
 ):
     w = prerequisite_world
-    found = ancestry_calls(w, w.git_calls[: w.c1_calls])
+    assert len(w.step_calls) >= 2, "control: the step ran once for each of c1 and c2"
+    found = [call for call in w.step_calls[0] if "--is-ancestor" in call["arguments"]]
     ours = [call["arguments"][-2:] for call in found]
     dependent_cs = {
         pill["checkout_sha"]
@@ -8267,18 +8261,20 @@ def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clon
     }
 
     # One call per distinct (checkout commit, tip): dep-nobaseline and dep-open share
-    # theirs, so a per-package call would run twice. dep-stale's and dep-github's
-    # checkout is the commit both clones' main still holds, a verdict base, so the
-    # filter leaves their calls to the ladder's own.
+    # theirs, so a per-package call would run twice. dep-stale and dep-github sit on
+    # the commit their clones' main still holds, so their prerequisites, which are
+    # also asked of that commit, are checked there too.
     nobaseline_c = pw_c(w.c1, "dep-nobaseline")
     assert pw_c(w.c1, "dep-open") == nobaseline_c
     assert ours.count([w.tip["pre-a"], nobaseline_c]) == 1
-    assert sorted(ours) == sorted(
-        [
-            [w.tip["pre-a"], nobaseline_c],
-            [w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")],
-        ]
-    )
+    expected_clone = {
+        (w.tip["pre-a"], nobaseline_c): w.l,
+        (w.tip["pre-a"], pw_c(w.c1, "dep-stale")): w.l,
+        (w.tip["pre-e"], pw_c(w.c1, "dep-equivalent")): w.l,
+        (w.tip["pre-pull"], pw_c(w.c1, "dep-github")): w.g,
+        (w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
+    }
+    assert sorted(ours) == sorted(list(pair) for pair in expected_clone)
     assert all(last in dependent_cs for _, last in ours)
     for call in found:
         arguments = call["arguments"]
@@ -8286,10 +8282,6 @@ def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clon
         assert any(a.startswith("core.attributesFile=") for a in arguments)
         assert {"GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"} <= set(call["overlay"])
         assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in call["overlay"]
-    expected_clone = {
-        (w.tip["pre-a"], nobaseline_c): w.l,
-        (w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
-    }
     for call in found:
         assert real(call["path"]) == real(expected_clone[tuple(call["arguments"][-2:])])
     # Nothing is asked of a prerequisite that is not merged, nor of another repository.
