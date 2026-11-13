@@ -3751,7 +3751,7 @@ def _assign_drift(
     for position, package in enumerate(packages):
         baseline = package["baseline"]
         found = decided_drift.get(package["target"]["clone"], {}).get(baseline["sha"])
-        if found is None:
+        if found is None or position not in checked_out:
             continue
         baseline["drift"] = dict(found)
         path = package["target"]["clone"]
