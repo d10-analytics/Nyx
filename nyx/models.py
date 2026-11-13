@@ -2531,8 +2531,6 @@ def _check_checkout(
     _comparison(item["vs_baseline"], f"{label}.vs_baseline", check="cached")
     _comparison(item["vs_base"], f"{label}.vs_base", check=basis)
     versus, against = item["vs_baseline"], item["vs_base"]
-    if versus["basis"] != "cached":
-        raise ProtocolError(f"{label}.vs_baseline.basis must be cached")
     if versus["relation"] == "absent":
         raise ProtocolError(f"{label}.vs_baseline.relation must not be absent")
     if against["basis"] != basis:
