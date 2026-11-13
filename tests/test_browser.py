@@ -11656,3 +11656,18 @@ def test_baseline_line_words_search_follows_the_facts_after_a_poll(open_page, re
     # The refreshed search text is the first render's: a reload of the same facts agrees.
     page.fill("#filter", "")
     assert page.locator(".card[hidden]").count() == 0
+
+
+def test_baseline_line_words_search_survives_a_full_render(open_page, real_checkouts):
+    """A card drawn afresh searches by the same words an in-place refresh gives it."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta = BASELINE_LINE_CARDS[:3]
+    equal = live("equal", 0, 0)
+    serve_baseline_states(page, double, {
+        alpha: (equal, equal, live("behind", 0, 3)), beta: (equal, equal, live("behind", 0, 58)),
+        delta: (equal, equal, live("behind", 0, 3))})
+    # Unchecking a display preference rebuilds every card through the first-render path.
+    page.get_by_label("Hide terminal rows", exact=True).check()
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    settle_frames(page)
+    assert sorted(visible_card_paths(page, "Checkout 3 behind main")) == [alpha, delta]
