@@ -11276,6 +11276,13 @@ BASELINE_LINE_READ = """card => {
     link: {tone: link.dataset.tone, line: link.dataset.line || null,
            style: getComputedStyle(link).borderTopStyle},
     fork: line.querySelector('.baseline-link[data-link="fork"]') !== null,
+    forkBox: (() => {
+      const node = line.querySelector('.baseline-link[data-link="fork"]');
+      if (!node) return null;
+      const box = rect(node);
+      return {left: box.x - base.x, bottom: box.y + box.height - base.y,
+              right: box.right - base.x, top: box.y - base.y};
+    })(),
     added: added ? added.textContent : null,
     behind: behind ? behind.textContent : null,
     behindLeft: behind ? rect(behind).x - base.x : null,
@@ -11400,6 +11407,10 @@ def test_baseline_line_markers_place_the_checkout_by_order_alone(
         assert lines[tag]["C"]["check"] is False
     assert lines["forked"]["fork"] and lines["forked"]["C"]["fork"]
     assert lines["forked"]["C"]["cy"] < lines["forked"]["B"]["cy"] - 3
+    # The fork line runs from the centre of B to the centre of C.
+    box, point_b, point_c = lines["forked"]["forkBox"], lines["forked"]["B"], lines["forked"]["C"]
+    assert abs(box["left"] - point_b["cx"]) < 1 and abs(box["bottom"] - point_b["cy"]) < 1
+    assert abs(box["right"] - point_c["cx"]) < 1 and abs(box["top"] - point_c["cy"]) < 1
     assert not lines["plain"]["fork"] and not lines["plain"]["C"]["fork"]
     assert abs(lines["plain"]["C"]["cy"] - lines["plain"]["B"]["cy"]) < 1
     assert lines["left"]["C"]["cx"] < lines["left"]["B"]["cx"] - 4
