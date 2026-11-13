@@ -309,7 +309,6 @@
       "behind": "the base moved {b} commits past it"
     },
     "cardBadge": {
-      "base_moved": "base moved {count}",
       "target_repo_missing": "Target repo missing",
       "target_repo_not_git": "Target repo not a git checkout",
       "branch_invalid": "Branch name invalid"
@@ -1085,13 +1084,14 @@
   }
 
   // The attention items that name each work item.  An item awaiting its merge
-  // is left out: the Code Status of its card already says so.
+  // is left out: the Code Status of its card already says so.  A moved base is
+  // left out too: the baseline line of the card draws it.
   function cardAttentionMap() {
     const items = new Map();
     const document = servedCheckoutsDocument();
     if (document === null) return items;
     document.attention.forEach((item) => {
-      if (item.class === "awaiting_merge") return;
+      if (item.class === "awaiting_merge" || item.code === "base_moved") return;
       item.packages.forEach((path) => {
         if (!items.has(path)) items.set(path, []);
         items.get(path).push(item);
