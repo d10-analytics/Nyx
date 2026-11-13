@@ -662,14 +662,23 @@ The `basis` is the base's: `live`, `recorded` or `cached`.
 clone's main worktree when the target is the clone, and it is null when that head
 cannot be read (a missing or unreadable worktree, or no commit yet), in which case
 `vs_baseline` is `unknown` and `vs_base` is `unknown` or, with no base, `absent`.
-`vs_baseline` compares C with the Baseline and takes the relation `equal` (C is
-the Baseline), `ahead` (C holds commits the Baseline lacks), `behind`,
-`diverged`, `differs` (the clone is shallow or partial, or lacks the Baseline
-commit) or `unknown` (a call failed or ran out of time); it never takes the relation absent,
-and its basis is always `cached`. `vs_base` compares C with the base the clone
-judges its verdicts against and takes `equal`, `ahead`, `behind`, `diverged`,
-`differs` or `unknown` as above, or `absent` exactly when the clone has no base; it carries the base's basis (`live`, `recorded` or
-`cached`). Neither comparison has an `objects_from`. Each count is one read-only
+`vs_baseline` compares C with the Baseline. It is `equal` when C is the
+Baseline, with no git call. Otherwise it is `unknown` when the clone is shallow or
+partial or unreadable, or when the check that the clone holds the Baseline commit
+could not settle; `differs` when a complete clone lacks the Baseline commit; and,
+when the commit is held, `ahead` (C holds commits the Baseline lacks), `behind`
+(the Baseline holds commits C lacks) or `diverged` (both) from one count. A count
+that failed, ran out of time or found no difference between distinct commits is
+`unknown`. It never takes the relation absent, and its basis is always `cached`.
+`vs_base` compares C with the base the clone judges its verdicts against. It is
+`absent` exactly when the clone has no base and `equal` when C is the base
+commit, with no git call. Otherwise it is `unknown` when the clone is shallow or
+partial or unreadable; then one count gives `ahead`, `behind` or `diverged`, and
+`unknown` when the count ran out of time or, on a `live` or `recorded` base,
+never ran; any other count that failed, or found no difference between distinct
+commits, is `differs`, which on a `cached` base includes a count that never ran.
+`vs_base` carries the base's basis (`live`, `recorded` or `cached`).
+Neither comparison has an `objects_from`. Each count is one read-only
 call per distinct commit and Baseline, or commit and base, and is recomputed on every run
 and never saved.
 
@@ -1282,7 +1291,8 @@ points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
 the remote main head. Colour carries the meaning and no count decides it: `C` is
 green at the Baseline, yellow when it holds commits of its own and red when it
 lacks the Baseline; `C` and `B` against main are green when none behind, yellow
-when behind and grey when unknown. A ring on `C` marks a checkout at the Baseline,
+when behind and grey when unknown. With no base, main is unknown: `M` is red and
+its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
 and a check mark a line that is green throughout. The base-moved item is not a
 tag; it still shows in the work item panel and in **Checkouts**.
 
