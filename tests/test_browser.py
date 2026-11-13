@@ -11339,7 +11339,7 @@ def test_baseline_line_tones_follow_the_one_rule(
     versus_cases = [
         ((EQUAL, comparison(relation, ahead, behind), EQUAL), tone)
         for relation, ahead, behind, tone in [
-            ("equal", None, None, "green"), ("ahead", 5, 0, "yellow"),
+            ("equal", 0, 0, "green"), ("ahead", 5, 0, "yellow"),
             ("behind", 0, 2, "red"), ("diverged", 1, 2, "red"),
             ("differs", None, None, "red"), ("unknown", None, None, "grey"),
         ]
