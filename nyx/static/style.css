@@ -705,6 +705,10 @@ button.pending {
 }
 .baseline-added { left: calc(var(--c) + .7rem); }
 .baseline-behind { left: calc(70% + .7rem); top: 1.3rem; margin-top: -.45rem; }
+.panel-baseline-line .card-baseline { flex: none; display: block; width: 100%; max-width: 14rem; }
+.panel-baseline-words { display: block; margin-top: .3rem; }
+.panel-baseline-legend { margin: .3rem 0 0; padding: 0; list-style: none; font-size: .8rem; color: var(--muted); }
+.panel-baseline-legend b { color: var(--text); }
 .connection.overflow .rail { stroke-dasharray: 7 4; }
 
 .work-item-panel {

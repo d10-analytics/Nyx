@@ -403,6 +403,7 @@
       "panelAttention": "Needs attention",
       "panelTarget": "Target repo",
       "panelBaseline": "Baseline",
+      "panelBaselineLine": "Baseline line",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
@@ -1789,6 +1790,28 @@
 
   // The checkout facts of one work item, read from the served document as the
   // Checkouts view reads them; nothing while no document can be shown.
+  // The legend of the baseline line, one entry per convention the strip uses.
+  const BASELINE_LEGEND = [
+    ["B", "the Baseline"],
+    ["C", "the commit checked out in the target"],
+    ["M", "the remote main head"],
+    ["ring", "the checkout is at the Baseline"],
+    ["fork", "the checkout has commits of its own (+N) beside a Baseline that has moved on"],
+    ["count by M", "commits the checkout is behind main"],
+  ];
+
+  // The baseline line of one work item as the card draws it, with its words
+  // and its legend; nothing when the checkout cannot be placed.
+  function panelBaselineLineHtml(item) {
+    const model = baselineLineModel(item.baseline);
+    if (model === null) return "";
+    const legend = BASELINE_LEGEND.map(([name, meaning]) =>
+      `<li><b>${text(name)}</b> ${text(meaning)}</li>`).join("");
+    return `${baselineLineHtml(item.baseline)}` +
+      `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>` +
+      `<ul class="panel-baseline-legend">${legend}</ul>`;
+  }
+
   function panelCodeHtml(entry) {
     const document = servedCheckoutsDocument();
     if (document === null) return "";
@@ -1823,6 +1846,11 @@
     }
     rows.push(panelRowHtml(codeWords("text", "panelBaseline"),
       baselineWords(document, item), "panel-baseline"));
+    const lineHtml = panelBaselineLineHtml(item);
+    if (lineHtml !== "") {
+      rows.push(panelRowHtml(codeWords("text", "panelBaselineLine"), lineHtml,
+        "panel-baseline-line"));
+    }
     const elsewhere = item.code_status === null || item.code_status === undefined
       ? [] : item.code_status.checked_out_elsewhere;
     if (elsewhere.length) {
