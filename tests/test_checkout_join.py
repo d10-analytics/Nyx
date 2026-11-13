@@ -7837,6 +7837,7 @@ def prerequisite_world(tmp_path_factory):
             [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=True
         )
         w.calls["c1"] = len(fake.calls())
+        w.c1_calls = len(recorded.calls)
         w.heads1 = {
             name: rev(tree, "HEAD")
             for name, tree in {
@@ -8179,3 +8180,307 @@ def test_the_parser_accepts_an_unknown_main_fact_whatever_its_package_code_statu
         item["merged_on_main"]
         for item in pw_pill(parsed, "dep-open")["items"]
     } == {"unknown"}
+
+
+def pw_c(document: dict[str, Any], name: str) -> str:
+    """The checked-out commit of one dependent's pill."""
+    return pw_pill(document, name)["checkout_sha"]
+
+
+@posix_only
+def test_each_merged_prerequisite_reads_whether_its_commits_reached_the_checkout(
+    prerequisite_world,
+):
+    w = prerequisite_world
+    document = w.c1
+
+    # Merged on the remote and fetched, but the worktree sits on the older commit.
+    assert pw_facts(document, "dep-stale") == {"pre-a": ("merged", "no")}
+    assert pw_pill(document, "dep-stale")["state"] == "not_in_checkout"
+    # Merged by a request whose commits this clone never fetched: C is the clone's own
+    # main, so a "main contains the checkout" shortcut would read yes.
+    assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "no")}
+    assert pw_pill(document, "dep-github")["state"] == "not_in_checkout"
+    assert pw_c(document, "dep-github") == rev(w.g, "trunk")
+    # No clone holds the branch; the highest-numbered request's head decides, and the
+    # lower-numbered request names a commit no clone holds, which would read no.
+    assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
+    assert pw_pill(document, "dep-deleted")["state"] == "met"
+    # An equivalence verdict cannot say the commits are missing.
+    assert verdict_rung(document, w.l, "pre-e") == "patch_equivalent"
+    assert pw_facts(document, "dep-equivalent") == {"pre-e": ("merged", "unknown")}
+    assert pw_pill(document, "dep-equivalent")["state"] == "unknown"
+    # A dependent with no Baseline is decided from its checked-out commit.
+    assert pw_package(document, "dep-nobaseline")["baseline"]["checkout"] is None
+    assert pw_facts(document, "dep-nobaseline") == {"pre-a": ("merged", "yes")}
+    assert pw_pill(document, "dep-nobaseline")["state"] == "met"
+    # A prerequisite of another repository is not looked up in this clone.
+    assert pw_facts(document, "dep-cross") == {"pre-a": ("merged", "unknown")}
+    assert pw_pill(document, "dep-cross")["state"] == "unknown"
+    # Only the merged prerequisite is checked; the unmerged and the no-commit ones are
+    # not, and the document parses (a "yes" on a not-merged item is refused).
+    assert pw_facts(document, "dep-open") == {
+        "pre-a": ("merged", "yes"),
+        "pre-open": ("not_merged", "unknown"),
+        "pre-empty": ("not_merged", "unknown"),
+    }
+    assert pw_pill(document, "dep-open")["state"] == "not_in_main"
+    assert models.parse_checkouts(json.dumps(document))
+    # After the worktree pulls the merge, the same prerequisite reads yes.
+    assert pw_facts(w.c2, "dep-stale") == {"pre-a": ("merged", "yes")}
+    assert pw_pill(w.c2, "dep-stale")["state"] == "met"
+    assert models.parse_checkouts(json.dumps(w.c2))
+
+
+def ancestry_calls(w: PrerequisiteWorld, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The recorded ``merge-base --is-ancestor`` calls whose last argument is a
+    dependent's checked-out commit: one no clone's verdict base names and no listed
+    request head is, as the ladder's own calls end with a base or a request head."""
+    bases = {
+        clone["verdict_base"]["sha"]
+        for document in (w.c1, w.c2)
+        for repository in document["repositories"]
+        for clone in repository["clones"]
+        if clone["verdict_base"] is not None
+    }
+    heads = {"d" * 40, w.tip["pre-pull"], w.tip["pre-deleted"]}
+    return [
+        call
+        for call in calls
+        if "merge-base" in call["arguments"]
+        and "--is-ancestor" in call["arguments"]
+        and call["arguments"][-1] not in bases | heads
+    ]
+
+
+@posix_only
+def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clone(
+    prerequisite_world,
+):
+    w = prerequisite_world
+    found = ancestry_calls(w, w.git_calls[: w.c1_calls])
+    ours = [call["arguments"][-2:] for call in found]
+    dependent_cs = {
+        pill["checkout_sha"]
+        for name in PW_NAMES
+        if name.startswith("dep-") and (pill := pw_pill(w.c1, name)) is not None
+    }
+
+    # One call per distinct (checkout commit, tip): dep-nobaseline and dep-open share
+    # theirs, so a per-package call would run twice. dep-stale's and dep-github's
+    # checkout is the commit both clones' main still holds, a verdict base, so the
+    # filter leaves their calls to the ladder's own.
+    nobaseline_c = pw_c(w.c1, "dep-nobaseline")
+    assert pw_c(w.c1, "dep-open") == nobaseline_c
+    assert ours.count([w.tip["pre-a"], nobaseline_c]) == 1
+    assert sorted(ours) == sorted(
+        [
+            [w.tip["pre-a"], nobaseline_c],
+            [w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")],
+        ]
+    )
+    assert all(last in dependent_cs for _, last in ours)
+    for call in found:
+        arguments = call["arguments"]
+        assert "--no-replace-objects" in arguments
+        assert any(a.startswith("core.attributesFile=") for a in arguments)
+        assert {"GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"} <= set(call["overlay"])
+        assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in call["overlay"]
+    expected_clone = {
+        (w.tip["pre-a"], nobaseline_c): w.l,
+        (w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
+    }
+    for call in found:
+        assert real(call["path"]) == real(expected_clone[tuple(call["arguments"][-2:])])
+    # Nothing is asked of a prerequisite that is not merged, nor of another repository.
+    named = {tip for tip, _ in ours}
+    assert w.tip["pre-open"] not in named
+    assert rev(w.l, "pre-empty") not in named
+    assert pw_c(w.c1, "dep-cross") not in {last for _, last in ours}
+    assert not any(
+        call["arguments"][-1] == pw_c(w.c1, "dep-cross")
+        for call in w.git_calls
+        if "--is-ancestor" in call["arguments"]
+    )
+    for call in w.git_calls:
+        assert not {"fetch", "pull", "push"} & set(call["arguments"])
+
+
+@posix_only
+def test_the_containment_checks_leave_the_cache_to_the_ladder(prerequisite_world):
+    w = prerequisite_world
+    bases = {
+        clone["verdict_base"]["sha"]
+        for document in (w.c0, w.c1, w.c2)
+        for repository in document["repositories"]
+        for clone in repository["clones"]
+        if clone["verdict_base"] is not None
+    }
+    saved = json.loads(w.cache.read_text())
+
+    assert saved["verdicts"], "control: the ladder stored its own verdicts"
+    # A key for a checkout commit that is no clone's verdict base would be the pill's.
+    assert {key.split(".")[1] for key in saved["verdicts"]} <= bases
+    assert {entry["rung"] for entry in saved["verdicts"].values()} <= checkouts.CACHE_RUNGS
+
+
+@pytest.fixture(scope="module")
+def containment_repository(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "containment") as (directory, home, patch):
+        repo = directory / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "trunk")
+        first = commit_file(repo, "a.txt", "a\n")
+        head = commit_file(repo, "b.txt", "b\n")
+        git(repo, "checkout", "-q", "-b", "side", first)
+        side = commit_file(repo, "c.txt", "c\n")
+        git(repo, "checkout", "-q", "trunk")
+        scratch = directory / "scratch"
+        scratch.mkdir()
+        yield {
+            "repo": repo,
+            "first": first,
+            "head": head,
+            "side": side,
+            "settings": checkouts._verdict_settings(str(scratch), real_git_version_text()),
+        }
+
+
+def real_git_version_text() -> str:
+    return git(".", "--version").stdout.split()[2]
+
+
+def containment_context(repo: Path, **options: Any) -> checkouts._CloneContext:
+    values: dict[str, Any] = {
+        "cwd": str(repo),
+        "ceiling": str(repo.parent),
+        "partial": False,
+        "shallow": False,
+        "local": {},
+        "cached": {},
+        "ssh_configured": False,
+        "common": str(repo / ".git"),
+    }
+    values.update(options)
+    return checkouts._CloneContext(**values)
+
+
+def containment_runner(seconds: float) -> checkouts._GitRunner:
+    executable = checkouts._resolve_program("git")
+    assert executable is not None
+    return checkouts._GitRunner(executable, time.monotonic_ns() + int(seconds * 1e9), 10.0)
+
+
+class RecordedGit:
+    """The git commands a runner is asked to run, by their arguments."""
+
+    def __init__(self, patch: pytest.MonkeyPatch) -> None:
+        self.arguments: list[list[str]] = []
+        original = checkouts._GitRunner.run
+        recorded = self
+
+        def run(runner, arguments, **options):
+            recorded.arguments.append(list(arguments))
+            return original(runner, arguments, **options)
+
+        patch.setattr(checkouts._GitRunner, "run", run)
+
+    def ancestry(self) -> list[list[str]]:
+        return [a[-2:] for a in self.arguments if "--is-ancestor" in a]
+
+    def probes(self) -> list[list[str]]:
+        return [a for a in self.arguments if "rev-list" in a]
+
+
+def test_a_spent_deadline_starts_no_git_child_and_leaves_merged_prerequisites_unknown(
+    containment_repository, monkeypatch
+):
+    w = containment_repository
+    started: list[Any] = []
+
+    def refuse(*arguments, **options):
+        started.append(arguments)
+        pytest.fail("a git child was started after the deadline")
+
+    monkeypatch.setattr(checkouts, "_start", refuse)
+    held = (w["first"], "ancestor")
+    outside = (w["side"], "ancestor")
+    requests = [("held", w["head"], [held]), ("outside", w["head"], [outside])]
+
+    decided = checkouts._clone_in_checkout(
+        containment_runner(-1.0), containment_context(w["repo"]), requests, w["settings"]
+    )
+
+    assert decided == {"held": "unknown", "outside": "unknown"}
+    assert not started
+
+    def derived(main_facts: list[str], held: str) -> str:
+        return models.derive_prerequisites(
+            [{"merged_on_main": fact, "in_checkout": held} for fact in main_facts]
+        )
+
+    assert derived(["merged", "merged"], decided["outside"]) == "unknown"
+    assert derived(["merged", "not_merged"], decided["outside"]) == "not_in_main"
+
+
+def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missing_one(
+    containment_repository, monkeypatch
+):
+    w = containment_repository
+    recorded = RecordedGit(monkeypatch)
+    absent = "e" * 40
+    requests = [
+        ("held", w["head"], [(w["first"], "ancestor")]),
+        ("outside", w["head"], [(w["side"], "ancestor")]),
+        ("outside-again", w["head"], [(w["side"], "pull_request")]),
+        ("outside-equivalent", w["head"], [(w["side"], "patch_equivalent")]),
+        ("absent-ancestry", w["head"], [(absent, "ancestor")]),
+        ("absent-equivalent", w["head"], [(absent, "patch_equivalent")]),
+        ("mixed-no", w["head"], [(w["first"], "ancestor"), (w["side"], "ancestor")]),
+        ("mixed-unknown", w["head"], [(w["first"], "ancestor"), (w["side"], "tree_equal")]),
+        ("no-commit", None, [(w["first"], "ancestor")]),
+    ]
+
+    decided = checkouts._clone_in_checkout(
+        containment_runner(60.0), containment_context(w["repo"]), requests, w["settings"]
+    )
+
+    assert decided == {
+        "held": "yes",
+        "outside": "no",
+        "outside-again": "no",
+        "outside-equivalent": "unknown",
+        "absent-ancestry": "no",
+        "absent-equivalent": "unknown",
+        "mixed-no": "no",
+        "mixed-unknown": "unknown",
+        "no-commit": "unknown",
+    }
+    # One presence probe for the three distinct tips, and one ancestry call each for the
+    # two present ones; the absent tip is read from the probe and never asked of git.
+    assert len(recorded.probes()) == 1
+    assert sorted(recorded.ancestry()) == sorted(
+        [[w["first"], w["head"]], [w["side"], w["head"]]]
+    )
+
+
+@pytest.mark.parametrize("options", [{"shallow": True}, {"partial": True}])
+def test_an_incomplete_clone_makes_no_call_and_reads_unknown(
+    containment_repository, monkeypatch, options
+):
+    w = containment_repository
+    recorded = RecordedGit(monkeypatch)
+    requests = [
+        ("held", w["head"], [(w["first"], "ancestor")]),
+        ("absent", w["head"], [("e" * 40, "ancestor")]),
+    ]
+
+    decided = checkouts._clone_in_checkout(
+        containment_runner(60.0),
+        containment_context(w["repo"], **options),
+        requests,
+        w["settings"],
+    )
+
+    assert decided == {"held": "unknown", "absent": "unknown"}
+    assert recorded.arguments == []
