@@ -11386,6 +11386,7 @@ def test_baseline_line_markers_place_the_checkout_by_order_alone(
         ((EQUAL, comparison("behind", 0, 2), EQUAL), "left"),
         ((EQUAL, comparison("diverged", 1, 2), EQUAL), "diverged"),
         ((EQUAL, comparison("differs"), EQUAL), "differs"),
+        ((EQUAL, comparison("unknown"), EQUAL), "unknown"),
         ((EQUAL, EQUAL, behind), "behind3"),
         ((EQUAL, EQUAL, comparison("behind", 0, 58)), "behind58"),
     ]
@@ -11403,7 +11404,7 @@ def test_baseline_line_markers_place_the_checkout_by_order_alone(
     assert abs(lines["plain"]["C"]["cy"] - lines["plain"]["B"]["cy"]) < 1
     assert lines["left"]["C"]["cx"] < lines["left"]["B"]["cx"] - 4
     assert lines["left"]["added"] is None
-    for tag in ("diverged", "differs"):
+    for tag in ("diverged", "differs", "unknown"):
         assert lines[tag]["C"]["form"] == "dotted"
         assert lines[tag]["C"]["cy"] < lines[tag]["B"]["cy"] - 3
     assert lines["behind3"]["behind"] == "3" and lines["behind58"]["behind"] == "58"
@@ -11416,7 +11417,7 @@ def test_baseline_line_markers_place_the_checkout_by_order_alone(
             assert three[key] == pytest.approx(fifty_eight[key], abs=0.5), (name, key)
     # The check mark needs three green tones.
     assert lines["equal"]["C"]["check"] and lines["equal"]["M"]["tone"] == "green"
-    for tag in ("behind3", "forked", "left", "diverged"):
+    for tag in ("behind3", "forked", "left", "diverged", "unknown"):
         assert lines[tag]["C"]["check"] is False
 
 
