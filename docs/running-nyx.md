@@ -637,7 +637,7 @@ work started from, written as a full 40 or 64 character lower-case hex ID (a
 short ID, upper-case letters or a name is `invalid`, and no value is `absent`;
 `Sanity Baseline:` is a different field and is never read as this one). The
 package's `baseline` in `--json` holds `status` (`declared`, `invalid` or
-`absent`), `sha` (set exactly when declared) and `drift`.
+`absent`), `sha` (set exactly when declared), `drift` and `checkout`.
 
 `drift` compares the Baseline with the base the target clone judges its verdicts
 against (`verdict_base`), in the shape of the other comparisons. It is present
