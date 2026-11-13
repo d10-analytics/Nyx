@@ -475,6 +475,84 @@ def _push_fragment(local: Sequence[Mapping[str, Any]], remote: Mapping[str, Any]
     return "unknown", None
 
 
+@dataclass(frozen=True)
+class BranchEvidence:
+    """The merge facts of one package branch's copies.
+
+    ``tips`` holds each counted tip with the rung its verdict came from (``None`` when the
+    copy has no verdict rung): every local copy's tip, and a present remote copy's tip when
+    no local copy holds it. ``no_commits_yet`` and ``merged`` are the two Code Status
+    decisions made from the copies' verdicts, ``no_commits_yet`` taking precedence, so a
+    branch with no commit of its own is never ``merged``.
+    """
+
+    tips: tuple[tuple[str, str | None], ...]
+    verdicts: tuple[str, ...]
+    no_commits_yet: bool
+
+    @property
+    def merged(self) -> bool:
+        return not self.no_commits_yet and all(verdict == "merged" for verdict in self.verdicts)
+
+
+def branch_evidence(
+    local: Sequence[Mapping[str, Any]],
+    states: Sequence[str | None],
+    remote: Mapping[str, Any] | None,
+    *,
+    remote_verdict: Mapping[str, Any] | None,
+) -> BranchEvidence | None:
+    """The tips, verdicts and merge decisions of a branch's copies, or ``None`` when the
+    branch is found nowhere.
+
+    ``states`` holds each local copy's no-commit state (``yes``, ``no``, ``unrun`` or
+    ``None`` for a copy that was no candidate). A copy whose check did not run counts as
+    ``unknown``. A present remote copy whose tip no local copy holds counts with its
+    ``remote_verdict``, and counts as ``unknown`` without one.
+    """
+    remote_present = remote is not None and remote["state"] == "present"
+    if not local and not remote_present:
+        return None
+    copy_verdicts = [
+        "unknown" if state == "unrun" else _verdict_state(copy)
+        for copy, state in zip(local, states)
+    ]
+    verdicts = list(copy_verdicts)
+    tips: list[tuple[str, str | None]] = []
+    for copy, state in zip(local, states):
+        verdict = copy["verdict"]
+        pair = (copy["sha"], None if state == "unrun" or verdict is None else verdict["rung"])
+        if pair not in tips:
+            tips.append(pair)
+    if remote_present:
+        by_tip = {copy["sha"]: verdict for copy, verdict in reversed(list(zip(local, copy_verdicts)))}
+        if remote["sha"] in by_tip:
+            verdicts.append(by_tip[remote["sha"]])
+        else:
+            verdicts.append("unknown" if remote_verdict is None else remote_verdict["state"])
+            tips.append(
+                (remote["sha"], None if remote_verdict is None else remote_verdict["rung"])
+            )
+    no_commits_yet = bool(local) and all(state == "yes" for state in states) and (
+        not remote_present or remote["sha"] in {copy["sha"] for copy in local}
+    )
+    return BranchEvidence(tuple(tips), tuple(verdicts), no_commits_yet)
+
+
+def package_branch_evidence(
+    repository: Mapping[str, Any],
+    name: str,
+    remote: Mapping[str, Any] | None,
+    *,
+    remote_verdict: Mapping[str, Any] | None,
+    no_commits: Mapping[tuple[str, str], str],
+) -> BranchEvidence | None:
+    """The evidence of branch ``name`` in the readable clones of ``repository``, the same
+    one ``join_branches`` decides its Code Status from."""
+    local, states = _local_copies(repository, name, no_commits)
+    return branch_evidence(local, states, remote, remote_verdict=remote_verdict)
+
+
 def _code_status(
     package: Mapping[str, Any],
     local: Sequence[Mapping[str, Any]],
@@ -488,29 +566,14 @@ def _code_status(
     """The Code Status of ``package`` from the copies of its branch, or ``None`` when the
     branch is found nowhere.
 
-    ``states`` holds each local copy's no-commit state (``yes``, ``no``, ``unrun`` or
-    ``None`` for a copy that was no candidate). A copy whose check did not run counts as
-    ``unknown``. A present remote copy whose tip no local copy holds counts with its
-    ``remote_verdict``, and counts as ``unknown`` without one. ``pulls`` is the
-    collection's listing for the branch's name, and its open requests are the branch's
-    whether or not a local copy exists.
+    ``pulls`` is the collection's listing for the branch's name, and its open requests
+    are the branch's whether or not a local copy exists. The copies' merge facts come from
+    ``branch_evidence``.
     """
-    remote_present = remote is not None and remote["state"] == "present"
-    if not local and not remote_present:
+    evidence = branch_evidence(local, states, remote, remote_verdict=remote_verdict)
+    if evidence is None:
         return None
-    copy_verdicts = [
-        "unknown" if state == "unrun" else _verdict_state(copy)
-        for copy, state in zip(local, states)
-    ]
-    verdicts = list(copy_verdicts)
-    if remote_present:
-        tips = {copy["sha"]: verdict for copy, verdict in reversed(list(zip(local, copy_verdicts)))}
-        if remote["sha"] in tips:
-            verdicts.append(tips[remote["sha"]])
-        else:
-            verdicts.append(
-                "unknown" if remote_verdict is None else remote_verdict["state"]
-            )
+    verdicts = evidence.verdicts
 
     held = sorted(
         {path for copy in local for path in copy["checked_out_in"]}, key=natural_key
@@ -528,11 +591,9 @@ def _code_status(
     }
     push, unpushed = _push_fragment(local, remote)
     open_pulls = [pull["number"] for pull in pulls if pull["state"] == "open"]
-    if local and all(state == "yes" for state in states) and (
-        not remote_present or remote["sha"] in {copy["sha"] for copy in local}
-    ):
+    if evidence.no_commits_yet:
         status["state"] = "no_commits_yet"
-    elif all(verdict == "merged" for verdict in verdicts):
+    elif evidence.merged:
         status["state"] = "merged"
         status["cleanup"] = (
             {"worktrees": len(held), "branches": 0}

@@ -88,6 +88,7 @@ from .checkout_join import (
     join_branches,
     moved_at_or_after,
     package_branch_copies,
+    package_branch_evidence,
     resolve_target,
 )
 from .models import (
@@ -3809,12 +3810,195 @@ def _latest_merged_request(
     return max(merged, key=lambda pull: pull.number, default=None)
 
 
+def _prerequisite_targets(
+    rows: Sequence[CompletionPrerequisiteHead], by_path: Mapping[str, dict[str, Any]]
+) -> list[tuple[str | None, dict[str, Any] | None]]:
+    """The pill items of one dependent's completion rows, sorted as the document sorts
+    them: each target ID with the one listed package it resolves to, or ``None`` for an
+    ID that is null, names no listed package or has a row that did not resolve."""
+    grouped: dict[str | None, list[CompletionPrerequisiteHead]] = {}
+    for row in rows:
+        grouped.setdefault(row.target_package_id, []).append(row)
+    result: list[tuple[str | None, dict[str, Any] | None]] = []
+    for target_id in sorted(grouped, key=lambda key: (key is None, key or "")):
+        target = by_path.get(grouped[target_id][0].target_path or "")
+        if (
+            target_id is None
+            or target is None
+            or not all(row.target_path is not None for row in grouped[target_id])
+        ):
+            target = None
+        result.append((target_id, target))
+    return result
+
+
+# The rungs whose verdict is evidence that a commit is not reachable from a checkout when
+# it is not: an equivalence verdict says the work landed by other commits.
+_CONTAINMENT_RUNGS = frozenset({"ancestor", "pull_request"})
+
+
+def _clone_in_checkout(
+    runner: _GitRunner,
+    context: _CloneContext | None,
+    requests: Sequence[tuple[Any, str, Sequence[tuple[str, str | None]]]],
+    settings: _VerdictSettings,
+) -> dict[Any, str]:
+    """Decide ``yes``, ``no`` or ``unknown`` for each request of one clone.
+
+    A request is (key, checked-out commit C, evidence tips with their verdict rungs).
+    Each distinct tip takes one presence probe in the clone; a tip a complete clone lacks
+    is not in C, and every other tip takes one ``merge-base --is-ancestor`` against C,
+    memoised on ``("contains", C, tip)``, run under the verdict overlay with no alternate
+    object directory. An incomplete clone makes no call. A tip not in C reads ``no`` when
+    its verdict came from ancestry or a pull request and ``unknown`` otherwise; a failed
+    or cut call reads ``unknown``. One tip known missing decides ``no`` whatever the
+    others say, and ``yes`` needs every tip in C.
+    """
+    complete = context is not None and not context.partial and not context.shallow
+    tips = sorted({tip for _, _, pairs in requests for tip, _ in pairs})
+    present: dict[str, str] = (
+        _present_objects(runner, context, tips, overlay=settings.overlay, pinned=settings.pinned)
+        if context is not None and complete and tips
+        else {}
+    )
+    memo: dict[tuple[str, str, str], bool | None] = {}
+
+    def contains(commit: str, tip: str) -> bool | None:
+        key = ("contains", commit, tip)
+        if key not in memo:
+            state = present.get(tip)
+            if context is None or not complete or state not in ("present", "missing"):
+                memo[key] = None
+            elif state == "missing":
+                memo[key] = False
+            else:
+                outcome = runner.run(
+                    [*settings.pinned, "merge-base", "--is-ancestor", tip, commit],
+                    path=context.cwd,
+                    ceiling=context.ceiling,
+                    overlay=settings.overlay,
+                )
+                if outcome.timed_out:
+                    memo[key] = None
+                else:
+                    memo[key] = {0: True, 1: False}.get(outcome.code)
+        return memo[key]
+
+    result: dict[Any, str] = {}
+    for key, commit, pairs in requests:
+        found = [(contains(commit, tip), rung) for tip, rung in pairs]
+        if any(held is False and rung in _CONTAINMENT_RUNGS for held, rung in found):
+            result[key] = "no"
+        elif found and all(held is True for held, _ in found):
+            result[key] = "yes"
+        else:
+            result[key] = "unknown"
+    return result
+
+
+def _assign_in_checkout(
+    runner: _GitRunner,
+    repositories: Sequence[dict[str, Any]],
+    contexts: Mapping[str, _CloneContext],
+    packages: Sequence[dict[str, Any]],
+    heads: PackageHeads | None,
+    checked_out: Mapping[int, str | None],
+    plan: PackageBranchPlan,
+    remote_verdicts: Mapping[tuple[str, str], Mapping[str, Any]],
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
+    no_commits: Mapping[tuple[str, str], str],
+    settings: _VerdictSettings,
+    max_parallel: int,
+) -> dict[tuple[int, str], str]:
+    """Decide whether each merged prerequisite of each pilled package is in its checkout,
+    keyed by (package position, target ID).
+
+    A prerequisite is merged under the rule the Code Status gives (the same
+    ``branch_evidence`` decision, ``no_commits_yet`` first) or, with no Code Status, by the
+    highest-numbered merged request, whose head is then the evidence. Only a prerequisite
+    of the dependent's own repository group, merged, with a checked-out commit known takes
+    part; every other item keeps ``unknown`` and no call is made for it. One job per
+    dependent clone decides its requests, and nothing is written or cached here.
+    """
+    rows = {
+        head.package_path: head.completion_prerequisites
+        for head in (heads.heads if heads is not None else ())
+    }
+    by_path = {package["package_path"]: package for package in packages}
+    repository_of = {
+        clone["path"]: repository for repository in repositories for clone in repository["clones"]
+    }
+    branch_of: dict[int, tuple[dict[str, Any], Any]] = {}
+    for repository, entries in zip(repositories, plan.branches):
+        for entry in entries:
+            for package in entry.packages:
+                branch_of[id(package)] = (repository, entry)
+    evidence: dict[int, list[tuple[str, str | None]] | None] = {}
+
+    def merged_tips(target: dict[str, Any]) -> list[tuple[str, str | None]] | None:
+        """The evidence tips of a merged prerequisite, ``None`` when it is not merged."""
+        if id(target) in evidence:
+            return evidence[id(target)]
+        tips: list[tuple[str, str | None]] | None = None
+        placed = branch_of.get(id(target))
+        if placed is not None:
+            repository, entry = placed
+            remote = repository["remote"]
+            found = package_branch_evidence(
+                repository,
+                entry.name,
+                entry.remote,
+                remote_verdict=(
+                    None if remote is None else remote_verdicts.get((remote["key"], entry.name))
+                ),
+                no_commits=no_commits,
+            )
+            if found is None:
+                request = _latest_merged_request(pulls, repository, entry.name)
+                if request is not None:
+                    tips = [(request.head, "pull_request")]
+            elif found.merged:
+                tips = list(found.tips)
+        evidence[id(target)] = tips
+        return tips
+
+    jobs: dict[str, list[tuple[Any, str, Sequence[tuple[str, str | None]]]]] = {}
+    for position, package in enumerate(packages):
+        commit = checked_out.get(position)
+        if commit is None:
+            continue
+        own = repository_of.get(package["target"]["clone"])
+        for target_id, target in _prerequisite_targets(
+            rows.get(package["package_path"], ()), by_path
+        ):
+            placed = None if target is None else branch_of.get(id(target))
+            if target is None or placed is None or placed[0] is not own:
+                continue
+            tips = merged_tips(target)
+            if tips:
+                jobs.setdefault(package["target"]["clone"], []).append(
+                    ((position, target_id), commit, tips)
+                )
+
+    def decide(item: tuple[str, Sequence[Any]]) -> dict[Any, str]:
+        path, requests = item
+        return _clone_in_checkout(runner, contexts.get(path), requests, settings)
+
+    result: dict[tuple[int, str], str] = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+            for decided in pool.map(decide, list(jobs.items())):
+                result.update(decided)
+    return result
+
+
 def _assign_prerequisites(
     repositories: Sequence[Mapping[str, Any]],
     packages: list[dict[str, Any]],
     heads: PackageHeads | None,
     checked_out: Mapping[int, str | None],
     pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
+    in_checkout: Mapping[tuple[int, str], str],
 ) -> None:
     """Write the prerequisites pill of every unfinished package with a clone or worktree
     target, from the Code Status of the packages its completion rows name.
@@ -3823,6 +4007,9 @@ def _assign_prerequisites(
     usable branch leave their item unknown. A target with no Code Status whose branch is
     declared on a clone or worktree is merged when a merged request into the repository's
     base names that branch. Nothing here reads a stage or follows a successor.
+
+    ``in_checkout`` holds the containment step's answer by (package position, target ID);
+    an item not merged, or without a checked-out commit, stays ``unknown`` whatever it says.
     """
     rows = {
         head.package_path: head.completion_prerequisites
@@ -3850,21 +4037,17 @@ def _assign_prerequisites(
     for position, package in enumerate(packages):
         if package["finished"] or package["target"]["status"] not in ("clone", "worktree"):
             continue
-        grouped: dict[str | None, list[CompletionPrerequisiteHead]] = {}
-        for row in rows.get(package["package_path"], ()):
-            grouped.setdefault(row.target_package_id, []).append(row)
+        commit = checked_out.get(position)
         items = []
-        for target_id in sorted(grouped, key=lambda key: (key is None, key or "")):
-            fact = "unknown"
-            target = by_path.get(grouped[target_id][0].target_path or "")
-            if (
-                target_id is not None
-                and target is not None
-                and all(row.target_path is not None for row in grouped[target_id])
-            ):
-                fact = main_fact(target)
+        for target_id, target in _prerequisite_targets(
+            rows.get(package["package_path"], ()), by_path
+        ):
+            fact = "unknown" if target is None else main_fact(target)
+            held = "unknown"
+            if fact == "merged" and commit is not None and target_id is not None:
+                held = in_checkout.get((position, target_id), "unknown")
             items.append(
-                {"target_package_id": target_id, "merged_on_main": fact, "in_checkout": "unknown"}
+                {"target_package_id": target_id, "merged_on_main": fact, "in_checkout": held}
             )
         state = derive_prerequisites(items)
         package["prerequisites"] = {
@@ -4783,6 +4966,7 @@ def collect_checkouts(
     remote_verdicts: dict[tuple[str, str], dict[str, Any]] = {}
     holder_verdicts = _CloneVerdicts()
     checked_out: dict[int, str | None] = {}
+    in_checkout: dict[tuple[int, str], str] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -4919,6 +5103,20 @@ def collect_checkouts(
                 max_parallel,
                 cache.verdicts,
             )
+            in_checkout = _assign_in_checkout(
+                verdict_runner,
+                repositories,
+                contexts,
+                packages,
+                package_heads,
+                checked_out,
+                plan,
+                remote_verdicts,
+                pulls,
+                no_commits,
+                settings,
+                max_parallel,
+            )
         _assign_removable(repositories)
         if cache_path is not None:
             _store_cache(
@@ -4943,7 +5141,9 @@ def collect_checkouts(
         pulls={key: _plain_pull_requests(listed) for key, listed in pulls.items()},
         no_commits=no_commits,
     )
-    _assign_prerequisites(repositories, packages, package_heads, checked_out, pulls)
+    _assign_prerequisites(
+        repositories, packages, package_heads, checked_out, pulls, in_checkout
+    )
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,
