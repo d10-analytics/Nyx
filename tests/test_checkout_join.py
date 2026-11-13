@@ -7680,7 +7680,7 @@ def test_every_pill_state_has_its_own_exact_wording():
 PW_NAMES = (
     "pre-a pre-e pre-open pre-empty pre-pull pre-deleted on-trunk no-target "
     "dep-stale dep-equivalent dep-nobaseline dep-open dep-unresolved dep-finished "
-    "dep-missing dep-github dep-deleted dep-cross"
+    "dep-missing dep-github dep-deleted dep-cross dep-squashed"
 ).split()
 PW_IDS = {
     name: f"{number:08d}-0000-4000-8000-{number:012d}"
@@ -7740,18 +7740,27 @@ def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
     w.g = clone(g_remote, w.folder / "G")
     point_origin_at(w.g, g_remote, GITHUB_URL)
     g_outside = clone(g_remote, base / "g-outside")
+    # Both are squash-merged on the remote: the branch tip never reaches trunk, only the
+    # squashed commit does, which is the commit GitHub reports as the request's merge commit.
+    w.merge: dict[str, str] = {}
     for name in ("pre-pull", "pre-deleted"):
         git(w.g, "checkout", "-q", "-b", name, "trunk")
         w.tip[name] = commit_file(w.g, f"{name}.txt", f"{name}\n")
         git(w.g, "push", "-q", "origin", name)
         git(w.g, "checkout", "-q", "trunk")
         git(g_outside, "fetch", "-q", "origin")
-        git(g_outside, "merge", "-q", "--no-ff", "-m", f"merge {name}", f"origin/{name}")
+        git(g_outside, "merge", "-q", "--squash", f"origin/{name}")
+        git(g_outside, "commit", "-q", "-m", f"squash {name}")
+        w.merge[name] = rev(g_outside, "HEAD")
         git(g_outside, "push", "-q", "origin", "trunk")
     git(w.g, "push", "-q", "origin", "--delete", "pre-deleted")
     git(w.g, "branch", "-q", "-D", "pre-deleted")
+    # The squashed commits are fetched, so their objects are in G; its trunk stays behind.
+    git(w.g, "fetch", "-q", "origin")
+    w.squashed_tree = w.trees / "dep-squashed"
+    git(w.g, "worktree", "add", "-q", "--detach", str(w.squashed_tree), w.merge["pre-pull"])
     w.deleted_tree = w.trees / "dep-deleted"
-    git(w.g, "worktree", "add", "-q", "-b", "deleted-work", str(w.deleted_tree), w.tip["pre-deleted"])
+    git(w.g, "worktree", "add", "-q", "-b", "deleted-work", str(w.deleted_tree), w.merge["pre-deleted"])
     commit_file(w.deleted_tree, "after.txt", "after\n")
     w.cross_tree = w.trees / "dep-cross"
     git(w.g, "worktree", "add", "-q", "-b", "cross-work", str(w.cross_tree), "trunk")
@@ -7797,6 +7806,7 @@ def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
     declare("dep-missing", "Drafts", f"Target repo: {w.nowhere}", *needs("pre-a"))
     declare("dep-github", "Drafts", f"Target repo: {w.g}", *needs("pre-pull"))
     declare("dep-deleted", "Drafts", f"Target repo: {w.deleted_tree}", *needs("pre-deleted"))
+    declare("dep-squashed", "Drafts", f"Target repo: {w.squashed_tree}", *needs("pre-pull"))
     declare("dep-cross", "Drafts", f"Target repo: {w.cross_tree}", *needs("pre-a"))
     return w
 
@@ -7823,10 +7833,12 @@ def prerequisite_world(tmp_path_factory):
             stdout=pr_answer(
                 g_branch_names(w.c0, w),
                 {
-                    "pre-pull": [pr_node(11, "merged", w.tip["pre-pull"])],
+                    "pre-pull": [pr_node(11, "merged", w.tip["pre-pull"], merge=w.merge["pre-pull"])],
                     "pre-deleted": [
-                        pr_node(21, "merged", "d" * 40),
-                        pr_node(22, "merged", w.tip["pre-deleted"]),
+                        pr_node(21, "merged", "d" * 40, merge="c" * 40),
+                        pr_node(
+                            22, "merged", w.tip["pre-deleted"], merge=w.merge["pre-deleted"]
+                        ),
                     ],
                 },
             )
@@ -7861,6 +7873,7 @@ def prerequisite_world(tmp_path_factory):
                 "dep-deleted": w.deleted_tree,
                 "dep-cross": w.cross_tree,
                 "dep-github": w.g,
+                "dep-squashed": w.squashed_tree,
                 "dep-unresolved": w.l,
             }.items()
         }
@@ -7871,6 +7884,19 @@ def prerequisite_world(tmp_path_factory):
         )
         recorded.active = False
         w.calls["c2"] = len(fake.calls())
+        # The same requests with no merge commit named: nothing proves the work missing.
+        fake.replay(
+            stdout=pr_answer(
+                g_branch_names(w.c0, w),
+                {
+                    "pre-pull": [pr_node(11, "merged", w.tip["pre-pull"])],
+                    "pre-deleted": [pr_node(22, "merged", w.tip["pre-deleted"])],
+                },
+            )
+        )
+        w.c3 = collect_packages(
+            [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=True
+        )
         w.git_calls = recorded.calls
     return w
 
@@ -7919,6 +7945,9 @@ def test_prerequisites_read_the_code_status_of_each_prerequisite_not_its_stage(p
     assert pw_facts(document, "dep-nobaseline") == {"pre-a": ("merged", "yes")}
     assert pw_facts(document, "dep-equivalent") == {"pre-e": ("merged", "unknown")}
     assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "no")}
+    # A squash merge leaves the branch tip outside the checkout that holds the work.
+    assert pw_facts(document, "dep-squashed") == {"pre-pull": ("merged", "yes")}
+    assert pw_pill(document, "dep-squashed")["state"] == "met"
     # The highest-numbered merged request decides a prerequisite no clone holds.
     assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
     assert pw_facts(document, "dep-cross") == {"pre-a": ("merged", "unknown")}
@@ -8211,13 +8240,14 @@ def test_each_merged_prerequisite_reads_whether_its_commits_reached_the_checkout
     # Merged on the remote and fetched, but the worktree sits on the older commit.
     assert pw_facts(document, "dep-stale") == {"pre-a": ("merged", "no")}
     assert pw_pill(document, "dep-stale")["state"] == "not_in_checkout"
-    # Merged by a request whose commits this clone never fetched: C is the clone's own
-    # main, so a "main contains the checkout" shortcut would read yes.
+    # Merged by a request whose merge commit this clone holds but its own main has not
+    # reached: C is the clone's own main, so a "main contains the checkout" shortcut
+    # would read yes.
     assert pw_facts(document, "dep-github") == {"pre-pull": ("merged", "no")}
     assert pw_pill(document, "dep-github")["state"] == "not_in_checkout"
     assert pw_c(document, "dep-github") == rev(w.g, "trunk")
-    # No clone holds the branch; the highest-numbered request's head decides, and the
-    # lower-numbered request names a commit no clone holds, which would read no.
+    # No clone holds the branch; the highest-numbered request's merge commit decides, and
+    # the lower-numbered request names a commit no clone holds, which would read unknown.
     assert pw_facts(document, "dep-deleted") == {"pre-deleted": ("merged", "yes")}
     assert pw_pill(document, "dep-deleted")["state"] == "met"
     # An equivalence verdict cannot say the commits are missing.
@@ -8271,8 +8301,9 @@ def test_the_containment_checks_are_pinned_single_and_run_in_the_dependents_clon
         (w.tip["pre-a"], nobaseline_c): w.l,
         (w.tip["pre-a"], pw_c(w.c1, "dep-stale")): w.l,
         (w.tip["pre-e"], pw_c(w.c1, "dep-equivalent")): w.l,
-        (w.tip["pre-pull"], pw_c(w.c1, "dep-github")): w.g,
-        (w.tip["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
+        (w.merge["pre-pull"], pw_c(w.c1, "dep-github")): w.g,
+        (w.merge["pre-pull"], pw_c(w.c1, "dep-squashed")): w.g,
+        (w.merge["pre-deleted"], pw_c(w.c1, "dep-deleted")): w.g,
     }
     assert sorted(ours) == sorted(list(pair) for pair in expected_clone)
     assert all(last in dependent_cs for _, last in ours)
@@ -8314,6 +8345,21 @@ def test_the_containment_checks_leave_the_cache_to_the_ladder(prerequisite_world
     # A key for a checkout commit that is no clone's verdict base would be the pill's.
     assert {key.split(".")[1] for key in saved["verdicts"]} <= bases
     assert {entry["rung"] for entry in saved["verdicts"].values()} <= checkouts.CACHE_RUNGS
+
+
+@posix_only
+def test_a_merged_request_naming_no_merge_commit_reads_unknown_never_no(prerequisite_world):
+    w = prerequisite_world
+    document = w.c3
+
+    assert verdict_rung(document, w.g, "pre-pull") == "pull_request"
+    for name, fact in (
+        ("dep-github", "pre-pull"),
+        ("dep-squashed", "pre-pull"),
+        ("dep-deleted", "pre-deleted"),
+    ):
+        assert pw_facts(document, name) == {fact: ("merged", "unknown")}, name
+        assert pw_pill(document, name)["state"] == "unknown", name
 
 
 @pytest.fixture(scope="module")
@@ -8424,7 +8470,12 @@ def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missin
     requests = [
         ("held", w["head"], [(w["first"], "ancestor")]),
         ("outside", w["head"], [(w["side"], "ancestor")]),
-        ("outside-again", w["head"], [(w["side"], "pull_request")]),
+        ("outside-merge", w["head"], [(w["side"], "pull_request")]),
+        ("held-merge", w["head"], [(w["first"], "pull_request")]),
+        ("absent-merge", w["head"], [(absent, "pull_request")]),
+        ("no-merge", w["head"], [(None, "pull_request")]),
+        ("held-no-merge", w["head"], [(w["first"], "ancestor"), (None, "pull_request")]),
+        ("outside-no-merge", w["head"], [(w["side"], "ancestor"), (None, "pull_request")]),
         ("outside-equivalent", w["head"], [(w["side"], "patch_equivalent")]),
         ("absent-ancestry", w["head"], [(absent, "ancestor")]),
         ("absent-equivalent", w["head"], [(absent, "patch_equivalent")]),
@@ -8440,7 +8491,12 @@ def test_a_live_job_reads_the_ancestry_of_each_tip_once_and_the_rung_of_a_missin
     assert decided == {
         "held": "yes",
         "outside": "no",
-        "outside-again": "no",
+        "outside-merge": "no",
+        "held-merge": "yes",
+        "absent-merge": "unknown",
+        "no-merge": "unknown",
+        "held-no-merge": "unknown",
+        "outside-no-merge": "no",
         "outside-equivalent": "unknown",
         "absent-ancestry": "no",
         "absent-equivalent": "unknown",

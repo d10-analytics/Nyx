@@ -8351,7 +8351,35 @@ PR_NODE = {
     "headRefOid": "a" * 40,
     "baseRefName": "trunk",
     "isCrossRepository": False,
+    "mergeCommit": {"oid": "b" * 40},
 }
+
+
+@pytest.mark.parametrize(
+    ("merge_commit", "expected"),
+    [
+        ({"oid": "b" * 40}, "b" * 40),
+        (None, None),
+        ("absent", None),
+        ({"oid": None}, None),
+        ({"oid": "not-an-object"}, None),
+        ({"oid": ["b" * 40]}, None),
+        ("b" * 40, None),
+    ],
+)
+def test_a_listed_requests_merge_commit_is_kept_only_when_it_is_an_object_id(
+    merge_commit, expected
+):
+    node = dict(PR_NODE)
+    if merge_commit == "absent":
+        del node["mergeCommit"]
+    else:
+        node["mergeCommit"] = merge_commit
+
+    assert checkouts._valid_pull_request(node)
+    (pull,) = checkouts._pull_requests_of([node])
+    assert pull.merge == expected
+    assert pull.head == "a" * 40
 
 
 def github_answer(count: int, node: dict[str, Any] | None = PR_NODE) -> dict[str, Any]:
@@ -8548,7 +8576,7 @@ def test_one_gh_call_per_repository_carries_every_distinct_branch_name_in_a_body
         assert (
             f"b{index}: pullRequests(headRefName: $h{index}, first: 10, "
             "orderBy: {field: CREATED_AT, direction: DESC}) "
-            "{ nodes { number state headRefOid baseRefName isCrossRepository } }"
+            "{ nodes { number state headRefOid baseRefName isCrossRepository mergeCommit { oid } } }"
         ) in query
     assert not Path(call.input_path).exists()
     assert not Path(call.input_path).parent.exists()
@@ -9118,14 +9146,21 @@ MISSING_HEAD = "c" * 40
 
 
 def pr_node(
-    number: int, state: str, head: str, base: str = "trunk", cross: bool = False
+    number: int,
+    state: str,
+    head: str,
+    base: str = "trunk",
+    cross: bool = False,
+    merge: str | None = None,
 ) -> dict[str, Any]:
+    """One answered pull request; ``merge`` is the commit GitHub made on the base."""
     return {
         "number": number,
         "state": state.upper(),
         "headRefOid": head,
         "baseRefName": base,
         "isCrossRepository": cross,
+        "mergeCommit": None if merge is None else {"oid": merge},
     }
 
 
