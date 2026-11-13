@@ -783,10 +783,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 9)
+# Checkout facts document (schema 10)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 9
+CHECKOUTS_SCHEMA_VERSION = 10
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -832,7 +832,8 @@ _PACKAGE_KEYS = frozenset(
         "code_status",
     }
 )
-_BASELINE_KEYS = frozenset({"status", "sha", "drift"})
+_BASELINE_KEYS = frozenset({"status", "sha", "drift", "checkout"})
+_CHECKOUT_KEYS = frozenset({"sha", "vs_baseline", "vs_base"})
 _BASELINE_STATUSES = frozenset({"declared", "invalid", "absent"})
 _CODE_STATUS_KEYS = frozenset(
     {
@@ -2486,6 +2487,77 @@ def _check_drift(
             )
 
 
+def _check_checkout(
+    package: Mapping[str, Any],
+    name: str,
+    clones: Mapping[str, tuple[Mapping[str, Any], int]],
+) -> None:
+    """Check a package's checkout comparisons against its drift, its target worktree's
+    head and its target clone's verdict base.
+
+    The key is null exactly when the drift is. ``sha`` is the target worktree's head
+    (the main worktree's for a clone target), null exactly when that head is
+    unavailable, and then both comparisons are ``unknown`` (``vs_base`` ``absent`` with
+    no base). ``vs_base`` takes the base's basis, is ``absent`` exactly with no base and
+    ``equal`` exactly when ``sha`` is the base commit; ``vs_baseline`` is always
+    ``cached`` and ``equal`` exactly when ``sha`` is the Baseline. Neither has a lender.
+    """
+    baseline = package["baseline"]
+    checkout = baseline["checkout"]
+    label = f"{name}.baseline.checkout"
+    if (baseline["drift"] is None) != (checkout is None):
+        raise ProtocolError(f"{label} is set exactly when the baseline has a drift")
+    if checkout is None:
+        return
+    item = _object(checkout, label)
+    _keys(item, _CHECKOUT_KEYS, label)
+    sha = _nullable(item["sha"], _object_id, f"{label}.sha")
+    target = package["target"]
+    clone = clones[target["clone"]][0]
+    expected = None
+    for listed in clone["worktrees"] or []:
+        if target["worktree"] is not None:
+            found = listed["path"] == target["worktree"]
+        else:
+            found = listed["main"]
+        if found:
+            if listed["status"] == "ok" and listed["head"] is not None:
+                expected = listed["head"]["sha"]
+            break
+    if sha != expected:
+        raise ProtocolError(f"{label}.sha must be the target worktree's head commit")
+    base = clone["verdict_base"]
+    basis = base["basis"] if base is not None else "cached"
+    _comparison(item["vs_baseline"], f"{label}.vs_baseline", check="cached")
+    _comparison(item["vs_base"], f"{label}.vs_base", check=basis)
+    versus, against = item["vs_baseline"], item["vs_base"]
+    if versus["basis"] != "cached":
+        raise ProtocolError(f"{label}.vs_baseline.basis must be cached")
+    if versus["relation"] == "absent":
+        raise ProtocolError(f"{label}.vs_baseline.relation must not be absent")
+    if against["basis"] != basis:
+        raise ProtocolError(
+            f"{label}.vs_base.basis must equal the target clone's verdict base basis"
+        )
+    if (against["relation"] == "absent") != (base is None):
+        raise ProtocolError(
+            f"{label}.vs_base.relation is absent exactly when the clone has no verdict base"
+        )
+    for part in ("vs_baseline", "vs_base"):
+        if item[part]["objects_from"] is not None:
+            raise ProtocolError(f"{label}.{part}.objects_from must be null")
+    if sha is None:
+        if versus["relation"] != "unknown" or against["relation"] not in ("unknown", "absent"):
+            raise ProtocolError(f"{label} must leave both comparisons unknown without a sha")
+        return
+    if (versus["relation"] == "equal") != (sha == baseline["sha"]):
+        raise ProtocolError(
+            f"{label}.vs_baseline.relation is equal exactly when sha is the baseline"
+        )
+    if base is not None and (against["relation"] == "equal") != (sha == base["sha"]):
+        raise ProtocolError(f"{label}.vs_base.relation is equal exactly when sha is the base")
+
+
 def _code_status(value: Any, name: str, *, allowed: bool) -> None:
     """Check one package's Code Status: every field's type, the fields' agreement with the
     state, and the text against the one text function."""
@@ -2780,6 +2852,7 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
         if target["clone"] is not None and target["clone"] not in listed_worktrees:
             raise ProtocolError(f"packages[{index}].target.clone names no clone")
         _check_drift(package, f"packages[{index}]", listed_clones)
+        _check_checkout(package, f"packages[{index}]", listed_clones)
         if target["worktree"] is not None:
             linked = listed_worktrees[target["clone"]]
             if linked is None or target["worktree"] not in linked:
