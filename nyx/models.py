@@ -783,10 +783,10 @@ def parse_catalog(payload: bytes | str | Mapping[str, Any]) -> Catalog:
 
 
 # ---------------------------------------------------------------------------
-# Checkout facts document (schema 10)
+# Checkout facts document (schema 11)
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_SCHEMA_VERSION = 10
+CHECKOUTS_SCHEMA_VERSION = 11
 CHECKOUTS_DIGEST_OMITTED = ("checkouts_digest", "observed_at")
 # A clone lists at most this many local branches; beyond it the clone is
 # reported as ``too_many_branches`` and none of its branches is examined.
@@ -830,8 +830,22 @@ _PACKAGE_KEYS = frozenset(
         "branch",
         "baseline",
         "code_status",
+        "prerequisites",
     }
 )
+_PREREQUISITES_KEYS = frozenset({"state", "text", "checkout_sha", "items"})
+_PREREQUISITE_ITEM_KEYS = frozenset({"target_package_id", "merged_on_main", "in_checkout"})
+# The pill's states, the wording of each, and the two facts every item carries.
+PREREQUISITE_TEXTS: dict[str, str] = {
+    "none": "No prerequisites",
+    "not_in_main": "Prerequisites not met in main",
+    "not_in_checkout": "Prerequisites not met in checkout",
+    "unknown": "Prerequisites unknown",
+    "met": "Prerequisites met",
+}
+PREREQUISITE_STATES = frozenset(PREREQUISITE_TEXTS)
+PREREQUISITE_MAIN_FACTS = frozenset({"merged", "not_merged", "unknown"})
+PREREQUISITE_CHECKOUT_FACTS = frozenset({"yes", "no", "unknown"})
 _BASELINE_KEYS = frozenset({"status", "sha", "drift", "checkout"})
 _CHECKOUT_KEYS = frozenset({"sha", "vs_baseline", "vs_base"})
 _BASELINE_STATUSES = frozenset({"declared", "invalid", "absent"})
@@ -1068,6 +1082,44 @@ def code_status_text(fields: Mapping[str, Any]) -> str:
             return listed
         return f"{text} \u00b7 in {_plural(len(paths), 'other worktree')}"
     return text
+
+
+def prerequisite_main_fact(code_status_state: str) -> str:
+    """The main fact a prerequisite's Code Status state gives: ``merged`` is merged,
+    ``unknown`` is unknown, and every other state is not merged."""
+    if code_status_state == "merged":
+        return "merged"
+    if code_status_state == "unknown":
+        return "unknown"
+    return "not_merged"
+
+
+def derive_prerequisites(items: Sequence[Mapping[str, Any]]) -> str:
+    """The pill state of a card's prerequisite items, the worst definite problem first.
+
+    No item is ``none``; any item not merged on main is ``not_in_main``; else any
+    merged item known missing from the checkout is ``not_in_checkout``; else any
+    unknown fact is ``unknown``; else ``met``.
+    """
+    if not items:
+        return "none"
+    if any(item["merged_on_main"] == "not_merged" for item in items):
+        return "not_in_main"
+    if any(
+        item["merged_on_main"] == "merged" and item["in_checkout"] == "no" for item in items
+    ):
+        return "not_in_checkout"
+    if any(
+        item["merged_on_main"] == "unknown" or item["in_checkout"] == "unknown"
+        for item in items
+    ):
+        return "unknown"
+    return "met"
+
+
+def prerequisites_text(state: str) -> str:
+    """The one wording of a pill state."""
+    return PREREQUISITE_TEXTS[state]
 
 
 def folder_sort_key(folder: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -2487,6 +2539,25 @@ def _check_drift(
             )
 
 
+def _target_head(
+    package: Mapping[str, Any], clones: Mapping[str, tuple[Mapping[str, Any], int]]
+) -> str | None:
+    """The head commit of a package's target worktree (the main worktree's for a clone
+    target), ``None`` when that head is unavailable."""
+    target = package["target"]
+    clone = clones[target["clone"]][0]
+    for listed in clone["worktrees"] or []:
+        if target["worktree"] is not None:
+            found = listed["path"] == target["worktree"]
+        else:
+            found = listed["main"]
+        if found:
+            if listed["status"] == "ok" and listed["head"] is not None:
+                return listed["head"]["sha"]
+            return None
+    return None
+
+
 def _check_checkout(
     package: Mapping[str, Any],
     name: str,
@@ -2514,16 +2585,7 @@ def _check_checkout(
     sha = _nullable(item["sha"], _object_id, f"{label}.sha")
     target = package["target"]
     clone = clones[target["clone"]][0]
-    expected = None
-    for listed in clone["worktrees"] or []:
-        if target["worktree"] is not None:
-            found = listed["path"] == target["worktree"]
-        else:
-            found = listed["main"]
-        if found:
-            if listed["status"] == "ok" and listed["head"] is not None:
-                expected = listed["head"]["sha"]
-            break
+    expected = _target_head(package, clones)
     if sha != expected:
         raise ProtocolError(f"{label}.sha must be the target worktree's head commit")
     base = clone["verdict_base"]
@@ -2554,6 +2616,113 @@ def _check_checkout(
         )
     if base is not None and (against["relation"] == "equal") != (sha == base["sha"]):
         raise ProtocolError(f"{label}.vs_base.relation is equal exactly when sha is the base")
+
+
+def _check_prerequisites(
+    package: Mapping[str, Any],
+    name: str,
+    clones: Mapping[str, tuple[Mapping[str, Any], int]],
+) -> None:
+    """Check a package's prerequisites pill against its own facts.
+
+    The pill is null exactly for a finished package or a target that is not a clone or
+    worktree. Otherwise its ``checkout_sha`` is the target worktree's head (and so the
+    checkout's ``sha`` where a Baseline gives one), its items are unique and sorted by
+    target ID with the one null ID last, a fact other than ``merged`` on main leaves
+    ``in_checkout`` ``unknown``, so does a null ``checkout_sha``, and the state and text
+    are the ones ``derive_prerequisites`` and ``prerequisites_text`` give.
+    """
+    pill = package["prerequisites"]
+    label = f"{name}.prerequisites"
+    pilled = not package["finished"] and package["target"]["status"] in ("clone", "worktree")
+    if (pill is not None) != pilled:
+        raise ProtocolError(
+            f"{label} is set exactly for an unfinished package with a clone or worktree target"
+        )
+    if pill is None:
+        return
+    item = _object(pill, label)
+    _keys(item, _PREREQUISITES_KEYS, label)
+    state = _choice(item["state"], PREREQUISITE_STATES, f"{label}.state")
+    text = _string(item["text"], f"{label}.text")
+    sha = _nullable(item["checkout_sha"], _object_id, f"{label}.checkout_sha")
+    if sha != _target_head(package, clones):
+        raise ProtocolError(f"{label}.checkout_sha must be the target worktree's head commit")
+    checkout = package["baseline"]["checkout"]
+    if checkout is not None and sha != checkout["sha"]:
+        raise ProtocolError(f"{label}.checkout_sha must equal baseline.checkout.sha")
+    items = _list(item["items"], f"{label}.items")
+    for position, raw in enumerate(items):
+        entry = _object(raw, f"{label}.items[{position}]")
+        _keys(entry, _PREREQUISITE_ITEM_KEYS, f"{label}.items[{position}]")
+        _uuid4(entry["target_package_id"], f"{label}.items[{position}].target_package_id", nullable=True)
+        main = _choice(
+            entry["merged_on_main"],
+            PREREQUISITE_MAIN_FACTS,
+            f"{label}.items[{position}].merged_on_main",
+        )
+        held = _choice(
+            entry["in_checkout"],
+            PREREQUISITE_CHECKOUT_FACTS,
+            f"{label}.items[{position}].in_checkout",
+        )
+        if held != "unknown" and (main != "merged" or sha is None):
+            raise ProtocolError(
+                f"{label}.items[{position}].in_checkout is unknown unless the prerequisite "
+                "is merged and the checkout commit is known"
+            )
+        if entry["target_package_id"] is None and (main, held) != ("unknown", "unknown"):
+            raise ProtocolError(
+                f"{label}.items[{position}] names no package, so both facts are unknown"
+            )
+    _ordered(
+        items,
+        lambda entry: (entry["target_package_id"] is None, entry["target_package_id"] or ""),
+        f"{label}.items",
+    )
+    if state != derive_prerequisites(items):
+        raise ProtocolError(f"{label}.state contradicts its items")
+    if text != prerequisites_text(state):
+        raise ProtocolError(f"{label}.text contradicts its state")
+
+
+def _check_prerequisite_facts(packages: Sequence[Mapping[str, Any]]) -> None:
+    """Check every pill item's main fact against the one listed package it names.
+
+    A ``merged`` or ``not_merged`` fact must agree with that package's Code Status. With
+    no Code Status the package is merged only through a declared branch on a clone or
+    worktree target, and is never ``not_merged``. An ``unknown`` fact stands whatever
+    the package's Code Status, since a row that did not resolve stays unknown.
+    """
+    listed: dict[str, list[Mapping[str, Any]]] = {}
+    for package in packages:
+        if package["package_id"] is not None:
+            listed.setdefault(package["package_id"], []).append(package)
+    for index, package in enumerate(packages):
+        pill = package["prerequisites"]
+        if pill is None:
+            continue
+        for position, item in enumerate(pill["items"]):
+            fact = item["merged_on_main"]
+            named = listed.get(item["target_package_id"], [])
+            if fact == "unknown" or len(named) != 1:
+                continue
+            label = f"packages[{index}].prerequisites.items[{position}].merged_on_main"
+            target = named[0]
+            status = target["code_status"]
+            if status is not None:
+                if fact != prerequisite_main_fact(status["state"]):
+                    raise ProtocolError(f"{label} contradicts the Code Status of its package")
+            elif fact == "not_merged":
+                raise ProtocolError(f"{label} is not_merged for a package with no Code Status")
+            elif not (
+                target["branch"]["status"] == "declared"
+                and target["target"]["status"] in ("clone", "worktree")
+            ):
+                raise ProtocolError(
+                    f"{label} is merged for a package with no Code Status and no declared "
+                    "branch on a clone or worktree target"
+                )
 
 
 def _code_status(value: Any, name: str, *, allowed: bool) -> None:
@@ -2867,7 +3036,9 @@ def parse_checkouts(payload: bytes | str | Mapping[str, Any]) -> dict[str, Any]:
             raise ProtocolError(
                 f"packages[{index}].target.status requires git to be available"
             )
+        _check_prerequisites(package, f"packages[{index}]", listed_clones)
     _ordered(packages, package_sort_key, "packages")
+    _check_prerequisite_facts(packages)
     _check_package_references(parsed, packages)
     _check_remote_verdicts(parsed)
     if canonical_digest(document, omit=CHECKOUTS_DIGEST_OMITTED) != digest:

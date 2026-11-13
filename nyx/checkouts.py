@@ -66,7 +66,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from .catalog import MAX_OUTPUT_BYTES, PackageHeads, finished_policy, scan_package_heads
+from .catalog import (
+    MAX_OUTPUT_BYTES,
+    CompletionPrerequisiteHead,
+    PackageHeads,
+    finished_policy,
+    scan_package_heads,
+)
 from .checkout_join import (
     CloneRefs,
     PackageBranchPlan,
@@ -98,12 +104,15 @@ from .models import (
     canonical_digest,
     clone_sort_key,
     derive_attention,
+    derive_prerequisites,
     derive_removable,
     diagnostic_sort_key,
     folder_sort_key,
     github_identity,
     load_strict_json,
     natural_key,
+    prerequisite_main_fact,
+    prerequisites_text,
     repository_sort_key,
     worktree_sort_key,
 )
@@ -3664,11 +3673,15 @@ def _assign_drift(
     contexts: Mapping[str, _CloneContext],
     verdicts: Mapping[str, _CloneVerdicts],
     packages: list[dict[str, Any]],
+    checked_out: Mapping[int, str | None],
     settings: _VerdictSettings,
     max_parallel: int,
 ) -> None:
     """Write the base drift of every unfinished package with a declared Baseline and a
     clone or worktree target.
+
+    ``checked_out`` holds each such package's checked-out commit by its position in
+    ``packages``, as ``_checked_out_commits`` read it.
 
     One job per target clone memoizes by Baseline, so a Baseline shared by packages is
     counted once; the same job compares each package's checked-out commit with its
@@ -3693,7 +3706,6 @@ def _assign_drift(
         for repository in repositories
         for clone in repository["clones"]
     }
-    checked_out: dict[int, str | None] = {}
     commits: dict[str, list[tuple[str | None, str]]] = {}
     for position, package in enumerate(packages):
         baseline = package["baseline"]
@@ -3704,8 +3716,7 @@ def _assign_drift(
         ):
             continue
         path = package["target"]["clone"]
-        commit = _checked_out_commit(owners[path][0], package["target"])
-        checked_out[position] = commit
+        commit = checked_out[position]
         pair = (commit, baseline["sha"])
         if pair not in commits.setdefault(path, []):
             commits[path].append(pair)
@@ -3740,7 +3751,7 @@ def _assign_drift(
     for position, package in enumerate(packages):
         baseline = package["baseline"]
         found = decided_drift.get(package["target"]["clone"], {}).get(baseline["sha"])
-        if found is None or position not in checked_out:
+        if found is None:
             continue
         baseline["drift"] = dict(found)
         path = package["target"]["clone"]
@@ -3761,6 +3772,106 @@ def _assign_drift(
             "sha": commit,
             "vs_baseline": dict(relation_baseline),
             "vs_base": dict(relation_base),
+        }
+
+
+def _checked_out_commits(
+    repositories: Sequence[Mapping[str, Any]], packages: Sequence[Mapping[str, Any]]
+) -> dict[int, str | None]:
+    """The checked-out commit of every unfinished package with a clone or worktree
+    target, by the package's position, read once for the drift and the prerequisites pill."""
+    owners = {
+        clone["path"]: clone for repository in repositories for clone in repository["clones"]
+    }
+    return {
+        position: _checked_out_commit(owners[package["target"]["clone"]], package["target"])
+        for position, package in enumerate(packages)
+        if not package["finished"] and package["target"]["status"] in ("clone", "worktree")
+    }
+
+
+def _latest_merged_request(
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
+    repository: Mapping[str, Any],
+    name: str,
+) -> _PullRequest | None:
+    """The highest-numbered merged request of ``repository`` into its base that names
+    the head branch ``name``, from the listing collection already holds."""
+    base = _remote_only_base(repository)
+    remote = repository["remote"]
+    if base is None or remote is None:
+        return None
+    merged = [
+        pull
+        for pull in pulls.get(remote["key"], {}).get(name, ())
+        if pull.state == "merged" and pull.base == base
+    ]
+    return max(merged, key=lambda pull: pull.number, default=None)
+
+
+def _assign_prerequisites(
+    repositories: Sequence[Mapping[str, Any]],
+    packages: list[dict[str, Any]],
+    heads: PackageHeads | None,
+    checked_out: Mapping[int, str | None],
+    pulls: Mapping[str, Mapping[str, Sequence[_PullRequest]]],
+) -> None:
+    """Write the prerequisites pill of every unfinished package with a clone or worktree
+    target, from the Code Status of the packages its completion rows name.
+
+    A row that did not resolve, one naming no ID, and a target that is listed with no
+    usable branch leave their item unknown. A target with no Code Status whose branch is
+    declared on a clone or worktree is merged when a merged request into the repository's
+    base names that branch. Nothing here reads a stage or follows a successor.
+    """
+    rows = {
+        head.package_path: head.completion_prerequisites
+        for head in (heads.heads if heads is not None else ())
+    }
+    by_path = {package["package_path"]: package for package in packages}
+    repository_of = {
+        clone["path"]: repository for repository in repositories for clone in repository["clones"]
+    }
+
+    def main_fact(target: Mapping[str, Any]) -> str:
+        status = target["code_status"]
+        if status is not None:
+            return prerequisite_main_fact(status["state"])
+        if target["branch"]["status"] != "declared" or target["target"]["status"] not in (
+            "clone",
+            "worktree",
+        ):
+            return "unknown"
+        found = _latest_merged_request(
+            pulls, repository_of[target["target"]["clone"]], target["branch"]["name"]
+        )
+        return "merged" if found is not None else "unknown"
+
+    for position, package in enumerate(packages):
+        if package["finished"] or package["target"]["status"] not in ("clone", "worktree"):
+            continue
+        grouped: dict[str | None, list[CompletionPrerequisiteHead]] = {}
+        for row in rows.get(package["package_path"], ()):
+            grouped.setdefault(row.target_package_id, []).append(row)
+        items = []
+        for target_id in sorted(grouped, key=lambda key: (key is None, key or "")):
+            fact = "unknown"
+            target = by_path.get(grouped[target_id][0].target_path or "")
+            if (
+                target_id is not None
+                and target is not None
+                and all(row.target_path is not None for row in grouped[target_id])
+            ):
+                fact = main_fact(target)
+            items.append(
+                {"target_package_id": target_id, "merged_on_main": fact, "in_checkout": "unknown"}
+            )
+        state = derive_prerequisites(items)
+        package["prerequisites"] = {
+            "state": state,
+            "text": prerequisites_text(state),
+            "checkout_sha": checked_out.get(position),
+            "items": items,
         }
 
 
@@ -4612,6 +4723,7 @@ def _package_entries(
                     "checkout": None,
                 },
                 "code_status": None,
+                "prerequisites": None,
             }
         )
     return entries
@@ -4670,6 +4782,7 @@ def collect_checkouts(
     plan = PackageBranchPlan((), ())
     remote_verdicts: dict[tuple[str, str], dict[str, Any]] = {}
     holder_verdicts = _CloneVerdicts()
+    checked_out: dict[int, str | None] = {}
     diagnostics = list(discovery.diagnostics)
 
     executable = _resolve_program("git")
@@ -4781,12 +4894,14 @@ def collect_checkouts(
                 settings,
                 max_parallel,
             )
+            checked_out = _checked_out_commits(repositories, packages)
             _assign_drift(
                 verdict_runner,
                 repositories,
                 contexts,
                 verdicts,
                 packages,
+                checked_out,
                 settings,
                 max_parallel,
             )
@@ -4828,6 +4943,7 @@ def collect_checkouts(
         pulls={key: _plain_pull_requests(listed) for key, listed in pulls.items()},
         no_commits=no_commits,
     )
+    _assign_prerequisites(repositories, packages, package_heads, checked_out, pulls)
     document: dict[str, Any] = {
         "schema_version": CHECKOUTS_SCHEMA_VERSION,
         "checkouts_digest": None,

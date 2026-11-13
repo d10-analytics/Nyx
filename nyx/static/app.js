@@ -59,7 +59,7 @@
   // The card reads the checkout facts document at exactly this schema, and the
   // digest covers every top-level key except the digest and its observation
   // instant, so a document the collector wrote authenticates unchanged.
-  const CHECKOUTS_SCHEMA_VERSION = 10;
+  const CHECKOUTS_SCHEMA_VERSION = 11;
   const CHECKOUTS_DIGEST_OMITTED = ["checkouts_digest", "observed_at"];
   const CHECKOUTS_KEYS = [
     "schema_version", "checkouts_digest", "observed_at", "configuration_revision",
@@ -68,7 +68,7 @@
   ];
   const CHECKOUTS_PACKAGE_KEYS = [
     "package_path", "package_id", "finished", "superseded", "target", "branch",
-    "baseline", "code_status",
+    "baseline", "code_status", "prerequisites",
   ];
   const CHECKOUTS_CODE_STATUS_KEYS = [
     "state", "text", "pull_request", "push", "unpushed", "cleanup",
