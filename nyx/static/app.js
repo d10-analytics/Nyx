@@ -580,6 +580,8 @@
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
+  // The baseline of each rendered card whose served package has a checkout.
+  let cardBaseline = new Map();
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
@@ -989,6 +991,80 @@
     return lines;
   }
 
+  // The served baseline of every work item whose checkout can be placed.
+  function baselineMap() {
+    const baselines = new Map();
+    const document = servedCheckoutsDocument();
+    if (document === null) return baselines;
+    document.packages.forEach((item) => {
+      if (item.baseline && item.baseline.checkout) baselines.set(item.package_path, item.baseline);
+    });
+    return baselines;
+  }
+
+  // The one place the colours of the baseline line are decided, and no commit
+  // count decides any of them.  The checkout against its Baseline is green when
+  // equal, yellow when it holds commits of its own, red when it lacks the
+  // Baseline and grey when that cannot be told.  The checkout and the Baseline
+  // against main are green at none behind, yellow behind and grey when
+  // unknown, never red; with main unknown M is red and the line to it dashed
+  // grey.  Positions are ordinal: the count printed beside M is never a distance.
+  function baselineLineModel(baseline) {
+    const checkout = baseline && baseline.checkout;
+    if (!checkout) return null;
+    const versus = checkout.vs_baseline;
+    const against = checkout.vs_base;
+    const drift = baseline.drift;
+    const baselineTone = {
+      equal: "green", ahead: "yellow", behind: "red", diverged: "red", differs: "red",
+    }[versus.relation] || "grey";
+    const mainTone = (comparison) => (comparison && {
+      equal: "green", ahead: "green", behind: "yellow", diverged: "yellow",
+    }[comparison.relation]) || "grey";
+    const mainUnknown = against.relation === "absent";
+    const tones = {
+      checkout: baselineTone,
+      main: mainUnknown ? "red" : mainTone(against),
+      baseline: mainTone(drift),
+    };
+    const place = {
+      equal: "equal", ahead: "right", behind: "left", diverged: "off", differs: "off",
+    }[versus.relation] || "unplaced";
+    return {
+      tones,
+      place,
+      forked: place === "right" && drift !== null && drift.relation === "behind",
+      added: place === "right" ? versus.ahead : null,
+      behind: against.behind > 0 ? against.behind : null,
+      link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
+      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green",
+    };
+  }
+
+  function baselineLineHtml(baseline) {
+    const model = baselineLineModel(baseline);
+    if (model === null) return "";
+    const point = (name, tone, extra, inner) =>
+      `<span class="baseline-point" data-point="${name}" data-tone="${tone}"${extra}>${inner}</span>`;
+    const link = (name, tone, extra) =>
+      `<span class="baseline-link" data-link="${name}" data-tone="${tone}"${extra}></span>`;
+    const form = model.place === "equal" ? "ring"
+      : model.place === "off" || model.place === "unplaced" ? "dotted" : "solid";
+    return `<span class="card-baseline" data-place="${model.place}" aria-hidden="true">` +
+      (model.forked || (model.place !== "left" && model.place !== "right")
+        ? "" : link("checkout", model.tones.checkout, "")) +
+      link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
+      (model.forked ? link("fork", model.tones.checkout, "") : "") +
+      point("B", model.tones.baseline, "", "") +
+      point("C", model.tones.checkout,
+        ` data-form="${form}"${model.forked ? " data-fork" : ""}`,
+        model.check ? '<span class="baseline-check">&#10003;</span>' : "") +
+      (model.added === null ? "" : `<span class="baseline-added" data-tone="${model.tones.checkout}">+${model.added}</span>`) +
+      point("M", model.tones.main, "", "") +
+      (model.behind === null ? "" : `<span class="baseline-behind">${model.behind}</span>`) +
+      "</span>";
+  }
+
   // The attention items that name each work item.  An item awaiting its merge
   // is left out: the Code Status of its card already says so.
   function cardAttentionMap() {
@@ -1023,7 +1099,8 @@
   function cardFactsHtml(path) {
     const status = cardCodeStatus.get(path);
     return (status === undefined ? "" : codeStatusPillHtml(status)) +
-      (cardAttention.get(path) || []).map(attentionBadgeHtml).join("");
+      (cardAttention.get(path) || []).map(attentionBadgeHtml).join("") +
+      baselineLineHtml(cardBaseline.get(path));
   }
 
   function searchText(entry, line) {
@@ -1261,6 +1338,7 @@
     // catalog change and the checkouts outcome never disagree about them.
     renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
     cardCodeStatus = codeStatusLineMap();
+    cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
     cardFactsMarkup = new Map();
     // Keyed by path so cards sharing a package identity keep their own relationships.
@@ -1450,6 +1528,10 @@
     }
     next.forEach((tag, index) => {
       const shown = current[index];
+      if (tag.classList.contains("card-baseline")) {
+        if (shown.outerHTML !== tag.outerHTML) shown.replaceWith(tag);
+        return;
+      }
       [...tag.attributes].forEach((attribute) => {
         if (shown.getAttribute(attribute.name) !== attribute.value) {
           shown.setAttribute(attribute.name, attribute.value);
@@ -1467,6 +1549,7 @@
   // path holds is simply absent.  The work item panel follows the same outcome.
   function updateCardCodeStatus() {
     cardCodeStatus = codeStatusLineMap();
+    cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
     let changed = false;
     board.querySelectorAll(".card[data-package-path]").forEach((card) => {

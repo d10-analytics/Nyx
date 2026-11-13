@@ -36,6 +36,8 @@
   --state-progress: #76b7ff;
   --state-waiting: #ffd18c;
   --state-done: #7fd49b;
+  --state-failed: #ff8a80;
+  --check-ink: #111821;
   --panel-space: 0px;
   font: 16px/1.45 system-ui, sans-serif;
   color: var(--text);
@@ -70,6 +72,8 @@
   --state-progress: #164f91;
   --state-waiting: #825000;
   --state-done: #1c6b3a;
+  --state-failed: #b3261e;
+  --check-ink: #ffffff;
 }
 body.panel-open { --panel-space: 22rem; }
 body.panel-collapsed { --panel-space: 2.6rem; }
@@ -629,6 +633,123 @@ button.pending {
 .card-code-status[data-state="merged"] { --tone: var(--state-done); }
 .card-code-status:is([data-state="unknown"], [data-state="superseded"], [data-state="no_commits_yet"]) { --tone: var(--control-border); }
 .card-attention { --tone: var(--state-waiting); }
+/* The baseline line: three markers on one horizontal line, drawn on the tag
+   surface so it reads the same on a plain card and on a brand-teal one. Places
+   are ordinal; a count is printed beside M and never sets a distance. */
+.card-baseline {
+  --tone: var(--control-border);
+  --b: 24%;
+  --c: 24%;
+  --c-top: 1.3rem;
+  position: relative;
+  flex: 1 1 100%;
+  height: 2.2rem;
+  border: 1px solid var(--border);
+  border-radius: .4rem;
+  background: var(--surface);
+  color: var(--text);
+}
+.card-baseline[data-place="right"] { --b: 12%; --c: 40%; }
+.card-baseline[data-place="left"] { --b: 40%; --c: 12%; }
+.card-baseline[data-place="off"], .card-baseline[data-place="unplaced"] { --b: 40%; --c: 12%; --c-top: .55rem; }
+.baseline-point[data-fork] { --c-top: .5rem; }
+.baseline-point, .baseline-link, .baseline-added, .baseline-behind { position: absolute; }
+.baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
+.baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
+.baseline-point[data-tone="red"], .baseline-link[data-tone="red"] { --tone: var(--state-failed); }
+.baseline-point[data-tone="grey"], .baseline-link[data-tone="grey"] { --tone: var(--control-border); }
+.baseline-point {
+  top: 1.3rem;
+  width: .8rem;
+  height: .8rem;
+  margin: -.4rem 0 0 -.4rem;
+  border-radius: 50%;
+  background: var(--tone);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.baseline-point[data-point="B"] { left: var(--b); width: .6rem; height: .6rem; margin: -.3rem 0 0 -.3rem; }
+.baseline-point[data-point="C"] { left: var(--c); top: var(--c-top); }
+.baseline-point[data-point="M"] { left: 70%; }
+.baseline-point[data-form="ring"] { box-shadow: 0 0 0 2px var(--surface), 0 0 0 3.5px var(--tone); }
+.baseline-point[data-form="dotted"] {
+  background: var(--surface);
+  border: 2px dotted var(--tone);
+}
+.baseline-point[data-point="C"]:has(.baseline-check) { width: 1.1rem; height: 1.1rem; margin: -.55rem 0 0 -.55rem; }
+.baseline-check { color: var(--check-ink); font-size: .75rem; font-weight: 700; line-height: 1; }
+.baseline-link {
+  top: 1.3rem;
+  height: 0;
+  border-top: 2px solid var(--tone);
+}
+.baseline-link[data-line="dashed"] { border-top-style: dashed; }
+.baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
+.card-baseline[data-place="right"] .baseline-link[data-link="main"] { left: var(--c); width: calc(70% - var(--c)); }
+.card-baseline[data-place="right"]:has(.baseline-point[data-fork]) .baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
+.baseline-link[data-link="checkout"] { left: min(var(--b), var(--c)); width: 28%; }
+.baseline-link[data-link="fork"] {
+  left: var(--c);
+  top: .5rem;
+  width: 0;
+  height: .8rem;
+  border-top: 0;
+  border-left: 2px solid var(--tone);
+  margin-left: -1px;
+}
+.baseline-added, .baseline-behind { position: absolute; }
+.baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
+.baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
+.baseline-point[data-tone="red"], .baseline-link[data-tone="red"] { --tone: var(--state-failed); }
+.baseline-point[data-tone="grey"], .baseline-link[data-tone="grey"] { --tone: var(--control-border); }
+.baseline-point {
+  top: 1.3rem;
+  width: .8rem;
+  height: .8rem;
+  margin: -.4rem 0 0 -.4rem;
+  border-radius: 50%;
+  background: var(--tone);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.baseline-point[data-point="B"] { left: var(--b); width: .6rem; height: .6rem; margin: -.3rem 0 0 -.3rem; }
+.baseline-point[data-point="C"] { left: var(--c); top: var(--c-top); }
+.baseline-point[data-point="M"] { left: 70%; }
+.baseline-point[data-form="ring"] { box-shadow: 0 0 0 2px var(--surface), 0 0 0 3.5px var(--tone); }
+.baseline-point[data-form="dotted"] {
+  background: var(--surface);
+  border: 2px dotted var(--tone);
+}
+.baseline-point[data-point="C"]:has(.baseline-check) { width: 1.1rem; height: 1.1rem; margin: -.55rem 0 0 -.55rem; }
+.baseline-check { color: var(--check-ink); font-size: .75rem; font-weight: 700; line-height: 1; }
+.baseline-link {
+  top: 1.3rem;
+  height: 0;
+  border-top: 2px solid var(--tone);
+}
+.baseline-link[data-line="dashed"] { border-top-style: dashed; }
+.baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
+.card-baseline[data-place="right"] .baseline-link[data-link="main"] { left: var(--c); width: calc(70% - var(--c)); }
+.card-baseline[data-place="right"]:has(.baseline-point[data-fork]) .baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
+.baseline-link[data-link="checkout"] { left: min(var(--b), var(--c)); width: 28%; }
+.baseline-link[data-link="fork"] {
+  left: var(--b);
+  top: .9rem;
+  width: 1.4rem;
+  transform-origin: left center;
+  transform: rotate(-26deg);
+}
+.baseline-added, .baseline-behind {
+  top: .35rem;
+  font-size: .72rem;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text);
+}
+.baseline-added { left: calc(var(--c) + .7rem); }
+.baseline-behind { left: calc(70% + .7rem); top: 1.3rem; margin-top: -.45rem; }
 .connection.overflow .rail { stroke-dasharray: 7 4; }
 
 .work-item-panel {
