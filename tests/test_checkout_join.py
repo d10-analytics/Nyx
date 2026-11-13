@@ -8484,3 +8484,19 @@ def test_an_incomplete_clone_makes_no_call_and_reads_unknown(
 
     assert decided == {"held": "unknown", "absent": "unknown"}
     assert recorded.arguments == []
+
+
+def test_a_failed_ancestry_call_reads_unknown_never_no(containment_repository, monkeypatch):
+    w = containment_repository
+    recorded = RecordedGit(monkeypatch)
+    # A checked-out "commit" that is a tree makes git fail the ancestry call (exit 128),
+    # which is neither "in C" nor "not in C".
+    tree = git(w["repo"], "rev-parse", f"{w['head']}^{{tree}}").stdout.strip()
+    requests = [("failed", tree, [(w["side"], "ancestor")])]
+
+    decided = checkouts._clone_in_checkout(
+        containment_runner(60.0), containment_context(w["repo"]), requests, w["settings"]
+    )
+
+    assert recorded.ancestry() == [[w["side"], tree]], "control: the call was made"
+    assert decided == {"failed": "unknown"}
