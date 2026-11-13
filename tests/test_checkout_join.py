@@ -43,6 +43,7 @@ from test_checkouts import (  # noqa: F401  (fixtures that isolate git and GitHu
     rederive,
     redigest,
     refusal_of,
+    repository_fingerprint,
     rev,
     shared_world_build,
     stand_in,
@@ -4541,10 +4542,10 @@ def give_no_commits(name: str):
     return change
 
 
-def test_schema_9_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(status_document):
+def test_schema_10_is_accepted_schema_8_refused_and_no_commits_yet_is_strict(status_document):
     """One collection serves every proof: each case mutates its own copy."""
-    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 9
-    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 9
+    assert status_document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 10
+    assert models.parse_checkouts(json.dumps(status_document))["schema_version"] == 10
 
     old = doc_copy(status_document)
     old["schema_version"] = 8
@@ -5354,6 +5355,70 @@ def drift_row(w: WorldW, basis, relation, ahead, behind, lender) -> dict[str, An
     }
 
 
+def relation(basis: str, name: str, ahead: int | None = None, behind: int | None = None):
+    return {
+        "basis": basis,
+        "relation": name,
+        "ahead": ahead,
+        "behind": behind,
+        "objects_from": None,
+    }
+
+
+def checkout_of(document: dict[str, Any], name: str) -> dict[str, Any] | None:
+    return world_package(document, name)["baseline"]["checkout"]
+
+
+def world_checkouts(w: WorldW, basis: str) -> dict[str, dict[str, Any]]:
+    """The checkout of each package with a drift, derived from the fixture's commit graph.
+
+    Clone A's checkout is O, the commit it was cloned at, so it lacks every Baseline
+    commit (X, X2, Y and the all-zero ID) and trails the base. Clone W's checked-out
+    ``topic`` is Y plus two commits of its own, so it holds X and is ahead of it by
+    Y, t1 and t2, and ahead of the base Y by two. Clone S is shallow at Y.
+    """
+    head = git(w.c["W"], "rev-parse", "topic").stdout.strip()
+    local = git(w.c["L"], "rev-parse", "HEAD").stdout.strip()
+    on_a = {
+        "sha": w.sha["O"],
+        "vs_baseline": relation("cached", "differs"),
+        "vs_base": (
+            relation("live", "behind", 0, 2) if basis == "live" else relation("cached", "equal", 0, 0)
+        ),
+    }
+    return {
+        **dict.fromkeys(("drift-moved", "drift-twin", "drift-off", "drift-equal", "drift-unheld"), on_a),
+        "drift-held": {
+            "sha": head,
+            "vs_baseline": relation("cached", "ahead", 3, 0),
+            "vs_base": relation(basis, "ahead", 2, 0),
+        },
+        "drift-shallow": {
+            "sha": w.sha["Y"],
+            "vs_baseline": relation("cached", "unknown"),
+            "vs_base": relation(basis, "equal", 0, 0),
+        },
+        "drift-unreadable": {
+            "sha": None,
+            "vs_baseline": relation("cached", "unknown"),
+            "vs_base": relation("cached", "absent"),
+        },
+        "drift-local": {
+            "sha": local,
+            "vs_baseline": relation("cached", "differs"),
+            "vs_base": relation("cached", "absent"),
+        },
+    }
+
+
+def assert_world_checkouts(w: WorldW, document: dict[str, Any], basis: str) -> None:
+    for name, row in world_checkouts(w, basis).items():
+        assert checkout_of(document, name) == row, name
+    for package in document["packages"]:
+        assert (package["baseline"]["checkout"] is None) == (package["baseline"]["drift"] is None)
+    assert checkout_of(document, "drift-finished") is None
+
+
 def test_world_w_reports_each_baseline_and_its_live_drift_from_the_target_base(world_w):
     w = world_w
     document = w.live
@@ -5375,6 +5440,7 @@ def test_world_w_reports_each_baseline_and_its_live_drift_from_the_target_base(w
     for name in ("drift-finished", "baseline-invalid", "branch-invalid", "default", "fresh",
                  "on-worktree", "on-c", "missing-in", "plain-in", "relative"):
         assert drift_of(document, name) is None, name
+    assert_world_checkouts(w, document, "live")
     shas = {
         "drift-moved": ("declared", w.sha["X"]),
         "drift-twin": ("declared", w.sha["X"]),
@@ -5433,6 +5499,7 @@ def test_world_w_offline_drift_is_counted_against_the_cached_base_of_the_target(
     }
     for name, row in expected.items():
         assert drift_of(document, name) == drift_row(w, *row), name
+    assert_world_checkouts(w, document, "cached")
     # the parser accepts the lender under the cached basis for drift
     assert models.parse_checkouts(json.dumps(redigest(doc_copy(document))))
 
@@ -5469,6 +5536,38 @@ def drift_calls(w: WorldW) -> list[dict[str, Any]]:
             and left != right
         ):
             assert "--no-replace-objects" in arguments
+            found.append(call)
+    return found
+
+
+def checkout_calls(w: WorldW) -> list[dict[str, Any]]:
+    """The recorded checkout counts after the verdict phase: a ``rev-list --left-right
+    --count`` from a recorded checkout commit to a declared Baseline or to the verdict
+    base of the clone it ran in, never from a Baseline (that is ``drift_calls``)."""
+    heads = {
+        p["baseline"]["checkout"]["sha"]
+        for p in w.live["packages"]
+        if p["baseline"]["checkout"] is not None and p["baseline"]["checkout"]["sha"] is not None
+    }
+    baselines = {
+        p["baseline"]["sha"] for p in w.live["packages"] if p["baseline"]["sha"] is not None
+    }
+    bases = {c["path"]: c["verdict_base"] for r in w.live["repositories"] for c in r["clones"]}
+    last_reflog = max(
+        index
+        for index, call in enumerate(w.calls)
+        if "reflog" in call["arguments"] and call["arguments"][-1].startswith("refs/heads/")
+    )
+    found = []
+    for call in w.calls[last_reflog + 1 :]:
+        arguments = call["arguments"]
+        if arguments[-3:-1] != ["--left-right", "--count"] or "rev-list" not in arguments:
+            continue
+        left, _, right = arguments[-1].partition("...")
+        base = bases.get(real(call["path"]))
+        if left in heads and left not in baselines and (
+            right in baselines or (base is not None and right == base["sha"])
+        ):
             found.append(call)
     return found
 
@@ -5535,6 +5634,33 @@ def test_one_count_runs_for_each_clone_and_baseline_with_the_alternates_of_both_
     assert alternates(real(w.c["W"]), w.sha["X"]) == []
 
 
+def test_the_checkout_counts_are_pinned_read_only_and_one_runs_per_commit_pair(world_w):
+    w = world_w
+
+    counts = checkout_calls(w)
+
+    assert counts, "control: counts ran"
+    for call in counts:
+        arguments = call["arguments"]
+        assert "--no-replace-objects" in arguments
+        assert ("-c", "core.quotePath=true") in list(zip(arguments, arguments[1:]))
+        assert call["scratch_exists"] == [True]
+        assert "HEAD" not in arguments[-1]
+    seen = sorted((real(call["path"]), call["arguments"][-1]) for call in counts)
+    head = git(w.c["W"], "rev-parse", "topic").stdout.strip()
+    # Clone A's five packages share one commit and one base: a single C...M count, and
+    # no Baseline count since A lacks every Baseline. Clone W counts its checkout
+    # against its Baseline and against the base.
+    assert seen == sorted(
+        [
+            (real(w.c["A"]), f"{w.sha['O']}...{w.sha['Y']}"),
+            (real(w.c["W"]), f"{head}...{w.sha['X']}"),
+            (real(w.c["W"]), f"{head}...{w.sha['Y']}"),
+        ]
+    )
+    assert not set(map(id, counts)) & set(map(id, drift_calls(w)))
+
+
 def test_a_spent_verdict_budget_leaves_the_counted_drift_unknown_and_the_rest_decided(world_w):
     w = world_w
     document = w.budget
@@ -5549,6 +5675,13 @@ def test_a_spent_verdict_budget_leaves_the_counted_drift_unknown_and_the_rest_de
     assert drift_of(document, "drift-shallow") == drift_row(w, "live", "differs", None, None, None)
     for name in ("drift-unreadable", "drift-local"):
         assert drift_of(document, name) == drift_row(w, "cached", "absent", None, None, None)
+    # every counted checkout relation is unknown; the uncounted equal ones stay decided
+    for name in ("drift-moved", "drift-twin", "drift-off", "drift-unheld", "drift-equal",
+                 "drift-held"):
+        assert checkout_of(document, name)["vs_baseline"] == relation("cached", "unknown"), name
+        assert checkout_of(document, name)["vs_base"] == relation("live", "unknown"), name
+    assert checkout_of(document, "drift-shallow")["vs_base"] == relation("live", "equal", 0, 0)
+    assert checkout_of(document, "drift-local")["vs_base"] == relation("cached", "absent")
     assert "checkout_cache_write_failed" not in {d["code"] for d in document["diagnostics"]}
 
 
@@ -5561,7 +5694,7 @@ def test_an_expired_deadline_leaves_git_too_old_and_every_drift_null(world_w):
     assert len(document["packages"]) == len(w.live["packages"])
     for package in document["packages"]:
         live = next(p for p in w.live["packages"] if p["package_path"] == package["package_path"])
-        assert package["baseline"] == {**live["baseline"], "drift": None}
+        assert package["baseline"] == {**live["baseline"], "drift": None, "checkout": None}
         assert package["target"]["status"] == (
             "invalid" if package["package_path"].endswith("relative") else "unchecked"
         )
@@ -5661,6 +5794,87 @@ def test_the_parser_refuses_a_baseline_or_drift_the_collected_facts_contradict(w
         assert message.startswith("packages[") and fragment in message, (label, message)
 
 
+def mutate_checkout(name: str, **changes: Any):
+    def change(document: dict[str, Any], _w: WorldW) -> None:
+        world_package(document, name)["baseline"]["checkout"].update(changes)
+
+    return change
+
+
+def mutate_relation(name: str, part: str, **changes: Any):
+    def change(document: dict[str, Any], _w: WorldW) -> None:
+        world_package(document, name)["baseline"]["checkout"][part].update(changes)
+
+    return change
+
+
+def give_checkout(name: str, donor: str):
+    def change(document: dict[str, Any], _w: WorldW) -> None:
+        world_package(document, name)["baseline"]["checkout"] = doc_copy(
+            checkout_of(document, donor)
+        )
+
+    return change
+
+
+def test_the_parser_refuses_a_checkout_its_own_worktree_and_base_facts_contradict(world_w):
+    w = world_w
+    absent = {"relation": "absent", "ahead": None, "behind": None, "objects_from": None}
+    equal = {"relation": "equal", "ahead": 0, "behind": 0, "objects_from": None}
+    behind = {"relation": "behind", "ahead": 0, "behind": 1, "objects_from": None}
+    ahead = {"relation": "ahead", "ahead": 1, "behind": 0, "objects_from": None}
+    refused = {
+        "checkout set when drift is null": (
+            give_checkout("drift-finished", "drift-moved"), "baseline.checkout"),
+        "checkout null when drift is set": (
+            mutate_baseline("drift-moved", checkout=None), "baseline.checkout"),
+        "a key beyond the three": (
+            mutate_checkout("drift-moved", extra=1), "baseline.checkout"),
+        "sha unlike the target worktree's head": (
+            mutate_checkout("drift-moved", sha=w.sha["Y"]), "baseline.checkout.sha"),
+        "sha set where the head is null": (
+            mutate_checkout("drift-unreadable", sha=w.sha["X"]), "baseline.checkout.sha"),
+        "sha null where the head is set": (
+            mutate_checkout("drift-moved", sha=None), "baseline.checkout.sha"),
+        "a counted relation with a null sha": (
+            mutate_relation("drift-unreadable", "vs_baseline", **ahead), "baseline.checkout"),
+        "vs_base basis unlike the base's": (
+            mutate_relation("drift-moved", "vs_base", basis="cached"), "baseline.checkout.vs_base.basis"),
+        "vs_base absent with a base": (
+            mutate_relation("drift-moved", "vs_base", **absent), "baseline.checkout.vs_base"),
+        "vs_base counted without a base": (
+            mutate_relation("drift-local", "vs_base", **behind), "baseline.checkout.vs_base"),
+        "vs_base equal with sha not the base": (
+            mutate_relation("drift-moved", "vs_base", **equal), "baseline.checkout.vs_base"),
+        "vs_base not equal with sha the base": (
+            mutate_relation("drift-shallow", "vs_base", **behind), "baseline.checkout.vs_base"),
+        "vs_baseline absent": (
+            mutate_relation("drift-moved", "vs_baseline", **absent), "baseline.checkout.vs_baseline"),
+        "vs_baseline basis other than cached": (
+            mutate_relation("drift-moved", "vs_baseline", basis="live"), "baseline.checkout.vs_baseline"),
+        "vs_baseline equal with sha not the Baseline": (
+            mutate_relation("drift-moved", "vs_baseline", **equal), "baseline.checkout.vs_baseline"),
+        "vs_baseline not equal with sha the Baseline": (
+            mutate_baseline("drift-moved", sha=w.sha["O"]), "baseline.checkout.vs_baseline"),
+        "an objects_from on vs_baseline": (
+            mutate_relation("drift-moved", "vs_baseline", objects_from=real(w.c["B"])),
+            "baseline.checkout.vs_baseline"),
+        "an objects_from on vs_base": (
+            mutate_relation("drift-moved", "vs_base", objects_from=real(w.c["B"])),
+            "baseline.checkout.vs_base"),
+    }
+    for label, (change, fragment) in refused.items():
+        document = doc_copy(w.live)
+        change(document, w)
+        message = refusal_of(document)
+        assert message.startswith("packages[") and fragment in message, (label, message)
+    # The drift refusals keep their own messages when the checkout is also contradictory.
+    document = doc_copy(w.live)
+    mutate_drift("drift-moved", basis="cached")(document, w)
+    mutate_relation("drift-moved", "vs_base", basis="cached")(document, w)
+    assert "baseline.drift.basis" in refusal_of(document)
+
+
 def test_the_parser_names_the_package_whose_baseline_it_refuses(world_w):
     w = world_w
     document = doc_copy(w.live)
@@ -5685,7 +5899,8 @@ def test_the_lender_of_a_branch_comparison_still_needs_a_live_or_recorded_basis(
 
 def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
     """The presence probe and the lender search of the drift phase carry the verdict
-    settings, ask each clone once, and no call runs where drift is decided without git."""
+    settings, ask each clone once, and no call runs where drift is decided without git
+    (the checkout comparison's own probe is the one other ask)."""
     w = world_w
     calls = w.calls
     last_reflog = max(
@@ -5705,12 +5920,19 @@ def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
         asked = sorted(item for item in call["arguments"] if len(item) == 40 and "=" not in item)
         by_clone.setdefault(real(call["path"]), []).append(asked)
     a_baselines = sorted([w.sha["X"], w.sha["X2"], WORLD_ABSENT])
-    assert by_clone[real(w.c["A"])] == [a_baselines], "one probe for A's distinct Baselines"
+    # The checkout comparison asks each clone once more, for the Baselines its targets'
+    # commits differ from: A's four (Y too, which no commit of A holds), W's one, and
+    # local L's one, where no drift probe runs because that clone has no base.
+    checkout_a = sorted([*a_baselines, w.sha["Y"]])
+    assert sorted(by_clone[real(w.c["A"])]) == sorted([a_baselines, checkout_a]), (
+        "one probe for A's distinct Baselines, one for its checkout comparison"
+    )
     assert by_clone[real(w.c["B"])] == [a_baselines], "one lender probe in B"
     assert by_clone[real(w.c["C"])] == [a_baselines], "the unheld one reaches C once"
-    # W is probed for its own Baseline and, in A's search, as a lender; the jobs run
-    # in parallel, so the two probes come in either order.
-    assert sorted(by_clone[real(w.c["W"])]) == sorted([[w.sha["X"]], a_baselines])
+    # W is probed for its own Baseline, as a lender in A's search and for its checkout;
+    # the jobs run in parallel, so the probes come in any order.
+    assert sorted(by_clone[real(w.c["W"])]) == sorted([[w.sha["X"]], [w.sha["X"]], a_baselines])
+    assert by_clone[real(w.c["L"])] == [[w.sha["X"]]], "only the checkout comparison probes L"
     for call in phase:
         arguments = call["arguments"]
         assert "rev-list" in arguments and real(call["path"]) in listed, arguments
@@ -5720,7 +5942,193 @@ def test_every_drift_probe_is_pinned_and_each_clone_is_asked_once(world_w):
         assert set(call["overlay"]) - {"GIT_ALTERNATE_OBJECT_DIRECTORIES"} == {
             "GIT_GRAFT_FILE", "GIT_ATTR_NOSYSTEM", "GIT_NO_LAZY_FETCH"
         }
-        assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U", "L")}
+        assert real(call["path"]) not in {real(w.c[key]) for key in ("S", "U")}
+
+
+# ---------------------------------------------------------------------------
+# One clone with linked worktrees on real history: the checkout comparisons
+# ---------------------------------------------------------------------------
+
+POSITION_NAMES = ("p-main", "p-ahead", "p-behind", "p-diverged", "p-zero", "p-orphan")
+NETWORK_COMMANDS = frozenset({"fetch", "ls-remote", "pull", "push", "remote"})
+
+
+class PositionWorld:
+    """Six packages declaring one Baseline P in one clone; three collections of it."""
+
+    folder: Path
+    root: Path
+    clone: Path
+    trees: dict[str, Path]
+    sha: dict[str, str]
+    first: dict[str, Any]
+    second: dict[str, Any]
+    third: dict[str, Any]
+    before: dict[str, Any]
+    after: dict[str, Any]
+    calls: list[dict[str, Any]]
+
+
+def position_package(document: dict[str, Any], name: str) -> dict[str, Any]:
+    (found,) = [p for p in document["packages"] if p["package_path"] == f"Fictional/Drafts/{name}"]
+    return found
+
+
+def worktree_state(tree: Path) -> dict[str, tuple[bytes, int]]:
+    """The bytes and modification time of a worktree's own index and HEAD files."""
+    state = {}
+    for name in ("index", "HEAD"):
+        located = git(tree, "rev-parse", "--git-path", name).stdout.strip()
+        path = Path(located) if os.path.isabs(located) else tree / located
+        state[name] = (path.read_bytes(), path.stat().st_mtime_ns)
+    return state
+
+
+def position_snapshot(w: PositionWorld) -> dict[str, Any]:
+    return {
+        "clone": repository_fingerprint(w.clone),
+        "trees": {name: worktree_state(tree) for name, tree in w.trees.items()},
+    }
+
+
+def build_position_world(base: Path) -> PositionWorld:
+    w = PositionWorld()
+    w.folder = base / "folder"
+    w.folder.mkdir()
+    remote = make_remote(base)
+    w.clone = clone(remote, w.folder / "Repo One")
+    parent = commit_file(w.clone, "parent.txt", "parent\n", "parent")
+    baseline = commit_file(w.clone, "baseline.txt", "baseline\n", "baseline")
+    # The remote's trunk, and so the cached base, is one commit past P; the main
+    # worktree stays on P, so the Baseline and the base are two different commits.
+    newest = commit_file(w.clone, "newest.txt", "newest\n", "newest")
+    git(w.clone, "push", "-q", "origin", "trunk")
+    git(w.clone, "reset", "-q", "--hard", baseline)
+    w.sha = {"parent": parent, "P": baseline, "Q": newest}
+    w.trees = {"main": w.clone}
+    ahead = linked(w.clone, base, "ahead", "-b", "ahead", baseline)
+    commit_file(ahead, "a1.txt", "a1\n")
+    commit_file(ahead, "a2.txt", "a2\n")
+    w.trees["ahead"] = ahead
+    w.trees["behind"] = linked(w.clone, base, "behind", "--detach", parent)
+    diverged = linked(w.clone, base, "diverged", "-b", "diverged", parent)
+    commit_file(diverged, "d1.txt", "d1\n")
+    w.trees["diverged"] = diverged
+    orphan = linked(w.clone, base, "orphan", "--detach", baseline)
+    git(orphan, "checkout", "-q", "--orphan", "unborn")
+    w.trees["orphan"] = orphan
+    w.root = base / "spec"
+    targets = {
+        "p-main": ("main", baseline),
+        "p-ahead": ("ahead", baseline),
+        "p-behind": ("behind", baseline),
+        "p-diverged": ("diverged", baseline),
+        "p-zero": ("main", WORLD_ABSENT),
+        "p-orphan": ("orphan", baseline),
+    }
+    for name, (tree, declared) in targets.items():
+        make_package(w.root, "Drafts", name, f"Target repo: {w.trees[tree]}\nBaseline: {declared}\n")
+    return w
+
+
+@pytest.fixture(scope="module")
+def position_world(tmp_path_factory):
+    with shared_world_build(tmp_path_factory, "position") as (directory, _home, patch):
+        w = build_position_world(directory)
+        recorded = RecordedRuns(patch)
+        recorded.active = True
+        w.first = collect_packages([w.folder], w.root, remote_checks=False)
+        w.sha["M1"] = commit_file(w.clone, "m1.txt", "m1\n", "main moves")
+        w.before = position_snapshot(w)
+        w.second = collect_packages([w.folder], w.root, remote_checks=False)
+        original = checkouts._GitRunner.run
+
+        def failing(runner, arguments, **options):
+            left, _, right = list(arguments)[-1].partition("...")
+            if "--count" in arguments and right == w.sha["P"] and left:
+                return checkouts._Outcome(1)
+            return original(runner, arguments, **options)
+
+        patch.setattr(checkouts._GitRunner, "run", failing)
+        w.third = collect_packages([w.folder], w.root, remote_checks=False)
+        patch.setattr(checkouts._GitRunner, "run", original)
+        w.after = position_snapshot(w)
+        recorded.active = False
+        w.calls = recorded.calls
+    return w
+
+
+def position(document: dict[str, Any], name: str) -> dict[str, Any]:
+    return position_package(document, name)["baseline"]["checkout"]
+
+
+def test_each_work_item_in_one_clone_reads_its_own_worktrees_commit_against_the_baseline(
+    position_world,
+):
+    w = position_world
+    document = w.first
+    sha = w.sha
+
+    assert document["remote_checks"] == "off", "control"
+    base = clone_at(document, w.clone)["verdict_base"]
+    assert (base["sha"], base["basis"]) == (sha["Q"], "cached"), "control"
+    expected = {
+        "p-main": (sha["P"], relation("cached", "equal", 0, 0), relation("cached", "behind", 0, 1)),
+        "p-ahead": (
+            git(w.trees["ahead"], "rev-parse", "HEAD").stdout.strip(),
+            relation("cached", "ahead", 2, 0),
+            relation("cached", "diverged", 2, 1),
+        ),
+        "p-behind": (
+            sha["parent"], relation("cached", "behind", 0, 1), relation("cached", "behind", 0, 2)
+        ),
+        "p-diverged": (
+            git(w.trees["diverged"], "rev-parse", "HEAD").stdout.strip(),
+            relation("cached", "diverged", 1, 1),
+            relation("cached", "diverged", 1, 2),
+        ),
+        "p-zero": (sha["P"], relation("cached", "differs"), relation("cached", "behind", 0, 1)),
+        "p-orphan": (None, relation("cached", "unknown"), relation("cached", "unknown")),
+    }
+    for name, (head, versus, against) in expected.items():
+        assert position(document, name) == {
+            "sha": head, "vs_baseline": versus, "vs_base": against
+        }, name
+    # Two work items with one Baseline in one clone get different values: a memo kept
+    # per clone would give both the answer of whichever ran first.
+    assert position(document, "p-main") != position(document, "p-ahead")
+
+
+def test_a_real_commit_in_the_target_turns_equal_into_ahead_one(position_world):
+    w = position_world
+
+    assert position(w.first, "p-main")["vs_baseline"] == relation("cached", "equal", 0, 0)
+    after = position(w.second, "p-main")
+
+    assert after["sha"] == w.sha["M1"]
+    assert after["vs_baseline"] == relation("cached", "ahead", 1, 0)
+    assert after["vs_base"] == relation("cached", "diverged", 1, 1)
+    assert position(w.second, "p-ahead") == position(w.first, "p-ahead"), "unmoved worktrees"
+
+
+def test_a_failed_checkout_count_is_unknown_and_never_differs(position_world):
+    w = position_world
+
+    for name in ("p-main", "p-ahead", "p-behind", "p-diverged"):
+        assert position(w.third, name)["vs_baseline"] == relation("cached", "unknown"), name
+        assert position(w.third, name)["vs_base"] == position(w.second, name)["vs_base"], name
+    assert position(w.third, "p-zero")["vs_baseline"] == relation("cached", "differs")
+
+
+def test_collecting_the_checkouts_writes_nothing_and_asks_no_remote(position_world):
+    w = position_world
+
+    assert w.before == w.after
+    assert w.calls, "control: calls were recorded"
+    words = {item for call in w.calls for item in call["arguments"]}
+    assert not words & NETWORK_COMMANDS, words & NETWORK_COMMANDS
+    for document in (w.first, w.second, w.third):
+        assert models.parse_checkouts(json.dumps(document))["packages"] == document["packages"]
 
 
 # ---------------------------------------------------------------------------
@@ -6648,6 +7056,14 @@ def test_an_unreadable_clone_without_origin_raises_only_its_unavailability(world
         base, ({"clone": path},), (attention_item("checkout_unavailable", clone=path),)
     )
     assert derived_attention(document) == expected
+    # An unreadable clone lists no worktree, so its packages' checkouts have no commit.
+    for package in document["packages"]:
+        if package["target"]["clone"] == path and package["baseline"]["checkout"] is not None:
+            package["baseline"]["checkout"] = {
+                "sha": None,
+                "vs_baseline": relation("cached", "unknown"),
+                "vs_base": relation("cached", "absent"),
+            }
     parses_rederived(document)
 
 

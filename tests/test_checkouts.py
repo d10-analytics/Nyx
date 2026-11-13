@@ -3009,7 +3009,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 9
+    assert document["schema_version"] == 10
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3606,7 +3606,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 9
+    assert first["schema_version"] == 10
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7405,7 +7405,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 9 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 10 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
@@ -7414,6 +7414,13 @@ def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sa
             del branch["contained_in"]
     with pytest.raises(models.ProtocolError, match="schema"):
         models.parse_checkouts(redigest(previous))
+    # The immediately previous schema is refused too: no reader for it remains.
+    stale = doc_copy(document)
+    stale["schema_version"] = 9
+    for package in stale["packages"]:
+        del package["baseline"]["checkout"]
+    with pytest.raises(models.ProtocolError, match="unsupported schema version"):
+        models.parse_checkouts(redigest(stale))
 
 
 # ---------------------------------------------------------------------------

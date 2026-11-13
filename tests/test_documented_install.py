@@ -1419,7 +1419,7 @@ def test_checkout_system_readme_states_the_folder_rule_and_the_suggestion_rule()
 def test_protocols_readme_states_the_checkout_schema_and_its_two_fields():
     readme = _normalized("docs/systems/protocols/README.md")
     for marker in (
-        "The checkout document is schema 9, and its two whole-document fields are part of "
+        "The checkout document is schema 10, and its two whole-document fields are part of "
         "the digest",
         "`configuration_revision` is `null` or one lowercase 64-character SHA-256 digest",
         "`folder_suggestions` holds entries of exactly `{path, package_count}`",
