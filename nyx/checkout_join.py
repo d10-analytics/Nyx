@@ -481,7 +481,9 @@ class BranchEvidence:
 
     ``tips`` holds each counted tip with the rung its verdict came from (``None`` when the
     copy has no verdict rung): every local copy's tip, and a present remote copy's tip when
-    no local copy holds it. ``no_commits_yet`` and ``merged`` are the two Code Status
+    no local copy holds it. ``pull_requests`` pairs each tip whose rung is
+    ``pull_request`` with the number of the request that decided it (``None`` when the
+    verdict named none). ``no_commits_yet`` and ``merged`` are the two Code Status
     decisions made from the copies' verdicts, ``no_commits_yet`` taking precedence, so a
     branch with no commit of its own is never ``merged``.
     """
@@ -489,6 +491,7 @@ class BranchEvidence:
     tips: tuple[tuple[str, str | None], ...]
     verdicts: tuple[str, ...]
     no_commits_yet: bool
+    pull_requests: tuple[tuple[str, int | None], ...] = ()
 
     @property
     def merged(self) -> bool:
@@ -519,11 +522,14 @@ def branch_evidence(
     ]
     verdicts = list(copy_verdicts)
     tips: list[tuple[str, str | None]] = []
+    numbers: dict[str, int | None] = {}
     for copy, state in zip(local, states):
         verdict = copy["verdict"]
         pair = (copy["sha"], None if state == "unrun" or verdict is None else verdict["rung"])
         if pair not in tips:
             tips.append(pair)
+        if pair[1] == "pull_request":
+            numbers.setdefault(copy["sha"], verdict.get("pull_request"))
     if remote_present:
         by_tip = {copy["sha"]: verdict for copy, verdict in reversed(list(zip(local, copy_verdicts)))}
         if remote["sha"] in by_tip:
@@ -533,10 +539,12 @@ def branch_evidence(
             tips.append(
                 (remote["sha"], None if remote_verdict is None else remote_verdict["rung"])
             )
+            if remote_verdict is not None and remote_verdict["rung"] == "pull_request":
+                numbers.setdefault(remote["sha"], remote_verdict.get("pull_request"))
     no_commits_yet = bool(local) and all(state == "yes" for state in states) and (
         not remote_present or remote["sha"] in {copy["sha"] for copy in local}
     )
-    return BranchEvidence(tuple(tips), tuple(verdicts), no_commits_yet)
+    return BranchEvidence(tuple(tips), tuple(verdicts), no_commits_yet, tuple(numbers.items()))
 
 
 def package_branch_evidence(

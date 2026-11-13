@@ -717,13 +717,17 @@ wording. The five states, in the order they are decided:
   and `unknown` otherwise.
 - `in_checkout` takes `yes`, `no` or `unknown`: it is `unknown` unless the
   prerequisite is `merged` and C is known. Its evidence is every branch tip Code
-  Status counted for the prerequisite, or the head of the merged request. It is
-  `yes` when each tip is an ancestor of C, with one read-only `merge-base
-  --is-ancestor` call per tip and C. It is `no` when a tip is not in C and the
-  merge verdict came from ancestry, a pull request or a merged request. It is
-  `unknown` when the verdict came from a patch, squash or tree equivalence, when the
-  clone is shallow, partial or unreadable, when a call failed or ran out of time,
-  and when the prerequisite belongs to another repository.
+  Status counted for the prerequisite; a tip decided through a pull request, or the
+  prerequisite's merged request when no Code Status exists, is evidenced by that
+  request's merge commit, the commit GitHub made on the base, not by the branch tip,
+  which a squash or rebase merge never lands. It is `yes` when each evidence commit
+  is an ancestor of C, with one read-only `merge-base --is-ancestor` call per
+  commit and C. It is `no` when an evidence commit is not in C and the merge verdict
+  came from ancestry or a pull request. It is `unknown` when the verdict came from a
+  patch, squash or tree equivalence, when GitHub named no merge commit for the
+  request, when the merge commit is not in the clone or the answer was saved by an
+  earlier run, when the clone is shallow, partial or unreadable, when a call failed
+  or ran out of time, and when the prerequisite belongs to another repository.
 
 A call is made only for a merged prerequisite, and none is made for any other.
 The pill is recomputed on every run and never saved; when time runs short, merged
