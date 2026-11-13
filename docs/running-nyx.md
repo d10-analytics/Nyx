@@ -1291,9 +1291,8 @@ points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
 the remote main head. Colour carries the meaning and no count decides it. `C` takes its colour from the
 checkout against its Baseline alone: green when it is at the Baseline, yellow when it
 holds commits of its own, red when it lacks the Baseline and grey when that cannot be
-computed; the link between `B` and `C` and the `+N` count of the checkout's own
-commits carry the same colour. `M` and the line to it take their colour from the
-checkout against main: green when it is none behind, yellow when it is behind and grey
+computed; the link between `B` and `C` carries the same colour. `M` and the line to it
+take their colour from the checkout against main: green when it is none behind, yellow when it is behind and grey
 when that cannot be computed. `B` takes its colour from the Baseline against main in
 the same way: green, yellow or grey, never red. With no base, main is unknown: `M` is
 red and its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
