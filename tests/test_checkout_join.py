@@ -8154,3 +8154,27 @@ def test_the_parser_accepts_each_collected_pill_and_refuses_the_stale_schema(pre
     for package in stale["packages"]:
         del package["prerequisites"]
     assert refusal_of(stale) == "unsupported schema version"
+
+
+@posix_only
+def test_the_parser_accepts_an_unknown_main_fact_whatever_its_package_code_status(
+    prerequisite_world,
+):
+    """An unresolved row stays unknown even when its target is listed, so the agreement
+    check applies only to a merged or not-merged fact."""
+    w = prerequisite_world
+    document = doc_copy(w.c1)
+    assert pw_package(document, "pre-a")["code_status"]["state"] == "merged"
+    assert pw_package(document, "pre-open")["code_status"]["state"] == "awaiting_merge"
+    pw_item(document, "dep-open", "pre-a")["merged_on_main"] = "unknown"
+    pw_item(document, "dep-open", "pre-open")["merged_on_main"] = "unknown"
+    pw_item(document, "dep-open", "pre-empty")["merged_on_main"] = "unknown"
+    retext_pill(document, "dep-open")
+
+    assert pw_pill(document, "dep-open")["state"] == "unknown"
+    parsed = models.parse_checkouts(json.dumps(redigest(document)))
+
+    assert {
+        item["merged_on_main"]
+        for item in pw_pill(parsed, "dep-open")["items"]
+    } == {"unknown"}
