@@ -2171,7 +2171,7 @@ def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 9
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 10
     assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
     assert [
         (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])
@@ -2482,6 +2482,31 @@ def test_checkout_guide_drift_relations_match_the_code():
         relation for relation in models._COMPARISON_RELATIONS if f"`{relation}`" in paragraph
     }
     assert documented == set(models._COMPARISON_RELATIONS)
+
+
+def _checkout_paragraph(guide: str) -> str:
+    """The `checkout` paragraph, from its opening sentence to the next paragraph."""
+    body = _subsection(guide, "Baseline and base drift")
+    start = body.index("`checkout` places the checkout itself")
+    return _normalised(body[start:].split("\n\n", 1)[0])
+
+
+def _relations_named(text: str) -> set[str]:
+    from nyx import models
+
+    return {relation for relation in models._COMPARISON_RELATIONS if f"`{relation}`" in text}
+
+
+def test_checkout_guide_checkout_relations_match_the_code():
+    from nyx import models
+
+    paragraph = _checkout_paragraph(_guide())
+    versus = paragraph.split("`vs_baseline` compares", 1)[1].split("`vs_base` compares", 1)[0]
+    against = paragraph.split("`vs_base` compares", 1)[1]
+
+    assert _relations_named(versus) == set(models._COMPARISON_RELATIONS) - {"absent"}
+    assert _relations_named(against) == set(models._COMPARISON_RELATIONS)
+    assert "is null exactly when `drift` is" in paragraph
 
 
 def _ranking_relations(guide: str) -> list[str]:

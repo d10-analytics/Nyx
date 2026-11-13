@@ -6,7 +6,7 @@ README is narrative only.
 ## Responsibilities
 
 - Typed validation of catalog and checkout documents.
-- The checkout document is schema 9, and its two whole-document fields are part
+- The checkout document is schema 10, and its two whole-document fields are part
   of the digest: `configuration_revision` is `null` or one lowercase
   64-character SHA-256 digest, and `folder_suggestions` holds entries of exactly
   `{path, package_count}` whose paths are absolute, strictly increasing in

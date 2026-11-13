@@ -59,7 +59,7 @@
   // The card reads the checkout facts document at exactly this schema, and the
   // digest covers every top-level key except the digest and its observation
   // instant, so a document the collector wrote authenticates unchanged.
-  const CHECKOUTS_SCHEMA_VERSION = 9;
+  const CHECKOUTS_SCHEMA_VERSION = 10;
   const CHECKOUTS_DIGEST_OMITTED = ["checkouts_digest", "observed_at"];
   const CHECKOUTS_KEYS = [
     "schema_version", "checkouts_digest", "observed_at", "configuration_revision",
@@ -309,7 +309,6 @@
       "behind": "the base moved {b} commits past it"
     },
     "cardBadge": {
-      "base_moved": "base moved {count}",
       "target_repo_missing": "Target repo missing",
       "target_repo_not_git": "Target repo not a git checkout",
       "branch_invalid": "Branch name invalid"
@@ -404,6 +403,7 @@
       "panelAttention": "Needs attention",
       "panelTarget": "Target repo",
       "panelBaseline": "Baseline",
+      "panelBaselineLine": "Baseline line",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
@@ -580,6 +580,8 @@
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
+  // The baseline of each rendered card whose served package has a checkout.
+  let cardBaseline = new Map();
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
@@ -989,14 +991,111 @@
     return lines;
   }
 
+  // The served baseline of every work item whose checkout can be placed.
+  function baselineMap() {
+    const baselines = new Map();
+    const document = servedCheckoutsDocument();
+    if (document === null) return baselines;
+    document.packages.forEach((item) => {
+      if (item.baseline && item.baseline.checkout) baselines.set(item.package_path, item.baseline);
+    });
+    return baselines;
+  }
+
+  // The one place the colours of the baseline line are decided, and no commit
+  // count decides any of them.  The checkout against its Baseline is green when
+  // equal, yellow when it holds commits of its own, red when it lacks the
+  // Baseline and grey when that cannot be told.  The checkout and the Baseline
+  // against main are green at none behind, yellow behind and grey when
+  // unknown, never red; with main unknown M is red and the line to it dashed
+  // grey.  Positions are ordinal: the count printed beside M is never a distance.
+  function baselineLineModel(baseline) {
+    const checkout = baseline && baseline.checkout;
+    if (!checkout) return null;
+    const versus = checkout.vs_baseline;
+    const against = checkout.vs_base;
+    const drift = baseline.drift;
+    const baselineTone = {
+      equal: "green", ahead: "yellow", behind: "red", diverged: "red", differs: "red",
+    }[versus.relation] || "grey";
+    const mainTone = (comparison) => ({
+      equal: "green", ahead: "green", behind: "yellow", diverged: "yellow",
+    }[comparison.relation]) || "grey";
+    const mainUnknown = against.relation === "absent";
+    const tones = {
+      checkout: baselineTone,
+      main: mainUnknown ? "red" : mainTone(against),
+      baseline: mainTone(drift),
+    };
+    const place = {
+      equal: "equal", ahead: "right", behind: "left", diverged: "off", differs: "off",
+    }[versus.relation] || "unplaced";
+    // The same facts in words, decided from the tones above so that the words,
+    // the colours and the search can never disagree.  A cached basis is named.
+    const counted = (comparison, tone, subject) => {
+      const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
+      return (tone === "grey"
+        ? `${subject} unknown against main`
+        : `${subject} ${comparison.behind} behind main`) + named;
+    };
+    const words = [
+      {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
+        grey: "Baseline unknown"}[baselineTone],
+      mainUnknown ? "Main unknown" : counted(against, tones.main, "Checkout"),
+      counted(drift, tones.baseline, "Baseline"),
+    ];
+    return {
+      tones,
+      words,
+      place,
+      forked: place === "right" && drift.relation === "behind",
+      added: place === "right" ? versus.ahead : null,
+      behind: against.behind > 0 ? against.behind : null,
+      link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
+      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green",
+    };
+  }
+
+  function baselineLineHtml(baseline) {
+    const model = baselineLineModel(baseline);
+    if (model === null) return "";
+    const point = (name, tone, extra, inner) =>
+      `<span class="baseline-point" data-point="${name}" data-tone="${tone}"${extra}>${inner}</span>`;
+    const link = (name, tone, extra) =>
+      `<span class="baseline-link" data-link="${name}" data-tone="${tone}"${extra}></span>`;
+    // The fork runs corner to corner of its box as an anti-aliased stroke.
+    const forkLink = (tone) =>
+      `<span class="baseline-link" data-link="fork" data-tone="${tone}">` +
+      '<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' +
+      '<line x1="0" y1="100" x2="100" y2="0" vector-effect="non-scaling-stroke"/></svg></span>';
+    const form = model.place === "equal" ? "ring"
+      : model.place === "off" || model.place === "unplaced" ? "dotted" : "solid";
+    const words = text(model.words.join(", "));
+    return `<span class="card-baseline" data-place="${model.place}" role="img" ` +
+      `aria-label="${words}" title="${words}">` +
+      (model.forked || (model.place !== "left" && model.place !== "right")
+        ? "" : link("checkout", model.tones.checkout, "")) +
+      link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
+      (model.forked ? forkLink(model.tones.checkout) : "") +
+      point("B", model.tones.baseline, "", "") +
+      point("C", model.tones.checkout,
+        ` data-form="${form}"${model.forked ? " data-fork" : ""}`,
+        model.check ? '<span class="baseline-check">&#10003;</span>' : "") +
+      (model.added === null ? "" : `<span class="baseline-added" data-tone="${model.tones.checkout}">+${model.added}</span>`) +
+      point("M", model.tones.main, "", "") +
+      (model.behind === null ? "" : `<span class="baseline-behind">${model.behind}</span>`) +
+      "</span>";
+  }
+
   // The attention items that name each work item.  An item awaiting its merge
-  // is left out: the Code Status of its card already says so.
+  // is left out: the Code Status of its card already says so.  A moved base is
+  // left out too: the baseline line of the card draws it.
   function cardAttentionMap() {
     const items = new Map();
     const document = servedCheckoutsDocument();
     if (document === null) return items;
     document.attention.forEach((item) => {
-      if (item.class === "awaiting_merge") return;
+      if (item.class === "awaiting_merge" || item.code === "base_moved") return;
       item.packages.forEach((path) => {
         if (!items.has(path)) items.set(path, []);
         items.get(path).push(item);
@@ -1023,7 +1122,17 @@
   function cardFactsHtml(path) {
     const status = cardCodeStatus.get(path);
     return (status === undefined ? "" : codeStatusPillHtml(status)) +
-      (cardAttention.get(path) || []).map(attentionBadgeHtml).join("");
+      (cardAttention.get(path) || []).map(attentionBadgeHtml).join("") +
+      baselineLineHtml(cardBaseline.get(path));
+  }
+
+  // The one search text of a card: its work item's fields, its Code Status and
+  // the words of its baseline line.  Both render paths read it from here.
+  function cardSearchText(entry) {
+    const model = baselineLineModel(cardBaseline.get(entry.package_path));
+    return searchText(entry, [
+      cardCodeStatus.get(entry.package_path)?.text, ...(model === null ? [] : model.words),
+    ].filter((value) => value !== null && value !== undefined).join(" "));
   }
 
   function searchText(entry, line) {
@@ -1048,13 +1157,12 @@
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
-    const codeStatus = cardCodeStatus.get(entry.package_path);
     const facts = cardFactsHtml(entry.package_path);
     cardFactsMarkup.set(entry.package_path, facts);
     return `<button class="card${selected ? " selected" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
-      `${idAttribute} data-search="${text(searchText(entry, codeStatus?.text))}">` +
+      `${idAttribute} data-search="${text(cardSearchText(entry))}">` +
       `<span class="card-title">${text(titleOf(entry))}</span>` +
       `<span class="card-filepath" title="${text(entry.package_path)}" ` +
       `aria-label="${text(`Filepath: ${entry.package_path}`)}">${text(folderNameOf(entry.package_path))}</span>` +
@@ -1261,6 +1369,7 @@
     // catalog change and the checkouts outcome never disagree about them.
     renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
     cardCodeStatus = codeStatusLineMap();
+    cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
     cardFactsMarkup = new Map();
     // Keyed by path so cards sharing a package identity keep their own relationships.
@@ -1450,6 +1559,10 @@
     }
     next.forEach((tag, index) => {
       const shown = current[index];
+      if (tag.classList.contains("card-baseline")) {
+        if (shown.outerHTML !== tag.outerHTML) shown.replaceWith(tag);
+        return;
+      }
       [...tag.attributes].forEach((attribute) => {
         if (shown.getAttribute(attribute.name) !== attribute.value) {
           shown.setAttribute(attribute.name, attribute.value);
@@ -1467,6 +1580,7 @@
   // path holds is simply absent.  The work item panel follows the same outcome.
   function updateCardCodeStatus() {
     cardCodeStatus = codeStatusLineMap();
+    cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
     let changed = false;
     board.querySelectorAll(".card[data-package-path]").forEach((card) => {
@@ -1479,7 +1593,7 @@
       }
       const entry = renderedEntries.get(path);
       if (entry) {
-        const search = searchText(entry, cardCodeStatus.get(path)?.text);
+        const search = cardSearchText(entry);
         if (card.dataset.search !== search) {
           card.dataset.search = search;
           changed = true;
@@ -1677,6 +1791,28 @@
     return null;
   }
 
+  // The legend of the baseline line, one entry per convention the strip uses.
+  const BASELINE_LEGEND = [
+    ["B", "the Baseline"],
+    ["C", "the commit checked out in the target"],
+    ["M", "the remote main head"],
+    ["ring", "the checkout is at the Baseline"],
+    ["fork", "the checkout has commits of its own (+N) beside a Baseline that has moved on"],
+    ["count by M", "commits the checkout is behind main"],
+  ];
+
+  // The baseline line of one work item as the card draws it, with its words
+  // and its legend; nothing when the checkout cannot be placed.
+  function panelBaselineLineHtml(item) {
+    const model = baselineLineModel(item.baseline);
+    if (model === null) return "";
+    const legend = BASELINE_LEGEND.map(([name, meaning]) =>
+      `<li><b>${text(name)}</b> ${text(meaning)}</li>`).join("");
+    return `${baselineLineHtml(item.baseline)}` +
+      `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>` +
+      `<ul class="panel-baseline-legend">${legend}</ul>`;
+  }
+
   // The checkout facts of one work item, read from the served document as the
   // Checkouts view reads them; nothing while no document can be shown.
   function panelCodeHtml(entry) {
@@ -1713,6 +1849,11 @@
     }
     rows.push(panelRowHtml(codeWords("text", "panelBaseline"),
       baselineWords(document, item), "panel-baseline"));
+    const lineHtml = panelBaselineLineHtml(item);
+    if (lineHtml !== "") {
+      rows.push(panelRowHtml(codeWords("text", "panelBaselineLine"), lineHtml,
+        "panel-baseline-line"));
+    }
     const elsewhere = item.code_status === null || item.code_status === undefined
       ? [] : item.code_status.checked_out_elsewhere;
     if (elsewhere.length) {

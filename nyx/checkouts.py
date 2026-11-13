@@ -3557,6 +3557,107 @@ def _clone_drift(
     return result
 
 
+def _checked_out_commit(clone: Mapping[str, Any], target: Mapping[str, Any]) -> str | None:
+    """The commit a package's target worktree has checked out, as the clone's listing
+    recorded it: the worktree the target names, else the main worktree. A missing or
+    unreadable worktree, or an unborn HEAD, gives ``None``."""
+    listed = clone.get("worktrees")
+    if not listed:
+        return None
+    wanted = target.get("worktree")
+    for item in listed:
+        if (item["path"] == wanted) if wanted is not None else item["main"]:
+            if item["status"] != "ok" or item["head"] is None:
+                return None
+            return item["head"]["sha"]
+    return None
+
+
+def _counted_or_unknown(outcome: _Outcome) -> dict[str, Any]:
+    """Read a ``rev-list --left-right --count`` outcome by its counts alone: any call
+    that failed, was cut, or printed anything else is ``unknown``, never ``differs``."""
+    fields = outcome.out.split()
+    if outcome.ok and len(fields) == 2 and all(f.isdigit() for f in fields):
+        ahead, behind = int(fields[0]), int(fields[1])
+        if ahead or behind:
+            relation = "diverged" if ahead and behind else "ahead" if ahead else "behind"
+            return _comparison(relation, ahead, behind, "cached")
+    return _comparison("unknown", basis="cached")
+
+
+def _clone_checkouts(
+    runner: _GitRunner,
+    context: _CloneContext | None,
+    base: _Base | None,
+    commits: Sequence[tuple[str | None, str]],
+    settings: _VerdictSettings,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Compare each checked-out commit C of one clone with its Baseline and with the
+    verdict base M, memoised on (C, Baseline) and (C, M), never on the clone.
+
+    Every count names the recorded commit, never ``HEAD``, so C and its counts come
+    from one moment. A Baseline absent from a complete clone's objects cannot be in
+    C's history, so it ``differs``; a failed or cut count is ``unknown``. The result
+    is keyed by ``("baseline", C, Baseline)`` and ``("base", C, M)``.
+    """
+    memo: dict[tuple[str, str, str], dict[str, Any]] = {}
+    complete = context is not None and not context.partial and not context.shallow
+    probed = sorted(
+        {baseline for commit, baseline in commits if commit is not None and commit != baseline}
+    )
+    present: dict[str, str] = (
+        _present_objects(runner, context, probed, overlay=settings.overlay, pinned=settings.pinned)
+        if context is not None and complete and probed
+        else {}
+    )
+
+    def against_baseline(commit: str, baseline: str) -> dict[str, Any]:
+        if commit == baseline:
+            return _comparison("equal", 0, 0)
+        if context is None or not complete:
+            return _comparison("unknown")
+        state = present.get(baseline)
+        if state == "missing":
+            return _comparison("differs")
+        if state != "present":
+            return _comparison("unknown")
+        return _counted_or_unknown(
+            runner.run(
+                [*settings.pinned, "rev-list", "--left-right", "--count", f"{commit}...{baseline}"],
+                path=context.cwd,
+                ceiling=context.ceiling,
+                overlay=settings.overlay,
+            )
+        )
+
+    def against_base(commit: str, current: _Base) -> dict[str, Any]:
+        if commit == current.sha:
+            return _comparison("equal", 0, 0, current.basis)
+        if context is None or not complete:
+            return _comparison("unknown", basis=current.basis)
+        overlay: dict[str, str | None] = dict(settings.overlay)
+        if current.alternate:
+            overlay["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = current.alternate
+        return _counted_comparison(
+            runner.run(
+                [*settings.pinned, "rev-list", "--left-right", "--count", f"{commit}...{current.sha}"],
+                path=context.cwd,
+                ceiling=context.ceiling,
+                overlay=overlay,
+            ),
+            current.basis,
+        )
+
+    for commit, baseline in commits:
+        if commit is None:
+            continue
+        if ("baseline", commit, baseline) not in memo:
+            memo[("baseline", commit, baseline)] = against_baseline(commit, baseline)
+        if base is not None and ("base", commit, base.sha) not in memo:
+            memo[("base", commit, base.sha)] = against_base(commit, base)
+    return memo
+
+
 def _assign_drift(
     runner: _GitRunner,
     repositories: list[dict[str, Any]],
@@ -3570,7 +3671,9 @@ def _assign_drift(
     clone or worktree target.
 
     One job per target clone memoizes by Baseline, so a Baseline shared by packages is
-    counted once; the results are written here, after the jobs, never by them.
+    counted once; the same job compares each package's checked-out commit with its
+    Baseline and the verdict base, memoized by commit pair. The results are written
+    here, after the jobs, never by them.
     """
     wanted: dict[str, list[str]] = {}
     for package in packages:
@@ -3590,6 +3693,22 @@ def _assign_drift(
         for repository in repositories
         for clone in repository["clones"]
     }
+    checked_out: dict[int, str | None] = {}
+    commits: dict[str, list[tuple[str | None, str]]] = {}
+    for position, package in enumerate(packages):
+        baseline = package["baseline"]
+        if not (
+            baseline["status"] == "declared"
+            and not package["finished"]
+            and package["target"]["status"] in ("clone", "worktree")
+        ):
+            continue
+        path = package["target"]["clone"]
+        commit = _checked_out_commit(owners[path][0], package["target"])
+        checked_out[position] = commit
+        pair = (commit, baseline["sha"])
+        if pair not in commits.setdefault(path, []):
+            commits[path].append(pair)
     jobs = []
     for path, shas in wanted.items():
         clone, repository = owners[path]
@@ -3601,20 +3720,48 @@ def _assign_drift(
                 decided.base if decided is not None else None,
                 shas,
                 _siblings(clone, repository["clones"], contexts),
+                commits.get(path, []),
             )
         )
 
-    def decide(job: Any) -> tuple[str, dict[str, dict[str, Any]]]:
-        path, context, base, shas, siblings = job
-        return path, _clone_drift(runner, context, base, shas, siblings, settings)
+    def decide(job: Any) -> tuple[str, dict[str, dict[str, Any]], dict[Any, dict[str, Any]]]:
+        path, context, base, shas, siblings, pairs = job
+        return (
+            path,
+            _clone_drift(runner, context, base, shas, siblings, settings),
+            _clone_checkouts(runner, context, base, pairs, settings),
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
-        decided_drift = dict(pool.map(decide, jobs))
-    for package in packages:
+        decided_jobs = list(pool.map(decide, jobs))
+    decided_drift = {path: drift for path, drift, _ in decided_jobs}
+    decided_checkouts = {path: found for path, _, found in decided_jobs}
+    bases = {job[0]: job[2] for job in jobs}
+    for position, package in enumerate(packages):
         baseline = package["baseline"]
         found = decided_drift.get(package["target"]["clone"], {}).get(baseline["sha"])
-        if found is not None and baseline["status"] == "declared" and not package["finished"]:
-            baseline["drift"] = dict(found)
+        if found is None or position not in checked_out:
+            continue
+        baseline["drift"] = dict(found)
+        path = package["target"]["clone"]
+        commit = checked_out[position]
+        base = bases[path]
+        memo = decided_checkouts[path]
+        if commit is None:
+            relation_baseline = _comparison("unknown")
+            relation_base = (
+                _comparison("absent") if base is None else _comparison("unknown", basis=base.basis)
+            )
+        else:
+            relation_baseline = memo[("baseline", commit, baseline["sha"])]
+            relation_base = (
+                _comparison("absent") if base is None else memo[("base", commit, base.sha)]
+            )
+        baseline["checkout"] = {
+            "sha": commit,
+            "vs_baseline": dict(relation_baseline),
+            "vs_base": dict(relation_base),
+        }
 
 
 def _remote_only_base(repository: dict[str, Any]) -> str | None:
@@ -4462,6 +4609,7 @@ def _package_entries(
                     "status": head.baseline.status,
                     "sha": head.baseline.sha,
                     "drift": None,
+                    "checkout": None,
                 },
                 "code_status": None,
             }

@@ -11160,41 +11160,350 @@ def with_moved_base(document, path, count):
 
 
 def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_checkouts):
-    """A card carries one tag per attention item naming it, and the panel the sentence."""
+    """A moved base is drawn by the card's baseline line, not a tag; the panel keeps its sentence."""
     document = real_checkouts.document_zero
     path = "Repo/Drafts/alpha"
-    moved = with_moved_base(document, path, 3)
+    declared = with_baseline_facts(document, {path: (comparison("behind", 0, 3), EQUAL, EQUAL)})
+    moved = with_moved_base(declared, path, 3)
     assert [item["code"] for item in moved["attention"] if path in item["packages"]] == ["base_moved"]
     double = BrowserCheckouts(document)
     page = open_code_status_page(open_page, real_checkouts, double)
     card = code_status_card(page, path)
     assert card.locator(".card-attention").count() == 0
-    status = card.locator(".card-code-status").element_handle()
 
     double.serve(checkouts_envelope(moved))
     fire_checkouts_poll(page)
-    tag = card.locator(".card-attention")
-    playwright.expect(tag).to_have_text("base moved 3")
-    sentence = f"the base of {path} moved 3 commits past its Baseline"
-    assert tag.get_attribute("title") == sentence
-    assert tag.get_attribute("data-code") == "base_moved"
-    # The tag sits beside the Code Status, which was not replaced to add it.
-    assert card.locator(".card-facts > *").evaluate_all(
-        "tags => tags.map(tag => tag.className)") == ["card-code-status", "card-attention"]
-    assert page.locator(".card-attention").count() == 1
+    settle_frames(page)
+    assert card.locator(".card-baseline").count() == 1
+    assert page.locator('.card-attention[data-code="base_moved"]').count() == 0
+    assert "base moved" not in card.inner_text()
 
     card.click()
     rows = panel_code_rows(page)
+    sentence = f"the base of {path} moved 3 commits past its Baseline"
     assert rows["Needs attention"] == sentence
     assert "the base moved 3 commits past it" in rows["Baseline"]
 
-    # The next scan without the drift removes the tag and the panel row.
+    # The next scan without the drift removes the panel row; the line stays off the tag.
     double.serve(checkouts_envelope(document))
     fire_checkouts_poll(page)
-    playwright.expect(tag).to_have_count(0)
     assert "Needs attention" not in panel_code_rows(page)
+    assert page.locator('.card-attention[data-code="base_moved"]').count() == 0
     assert card.locator(".card-code-status").count() == 1
-    del status
+
+
+BASELINE_LINE_CARDS = (
+    "Repo/Drafts/alpha", "Repo/Drafts/beta", "Repo/Drafts/delta", "Repo/Drafts/epsilon",
+)
+BASELINE_LINE_SHA = "b" * 40
+BASELINE_LINE_TONE_COLORS = {
+    "green": "--state-done", "yellow": "--state-waiting", "red": "--state-failed",
+    "grey": "--control-border",
+}
+
+
+def comparison(relation, ahead=None, behind=None):
+    """One served comparison, shaped as the collector writes it."""
+    return {
+        "basis": "cached", "relation": relation, "ahead": ahead, "behind": behind,
+        "objects_from": None,
+    }
+
+
+def with_baseline_facts(document, states):
+    """One capture where each path in ``states`` has a declared Baseline and checkout.
+
+    ``states`` maps a package path to ``(drift, vs_baseline, vs_base)``, or to
+    ``None`` for a package served without a checkout.  The variant is served
+    unparsed: the line reads only the document, and the collector's own proof
+    of the document is its own.
+    """
+    def mutate(variant):
+        for package in variant["packages"]:
+            if package["package_path"] not in states:
+                continue
+            state = states[package["package_path"]]
+            if state is None:
+                package["baseline"]["drift"] = None
+                package["baseline"]["checkout"] = None
+                continue
+            drift, versus, against = state
+            package["baseline"]["status"] = "declared"
+            package["baseline"]["sha"] = BASELINE_LINE_SHA
+            package["baseline"]["drift"] = drift
+            package["baseline"]["checkout"] = {
+                "sha": "c" * 40, "vs_baseline": versus, "vs_base": against,
+            }
+    return checkout_raw_variant(document, mutate)
+
+
+def serve_baseline_states(page, double, states):
+    """Deliver one poll whose packages carry ``states`` and let the cards settle."""
+    double.serve(checkouts_envelope(with_baseline_facts(double.document, states)))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+
+
+BASELINE_LINE_READ = """card => {
+  const rect = (node) => {
+    const box = node.getBoundingClientRect();
+    return {x: box.x, y: box.y, width: box.width, height: box.height,
+            cx: box.x + box.width / 2, cy: box.y + box.height / 2, right: box.right};
+  };
+  const lines = card.querySelectorAll('.card-baseline');
+  const line = lines[0];
+  if (!line) return {count: 0};
+  const base = rect(line);
+  const point = (name) => {
+    const node = line.querySelector(`.baseline-point[data-point="${name}"]`);
+    const box = rect(node);
+    const style = getComputedStyle(node);
+    return {
+      tone: node.dataset.tone, form: node.dataset.form || null, fork: 'fork' in node.dataset,
+      check: node.querySelector('.baseline-check') !== null,
+      cx: box.cx - base.x, cy: box.cy - base.y, width: box.width, height: box.height,
+      right: box.right - base.x, background: style.backgroundColor,
+      color: node.querySelector('.baseline-check')
+        ? getComputedStyle(node.querySelector('.baseline-check')).color : null,
+    };
+  };
+  const link = line.querySelector('.baseline-link[data-link="main"]');
+  const added = line.querySelector('.baseline-added');
+  const behind = line.querySelector('.baseline-behind');
+  return {
+    count: lines.length, surface: getComputedStyle(line).backgroundColor,
+    B: point('B'), C: point('C'), M: point('M'),
+    link: {tone: link.dataset.tone, line: link.dataset.line || null,
+           style: getComputedStyle(link).borderTopStyle},
+    fork: line.querySelector('.baseline-link[data-link="fork"]') !== null,
+    forkBox: (() => {
+      const node = line.querySelector('.baseline-link[data-link="fork"]');
+      if (!node) return null;
+      const box = rect(node);
+      return {left: box.x - base.x, bottom: box.y + box.height - base.y,
+              right: box.right - base.x, top: box.y - base.y};
+    })(),
+    added: added ? added.textContent : null,
+    behind: behind ? behind.textContent : null,
+    behindLeft: behind ? rect(behind).x - base.x : null,
+  };
+}"""
+
+
+def baseline_line(page, path):
+    """What one card's baseline line draws, by its markup and its rendered boxes."""
+    return code_status_card(page, path).evaluate(BASELINE_LINE_READ)
+
+
+def baseline_token_color(page, name):
+    """The computed colour of one theme token."""
+    return page.evaluate(
+        """name => {
+          const probe = document.createElement('span');
+          probe.style.color = `var(${name})`;
+          document.body.append(probe);
+          const color = getComputedStyle(probe).color;
+          probe.remove();
+          return color;
+        }""",
+        name,
+    )
+
+
+def baseline_line_cases(page, double, cases):
+    """Serve ``cases`` four at a time, one per card, and yield each case with its line."""
+    for start in range(0, len(cases), len(BASELINE_LINE_CARDS)):
+        chunk = cases[start:start + len(BASELINE_LINE_CARDS)]
+        padded = chunk + [chunk[0]] * (len(BASELINE_LINE_CARDS) - len(chunk))
+        serve_baseline_states(
+            page, double, {path: case[0] for path, case in zip(BASELINE_LINE_CARDS, padded)})
+        for path, case in zip(BASELINE_LINE_CARDS, chunk):
+            yield case, baseline_line(page, path)
+
+
+def baseline_line_page(open_page, real_checkouts):
+    double = BrowserCheckouts(real_checkouts.document_zero)
+    return open_code_status_page(open_page, real_checkouts, double), double
+
+
+EQUAL = comparison("equal", 0, 0)
+BASELINE_VS_MAIN_CASES = [
+    ("equal", EQUAL, "green"),
+    ("ahead", comparison("ahead", 2, 0), "green"),
+    ("behind 3", comparison("behind", 0, 3), "yellow"),
+    ("behind 58", comparison("behind", 0, 58), "yellow"),
+    ("diverged", comparison("diverged", 1, 4), "yellow"),
+    ("differs", comparison("differs"), "grey"),
+    ("unknown", comparison("unknown"), "grey"),
+]
+
+
+def test_baseline_line_tones_follow_the_one_rule(
+    open_page, real_checkouts
+):
+    """Each fact's tone is the rule's result: no count makes red, and unknown is grey."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    versus_cases = [
+        ((EQUAL, comparison(relation, ahead, behind), EQUAL), tone)
+        for relation, ahead, behind, tone in [
+            ("equal", 0, 0, "green"), ("ahead", 5, 0, "yellow"),
+            ("behind", 0, 2, "red"), ("diverged", 1, 2, "red"),
+            ("differs", None, None, "red"), ("unknown", None, None, "grey"),
+        ]
+    ]
+    for (state, tone), line in baseline_line_cases(page, double, versus_cases):
+        assert line["count"] == 1
+        assert line["C"]["tone"] == tone, (state[1]["relation"], line["C"])
+        assert (line["C"]["check"]) is (tone == "green")
+    against_cases = [((EQUAL, EQUAL, against), tone) for _, against, tone in BASELINE_VS_MAIN_CASES]
+    for (state, tone), line in baseline_line_cases(page, double, against_cases):
+        assert line["M"]["tone"] == tone, (state[2], line["M"])
+        assert line["link"]["tone"] == tone and line["link"]["line"] is None
+    drift_cases = [((drift, EQUAL, EQUAL), tone) for _, drift, tone in BASELINE_VS_MAIN_CASES]
+    for (state, tone), line in baseline_line_cases(page, double, drift_cases):
+        assert line["B"]["tone"] == tone, (state[0], line["B"])
+    # The same tone in the 3-behind and 58-behind cases: no count sets a colour.
+    assert BASELINE_VS_MAIN_CASES[2][2] == BASELINE_VS_MAIN_CASES[3][2] == "yellow"
+    # Main unknown is the one red M, and the line to it is dashed grey.
+    (_, line), = baseline_line_cases(
+        page, double, [((comparison("absent"), EQUAL, comparison("absent")), "red")])
+    assert line["M"]["tone"] == "red"
+    assert line["link"] == {"tone": "grey", "line": "dashed", "style": "dashed"}
+    assert line["C"]["tone"] == "green" and not line["C"]["check"]
+    # One marker per tone is drawn in its token's computed colour.
+    for tone, token in BASELINE_LINE_TONE_COLORS.items():
+        expected = baseline_token_color(page, token)
+        relation = {"green": EQUAL, "yellow": comparison("behind", 0, 3),
+                    "red": comparison("absent"), "grey": comparison("unknown")}[tone]
+        (_, line), = baseline_line_cases(page, double, [((EQUAL, EQUAL, relation), tone)])
+        assert line["M"]["tone"] == tone
+        assert line["M"]["background"] == expected, (tone, line["M"])
+
+
+def test_baseline_line_markers_place_the_checkout_by_order_alone(
+    open_page, real_checkouts
+):
+    """Ring, plus count, fork, side, dotted form and the count beside M, never a distance."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    behind = comparison("behind", 0, 3)
+    cases = [
+        ((EQUAL, EQUAL, EQUAL), "equal"),
+        ((behind, comparison("ahead", 5, 0), EQUAL), "forked"),
+        ((EQUAL, comparison("ahead", 5, 0), EQUAL), "plain"),
+        ((EQUAL, comparison("behind", 0, 2), EQUAL), "left"),
+        ((EQUAL, comparison("diverged", 1, 2), EQUAL), "diverged"),
+        ((EQUAL, comparison("differs"), EQUAL), "differs"),
+        ((EQUAL, comparison("unknown"), EQUAL), "unknown"),
+        ((EQUAL, EQUAL, behind), "behind3"),
+        ((EQUAL, EQUAL, comparison("behind", 0, 58)), "behind58"),
+    ]
+    lines = {tag: line for (_, tag), line in baseline_line_cases(page, double, cases)}
+    assert lines["equal"]["C"]["form"] == "ring"
+    assert abs(lines["equal"]["C"]["cx"] - lines["equal"]["B"]["cx"]) < 1
+    assert lines["equal"]["added"] is None and lines["equal"]["C"]["check"] is True
+    for tag in ("forked", "plain"):
+        assert lines[tag]["added"] == "+5"
+        assert lines[tag]["C"]["cx"] > lines[tag]["B"]["cx"] + 4
+        assert lines[tag]["C"]["check"] is False
+    assert lines["forked"]["fork"] and lines["forked"]["C"]["fork"]
+    assert lines["forked"]["C"]["cy"] < lines["forked"]["B"]["cy"] - 3
+    # The fork line runs from the centre of B to the centre of C.
+    box, point_b, point_c = lines["forked"]["forkBox"], lines["forked"]["B"], lines["forked"]["C"]
+    assert abs(box["left"] - point_b["cx"]) < 1 and abs(box["bottom"] - point_b["cy"]) < 1
+    assert abs(box["right"] - point_c["cx"]) < 1 and abs(box["top"] - point_c["cy"]) < 1
+    assert not lines["plain"]["fork"] and not lines["plain"]["C"]["fork"]
+    assert abs(lines["plain"]["C"]["cy"] - lines["plain"]["B"]["cy"]) < 1
+    assert lines["left"]["C"]["cx"] < lines["left"]["B"]["cx"] - 4
+    assert lines["left"]["added"] is None
+    for tag in ("diverged", "differs", "unknown"):
+        assert lines[tag]["C"]["form"] == "dotted"
+        assert lines[tag]["C"]["cy"] < lines[tag]["B"]["cy"] - 3
+    assert lines["behind3"]["behind"] == "3" and lines["behind58"]["behind"] == "58"
+    for tag in ("behind3", "behind58"):
+        assert lines[tag]["behindLeft"] >= lines[tag]["M"]["right"] - 1
+    assert lines["equal"]["behind"] is None
+    for name in ("B", "C", "M"):
+        three, fifty_eight = lines["behind3"][name], lines["behind58"][name]
+        for key in ("cx", "cy", "width", "height"):
+            assert three[key] == pytest.approx(fifty_eight[key], abs=0.5), (name, key)
+    # The check mark needs three green tones.
+    assert lines["equal"]["C"]["check"] and lines["equal"]["M"]["tone"] == "green"
+    for tag in ("behind3", "forked", "left", "diverged", "unknown"):
+        assert lines[tag]["C"]["check"] is False
+
+
+def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
+    open_page, real_checkouts
+):
+    """C and M green with B yellow is not all green, so no check mark is drawn."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    cases = [((comparison("behind", 0, 3), EQUAL, EQUAL), "yellow")]
+    (_, line), = baseline_line_cases(page, double, cases)
+    assert [line[name]["tone"] for name in "BCM"] == ["yellow", "green", "green"]
+    assert line["C"]["check"] is False
+
+
+def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_checkout(
+    open_page, real_checkouts
+):
+    """One line per card with a checkout, grey when all unknown, none when none is served."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    unknown = comparison("unknown")
+    gamma = "Repo/Shipped/gamma"
+    assert page.locator(".card-baseline").count() == 0
+    serve_baseline_states(page, double, {
+        BASELINE_LINE_CARDS[0]: (unknown, unknown, unknown),
+        BASELINE_LINE_CARDS[1]: (EQUAL, EQUAL, EQUAL),
+        BASELINE_LINE_CARDS[2]: None,
+    })
+    line = baseline_line(page, BASELINE_LINE_CARDS[0])
+    assert line["count"] == 1
+    assert [line[name]["tone"] for name in "BCM"] == ["grey"] * 3
+    assert line["C"]["check"] is False
+    assert baseline_line(page, BASELINE_LINE_CARDS[1])["C"]["check"] is True
+    for path in (BASELINE_LINE_CARDS[2], BASELINE_LINE_CARDS[3], gamma):
+        assert baseline_line(page, path)["count"] == 0, path
+    # Several polls changing the facts in place still leave one line per card.
+    for state in [(EQUAL, comparison("ahead", 5, 0), comparison("behind", 0, 3)),
+                  (comparison("absent"), EQUAL, comparison("absent")), (EQUAL, EQUAL, EQUAL)]:
+        serve_baseline_states(page, double, {path: state for path in BASELINE_LINE_CARDS})
+        assert [baseline_line(page, path)["count"] for path in BASELINE_LINE_CARDS] == [1] * 4
+        assert baseline_line(page, gamma)["count"] == 0
+    assert page.locator(".card-baseline").count() == 4
+    # A poll back to a null checkout removes the line; a failed read hides the rest.
+    serve_baseline_states(page, double, {
+        BASELINE_LINE_CARDS[0]: None, BASELINE_LINE_CARDS[1]: (EQUAL, EQUAL, EQUAL)})
+    assert baseline_line(page, BASELINE_LINE_CARDS[0])["count"] == 0
+    assert page.locator(".card-baseline").count() == 1
+    double.fail("checkouts_failed")
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.locator(".card-baseline").count() == 0
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_baseline_line_is_readable_on_every_card_surface(
+    open_page, real_checkouts, theme
+):
+    """Red reads 4.5:1 on the line's surface on both cards; the check reads 3:1 on its green."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    page.get_by_label("Theme", exact=True).select_option(theme)
+    teal, neutral = BASELINE_LINE_CARDS[0], BASELINE_LINE_CARDS[1]
+    assert code_status_card(page, teal).evaluate(
+        "card => getComputedStyle(card).backgroundColor") == NO_INCOMING_CARD
+    serve_baseline_states(page, double, {
+        path: (comparison("absent"), EQUAL, comparison("absent")) for path in (teal, neutral)})
+    for path in (teal, neutral):
+        line = baseline_line(page, path)
+        assert line["M"]["tone"] == "red"
+        assert contrast_ratio(line["M"]["background"], line["surface"]) >= 4.5, (theme, path, line)
+    serve_baseline_states(page, double, {path: (EQUAL, EQUAL, EQUAL) for path in (teal, neutral)})
+    for path in (teal, neutral):
+        line = baseline_line(page, path)
+        assert line["C"]["check"]
+        assert contrast_ratio(line["C"]["color"], line["C"]["background"]) >= 3, (theme, line)
+        expected = "rgb(255, 255, 255)" if theme == "light" else "rgb(17, 24, 33)"
+        assert line["C"]["color"] == expected
 
 
 def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
@@ -11278,3 +11587,131 @@ def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
     playwright.expect(quiet_group).to_have_count(1)
     assert quiet_items.count() == 0
     assert "Repo/Shipped/gamma" in quiet_group.locator(".checkouts-package").inner_text()
+
+
+def live(relation, ahead=None, behind=None):
+    """A comparison counted against a live remote check."""
+    return {**comparison(relation, ahead, behind), "basis": "live"}
+
+
+def baseline_line_words(page, path):
+    """The accessible name and tooltip of one card's baseline line."""
+    return code_status_card(page, path).locator(".card-baseline").evaluate(
+        "line => ({name: line.getAttribute('aria-label'), title: line.title, "
+        "role: line.getAttribute('role'), hidden: line.hasAttribute('aria-hidden')})")
+
+
+def baseline_line_words_cases():
+    """(drift, vs_baseline, vs_base) with the phrases each must give."""
+    equal = live("equal", 0, 0)
+    return [
+        ((equal, equal, equal),
+         "Baseline synced, Checkout 0 behind main, Baseline 0 behind main"),
+        ((live("behind", 0, 3), live("ahead", 2, 0), live("behind", 0, 3)),
+         "Baseline not synced, Checkout 3 behind main, Baseline 3 behind main"),
+        ((live("behind", 0, 58), live("behind", 0, 2), live("behind", 0, 58)),
+         "Baseline not synced, Checkout 58 behind main, Baseline 58 behind main"),
+        ((equal, live("diverged", 1, 2), live("diverged", 1, 4)),
+         "Baseline not synced, Checkout 4 behind main, Baseline 0 behind main"),
+        ((live("ahead", 1, 0), live("differs"), live("differs")),
+         "Baseline not synced, Checkout unknown against main, Baseline 0 behind main"),
+        ((live("unknown"), live("unknown"), live("unknown")),
+         "Baseline unknown, Checkout unknown against main, Baseline unknown against main"),
+        ((live("absent"), equal, live("absent")),
+         "Baseline synced, Main unknown, Baseline unknown against main"),
+        ((comparison("behind", 0, 3), equal, equal),
+         "Baseline synced, Checkout 0 behind main, Baseline 3 behind main (cached)"),
+        ((equal, equal, comparison("behind", 0, 3)),
+         "Baseline synced, Checkout 3 behind main (cached), Baseline 0 behind main"),
+    ]
+
+
+def test_baseline_line_words_state_every_fact_in_the_approved_phrases(
+    open_page, real_checkouts
+):
+    """The line's name and tooltip are the same words, built from the tone rule's facts."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    cases = baseline_line_words_cases()
+    for start in range(0, len(cases), len(BASELINE_LINE_CARDS)):
+        chunk = cases[start:start + len(BASELINE_LINE_CARDS)]
+        padded = chunk + [chunk[0]] * (len(BASELINE_LINE_CARDS) - len(chunk))
+        serve_baseline_states(
+            page, double, {path: case[0] for path, case in zip(BASELINE_LINE_CARDS, padded)})
+        for path, (_, expected) in zip(BASELINE_LINE_CARDS, chunk):
+            shown = baseline_line_words(page, path)
+            assert shown == {"name": expected, "title": expected, "role": "img",
+                             "hidden": False}, shown
+
+
+def test_baseline_line_words_search_follows_the_facts_after_a_poll(open_page, real_checkouts):
+    """A search for the words finds the cards stating them, before and after a refresh."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta = BASELINE_LINE_CARDS[:3]
+    equal = live("equal", 0, 0)
+
+    def against(count):
+        return (equal, equal, live("behind", 0, count))
+
+    serve_baseline_states(page, double, {
+        alpha: against(3), beta: against(58), delta: against(3)})
+    query = "Checkout 3 behind main"
+    assert sorted(visible_card_paths(page, query)) == [alpha, delta]
+    assert sorted(visible_card_paths(page, "baseline synced")) == [alpha, beta, delta]
+    serve_baseline_states(page, double, {
+        alpha: against(3), beta: against(3), delta: against(4)})
+    assert sorted(visible_card_paths(page, query)) == [alpha, beta]
+    # The refreshed search text is the first render's: a reload of the same facts agrees.
+    page.fill("#filter", "")
+    assert page.locator(".card[hidden]").count() == 0
+
+
+def test_baseline_line_words_search_survives_a_full_render(open_page, real_checkouts):
+    """A card drawn afresh searches by the same words an in-place refresh gives it."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta = BASELINE_LINE_CARDS[:3]
+    equal = live("equal", 0, 0)
+    serve_baseline_states(page, double, {
+        alpha: (equal, equal, live("behind", 0, 3)), beta: (equal, equal, live("behind", 0, 58)),
+        delta: (equal, equal, live("behind", 0, 3))})
+    # Unchecking a display preference rebuilds every card through the first-render path.
+    page.get_by_label("Hide terminal rows", exact=True).check()
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    settle_frames(page)
+    assert sorted(visible_card_paths(page, "Checkout 3 behind main")) == [alpha, delta]
+
+
+def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real_checkouts):
+    """The panel row repeats the card's phrases, names every convention and follows a poll."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, gamma = "Repo/Drafts/alpha", "Repo/Shipped/gamma"
+    equal = live("equal", 0, 0)
+    serve_baseline_states(page, double, {
+        alpha: (live("behind", 0, 58), live("ahead", 5, 0), live("behind", 0, 3)),
+        gamma: None,
+    })
+    code_status_card(page, alpha).click()
+    row = page.locator("#work-item-panel-body .panel-baseline-line")
+    playwright.expect(row).to_have_count(1)
+    card_words = baseline_line_words(page, alpha)["name"]
+    assert card_words == (
+        "Baseline not synced, Checkout 3 behind main, Baseline 58 behind main")
+    shown = row.inner_text()
+    assert card_words in shown
+    legend = row.locator(".panel-baseline-legend li").all_inner_texts()
+    assert [entry.split(" ")[0] for entry in legend] == ["B", "C", "M", "ring", "fork", "count"]
+    for expected in ("Baseline", "checked out", "main head", "ring", "fork", "+N", "count by M"):
+        assert expected in " ".join(legend)
+    assert row.locator(".card-baseline").count() == 1
+    assert row.locator(".baseline-added").inner_text() == "+5"
+
+    # A poll that changes the facts rewrites the row.
+    serve_baseline_states(page, double, {alpha: (equal, equal, equal), gamma: None})
+    playwright.expect(row.locator(".panel-baseline-words")).to_have_text(
+        "Baseline synced, Checkout 0 behind main, Baseline 0 behind main")
+    assert "Baseline synced" in row.inner_text()
+    assert "Checkout 0 behind main" in row.inner_text()
+
+    # A work item with no placeable checkout shows no such row.
+    code_status_card(page, gamma).click()
+    playwright.expect(page.locator("#work-item-panel-body .panel-code")).to_have_count(1)
+    assert page.locator("#work-item-panel-body .panel-baseline-line").count() == 0
