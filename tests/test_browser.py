@@ -11666,3 +11666,40 @@ def test_baseline_line_words_search_survives_a_full_render(open_page, real_check
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
     settle_frames(page)
     assert sorted(visible_card_paths(page, "Checkout 3 behind main")) == [alpha, delta]
+
+
+def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real_checkouts):
+    """The panel row repeats the card's phrases, names every convention and follows a poll."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, gamma = "Repo/Drafts/alpha", "Repo/Shipped/gamma"
+    equal = live("equal", 0, 0)
+    serve_baseline_states(page, double, {
+        alpha: (live("behind", 0, 58), live("ahead", 5, 0), live("behind", 0, 3)),
+        gamma: None,
+    })
+    code_status_card(page, alpha).click()
+    row = page.locator("#work-item-panel-body .panel-baseline-line")
+    playwright.expect(row).to_have_count(1)
+    card_words = baseline_line_words(page, alpha)["name"]
+    assert card_words == (
+        "Baseline not synced, Checkout 3 behind main, Baseline 58 behind main")
+    shown = row.inner_text()
+    assert card_words in shown
+    legend = row.locator(".panel-baseline-legend li").all_inner_texts()
+    assert [entry.split(" ")[0] for entry in legend] == ["B", "C", "M", "ring", "fork", "count"]
+    for expected in ("Baseline", "checked out", "main head", "ring", "fork", "+N", "count by M"):
+        assert expected in " ".join(legend)
+    assert row.locator(".card-baseline").count() == 1
+    assert row.locator(".baseline-added").inner_text() == "+5"
+
+    # A poll that changes the facts rewrites the row.
+    serve_baseline_states(page, double, {alpha: (equal, equal, equal), gamma: None})
+    playwright.expect(row.locator(".panel-baseline-words")).to_have_text(
+        "Baseline synced, Checkout 0 behind main, Baseline 0 behind main")
+    assert "Baseline synced" in row.inner_text()
+    assert "Checkout 0 behind main" in row.inner_text()
+
+    # A work item with no placeable checkout shows no such row.
+    code_status_card(page, gamma).click()
+    playwright.expect(page.locator("#work-item-panel-body .panel-code")).to_have_count(1)
+    assert page.locator("#work-item-panel-body .panel-baseline-line").count() == 0
