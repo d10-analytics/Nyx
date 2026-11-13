@@ -682,6 +682,54 @@ Neither comparison has an `objects_from`. Each count is one read-only
 call per distinct commit and Baseline, or commit and base, and is recomputed on every run
 and never saved.
 
+### Prerequisites of a work item
+
+Each package in `--json` carries `prerequisites`, the answer to whether the work
+items it names in `Completion Prerequisite:` rows are in main and in its checkout.
+`prerequisites` is null for a finished package and for a package whose target is
+not a clone or a worktree. Otherwise it is `{state, text, checkout_sha, items}`:
+`checkout_sha` is the commit C (see `checkout` above) and is null when it cannot
+be read, and `items` holds one entry per distinct prerequisite, ordered by its
+Package ID with the entries that name no Package ID last. Each entry has
+`target_package_id`, `merged_on_main` and `in_checkout`. C is read for every
+eligible package here, with or without a declared Baseline.
+
+The `state` is the worst definite problem among the items, and `text` is its
+wording. The five states, in the order they are decided:
+
+- `none`: `No prerequisites`, when the package has no prerequisite.
+- `not_in_main`: `Prerequisites not met in main`, when any prerequisite is not
+  merged on main.
+- `not_in_checkout`: `Prerequisites not met in checkout`, when every
+  prerequisite is merged on main or unknown and any merged one is known to be
+  missing from C.
+- `unknown`: `Prerequisites unknown`, when nothing is definitely wrong and any
+  fact is unknown.
+- `met`: `Prerequisites met`, when every prerequisite is merged on main and in C.
+
+- `merged_on_main` takes `merged`, `not_merged` or `unknown`: the prerequisite's
+  Code Status `merged` is `merged`; `in_progress`, `pr_open`, `awaiting_merge`,
+  `no_commits_yet` and `superseded` are `not_merged`; `unknown` is `unknown`, as is
+  a prerequisite with no usable branch (the default branch, no branch that applies,
+  or none declared) or a row that did not resolve to one package. A prerequisite
+  with no Code Status because its branch is deleted everywhere is `merged` when
+  the highest-numbered merged request into the repository's base names that branch,
+  and `unknown` otherwise.
+- `in_checkout` takes `yes`, `no` or `unknown`, and is `unknown` unless the
+  prerequisite is `merged` and C is known. Its evidence is every branch tip Code
+  Status counted for the prerequisite, or the head of the merged request. It is
+  `yes` when each tip is an ancestor of C, with one read-only `merge-base
+  --is-ancestor` call per tip and C. It is `no` when a tip is not in C and the
+  merge verdict came from ancestry, a pull request or a merged request. It is
+  `unknown` when the verdict came from a patch, squash or tree equivalence, when the
+  clone is shallow, partial or unreadable, when a call failed or ran out of time,
+  and when the prerequisite belongs to another repository.
+
+A call is made only for a merged prerequisite, and none is made for any other.
+The pill is recomputed on every run and never saved; when time runs short, merged
+prerequisites read unknown first and a prerequisite already known not merged
+still reads `not_merged`.
+
 ### Availability
 
 Every clone line starts, right after its path, with an availability element, and
@@ -1286,7 +1334,7 @@ already name its project and stage; hover for the whole filepath) and, as tags,
 a target folder that differs from its project, its Code Status, one tag for
 each **Needs attention** item that names it (except an item awaiting its merge,
 which the Code Status states, and a moved base, which the baseline line draws),
-and, when the checkout can be placed, a baseline line. The line is a small strip of three
+a prerequisites pill, and, when the checkout can be placed, a baseline line. The line is a small strip of three
 points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
 the remote main head. Colour carries the meaning and no count decides it. `C` takes its colour from the
 checkout against its Baseline alone: green when it is at the Baseline, yellow when it
@@ -1298,7 +1346,11 @@ the same way: green, yellow or grey, never red. With no base, main is unknown: `
 red and its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
 a dotted `C` one that has diverged from the Baseline, differs from it or cannot be
 placed against it, and a check
-mark in `C` a line whose `C`, `M` and `B` are all green. The base-moved item is not a
+mark in `C` a line whose `C`, `M` and `B` are all green and whose card's prerequisites
+pill is green or absent. The prerequisites pill is green for `No prerequisites` and
+`Prerequisites met`, red for `Prerequisites not met in main` and `Prerequisites not
+met in checkout`, and grey for `Prerequisites unknown`; a grey pill takes the check
+mark away. The base-moved item is not a
 tag; it still shows in the work item panel and in **Checkouts**.
 
 The **work item panel** on the left shows the selected card in full. A left or
@@ -1307,7 +1359,8 @@ and a right click never does. The panel lists the work item's stage, project,
 whole filepath, target folder, status, program, every reported field and its
 Package ID; then **Needs** and **Blocks**, each relationship a link that
 selects the card it names; then, under **Code**, what the last checkout scan
-says of the work item: its Code Status, the attention items that name it, its
+says of the work item: its Code Status, its prerequisites row (the pill and one line
+per prerequisite, named by its title, with its two facts in words), the attention items that name it, its
 target repo, branch, the branch's remote copy, merge verdict and pull requests,
 and its Baseline with how far the base has moved past it, then the baseline
 line itself with its words and a legend naming `B`, `C`, `M`, the ring, the fork
