@@ -13,11 +13,20 @@
   `python -m pytest tests/test_catalog.py -v`.
 - Full verification is the GitHub Actions workflow
   `.github/workflows/tests.yml`, run on every push and on manual dispatch.
-  Every push, to a branch or to a tag, runs the three package lanes and the
+  Every push to a branch or to a tag runs the three package lanes and the
   source-suite jobs `nyx-suite`, `nyx-windows-suite` and `nyx-macos-suite`,
-  each split into matrix shards; a push to `main` also runs the two desktop
-  lanes, and a manual dispatch runs those two desktop lanes only, from that
-  branch: `gh workflow run tests.yml --ref <branch>`. Reproduce one shard
+  each split into matrix shards; a manual dispatch runs the two desktop lanes
+  only, from that branch: `gh workflow run tests.yml --ref <branch>`. A push
+  to `main` runs all of them unless the `reuse-gate` job finds passing results
+  for the identical tree: it skips the package and suite lanes when a
+  successful push run on another ref tested the same tree, and skips the
+  desktop lanes when a successful dispatch run tested the same tree. Reuse is
+  exact-tree only (a different tree, however small the difference, runs the
+  lanes), and any API failure, missing token scope or unreadable response
+  runs the lanes. A reused `main` run shows the reused lanes as skipped and is
+  green on the matched run's evidence; its summary records the matched run.
+  A desktop dispatch at the branch's final HEAD is what lets the merge push
+  skip the desktop lanes. Reproduce one shard
   locally with `python -m pytest tests/ -v --nyx-shard=I/N` (`I` the 0-based
   shard index, `N` the shard count); without the option pytest runs every
   test. Hand-run the desktop lanes on
@@ -28,8 +37,7 @@
   `tests/test_desktop_artifact.py`, `tests/native_ui.py`,
   `tests/test_documented_install.py`, or `.github/workflows/tests.yml`. A
   manual run is CI evidence only when both desktop lanes ran and passed; a
-  run whose desktop lanes show as skipped proves nothing. Do not hand-run
-  `main`: its push already runs every lane.
+  run whose desktop lanes show as skipped proves nothing.
   Local runs are feedback, not CI evidence.
 - Some proofs run only on CI hosts or when CI sets
   `NYX_VERIFY_DOCUMENTED_INSTALL`, `NYX_VERIFY_DOCUMENTED_BUILD`, or
