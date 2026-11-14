@@ -159,6 +159,26 @@ def test_wheel_contains_every_module_and_frontend_asset():
     assert EXPECTED_ASSETS <= names
 
 
+def test_wheel_metadata_declares_the_mit_license():
+    wheel = _wheel_path()
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_names) == 1
+        metadata = archive.read(metadata_names[0]).decode("utf-8")
+    assert "License-Expression: MIT" in metadata.splitlines()
+
+
+def test_wheel_ships_the_license_text_in_dist_info():
+    wheel = _wheel_path()
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names), (
+        "the wheel does not carry the root LICENSE under dist-info/licenses/"
+    )
+
+
 @pytest.mark.parametrize(
     "sequence", _prohibited_sequences(), ids=lambda sequence: sequence.decode("ascii")
 )
