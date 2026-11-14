@@ -25,6 +25,7 @@ the outputs file last, so a ``true`` output is never left behind by a failure.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -153,7 +154,7 @@ def make_client(api_url: str, token: str | None, timeout: float = REQUEST_TIMEOU
             return json.loads(body.decode("utf-8"))
         except urllib.error.HTTPError as error:
             raise ExpectedFailure(f"GET {path} returned HTTP {error.code}") from error
-        except (OSError, ValueError, UnicodeDecodeError) as error:
+        except (OSError, ValueError, http.client.HTTPException) as error:
             raise ExpectedFailure(f"GET {path} failed: {type(error).__name__}: {error}") from error
 
     return get
