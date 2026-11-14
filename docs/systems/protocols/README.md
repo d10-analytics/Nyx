@@ -6,7 +6,7 @@ README is narrative only.
 ## Responsibilities
 
 - Typed validation of catalog and checkout documents.
-- The checkout document is schema 10, and its two whole-document fields are part
+- The checkout document is schema 11, and its two whole-document fields are part
   of the digest: `configuration_revision` is `null` or one lowercase
   64-character SHA-256 digest, and `folder_suggestions` holds entries of exactly
   `{path, package_count}` whose paths are absolute, strictly increasing in
@@ -38,6 +38,11 @@ README is narrative only.
   calls it after the join and `parse_checkouts` recomputes all three from the
   document's own facts and refuses any inequality, so no consumer needs its own
   rules for what needs attention.
+- `derive_prerequisites` is the single derivation of every prerequisites pill's
+  state, and `prerequisites_text` its wording. `checkouts` calls them after the
+  join and `parse_checkouts` recomputes them from the pill's own items, and
+  refuses a main fact its package's Code Status contradicts, so no consumer
+  needs its own rules for what a prerequisite means.
 - `code_status_text` is the single text of a package's Code Status.
   `checkouts` calls it when it builds the document and `parse_checkouts`
   recomputes it from the stored fields, so a document whose text disagrees with

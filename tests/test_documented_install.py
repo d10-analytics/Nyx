@@ -184,6 +184,22 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
+PREREQUISITES_PILL_MARKERS = {
+    "docs/running-nyx.md": (
+        "a prerequisites pill, and, when the checkout can be placed, a baseline line",
+        "whose card's prerequisites pill is green or absent",
+        "a grey pill takes the check mark away",
+        "its prerequisites row (the pill and one line per prerequisite",
+    ),
+    "docs/systems/checkouts/README.md": (
+        "Derives each unfinished package's prerequisites pill once",
+    ),
+    "docs/systems/board-web/README.md": (
+        "its prerequisites pill (the five wordings the document carries",
+        "a prerequisites row with the pill and one line per prerequisite",
+    ),
+}
+
 CHECKOUT_RETIRED_WORDING = (
     "A branch created at the default branch's head with no commit of its own is "
     "already part of the default branch, so it reads `merged · cleanup pending ...` "
@@ -840,6 +856,13 @@ def test_documents_publish_the_checkout_contract():
             assert marker in document, (name, marker)
 
 
+def test_documents_publish_the_prerequisites_pill_sentences_once():
+    for name, markers in PREREQUISITES_PILL_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert document.count(marker) == 1, (name, marker)
+
+
 def test_checkout_documentation_drops_the_cached_only_wording():
     document = re.sub(
         r"\s+", " ", (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
@@ -1419,12 +1442,14 @@ def test_checkout_system_readme_states_the_folder_rule_and_the_suggestion_rule()
 def test_protocols_readme_states_the_checkout_schema_and_its_two_fields():
     readme = _normalized("docs/systems/protocols/README.md")
     for marker in (
-        "The checkout document is schema 10, and its two whole-document fields are part of "
+        "The checkout document is schema 11, and its two whole-document fields are part of "
         "the digest",
         "`configuration_revision` is `null` or one lowercase 64-character SHA-256 digest",
         "`folder_suggestions` holds entries of exactly `{path, package_count}`",
         "strictly increasing in natural path order, never a configured folder",
         "the list is empty while the package scan is unavailable",
+        "`derive_prerequisites` is the single derivation of every prerequisites pill's state",
+        "`parse_checkouts` recomputes them from the pill's own items",
     ):
         assert marker in readme, marker
 

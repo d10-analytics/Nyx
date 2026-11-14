@@ -2171,7 +2171,7 @@ def test_subprocess_prints_the_package_list_of_the_configured_workspace(tmp_path
 
     assert completed.returncode == 0, completed.stderr
     document = models.parse_checkouts(completed.stdout)
-    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 10
+    assert document["schema_version"] == models.CHECKOUTS_SCHEMA_VERSION == 11
     assert document["package_scan"] == {"status": "complete", "finished_policy": "configured"}
     assert [
         (p["package_path"], p["finished"], p["package_id"], p["superseded"], p["branch"]["name"])
@@ -2507,6 +2507,61 @@ def test_checkout_guide_checkout_relations_match_the_code():
     assert _relations_named(versus) == set(models._COMPARISON_RELATIONS) - {"absent"}
     assert _relations_named(against) == set(models._COMPARISON_RELATIONS)
     assert "is null exactly when `drift` is" in paragraph
+
+
+def _prerequisites_subsection(guide: str) -> str:
+    return _normalised(_subsection(guide, "Prerequisites of a work item"))
+
+
+def _backticked(text: str) -> set[str]:
+    return set(re.findall(r"`([^`]+)`", text))
+
+
+def test_checkout_guide_prerequisites_states_and_words_match_the_code():
+    from nyx import models
+
+    body = _subsection(_guide(), "Prerequisites of a work item")
+    bullets = [
+        _normalised(bullet)
+        for bullet in _bullets(body)
+        if re.match(r"- `(none|not_in_main|not_in_checkout|unknown|met)`:", bullet)
+    ]
+    documented = [re.match(r"- `([a-z_]+)`: `([^`]+)`", bullet).groups() for bullet in bullets]
+
+    assert [state for state, _ in documented] == [
+        "none",
+        "not_in_main",
+        "not_in_checkout",
+        "unknown",
+        "met",
+    ]
+    assert {state for state, _ in documented} == set(models.PREREQUISITE_STATES)
+    assert all(words == models.prerequisites_text(state) for state, words in documented)
+
+
+def test_checkout_guide_prerequisites_facts_and_null_rule_match_the_code():
+    from nyx import models
+
+    body = _subsection(_guide(), "Prerequisites of a work item")
+    bullets = {
+        name: _normalised(bullet)
+        for bullet in _bullets(body)
+        for name in ("merged_on_main", "in_checkout")
+        if bullet.startswith(f"- `{name}`")
+    }
+    assert set(bullets) == {"merged_on_main", "in_checkout"}
+
+    def values(name: str) -> set[str]:
+        return _backticked(bullets[name].split(":", 1)[0]) - {name}
+
+    assert values("merged_on_main") == set(models.PREREQUISITE_MAIN_FACTS)
+    assert values("in_checkout") == set(models.PREREQUISITE_CHECKOUT_FACTS)
+    text = _prerequisites_subsection(_guide())
+    assert (
+        "`prerequisites` is null for a finished package and for a package whose target is "
+        "not a clone or a worktree" in text
+    )
+    assert "recomputed on every run and never saved" in text
 
 
 def _ranking_relations(guide: str) -> list[str]:

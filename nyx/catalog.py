@@ -792,6 +792,54 @@ def _scan_stage(
     return complete
 
 
+def _build_candidate_index(
+    records: Iterable[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    """Index scan records by every package ID they could answer to."""
+    index: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        for candidate in record["candidate_ids"]:
+            index.setdefault(candidate, []).append(record)
+    return index
+
+
+def _resolve_edge_target(
+    source: dict[str, object],
+    row: dict[str, object],
+    index: dict[str, list[dict[str, object]]],
+    identity_complete: bool,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Resolve one prerequisite row to its single target record.
+
+    Returns ``(target, None)`` when the row names one readable, identified
+    package other than the source.  Otherwise returns the unresolved reason; a
+    row naming the source itself returns ``(source, "self_edge")`` and every
+    other unresolved row returns ``(None, reason)``.
+    """
+    target_id = row["target_package_id"]
+    if not row.get("valid", False) or target_id is None:
+        return None, "invalid_prerequisite"
+    candidates = index.get(target_id, [])
+    if not candidates:
+        return None, (
+            "identity_coverage_incomplete" if not identity_complete else "missing_target"
+        )
+    if len(candidates) > 1:
+        return None, "duplicate_target"
+    target = candidates[0]
+    if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor"}:
+        return None, "target_unreadable"
+    if target.get("read_diagnostic") == "changed_during_read":
+        return None, "target_changed_during_read"
+    if not identity_complete:
+        return None, "identity_coverage_incomplete"
+    if target.get("package_id") != target_id or not target.get("relationship"):
+        return None, "target_invalid_identity"
+    if target is source:
+        return target, "self_edge"
+    return target, None
+
+
 def _edge(
     source: dict[str, object],
     row: dict[str, object],
@@ -821,30 +869,12 @@ def _edge(
             "resolved_state": "unknown",
             "reason": "invalid_prerequisite",
         }
-    if not row.get("valid", False) or target_id is None:
+    target, unresolved = _resolve_edge_target(source, row, index, identity_complete)
+    if target is None:
+        edge["reason"] = unresolved
         return edge
-    candidates = index.get(target_id, [])
-    if not candidates:
-        edge["reason"] = (
-            "identity_coverage_incomplete" if not identity_complete else "missing_target"
-        )
-        return edge
-    if len(candidates) > 1:
-        edge["reason"] = "duplicate_target"
-        return edge
-    target = candidates[0]
     target_relationship = target.get("relationship")
-    if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor"}:
-        edge["reason"] = "target_unreadable"
-        return edge
-    if target.get("read_diagnostic") == "changed_during_read":
-        edge["reason"] = "target_changed_during_read"
-        return edge
-    if not identity_complete:
-        edge["reason"] = "identity_coverage_incomplete"
-    elif target.get("package_id") != target_id or not target_relationship:
-        edge["reason"] = "target_invalid_identity"
-    elif target is source:
+    if unresolved == "self_edge":
         if kind == "completion":
             edge["observed_stage"] = target["stage"]
         else:
@@ -1171,10 +1201,7 @@ def _build_catalog(
     program_diagnostics = scan.program_diagnostics
     inventory_projects = scan.inventory_projects
     inventory_stages = scan.inventory_stages
-    index: dict[str, list[dict[str, object]]] = {}
-    for record in records:
-        for candidate in record["candidate_ids"]:
-            index.setdefault(candidate, []).append(record)
+    index = _build_candidate_index(records)
     identity_complete = not identity_diagnostics
 
     program_index = _program_index(program_descriptors)
@@ -1370,6 +1397,20 @@ class BaselineHead:
 
 
 @dataclass(frozen=True)
+class CompletionPrerequisiteHead:
+    """One ``Completion Prerequisite:`` row as the catalog resolves it.
+
+    ``target_path`` is the target's package path when the row resolves to one
+    package; otherwise it is ``None`` and ``reason`` is the catalog's
+    unresolved reason for the row.
+    """
+
+    target_package_id: str | None
+    target_path: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class PackageHead:
     """The header facts of one package that a checkout can be joined to."""
 
@@ -1380,6 +1421,7 @@ class PackageHead:
     target_repo: TargetRepoHead
     branch: BranchHead
     baseline: BaselineHead
+    completion_prerequisites: tuple[CompletionPrerequisiteHead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1438,6 +1480,33 @@ def finished_policy(
     return "configured" if _finished_stages(completed_stage_names) else "not_configured"
 
 
+def _completion_heads(
+    record: dict[str, object],
+    index: dict[str, list[dict[str, object]]],
+    identity_complete: bool,
+) -> tuple[CompletionPrerequisiteHead, ...]:
+    relationship = record["relationship"]
+    if not relationship:
+        return ()
+    heads = []
+    for row in relationship["prerequisites"]:
+        if row.get("kind") != "completion":
+            continue
+        target, reason = _resolve_edge_target(record, row, index, identity_complete)
+        heads.append(
+            CompletionPrerequisiteHead(
+                target_package_id=row["target_package_id"],
+                target_path=(
+                    str(target["package_path"])
+                    if reason is None and target is not None
+                    else None
+                ),
+                reason=reason,
+            )
+        )
+    return tuple(heads)
+
+
 def scan_package_heads(
     spec_root: Path,
     *,
@@ -1452,6 +1521,8 @@ def scan_package_heads(
     """
     finished_stages = _finished_stages(completed_stage_names)
     scan = _scan_specification_root(Path(spec_root))
+    index = _build_candidate_index(scan.records)
+    identity_complete = not scan.identity_diagnostics
     heads = []
     for record in sorted(scan.records, key=lambda item: str(item["package_path"])):
         relationship = record["relationship"]
@@ -1468,6 +1539,9 @@ def scan_package_heads(
                 target_repo=_target_repo_head(join["target_repo"]),
                 branch=_branch_head(join["branch"]),
                 baseline=_baseline_head(join["baseline"]),
+                completion_prerequisites=_completion_heads(
+                    record, index, identity_complete
+                ),
             )
         )
     return PackageHeads(

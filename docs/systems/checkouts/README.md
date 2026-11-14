@@ -84,6 +84,15 @@ README is narrative only.
   comparisons are null exactly when the drift is and are never saved. A package target
   that is missing or not a git checkout also records `within_folders`, true when
   its path lies in or under a configured checkout folder.
+- Derives each unfinished package's prerequisites pill once, for a clone or worktree
+  target, from the Code Status of the packages its `Completion Prerequisite:` rows
+  name and the checked-out commit C, read for every such package whether or not it
+  declares a Baseline. Each merged prerequisite takes one read-only `merge-base
+  --is-ancestor` check of its evidence tips against C, memoised per collection in
+  the containment step's per-clone job. A prerequisite merged through a pull
+  request is in C when its tip or the request's merge commit is. A saved
+  pull-request lookup keeps no merge commit. The pill is recomputed on every run,
+  never saved, and the parser recomputes it from the same facts.
 - Calls `derive_attention` after the join and stores the clone availability,
   each repository's free clones and the attention list it returns.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no

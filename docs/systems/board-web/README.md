@@ -23,12 +23,15 @@ README is narrative only.
   selection): the selected entry's declared and reported fields, its
   relationships as links that select the card they name, and its checkout
   facts from the served document (Code Status, attention items, target repo,
-  branch, remote copy, verdict, pull requests, Baseline drift and a row with the
+  branch, remote copy, verdict, pull requests, a prerequisites row with the pill and one
+  line per prerequisite, Baseline drift and a row with the
   baseline line and its legend), absent
   whenever the card's Code Status tag is hidden. The panel is written only when
   its markup changes, and whether it is open is a browser-local preference.
 - Reads the checkouts document those routes serve, and shows each card's
-  Code Status tag, one tag per attention item naming the card (all but an
+  Code Status tag, its prerequisites pill (the five wordings the document carries,
+  green, red or grey by state alone, and the check mark of the baseline line only
+  while the pill is green or absent), one tag per attention item naming the card (all but an
   awaiting merge, which the Code Status states, and a moved base, which the baseline
   line draws) and a baseline line of three points, the Baseline, the checkout
   and main: the text `nyx checkouts --json` gives and the line's words, searchable

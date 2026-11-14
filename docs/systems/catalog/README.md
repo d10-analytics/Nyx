@@ -10,7 +10,9 @@ README is narrative only.
 - Reports, from the same scan, the package heads `checkouts` reads (each
   package's `Target repo:`, optional `Branch:`, optional `Baseline:` as a
   declared, invalid or absent full commit ID, finished stage and
-  superseded flag), without adding them to the catalog document.
+  superseded flag, and each `Completion Prerequisite:` row's target ID,
+  target package path and the catalog's unresolved reason, resolved by the same
+  helper as the rendered edges), without adding them to the catalog document.
 
 ## Outside this boundary
 
