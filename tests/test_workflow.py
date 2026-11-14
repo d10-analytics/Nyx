@@ -6,8 +6,12 @@ extension establish: exact commands, installer extras, artifact inputs,
 required-native environment, interactive-session preflight, stage ordering,
 job time limits and non-zero exit propagation.  The trigger and the lane
 routing are pinned exactly too: the workflow triggers only on an unconfigured
-push and workflow_dispatch, every job triggers under exactly its lane
-condition, and no step carries a condition.  Checks read each step's
+push and workflow_dispatch, the reuse gate is the one job outside the lane map,
+every lane depends on only the gate and triggers under exactly its group's
+reuse-aware condition, and no step carries a condition.  A guard-property check
+evaluates those parsed conditions to prove that a successful branch push run or
+dispatch run ran every lane of its group, which is what lets a push to main
+reuse it, and lane text may not read the ref or event.  Checks read each step's
 effective lines (the stripped lines left after dropping blank lines and
 full-line comments) and match gating commands exactly, so a commented-out or
 failure-masked command does not satisfy them.  Each supported behavior is
@@ -27,9 +31,8 @@ from typing import Any, Callable
 import pytest
 import yaml
 
-WORKFLOW_PATH = (
-    Path(__file__).parents[1] / ".github" / "workflows" / "tests.yml"
-)
+REPO_ROOT = Path(__file__).parents[1]
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "tests.yml"
 
 # The established lane matrix.  Baseline jobs keep their latest labels; the
 # desktop lanes pin the explicit feasibility hosts.
@@ -93,18 +96,38 @@ DOCUMENTED_BUILD_ENV = "NYX_VERIFY_DOCUMENTED_BUILD"
 
 # The trigger mapping is exact: both events carry no configuration, so there is
 # no branch, path or tag filter and no dispatch input.  Pushes build the
-# package lanes; the native desktop lanes wait for main pushes and dispatched
-# runs.
+# package and suite lanes; the native desktop lanes wait for dispatched runs
+# and main pushes.  A push to main consults the reuse gate and skips a group
+# whose identical-tree results already passed; every lane's condition starts
+# with a status check so a skipped or failed gate still lets it run.
 TRIGGER_EVENTS = {"push": None, "workflow_dispatch": None}
-PACKAGE_LANE_CONDITION = "github.event_name == 'push'"
+GATE_JOB = "reuse-gate"
+PACKAGE_LANE_CONDITION = (
+    "!cancelled() && github.event_name == 'push' && "
+    "(github.ref != 'refs/heads/main' || "
+    "needs.reuse-gate.outputs.reuse_source != 'true')"
+)
 DESKTOP_LANE_CONDITION = (
-    "github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'"
+    "!cancelled() && (github.event_name == 'workflow_dispatch' || "
+    "(github.ref == 'refs/heads/main' && "
+    "needs.reuse-gate.outputs.reuse_desktop != 'true'))"
 )
 LANE_ROUTING_CONDITIONS = {
     **{name: PACKAGE_LANE_CONDITION for name in BASELINE_JOBS},
     **{name: PACKAGE_LANE_CONDITION for name in SUITE_JOBS},
     **{name: DESKTOP_LANE_CONDITION for name in DESKTOP_JOBS},
 }
+
+GATE_CONDITION = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+GATE_PERMISSIONS = {"contents": "read", "actions": "read"}
+GATE_SCRIPT = ".github/scripts/reuse_gate.py"
+GATE_COMMAND = f"python3 {GATE_SCRIPT}"
+GATE_OUTPUT_NAMES = ("reuse_source", "reuse_desktop")
+GATE_CHECKOUT = {
+    "uses": "actions/checkout@v4",
+    "with": {"sparse-checkout": ".github/scripts", "persist-credentials": False},
+}
+GATE_TOKEN_ENV = {"GITHUB_TOKEN": "${{ github.token }}"}
 
 LINUX_SERVICE_STEP = "Verify package and installed service"
 BASELINE_LIFECYCLE_STEP = "Verify package and installed lifecycle"
@@ -267,6 +290,7 @@ TIMEOUT_KEY = "timeout-minutes"
 TIMEOUT_MINIMUM_MINUTES = 1
 TIMEOUT_MAXIMUM_MINUTES = 60
 JOB_TIMEOUT_MINUTES = {
+    GATE_JOB: 5,
     "nyx": 10,
     "nyx-windows": 10,
     "nyx-macos": 10,
@@ -474,18 +498,21 @@ def check_workflow_trigger(workflow: dict[str, Any]) -> list[str]:
 
 
 def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
-    """Require every job to trigger under exactly its lane condition.
+    """Require every lane to depend on the gate and carry its group's condition.
 
-    A job outside the routing map has no lane; a mapped job must carry its
-    condition exactly (an absent ``if`` included in the rejection).  Routing
-    stays a job-level decision, so no step declares a condition.  Missing jobs
-    stay owned by ``check_job_matrix``.  Lanes are independent: a job may not
-    declare ``needs:``, because a dependency skips the lane precisely when its
-    own ``if`` would have fired.
+    A job outside the routing map has no lane unless it is the reuse gate,
+    which ``check_reuse_gate`` owns.  A mapped job must carry its condition
+    exactly (an absent ``if`` included in the rejection) and ``needs`` exactly
+    the gate.  Routing stays a job-level decision, so no step declares a
+    condition.  Missing jobs stay owned by ``check_job_matrix``.  Lanes stay
+    independent of each other: a lane that needs another lane is skipped
+    precisely when that lane's own ``if`` would have fired.
     """
 
     problems: list[str] = []
     for name, job in _jobs(workflow).items():
+        if name == GATE_JOB:
+            continue
         condition = LANE_ROUTING_CONDITIONS.get(name)
         if condition is None:
             problems.append(f"{name}: job is outside the lane routing map")
@@ -501,10 +528,314 @@ def check_lane_routing(workflow: dict[str, Any]) -> list[str]:
                     f"{name}: step {step.get('name') or step.get('uses')!r} "
                     f"declares if={step['if']!r}"
                 )
-        if isinstance(job, dict) and "needs" in job:
+        needs = job.get("needs") if isinstance(job, dict) else None
+        if needs != [GATE_JOB]:
             problems.append(
-                f"{name}: job declares needs={job['needs']!r}; lanes are independent"
+                f"{name}: job needs is {needs!r}, expected {[GATE_JOB]!r}; "
+                "lanes depend on the gate only, never on each other"
             )
+    return problems
+
+
+def check_reuse_gate(workflow: dict[str, Any]) -> list[str]:
+    """Pin the reuse gate's shape and keep it the only privileged job.
+
+    The gate is a main-push-only job on the plain hosted Ubuntu label with
+    read-only token scopes, no dependency, exactly two outputs read from its
+    run step, and exactly two steps: a credential-free sparse checkout of the
+    script directory and one run of that script.  No other job and no workflow
+    level key declares ``permissions``.
+    """
+
+    problems: list[str] = []
+    if "permissions" in workflow:
+        problems.append(f"workflow declares permissions={workflow['permissions']!r}")
+    for name, job in _jobs(workflow).items():
+        if name != GATE_JOB and isinstance(job, dict) and "permissions" in job:
+            problems.append(f"{name}: job declares permissions={job['permissions']!r}")
+    gate = _job(workflow, GATE_JOB)
+    if not isinstance(gate, dict):
+        return [*problems, f"{GATE_JOB}: job is missing"]
+    expected = {
+        "if": GATE_CONDITION,
+        "runs-on": "ubuntu-latest",
+        "permissions": GATE_PERMISSIONS,
+    }
+    for key, value in expected.items():
+        if gate.get(key) != value:
+            problems.append(f"{GATE_JOB}: {key} is {gate.get(key)!r}, expected {value!r}")
+    if "needs" in gate:
+        problems.append(f"{GATE_JOB}: job declares needs={gate['needs']!r}")
+    steps = gate.get("steps")
+    if not isinstance(steps, list) or len(steps) != 2 or not all(
+        isinstance(step, dict) for step in steps
+    ):
+        return [*problems, f"{GATE_JOB}: steps are not exactly a checkout and one run"]
+    checkout, run = steps
+    if checkout != GATE_CHECKOUT:
+        problems.append(f"{GATE_JOB}: checkout step is {checkout!r}, expected {GATE_CHECKOUT!r}")
+    if set(run) != {"id", "env", "run"} or not isinstance(run.get("id"), str) or not run["id"]:
+        problems.append(f"{GATE_JOB}: run step keys are {sorted(run)!r}, expected id, env, run")
+        return problems
+    if run["env"] != GATE_TOKEN_ENV:
+        problems.append(f"{GATE_JOB}: run step env is {run['env']!r}, expected {GATE_TOKEN_ENV!r}")
+    if _effective_lines(run) != [GATE_COMMAND]:
+        problems.append(
+            f"{GATE_JOB}: run step lines are {_effective_lines(run)!r}, expected {[GATE_COMMAND]!r}"
+        )
+    if not (REPO_ROOT / GATE_SCRIPT).is_file():
+        problems.append(f"{GATE_JOB}: {GATE_SCRIPT} does not exist")
+    outputs = {
+        name: f"${{{{ steps.{run['id']}.outputs.{name} }}}}" for name in GATE_OUTPUT_NAMES
+    }
+    if gate.get("outputs") != outputs:
+        problems.append(f"{GATE_JOB}: outputs are {gate.get('outputs')!r}, expected {outputs!r}")
+    return problems
+
+
+# --------------------------------------------------------------------------
+# Guard property: the reuse inference holds for the workflow's actual routing
+# --------------------------------------------------------------------------
+
+MAIN_REF = "refs/heads/main"
+GUARD_EVENTS = ("push", "workflow_dispatch")
+GUARD_REFS = (MAIN_REF, "refs/heads/feature", "refs/tags/v1")
+GATE_OUTPUT_PAIRS = tuple(
+    {"reuse_source": source, "reuse_desktop": desktop}
+    for source in ("true", "false")
+    for desktop in ("true", "false")
+)
+GATE_STATES = (
+    ("skipped", {}),
+    ("failure", {}),
+    *(("success", pair) for pair in GATE_OUTPUT_PAIRS),
+    ("success", {}),
+)
+LANE_GROUPS = {
+    **{name: "source" for name in (*BASELINE_JOBS, *SUITE_JOBS)},
+    **{name: "desktop" for name in DESKTOP_JOBS},
+}
+REUSE_EVIDENCE_RULE = (
+    "reuse evidence rule: a successful branch push run is taken as proof that "
+    "every package and suite lane ran, and a successful dispatch run as proof "
+    "that both desktop lanes ran, so a lane condition change must keep that true"
+)
+
+
+class GuardEvaluationError(ValueError):
+    """Raised for an expression element the guard evaluator does not model."""
+
+
+_GUARD_TOKEN = re.compile(
+    r"\s*(?:(&&|\|\||==|!=|!|\(|\))|'((?:[^']|'')*)'|([A-Za-z_][\w.\-]*))"
+)
+
+
+def _guard_tokens(text: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while text[position:].strip():
+        match = _GUARD_TOKEN.match(text, position)
+        if match is None:
+            raise GuardEvaluationError(f"unmodelled syntax at {text[position:]!r}")
+        operator, string, name = match.groups()
+        if operator is not None:
+            tokens.append(("op", operator))
+        elif name is not None:
+            tokens.append(("name", name))
+        else:
+            tokens.append(("str", string.replace("''", "'")))
+        position = match.end()
+    return tokens
+
+
+class _GuardParser:
+    """Evaluate one job condition over a modelled event, ref and gate state."""
+
+    def __init__(self, text: str, event: str, ref: str, outputs: dict[str, str]):
+        self.tokens = _guard_tokens(text)
+        self.index = 0
+        self.event = event
+        self.ref = ref
+        self.outputs = outputs
+        self.status_check = False
+
+    def _peek(self) -> tuple[str, str] | None:
+        return self.tokens[self.index] if self.index < len(self.tokens) else None
+
+    def _take(self) -> tuple[str, str]:
+        token = self._peek()
+        if token is None:
+            raise GuardEvaluationError("expression ends early")
+        self.index += 1
+        return token
+
+    def _accept(self, operator: str) -> bool:
+        if self._peek() == ("op", operator):
+            self.index += 1
+            return True
+        return False
+
+    def evaluate(self) -> bool:
+        value = self._or()
+        if self._peek() is not None:
+            raise GuardEvaluationError(f"unmodelled token {self._peek()!r}")
+        return self._boolean(value)
+
+    @staticmethod
+    def _boolean(value: bool | str) -> bool:
+        if not isinstance(value, bool):
+            raise GuardEvaluationError(f"unmodelled truthiness of {value!r}")
+        return value
+
+    def _or(self) -> bool | str:
+        value = self._and()
+        while self._accept("||"):
+            right = self._and()
+            value = self._boolean(value) or self._boolean(right)
+        return value
+
+    def _and(self) -> bool | str:
+        value = self._not()
+        while self._accept("&&"):
+            right = self._not()
+            value = self._boolean(value) and self._boolean(right)
+        return value
+
+    def _not(self) -> bool | str:
+        if self._accept("!"):
+            return not self._boolean(self._not())
+        return self._comparison()
+
+    def _comparison(self) -> bool | str:
+        left = self._primary()
+        for operator in ("==", "!="):
+            if self._accept(operator):
+                right = self._primary()
+                if not isinstance(left, str) or not isinstance(right, str):
+                    raise GuardEvaluationError("unmodelled comparison of non-strings")
+                equal = left.lower() == right.lower()
+                return equal if operator == "==" else not equal
+        return left
+
+    def _primary(self) -> bool | str:
+        kind, value = self._take()
+        if kind == "str":
+            return value
+        if kind == "op":
+            if value != "(":
+                raise GuardEvaluationError(f"unmodelled operator {value!r}")
+            inner = self._or()
+            if not self._accept(")"):
+                raise GuardEvaluationError("unbalanced parenthesis")
+            return inner
+        if self._accept("("):
+            if value != "cancelled" or not self._accept(")"):
+                raise GuardEvaluationError(f"unmodelled function {value}()")
+            self.status_check = True
+            return False
+        return self._context(value)
+
+    def _context(self, name: str) -> str:
+        if name == "github.event_name":
+            return self.event
+        if name == "github.ref":
+            return self.ref
+        prefix = f"needs.{GATE_JOB}.outputs."
+        if name.startswith(prefix) and name != prefix:
+            return self.outputs.get(name[len(prefix) :], "")
+        raise GuardEvaluationError(f"unmodelled context {name!r}")
+
+
+def guard_runs(
+    text: str, event: str, ref: str, gate_result: str, outputs: dict[str, str]
+) -> bool:
+    """Return whether a lane with this condition starts under the scenario.
+
+    A condition without a status-check function is also gated by the implicit
+    ``success()`` of its dependency, so a skipped or failed gate skips it.
+    """
+
+    parser = _GuardParser(text, event, ref, outputs)
+    value = parser.evaluate()
+    return value if parser.status_check else value and gate_result == "success"
+
+
+def _expected_guard(group: str, event: str, ref: str, outputs: dict[str, str]) -> bool:
+    if event == "workflow_dispatch":
+        return group == "desktop"
+    if ref != MAIN_REF:
+        return group == "source"
+    return outputs.get(f"reuse_{group}", "") != "true"
+
+
+def check_guard_property(workflow: dict[str, Any]) -> list[str]:
+    """Evaluate each lane's parsed condition over every event, ref and gate state.
+
+    Package and suite lanes always run on a push to another ref and never on a
+    dispatch; desktop lanes always run on a dispatch and never on a push to
+    another ref; on a push to main each group runs exactly when its own gate
+    output is not ``'true'``, so a skipped, failed or empty gate runs both.
+    """
+
+    problems: list[str] = []
+    for name, group in LANE_GROUPS.items():
+        job = _job(workflow, name)
+        text = job.get("if") if isinstance(job, dict) else None
+        if not isinstance(text, str):
+            problems.append(f"{name}: job condition {text!r} is not a string; {REUSE_EVIDENCE_RULE}")
+            continue
+        problems.extend(_guard_problems(name, group, text))
+    return problems
+
+
+def _guard_problems(name: str, group: str, text: str) -> list[str]:
+    problems: list[str] = []
+    for event in GUARD_EVENTS:
+        for ref in GUARD_REFS:
+            for result, outputs in GATE_STATES:
+                want = _expected_guard(group, event, ref, outputs)
+                try:
+                    got = guard_runs(text, event, ref, result, outputs)
+                except GuardEvaluationError as error:
+                    return [f"{name}: {error}; {REUSE_EVIDENCE_RULE}"]
+                if got != want:
+                    problems.append(
+                        f"{name}: {'runs' if got else 'skips'} on {event} of {ref} "
+                        f"with gate {result} {outputs}, expected "
+                        f"{'to run' if want else 'to skip'}; {REUSE_EVIDENCE_RULE}"
+                    )
+    return problems
+
+
+_LANE_REF_READ = re.compile(
+    r"github\.(?:ref|event_name)|github\[\s*['\"](?:ref|event_name)|"
+    r"GITHUB_(?:REF|EVENT_NAME)",
+    re.IGNORECASE,
+)
+
+
+def check_lane_ref_reads(workflow: dict[str, Any]) -> list[str]:
+    """Reject lane text that reads the ref or event, so lanes behave alike everywhere.
+
+    Cross-ref evidence is valid only while a lane does the same work on every
+    ref and event.  Job ``env`` and each step's ``run``, ``env`` and ``with``
+    may not read either value; the job-level ``if`` and the gate are exempt.
+    """
+
+    problems: list[str] = []
+    for name, job in _jobs(workflow).items():
+        if name == GATE_JOB or not isinstance(job, dict):
+            continue
+        places = [("job env", job.get("env"))]
+        for step in _steps(job):
+            label = step.get("name") or step.get("uses") or step.get("id")
+            places.extend(
+                (f"step {label!r} {key}", step.get(key)) for key in ("run", "env", "with")
+            )
+        for place, value in places:
+            if value is not None and _LANE_REF_READ.search(str(value)):
+                problems.append(f"{name}: {place} reads the ref or event: {value!r}")
     return problems
 
 
@@ -1257,6 +1588,9 @@ def check_no_offscreen_substitute(workflow: dict[str, Any]) -> list[str]:
 CHECKS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
     "workflow_trigger": check_workflow_trigger,
     "lane_routing": check_lane_routing,
+    "reuse_gate": check_reuse_gate,
+    "guard_property": check_guard_property,
+    "lane_ref_reads": check_lane_ref_reads,
     "job_matrix": check_job_matrix,
     "shell_matrix": check_shell_matrix,
     "baseline_source_suite": check_baseline_source_suite,
@@ -1547,14 +1881,72 @@ def _mutate_narrow_desktop_routing_to_main(workflow: dict[str, Any]) -> None:
     _job(workflow, "nyx-desktop-macos")["if"] = "github.ref == 'refs/heads/main'"
 
 
-def _mutate_sequence_desktop_lane_after_package_lane(workflow: dict[str, Any]) -> None:
-    _job(workflow, "nyx-desktop-windows")["needs"] = ["nyx-windows"]
+def _mutate_lane_needs_another_lane(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-desktop-windows")["needs"] = [GATE_JOB, "nyx-windows"]
 
 
 def _mutate_condition_the_documented_build_step(workflow: dict[str, Any]) -> None:
     _step(workflow, "nyx-desktop-windows", DOCUMENTED_BUILD_STEP)["if"] = (
         "github.ref == 'refs/heads/main'"
     )
+
+
+def _mutate_drop_lane_needs(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx-macos").pop("needs")
+
+
+def _mutate_gate_actions_write(workflow: dict[str, Any]) -> None:
+    _job(workflow, GATE_JOB)["permissions"]["actions"] = "write"
+
+
+def _mutate_gate_keeps_credentials(workflow: dict[str, Any]) -> None:
+    del _job(workflow, GATE_JOB)["steps"][0]["with"]["persist-credentials"]
+
+
+def _mutate_gate_adds_setup_python(workflow: dict[str, Any]) -> None:
+    _job(workflow, GATE_JOB)["steps"].insert(
+        1, {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}}
+    )
+
+
+def _mutate_gate_runs_on_every_push(workflow: dict[str, Any]) -> None:
+    _job(workflow, GATE_JOB)["if"] = "github.event_name == 'push'"
+
+
+def _mutate_unpin_gate_timeout(workflow: dict[str, Any]) -> None:
+    _job(workflow, GATE_JOB)[TIMEOUT_KEY] = 10
+
+
+def _mutate_lane_declares_permissions(workflow: dict[str, Any]) -> None:
+    _job(workflow, "nyx")["permissions"] = {"contents": "read"}
+
+
+def _mutate_workflow_declares_permissions(workflow: dict[str, Any]) -> None:
+    workflow["permissions"] = {"contents": "read"}
+
+
+def _mutate_gate_output_from_another_step(workflow: dict[str, Any]) -> None:
+    _job(workflow, GATE_JOB)["outputs"]["reuse_desktop"] = (
+        "${{ steps.other.outputs.reuse_desktop }}"
+    )
+
+
+def _set_condition(job: str, condition: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(workflow: dict[str, Any]) -> None:
+        _job(workflow, job)["if"] = condition
+
+    return mutate
+
+
+def _mutate_lane_echoes_ref_name(workflow: dict[str, Any]) -> None:
+    step = _step(workflow, "nyx-suite", SUITE_STEP)
+    step["run"] = 'echo "${{ github.ref_name }}"\n' + _run_text(step)
+
+
+def _mutate_lane_step_env_reads_event(workflow: dict[str, Any]) -> None:
+    _step(workflow, "nyx-desktop-macos", PREFLIGHT_STEP).setdefault("env", {})[
+        "NYX_EVENT"
+    ] = "${{ github.event_name }}"
 
 
 def _mutate_add_unrouted_job(workflow: dict[str, Any]) -> None:
@@ -2213,9 +2605,74 @@ MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], list[str]], Callable[[dict
         _mutate_condition_the_documented_build_step,
     ),
     "add an unrouted job": (check_lane_routing, _mutate_add_unrouted_job),
-    "sequence a desktop lane after a package lane": (
+    "drop a lane's needs": (check_lane_routing, _mutate_drop_lane_needs),
+    "gate gains actions write": (check_reuse_gate, _mutate_gate_actions_write),
+    "gate keeps checkout credentials": (
+        check_reuse_gate,
+        _mutate_gate_keeps_credentials,
+    ),
+    "gate gains a setup-python step": (check_reuse_gate, _mutate_gate_adds_setup_python),
+    "gate runs on every push": (check_reuse_gate, _mutate_gate_runs_on_every_push),
+    "unpin the gate timeout": (check_job_time_limits, _mutate_unpin_gate_timeout),
+    "a lane declares permissions": (check_reuse_gate, _mutate_lane_declares_permissions),
+    "the workflow declares permissions": (
+        check_reuse_gate,
+        _mutate_workflow_declares_permissions,
+    ),
+    "gate output read from another step": (
+        check_reuse_gate,
+        _mutate_gate_output_from_another_step,
+    ),
+    "a suite lane skips non-main pushes": (
+        check_guard_property,
+        _set_condition(
+            "nyx-windows-suite",
+            "!cancelled() && github.event_name == 'push' && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.reuse-gate.outputs.reuse_source != 'true'",
+        ),
+    ),
+    "a desktop lane lacks the dispatch disjunct": (
+        check_guard_property,
+        _set_condition(
+            "nyx-desktop-windows",
+            "!cancelled() && (github.ref == 'refs/heads/main' && "
+            "needs.reuse-gate.outputs.reuse_desktop != 'true')",
+        ),
+    ),
+    "a desktop lane reads the source output": (
+        check_guard_property,
+        _set_condition(
+            "nyx-desktop-macos",
+            DESKTOP_LANE_CONDITION.replace("reuse_desktop", "reuse_source"),
+        ),
+    ),
+    "a lane tests for false instead of not true": (
+        check_guard_property,
+        _set_condition(
+            "nyx-macos",
+            PACKAGE_LANE_CONDITION.replace("!= 'true'", "== 'false'"),
+        ),
+    ),
+    "a lane condition uses an unmodelled function": (
+        check_guard_property,
+        _set_condition(
+            "nyx",
+            PACKAGE_LANE_CONDITION.replace("!cancelled()", "!failure()"),
+        ),
+    ),
+    "a lane drops the status check": (
+        check_guard_property,
+        _set_condition("nyx-suite", PACKAGE_LANE_CONDITION.removeprefix("!cancelled() && ")),
+    ),
+    "a lane echoes the ref name": (check_lane_ref_reads, _mutate_lane_echoes_ref_name),
+    "a lane step env reads the event": (
+        check_lane_ref_reads,
+        _mutate_lane_step_env_reads_event,
+    ),
+    "a lane needs another lane": (
         check_lane_routing,
-        _mutate_sequence_desktop_lane_after_package_lane,
+        _mutate_lane_needs_another_lane,
     ),
     "change baseline runner": (check_job_matrix, _mutate_change_baseline_runner),
     "remove pwsh shell declaration": (
@@ -2721,3 +3178,57 @@ def test_altered_copy_beside_an_intact_gate_is_rejected() -> None:
     assert check_baseline_ruff(mutated) == [
         "nyx-macos: Ruff command 'ruff check .' is altered as 'ruff check . || true'"
     ]
+
+
+# --------------------------------------------------------------------------
+# The guard evaluator and the routing property read the parsed conditions
+# --------------------------------------------------------------------------
+
+
+def test_guard_property_reads_the_parsed_condition_not_the_constants() -> None:
+    # An equivalent rewrite satisfies the property but not the exact-text rule,
+    # so each check answers from its own input.
+    mutated = copy.deepcopy(load_workflow())
+    _job(mutated, "nyx")["if"] = (
+        "!cancelled() && github.event_name == 'push' && "
+        "(needs.reuse-gate.outputs.reuse_source != 'true' || github.ref != 'refs/heads/main')"
+    )
+    assert check_guard_property(mutated) == []
+    assert any(p.startswith("nyx: job condition") for p in check_lane_routing(mutated))
+
+
+def test_guard_property_failure_names_the_reuse_evidence_rule() -> None:
+    mutated = copy.deepcopy(load_workflow())
+    _job(mutated, "nyx-suite")["if"] = "github.event_name == 'push'"
+    problems = check_guard_property(mutated)
+    assert problems
+    assert all("successful branch push run" in p and "dispatch run" in p for p in problems)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "github.event_name == 'push' && github.actor == 'x'",
+        "github.event_name == 'push' && github.ref < 'x'",
+        "!cancelled() && always()",
+        "github.event_name",
+        "github.event_name == 'push' ||",
+        "(github.event_name == 'push'",
+    ],
+)
+def test_guard_evaluator_raises_on_anything_unmodelled(condition: str) -> None:
+    with pytest.raises(GuardEvaluationError):
+        guard_runs(condition, "push", MAIN_REF, "success", {})
+
+
+def test_guard_evaluator_models_implicit_success_and_absent_outputs() -> None:
+    plain = "github.event_name == 'push'"
+    assert guard_runs(plain, "push", MAIN_REF, "success", {})
+    assert not guard_runs(plain, "push", MAIN_REF, "skipped", {})
+    assert guard_runs(
+        "!cancelled() && needs.reuse-gate.outputs.reuse_source != 'true'",
+        "push",
+        MAIN_REF,
+        "skipped",
+        {},
+    )

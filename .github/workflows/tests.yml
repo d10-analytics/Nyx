@@ -5,8 +5,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Decides, for a push to main only, whether passing results for the identical
+  # tree already exist; every lane runs unless its group is positively matched.
+  reuse-gate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse_source: ${{ steps.gate.outputs.reuse_source }}
+      reuse_desktop: ${{ steps.gate.outputs.reuse_desktop }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/reuse_gate.py
+
   nyx:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -75,7 +98,8 @@ jobs:
           python -m pytest tests/test_documented_install.py::test_documented_native_installation_and_lifecycle -v
 
   nyx-windows:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -106,7 +130,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-macos:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -130,7 +155,8 @@ jobs:
           "$runner_python" -m pytest tests/test_wheel_install.py -v
 
   nyx-suite:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -154,7 +180,8 @@ jobs:
           "$runner_python" -m pytest tests/ -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}
 
   nyx-windows-suite:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: windows-latest
     timeout-minutes: 30
     strategy:
@@ -183,7 +210,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-macos-suite:
-    if: github.event_name == 'push'
+    needs: [reuse-gate]
+    if: "!cancelled() && github.event_name == 'push' && (github.ref != 'refs/heads/main' || needs.reuse-gate.outputs.reuse_source != 'true')"
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
@@ -208,7 +236,8 @@ jobs:
           "$runner_python" -m pytest tests/ -v --nyx-shard=${{ strategy.job-index }}/${{ strategy.job-total }}
 
   nyx-desktop-windows:
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: [reuse-gate]
+    if: "!cancelled() && (github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && needs.reuse-gate.outputs.reuse_desktop != 'true'))"
     runs-on: windows-2025
     timeout-minutes: 35
     steps:
@@ -277,7 +306,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   nyx-desktop-macos:
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: [reuse-gate]
+    if: "!cancelled() && (github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && needs.reuse-gate.outputs.reuse_desktop != 'true'))"
     runs-on: macos-15
     timeout-minutes: 15
     steps:
