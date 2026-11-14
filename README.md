@@ -213,3 +213,9 @@ authentication, so other local accounts on the same host can read the catalog
 and workspace path, change board settings, and change the active workspace's
 checkout folders and GitHub lookup. The browser never edits
 specification files; shared or remote hosting is not supported.
+
+## License
+
+Nyx is released under the MIT License; see the LICENSE file in the repository root.
+The bundled font nyx/static/Anta-Regular.ttf is licensed separately under the SIL
+Open Font License; its terms are in nyx/static/Anta-OFL.txt.

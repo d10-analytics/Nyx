@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nyx"
 version = "0.1.0"
-description = "Private catalog viewer"
+description = "Nyx is a development planner: it shows what to build next, what each piece depends on, and whether its code has merged."
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = []
 
