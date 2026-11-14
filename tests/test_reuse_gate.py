@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import socketserver
 import subprocess
 import sys
 import threading
@@ -366,6 +367,39 @@ def test_http_failures_fail_open_with_a_warning(tmp_path, override_path, respons
     routes[override_path] = response
     result = http_gate(tmp_path, routes)
     assert result.code == 0
+    assert outcome(result) == ("false", "false")
+    assert result.stdout.startswith("::warning::")
+    assert reason in result.stdout and reason in result.summary
+
+
+class _RawHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.recv(65536)
+        self.request.sendall(self.server.raw_response)
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "reason"),
+    [
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n12345", "IncompleteRead"),
+        (b"not an http status line\r\n\r\n", "BadStatusLine"),
+    ],
+)
+def test_truncated_body_and_malformed_status_line_fail_open(tmp_path, raw_response, reason):
+    server = socketserver.TCPServer(("127.0.0.1", 0), _RawHandler)
+    server.raw_response = raw_response
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    thread.start()
+    try:
+        env = environment(tmp_path, f"http://127.0.0.1:{server.server_address[1]}")
+        out = io.StringIO()
+        code = reuse_gate.main(env, None, out)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    result = Result(env, code, out.getvalue())
+    assert code == 0
     assert outcome(result) == ("false", "false")
     assert result.stdout.startswith("::warning::")
     assert reason in result.stdout and reason in result.summary
