@@ -28,9 +28,6 @@
   --no-incoming-arrow: #01787c;
   --link: #9ebcff;
   --warning: #ffd18c;
-  --pending: #785b1b;
-  --pending-border: #b88a32;
-  --pending-text: #fff1bf;
   --shadow: #00000030;
   --selected-shadow: #00000050;
   --state-progress: #76b7ff;
@@ -64,9 +61,6 @@
   --no-incoming-arrow: #01787c;
   --link: #3e5790;
   --warning: #825000;
-  --pending: #ffd97a;
-  --pending-border: #b98120;
-  --pending-text: #172b4d;
   --shadow: #172b4d18;
   --selected-shadow: #172b4d30;
   --state-progress: #164f91;
@@ -171,11 +165,6 @@ input:focus-visible, button:focus-visible, select:focus-visible, summary:focus-v
   outline-color: var(--toolbar-focus-ring);
 }
 button { cursor: pointer; background: var(--surface); color: var(--heading); font-weight: 600; }
-button.pending {
-  background: var(--pending);
-  border-color: var(--pending-border);
-  color: var(--pending-text);
-}
 
 .visually-hidden {
   position: absolute;

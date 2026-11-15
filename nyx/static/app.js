@@ -414,7 +414,7 @@
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
-      "showOnBoardMissing": "This work item is not on the displayed board; choose Refresh view on the board.",
+      "showOnBoardMissing": "This work item is not on the board. The board shows catalog changes within ten seconds.",
       "uncommittedOperation": "{worktree} has an unfinished git operation",
       "awaitingMergePullRequest": "(pull request #{n})",
       "settingsDiffer": "Collected under different settings from the board shown.",
@@ -492,7 +492,6 @@
   // stood on has left.
   checkoutsHeading.setAttribute("tabindex", "-1");
   const checkRemotesButton = document.querySelector("#check-remotes");
-  const refreshButton = document.querySelector("#refresh");
   const foldersEditor = document.querySelector("#checkout-folders-editor");
   const foldersList = document.querySelector("#checkout-folders-list");
   const foldersLookup = document.querySelector("#checkout-folders-github");
@@ -517,7 +516,6 @@
   const stageOrderStatus = document.querySelector("#stage-order-status");
 
   let displayed = null;
-  let pending = null;
   let busy = false;
   let queued = null;
   let selectedPath = null;
@@ -1327,8 +1325,7 @@
   function syncBoardIssues(panel = board.querySelector("#board-issues")) {
     const diagnostics = workspaceDiagnostics(displayed);
     // A checkouts failure is a card-scoped part beside the catalog's refresh
-    // issue: it never changes the catalog, the button, focus or selection, and
-    // it never reaches the live region.
+    // issue: it never changes the catalog, focus or selection, and it never reaches the live region.
     const checkoutsFailure = checkoutsOutcome.state === "failed"
       ? checkoutsOutcome.failure : null;
     if (!diagnostics.length && !refreshFailure && !checkoutsFailure) {
@@ -2245,12 +2242,6 @@
     return authenticate(snapshot, "catalog_digest", ["catalog_digest"]);
   }
 
-  function setPending(available) {
-    refreshButton.dataset.pending = String(available);
-    refreshButton.classList.toggle("pending", available);
-    syncViewLabels();
-  }
-
   function readViewPreference() {
     shownView = VIEW_BOARD;
     try {
@@ -2262,17 +2253,14 @@
   }
 
   function syncViewLabels() {
-    refreshButton.textContent = pending && shownView === VIEW_BOARD
-      ? "Apply update" : "Refresh view";
-    viewBoardButton.textContent = pending && shownView === VIEW_CHECKOUTS
-      ? "Board (update waiting)" : "Board";
+    viewBoardButton.textContent = "Board";
     viewBoardButton.setAttribute("aria-pressed", String(shownView === VIEW_BOARD));
     viewCheckoutsButton.setAttribute("aria-pressed", String(shownView === VIEW_CHECKOUTS));
   }
 
   // Exactly one view is shown.  Switching keeps focus on the pressed switch
-  // button and never applies a waiting catalog: the board keeps its pending
-  // snapshot, and the switch names it while the checkouts view is shown.
+  // button and requests nothing: the catalog is installed whichever view is
+  // shown, so the board is current when it returns.
   function applyView() {
     const checkoutsShown = shownView === VIEW_CHECKOUTS;
     board.hidden = checkoutsShown;
@@ -2800,10 +2788,8 @@
     const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
     const retainDraft = priorEditor.length > 0 && hasUnsavedStageOrder();
     displayed = snapshot;
-    pending = null;
     refreshFailure = null;
     document.querySelector("#refresh-status").textContent = "";
-    setPending(false);
     editorStageOrder = [...new Set([
       ...(retainDraft ? priorEditor : editorNames(snapshot)),
       ...inventoryStageNames(snapshot),
@@ -4565,10 +4551,10 @@
     requestCheckouts("check");
   }
 
-  // One checkouts request at most is in flight: a tick, or the view's refresh
-  // button, that finds one running is skipped rather than queued, because the
+  // One checkouts request at most is in flight: a tick or return check that
+  // finds one running is skipped rather than queued, because the
   // server answers every request with the document it has and rescans at most
-  // once a minute.  A POST queued by the button is the one exception.
+  // once a minute.  A POST queued by Check remotes now is the one exception.
   function requestCheckouts(kind = "read") {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
@@ -4690,13 +4676,7 @@
         if (kind === "manual" || kind === "settings" || !displayed) {
           apply(snapshot);
         } else {
-          if (digestOf(snapshot) !== digestOf(displayed)) {
-            pending = snapshot;
-            setPending(true);
-          } else {
-            pending = null;
-            setPending(false);
-          }
+          if (digestOf(snapshot) !== digestOf(displayed)) apply(snapshot);
           if (hadRefreshFailure) {
             syncBoardIssues();
             drawRails();
@@ -4774,7 +4754,8 @@
     copyStatus.textContent = "";
     if (!displayed || !workspace ||
       workspace.revision !== displayed.configuration_revision) {
-      showCopyStatus("Full directory path is unavailable. Refresh the view and try again.", anchor, true);
+      if (displayed) loadWorkspace();
+      showCopyStatus("Full directory path is unavailable. Try again in a moment.", anchor, true);
       return;
     }
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
@@ -4799,16 +4780,6 @@
   checkRemotesButton.addEventListener("click", () => {
     if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
     pressCheckRemotes();
-  });
-  refreshButton.addEventListener("click", () => {
-    // In the checkouts view the button asks for the latest served scan and
-    // never applies a waiting board catalog.
-    if (shownView === VIEW_CHECKOUTS) {
-      requestCheckouts("read");
-      return;
-    }
-    if (pending) apply(pending);
-    else request("manual");
   });
   stageOrderList.addEventListener("click", (event) => {
     if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
