@@ -1490,8 +1490,18 @@
       scrollX: window.scrollX,
       scrollY: window.scrollY,
       issuesFocus: board.querySelector("#board-issues")?.contains(active) ? active : null,
+      panelFocus: null,
       anchor: null,
     };
+    // Focus inside the work item panel, which a redraw rewrites: the relationship
+    // link it was on (followed to its new path), else the panel's heading.
+    if (workItemPanelBody.contains(active)) {
+      const link = active.closest("[data-select-path]");
+      place.panelFocus = {
+        element: active,
+        linkPath: link ? followedPath(link.dataset.selectPath, renderedCatalog, displayed) : null,
+      };
+    }
     const focused = active instanceof Element ? active.closest(".card") : null;
     const card = board.contains(focused) ? focused : board.querySelector(".card.selected");
     const entry = card ? renderedEntries.get(card.dataset.packagePath) : null;
@@ -1517,6 +1527,14 @@
     const shown = Boolean(card) && !card.hidden && Boolean(entry);
     if (shown && anchor.focused) card.focus({preventScroll: true});
     if (place.issuesFocus?.isConnected) place.issuesFocus.focus({preventScroll: true});
+    const panelFocus = place.panelFocus;
+    if (panelFocus && !panelFocus.element.isConnected) {
+      const link = panelFocus.linkPath === null ? undefined
+        : [...workItemPanelBody.querySelectorAll("[data-select-path]")].find((item) =>
+          item.dataset.selectPath === panelFocus.linkPath);
+      (link ?? workItemPanelBody.querySelector("#work-item-panel-heading"))
+        ?.focus({preventScroll: true});
+    }
     if (shown && entry.stage === anchor.stage && columnKeyOf(entry) === anchor.column) {
       const rect = card.getBoundingClientRect();
       window.scrollBy({left: rect.left - anchor.rect.left, top: rect.top - anchor.rect.top,
