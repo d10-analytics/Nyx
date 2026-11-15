@@ -11620,6 +11620,23 @@ def test_install_keeps_focus_in_the_work_item_panel(open_page):
         " && document.activeElement.textContent.includes('Renamed foundation')")
 
 
+def test_install_moves_focus_to_the_panel_heading_when_its_link_is_gone(open_page):
+    """When the focused relationship link no longer exists, focus lands on the panel heading."""
+    changed = json.loads(board_payload())
+    next(item for item in changed["entries"] if item["package_id"] == STEP_TWO)[
+        "relationship"]["prerequisites"] = []
+    client = SequenceClient([board_payload(), json.dumps(_reseal(changed)).encode()])
+    page = open_page(client, fake_clock=True)
+    body = page.locator("#work-item-panel-body")
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    link = body.locator(".panel-link").first
+    assert link.inner_text().startswith("Foundation step")
+    link.focus()
+    fire_poll(page)
+    playwright.expect(body.locator(".panel-link").first).not_to_contain_text("Foundation step")
+    assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
+
+
 def test_work_item_panel_collapses_and_remembers_the_choice(open_page):
     """The panel starts open, gives its width back when collapsed, and the choice is stored."""
     page = open_page(StaticClient(board_payload()))
