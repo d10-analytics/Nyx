@@ -18,6 +18,13 @@ README is narrative only.
   lanes; a relationship left without one is drawn while either of its cards is
   selected, and the cards at the other end of the selected card's relationships
   are marked.
+- Installs a changed catalog itself at the next ten-second check, or at once
+  when the page becomes visible or the window regains focus, with no button and
+  no pending state. It keeps the reader's place across an install: the selected
+  card and its panel, keyboard focus on a card that still exists, the position of
+  the focused or selected card when it keeps its row and column, the window
+  scroll, the search and the Board settings draft, and it marks the new or
+  changed cards for a few seconds.
 - Shows the work item panel beside the board, filled by a left or right click
   on a card (a right click also copies the directory path and never clears the
   selection): the selected entry's declared and reported fields, its
@@ -35,13 +42,12 @@ README is narrative only.
   awaiting merge, which the Code Status states, and a moved base, which the baseline
   line draws) and a baseline line of three points, the Baseline, the checkout
   and main: the text `nyx checkouts --json` gives and the line's words, searchable
-  with the card's other text and rewritten in place on each scan, without **Apply
-  update**. The text is Nyx's last successful checkout scan, and Nyx rescans
+  with the card's other text and rewritten in place on each scan. The text is Nyx's last successful checkout scan, and Nyx rescans
   about once a minute while a board page is open.
 - Shows a line only while the served document was scanned under the configuration
   the board displays, so a Board settings save on the same page hides every line
   until the next scan, for up to about 75 seconds, and a configuration change
-  saved elsewhere hides them until **Apply update** installs the new catalog;
+  saved elsewhere hides them until the next check installs the new catalog;
   a checkout folder save on the same page hides them only until its own
   checkouts read answers with a scan of the new folders, and the page installs
   the new catalog itself (with a checkouts read already in flight at the save,

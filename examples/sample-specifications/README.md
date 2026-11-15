@@ -83,7 +83,7 @@ evidence.
 hide confirmed-empty dimensions, but unchecking it does not reveal finished
 rows while **Hide terminal rows** remains checked.
 
-## Move a work item and apply the update
+## Move a work item
 
 Nyx reads directory placement; it does not move work items. From the repository
 root, move the fictional verification work item manually:
@@ -93,13 +93,10 @@ mv examples/sample-specifications/Trail_Web/Testing/verify \
    examples/sample-specifications/Trail_Web/Ready_For_Review/verify
 ```
 
-Wait for Nyx's automatic update check (it runs every ten seconds). The changed
-catalog is held as a pending snapshot and the button becomes **Apply update**;
-click it to adopt the new stage and card location together. When no update is
-pending, **Refresh view** requests an immediate check and applies that response
-directly. Move the work item back to `Testing`, wait for the next automatic check,
-and apply it again so the checked-in sample returns to its documented starting
-state:
+Nyx's automatic update check runs every ten seconds, and at once when you return
+to the window; the card appears in its new stage on its own. Move the work item
+back to `Testing` and wait for the next check so the checked-in sample returns to
+its documented starting state:
 
 ```bash
 mv examples/sample-specifications/Trail_Web/Ready_For_Review/verify \

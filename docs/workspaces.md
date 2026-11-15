@@ -208,7 +208,8 @@ than deciding when work can move. A safe direct child such as `Testing` or
 `Ready_For_Review` is also a stage, and its spelling is preserved on the board.
 You do not need to create every stage in advance. Direct files such as a tracked
 `.gitkeep` preserve an empty directory in version control but are not work items.
-After moving files, request a refresh and apply the update.
+After moving files, the board shows the change at its next check, within ten
+seconds.
 
 ### Define whole-item completion
 
@@ -337,11 +338,10 @@ Other keys the record already holds, such as `stage_orders`, stay as they are.
 ## Move files yourself
 
 Nyx does not provide lifecycle buttons. Move a work item directory with your
-editor or existing file tools while Nyx is running, then choose **Refresh view**
-when no update is waiting. If the refreshed catalog differs, the button becomes
-**Apply update**; the new inventory, cards, and diagnostics remain pending until
-you apply them together. A failed or malformed refresh leaves the displayed
-snapshot in place.
+editor or existing file tools while Nyx is running. The board installs the new
+inventory, cards, and diagnostics together at its next check, within ten seconds,
+or at once when you return to the window. A failed or malformed refresh leaves the
+displayed snapshot in place.
 
 The browser's **Hide empty rows and columns** checkbox compacts confirmed-empty
 dimensions from the displayed snapshot; unchecking it restores those rows and

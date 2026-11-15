@@ -903,7 +903,7 @@ tag under its folder name, holding exactly the text
 `nyx checkouts --json` gives for that package; the browser shows what it is
 served and rebuilds nothing. That text comes from Nyx's last successful checkout
 scan: while a board page is open Nyx rescans about once a minute, and the line
-updates on its own, without **Apply update**. The line is part of the card's
+updates on its own. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
@@ -915,7 +915,7 @@ the new catalog itself. When a checkouts read is already in flight at the save,
 the page sends no read of its own, and the line follows at the next ten-second
 check instead. After a configuration change saved elsewhere, such as
 settings saved from another page, the scan arrives first and the line stays
-hidden until **Apply update** installs the new catalog.
+hidden until the next check installs the new catalog.
 
 Each listed package also has a `baseline` (see Baseline and base drift above).
 When every package that names a branch in its repository is finished and reads
@@ -1382,24 +1382,25 @@ is hidden. **Hide details** collapses the panel to a strip and **Details**
 opens it again; the choice is remembered in this browser like the other display
 preferences. The panel belongs to the board and is not shown in **Checkouts**.
 
-Nyx checks for changed information every ten seconds. **Apply update** loads the
-waiting snapshot; **Refresh view** requests an immediate check when no update is
-waiting. Catalog changes are not applied automatically while you are reading a
-snapshot.
+Nyx checks for changed information every ten seconds, and at once when you return
+to the window. A changed catalog is installed at the next check, at most ten
+seconds after the change, without any button. Your selection, keyboard focus,
+scroll position, search and **Board settings** draft are kept, and the cards that
+changed are marked for a few seconds.
 
 A card whose package has a Code Status shows a Code Status tag under its
 folder name, holding the same text `nyx checkouts --json` gives for that package.
 Nyx reads it from its last successful checkout scan, and it rescans about once a
-minute while a board page is open, so the line updates on its own, without
-**Apply update**; **Search** covers it. While Nyx has no scan to serve, no card
+minute while a board page is open, so the line updates on its own;
+**Search** covers it. While Nyx has no scan to serve, no card
 shows a line and the issues panel says `Code Status unavailable`. The lines are
 also hidden, with no message, while the board displays a configuration other
 than the one the scan was made under: for up to about 75 seconds after a Board
 settings save on the same page, until the checkouts read that a checkout folder
 save on the same page requests answers with a scan of the new folders (or, when
 a checkouts read was already in flight at the save, until the next ten-second
-check), and, after a configuration change saved elsewhere, until you press
-**Apply update**.
+check), and, after a configuration change saved elsewhere, until the next check
+installs the new catalog.
 
 An explicit completion policy affects only whole-item `Completion Prerequisite`
 relationships. Moving a work item into a selected stage can satisfy that
@@ -1466,11 +1467,9 @@ reads how many match (for example "Quiet repositories (3, 1 matching)"). It is
 hidden when none match, and shows every repository again when you clear the
 search. **Hide empty
 rows and columns** and **Hide terminal rows** give way to **Hide quiet
-checkouts**. Switching views never applies a waiting board update: the board
-keeps it, and the switch reads **Board (update waiting)** until you apply it on
-the board. **Refresh view** in **Checkouts** asks for the latest served scan
-and nothing else: Nyx answers from the scan it has, which it renews at most about
-once a minute, so pressing it more often returns the same scan.
+checkouts**. Switching views never waits for an update: the board is
+always current, and every check reads the latest served scan, which Nyx renews
+at most about once a minute.
 
 The line under the heading says how current the page is: `Local state` with the
 time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
@@ -1562,7 +1561,8 @@ branches**, and the repository's heading when no such row exists. An item that
 names work items has a **Show on board** button for each of them, which
 switches to the board and selects that card. If the work item is in a finished
 row the view says to uncheck **Hide terminal rows**, and if the board does not
-show it the view says to choose **Refresh view** on the board.
+show it the view says: This work item is not on the board. The board shows catalog
+changes within ten seconds.
 
 Below the list each repository is a group named by its remote, with its default
 branch, the state of its remote check and pull request lookup, and its free
@@ -1748,7 +1748,8 @@ repeatable browser session; it does not add a permanent screenshot framework.
   directories, specification files, and program descriptors that could not be
   read or identified.
   The [reference](specification-reference.md) explains the expected format.
-- **An edit has not appeared:** request a refresh and apply any pending update.
+- **An edit has not appeared:** the edit appears at the next check, within ten
+  seconds, or at once when you return to the window.
   If the catalog cannot be refreshed, the browser reports the problem; do not
   treat the retained view as confirmation of the latest file contents.
 - **A refresh reports `producer_output_too_large`:** Nyx did not produce the
