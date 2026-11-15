@@ -986,6 +986,8 @@ def page_launcher(browser, launch_timeout_ms=15000):
 
 # Mirrors POLL_INTERVAL in nyx/static/app.js, the browser's poll interval.
 POLL_INTERVAL_MS = 10_000
+# Mirrors CHANGE_MARK_MS in nyx/static/app.js, how long a changed card stays marked.
+CHANGE_MARK_MS = 4_000
 
 
 def fire_poll(page):
@@ -4215,6 +4217,20 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
         "el => getComputedStyle(el, '::before').borderTopColor"
     )
     assert contrast_ratio(divider, page_color) >= 3
+    colors = page.evaluate("""() => {
+      const resolve = token => {
+        const probe = document.createElement('span');
+        probe.style.color = `var(${token})`;
+        document.body.append(probe);
+        const color = getComputedStyle(probe).color;
+        probe.remove();
+        return color;
+      };
+      return {mark: resolve('--change-mark'), surface: resolve('--surface'),
+              selected: resolve('--selected-ring'), focus: resolve('--focus-ring')};
+    }""")
+    assert contrast_ratio(colors["mark"], colors["surface"]) >= 3, colors
+    assert colors["mark"] not in (colors["selected"], colors["focus"]), colors
 
 
 def assert_focus_indicator(control, *, expected=None, card=False):
@@ -6721,6 +6737,182 @@ def test_checkouts_view_starts_in_board_without_a_known_value(
     playwright.expect(page.locator("#checkouts")).to_be_hidden()
 
 
+def test_change_marks_follow_poll_installs_only(open_page):
+    """Cards a poll install changed carry a mark that one timer clears in place."""
+    added_id = "123e4567-e89b-42d3-a456-426614174520"
+    status_id, relation_id, quiet_id = (
+        f"123e4567-e89b-42d3-a456-42661417452{index}" for index in (1, 2, 3))
+    base = json.loads(board_payload())
+    base["entries"].extend([
+        _entry(status_id, "Alpha/Under_Development/status-card", "under_development",
+               "Status card", "Alpha"),
+        _entry(relation_id, "Alpha/Under_Development/relation-card", "under_development",
+               "Relation card", "Alpha", prerequisites=[_edge(STEP_ONE, "build")]),
+        _entry(quiet_id, "Alpha/Under_Development/quiet-card", "under_development",
+               "Quiet card", "Alpha"),
+    ])
+    base["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(base)
+
+    def edit(catalog, package_id, change):
+        value = copy.deepcopy(catalog)
+        for entry in value["entries"]:
+            if entry["package_id"] == package_id:
+                change(entry)
+        value["entries"].sort(key=lambda entry: entry["package_path"])
+        return _reseal(value)
+
+    def retitle(title):
+        return lambda entry: entry["declared"].__setitem__("title", title)
+
+    def move_stage(entry):
+        entry["package_path"] = "Alpha/Queue/step-two"
+        entry["stage"] = "Queue"
+
+    def move_project(entry):
+        entry["package_path"] = "Alpha/Under_Development/loose"
+        entry["project"] = "Alpha"
+
+    def rename_claim(entry):
+        entry["relationship"]["prerequisites"][0]["claim_name"] = "build-again"
+
+    changed = base
+    changed = edit(changed, STEP_TWO, move_stage)
+    changed = edit(changed, LOOSE, move_project)
+    changed = edit(changed, GATE, retitle("Gate renamed"))
+    changed = edit(changed, status_id, lambda entry: entry["declared"].__setitem__(
+        "status", "blocked"))
+    changed = edit(changed, relation_id, rename_claim)
+    changed["entries"].append(_entry(
+        added_id, "Alpha/Queue/added", "queue", "Added card", "Alpha"))
+    changed["entries"].sort(key=lambda entry: entry["package_path"])
+    _reseal(changed)
+    marked_ids = {added_id, STEP_TWO, LOOSE, GATE, status_id}
+
+    client = SequenceClient([base])
+    page = open_page(
+        client, settings=BrowserSettings(), fake_clock=True,
+        init_script=RESPONSE_RECORDER + FETCH_START_COUNTER,
+    )
+    playwright.expect(page.locator("#stage-order-status")).to_have_text(
+        "Current board settings loaded.")
+
+    def set_focus(value):
+        page.evaluate(f"() => {{ document.hasFocus = () => {str(value).lower()}; }}")
+
+    def marked():
+        return set(page.locator(".card.changed").evaluate_all(
+            "cards => cards.map(card => card.dataset.packageId)"))
+
+    def advance(milliseconds):
+        """Move the fake clock and wait for any poll the move started."""
+        page.clock.fast_forward(milliseconds)
+        started = page.evaluate("window.fetchStarts.catalog")
+        wait_for_responses(page, "catalogResponses", started)
+        settle_frames(page)
+
+    def install(catalog, trigger=fire_poll):
+        client.payloads = [catalog]
+        trigger(page)
+        settle_frames(page)
+
+    set_focus(True)
+    # (1) The first load marks nothing.
+    assert marked() == set()
+
+    # (2) A poll install marks exactly the new and the changed cards.
+    install(changed)
+    assert marked() == marked_ids
+    assert page.locator("#refresh-status").inner_text() == ""
+    names = page.locator(".card.changed").first.evaluate("card => card.getAttributeNames().sort()")
+    assert names == page.locator(f'.card[data-package-id="{quiet_id}"]').evaluate(
+        "card => card.getAttributeNames().sort()")
+    assert page.locator(f'.card[data-package-id="{relation_id}"]').get_attribute("class") == "card"
+    assert page.locator(".card.changed").first.evaluate(
+        "card => getComputedStyle(card, '::before').animationName") != "none"
+
+    # (3) A redraw from the toolbar keeps the same marks.
+    page.locator("#hide-terminal-rows").click()
+    page.locator("#hide-terminal-rows").click()
+    assert marked() == marked_ids
+
+    # (4) A later install adds to the marks; the timer restarts with it and the
+    # clear removes the class without redrawing a card.
+    page.clock.fast_forward(3_000)
+    second = edit(changed, quiet_id, retitle("Quiet renamed"))
+    install(second, return_check)
+    assert marked() == marked_ids | {quiet_id}
+    advance(CHANGE_MARK_MS - 2_000)
+    assert marked() == marked_ids | {quiet_id}
+    handle = page.locator(f'.card[data-package-id="{quiet_id}"]').element_handle()
+    advance(CHANGE_MARK_MS - 1_999)
+    assert marked() == set()
+    assert handle.evaluate("node => node.isConnected")
+
+    # (5) Reduced motion keeps the mark and drops its animation.
+    page.emulate_media(reduced_motion="reduce")
+    third = edit(second, STEP_ONE, retitle("Foundation renamed"))
+    install(third)
+    assert marked() == {STEP_ONE}
+    assert page.locator(".card.changed").evaluate(
+        "card => getComputedStyle(card, '::before').animationName") == "none"
+    advance(CHANGE_MARK_MS + 1)
+    assert marked() == set()
+
+    # (6) The reader's own save installs without a mark.
+    fourth = edit(third, GATE, retitle("Gate saved"))
+    client.payloads = [fourth]
+    open_stage_editor(page)
+    page.get_by_role("button", name="Move Under Development up").click()
+    page.get_by_role("button", name="Save").click()
+    page.get_by_text("Board settings saved.", exact=True).wait_for()
+    playwright.expect(page.locator(f'.card[data-package-id="{GATE}"] .card-title')).to_have_text(
+        "Gate saved")
+    settle_frames(page)
+    assert marked() == set()
+
+    # (7) Marks made while the window is unfocused wait for the reader, and a
+    # later install adds to them rather than replacing them.
+    set_focus(False)
+    fifth = edit(fourth, quiet_id, retitle("Quiet again"))
+    install(fifth)
+    assert marked() == {quiet_id}
+    advance(CHANGE_MARK_MS + 1)
+    assert marked() == {quiet_id}
+    sixth = edit(fifth, status_id, retitle("Status again"))
+    install(sixth)
+    assert marked() == {quiet_id, status_id}
+    set_focus(True)
+    install(sixth, return_check)
+    assert marked() == {quiet_id, status_id}
+    advance(CHANGE_MARK_MS + 1)
+    assert marked() == set()
+
+    # (7b) An install on the return check adds to the marks made while away.
+    set_focus(False)
+    seventh = edit(sixth, quiet_id, retitle("Quiet third"))
+    install(seventh)
+    eighth = edit(seventh, status_id, retitle("Status third"))
+    install(eighth)
+    assert marked() == {quiet_id, status_id}
+    set_focus(True)
+    ninth = edit(eighth, relation_id, retitle("Relation renamed"))
+    install(ninth, return_check)
+    assert marked() == {quiet_id, status_id, relation_id}
+    advance(CHANGE_MARK_MS + 1)
+    assert marked() == set()
+
+    # (7c) An unfocused install stops the timer a focused install started.
+    tenth = edit(ninth, GATE, retitle("Gate focused"))
+    install(tenth)
+    assert marked() == {GATE}
+    set_focus(False)
+    eleventh = edit(tenth, STEP_ONE, retitle("Foundation unfocused"))
+    install(eleventh, return_check)
+    advance(CHANGE_MARK_MS + 1)
+    assert marked() == {GATE, STEP_ONE}
+
+
 def test_checkouts_view_installs_the_catalog_for_the_board(
     open_page, real_checkouts
 ):
@@ -6751,11 +6943,14 @@ def test_checkouts_view_installs_the_catalog_for_the_board(
     playwright.expect(page.locator("#view-board")).to_have_text("Board")
     assert page.locator("#refresh").count() == 0
     catalogs = page.evaluate("window.catalogResponses.length")
+    # The marks an install made while Checkouts was shown expire there.
+    page.clock.fast_forward(CHANGE_MARK_MS + 1)
     page.locator("#view-board").click()
     playwright.expect(page.locator("#board")).to_be_visible()
     # The catalog installed while the board was hidden is shown at once, and the
     # switch asked for nothing.
     assert "Alpha renamed" in page.locator(".card-title").all_inner_texts()
+    assert page.locator(".card.changed").count() == 0
     assert page.locator("#view-board").inner_text() == "Board"
     settle_frames(page)
     assert page.evaluate("window.catalogResponses.length") == catalogs
