@@ -11641,6 +11641,7 @@ def test_install_keeps_focus_in_the_work_item_panel(open_page):
     """An automatic install that rewrites the panel hands focus back inside it."""
     client = SequenceClient([
         board_payload(), board_payload(titles={"step_one": "Renamed foundation"}),
+        board_payload(titles={"step_one": "Renamed again"}),
     ])
     page = open_page(client, fake_clock=True)
     body = page.locator("#work-item-panel-body")
@@ -11654,6 +11655,16 @@ def test_install_keeps_focus_in_the_work_item_panel(open_page):
     assert page.evaluate(
         "document.activeElement.classList.contains('panel-link')"
         " && document.activeElement.textContent.includes('Renamed foundation')")
+    # A focused All fields summary is replaced by the rewrite and focus lands on the new one.
+    summary = body.locator("details.panel-all-fields summary")
+    summary.focus()
+    old_summary = summary.element_handle()
+    fire_poll(page)
+    playwright.expect(body.locator(".panel-link").first).to_contain_text("Renamed again")
+    assert not old_summary.evaluate("node => node.isConnected")
+    assert page.evaluate(
+        "document.activeElement === document.querySelector("
+        "'#work-item-panel-body details.panel-all-fields summary')")
 
 
 def test_install_moves_focus_to_the_panel_heading_when_its_link_is_gone(open_page):
@@ -11838,10 +11849,18 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     settle_frames(page)
     assert heading.evaluate("node => node.isConnected")
     assert details.evaluate("node => node.isConnected && node.open")
+    # A scan that rewrites the panel hands a focused summary to the new one.
+    summary = body.locator("details.panel-all-fields summary")
+    summary.focus()
+    old_summary = summary.element_handle()
     double.serve(checkouts_with_text(document, "Repo/Drafts/alpha", "custom words"))
     fire_checkouts_poll(page)
     playwright.expect(body.locator(".panel-code-status dd")).to_have_text("custom words")
     assert body.locator("details.panel-all-fields").evaluate("node => node.open")
+    assert not old_summary.evaluate("node => node.isConnected")
+    assert page.evaluate(
+        "document.activeElement === document.querySelector("
+        "'#work-item-panel-body details.panel-all-fields summary')")
 
     # A failed read removes the Code part and its folded rows with the card tags.
     double.fail("checkouts_failed")
