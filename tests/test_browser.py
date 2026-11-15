@@ -11601,6 +11601,25 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
 
 
+def test_install_keeps_focus_in_the_work_item_panel(open_page):
+    """An automatic install that rewrites the panel hands focus back inside it."""
+    client = SequenceClient([
+        board_payload(), board_payload(titles={"step_one": "Renamed foundation"}),
+    ])
+    page = open_page(client, fake_clock=True)
+    body = page.locator("#work-item-panel-body")
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    link = body.locator(".panel-link").first
+    assert link.inner_text().startswith("Foundation step")
+    link.focus()
+    fire_poll(page)
+    playwright.expect(body.locator(".panel-link").first).to_contain_text("Renamed foundation")
+    # The rewritten panel holds the same relationship link, so focus returns to it.
+    assert page.evaluate(
+        "document.activeElement.classList.contains('panel-link')"
+        " && document.activeElement.textContent.includes('Renamed foundation')")
+
+
 def test_work_item_panel_collapses_and_remembers_the_choice(open_page):
     """The panel starts open, gives its width back when collapsed, and the choice is stored."""
     page = open_page(StaticClient(board_payload()))
