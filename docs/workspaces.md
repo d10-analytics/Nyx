@@ -122,6 +122,8 @@ specifications/
 
 Each work item has its own directory containing `spec.md`. You can add grouping
 directories between a stage and its work item directories as the project grows.
+Nyx reads only that `spec.md`; other files and folders inside the work item
+directory are ignored.
 
 Every UUID field (`Package ID`, `Program ID`, `Program Membership`,
 `Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a
