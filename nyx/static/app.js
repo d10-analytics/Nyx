@@ -4928,8 +4928,15 @@
   loadSettings();
   request("manual");
   requestCheckouts();
-  window.setInterval(() => {
+  function checkNow() {
     request("poll");
     requestCheckouts();
-  }, POLL_INTERVAL);
+  }
+  window.setInterval(checkNow, POLL_INTERVAL);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") checkNow();
+  });
+  window.addEventListener("focus", (event) => {
+    if (event.target === window) checkNow();
+  });
 })();
