@@ -54,6 +54,8 @@
   const RAIL_INSET = 20;
   const RAIL_LANE_CAP = 8;
   const POLL_INTERVAL = 10000;
+  // How long the cards an automatic install changed stay marked.
+  const CHANGE_MARK_MS = 4000;
   const CATALOG_ROUTE = "/api/catalog";
   const CHECKOUTS_ROUTE = "/api/checkouts";
   // The card reads the checkout facts document at exactly this schema, and the
@@ -414,7 +416,7 @@
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
-      "showOnBoardMissing": "This work item is not on the displayed board; choose Refresh view on the board.",
+      "showOnBoardMissing": "This work item is not on the board. The board shows catalog changes within ten seconds.",
       "uncommittedOperation": "{worktree} has an unfinished git operation",
       "awaitingMergePullRequest": "(pull request #{n})",
       "settingsDiffer": "Collected under different settings from the board shown.",
@@ -492,7 +494,6 @@
   // stood on has left.
   checkoutsHeading.setAttribute("tabindex", "-1");
   const checkRemotesButton = document.querySelector("#check-remotes");
-  const refreshButton = document.querySelector("#refresh");
   const foldersEditor = document.querySelector("#checkout-folders-editor");
   const foldersList = document.querySelector("#checkout-folders-list");
   const foldersLookup = document.querySelector("#checkout-folders-github");
@@ -517,7 +518,6 @@
   const stageOrderStatus = document.querySelector("#stage-order-status");
 
   let displayed = null;
-  let pending = null;
   let busy = false;
   let queued = null;
   let selectedPath = null;
@@ -1201,15 +1201,77 @@
     return parts[parts.length - 1] || String(path);
   }
 
+  // Cards an automatic install changed.  A mark is keyed by the card's identity
+  // (its unique Package ID, else its folder path) so a later redraw or a stage
+  // move keeps it; only the timer empties the set.
+  const changeMarks = new Set();
+  let changeMarkTimer = null;
+  let markIndexCatalog = null;
+  let markIndex = null;
+
+  function markKeyOf(entry, ids) {
+    return entry.package_id && ids.get(entry.package_id)
+      ? `id:${entry.package_id}` : `path:${entry.package_path}`;
+  }
+
+  function markKeyInDisplayed(entry) {
+    if (markIndexCatalog !== displayed) {
+      markIndexCatalog = displayed;
+      markIndex = indexByPackageId(displayed.entries);
+    }
+    return markKeyOf(entry, markIndex);
+  }
+
+  function changeMarksBetween(from, to) {
+    const before = indexByPackageId(from.entries);
+    const after = indexByPackageId(to.entries);
+    const byPath = new Map(from.entries.map((entry) => [entry.package_path, entry]));
+    const keys = [];
+    to.entries.forEach((entry) => {
+      const unique = entry.package_id && before.get(entry.package_id) && after.get(entry.package_id);
+      const prior = unique ? before.get(entry.package_id) : byPath.get(entry.package_path);
+      const changed = !prior || prior.stage !== entry.stage || prior.project !== entry.project ||
+        prior.declared.title !== entry.declared.title ||
+        prior.declared.status !== entry.declared.status;
+      if (changed) keys.push(markKeyOf(entry, after));
+    });
+    return keys;
+  }
+
+  function readerIsPresent() {
+    return document.visibilityState === "visible" && document.hasFocus();
+  }
+
+  function stopChangeMarkTimer() {
+    if (changeMarkTimer === null) return;
+    window.clearTimeout(changeMarkTimer);
+    changeMarkTimer = null;
+  }
+
+  function startChangeMarkTimer() {
+    stopChangeMarkTimer();
+    changeMarkTimer = window.setTimeout(() => {
+      changeMarkTimer = null;
+      changeMarks.clear();
+      board.querySelectorAll(".card.changed").forEach((card) => card.classList.remove("changed"));
+    }, CHANGE_MARK_MS);
+  }
+
+  // The reader coming back starts the clock for marks made while they were away.
+  function resumeChangeMarkTimer() {
+    if (changeMarks.size && changeMarkTimer === null && readerIsPresent()) startChangeMarkTimer();
+  }
+
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
+    const changed = changeMarks.has(markKeyInDisplayed(entry));
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
     const facts = cardFactsHtml(entry.package_path);
     cardFactsMarkup.set(entry.package_path, facts);
-    return `<button class="card${selected ? " selected" : ""}" ` +
+    return `<button class="card${selected ? " selected" : ""}${changed ? " changed" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
       `${idAttribute} data-search="${text(cardSearchText(entry))}">` +
@@ -1327,8 +1389,7 @@
   function syncBoardIssues(panel = board.querySelector("#board-issues")) {
     const diagnostics = workspaceDiagnostics(displayed);
     // A checkouts failure is a card-scoped part beside the catalog's refresh
-    // issue: it never changes the catalog, the button, focus or selection, and
-    // it never reaches the live region.
+    // issue: it never changes the catalog, focus or selection, and it never reaches the live region.
     const checkoutsFailure = checkoutsOutcome.state === "failed"
       ? checkoutsOutcome.failure : null;
     if (!diagnostics.length && !refreshFailure && !checkoutsFailure) {
@@ -1398,9 +1459,97 @@
     return '<p class="empty board-empty">No work items match the current board.</p>';
   }
 
+  // The catalog the board on screen was drawn from: a card's identity across a
+  // redraw is judged between it and the catalog about to be drawn.
+  let renderedCatalog = null;
+
+  // The path a card follows to in the catalog being drawn.  Its Package ID
+  // identifies it when exactly one entry carries that ID in both catalogs, so a
+  // card that changed stage is still the same card; otherwise its folder path
+  // does, and a path no longer present identifies nothing.
+  function followedPath(path, from, to) {
+    if (!from || !to) return null;
+    const source = from.entries.find((entry) => entry.package_path === path);
+    if (!source) return null;
+    if (source.package_id) {
+      const before = indexByPackageId(from.entries).get(source.package_id);
+      const after = indexByPackageId(to.entries).get(source.package_id);
+      if (before && after) return after.package_path;
+    }
+    return to.entries.some((entry) => entry.package_path === path) ? path : null;
+  }
+
+  // What a redraw must hand back to the reader: the card the window position is
+  // held to (the focused card, else the selected one), the focus it holds, and
+  // the window scroll.  Nothing is kept while the checkouts view is shown, whose
+  // own rows stay put and whose scroll and focus an install must not touch.
+  function captureReaderPlace() {
+    if (shownView === VIEW_CHECKOUTS) return null;
+    const active = document.activeElement;
+    const place = {
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      issuesFocus: board.querySelector("#board-issues")?.contains(active) ? active : null,
+      panelFocus: null,
+      anchor: null,
+    };
+    // Focus inside the work item panel, which a redraw rewrites: the relationship
+    // link it was on (followed to its new path), else the panel's heading.
+    if (workItemPanelBody.contains(active)) {
+      const link = active.closest("[data-select-path]");
+      place.panelFocus = {
+        element: active,
+        linkPath: link ? followedPath(link.dataset.selectPath, renderedCatalog, displayed) : null,
+      };
+    }
+    const focused = active instanceof Element ? active.closest(".card") : null;
+    const card = board.contains(focused) ? focused : board.querySelector(".card.selected");
+    const entry = card ? renderedEntries.get(card.dataset.packagePath) : null;
+    if (card && entry) {
+      place.anchor = {
+        path: followedPath(card.dataset.packagePath, renderedCatalog, displayed),
+        focused: card === focused,
+        stage: entry.stage,
+        column: columnKeyOf(entry),
+        rect: card.getBoundingClientRect(),
+      };
+    }
+    return place;
+  }
+
+  function restoreReaderPlace(place) {
+    if (place === null) return;
+    const anchor = place.anchor;
+    const card = anchor && anchor.path !== null
+      ? [...board.querySelectorAll(".card")].find((item) =>
+        item.dataset.packagePath === anchor.path) : null;
+    const entry = card ? renderedEntries.get(anchor.path) : null;
+    const shown = Boolean(card) && !card.hidden && Boolean(entry);
+    if (shown && anchor.focused) card.focus({preventScroll: true});
+    if (place.issuesFocus?.isConnected) place.issuesFocus.focus({preventScroll: true});
+    const panelFocus = place.panelFocus;
+    if (panelFocus && !panelFocus.element.isConnected) {
+      const link = panelFocus.linkPath === null ? undefined
+        : [...workItemPanelBody.querySelectorAll("[data-select-path]")].find((item) =>
+          item.dataset.selectPath === panelFocus.linkPath);
+      (link ?? workItemPanelBody.querySelector("#work-item-panel-heading"))
+        ?.focus({preventScroll: true});
+    }
+    if (shown && entry.stage === anchor.stage && columnKeyOf(entry) === anchor.column) {
+      const rect = card.getBoundingClientRect();
+      window.scrollBy({left: rect.left - anchor.rect.left, top: rect.top - anchor.rect.top,
+        behavior: "instant"});
+    } else {
+      window.scrollTo({left: place.scrollX, top: place.scrollY, behavior: "instant"});
+    }
+  }
+
   function renderBoard() {
+    const place = captureReaderPlace();
     renderBoardGrid();
     renderWorkItemPanel();
+    restoreReaderPlace(place);
+    renderedCatalog = displayed;
   }
 
   function renderBoardGrid() {
@@ -2245,12 +2394,6 @@
     return authenticate(snapshot, "catalog_digest", ["catalog_digest"]);
   }
 
-  function setPending(available) {
-    refreshButton.dataset.pending = String(available);
-    refreshButton.classList.toggle("pending", available);
-    syncViewLabels();
-  }
-
   function readViewPreference() {
     shownView = VIEW_BOARD;
     try {
@@ -2262,17 +2405,14 @@
   }
 
   function syncViewLabels() {
-    refreshButton.textContent = pending && shownView === VIEW_BOARD
-      ? "Apply update" : "Refresh view";
-    viewBoardButton.textContent = pending && shownView === VIEW_CHECKOUTS
-      ? "Board (update waiting)" : "Board";
+    viewBoardButton.textContent = "Board";
     viewBoardButton.setAttribute("aria-pressed", String(shownView === VIEW_BOARD));
     viewCheckoutsButton.setAttribute("aria-pressed", String(shownView === VIEW_CHECKOUTS));
   }
 
   // Exactly one view is shown.  Switching keeps focus on the pressed switch
-  // button and never applies a waiting catalog: the board keeps its pending
-  // snapshot, and the switch names it while the checkouts view is shown.
+  // button and requests nothing: the catalog is installed whichever view is
+  // shown, so the board is current when it returns.
   function applyView() {
     const checkoutsShown = shownView === VIEW_CHECKOUTS;
     board.hidden = checkoutsShown;
@@ -2796,23 +2936,26 @@
     renderStageOrderEditor();
   }
 
-  function apply(snapshot) {
+  function apply(snapshot, markChanges = false) {
+    if (markChanges && displayed) {
+      const keys = changeMarksBetween(displayed, snapshot);
+      if (keys.length) {
+        keys.forEach((key) => changeMarks.add(key));
+        if (readerIsPresent()) startChangeMarkTimer();
+        else stopChangeMarkTimer();
+      }
+    }
     const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
     const retainDraft = priorEditor.length > 0 && hasUnsavedStageOrder();
     displayed = snapshot;
-    pending = null;
     refreshFailure = null;
     document.querySelector("#refresh-status").textContent = "";
-    setPending(false);
     editorStageOrder = [...new Set([
       ...(retainDraft ? priorEditor : editorNames(snapshot)),
       ...inventoryStageNames(snapshot),
     ])];
     if (!retainDraft) editorCompletedStages = [...savedCompletedStages];
-    if (selectedPath && !snapshot.entries.some((entry) =>
-      entry.package_path === selectedPath)) {
-      selectedPath = null;
-    }
+    if (selectedPath) selectedPath = followedPath(selectedPath, renderedCatalog, snapshot);
     renderBoard();
     // The status line names how the scan and the board's settings differ, so a
     // newly applied catalog re-renders it.
@@ -4565,10 +4708,10 @@
     requestCheckouts("check");
   }
 
-  // One checkouts request at most is in flight: a tick, or the view's refresh
-  // button, that finds one running is skipped rather than queued, because the
+  // One checkouts request at most is in flight: a tick or return check that
+  // finds one running is skipped rather than queued, because the
   // server answers every request with the document it has and rescans at most
-  // once a minute.  A POST queued by the button is the one exception.
+  // once a minute.  A POST queued by Check remotes now is the one exception.
   function requestCheckouts(kind = "read") {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
@@ -4690,13 +4833,7 @@
         if (kind === "manual" || kind === "settings" || !displayed) {
           apply(snapshot);
         } else {
-          if (digestOf(snapshot) !== digestOf(displayed)) {
-            pending = snapshot;
-            setPending(true);
-          } else {
-            pending = null;
-            setPending(false);
-          }
+          if (digestOf(snapshot) !== digestOf(displayed)) apply(snapshot, kind === "poll");
           if (hadRefreshFailure) {
             syncBoardIssues();
             drawRails();
@@ -4774,7 +4911,8 @@
     copyStatus.textContent = "";
     if (!displayed || !workspace ||
       workspace.revision !== displayed.configuration_revision) {
-      showCopyStatus("Full directory path is unavailable. Refresh the view and try again.", anchor, true);
+      if (displayed) loadWorkspace();
+      showCopyStatus("Full directory path is unavailable. Try again in a moment.", anchor, true);
       return;
     }
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
@@ -4799,16 +4937,6 @@
   checkRemotesButton.addEventListener("click", () => {
     if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
     pressCheckRemotes();
-  });
-  refreshButton.addEventListener("click", () => {
-    // In the checkouts view the button asks for the latest served scan and
-    // never applies a waiting board catalog.
-    if (shownView === VIEW_CHECKOUTS) {
-      requestCheckouts("read");
-      return;
-    }
-    if (pending) apply(pending);
-    else request("manual");
   });
   stageOrderList.addEventListener("click", (event) => {
     if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
@@ -4928,8 +5056,21 @@
   loadSettings();
   request("manual");
   requestCheckouts();
-  window.setInterval(() => {
+  function checkNow() {
     request("poll");
     requestCheckouts();
-  }, POLL_INTERVAL);
+  }
+  window.setInterval(checkNow, POLL_INTERVAL);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      resumeChangeMarkTimer();
+      checkNow();
+    }
+  });
+  window.addEventListener("focus", (event) => {
+    if (event.target === window) {
+      resumeChangeMarkTimer();
+      checkNow();
+    }
+  });
 })();

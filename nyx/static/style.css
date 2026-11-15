@@ -25,12 +25,10 @@
   --focus-ring: #4889ce;
   --toolbar-focus-ring: #ffffff;
   --selected-ring: #4889ce;
+  --change-mark: #ffd24a;
   --no-incoming-arrow: #01787c;
   --link: #9ebcff;
   --warning: #ffd18c;
-  --pending: #785b1b;
-  --pending-border: #b88a32;
-  --pending-text: #fff1bf;
   --shadow: #00000030;
   --selected-shadow: #00000050;
   --state-progress: #76b7ff;
@@ -61,12 +59,10 @@
   --focus-ring: #2463a5;
   --toolbar-focus-ring: #ffffff;
   --selected-ring: #8db9e7;
+  --change-mark: #0a1017;
   --no-incoming-arrow: #01787c;
   --link: #3e5790;
   --warning: #825000;
-  --pending: #ffd97a;
-  --pending-border: #b98120;
-  --pending-text: #172b4d;
   --shadow: #172b4d18;
   --selected-shadow: #172b4d30;
   --state-progress: #164f91;
@@ -171,11 +167,6 @@ input:focus-visible, button:focus-visible, select:focus-visible, summary:focus-v
   outline-color: var(--toolbar-focus-ring);
 }
 button { cursor: pointer; background: var(--surface); color: var(--heading); font-weight: 600; }
-button.pending {
-  background: var(--pending);
-  border-color: var(--pending-border);
-  color: var(--pending-text);
-}
 
 .visually-hidden {
   position: absolute;
@@ -601,6 +592,26 @@ button.pending {
   background: var(--no-incoming-arrow);
 }
 .card:hover, .card:focus { border-color: var(--focus-border); outline: 2px solid var(--focus-ring); }
+.card.changed::before {
+  content: "";
+  position: absolute;
+  top: .45rem;
+  bottom: .45rem;
+  left: .2rem;
+  width: .3rem;
+  border-radius: .15rem;
+  background: var(--change-mark);
+  box-shadow: 0 0 0 1px var(--surface);
+  pointer-events: none;
+  animation: change-mark-fade .8s ease-out;
+}
+@keyframes change-mark-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.changed::before { animation: none; }
+}
 .card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--selected-ring), 0 2px 5px var(--selected-shadow); }
 .card-title { display: block; font-weight: 700; margin-bottom: .25rem; }
 .card.related { border-color: var(--emphasis); border-style: dashed; box-shadow: 0 0 0 1px var(--emphasis); }

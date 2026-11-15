@@ -1125,12 +1125,13 @@ def _answer(method: Any, timeout: float = 60.0) -> dict[str, Any]:
 
 
 def test_a_real_check_serves_live_labels_and_the_local_refresh_records_them(tmp_path, monkeypatch):
-    world = _real_world(tmp_path, monkeypatch)
+    world = _real_world(tmp_path, monkeypatch, hold=True)
     try:
         before = _fingerprints(world.first, world.second, world.remote)
         waiting = _Request(world.runtime.get_checkouts).start()
         world.recorder.wait_for_calls(1)
         assert not waiting.finished, "the first request answered before its check ran"
+        world.recorder.release.touch()
         first = waiting.join(timeout=60)
         assert _fingerprints(world.first, world.second, world.remote) == before
         calls = len(world.recorder.lines())

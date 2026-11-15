@@ -123,14 +123,14 @@ never through this system. It
   in its work item panel, and never derives, rescans or ages them:
   the line holds the text `nyx checkouts --json` gives from the last successful
   scan, refreshed about once a minute by `application-serving` and updated in
-  place on its own without **Apply update**, searchable with the card's other
+  place on its own, searchable with the card's other
   text, and hidden while the served document's `configuration_revision` differs
   from the displayed catalog's, which adds no entry and lasts for up to about
   75 seconds after a Board settings save on the same page, until the checkouts
   read that a checkout folder save on the same page requests answers with a scan
   of the new folders (or the next tick, when a read was already in flight at the
   save), or, after a configuration change saved elsewhere, until
-  **Apply update** installs the new catalog; while no document can be served the
+  the next check installs the new catalog; while no document can be served the
   issues panel says `Code Status unavailable`.
 
 ## Collaborators

@@ -5923,10 +5923,10 @@ def test_required_native_embedded_board_renders_content_gated_finished_stage_and
                     for link in snapshot["links"]
                 )
                 shared.catalog_admitted = False
-                _eval_js(application, page, "document.querySelector('#refresh').click()")
+                _eval_js(application, page, "window.dispatchEvent(new Event('focus'))")
                 assert "Latest refresh issue:" in _wait_for_refresh_issue(application, page)
                 shared.catalog_admitted = True
-                _eval_js(application, page, "document.querySelector('#refresh').click()")
+                _eval_js(application, page, "window.dispatchEvent(new Event('focus'))")
                 recovered = _wait_for_json_board(application, page, probe=probe)
                 assert "Alpha delivery" in recovered["titles"]
                 assert "Latest refresh issue:" not in recovered["refreshIssue"]

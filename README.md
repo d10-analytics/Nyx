@@ -84,9 +84,10 @@ above: `.venv/bin/nyx`. That relative path works from the repository root. When
 a guide runs commands from another directory, use the absolute path to that same
 console, and quote paths containing spaces.
 
-When files change, Nyx checks for an update every ten seconds. Click **Apply
-update** when it appears to load the new view. **Refresh view** checks immediately
-when no update is waiting. Use the stop command above when you are finished.
+When files change, Nyx installs the new catalog itself at its next check, within
+ten seconds, or at once when you return to the window. Your selection, search and
+place on the board stay where they were. Use the stop command above when you are
+finished.
 
 Setup saves the workspace location for your account on this host. This setup
 choice is separate from the browser's personal
