@@ -1395,9 +1395,79 @@
     return '<p class="empty board-empty">No work items match the current board.</p>';
   }
 
+  // The catalog the board on screen was drawn from: a card's identity across a
+  // redraw is judged between it and the catalog about to be drawn.
+  let renderedCatalog = null;
+
+  // The path a card follows to in the catalog being drawn.  Its Package ID
+  // identifies it when exactly one entry carries that ID in both catalogs, so a
+  // card that changed stage is still the same card; otherwise its folder path
+  // does, and a path no longer present identifies nothing.
+  function followedPath(path, from, to) {
+    if (!from || !to) return null;
+    const source = from.entries.find((entry) => entry.package_path === path);
+    if (!source) return null;
+    if (source.package_id) {
+      const before = indexByPackageId(from.entries).get(source.package_id);
+      const after = indexByPackageId(to.entries).get(source.package_id);
+      if (before && after) return after.package_path;
+    }
+    return to.entries.some((entry) => entry.package_path === path) ? path : null;
+  }
+
+  // What a redraw must hand back to the reader: the card the window position is
+  // held to (the focused card, else the selected one), the focus it holds, and
+  // the window scroll.  Nothing is kept while the checkouts view is shown, whose
+  // own rows stay put and whose scroll and focus an install must not touch.
+  function captureReaderPlace() {
+    if (shownView === VIEW_CHECKOUTS) return null;
+    const active = document.activeElement;
+    const place = {
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      issuesFocus: board.querySelector("#board-issues")?.contains(active) ? active : null,
+      anchor: null,
+    };
+    const focused = active instanceof Element ? active.closest(".card") : null;
+    const card = board.contains(focused) ? focused : board.querySelector(".card.selected");
+    const entry = card ? renderedEntries.get(card.dataset.packagePath) : null;
+    if (card && entry) {
+      place.anchor = {
+        path: followedPath(card.dataset.packagePath, renderedCatalog, displayed),
+        focused: card === focused,
+        stage: entry.stage,
+        column: columnKeyOf(entry),
+        rect: card.getBoundingClientRect(),
+      };
+    }
+    return place;
+  }
+
+  function restoreReaderPlace(place) {
+    if (place === null) return;
+    const anchor = place.anchor;
+    const card = anchor && anchor.path !== null
+      ? [...board.querySelectorAll(".card")].find((item) =>
+        item.dataset.packagePath === anchor.path) : null;
+    const entry = card ? renderedEntries.get(anchor.path) : null;
+    const shown = Boolean(card) && !card.hidden && Boolean(entry);
+    if (shown && anchor.focused) card.focus({preventScroll: true});
+    if (place.issuesFocus?.isConnected) place.issuesFocus.focus({preventScroll: true});
+    if (shown && entry.stage === anchor.stage && columnKeyOf(entry) === anchor.column) {
+      const rect = card.getBoundingClientRect();
+      window.scrollBy({left: rect.left - anchor.rect.left, top: rect.top - anchor.rect.top,
+        behavior: "instant"});
+    } else {
+      window.scrollTo({left: place.scrollX, top: place.scrollY, behavior: "instant"});
+    }
+  }
+
   function renderBoard() {
+    const place = captureReaderPlace();
     renderBoardGrid();
     renderWorkItemPanel();
+    restoreReaderPlace(place);
+    renderedCatalog = displayed;
   }
 
   function renderBoardGrid() {
@@ -2795,10 +2865,7 @@
       ...inventoryStageNames(snapshot),
     ])];
     if (!retainDraft) editorCompletedStages = [...savedCompletedStages];
-    if (selectedPath && !snapshot.entries.some((entry) =>
-      entry.package_path === selectedPath)) {
-      selectedPath = null;
-    }
+    if (selectedPath) selectedPath = followedPath(selectedPath, renderedCatalog, snapshot);
     renderBoard();
     // The status line names how the scan and the board's settings differ, so a
     // newly applied catalog re-renders it.
