@@ -146,6 +146,8 @@ never through this system. It
   [protocols invariants](../protocols/README.md#cross-system-invariants).
 - Calls `code_status_text`; see
   [protocols invariants](../protocols/README.md#cross-system-invariants).
+- Calls `derive_attention`, `derive_prerequisites` and `prerequisites_text`;
+  see [protocols invariants](../protocols/README.md#cross-system-invariants).
 
 ## Cross-system invariants
 

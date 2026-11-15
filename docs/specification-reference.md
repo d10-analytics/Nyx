@@ -95,9 +95,10 @@ capital letter (`A`–`Z`), be at most 64 characters long, and contain no `:`,
 `*`, `` ` ``, `<`, `>`, `|`, `[`, `]`, or control characters. The field names in
 the table above (`Package ID`, `Status`, `Target repo`, `Program Membership`,
 `Claim`, `Prerequisite`, `Completion Prerequisite`, and `Superseded By`) never
-become additional reported text, in any capitalization. `Branch` is not in that
-list: although it has a row in the table, its value also stays searchable
-reported text, retained under the same rules as any other reported field.
+become additional reported text, in any capitalization. `Branch` and `Baseline`
+are not in that list: although each has a row in the table, its value also
+stays searchable reported text, retained under the same rules as any other
+reported field.
 Nyx ignores a line whose
 name breaks these rules; it does not shorten a long name. Names are compared
 case-insensitively for `A`–`Z`; the first occurrence with a nonempty value wins.
@@ -110,6 +111,10 @@ stage is the next direct directory containing the work item. Directory names are
 literal identities: `Testing` and `testing` are different stages, and Nyx does
 not title-case, normalize, or alias them. Grouping directories may appear below
 the stage before the work item directory.
+
+Nyx reads only `spec.md` in a work item directory. It never scans other files
+or subdirectories there (for example `attachments/`), even when they contain a
+`spec.md` or a link.
 
 Nyx discovers safe direct project and stage directories even when they are not
 in the familiar lifecycle table. Names beginning with `.`, `Reference`, and
