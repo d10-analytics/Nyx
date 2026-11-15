@@ -1233,7 +1233,7 @@
       const changed = !prior || prior.stage !== entry.stage || prior.project !== entry.project ||
         prior.declared.title !== entry.declared.title ||
         prior.declared.status !== entry.declared.status;
-      if (changed) keys.push(unique ? `id:${entry.package_id}` : `path:${entry.package_path}`);
+      if (changed) keys.push(markKeyOf(entry, after));
     });
     return keys;
   }
