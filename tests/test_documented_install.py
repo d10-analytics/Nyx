@@ -978,9 +978,9 @@ BRANCH_HEADER_MARKERS = (
     "| `Branch: name` | Optional. The git branch the work is done on, or a value "
     "starting with `not applicable` (then a reason) for work that has no branch. "
     "`nyx checkouts` reads it, and its value also stays searchable reported text. |",
-    "`Branch` is not in that list: although it has a row in the table, its value also "
-    "stays searchable reported text, retained under the same rules as any other "
-    "reported field.",
+    "`Branch` and `Baseline` are not in that list: although each has a row in the table, "
+    "its value also stays searchable reported text, retained under the same rules as "
+    "any other reported field.",
     "For `nyx checkouts`, a bold label or one pair of backticks around the value is "
     "tolerated for both fields; the browser's display of `Target repo` is unchanged "
     "and keeps a backtick.",
@@ -1367,7 +1367,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
         assert "checkout settings `PUT`" in text
     assert (
         "and a **Checkout folders** editor that changes the active workspace's checkout "
-        "folders and GitHub lookup, and the header search"
+        "folders and GitHub lookup. The header search filters it by repository"
     ) in readme
     assert (
         "its editor writes only the checkout settings, through the checkout settings `PUT`"
