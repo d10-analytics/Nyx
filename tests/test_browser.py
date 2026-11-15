@@ -4227,9 +4227,11 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
         return color;
       };
       return {mark: resolve('--change-mark'), surface: resolve('--surface'),
-              selected: resolve('--selected-ring'), focus: resolve('--focus-ring')};
+              selected: resolve('--selected-ring'), focus: resolve('--focus-ring'),
+              teal: resolve('--no-incoming-arrow')};
     }""")
     assert contrast_ratio(colors["mark"], colors["surface"]) >= 3, colors
+    assert contrast_ratio(colors["mark"], colors["teal"]) >= 3, colors
     assert colors["mark"] not in (colors["selected"], colors["focus"]), colors
 
 
