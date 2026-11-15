@@ -12261,6 +12261,10 @@ def test_prerequisites_pill_follows_the_served_state_everywhere(open_page, real_
     code_status_card(page, beta).click()
     # Under the green pill the lines are folded under All fields.
     assert panel_code_rows(page)["Prerequisites"] == wording("met")
+    assert [label for label, _ in panel_all_fields(page)] == [
+        "Branch", "Package ID", "Target repo", "Remote copy", "Verdict", "Pull requests",
+        "Baseline", "Each prerequisite", "Baseline line legend",
+    ]
     row = dict(panel_all_fields(page))["Each prerequisite"]
     assert f"{titles[ids['alpha']]}: merged on main, in this checkout" in row
     assert "A prerequisite that cannot be read" in row
