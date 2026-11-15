@@ -1312,7 +1312,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "until the checkouts read that a checkout folder save on the same page requests "
         "answers with a scan of the new folders (or, when a checkouts read was already in "
         "flight at the save, until the next ten-second check), and, after a configuration "
-        "change saved elsewhere, until you press **Apply update**",
+        "change saved elsewhere, until the next check installs the new catalog",
         "When a checkouts read is already in flight at the save, the page sends no read of "
         "its own, and the line follows at the next ten-second check instead",
         "When a checkouts read is already in flight at the save, that read answers with the "
@@ -1403,6 +1403,54 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "a checkout folder save on the same page requests answers with a scan of the new "
         "folders (or the next tick, when a read was already in flight at the save)"
     ) in checkouts
+
+
+USER_DOCUMENTS = (
+    "README.md",
+    "docs/running-nyx.md",
+    "docs/workspaces.md",
+    "docs/specification-reference.md",
+    "examples/sample-specifications/README.md",
+    "docs/systems/board-web/README.md",
+    "docs/systems/checkouts/README.md",
+)
+
+
+def test_documents_describe_the_automatic_board_update():
+    guide = _normalized("docs/running-nyx.md")
+    board_web = _normalized("docs/systems/board-web/README.md")
+    for marker in (
+        "Nyx checks for changed information every ten seconds, and at once when you "
+        "return to the window. A changed catalog is installed at the next check, at "
+        "most ten seconds after the change, without any button. Your selection, "
+        "keyboard focus, scroll position, search and **Board settings** draft are "
+        "kept, and the cards that changed are marked for a few seconds.",
+        "- **An edit has not appeared:** the edit appears at the next check, within "
+        "ten seconds, or at once when you return to the window.",
+        "This work item is not on the board. The board shows catalog changes within "
+        "ten seconds.",
+    ):
+        assert guide.count(marker) == 1, marker
+    assert (
+        "Installs a changed catalog itself at the next ten-second check, or at once "
+        "when the page becomes visible or the window regains focus, with no button and "
+        "no pending state."
+    ) in board_web
+
+
+@pytest.mark.parametrize("name", USER_DOCUMENTS)
+def test_no_user_document_names_a_removed_control_or_asks_for_a_refresh(name):
+    text = _normalized(name).lower()
+    for banned in (
+        "apply update",
+        "refresh view",
+        "update waiting",
+        "pending update",
+        "request a refresh",
+        "apply the update",
+        "waiting board update",
+    ):
+        assert banned not in text, (name, banned)
 
 
 def test_checkout_system_readme_states_the_developer_tools_check():
