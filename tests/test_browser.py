@@ -3027,10 +3027,18 @@ def test_reader_place_survives_installs_and_redraws(open_page):
     # (4) A card the search no longer matches is not focused; the text stays.
     page.fill("#filter", "keystone")
     card(moved_path).evaluate("node => node.focus({preventScroll: true})")
+    scroll = scroll_now()
     client.payloads = [retitled]
     fire_poll(page)
     playwright.expect(card(moved_path)).to_be_hidden()
     assert not focused_card()
+    # The search empties the board, so the page may only shrink to its new end;
+    # chasing the hidden card's empty rectangle would throw both offsets away.
+    now = scroll_now()
+    longest = page.evaluate(
+        "document.documentElement.scrollHeight - window.innerHeight")
+    assert abs(now["x"] - scroll["x"]) <= 1
+    assert abs(now["y"] - min(scroll["y"], longest)) <= 1
     assert page.locator("#filter").input_value() == "keystone"
     page.fill("#filter", "")
     assert card(moved_path).get_attribute("aria-pressed") == "true"
