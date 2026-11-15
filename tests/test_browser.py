@@ -1042,16 +1042,6 @@ def return_check(page):
     response.value.finished()
 
 
-def install_now(page):
-    """Run the return check, wait for its catalog response and let it settle.
-
-    The response is installed by the page's continuation, so a test reads the
-    board only after the frames that flush it.
-    """
-    return_check(page)
-    settle_frames(page)
-
-
 def wait_for_responses(page, recorder, count):
     """Wait until the page has received ``count`` responses on one route."""
     page.wait_for_function(f"() => window.{recorder}.length >= {count}", timeout=5000)
