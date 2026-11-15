@@ -25,6 +25,7 @@
   --focus-ring: #4889ce;
   --toolbar-focus-ring: #ffffff;
   --selected-ring: #4889ce;
+  --change-mark: #ffd24a;
   --no-incoming-arrow: #01787c;
   --link: #9ebcff;
   --warning: #ffd18c;
@@ -58,6 +59,7 @@
   --focus-ring: #2463a5;
   --toolbar-focus-ring: #ffffff;
   --selected-ring: #8db9e7;
+  --change-mark: #b34a00;
   --no-incoming-arrow: #01787c;
   --link: #3e5790;
   --warning: #825000;
@@ -590,6 +592,27 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--no-incoming-arrow);
 }
 .card:hover, .card:focus { border-color: var(--focus-border); outline: 2px solid var(--focus-ring); }
+.card.changed::before {
+  content: "";
+  position: absolute;
+  top: .45rem;
+  bottom: .45rem;
+  left: .2rem;
+  width: .3rem;
+  border-radius: .15rem;
+  background: var(--change-mark);
+  box-shadow: 0 0 0 1px var(--surface);
+  pointer-events: none;
+  animation: change-mark-fade 4s ease-in forwards;
+}
+@keyframes change-mark-fade {
+  from { opacity: 1; }
+  60% { opacity: 1; }
+  to { opacity: .35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.changed::before { animation: none; }
+}
 .card.selected { border-color: var(--emphasis); box-shadow: 0 0 0 3px var(--selected-ring), 0 2px 5px var(--selected-shadow); }
 .card-title { display: block; font-weight: 700; margin-bottom: .25rem; }
 .card.related { border-color: var(--emphasis); border-style: dashed; box-shadow: 0 0 0 1px var(--emphasis); }

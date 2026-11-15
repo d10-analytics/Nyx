@@ -54,6 +54,8 @@
   const RAIL_INSET = 20;
   const RAIL_LANE_CAP = 8;
   const POLL_INTERVAL = 10000;
+  // How long the cards an automatic install changed stay marked.
+  const CHANGE_MARK_MS = 4000;
   const CATALOG_ROUTE = "/api/catalog";
   const CHECKOUTS_ROUTE = "/api/checkouts";
   // The card reads the checkout facts document at exactly this schema, and the
@@ -1199,15 +1201,77 @@
     return parts[parts.length - 1] || String(path);
   }
 
+  // Cards an automatic install changed.  A mark is keyed by the card's identity
+  // (its unique Package ID, else its folder path) so a later redraw or a stage
+  // move keeps it; only the timer empties the set.
+  const changeMarks = new Set();
+  let changeMarkTimer = null;
+  let markIndexCatalog = null;
+  let markIndex = null;
+
+  function markKeyOf(entry, ids) {
+    return entry.package_id && ids.get(entry.package_id)
+      ? `id:${entry.package_id}` : `path:${entry.package_path}`;
+  }
+
+  function markKeyInDisplayed(entry) {
+    if (markIndexCatalog !== displayed) {
+      markIndexCatalog = displayed;
+      markIndex = indexByPackageId(displayed.entries);
+    }
+    return markKeyOf(entry, markIndex);
+  }
+
+  function changeMarksBetween(from, to) {
+    const before = indexByPackageId(from.entries);
+    const after = indexByPackageId(to.entries);
+    const byPath = new Map(from.entries.map((entry) => [entry.package_path, entry]));
+    const keys = [];
+    to.entries.forEach((entry) => {
+      const unique = entry.package_id && before.get(entry.package_id) && after.get(entry.package_id);
+      const prior = unique ? before.get(entry.package_id) : byPath.get(entry.package_path);
+      const changed = !prior || prior.stage !== entry.stage || prior.project !== entry.project ||
+        prior.declared.title !== entry.declared.title ||
+        prior.declared.status !== entry.declared.status;
+      if (changed) keys.push(unique ? `id:${entry.package_id}` : `path:${entry.package_path}`);
+    });
+    return keys;
+  }
+
+  function readerIsPresent() {
+    return document.visibilityState === "visible" && document.hasFocus();
+  }
+
+  function stopChangeMarkTimer() {
+    if (changeMarkTimer === null) return;
+    window.clearTimeout(changeMarkTimer);
+    changeMarkTimer = null;
+  }
+
+  function startChangeMarkTimer() {
+    stopChangeMarkTimer();
+    changeMarkTimer = window.setTimeout(() => {
+      changeMarkTimer = null;
+      changeMarks.clear();
+      board.querySelectorAll(".card.changed").forEach((card) => card.classList.remove("changed"));
+    }, CHANGE_MARK_MS);
+  }
+
+  // The reader coming back starts the clock for marks made while they were away.
+  function resumeChangeMarkTimer() {
+    if (changeMarks.size && changeMarkTimer === null && readerIsPresent()) startChangeMarkTimer();
+  }
+
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
+    const changed = changeMarks.has(markKeyInDisplayed(entry));
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
     const targetProject = entry.declared.target_project &&
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
     const facts = cardFactsHtml(entry.package_path);
     cardFactsMarkup.set(entry.package_path, facts);
-    return `<button class="card${selected ? " selected" : ""}" ` +
+    return `<button class="card${selected ? " selected" : ""}${changed ? " changed" : ""}" ` +
       'type="button" ' +
       `aria-pressed="${selected}" data-package-path="${text(entry.package_path)}"` +
       `${idAttribute} data-search="${text(cardSearchText(entry))}">` +
@@ -2854,7 +2918,15 @@
     renderStageOrderEditor();
   }
 
-  function apply(snapshot) {
+  function apply(snapshot, markChanges = false) {
+    if (markChanges && displayed) {
+      const keys = changeMarksBetween(displayed, snapshot);
+      if (keys.length) {
+        keys.forEach((key) => changeMarks.add(key));
+        if (readerIsPresent()) startChangeMarkTimer();
+        else stopChangeMarkTimer();
+      }
+    }
     const priorEditor = editorStageOrder.length ? [...editorStageOrder] : [];
     const retainDraft = priorEditor.length > 0 && hasUnsavedStageOrder();
     displayed = snapshot;
@@ -4743,7 +4815,7 @@
         if (kind === "manual" || kind === "settings" || !displayed) {
           apply(snapshot);
         } else {
-          if (digestOf(snapshot) !== digestOf(displayed)) apply(snapshot);
+          if (digestOf(snapshot) !== digestOf(displayed)) apply(snapshot, kind === "poll");
           if (hadRefreshFailure) {
             syncBoardIssues();
             drawRails();
@@ -4972,9 +5044,15 @@
   }
   window.setInterval(checkNow, POLL_INTERVAL);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") checkNow();
+    if (document.visibilityState === "visible") {
+      resumeChangeMarkTimer();
+      checkNow();
+    }
   });
   window.addEventListener("focus", (event) => {
-    if (event.target === window) checkNow();
+    if (event.target === window) {
+      resumeChangeMarkTimer();
+      checkNow();
+    }
   });
 })();
