@@ -1019,6 +1019,29 @@ window.fetch = function (...args) {
 """
 
 
+# Counts the catalog and Checkouts requests the page starts, synchronously in
+# the fetch call, so a test reads them in the evaluate that caused them.
+FETCH_START_COUNTER = """
+window.fetchStarts = {catalog: 0, checkouts: 0};
+const nyxCountFetch = window.fetch;
+window.fetch = function (...args) {
+  const route = String(args[0]);
+  if (route.includes("/api/checkouts") && !route.includes("remote-check")) {
+    window.fetchStarts.checkouts++;
+  }
+  if (route.includes("/api/catalog")) window.fetchStarts.catalog++;
+  return nyxCountFetch(...args);
+};
+"""
+
+
+def return_check(page):
+    """Dispatch the window focus event and wait for the catalog response it starts."""
+    with page.expect_response("**/api/catalog", timeout=5000) as response:
+        page.evaluate("() => window.dispatchEvent(new Event('focus'))")
+    response.value.finished()
+
+
 def wait_for_responses(page, recorder, count):
     """Wait until the page has received ``count`` responses on one route."""
     page.wait_for_function(f"() => window.{recorder}.length >= {count}", timeout=5000)
@@ -5356,6 +5379,69 @@ def test_checkouts_client_requests_at_load_and_once_per_tick(open_page, real_che
     assert double.calls == 1
     fire_checkouts_poll(page)
     assert double.calls == 2
+
+
+def test_return_to_page_checks_at_once_and_element_focus_does_not(open_page):
+    page = open_page(
+        StaticClient(board_payload()),
+        settings=BrowserSettings(),
+        fake_clock=True,
+        init_script=FETCH_START_COUNTER + RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "catalogResponses", 1)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    observe_removed_cards(page)
+
+    def settle(catalog, checkouts):
+        wait_for_responses(page, "catalogResponses", catalog)
+        wait_for_responses(page, "checkoutsResponses", checkouts)
+        # The response body is read and rendered in later tasks; wait them out
+        # so the next check does not find the previous request still running.
+        for _ in range(5):
+            settle_frames(page)
+
+    def starts(script):
+        before = page.evaluate("() => ({...window.fetchStarts})")
+        after = page.evaluate(script)
+        return {key: after[key] - before[key] for key in after}
+
+    # The count is read in the evaluate that dispatches, so absence needs no wait.
+    dispatch_focus = """() => {
+      window.dispatchEvent(new Event("focus"));
+      return {...window.fetchStarts};
+    }"""
+    assert starts(dispatch_focus) == {"catalog": 1, "checkouts": 1}
+    settle(2, 2)
+    assert starts("""() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      return {...window.fetchStarts};
+    }""") == {"catalog": 1, "checkouts": 1}
+    settle(3, 3)
+    assert starts("""() => {
+      Object.defineProperty(document, "visibilityState", {configurable: true, get: () => "hidden"});
+      try {
+        document.dispatchEvent(new Event("visibilitychange"));
+      } finally {
+        delete document.visibilityState;
+      }
+      return {...window.fetchStarts};
+    }""") == {"catalog": 0, "checkouts": 0}
+    assert starts("""() => {
+      document.querySelector(".card").focus();
+      return {...window.fetchStarts};
+    }""") == {"catalog": 0, "checkouts": 0}
+    assert starts("""() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+      return {...window.fetchStarts};
+    }""") == {"catalog": 1, "checkouts": 1}
+    settle(4, 4)
+    # An unchanged catalog is a poll, never a re-apply: no card node was replaced.
+    assert page.evaluate("window.removedCards") == 0
+    return_check(page)
+    settle(5, 5)
+    assert page.evaluate("window.removedCards") == 0
 
 
 def test_checkouts_tick_is_skipped_while_one_request_is_in_flight(open_page, real_checkouts):
