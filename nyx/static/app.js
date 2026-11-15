@@ -2074,6 +2074,7 @@
     }
     rows.push(panelRowHtml(codeWords("column", "branch"),
       wordText("packageBranchStatus", item.branch.status, {name: item.branch.name}), "panel-branch"));
+    let foldedPrerequisites = "";
     if (item.prerequisites !== null && item.prerequisites !== undefined) {
       const itemsHtml = panelPrerequisiteItemsHtml(item.prerequisites);
       const green = prerequisitesTone(item.prerequisites) === "green";
@@ -2081,8 +2082,8 @@
         prerequisitesPillHtml(item.prerequisites) + (green ? "" : itemsHtml),
         "panel-prerequisites"));
       if (green && itemsHtml !== "") {
-        folded.push(panelRowHtml(codeWords("text", "panelEachPrerequisite"), itemsHtml,
-          "panel-each-prerequisite"));
+        foldedPrerequisites = panelRowHtml(codeWords("text", "panelEachPrerequisite"), itemsHtml,
+          "panel-each-prerequisite");
       }
     }
     const attention = document.attention.filter((candidate) =>
@@ -2116,6 +2117,7 @@
     }
     folded.push(panelRowHtml(codeWords("text", "panelBaseline"),
       baselineWords(document, item), "panel-baseline"));
+    if (foldedPrerequisites !== "") folded.push(foldedPrerequisites);
     const legendHtml = panelBaselineLegendHtml(item);
     if (legendHtml !== "") {
       folded.push(panelRowHtml(codeWords("text", "panelBaselineLegend"), legendHtml,
