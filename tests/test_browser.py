@@ -6739,6 +6739,18 @@ def test_checkouts_view_starts_in_board_without_a_known_value(
     playwright.expect(page.locator("#checkouts")).to_be_hidden()
 
 
+def resting_mark_opacities(page):
+    """Opacity of every mark once its animation has finished.
+
+    The mark's colour is contrast-checked at full strength, so a resting
+    opacity below 1 would put the visible mark under that contrast.
+    """
+    return page.locator(".card.changed").evaluate_all("""cards => cards.map(card => {
+        card.getAnimations({subtree: true}).forEach(animation => animation.finish());
+        return Number(getComputedStyle(card, '::before').opacity);
+    })""")
+
+
 def test_change_marks_follow_poll_installs_only(open_page):
     """Cards a poll install changed carry a mark that one timer clears in place."""
     added_id = "123e4567-e89b-42d3-a456-426614174520"
@@ -6832,11 +6844,13 @@ def test_change_marks_follow_poll_installs_only(open_page):
     assert page.locator(f'.card[data-package-id="{relation_id}"]').get_attribute("class") == "card"
     assert page.locator(".card.changed").first.evaluate(
         "card => getComputedStyle(card, '::before').animationName") != "none"
+    assert resting_mark_opacities(page) == [1.0] * len(marked_ids)
 
     # (3) A redraw from the toolbar keeps the same marks.
     page.locator("#hide-terminal-rows").click()
     page.locator("#hide-terminal-rows").click()
     assert marked() == marked_ids
+    assert resting_mark_opacities(page) == [1.0] * len(marked_ids)
 
     # (4) A later install adds to the marks; the timer restarts with it and the
     # clear removes the class without redrawing a card.
