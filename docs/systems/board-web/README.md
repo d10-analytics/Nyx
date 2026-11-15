@@ -21,8 +21,8 @@ README is narrative only.
 - Installs a changed catalog itself at the next ten-second check, or at once
   when the page becomes visible or the window regains focus, with no button and
   no pending state. It keeps the reader's place across an install: the selected
-  card and its panel, keyboard focus on a card that still exists, the position of
-  the focused or selected card when it keeps its row and column, the window
+  card and its panel, keyboard focus on a card that still exists or inside the
+  work item panel, the position of the focused or selected card when it keeps its row and column, the window
   scroll, the search and the Board settings draft, and it marks the new or
   changed cards for a few seconds.
 - Shows the work item panel beside the board, filled by a left or right click
