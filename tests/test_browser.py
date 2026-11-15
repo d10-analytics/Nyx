@@ -2848,6 +2848,238 @@ def test_successive_polls_install_each_changed_catalog(open_page):
     assert page.locator("#refresh").count() == 0
 
 
+def reader_place_payload():
+    """A board wide and tall enough to scroll on both axes at 800 x 420."""
+    value = json.loads(board_payload())
+    _admit_inventory_stage(value, "Alpha", "Review")
+    value["entries"].append(_entry(
+        "123e4567-e89b-42d3-a456-426614174099",
+        "Alpha/Review/new", "under_development", "New review", "Alpha",
+    ))
+    for index in range(6):
+        project = f"Wide {index}"
+        _admit_inventory_stage(value, project, "Under_Development")
+        value["entries"].append(_entry(
+            f"123e4567-e89b-42d3-a456-4266141742{index:02d}",
+            f"{project}/Under_Development/item", "under_development",
+            f"Wide item {index}", project,
+        ))
+    for index in range(14):
+        value["entries"].append(_entry(
+            f"123e4567-e89b-42d3-a456-4266141743{index:02d}",
+            f"Alpha/Under_Development/f{index:02d}", "under_development",
+            f"Filler {index:02d}", "Alpha",
+        ))
+    value["inventory"]["projects"].sort(key=lambda item: item["name"])
+    value["inventory"]["stages"].sort(key=lambda item: (item["project"], item["stage"]))
+    value["entries"].sort(key=lambda entry: entry["package_path"])
+    return value
+
+
+def reader_place_variant(base, *, add=(), remove=(), change=None, diagnostic=False):
+    """One resealed copy of ``base`` with entries added, removed or changed."""
+    value = copy.deepcopy(base)
+    value["entries"] = [
+        entry for entry in value["entries"] if entry["package_path"] not in remove
+    ]
+    for entry in value["entries"]:
+        if entry["package_path"] in (change or {}):
+            change[entry["package_path"]](entry)
+    value["entries"].extend(add)
+    value["entries"].sort(key=lambda entry: entry["package_path"])
+    if diagnostic:
+        value["discovery_diagnostics"] = [
+            {"code": "discovery_unavailable", "message": "discovery failure"}
+        ]
+    return _reseal(value)
+
+
+def test_reader_place_survives_installs_and_redraws(open_page):
+    """An install keeps the focused or selected card where the reader sees it."""
+    k_id = "123e4567-e89b-42d3-a456-426614174350"
+    k_path = "Alpha/Under_Development/f07"
+
+    def make_k(entry):
+        entry["package_id"] = k_id
+        entry["declared"]["title"] = "Keystone"
+
+    def move_k(path, title="Keystone"):
+        def move(entry):
+            entry["package_path"] = path
+            entry["stage"] = path.split("/")[1]
+            entry["declared"]["title"] = title
+        return move
+
+    base = reader_place_payload()
+    for entry in base["entries"]:
+        if entry["package_path"] == k_path:
+            make_k(entry)
+    _reseal(base)
+    above = _entry(
+        "123e4567-e89b-42d3-a456-426614174351",
+        "Alpha/Under_Development/f00-added", "under_development", "Added above", "Alpha",
+    )
+    with_above = reader_place_variant(base, add=[above])
+    moved = reader_place_variant(
+        with_above, change={k_path: move_k("Alpha/Queue/f07")},
+    )
+    retitled = reader_place_variant(
+        moved, change={"Alpha/Queue/f07": move_k("Alpha/Queue/f07", "Renamed")},
+    )
+    other = _entry(k_id, "Alpha/Under_Development/f03-copy", "under_development",
+                   "Copy", "Alpha")
+    duplicated = reader_place_variant(
+        retitled, add=[other], change={"Alpha/Queue/f07": move_k("Alpha/Review/f07", "Renamed")},
+    )
+    unduplicated = reader_place_variant(
+        duplicated, remove=["Alpha/Under_Development/f03-copy"],
+        change={"Alpha/Review/f07": move_k("Alpha/Review/f07", "Renamed again")},
+    )
+    removed = reader_place_variant(unduplicated, remove=["Alpha/Under_Development/f10"])
+    flagged = reader_place_variant(removed, diagnostic=True)
+    changed = reader_place_variant(flagged, remove=["Alpha/Under_Development/f12"])
+    settings = BrowserSettings(order=["Queue", "Under_Development", "Review"])
+    client = SequenceClient([base])
+    page = open_page(client, settings=settings, fake_clock=True)
+    page.set_viewport_size({"width": 800, "height": 420})
+    playwright.expect(page.locator("#stage-order-status")).to_have_text(
+        "Current board settings loaded.")
+    page.evaluate("""() => {
+        window.boardRedraws = 0;
+        new MutationObserver((records) => {
+            if (records.some((record) => record.addedNodes.length)) window.boardRedraws++;
+        }).observe(document.querySelector('#board'), {childList: true});
+    }""")
+
+    def card(path):
+        return page.locator(f'.card[data-package-path="{path}"]')
+
+    def place(path):
+        return card(path).evaluate("""node => {
+            const rect = node.getBoundingClientRect();
+            return {top: rect.top, left: rect.left, scrollX: window.scrollX,
+                    scrollY: window.scrollY, focused: node === document.activeElement,
+                    selected: node.classList.contains('selected')};
+        }""")
+
+    def scroll_now():
+        return page.evaluate("({x: window.scrollX, y: window.scrollY})")
+
+    def focused_card():
+        return page.evaluate("Boolean(document.activeElement.closest('.card'))")
+
+    def redraws():
+        return page.evaluate("window.boardRedraws")
+
+    def wait_for_redraws(count):
+        page.wait_for_function(f"() => window.boardRedraws >= {count}", timeout=5000)
+
+    # Scroll both axes, then select and focus Keystone.
+    card(k_path).click()
+    card(k_path).evaluate("node => node.focus({preventScroll: true})")
+    page.evaluate("window.scrollTo(260, 330)")
+    before = place(k_path)
+    assert before["scrollX"] > 0 and before["scrollY"] > 0
+    assert before["focused"] and before["selected"]
+
+    # (1) A card installed above Keystone in its cell does not move it.
+    client.payloads = [with_above]
+    fire_poll(page)
+    added = card("Alpha/Under_Development/f00-added")
+    playwright.expect(added).to_have_count(1)
+    assert added.evaluate(
+        "node => node.compareDocumentPosition(document.querySelector("
+        f"'.card[data-package-path=\"{k_path}\"]')) & Node.DOCUMENT_POSITION_FOLLOWING")
+    after = place(k_path)
+    assert after["focused"]
+    assert abs(after["top"] - before["top"]) <= 1
+    assert abs(after["left"] - before["left"]) <= 1
+
+    # (2) The second redraw, from settings changed elsewhere, holds it too.
+    settings.order = ["Queue", "Review", "Under_Development"]
+    settings.revision = "revision-2"
+    marks = redraws()
+    client.payloads = [with_above]
+    fire_poll(page)
+    wait_for_redraws(marks + 2)
+    playwright.expect(page.locator(".row-head")).to_have_text(
+        ["Queue", "Review", "Under Development"])
+    playwright.expect(page.locator("#stage-order-status")).to_have_text(
+        "Current board settings loaded.")
+    after = place(k_path)
+    assert after["focused"]
+    assert abs(after["top"] - before["top"]) <= 1
+    assert abs(after["left"] - before["left"]) <= 1
+
+    # (3) A stage move keeps the card selected and focused and the scroll.
+    scroll = scroll_now()
+    client.payloads = [moved]
+    fire_poll(page)
+    moved_path = "Alpha/Queue/f07"
+    playwright.expect(card(moved_path)).to_have_count(1)
+    assert card(k_path).count() == 0
+    after = place(moved_path)
+    assert after["focused"] and after["selected"]
+    assert page.locator("#work-item-panel-heading").inner_text() == "Keystone"
+    now = scroll_now()
+    assert abs(now["x"] - scroll["x"]) <= 1 and abs(now["y"] - scroll["y"]) <= 1
+
+    # (4) A card the search no longer matches is not focused; the text stays.
+    page.fill("#filter", "keystone")
+    card(moved_path).evaluate("node => node.focus({preventScroll: true})")
+    client.payloads = [retitled]
+    fire_poll(page)
+    playwright.expect(card(moved_path)).to_be_hidden()
+    assert not focused_card()
+    assert page.locator("#filter").input_value() == "keystone"
+    page.fill("#filter", "")
+    assert card(moved_path).get_attribute("aria-pressed") == "true"
+
+    # (5) A moved card whose ID another card now shares loses selection and focus.
+    card(moved_path).evaluate("node => node.focus({preventScroll: true})")
+    scroll = scroll_now()
+    client.payloads = [duplicated]
+    fire_poll(page)
+    playwright.expect(card("Alpha/Review/f07")).to_have_count(1)
+    assert page.locator(".card.selected").count() == 0
+    assert page.locator("#work-item-panel-heading").inner_text() == (
+        "Click a work item to show its details here.")
+    assert not focused_card()
+    now = scroll_now()
+    assert abs(now["x"] - scroll["x"]) <= 1 and abs(now["y"] - scroll["y"]) <= 1
+
+    # (6) A removed card clears the selection and leaves the scroll alone.
+    client.payloads = [unduplicated]
+    fire_poll(page)
+    card("Alpha/Under_Development/f10").click()
+    assert card("Alpha/Under_Development/f10").get_attribute("aria-pressed") == "true"
+    page.evaluate("document.activeElement.blur()")
+    scroll = scroll_now()
+    assert scroll["y"] > 0
+    client.payloads = [removed]
+    fire_poll(page)
+    playwright.expect(card("Alpha/Under_Development/f10")).to_have_count(0)
+    assert page.locator(".card.selected").count() == 0
+    assert page.locator("#work-item-panel-heading").inner_text() == (
+        "Click a work item to show its details here.")
+    assert abs(scroll_now()["y"] - scroll["y"]) <= 1
+
+    # (7) Focus on the issues summary survives an install that keeps the issue.
+    client.payloads = [flagged]
+    fire_poll(page)
+    summary = page.locator("#board-issues summary")
+    playwright.expect(summary).to_have_count(1)
+    summary.evaluate("node => node.focus({preventScroll: true})")
+    handle = summary.element_handle()
+    page.evaluate("window.scrollTo(0, 200)")
+    scroll = scroll_now()
+    client.payloads = [changed]
+    fire_poll(page)
+    playwright.expect(card("Alpha/Under_Development/f12")).to_have_count(0)
+    assert handle.evaluate("node => node.isConnected && node === document.activeElement")
+    assert abs(scroll_now()["y"] - scroll["y"]) <= 1
+
+
 def observe_removed_cards(page):
     page.evaluate("""() => {
       window.removedCards = 0;
@@ -6494,8 +6726,19 @@ def test_checkouts_view_installs_the_catalog_for_the_board(
     double = BrowserCheckouts(real_checkouts.document_zero)
     client = SequenceClient([real_checkouts.catalog, changed])
     page = checkouts_view_page(open_page, real_checkouts, double, client=client)
+    # The install leaves the Checkouts window scroll and focused control alone.
+    page.set_viewport_size({"width": 800, "height": 160})
+    control = page.locator("#checkouts").locator(
+        "button, summary, a[href], input, select").first
+    control.evaluate("node => node.focus({preventScroll: true})")
+    page.evaluate("window.scrollTo(0, 40)")
+    scroll = page.evaluate("({x: window.scrollX, y: window.scrollY})")
+    assert scroll["y"] > 0
+    focused = control.element_handle()
     fire_checkouts_poll(page)
     settle_frames(page)
+    assert page.evaluate("window.scrollY") == scroll["y"]
+    assert focused.evaluate("node => node === document.activeElement")
     # The switch never names a waiting update, and no button exists.
     playwright.expect(page.locator("#view-board")).to_have_text("Board")
     assert page.locator("#refresh").count() == 0
