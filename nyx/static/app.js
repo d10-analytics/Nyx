@@ -413,6 +413,10 @@
       "panelPrerequisites": "Prerequisites",
       "prerequisiteUnreadable": "A prerequisite that cannot be read",
       "panelBaselineLine": "Baseline line",
+      "panelBaselineLegend": "Baseline line legend",
+      "panelEachPrerequisite": "Each prerequisite",
+      "panelAllFields": "All fields ({count})",
+      "panelPackageId": "Package ID",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
       "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
@@ -529,6 +533,9 @@
   // The panel markup last written, so a refresh that changes nothing the panel
   // shows leaves its focus and scroll position alone.
   let panelMarkup = null;
+  // Whether the reader left the All fields disclosure open; kept for the life
+  // of the page and never stored.
+  let allFieldsOpen = false;
   // The interactive index of the rendered board, kept for the panel's
   // relationship lists.
   let boardById = new Map();
@@ -1262,13 +1269,18 @@
     if (changeMarks.size && changeMarkTimer === null && readerIsPresent()) startChangeMarkTimer();
   }
 
+  // The declared target folder when it differs from the project, else "".
+  function differingTargetFolder(entry) {
+    return entry.declared.target_project &&
+      entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
+  }
+
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
     const changed = changeMarks.has(markKeyInDisplayed(entry));
     const idAttribute = entry.package_id
       ? ` data-package-id="${text(entry.package_id)}"` : "";
-    const targetProject = entry.declared.target_project &&
-      entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
+    const targetProject = differingTargetFolder(entry);
     const facts = cardFactsHtml(entry.package_path);
     cardFactsMarkup.set(entry.package_path, facts);
     return `<button class="card${selected ? " selected" : ""}${changed ? " changed" : ""}" ` +
@@ -2002,16 +2014,22 @@
     ["count by M", "commits the checkout is behind main"],
   ];
 
-  // The baseline line of one work item as the card draws it, with its words
-  // and its legend; nothing when the checkout cannot be placed.
+  // The baseline line of one work item as the card draws it, with its words;
+  // nothing when the checkout cannot be placed.
   function panelBaselineLineHtml(item) {
     const model = baselineLineModel(item.baseline, item.prerequisites);
     if (model === null) return "";
+    return `${baselineLineHtml(item.baseline, item.prerequisites)}` +
+      `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>`;
+  }
+
+  // The legend of the baseline line, one entry per convention the strip uses;
+  // nothing when the checkout cannot be placed.
+  function panelBaselineLegendHtml(item) {
+    if (baselineLineModel(item.baseline, item.prerequisites) === null) return "";
     const legend = BASELINE_LEGEND.map(([name, meaning]) =>
       `<li><b>${text(name)}</b> ${text(meaning)}</li>`).join("");
-    return `${baselineLineHtml(item.baseline, item.prerequisites)}` +
-      `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>` +
-      `<ul class="panel-baseline-legend">${legend}</ul>`;
+    return `<ul class="panel-baseline-legend">${legend}</ul>`;
   }
 
   // One line per prerequisite: the title of the one catalog entry with its
@@ -2032,22 +2050,40 @@
   }
 
   // The checkout facts of one work item, read from the served document as the
-  // Checkouts view reads them; nothing while no document can be shown.
+  // Checkouts view reads them: the visible Code section and the rows folded
+  // under All fields.  Both are empty while no document can be shown.
   function panelCodeHtml(entry) {
+    const none = {section: "", folded: []};
     const document = servedCheckoutsDocument();
-    if (document === null) return "";
+    if (document === null) return none;
     const item = document.packages.find((candidate) =>
       candidate.package_path === entry.package_path);
-    if (item === undefined) return "";
+    if (item === undefined) return none;
     const rows = [];
+    const folded = [];
     if (item.code_status !== null && item.code_status !== undefined) {
       rows.push(panelRowHtml(codeWords("text", "panelCodeStatus"),
         codeStatusPillHtml(item.code_status), "panel-code-status"));
     }
+    const targetRow = panelRowHtml(codeWords("text", "panelTarget"), packageTargetWords(item.target),
+      "panel-target");
+    if (item.target.status === "clone" || item.target.status === "worktree") {
+      folded.push(targetRow);
+    } else {
+      rows.push(targetRow);
+    }
+    rows.push(panelRowHtml(codeWords("column", "branch"),
+      wordText("packageBranchStatus", item.branch.status, {name: item.branch.name}), "panel-branch"));
     if (item.prerequisites !== null && item.prerequisites !== undefined) {
+      const itemsHtml = panelPrerequisiteItemsHtml(item.prerequisites);
+      const green = prerequisitesTone(item.prerequisites) === "green";
       rows.push(panelRowHtml(codeWords("text", "panelPrerequisites"),
-        prerequisitesPillHtml(item.prerequisites) + panelPrerequisiteItemsHtml(item.prerequisites),
+        prerequisitesPillHtml(item.prerequisites) + (green ? "" : itemsHtml),
         "panel-prerequisites"));
+      if (green && itemsHtml !== "") {
+        folded.push(panelRowHtml(codeWords("text", "panelEachPrerequisite"), itemsHtml,
+          "panel-each-prerequisite"));
+      }
     }
     const attention = document.attention.filter((candidate) =>
       candidate.packages.includes(entry.package_path));
@@ -2057,21 +2093,6 @@
           `<span class="panel-attention" data-code="${text(candidate.code)}">${attentionWords(candidate)}</span>`)
           .join("<br>"), "panel-attention-row"));
     }
-    rows.push(panelRowHtml(codeWords("text", "panelTarget"), packageTargetWords(item.target),
-      "panel-target"));
-    rows.push(panelRowHtml(codeWords("column", "branch"),
-      wordText("packageBranchStatus", item.branch.status, {name: item.branch.name}), "panel-branch"));
-    const served = packageBranchOf(document, entry.package_path);
-    if (served !== null) {
-      rows.push(panelRowHtml(codeWords("column", "remoteCopy"),
-        remoteCopyWords(document, served.group, served.entry.remote), "panel-remote-copy"));
-      rows.push(panelRowHtml(codeWords("column", "verdict"),
-        verdictWords(document, served.group, served.entry), "panel-verdict"));
-      rows.push(panelRowHtml(codeWords("column", "pullRequests"),
-        pullRequestsWords(document, served.group, served.entry), "panel-pulls"));
-    }
-    rows.push(panelRowHtml(codeWords("text", "panelBaseline"),
-      baselineWords(document, item), "panel-baseline"));
     const lineHtml = panelBaselineLineHtml(item);
     if (lineHtml !== "") {
       rows.push(panelRowHtml(codeWords("text", "panelBaselineLine"), lineHtml,
@@ -2083,35 +2104,57 @@
       rows.push(panelRowHtml(codeWords("text", "panelElsewhere"),
         elsewhere.map((path) => text(checkoutName(path))).join(" · "), "panel-elsewhere"));
     }
-    return '<section class="panel-section panel-code">' +
-      `<h3>${text(codeWords("text", "panelCodeHeading"))}</h3><dl>${rows.join("")}</dl></section>`;
+    // The folded rows keep the order the disclosure shows them in.
+    const served = packageBranchOf(document, entry.package_path);
+    if (served !== null) {
+      folded.push(panelRowHtml(codeWords("column", "remoteCopy"),
+        remoteCopyWords(document, served.group, served.entry.remote), "panel-remote-copy"));
+      folded.push(panelRowHtml(codeWords("column", "verdict"),
+        verdictWords(document, served.group, served.entry), "panel-verdict"));
+      folded.push(panelRowHtml(codeWords("column", "pullRequests"),
+        pullRequestsWords(document, served.group, served.entry), "panel-pulls"));
+    }
+    folded.push(panelRowHtml(codeWords("text", "panelBaseline"),
+      baselineWords(document, item), "panel-baseline"));
+    const legendHtml = panelBaselineLegendHtml(item);
+    if (legendHtml !== "") {
+      folded.push(panelRowHtml(codeWords("text", "panelBaselineLegend"), legendHtml,
+        "panel-baseline-legend-row"));
+    }
+    return {
+      section: '<section class="panel-section panel-code">' +
+        `<h3>${text(codeWords("text", "panelCodeHeading"))}</h3><dl>${rows.join("")}</dl></section>`,
+      folded,
+    };
   }
 
   function panelHtml(entry) {
-    const rows = [
-      panelRowHtml("Stage", text(stageLabelOf(entry.stage))),
-      panelRowHtml("Project", text(projectOf(entry))),
-      panelRowHtml("Filepath", `<span class="panel-path">${text(entry.package_path)}</span>`,
-        "panel-filepath"),
-    ];
-    if (entry.declared.target_project) {
-      rows.push(panelRowHtml("Target Folder", text(entry.declared.target_project), "panel-project"));
-    }
+    const rows = [];
+    const targetFolder = differingTargetFolder(entry);
+    if (targetFolder) rows.push(panelRowHtml("Target Folder", text(targetFolder), "panel-project"));
     if (entry.declared.status) rows.push(panelRowHtml("Status", text(entry.declared.status)));
     if (entry.relationship.program.title) {
       rows.push(panelRowHtml("Program", text(entry.relationship.program.title)));
     }
-    entry.reported_fields.forEach((field) => {
-      rows.push(panelRowHtml(field.name, text(field.value), "panel-reported"));
-    });
+    const code = panelCodeHtml(entry);
+    const all = entry.reported_fields.map((field) =>
+      panelRowHtml(field.name, text(field.value), "panel-reported"));
     if (entry.package_id) {
-      rows.push(panelRowHtml("Package ID", `<span class="panel-path">${text(entry.package_id)}</span>`));
+      all.push(panelRowHtml(codeWords("text", "panelPackageId"),
+        `<span class="panel-path">${text(entry.package_id)}</span>`));
     }
+    all.push(...code.folded);
+    // The open state is never written here: a toggle must not rewrite the panel.
+    const disclosure = all.length
+      ? '<details class="panel-all-fields"><summary>' +
+        `${text(codeWords("text", "panelAllFields").replace("{count}", String(all.length)))}` +
+        `</summary><dl>${all.join("")}</dl></details>` : "";
     return `<h2 id="work-item-panel-heading" class="panel-title" tabindex="-1">${text(titleOf(entry))}</h2>` +
-      `<dl class="panel-section panel-fields">${rows.join("")}</dl>` +
+      `<p class="panel-path-line">${text(entry.package_path)}</p>` +
+      (rows.length ? `<dl class="panel-section panel-fields">${rows.join("")}</dl>` : "") +
       panelLinksHtml(entry, "Needs", prerequisiteLinks(entry, boardById)) +
       panelLinksHtml(entry, "Blocks", dependentLinks(entry, boardDependents)) +
-      panelCodeHtml(entry);
+      code.section + disclosure;
   }
 
   // The panel shows the selected card, or says how to fill it.  It is written
@@ -2122,8 +2165,12 @@
       ? '<p id="work-item-panel-heading" class="panel-empty">Click a work item to show its details here.</p>'
       : panelHtml(entry);
     if (html === panelMarkup) return;
+    const live = workItemPanelBody.querySelector("details.panel-all-fields");
+    if (live !== null) allFieldsOpen = live.open;
     panelMarkup = html;
     workItemPanelBody.innerHTML = html;
+    const drawn = workItemPanelBody.querySelector("details.panel-all-fields");
+    if (drawn !== null) drawn.open = allFieldsOpen;
   }
 
   // The panel belongs to the board: it is shown with it, and the board keeps
