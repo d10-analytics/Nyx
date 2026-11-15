@@ -1042,6 +1042,16 @@ def return_check(page):
     response.value.finished()
 
 
+def install_now(page):
+    """Run the return check, wait for its catalog response and let it settle.
+
+    The response is installed by the page's continuation, so a test reads the
+    board only after the frames that flush it.
+    """
+    return_check(page)
+    settle_frames(page)
+
+
 def wait_for_responses(page, recorder, count):
     """Wait until the page has received ``count`` responses on one route."""
     page.wait_for_function(f"() => window.{recorder}.length >= {count}", timeout=5000)
@@ -1214,6 +1224,52 @@ def test_card_copy_failure_shows_error_beside_card(open_page, tmp_path):
     playwright.expect(popup).to_have_text(
         "Clipboard access was denied; directory path was not copied."
     )
+
+
+def test_card_copy_without_a_workspace_says_try_again(open_page, tmp_path):
+    class WorkspaceFailsOnce(BrowserSettings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.workspace_reads = 0
+            self.first_read = threading.Event()
+
+        def get_workspace(self):
+            self.workspace_reads += 1
+            if self.workspace_reads == 1:
+                self.first_read.set()
+                raise CatalogError("settings_unavailable")
+            return super().get_workspace()
+
+    settings = WorkspaceFailsOnce(root=tmp_path)
+    page = open_page(
+        StaticClient(board_payload()),
+        settings=settings,
+        init_script="""window.copied = [];
+        Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: {writeText: (text) => { window.copied.push(text); return Promise.resolve(); }}
+        });""",
+    )
+    assert settings.first_read.wait(timeout=5)
+    settle_frames(page)
+    assert settings.workspace_reads == 1
+    card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
+    relative = card.get_attribute("data-package-path")
+    popup = page.locator("#copy-status")
+    with page.expect_response("**/api/workspace") as workspace:
+        card.click(button="right")
+    playwright.expect(popup).to_have_text(
+        "Full directory path is unavailable. Try again in a moment."
+    )
+    playwright.expect(popup).to_have_class(re.compile(r"\berror\b"))
+    workspace.value.finished()
+    assert settings.workspace_reads == 2
+    assert page.evaluate("window.copied") == []
+    # The catalog is unchanged; only the fresh read made the second attempt work.
+    card.click(button="right")
+    playwright.expect(popup).to_have_text("Full directory path copied.")
+    assert page.evaluate("window.copied") == [str(tmp_path / relative)]
+    assert settings.workspace_reads == 2
 
 
 def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_targets(open_page):
@@ -1583,13 +1639,13 @@ def test_browser_admits_every_python_valid_typed_edge_reason(open_page):
         values.append(value)
     client = SequenceClient([board_payload()] + values)
     page = open_page(client, fake_clock=True)
-    # Freeze the page timers so no poll can interleave with the refresh clicks.
+    # Freeze the page timers so only the explicit polls fire.
     # pause_at takes seconds, so one second ahead of the page's current time.
     page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
     assert client.calls == 1, "pausing the clock must not fire a poll"
     gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
     for kind, reason in reasons:
-        page.locator("#refresh").click()
+        fire_poll(page)
         playwright.expect(gate_title).to_have_text(f"Gate {kind} {reason}", timeout=5000)
         assert page.locator("#board-issues").count() == 0, f"{kind} {reason}"
     assert client.calls == len(reasons) + 1
@@ -1637,7 +1693,7 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         client = BlockingRawSequenceClient([valid, invalid], blocked_call=2)
         page = open_page(client)
-        page.get_by_role("button", name="Refresh view").click()
+        page.evaluate("() => window.dispatchEvent(new Event('focus'))")
         assert client.started.wait(timeout=5)
         assert page.locator("#board .card").count() == 4
         assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
@@ -1976,7 +2032,7 @@ def test_filter_hides_non_matching_cards_and_their_rails(open_page):
     assert page.locator(".rail-layer .rail").count() == 3
 
 
-def test_poll_exposes_one_pending_update_until_applied(open_page):
+def test_poll_installs_a_changed_catalog_at_the_interval(open_page):
     first = board_payload()
     second = board_payload(titles={"step_one": "Renamed foundation"})
     client = SequenceClient([first, second])
@@ -1991,7 +2047,9 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
         "     window.__pollRegisteredAt = performance.now();"
         "   return real(...args); }; })();"
     )
-    page = open_page(client, fake_clock=True, init_script=record_registration)
+    page = open_page(
+        client, fake_clock=True, init_script=record_registration + FETCH_START_COUNTER,
+    )
     # Pause page time (pause_at takes seconds) so the bounds do not depend on
     # real time; frames do not run while paused, so only fast_forward advances.
     page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
@@ -2000,22 +2058,25 @@ def test_poll_exposes_one_pending_update_until_applied(open_page):
     now = page.evaluate("performance.now()")
     assert now - registered < 9_000, f"launch took {now - registered} ms past registration"
     # No poll before the documented interval has elapsed since registration.
-    # Stop 100 ms short of 9 s so a poll due exactly at 9 s is not a race, and
-    # give any request a poll fired in that span real time to reach the server.
+    # Stop 100 ms short of 9 s so a poll due exactly at 9 s is not a race. The
+    # start counter is synchronous in the fetch call, so it shows without a
+    # real-clock wait that no request started in that span.
     page.clock.fast_forward(registered + 8_900 - now)
-    page.wait_for_timeout(250)
+    assert page.evaluate("window.fetchStarts.catalog") == 1
     assert client.calls == 1
-    # A poll arrives by 10.4 s after registration.
-    with page.expect_response("**/api/catalog", timeout=3000):
+    # A poll arrives by 10.4 s after registration and installs its catalog.
+    with page.expect_response("**/api/catalog", timeout=3000) as response:
         page.clock.fast_forward(1_500)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
+    response.value.finished()
+    assert page.evaluate("window.fetchStarts.catalog") == 2
     assert client.calls == 2
-    assert page.locator("#refresh").inner_text() == "Apply update"
-    assert "Foundation step" in page.locator("#board").inner_text()
-    page.click("#refresh")
-    page.wait_for_selector("#board .card", timeout=15000)
-    assert "Renamed foundation" in page.locator("#board").inner_text()
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    # Frames do not run while the clock is paused, so wait on the DOM itself.
+    page.wait_for_function(
+        "() => document.querySelector('#board').textContent.includes('Renamed foundation')",
+        timeout=5000,
+    )
+    assert "Foundation step" not in page.locator("#board").inner_text()
+    assert page.locator("#refresh").count() == 0
 
 
 def test_saved_stage_order_projects_rows_without_phantom_or_catalog_changes(open_page):
@@ -2064,17 +2125,17 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     open_stage_editor(page)
     assert row_labels(page) == ["Queue", "Under Development"]
 
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
     assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
     assert page.get_by_role("button", name="Save").is_disabled()
     assert settings.calls == []
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
     assert row_labels(page) == ["Under Development", "Review"]
     assert page.locator("[data-lifecycle='Queue']").count() == 0
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function(
         "() => document.querySelector('.row-head')?.firstChild.textContent === 'Queue'"
     )
@@ -2083,13 +2144,13 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     assert stage_editor_order(page) == ["Queue", "Under_Development"]
     assert page.get_by_role("button", name="Save").is_disabled()
     assert settings.calls == []
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.locator("#board .board-empty").wait_for()
     assert row_labels(page) == []
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
     assert settings.order == ["Queue", "Under_Development"]
@@ -2111,7 +2172,7 @@ def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
     page.locator("#stage-order-editor").wait_for()
     open_stage_editor(page)
 
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
     page.get_by_role("button", name="Move Review up").press("Enter")
@@ -2119,7 +2180,7 @@ def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
     assert page.get_by_role("button", name="Save").is_enabled()
     assert settings.calls == []
 
-    page.get_by_role("button", name="Refresh view").click()
+    return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
     assert row_labels(page) == ["Queue", "Under Development"]
     assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
@@ -2318,18 +2379,21 @@ def test_stage_editor_focus_survives_held_settings_requests(open_page):
     assert_focus_sampler_clean(retry_page)
 
 
-def test_manual_refresh_keeps_focus_outside_stage_editor(open_page):
+def test_install_keeps_focus_outside_the_board(open_page):
     settings = BrowserSettings()
-    page = open_page(StaticClient(board_payload()), settings=settings)
+    client = SequenceClient([
+        board_payload(), board_payload(titles={"step_one": "Renamed foundation"}),
+    ])
+    page = open_page(client, settings=settings)
     page.locator("#stage-order-heading").press("Enter")
-    refresh = page.get_by_role("button", name="Refresh view", exact=True)
-    refresh.focus()
+    switch = page.locator("#view-board")
+    switch.focus()
     arm_focus_sampler(page)
     card = page.locator(".card").first.element_handle()
-    with page.expect_response("**/api/catalog"):
-        refresh.press("Enter")
+    return_check(page)
     page.wait_for_function("node => !node.isConnected", arg=card)
-    playwright.expect(refresh).to_be_focused()
+    assert "Renamed foundation" in page.locator("#board").inner_text()
+    playwright.expect(switch).to_be_focused()
     assert_focus_sampler_clean(page)
 
 
@@ -2557,7 +2621,7 @@ def test_apply_reloads_settings_saved_on_another_page_without_a_draft(open_page)
 
         before_apply = settings.get_calls
         other_loads = settings_loads(other)
-        other.locator("#refresh").click()
+        return_check(other)
         playwright.expect(other.locator(".row-head")).to_have_text(["Queue", "Review", "Under Development"])
         assert stage_editor_order(other) == ["Queue", "Review", "Under_Development"]
         assert settings_loads(other) == other_loads + 1
@@ -2589,7 +2653,7 @@ def test_apply_keeps_unsaved_draft_when_settings_change_on_another_page(open_pag
         save_review_first_elsewhere(page, settings)
         before = settings.get_calls
         other_loads = settings_loads(other)
-        other.locator("#refresh").click()
+        return_check(other)
         playwright.expect(status).to_have_text(CHANGED_ELSEWHERE)
         assert stage_editor_order(other) == expected_draft
         assert queue_finished.is_checked() == (draft == "completed-stage")
@@ -2626,7 +2690,7 @@ def test_apply_adds_no_settings_load_while_settings_await_reload(open_page):
         client.payload = three_stage_payload(titles={"step_one": "Renamed foundation"})
         before = settings.get_calls
         other_loads = settings_loads(other)
-        other.locator("#refresh").click()
+        return_check(other)
         playwright.expect(
             other.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
         ).to_have_text("Renamed foundation")
@@ -2695,11 +2759,12 @@ def test_apply_during_an_in_flight_save_keeps_the_editor_usable(open_page):
         # The catalog already carries the saved revision while the page still
         # holds the previous one and its draft.
         client.payload = three_stage_payload(titles={"step_one": "Renamed foundation"})
-        page.locator("#refresh").click()
+        return_check(page)
         playwright.expect(
             page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-title')
         ).to_have_text("Renamed foundation")
         assert status.text_content() == "Saving board settings…"
+        assert page.get_by_text(CHANGED_ELSEWHERE).count() == 0
         assert settings_loads(page) == loads
     finally:
         settings.hold.set()
@@ -2724,13 +2789,13 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     ))
     first["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(first)
-    pending = json.loads(json.dumps(first))
-    for entry in pending["entries"]:
+    retitled = json.loads(json.dumps(first))
+    for entry in retitled["entries"]:
         if entry["package_id"] == STEP_ONE:
-            entry["declared"]["title"] = "Pending foundation"
-    _reseal(pending)
+            entry["declared"]["title"] = "Retitled foundation"
+    _reseal(retitled)
     settings = BrowserSettings()
-    page = open_page(SequenceClient([first, pending]), settings=settings)
+    page = open_page(SequenceClient([first, retitled]), settings=settings)
     page.locator("#stage-order-editor").wait_for()
     open_stage_editor(page)
     page.fill("#filter", "dependent")
@@ -2747,11 +2812,11 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
     page.wait_for_function(
-        "() => document.querySelector('#board')?.textContent.includes('Pending foundation')"
+        "() => document.querySelector('#board')?.textContent.includes('Retitled foundation')"
     )
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
     page.locator("#board").get_by_text(
-        "Pending foundation", exact=True
+        "Retitled foundation", exact=True
     ).wait_for(state="attached")
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
@@ -2773,59 +2838,24 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     assert_rail_lanes_do_not_overlap(page)
 
 
-def test_poll_reconciles_a_b_a_before_a_click_fetches_the_next_manual_snapshot(open_page):
+def test_successive_polls_install_each_changed_catalog(open_page):
     first = board_payload(titles={"step_one": "A"})
     middle = board_payload(titles={"step_one": "B"})
     latest = board_payload(titles={"step_one": "A"})
-    manual = board_payload(titles={"step_one": "C"})
-    client = SequenceClient([first, middle, latest, manual])
-    page = open_page(client, fake_clock=True)
-
-    # The browser's periodic poll observes B and then the displayed A again.
-    fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
-    assert page.locator("#board").get_by_text("A", exact=True).count() == 1
-    fire_poll(page)
-    page.wait_for_function(
-        "() => !document.querySelector('#refresh').classList.contains('pending')", timeout=5000
-    )
-    assert page.locator("#refresh").inner_text() == "Refresh view"
-    assert page.locator("#board").get_by_text("B", exact=True).count() == 0
-
-    # A stale B must not be applied by this click: it is now a normal manual refresh.
-    page.click("#refresh")
-    page.locator("#board").get_by_text("C", exact=True).wait_for(timeout=15000)
-    assert client.calls == 4
-    assert page.locator("#board").get_by_text("B", exact=True).count() == 0
-
-
-def test_later_successful_poll_replaces_pending_candidate_before_apply(open_page):
-    first = board_payload(titles={"step_one": "A"})
-    middle = board_payload(titles={"step_one": "B"})
-    latest = board_payload(titles={"step_one": "C"})
     client = SequenceClient([first, middle, latest])
     page = open_page(client, fake_clock=True)
 
+    # The periodic poll installs B, then installs the original A again.
     fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
-    # Let the second periodic response supersede B while A remains displayed.
-    # The candidate changes no visible text, so watch the button for the
-    # rewrite that shows the second response was handled.
-    page.evaluate("""() => {
-      window.refreshChangeRecords = 0;
-      new MutationObserver((records) => {
-        window.refreshChangeRecords += records.length;
-      }).observe(document.querySelector('#refresh'), {
-        childList: true, characterData: true, subtree: true, attributes: true,
-      });
-    }""")
+    settle_frames(page)
+    assert page.locator("#board").get_by_text("B", exact=True).count() == 1
+    assert page.locator("#board").get_by_text("A", exact=True).count() == 0
     fire_poll(page)
-    page.wait_for_function("() => window.refreshChangeRecords > 0", timeout=5000)
-    assert page.locator("#refresh").inner_text() == "Apply update"
-    page.click("#refresh")
-    page.locator("#board").get_by_text("C", exact=True).wait_for(timeout=15000)
-    assert client.calls == 3
+    settle_frames(page)
+    assert page.locator("#board").get_by_text("A", exact=True).count() == 1
     assert page.locator("#board").get_by_text("B", exact=True).count() == 0
+    assert client.calls == 3
+    assert page.locator("#refresh").count() == 0
 
 
 def observe_removed_cards(page):
@@ -2895,7 +2925,10 @@ def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
         {"code": "discovery_unavailable", "message": "One folder could not be read"}
     ]
     _reseal(value)
-    client = SequenceClient([value, CatalogError("producer_protocol_error"), value])
+    retitled = json.loads(json.dumps(value))
+    retitled["entries"][0]["declared"]["title"] = "Retitled after the failure"
+    _reseal(retitled)
+    client = SequenceClient([value, CatalogError("producer_protocol_error"), retitled])
     page = open_page(client)
     panel = page.locator("#board-issues").element_handle()
     summary = page.locator("#board-issues summary")
@@ -2903,8 +2936,7 @@ def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
     summary.press("Enter")
     kept_summary = summary.element_handle()
     observe_removed_cards(page)
-    with page.expect_response("**/api/catalog"):
-        page.locator("#refresh").click()
+    return_check(page)
     playwright.expect(summary).to_have_text(
         "Workspace issues: discovery_unavailable (1) · Latest refresh issue: producer_protocol_error"
     )
@@ -2914,9 +2946,11 @@ def test_issues_panel_keeps_open_state_through_failure_and_rebuild(open_page):
     assert page.evaluate("window.removedCards") == 0
 
     card = page.locator(f'.card[data-package-id="{STEP_TWO}"]').element_handle()
-    with page.expect_response("**/api/catalog"):
-        page.locator("#refresh").click()
+    return_check(page)
     playwright.expect(summary).to_have_text("Workspace issues: discovery_unavailable (1)")
+    # The recovering poll carried a changed catalog, so it installed.
+    assert page.evaluate("window.removedCards") > 0
+    assert "Retitled after the failure" in page.locator("#board").inner_text()
     assert not card.evaluate("node => node.isConnected")
     assert panel.evaluate("node => node.isConnected")
     assert kept_summary.evaluate("node => node.isConnected")
@@ -2944,7 +2978,7 @@ def test_poll_recovery_removes_issues_in_place_and_announces_resolution(open_pag
         "Refresh issue resolved.", timeout=5000
     )
     assert page.locator("#board-issues").count() == 0
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
     assert kept.evaluate("node => node.isConnected && node === document.activeElement")
     assert kept.get_attribute("aria-pressed") == "true"
     assert page.evaluate("window.removedCards") == 0
@@ -2959,9 +2993,7 @@ def test_refresh_failure_changes_are_announced_once(open_page):
     observe_refresh_status(page)
     counts = []
     for failure in ("producer_unavailable", "producer_unavailable", "producer_timeout"):
-        with page.expect_response("**/api/catalog") as response:
-            page.locator("#refresh").click()
-        response.value.finished()
+        return_check(page)
         playwright.expect(page.locator("#refresh-status")).to_have_text(
             f"Latest refresh issue: {failure}"
         )
@@ -2974,37 +3006,46 @@ def test_refresh_failure_changes_are_announced_once(open_page):
     assert client.calls == 4
 
 
-def test_applying_pending_update_empties_refresh_status_silently(open_page):
+def test_install_after_recovery_empties_refresh_status_silently(open_page):
     client = SequenceClient([
         board_payload(titles={"step_one": "A"}),
+        CatalogError("producer_protocol_error"),
         board_payload(titles={"step_one": "B"}),
+        board_payload(titles={"step_one": "C"}),
         CatalogError("producer_protocol_error"),
     ])
     page = open_page(client, fake_clock=True)
-    fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
+    status = page.locator("#refresh-status")
     fire_poll(page)
     page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
         timeout=5000
     )
-    # The failed poll does not erase the pending candidate B.
+    # The failed poll keeps the displayed board A and names the failure once.
     assert page.locator("#board").get_by_text("A", exact=True).count() == 1
-    assert page.locator("#refresh").inner_text() == "Apply update"
+    assert page.locator("#refresh").count() == 0
     assert "producer_protocol_error" in page.locator("#board-issues summary").inner_text()
     assert page.locator("#board-issues").get_attribute("open") is None
-    status = page.locator("#refresh-status")
     assert status.inner_text() == "Latest refresh issue: producer_protocol_error"
+    # The next changed poll installs B and announces the recovery once.
     observe_refresh_status(page)
-    page.get_by_role("button", name="Apply update", exact=True).click()
+    fire_poll(page)
+    playwright.expect(status).to_have_text("Refresh issue resolved.", timeout=5000)
     assert page.locator("#board").get_by_text("B", exact=True).count() == 1
     assert page.locator("#board-issues").count() == 0
-    assert status.inner_text() == ""
-    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
+    settle_frames(page)
+    assert page.evaluate("window.refreshStatusTexts").count("Refresh issue resolved.") == 1
+    # A later changed install empties the line without new text.
+    fire_poll(page)
+    playwright.expect(status).to_have_text("", timeout=5000)
+    assert page.locator("#board").get_by_text("C", exact=True).count() == 1
+    settle_frames(page)
+    assert page.evaluate("window.refreshStatusTexts").count("Refresh issue resolved.") == 1
+    assert page.evaluate("window.refreshStatusTexts")[-1] == ""
     cleared_records = page.evaluate("window.refreshStatusRecords")
     fire_poll(page)
     playwright.expect(status).to_have_text("Latest refresh issue: producer_protocol_error", timeout=5000)
     assert page.evaluate("window.refreshStatusRecords") > cleared_records
-    assert "Refresh issue resolved." not in page.evaluate("window.refreshStatusTexts")
+    assert page.evaluate("window.refreshStatusTexts").count("Refresh issue resolved.") == 1
 
 
 def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_refresh(open_page):
@@ -3035,7 +3076,7 @@ def test_catalog_diagnostics_remain_visible_through_selection_filter_and_empty_r
         "discovery_unavailable first catalog discovery failure"
     )
     page.fill("#filter", "")
-    page.click("#refresh")
+    return_check(page)
     page.wait_for_function(
         "() => document.querySelectorAll('#board .card').length === 0", timeout=15000
     )
@@ -3123,11 +3164,11 @@ def test_refresh_changing_only_incoming_edge_state_keeps_card_color(open_page):
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
     card.click()
-    refresh = page.locator("#refresh")
+    observe_removed_cards(page)
     fire_poll(page)
-    playwright.expect(refresh).to_have_text("Apply update", timeout=5000)
-    refresh.click()
-    playwright.expect(refresh).to_have_text("Refresh view")
+    settle_frames(page)
+    assert page.evaluate("window.removedCards") > 0
+    assert page.locator("#refresh").count() == 0
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
 
@@ -3155,7 +3196,10 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
 
 
 def test_same_project_relationship_text_is_available_to_screen_readers(open_page):
-    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+    page = open_page(SequenceClient([
+        dependency_state_payload("unsatisfied"),
+        dependency_state_payload("unsatisfied", titles={"loose": "Retitled loose"}),
+    ]))
     expected = {
         STEP_TWO: ["needs: Foundation step", "blocks: Gate step"],
         STEP_ONE: [f"blocks: Dependent step · {XSS_TITLE} (Beta)"],
@@ -3183,8 +3227,9 @@ def test_same_project_relationship_text_is_available_to_screen_readers(open_page
 
     page.fill("#filter", "Dependent step")
     kept = dependent.element_handle()
-    page.get_by_role("button", name="Refresh view", exact=True).click()
+    return_check(page)
     page.wait_for_function("node => !node.isConnected", arg=kept)
+    assert page.locator(f'.card[data-package-id="{LOOSE}"] .card-title').text_content() == "Retitled loose"
     assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').is_hidden()
     assert page.locator(".rail").count() == 0
     assert dependent.locator(".card-rail-text").all_text_contents() == expected[STEP_TWO]
@@ -3868,7 +3913,7 @@ def test_refresh_rebuilds_connections_and_keeps_selection_emphasis(open_page):
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
-    page.click("#refresh")
+    return_check(page)
     playwright.expect(page.locator(
         f'.connection[data-source="{STEP_TWO}"][data-dependent="{LOOSE}"]'
     )).to_have_count(1)
@@ -3928,7 +3973,7 @@ def test_native_themes_preserve_readable_cards_arrows_and_selection(
         card.querySelectorAll('.card-title, .card-project, .card-filepath, .link, .link em')
           .forEach(el => pairs.push([color(el), background(card)]));
       });
-      document.querySelectorAll('input, select, #refresh').forEach(el =>
+      document.querySelectorAll('input, select, #view-board').forEach(el =>
         pairs.push([color(el), background(el)]));
       const input = document.querySelector('input');
       pairs.push([getComputedStyle(input, '::placeholder').color, background(input)]);
@@ -3996,7 +4041,7 @@ def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_out
     assert selected_ring in card.evaluate("node => getComputedStyle(node).boxShadow")
 
     assert_focus_indicator(card, expected=card_outline, card=True)
-    for selector in ("#filter", "#refresh", "#theme", "#compact-view", "#hide-terminal-rows"):
+    for selector in ("#filter", "#view-board", "#theme", "#compact-view", "#hide-terminal-rows"):
         assert_focus_indicator(page.locator(selector), expected="rgb(255, 255, 255)")
     page.locator("#stage-order-heading").press("Enter")
     page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
@@ -4225,21 +4270,25 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
     assert connection_pairs(page) == set()
 
 
-def test_successful_changed_poll_clears_previous_error_without_applying_update(open_page):
+def test_successful_changed_poll_clears_previous_error_and_installs(open_page):
     client = SequenceClient([
         board_payload(), CatalogError("producer_timeout"),
         board_payload(titles={"step_one": "Recovered foundation"}),
     ])
     page = open_page(client, fake_clock=True)
+    observe_refresh_status(page)
     fire_poll(page)
     page.locator("#board").get_by_text("Latest refresh issue: producer_timeout", exact=True).wait_for(timeout=5000)
     fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
+    settle_frames(page)
     assert page.locator("#board-issues").count() == 0
-    assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 1
-    assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 0
-    page.click("#refresh")
+    assert page.locator("#refresh").count() == 0
+    assert page.locator(".card-title").get_by_text("Foundation step", exact=True).count() == 0
     assert page.locator(".card-title").get_by_text("Recovered foundation", exact=True).count() == 1
+    texts = page.evaluate("window.refreshStatusTexts")
+    assert texts.count("Latest refresh issue: producer_timeout") == 1
+    assert texts.count("Refresh issue resolved.") == 1
+    assert page.locator("#refresh-status").inner_text() == "Refresh issue resolved."
     assert client.calls == 3
 
 
@@ -4431,7 +4480,7 @@ def test_malformed_poll_retains_displayed_board_and_local_preference(open_page):
         "rows => rows.map(row => row.dataset.lifecycle)"
     ) == ["Partial", "Queue", "Testing", "Empty"]
     assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
 
 
 @pytest.mark.parametrize("storage_setup", [
@@ -4592,7 +4641,7 @@ def test_finished_rows_hidden_precedes_incomplete_discovery(open_page):
     ).inner_text()
 
 
-def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
+def test_search_resize_and_install_keep_axes_and_rails_valid(open_page):
     first = compact_payload()
     second = compact_payload(extra_stage=True)
     page = open_page(SequenceClient([first, second]), fake_clock=True)
@@ -4610,15 +4659,12 @@ def test_search_resize_and_pending_apply_keep_axes_and_rails_valid(open_page):
     )
     assert connection_pairs(page) == {(COMPACT_CARD, COMPACT_DEPENDENT)}
     fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
-    assert page.locator('.card[data-package-path="Alpha/Review/new"]').count() == 0
-    assert page.locator('.board-row[data-lifecycle="Review"]').count() == 0
-    page.click("#refresh")
     page.locator('.card[data-package-path="Alpha/Review/new"]').wait_for(timeout=15000)
     assert page.locator('.board-row[data-lifecycle="Review"]').count() == 1
+    assert page.locator("#refresh").count() == 0
 
 
-def test_pending_removed_entry_snapshot_clears_selection_only_after_apply(open_page):
+def test_poll_removing_the_selected_entry_clears_selection(open_page):
     first = lifecycle_payload()
     second = json.loads(lifecycle_payload())
     second["entries"] = [entry for entry in second["entries"] if entry["stage"] != "Done"]
@@ -4629,13 +4675,8 @@ def test_pending_removed_entry_snapshot_clears_selection_only_after_apply(open_p
     assert done.get_attribute("aria-pressed") == "true"
 
     fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
-    assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
-    assert done.get_attribute("aria-pressed") == "true"
-
-    page.click("#refresh")
     page.wait_for_function(
-        "() => !document.querySelector('#refresh').classList.contains('pending')",
+        "() => !document.querySelector('.card[data-package-path=\"Fictional/Done/package\"]')",
         timeout=15000,
     )
     assert page.locator('.board-row[data-lifecycle="Done"]').count() == 0
@@ -4699,7 +4740,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([json.loads(payload), reversed_value]))
-        page.get_by_role("button", name="Refresh view").click()
+        return_check(page)
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
@@ -4707,7 +4748,7 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
     assert sorted(page.locator("#board .card").evaluate_all(
         "cards => cards.map(card => card.dataset.packagePath)"
     )) == expected_paths
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
 
 
 @pytest.mark.parametrize(
@@ -4741,7 +4782,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_role("button", name="Refresh view").click()
+        return_check(page)
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
@@ -4753,7 +4794,7 @@ def test_digest_consistent_invalid_terminal_policy_keeps_last_valid_board(open_p
     assert page.locator(".board-row").evaluate_all(
         "rows => rows.map(row => [row.dataset.lifecycle, row.querySelector('.card-title')?.textContent])"
     ) == [[stage, title] for stage, _lifecycle, _label, title in sorted(STAGE_ROWS)]
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
 
 
 def _malformed_browser_inventory(case):
@@ -4819,14 +4860,14 @@ def test_browser_rejects_each_malformed_inventory_class_before_replacing_board(
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
         page = open_page(RawSequenceClient([valid, invalid]))
-        page.get_by_role("button", name="Refresh view").click()
+        return_check(page)
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
             timeout=15000
         )
 
     assert page.locator("#board .card").count() == 7
     assert page.locator('.card[data-package-path="Fictional/Done/package"]').count() == 1
-    assert page.locator("#refresh").inner_text() == "Refresh view"
+    assert page.locator("#refresh").count() == 0
 
 
 @pytest.mark.parametrize("value,accepted", reported_contract_cases())
@@ -4850,7 +4891,7 @@ def test_reported_contract_at_browser_acceptance(open_page, monkeypatch, value, 
     else:
         page = open_page(RawSequenceClient([raw_catalog(), value]))
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
-        page.click("#refresh")
+        return_check(page)
         page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for()
         assert page.locator(".card-title").all_text_contents() == ["First", "Second"]
 
@@ -4949,19 +4990,11 @@ def test_real_unsafe_and_overlong_folders_keep_the_healthy_card_after_refresh(op
         f"# Deep\nPackage ID: {STEP_ONE}\n", encoding="utf-8"
     )
 
-    # The documented refresh flow: the button starts as Refresh view with no
-    # update waiting, the periodic poll advertises the changed catalog as
-    # Apply update, and choosing that button applies the new catalog.
-    refresh = page.locator("#refresh")
-    assert refresh.inner_text() == "Refresh view"
+    # The periodic poll installs the changed catalog; the page has no button.
+    assert page.locator("#refresh").count() == 0
     fire_poll(page)
-    page.wait_for_selector("#refresh.pending", timeout=5000)
-    assert refresh.inner_text() == "Apply update"
-    refresh.click()
-    page.wait_for_function(
-        "() => !document.querySelector('#refresh').classList.contains('pending')",
-        timeout=15000,
-    )
+    page.wait_for_selector("#board-issues", timeout=15000)
+    assert page.locator("#refresh").count() == 0
 
     issues = page.locator("#board-issues")
     assert issues.count() == 1
@@ -5462,9 +5495,12 @@ def test_checkouts_tick_is_skipped_while_one_request_is_in_flight(open_page, rea
     assert double.calls == 1
     fire_poll(page)
     assert double.calls == 1
-    # The third tick answers a changed catalog, which offers an update.
+    # The third tick answers a changed catalog, which is installed.
     fire_poll(page)
-    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    playwright.expect(
+        page.locator('.card[data-package-path="Repo/Drafts/alpha"]')
+    ).to_have_count(0)
+    assert page.locator("#refresh").count() == 0
     assert double.calls == 1
     gate.set()
     wait_for_responses(page, "checkoutsResponses", 1)
@@ -5473,10 +5509,9 @@ def test_checkouts_tick_is_skipped_while_one_request_is_in_flight(open_page, rea
     assert double.calls == 2
 
 
-def test_checkouts_client_ignores_the_catalog_buttons(open_page, real_checkouts):
+def test_checkouts_client_ignores_catalog_installs(open_page, real_checkouts):
     double = BrowserCheckouts(real_checkouts.document_zero)
     client = SequenceClient([
-        real_checkouts.catalog,
         real_checkouts.catalog,
         real_checkouts.catalog_after_move,
     ])
@@ -5485,22 +5520,13 @@ def test_checkouts_client_ignores_the_catalog_buttons(open_page, real_checkouts)
     settle_frames(page)
     assert "Repo/Drafts/alpha" in card_paths(page)
     assert double.calls == 1
-    # Refresh view asks the catalog for another snapshot and nothing else.
-    with page.expect_response("**/api/catalog") as refreshed:
-        page.locator("#refresh").click()
-    refreshed.value.finished()
-    assert double.calls == 1
-    # Applying an offered update installs that snapshot and asks for nothing.
+    # A tick installs the changed catalog; the install itself asks for nothing,
+    # so the tick's own read is the only new checkouts request.
     fire_poll(page)
-    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
     wait_for_responses(page, "checkoutsResponses", 2)
     settle_frames(page)
-    # The tick itself asked for checkouts; the button press adds no request.
-    assert double.calls == 2
-    page.locator("#refresh").click()
-    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
-    settle_frames(page)
     assert "Repo/Drafts/alpha" not in card_paths(page)
+    assert page.locator("#refresh").count() == 0
     assert double.calls == 2
     assert page.evaluate("window.checkoutsResponses") == [200, 200]
 
@@ -5515,6 +5541,7 @@ def test_standalone_server_offers_no_checkouts_route(open_page, real_checkouts):
     settle_frames(page)
     shown = card_paths(page)
     assert shown
+    observe_removed_cards(page)
     fire_poll(page)
     fire_poll(page)
     wait_for_responses(page, "checkoutsResponses", 3)
@@ -5522,8 +5549,8 @@ def test_standalone_server_offers_no_checkouts_route(open_page, real_checkouts):
     assert page.evaluate("window.checkoutsResponses") == [404, 404, 404]
     assert page.locator("#board-issues").count() == 0
     assert card_paths(page) == shown
-    assert page.locator("#refresh").inner_text() == "Refresh view"
-    assert page.locator("#refresh.pending").count() == 0
+    assert page.evaluate("window.removedCards") == 0
+    assert page.locator("#refresh").count() == 0
     assert page.locator("#refresh-status").inner_text() == ""
 
 
@@ -5566,8 +5593,7 @@ def test_checkouts_failure_notice_keeps_focus_and_the_catalog(open_page, real_ch
             [f"checkouts Code Status unavailable: {code}"]
         )
         assert page.locator(".refresh-issue-summary").count() == 0, code
-        assert page.locator("#refresh").inner_text() == "Refresh view", code
-        assert page.locator("#refresh.pending").count() == 0, code
+        assert page.locator("#refresh").count() == 0, code
         assert kept.evaluate("node => node.isConnected && node === document.activeElement"), code
         assert kept.get_attribute("aria-pressed") == "true", code
         assert page.evaluate("window.removedCards") == 0, code
@@ -5820,6 +5846,7 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
     card.click()
     kept = card.element_handle()
     shown = card_paths(page)
+    observe_removed_cards(page)
     for case in checkouts_document_mutations():
         envelope = checkouts_envelope(copy.deepcopy(real_checkouts.document_zero))
         case["mutate"](envelope["checkouts"])
@@ -5837,8 +5864,8 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
         )
         # Only the notice changes: the catalog, its selection and the button stay.
         assert summary.count() == 1, case["id"]
-        assert page.locator("#refresh").inner_text() == "Refresh view", case["id"]
-        assert page.locator("#refresh.pending").count() == 0, case["id"]
+        assert page.locator("#refresh").count() == 0, case["id"]
+        assert page.evaluate("window.removedCards") == 0, case["id"]
         assert card_paths(page) == shown, case["id"]
         assert kept.evaluate("node => node.isConnected && node === document.activeElement"), (
             case["id"]
@@ -6146,8 +6173,7 @@ def test_checkouts_tick_rewrites_the_line_in_place(open_page, real_checkouts):
     assert card.evaluate("node => node === document.activeElement")
     assert card.get_attribute("aria-pressed") == "true"
     assert_focus_sampler_clean(page)
-    assert page.locator("#refresh").inner_text() == "Refresh view"
-    assert page.locator("#refresh.pending").count() == 0
+    assert page.locator("#refresh").count() == 0
     assert page.evaluate("window.scrollY") == offset
     assert page.evaluate("window.refreshStatusRecords") == 0
     # The filter pass redrew the rails: the old layer is gone and a new one holds
@@ -6208,8 +6234,8 @@ def test_checkouts_failure_hides_every_code_status_line(open_page, real_checkout
     assert page.locator(".checkouts-issue-summary").count() == 0
 
 
-def test_apply_update_hides_the_code_status_until_a_matching_scan(open_page, real_checkouts):
-    """A saved board revision keeps the displayed lines, and applying it hides them."""
+def test_install_hides_the_code_status_until_a_matching_scan(open_page, real_checkouts):
+    """A board revision saved elsewhere is installed and hides the lines until a matching scan."""
     double = BrowserCheckouts(real_checkouts.document_zero)
     settings = BrowserSettings(revision=real_checkouts.revision)
     page = open_page(
@@ -6225,12 +6251,9 @@ def test_apply_update_hides_the_code_status_until_a_matching_scan(open_page, rea
     assert page.locator(".card-code-status").count() == len(CHECKOUTS_CODE_STATUS_TEXTS)
     settings.revision = real_checkouts.revision_moved
     fire_checkouts_poll(page)
-    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
-    # The displayed catalog is still the old revision, so its lines still match.
-    for path, expected in CHECKOUTS_CODE_STATUS_TEXTS.items():
-        assert code_status_line(page, path) == f"Code Status: {expected}", path
-    page.locator("#refresh").click()
-    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    # The tick installs the catalog carrying the new revision, so no scan matches it.
+    playwright.expect(page.locator(".card-code-status")).to_have_count(0)
+    assert page.locator("#refresh").count() == 0
     settle_frames(page)
     assert page.locator(".card-code-status").count() == 0
     assert page.locator(".checkouts-issue-summary").count() == 0
@@ -6272,12 +6295,16 @@ def test_null_configuration_revision_never_shows_a_code_status_line(open_page, r
 def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts):
     """A moved package has no line until its card is displayed, and then gets one."""
     double = BrowserCheckouts(real_checkouts.document_zero)
-    client = SequenceClient([real_checkouts.catalog, real_checkouts.catalog_after_move])
+    client = SequenceClient([
+        real_checkouts.catalog, real_checkouts.catalog, real_checkouts.catalog_after_move,
+    ])
     page = open_code_status_page(open_page, real_checkouts, double, client=client)
     assert "Repo/Drafts/alpha" in card_paths(page)
     double.serve(checkouts_envelope(real_checkouts.document_three))
+    # This tick's catalog is unchanged, so the card the scan no longer names stays.
     fire_checkouts_poll(page)
-    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
+    settle_frames(page)
+    assert "Repo/Drafts/alpha" in card_paths(page)
     # The displayed card's path is absent from the served scan, so it has no
     # line; the other packages keep theirs.
     assert code_status_card(page, "Repo/Drafts/alpha").locator(".card-code-status").count() == 0
@@ -6285,8 +6312,12 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
         assert code_status_line(page, path) == (
             f"Code Status: {package_text(real_checkouts.document_three, path)}"
         ), path
-    page.locator("#refresh").click()
-    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    # The next tick's catalog carries the moved package and is installed, and its
+    # read serves the same scan again.
+    double.serve(checkouts_envelope(real_checkouts.document_three))
+    fire_checkouts_poll(page)
+    settle_frames(page)
+    assert page.locator("#refresh").count() == 0
     assert "Repo/Shipped/alpha" in card_paths(page)
     assert code_status_line(page, "Repo/Shipped/alpha") == (
         f"Code Status: {package_text(real_checkouts.document_three, 'Repo/Shipped/alpha')}"
@@ -6460,10 +6491,10 @@ def test_checkouts_view_starts_in_board_without_a_known_value(
     playwright.expect(page.locator("#checkouts")).to_be_hidden()
 
 
-def test_checkouts_view_keeps_a_waiting_catalog_update_for_the_board(
+def test_checkouts_view_installs_the_catalog_for_the_board(
     open_page, real_checkouts
 ):
-    """A tick while Checkouts is shown offers the change to the board, not here."""
+    """A tick while Checkouts is shown installs the change for the board."""
     changed = copy.deepcopy(real_checkouts.catalog)
     title = next(
         entry for entry in changed["entries"] if entry["package_path"] == "Repo/Drafts/alpha"
@@ -6474,25 +6505,19 @@ def test_checkouts_view_keeps_a_waiting_catalog_update_for_the_board(
     client = SequenceClient([real_checkouts.catalog, changed])
     page = checkouts_view_page(open_page, real_checkouts, double, client=client)
     fire_checkouts_poll(page)
-    # The board's update is offered on the board, never applied from here.
-    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
-    playwright.expect(page.locator("#view-board")).to_have_text("Board (update waiting)")
+    settle_frames(page)
+    # The switch never names a waiting update, and no button exists.
+    playwright.expect(page.locator("#view-board")).to_have_text("Board")
+    assert page.locator("#refresh").count() == 0
     catalogs = page.evaluate("window.catalogResponses.length")
-    checkouts = page.evaluate("window.checkoutsResponses.length")
-    with page.expect_response("**/api/checkouts") as response:
-        page.locator("#refresh").click()
-    response.value.finished()
-    assert page.evaluate("window.checkoutsResponses.length") == checkouts + 1
-    assert page.evaluate("window.catalogResponses.length") == catalogs
-    assert "Alpha renamed" not in page.locator(".card-title").all_inner_texts()
-    # The waiting update is still waiting when the board is shown again.
     page.locator("#view-board").click()
-    playwright.expect(page.locator("#refresh")).to_have_text("Apply update")
-    assert page.locator("#refresh.pending").count() == 1
-    assert page.locator("#view-board").inner_text() == "Board"
-    page.locator("#refresh").click()
-    playwright.expect(page.locator("#refresh")).to_have_text("Refresh view")
+    playwright.expect(page.locator("#board")).to_be_visible()
+    # The catalog installed while the board was hidden is shown at once, and the
+    # switch asked for nothing.
     assert "Alpha renamed" in page.locator(".card-title").all_inner_texts()
+    assert page.locator("#view-board").inner_text() == "Board"
+    settle_frames(page)
+    assert page.evaluate("window.catalogResponses.length") == catalogs
 
 
 def test_checkouts_view_search_carries_back_to_the_board(open_page, real_checkouts):
@@ -9157,7 +9182,7 @@ def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
     playwright.expect(other.locator("#checkouts")).to_be_visible()
     playwright.expect(other.locator("#board")).to_be_hidden()
     assert other.locator("#checkouts-action-status").inner_text() == (
-        "This work item is not on the displayed board; choose Refresh view on the board.")
+        "This work item is not on the board. The board shows catalog changes within ten seconds.")
     assert other.evaluate("key => window.localStorage.getItem(key)", key) == stored
 
 
@@ -9975,11 +10000,11 @@ def toggle_folders_editor(page):
     settle_frames(page)
 
 
-def open_folders_page(launch, attention_checkouts, settings, double=None):
+def open_folders_page(launch, attention_checkouts, settings, double=None, client=None):
     """Open the checkouts view over a document that collects one folder."""
     double = double or BrowserCheckouts(attention_checkouts.document)
     page = launch(
-        StaticClient(attention_checkouts.catalog_all),
+        client or StaticClient(attention_checkouts.catalog_all),
         settings=settings, checkouts=double, fake_clock=True, init_script=RESPONSE_RECORDER,
     )
     wait_for_responses(page, "checkoutsResponses", 1)
@@ -10415,7 +10440,8 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
     """Nothing the view redraws touches an open editor, its draft or the focus in it."""
     settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]
-    page, _ = open_folders_page(open_page, attention_checkouts, settings)
+    client = StaticClient(attention_checkouts.catalog_all)
+    page, _ = open_folders_page(open_page, attention_checkouts, settings, client=client)
     toggle_folders_editor(page)
     playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
     add_folder(page, "/work/draft")
@@ -10443,11 +10469,17 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
     assert page.evaluate("window.editorRecords") == []
     intact()
 
-    # Installing a catalog from the board's Refresh view leaves the editor alone.
+    # Installing a changed catalog leaves the editor alone.
+    changed = copy.deepcopy(attention_checkouts.catalog_all)
+    changed["entries"][0]["declared"]["title"] = "Retitled by the install"
+    _reseal(changed)
+    client.payload = changed
     page.locator("#view-board").click()
-    with page.expect_response("**/api/catalog"):
-        page.get_by_role("button", name="Refresh view", exact=True).click()
+    fire_poll(page)
     settle_frames(page)
+    assert page.locator(
+        f'.card[data-package-path="{changed["entries"][0]["package_path"]}"] .card-title'
+    ).text_content() == "Retitled by the install"
     page.locator("#view-checkouts").click()
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     settle_frames(page)
@@ -10907,7 +10939,7 @@ def test_checkout_folders_editor_follows_a_record_changed_elsewhere(
     def refresh_board_view():
         installs[0] += 1
         page.locator("#view-board").click()
-        page.get_by_role("button", name="Refresh view", exact=True).click()
+        fire_poll(page)
         wait_for_catalog_installs(page, installs[0])
         page.locator("#view-checkouts").click()
         playwright.expect(page.locator("#checkouts")).to_be_visible()
@@ -10960,46 +10992,11 @@ def test_checkout_folders_save_refreshes_the_catalog_and_reads_the_new_folders(
     assert page.evaluate("window.catalogResponses.length") == catalogs + 1
     assert page.evaluate("window.checkoutsResponses.length") == reads + 1
     assert double.calls == calls + 1
-    assert page.locator("#refresh").get_attribute("data-pending") == "false"
+    assert page.locator("#refresh").count() == 0
     playwright.expect(body).not_to_contain_text(NO_FOLDERS_WORDS)
     assert SETTINGS_SENTENCE not in page.locator("#checkouts-status-line").inner_text()
     assert (settings.order, settings.completed) == (order, completed)
     assert settings.calls == []
-
-
-def test_checkout_folders_save_refresh_clears_an_update_marked_by_a_poll(
-    open_page, attention_checkouts
-):
-    """A tick between the save's commit and its refresh leaves no waiting update."""
-
-    class HeldCommit(HexRevisionSettings):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.committed = threading.Event()
-            self.release = threading.Event()
-
-        def save_checkout_settings(self, revision, folders, github_lookup):
-            answer = super().save_checkout_settings(revision, folders, github_lookup)
-            self.committed.set()
-            self.release.wait(timeout=10)
-            return answer
-
-    settings = HeldCommit(revision=CHECKOUTS_REVISION)
-    double = BrowserCheckouts()
-    settings.checkouts = double
-    page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
-    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
-    add_folder(page, "/work/alpha")
-    refresh = page.locator("#refresh")
-    try:
-        folders_save_button(page).click()
-        assert settings.committed.wait(timeout=5)
-        fire_poll(page)
-        playwright.expect(refresh).to_have_attribute("data-pending", "true")
-    finally:
-        settings.release.set()
-    playwright.expect(page.locator(FOLDERS_STATUS)).to_have_text("Checkout folders saved.")
-    playwright.expect(refresh).to_have_attribute("data-pending", "false")
 
 
 def test_checkout_folders_save_sends_no_second_checkouts_request_while_one_is_in_flight(
@@ -11046,7 +11043,7 @@ def test_board_settings_save_leaves_a_flagged_checkout_folders_draft_unsaveable(
     settings.save_checkout_settings(settings.revision, ["/work/alpha", "/work/third"], False)
     outside_saves = len(settings.folder_calls)
     page.locator("#view-board").click()
-    page.get_by_role("button", name="Refresh view", exact=True).click()
+    fire_poll(page)
     wait_for_catalog_installs(page, 2)
     page.locator("#view-checkouts").click()
     status = page.locator(FOLDERS_STATUS)
