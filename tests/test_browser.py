@@ -12859,3 +12859,28 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     playwright.expect(page.locator("#work-item-panel-body .panel-code")).to_have_count(1)
     assert page.locator("#work-item-panel-body .panel-baseline-line").count() == 0
     assert "Baseline line legend" not in dict(panel_all_fields(page))
+
+
+def signal_quiet_serves_a_finished_work_item_with_code_status(document):
+    """Alpha is finished yet shows a Code Status; it targets Quiet Clone, which it leaves free."""
+    signal_quiet_assigned_alpha(document)
+    alpha = next(p for p in document["packages"] if p["package_path"] == "Repo/Drafts/alpha")
+    alpha["finished"] = True
+    alpha["code_status"] = {
+        "state": "merged", "text": "merged", "pull_request": None, "push": None,
+        "unpushed": None, "cleanup": {"worktrees": 0, "branches": 0},
+        "checked_out_elsewhere": []}
+
+
+def test_checkouts_line_is_green_when_it_only_serves_a_live_work_item(
+        open_page, view_checkouts):
+    """A free clone that serves a live work item is green, not grey."""
+    base = view_checkouts.document_checked
+    page, double = open_view_checkouts(open_page, view_checkouts, base)
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    quiet = checkout_group(base, "quiet")
+    assert repository_line(page, quiet)["tone"] == "grey"
+    serve_checkouts(page, double, checkout_variant(base, signal_quiet_serves_a_finished_work_item_with_code_status))
+    line = repository_line(page, quiet)
+    assert (line["tone"], line["pills"], line["activity"], line["inUseTone"]) == (
+        "green", [], "0 of 1 in use · 1 work item", "green")
