@@ -10010,6 +10010,19 @@ def signal_only_behind_clones(document):
         checkout_clone(document, "Repo Clone 3")[1]["cached_default"])
 
 
+WINDOWS_SHAPED_REMOTE_KEY = r"file:C:\Users\runneradmin\Temp\pytest-7\remotes\festival-site"
+
+
+def signal_windows_shaped_remote_key(document):
+    """The remote repository served under the key Windows spells for it.
+
+    A ``file:`` path there carries backslashes, which CSS reads as escapes
+    (``\\U``, ``\\r``, ``\\t``), so a lookup that interpolates the key into a
+    selector matches nothing.
+    """
+    checkout_group(document, "remote")["remote"]["key"] = WINDOWS_SHAPED_REMOTE_KEY
+
+
 def with_observed_at(document, observed_at):
     """The same capture with one observation time; the digest does not cover it."""
     changed = copy.deepcopy(document)
@@ -10611,6 +10624,18 @@ LINE_TONE_TOKENS = {
 }
 
 
+def repository_section_indexes(page, key):
+    """Where the sections a served repository key draws sit, in the served order.
+
+    The key is a remote URL, which Windows spells as a ``file:`` path with
+    backslashes; CSS reads ``\\U``, ``\\r`` and ``\\t`` there as escapes, so the
+    sections are compared as data instead of being interpolated into a selector.
+    """
+    return page.locator(".checkouts-group").evaluate_all(
+        """(items, key) => items.flatMap(
+          (item, index) => item.dataset.checkoutsGroup === key ? [index] : [])""", key)
+
+
 def repository_line(page, group):
     """The line a served group draws: tone, pill texts in order, activity and name words."""
     return page.evaluate("""(key) => {
@@ -10705,8 +10730,9 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         assert keys == served_order, case
         assert line["name"] == group["remote"]["display"], case
         if case in ("m", "n"):
-            section = page.locator(
-                f'.checkouts-group[data-checkouts-group="{group["remote"]["key"]}"]')
+            indexes = repository_section_indexes(page, group["remote"]["key"])
+            assert len(indexes) == 1, (case, indexes)
+            section = page.locator(".checkouts-group").nth(indexes[0])
             pill = section.locator(
                 'button[data-pill="amber-worktrees"]' if case == "m"
                 else 'button[data-pill="amber-behind"]')
@@ -10722,6 +10748,17 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
                 # The behind pill focuses the first behind clone's row.
                 assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
 
+    # Windows spells a ``file:`` remote key with backslashes, which CSS reads as
+    # escapes: the line and its toggle must still be found and read as data.
+    serve_checkouts(page, double, checkout_variant(base, signal_windows_shaped_remote_key))
+    indexes = repository_section_indexes(page, WINDOWS_SHAPED_REMOTE_KEY)
+    assert len(indexes) == 1, indexes
+    toggle = page.locator(".checkouts-group").nth(indexes[0]).locator(
+        ".checkouts-line-toggle")
+    assert toggle.get_attribute("aria-expanded") == "false"
+    toggle.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+
     # A grey repository the quiet rule does not call quiet is shown with the box
     # checked; one it does call quiet is not.
     serve_checkouts(page, double, checkout_variant(base, signal_quiet_second_free_clone))
@@ -10730,7 +10767,7 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
     assert repository_line(page, checkout_group(base, "quiet"))["tone"] == "grey"
     serve_checkouts(page, double, base)
     assert repository_line(page, checkout_group(base, "quiet")) is None
-    assert page.locator(f'.checkouts-group[data-checkouts-group="{quiet_key}"]').count() == 0
+    assert repository_section_indexes(page, quiet_key) == []
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
 
     # Each tone's edge is its existing token, in both themes.
