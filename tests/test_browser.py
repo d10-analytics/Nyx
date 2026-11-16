@@ -6576,7 +6576,7 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
 # The checkouts view: view switch, status line, remote checks and panels
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_VIEW_PLACEHOLDER = "Find a checkout, branch, or work item…"
+CHECKOUTS_VIEW_PLACEHOLDER = "Find a repository, checkout, branch, or work item…"
 BOARD_SEARCH_PLACEHOLDER = "Find a work item, project, or program…"
 
 
@@ -6646,7 +6646,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.locator("#board").is_visible()
     assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
     assert page.get_by_label("Hide empty rows and columns", exact=True).is_visible()
-    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.get_by_label("Hide quiet repositories", exact=True).is_hidden()
     assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
     # The existing preference keys keep their unset defaults; the view choice is
     # its own key.
@@ -6665,11 +6665,14 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.evaluate("document.activeElement.id") == "view-checkouts"
     assert page.get_by_label("Hide terminal rows", exact=True).is_hidden()
     assert page.get_by_label("Hide empty rows and columns", exact=True).is_hidden()
-    quiet = page.get_by_label("Hide quiet checkouts", exact=True)
+    quiet = page.get_by_label("Hide quiet repositories", exact=True)
     assert quiet.is_visible()
     assert quiet.is_checked()
     assert page.locator("#filter").get_attribute("placeholder") == CHECKOUTS_VIEW_PLACEHOLDER
     assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "checkouts"
+    assert checkouts_switch.inner_text() == "Repositories"
+    assert page.locator("#checkouts-heading").inner_text() == "Repositories"
+    assert page.title() == "Nyx"
     # The checkouts preference is its own key and does not disturb the others.
     assert page.evaluate(
         "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
@@ -6685,7 +6688,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     playwright.expect(page.locator("#board")).to_be_hidden()
     assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
-    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
 
     page.locator("#view-board").click()
     playwright.expect(page.locator("#board")).to_be_visible()
@@ -6693,7 +6696,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
     assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "board"
     assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
-    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.get_by_label("Hide quiet repositories", exact=True).is_hidden()
     assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
 
 
@@ -8240,7 +8243,7 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     assert names.all_inner_texts() == [
         group["remote"]["display"] for group in document["repositories"] if group not in quiet]
 
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert names.all_inner_texts() == [
         group["remote"]["display"] for group in document["repositories"]]
     remote_index = group_index(document, "remote")
@@ -8411,7 +8414,7 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     row.locator("summary").click()
     assert row.locator("li").inner_text() == f"{quiet_display} Quiet Clone"
 
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert groups() == [quiet_display, other_display]
     assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
 
@@ -8424,11 +8427,11 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     settle_frames(page)
     page.wait_for_function(
         "() => document.querySelectorAll('#checkouts-body .checkouts-group').length === 2")
-    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
     assert groups() == [quiet_display, other_display]
 
     # Checked again, a stash makes the quiet clone ordinary: its own group, no row.
-    page.get_by_label("Hide quiet checkouts", exact=True).check()
+    page.get_by_label("Hide quiet repositories", exact=True).check()
     assert groups() == [other_display]
     serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
     assert groups() == [quiet_display, other_display]
@@ -8449,7 +8452,7 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     """The shared search hides every group whose served names do not match."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert page.locator(".checkouts-group").count() == len(document["repositories"])
     page.fill("#filter", "topic-a")
     visible = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
@@ -8551,7 +8554,7 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
     """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
     document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote = checkout_group(document, "remote")["remote"]["display"]
     quiet = checkout_group(document, "quiet")["remote"]["display"]
 
@@ -8845,7 +8848,7 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
     """Each work item's table action shows its card, or says why it cannot."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
     topic_a = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-a"]')
@@ -8977,7 +8980,7 @@ def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkou
     """A search survives the jump unless it is what hides the card."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
 
     def show_button():
         remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
@@ -10074,7 +10077,7 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     """Stacked at 360 px, tabular from 701 px, with table roles throughout."""
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     toggle_folders_editor(page)
     playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
         "Current checkout folders loaded.")
@@ -10381,7 +10384,7 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
     ready = view_checkouts.document_topic_committed
     setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, ready)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     observe_checkouts_mutations(page)
     live = """() => [...document.querySelectorAll(
       '#checkouts [aria-live], #checkouts [role=status], #checkouts [role=alert], #checkouts output')]
