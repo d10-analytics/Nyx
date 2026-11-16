@@ -396,6 +396,16 @@
       "quietRow": "Quiet repositories ({count})",
       "quietRowMatching": "Quiet repositories ({count}, {matching} matching)",
       "freeClones": "Free clones: {clones}",
+      "lineTrunkClones": "{branch} · {clones}",
+      "lineClones": "{clones}",
+      "lineInUse": "{n} of {m} in use",
+      "lineWorkItems": " · {items}",
+      "pillLocalOnly": "\u2715\uFE0E {branches} local only",
+      "pillChangesOnlyHere": "\u2715\uFE0E changes only on this machine",
+      "pillToMerge": "\u26A0\uFE0E {branches} to merge or clean up",
+      "pillWorktrees": "\u26A0\uFE0E worktrees to clean up",
+      "pillBehind": "\u26A0\uFE0E {trunk} behind remote",
+      "defaultBranchFallback": "default branch",
       "workItemBranches": "Work item branches",
       "attentionHeading": "Needs attention",
       "detailsToggle": "Details",
@@ -3492,19 +3502,73 @@
     return parts.join('<span class="checkouts-separator"> · </span>');
   }
 
+  // The repository line: the name, its default branch and clone count, the
+  // pills, and the activity summary.  The tone is an attribute a refresh
+  // updates, never part of a key.  Its caption (remote check, pull request
+  // lookup, free clones) sits beneath it.
+  function pillHtml(group, code, tone, words) {
+    const key = keyOf("pill", groupKey(group), code);
+    return `<button type="button" class="checkouts-pill" data-pill="${code}" ` +
+      `data-tone="${tone}" ${controlAttrs(key, "pill")}>${words}</button>`;
+  }
+
+  function pillsHtml(group, signals) {
+    const pills = [];
+    if (signals.red.size > 0) {
+      pills.push(pillHtml(group, "red-branches", "red", wordText("text", "pillLocalOnly",
+        {branches: plural(signals.red.size, "branch")})));
+    } else if (signals.uncountedRed) {
+      pills.push(pillHtml(group, "red-changes", "red",
+        wordText("text", "pillChangesOnlyHere")));
+    }
+    if (signals.amber.size > 0) {
+      pills.push(pillHtml(group, "amber-branches", "amber", wordText("text", "pillToMerge",
+        {branches: plural(signals.amber.size, "branch")})));
+    }
+    if (signals.worktrees.length > 0) {
+      pills.push(pillHtml(group, "amber-worktrees", "amber",
+        wordText("text", "pillWorktrees")));
+    }
+    if (signals.behind.length > 0) {
+      pills.push(pillHtml(group, "amber-behind", "amber", wordText("text", "pillBehind",
+        {trunk: signals.trunk === null ? codeWords("text", "defaultBranchFallback")
+          : signals.trunk})));
+    }
+    return pills.join("");
+  }
+
+  function lineActivityHtml(signals) {
+    const inUse = wordText("text", "lineInUse", {n: signals.inUse, m: signals.cloneCount});
+    const items = signals.workItems > 0
+      ? wordText("text", "lineWorkItems", {items: plural(signals.workItems, "work item")}) : "";
+    return '<span class="checkouts-line-activity">' +
+      `<span class="checkouts-line-inuse"${signals.tone === "green" ? ' data-tone="green"' : ""}>` +
+      `${inUse}</span>${items}</span>`;
+  }
+
   function groupHeaderHtml(document, group) {
+    const signals = repositorySignals(document, group);
     const defaultBranch = group.default_branch === null ? null : group.default_branch.name;
+    const clones = plural(group.clones.length, "clone");
+    const trunkWords = defaultBranch === null
+      ? wordText("text", "lineClones", {clones})
+      : wordText("text", "lineTrunkClones", {branch: defaultBranch, clones});
+    const key = keyOf("head", groupKey(group));
     const free = freeClonesHtml(document, group);
-    return '<h2 class="checkouts-group-head" tabindex="-1" ' +
-      `${blockAttrs(keyOf("head", groupKey(group)))}>` +
-      `<span class="checkouts-group-name">${text(remoteName(group))}</span>` +
-      (defaultBranch === null ? "" :
-        `<span class="checkouts-group-default">${text(defaultBranch)}</span>`) +
+    return `<h2 class="checkouts-line" tabindex="-1" data-tone="${signals.tone}" ` +
+      `${blockAttrs(key)}>` +
+      `<button type="button" class="checkouts-line-toggle" aria-expanded="true" ` +
+      `${controlAttrs(key, "toggle")}>` +
+      `<span class="checkouts-line-name">${text(remoteName(group))}</span>` +
+      `<span class="checkouts-line-trunk">${trunkWords}</span></button>` +
+      `<span class="checkouts-line-pills">${pillsHtml(group, signals)}</span>` +
+      `${lineActivityHtml(signals)}</h2>` +
+      '<p class="checkouts-group-caption">' +
       `<span class="checkouts-group-check">${checkWords(document, group)}</span>` +
       `<span class="checkouts-group-lookup">${groupLookupWords(document, group)}</span>` +
       (free === "" ? "" : `<span class="checkouts-group-free">` +
         `${wordHtml("text", "freeClones", {clones: free})}</span>`) +
-      "</h2>";
+      "</p>";
   }
 
   // A work item the view still has something to say about: one that is not
@@ -3558,6 +3622,157 @@
     const key = group.remote === null ? null : group.remote.key;
     return !document.attention.some((item) => item.clone === clone.path ||
       (key !== null && item.repository === key));
+  }
+
+  // ---------------------------------------------------------------------
+  // The signal rules: the one owner of every repository's tone, pill and
+  // activity figure, read from the served document alone
+  // ---------------------------------------------------------------------
+
+  const UNIQUE_WORK_BRANCH_CODES = new Set(
+    ["branch_unpushed", "branch_not_pushed", "default_branch_ahead"]);
+  const AMBER_CLASSES = new Set(["awaiting_merge", "cleanup_ready", "base_moved", "configuration"]);
+  const signalsByDocument = new WeakMap();
+
+  // The branch a worktree is on: its own head's when readable (null when
+  // detached), else the one that lists it as checked out there.  Mirrors the
+  // collector's own reading.
+  function worktreeBranch(clone, worktree) {
+    if (worktree.status === "ok") return worktree.head.branch;
+    const listed = clone.branches.find((branch) => branch.checked_out_in.includes(worktree.path));
+    return listed === undefined ? null : listed.name;
+  }
+
+  // The branches an unfinished work item holds in one clone, so removing them
+  // is not offered.  Mirrors the collector's own count.
+  function heldBranches(document, clone) {
+    const unfinished = new Set(document.packages
+      .filter((item) => !item.finished).map((item) => item.package_path));
+    return new Set(clone.branches.filter((branch) => (branch.packages || []).some((reference) =>
+      (reference.basis === "target_clone" || reference.basis === "sibling_clone") &&
+      unfinished.has(reference.package_path))).map((branch) => branch.name));
+  }
+
+  function cloneIsInUse(clone) {
+    const availability = clone.availability;
+    return availability !== null && availability !== undefined &&
+      (availability.state === "occupied" || availability.state === "assigned");
+  }
+
+  function computeSignals(document, group) {
+    const key = group.remote === null ? null : group.remote.key;
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    const items = document.attention.filter((item) =>
+      (item.clone !== null && item.clone !== undefined && clonePaths.has(item.clone)) ||
+      (key !== null && item.repository === key));
+    const red = new Set();
+    const amber = new Set();
+    const perClone = new Map();
+    const worktrees = [];
+    const behind = [];
+    let trunk = group.default_branch === null ? null : group.default_branch.name;
+    group.clones.forEach((clone) => {
+      const own = {red: new Set(), amber: new Set(), behind: false, tone: "grey"};
+      perClone.set(clone.path, own);
+      if (clone.status !== "ok") return;
+      const distance = defaultDistance(clone);
+      own.behind = distance !== null && distance.relation === "behind";
+      if (own.behind) {
+        behind.push(clone.path);
+        if (trunk === null) trunk = defaultBranchName(clone);
+      }
+      const held = heldBranches(document, clone);
+      clone.branches.forEach((branch) => {
+        if (branch.removable !== null && branch.removable !== undefined &&
+          branch.removable.removable && !held.has(branch.name)) {
+          own.amber.add(branch.name);
+          amber.add(branch.name);
+        }
+      });
+    });
+    items.forEach((item) => {
+      const clone = group.clones.find((candidate) => candidate.path === item.clone);
+      if (item.class === "awaiting_merge" && item.branch !== null) {
+        amber.add(item.branch);
+        if (clone !== undefined) perClone.get(clone.path).amber.add(item.branch);
+      }
+      if (item.class !== "unique_work" || clone === undefined) return;
+      let branch = null;
+      if (UNIQUE_WORK_BRANCH_CODES.has(item.code)) {
+        branch = item.branch;
+      } else if (item.code === "uncommitted_changes") {
+        const path = item.worktree === null || item.worktree === undefined
+          ? clone.path : item.worktree;
+        const worktree = (clone.worktrees || []).find((candidate) => candidate.path === path);
+        branch = worktree === undefined ? null : worktreeBranch(clone, worktree);
+      }
+      if (branch !== null) {
+        red.add(branch);
+        perClone.get(clone.path).red.add(branch);
+      }
+    });
+    group.clones.forEach((clone) => {
+      if (clone.status !== "ok") return;
+      const held = heldBranches(document, clone);
+      (clone.worktrees || []).forEach((worktree) => {
+        if (worktree.main || worktree.removable === null || worktree.removable === undefined ||
+          !worktree.removable.removable) return;
+        const branch = worktreeBranch(clone, worktree);
+        if (branch !== null && (held.has(branch) || amber.has(branch))) return;
+        worktrees.push({clone: clone.path, path: worktree.path});
+      });
+    });
+    const unique = items.filter((item) => item.class === "unique_work");
+    const served = servedWorkItems(document, group);
+    const inUse = group.clones.filter(cloneIsInUse).length;
+    let tone = "grey";
+    if (unique.length) tone = "red";
+    else if (items.some((item) => AMBER_CLASSES.has(item.class)) || behind.length) tone = "amber";
+    else if (inUse > 0 || served.size > 0) tone = "green";
+    group.clones.forEach((clone) => {
+      const own = perClone.get(clone.path);
+      const mine = items.filter((item) => item.clone === clone.path);
+      if (mine.some((item) => item.class === "unique_work")) own.tone = "red";
+      else if (own.behind || mine.some((item) => AMBER_CLASSES.has(item.class))) own.tone = "amber";
+      else if (cloneIsInUse(clone)) own.tone = "green";
+    });
+    const first = (classes) => items.find((item) => classes.includes(item.class));
+    const keyOfItem = (item) => item === undefined ? null : attentionKey(item);
+    return {
+      tone,
+      red,
+      amber,
+      uncountedRed: unique.length > 0 && red.size === 0,
+      worktrees,
+      behind,
+      trunk,
+      perClone,
+      inUse,
+      cloneCount: group.clones.length,
+      workItems: served.size,
+      destinations: {
+        red: keyOfItem(first(["unique_work"])),
+        amber: keyOfItem(first(["awaiting_merge", "cleanup_ready"])),
+        worktrees: keyOfItem(first(["cleanup_ready"])),
+        behind: behind.length ? behind[0] : null,
+      },
+    };
+  }
+
+  // Cached per document and repository, as the live work item paths are.
+  function repositorySignals(document, group) {
+    let byGroup = signalsByDocument.get(document);
+    if (byGroup === undefined) {
+      byGroup = new Map();
+      signalsByDocument.set(document, byGroup);
+    }
+    const id = groupKey(group);
+    let signals = byGroup.get(id);
+    if (signals === undefined) {
+      signals = computeSignals(document, group);
+      byGroup.set(id, signals);
+    }
+    return signals;
   }
 
   function quietRowHtml(document, quiet) {
@@ -4182,19 +4397,43 @@
     return holder.content.textContent;
   }
 
+  // Every live work item a repository serves, by path: those its clones' branches
+  // name, those targeting its clones, and those its work item branches name.
+  // Search and the signal rules read the one set.
+  function servedWorkItems(document, group) {
+    const served = new Map();
+    const notePackage = (item) => served.set(item.package_path, item);
+    group.clones.forEach((clone) => {
+      if (clone.status === "ok") {
+        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
+      }
+    });
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    document.packages.forEach((item) => {
+      if (isLivePackage(item) && item.target !== null && item.target !== undefined &&
+        clonePaths.has(item.target.clone)) notePackage(item);
+    });
+    const live = livePackagePaths(document);
+    livePackageBranches(document, group).forEach((entry) => {
+      entry.packages.filter((path) => live.has(path)).forEach((path) => {
+        const item = document.packages.find((candidate) => candidate.package_path === path);
+        if (item !== undefined) notePackage(item);
+      });
+    });
+    return served;
+  }
+
   function groupSearchText(document, group) {
     const values = [remoteName(group)];
     if (group.default_branch !== null && group.default_branch.name !== null) {
       values.push(group.default_branch.name);
     }
-    const served = new Map();
-    const notePackage = (item) => served.set(item.package_path, item);
+    const served = servedWorkItems(document, group);
     group.clones.forEach((clone) => {
       values.push(checkoutName(clone.path), clone.path);
       values.push(wordsOf(availabilityCellHtml(clone)));
       if (clone.status === "ok") {
         values.push(wordsOf(cloneHeadHtml(clone)), wordsOf(cloneTreeHtml(clone)));
-        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
       } else {
         values.push(wordsOf(text(codeWords("status", clone.status))));
       }
@@ -4205,19 +4444,7 @@
       });
       (clone.branches || []).forEach((branch) => values.push(branch.name));
     });
-    const clonePaths = new Set(group.clones.map((clone) => clone.path));
-    document.packages.forEach((item) => {
-      if (isLivePackage(item) && item.target !== null && item.target !== undefined &&
-        clonePaths.has(item.target.clone)) notePackage(item);
-    });
-    const live = livePackagePaths(document);
-    livePackageBranches(document, group).forEach((entry) => {
-      values.push(entry.name);
-      entry.packages.filter((path) => live.has(path)).forEach((path) => {
-        const item = document.packages.find((candidate) => candidate.package_path === path);
-        if (item !== undefined) notePackage(item);
-      });
-    });
+    livePackageBranches(document, group).forEach((entry) => values.push(entry.name));
     served.forEach((item, path) => {
       values.push(path);
       if (item.code_status !== null && item.code_status !== undefined) {
@@ -4405,7 +4632,7 @@
       revealDestination(group);
       const row = [...group.querySelectorAll("table.checkouts-package-branches tr[data-branch]")]
         .find((candidate) => candidate.dataset.branch === item.branch);
-      focusDestination(row === undefined ? group.querySelector(".checkouts-group-head") : row);
+      focusDestination(row === undefined ? group.querySelector(".checkouts-line-toggle") : row);
       return;
     }
     const cloneRow = cloneRowFor(item.clone);
@@ -4594,7 +4821,7 @@
   }
 
   // The control it was on, else its block, else the next row's toggle in its
-  // group, else the group's heading, else the view's heading.
+  // group, else the repository line's toggle, else the view's heading.
   function restoreCheckoutsFocus(focus) {
     if (focus === null || document.activeElement === focus.element) return;
     let target = findByKey(checkoutsBody, focus.key, focus.control);
@@ -4606,7 +4833,7 @@
     }
     if (target === null && focus.group !== null) {
       const group = findByKey(checkoutsBody, focus.group, null);
-      target = group === null ? null : group.querySelector(".checkouts-group-head");
+      target = group === null ? null : group.querySelector(".checkouts-line-toggle");
     }
     if (target === null) target = checkoutsHeading;
     target.focus({preventScroll: true});
