@@ -11829,7 +11829,7 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     fire_checkouts_poll(page)
     playwright.expect(body.locator(".panel-target dd")).to_have_text("does not exist")
     rows = list(panel_code_rows(page).items())
-    assert ("Target repo", "does not exist") in rows
+    assert rows[:2] == [("Target repo", "does not exist"), ("Branch", rows[1][1])]
     assert [label for label, _ in panel_all_fields(page)].count("Target repo") == 0
     code_status_card(page, "Repo/Drafts/epsilon").click()
     assert "Target repo" not in panel_code_rows(page)
