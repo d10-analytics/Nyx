@@ -1666,7 +1666,7 @@ The checked-in images use only fictional data. Three show the complete
 community-event fixture listed in the [workspace guide](workspaces.md): four
 `spec.md` work items (Queue/festival, Done/permit, Needs_Fixes/cleanup, and
 Under_Development/event-site), and two `.gitkeep` empty dimensions. The fourth,
-`docs/images/sample-checkouts.png`, adds the fictional checkout fixture
+`docs/images/sample-repositories.png`, adds the fictional checkout fixture
 described below. Create that
 disposable workspace outside the repository, configure it with
 `nyx --setup <fixture-root>`, and start Nyx through
@@ -1710,9 +1710,10 @@ hidden). Keep **Board settings** closed in every image.
    and `Community_Resources` column. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 4. Check **Hide empty rows and columns** again, choose **Dark** and the
-   **Repositories** view, and open the **Details** row of the second festival
-   clone. Save this view as `docs/images/sample-checkouts.png` (see the
-   checkout fixture below).
+   **Repositories** view, check **Hide quiet repositories**, open the
+   two-clone repository and open the **Details** row of its second clone. Save
+   this view as `docs/images/sample-repositories.png` (see the checkout
+   fixture below).
 
 The first image is light with the saved row order and selected festival card
 showing its filepath. The second is dark with compact view checked and the same
@@ -1725,9 +1726,9 @@ toolbar with **Board** selected.
 
 The fourth image is dark, 1600 × 1200, with **Repositories** selected and **Hide
 quiet repositories** checked. It shows the status line with **Check remotes now** and the closed
-**Checkout folders** control,
-the **Needs attention** list with its one item, the quiet line,
-and the repository with two clones, with the second clone's **Details** open.
+**Checkout folders** control, the pill bar, the quiet line, and the open
+repository with two clones, whose five-column clone table shows the second
+clone's **Details** open.
 Create its fictional fixture outside the repository, beside the workspace
 fixture. Make two local bare remotes whose default branch is `trunk`,
 `festival-site` and `volunteer-roster`, and clone `festival-site` twice
