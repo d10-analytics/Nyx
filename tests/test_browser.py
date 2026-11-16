@@ -13330,3 +13330,25 @@ def test_checkouts_line_is_green_when_it_only_serves_a_live_work_item(
     line = repository_line(page, quiet)
     assert (line["tone"], line["pills"], line["activity"], line["inUseTone"]) == (
         "green", [], "0 of 1 in use · 1 work item", "green")
+
+
+def test_checkouts_behind_list_entry_clears_a_search_that_hides_its_repository(
+    open_page, view_checkouts
+):
+    """A behind-list entry clears a search hiding its repository, opens the line, focuses the row."""
+    document = checkout_variant(view_checkouts.document_checked, signal_only_behind_clones)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    page.fill("#filter", "zzz")
+    assert page.locator(".checkouts-group").evaluate_all(
+        "groups => groups.map(group => group.hidden)") == [True] * 2
+    assert bar_pill_texts(page) == [f"{AMBER_MARK} 1 repository behind remote"]
+    open_bar_list(page, "behind").locator("li button").press("Enter")
+    assert page.locator("#filter").input_value() == ""
+    target = focused_checkouts_target(page)
+    assert target["clone"] == "Repo Clone 2"
+    assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
+    toggle = page.locator(".checkouts-group").filter(
+        has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    ).locator(".checkouts-line-toggle")
+    assert toggle.get_attribute("aria-expanded") == "true"
