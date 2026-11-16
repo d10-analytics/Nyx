@@ -4086,8 +4086,10 @@
     return parts.join(" · ");
   }
 
-  function tonedHtml(tone, html) {
-    return tone === "" ? html : `<span class="checkouts-phrase" data-tone="${tone}">${html}</span>`;
+  function tonedHtml(tone, html, names = null) {
+    return tone === "" ? html : `<span class="checkouts-phrase" data-tone="${tone}"` +
+      (names === null ? "" : ` data-branches="${text(JSON.stringify(names))}"`) +
+      `>${html}</span>`;
   }
 
   // The Uncommitted changes cell: today's words, red when a change or an
@@ -4137,12 +4139,14 @@
     const take = (names) => {
       const fresh = [...names].filter((name) => !taken.has(name));
       fresh.forEach((name) => taken.add(name));
-      return fresh.length;
+      return fresh;
     };
     const live = livePackagePaths(document);
     const phrases = [];
-    const add = (tone, code, count) => {
-      if (count > 0) phrases.push(tonedHtml(tone, wordText("text", code, {n: count})));
+    const add = (tone, code, names) => {
+      if (names.length > 0) {
+        phrases.push(tonedHtml(tone, wordText("text", code, {n: names.length}), names));
+      }
     };
     add("red", "branchLocalOnly", take(own.red));
     add("amber", "branchAwaitingMerge", take(own.awaiting));
