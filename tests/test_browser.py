@@ -8579,7 +8579,13 @@ def mutate_searchable_words(document):
 
 
 def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_checkouts):
-    """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
+    """Search keeps today's words, including availability words and `clean` that no cell shows.
+
+    A Code Status phrase, HEAD and tree word or a worktree's HEAD finds its
+    group by the words its cells show. The availability words of a clone and
+    the tree word `clean` still find their group though the Availability column
+    is gone and a clean checkout's Uncommitted changes cell reads a dash.
+    """
     document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
     open_repository(page, "remote")
@@ -8595,8 +8601,24 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
     assert sorted(shown("")) == sorted([remote, quiet])
     # The served Code Status text of a work item the group serves.
     assert shown("pushed") == [remote]
-    # The availability words of a clone row.
+    # The availability words of a clone row still match, though no visible
+    # cell of the opened clone rows shows them.
     assert shown("has linked worktrees") == [remote]
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(remote) + "$")))
+    clones = group.locator("table.checkouts-clones > tbody > tr.checkouts-clone")
+    assert clones.count() == 3
+    cells = group.locator(
+        "table.checkouts-clones > tbody > tr.checkouts-clone > :is(td, th)"
+    ).evaluate_all("cells => cells.map(cell => cell.innerText.toLowerCase())")
+    assert cells and not any("has linked worktrees" in cell for cell in cells)
+    # The tree word `clean` finds the repository whose clones are clean, though
+    # every Uncommitted changes cell of its clone rows reads a dash.
+    assert shown("clean") == [remote]
+    page.fill("#filter", "")
+    assert clones.evaluate_all(
+        "rows => rows.map(row => row.children[3].innerText.trim())") == ["—"] * 3
+    assert not any("clean" in cell for cell in cells)
     # The HEAD words of the quiet clone's main worktree, and its tree words.
     assert shown("detached at abc1234") == [quiet]
     assert shown("3 unstaged") == [quiet]
@@ -10640,7 +10662,7 @@ CHECKOUTS_TEXT_SAMPLES = {
     "column headers": "#checkouts th[scope=col]",
     "cell values": (
         "#checkouts-body td, #checkouts-body th[scope=row], .checkouts-basis, "
-        ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
+        ".checkouts-empty, .checkouts-caption, .checkouts-note, "
         ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
         ".checkouts-quiet-line, .checkouts-quiet-show"),
     "toned phrases": ".checkouts-phrase, .checkouts-relation[data-tone]",
