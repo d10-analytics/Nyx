@@ -1630,11 +1630,12 @@ remote, `N awaiting merge` and `N merged, removable`; and green for `N in
 progress`, which are pushed branches of a live work item. Each branch takes one
 phrase, in that order. A merge verdict reads `merged` with the proof that decided
 it (such as `tip is in main` or `pull request #7 merged`), `not merged`, or `merge
-state unknown` with the reason. **Branches** also names each branch or worktree
-that is not removable with what blocks it, such as `not merged`, `merge state
-unknown` or `its worktree has changes`. **Details** opens a clone's row to show its
-path, branches, linked worktrees and work items; a branch that another branch
-contains is listed under **Folded branches**, which you open on demand.
+state unknown` with the reason. **Details** opens a clone's row to show its
+path, branches, linked worktrees and work items. The branch and linked-worktree
+tables there each end with a **Cleanup** column. That column names what blocks a
+branch or worktree that is not removable, such as `not merged`, `merge state
+unknown` or `its worktree has changes`. A branch that another branch contains is
+listed under **Folded branches**, which you open on demand.
 
 Repositories that need nothing are quiet: one clone that can be read and is free,
 its default branch equal to its remote, and no stash, linked worktree, other
