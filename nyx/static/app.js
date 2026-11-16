@@ -2470,7 +2470,7 @@
     terminalControl.closest("label").hidden = checkoutsShown;
     quietCheckoutsLabel.hidden = !checkoutsShown;
     filter.placeholder = checkoutsShown
-      ? "Find a checkout, branch, or work item…"
+      ? "Find a repository, checkout, branch, or work item…"
       : "Find a work item, project, or program…";
     syncViewLabels();
     applyWorkItemPanel();

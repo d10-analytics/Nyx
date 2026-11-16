@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Work item viewer</title>
+    <title>Nyx</title>
     <meta name="color-scheme" content="dark light">
     <script src="/static/theme.js"></script>
     <link rel="stylesheet" href="/static/style.css">
@@ -42,7 +42,7 @@
         <div class="controls">
           <div class="view-switch" role="group" aria-label="View">
             <button id="view-board" type="button" aria-pressed="true">Board</button>
-            <button id="view-checkouts" type="button" aria-pressed="false">Checkouts</button>
+            <button id="view-checkouts" type="button" aria-pressed="false">Repositories</button>
           </div>
           <label for="theme">Theme</label>
           <select id="theme">
@@ -64,7 +64,7 @@
           </div>
           <label class="compact-control checkouts-control" for="hide-quiet-checkouts" hidden>
             <input id="hide-quiet-checkouts" type="checkbox" checked>
-            Hide quiet checkouts
+            Hide quiet repositories
           </label>
         </div>
       </div>
@@ -75,7 +75,7 @@
     </aside>
     <main id="board"></main>
     <main id="checkouts" aria-labelledby="checkouts-heading" hidden>
-      <h1 id="checkouts-heading">Checkouts</h1>
+      <h1 id="checkouts-heading">Repositories</h1>
       <div class="checkouts-status">
         <p id="checkouts-status-line" class="checkouts-status-line"></p>
         <button id="check-remotes" type="button">Check remotes now</button>
