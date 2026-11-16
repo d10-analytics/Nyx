@@ -9200,6 +9200,46 @@ def open_attention_checkouts(launch, attention_checkouts, document, *, catalog=N
     return page, double
 
 
+def bar_pill_texts(page):
+    """The pills of the attention bar, in the order the page draws them."""
+    return page.locator("#checkouts-body .checkouts-bar-pill").all_inner_texts()
+
+
+def open_bar_list(page, name):
+    """Open one bar list by pressing its pill (a list already open is left open)."""
+    pill = page.locator(f'#checkouts-body .checkouts-bar-pill[data-list="{name}"]').first
+    if pill.get_attribute("aria-expanded") != "true":
+        pill.click()
+    assert pill.get_attribute("aria-expanded") == "true"
+    box = page.locator(f'#checkouts-body .checkouts-attention-listbox[data-list="{name}"]')
+    playwright.expect(box).to_be_visible()
+    return box
+
+
+def open_every_bar_list(page):
+    """Open every list the bar's pills control."""
+    for name in page.locator("#checkouts-body .checkouts-bar-pill").evaluate_all(
+        "pills => [...new Set(pills.map(pill => pill.dataset.list))]"
+    ):
+        open_bar_list(page, name)
+
+
+def attention_item(page, code):
+    """The attention item with ``code``, its bar list opened first when it sits in one."""
+    item = page.locator(f'#checkouts-body li[data-code="{code}"]').first
+    name = item.evaluate(
+        "el => { const box = el.closest('.checkouts-attention-listbox');"
+        " return box === null ? null : box.dataset.list; }")
+    if name is not None:
+        open_bar_list(page, name)
+    return item
+
+
+def press_attention_item(page, code):
+    """Open the item's list, then press the control the item holds."""
+    attention_item(page, code).locator("button").press("Enter")
+
+
 def attention_words(item):
     """The words one attention item must read, built from the view's own block."""
     words = checkout_words()
@@ -9252,22 +9292,48 @@ def focused_inside_viewport(page):
 
 
 def test_checkouts_attention_list_follows_the_document(open_page, attention_checkouts):
-    """Items equal the served array in order, with class headings and served counts."""
+    """The bar totals the lines' counts; its lists and the headed classes hold every item."""
     document = attention_checkouts.document
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    red_classes, amber_classes = ["unique_work"], ["awaiting_merge", "cleanup_ready"]
+    listed = red_classes + amber_classes
+    codes = lambda classes: [  # noqa: E731
+        item["code"] for item in document["attention"] if item["class"] in classes]
+    # Three branches are local only and three to merge or clean up; no clone is
+    # behind and no worktree stands alone, so the bar holds the two pills.
+    assert bar_pill_texts(page) == [f"{RED_MARK} 3 branches local only",
+                                    f"{AMBER_MARK} 3 branches to merge or clean up"]
+    # A closed list stays in the page, hidden; a press opens it and a second closes it.
     items = page.locator("#checkouts-body .checkouts-attention li[data-code]")
-    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
-        item["code"] for item in document["attention"]]
-    # A class heading appears exactly where the class changes in document order.
+    assert items.count() == len(document["attention"])
+    boxes = page.locator("#checkouts-body .checkouts-attention-listbox")
+    assert boxes.evaluate_all("nodes => nodes.map(node => node.hidden)") == [True, True]
+    red = open_bar_list(page, "red")
+    assert red.locator("li[data-code]").evaluate_all(
+        "rows => rows.map(row => row.dataset.code)") == codes(red_classes)
+    page.locator('.checkouts-bar-pill[data-list="red"]').click()
+    playwright.expect(red).to_be_hidden()
+    assert red.locator("li[data-code]").count() == len(codes(red_classes))
+    open_bar_list(page, "red")
+    amber = open_bar_list(page, "amber")
+    assert amber.locator("li[data-code]").evaluate_all(
+        "rows => rows.map(row => row.dataset.code)") == codes(amber_classes)
+    # base_moved and configuration items stay listed below the bar under headings.
     classes = []
     for item in document["attention"]:
-        if not classes or classes[-1] != item["class"]:
+        if item["class"] not in listed and (not classes or classes[-1] != item["class"]):
             classes.append(item["class"])
-    headings = page.locator("#checkouts-body .checkouts-attention .checkouts-attention-class")
+    assert classes
+    headings = page.locator("#checkouts-body .checkouts-attention > .checkouts-attention-class")
     assert headings.evaluate_all("nodes => nodes.map(node => node.dataset.class)") == classes
     assert headings.all_inner_texts() == [
         checkout_words()["attentionClass"][name] for name in classes]
+    below = page.locator("#checkouts-body .checkouts-attention > ul li[data-code]")
+    assert below.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"] if item["class"] not in listed]
     assert page.locator(".checkouts-attention h2").inner_text() == "Needs attention"
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"]]
     # Each item reads its words with the served count.
     texts = items.evaluate_all(
         "rows => rows.map(row => row.querySelector("
@@ -9317,10 +9383,10 @@ def test_checkouts_attention_counts_read_singular_at_one_and_plural_otherwise(
             item["count"] = count
             variant["attention"].append(item)
         serve_checkouts(page, double, redigest(variant))
+        open_every_bar_list(page)
         for code, (template, noun) in expected.items():
             phrase = f"1 {noun}" if count == 1 else f"{count} {plurals[noun]}"
-            sentence = page.locator(
-                f'li[data-code="{code}"]').first.inner_text()
+            sentence = attention_item(page, code).inner_text()
             assert sentence == template.format(phrase), (code, count)
 
 
@@ -9339,7 +9405,7 @@ def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
 
     document = checkout_variant(attention_checkouts.document, open_pull_request)
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    sentence = page.locator('li[data-code="awaiting_merge"] button').inner_text()
+    sentence = attention_item(page, "awaiting_merge").locator("button").inner_text()
     assert sentence == "topic-g is finished but not merged (pull request #7)"
     assert sentence == attention_words(
         next(item for item in document["attention"] if item["code"] == "awaiting_merge"))
@@ -9353,7 +9419,7 @@ def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
 
     def press(code):
-        page.locator(f'li[data-code="{code}"] button').press("Enter")
+        press_attention_item(page, code)
 
     clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     line = page.locator(".checkouts-group").filter(has=clone_two).locator(
@@ -9467,7 +9533,7 @@ def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
         set_clone_status(clone, "failed")
 
     serve_checkouts(page, double, checkout_variant(attention_checkouts.document, unreadable))
-    page.locator('li[data-code="checkout_unavailable"] button').press("Enter")
+    press_attention_item(page, "checkout_unavailable")
     target = focused_checkouts_target(page)
     assert (target["clone"], target["cls"]) == ("Repo Clone 10", "checkouts-clone")
     assert page.locator(
@@ -9480,6 +9546,7 @@ def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
 
     variant = checkout_variant(attention_checkouts.document, own_worktree)
     serve_checkouts(page, double, variant)
+    open_bar_list(page, "red")
     page.locator('li[data-code="uncommitted_changes"]').filter(
         has_text="Repo Clone 3 has 2 uncommitted changes").locator("button").press("Enter")
     target = focused_checkouts_target(page)
@@ -9497,7 +9564,7 @@ def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
 
     document = checkout_variant(attention_checkouts.document, mismatch)
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    page.locator('li[data-code="upstream_mismatch"] button').press("Enter")
+    press_attention_item(page, "upstream_mismatch")
     target = focused_checkouts_target(page)
     assert target["branch"] == "topic-a-part"
     assert page.locator('tr.checkouts-clone-branch[data-branch="topic-a"] '
@@ -9516,13 +9583,19 @@ def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
     assert items.count() == len(document["attention"])
     assert page.locator(".checkouts-group").evaluate_all(
         "groups => groups.map(group => group.hidden)") == [True]
+    # The bar and its lists ignore the search: both open while every line is hidden.
+    assert bar_pill_texts(page) == [f"{RED_MARK} 3 branches local only",
+                                    f"{AMBER_MARK} 3 branches to merge or clean up"]
+    open_bar_list(page, "red")
+    open_bar_list(page, "amber")
+    assert page.locator("#filter").input_value() == "zzz"
     page.locator('li[data-code="branch_unpushed"] button').press("Enter")
     assert page.locator("#filter").input_value() == ""
     assert page.locator(".checkouts-group").evaluate_all(
         "groups => groups.map(group => group.hidden)") == [False]
     assert focused_checkouts_target(page)["branch"] == "topic-a"
 
-    # The package-branch destination clears it the same way.
+    # The package-branch destination in the amber list clears it the same way.
     page.fill("#filter", "zzz")
     page.locator('li[data-code="awaiting_merge"] button').press("Enter")
     assert page.locator("#filter").input_value() == ""
@@ -10197,6 +10270,15 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     assert page.evaluate("Object.keys(localStorage)") == keys
     assert_focus_sampler_clean(page)
 
+    # An open bar list stays open across a delivered refresh, with its pill.
+    box = open_bar_list(page, "amber")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    playwright.expect(box).to_be_visible()
+    assert page.locator('.checkouts-bar-pill[data-list="amber"]').first.get_attribute(
+        "aria-expanded") == "true"
+    serve_checkouts(page, double, before)
+    playwright.expect(box).to_be_visible()
+
 
 def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     open_page, view_checkouts
@@ -10388,6 +10470,16 @@ def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
         page.locator(".checkouts-group").filter(has=row).locator(".checkouts-group-body")
     ).to_be_hidden()
 
+    # A bar list none of whose pills remains is forgotten and returns closed.
+    open_bar_list(page, "red")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator('.checkouts-bar-pill[data-list="red"]').count() == 0
+    assert page.locator('.checkouts-attention-listbox[data-list="red"]').count() == 0
+    serve_checkouts(page, double, before)
+    assert page.locator('.checkouts-bar-pill[data-list="red"]').first.get_attribute(
+        "aria-expanded") == "false"
+    playwright.expect(page.locator('.checkouts-attention-listbox[data-list="red"]')).to_be_hidden()
+
 
 def long_name_variant(view_checkouts):
     """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
@@ -10508,7 +10600,7 @@ CHECKOUTS_TEXT_SAMPLES = {
         ".checkouts-quiet summary, .checkouts-quiet li"),
     "attention items": (
         ".checkouts-attention h2, .checkouts-attention-class, "
-        ".checkouts-attention-item, .checkouts-attention-go"),
+        ".checkouts-attention-item, .checkouts-attention-go, .checkouts-bar-pill"),
     "repository lines": (
         ".checkouts-line-name, .checkouts-line-trunk, .checkouts-line-activity, "
         ".checkouts-line-inuse, .checkouts-pill"),
@@ -10582,11 +10674,21 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
             assert ratio >= 4.5, (name, sample, color, background, ratio)
 
     open_every_repository(page)
+    open_every_bar_list(page)
+    settle_frames(page)
+    for name, pairs in checkouts_text_colors(page).items():
+        if name != "attention items":
+            continue
+        assert pairs
+        for color, background, sample in pairs:
+            ratio = contrast_ratio(color, background)
+            assert ratio >= 4.5, (name, sample, color, background, ratio)
     rings = {
         "view switch": "#view-checkouts",
         "line toggle": ".checkouts-line-toggle",
         "row toggle": 'tr.checkouts-clone[data-clone="Repo Clone 3"] .checkouts-toggle',
         "fold": ".checkouts-fold-toggle",
+        "bar pill": ".checkouts-bar-pill",
         "attention item": ".checkouts-attention-go",
         "Check remotes now": "#check-remotes",
         "Show on board": ".checkouts-show-on-board",
@@ -10707,6 +10809,37 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         if case in ("m", "n"):
             section = page.locator(
                 f'.checkouts-group[data-checkouts-group="{group["remote"]["key"]}"]')
+            line_toggle = section.locator(".checkouts-line-toggle")
+            if line_toggle.get_attribute("aria-expanded") == "true":
+                line_toggle.click()
+            if case == "n":
+                # The attention array is empty, yet the bar holds the behind pill,
+                # its list names the repository, and pressing it opens the line
+                # and focuses the first behind clone's row.
+                assert document["attention"] == []
+                assert bar_pill_texts(page) == [f"{AMBER_MARK} 1 repository behind remote"]
+                behind = open_bar_list(page, "behind")
+                assert behind.locator("li").all_inner_texts() == [
+                    group["remote"]["display"]]
+                behind.locator("li button").press("Enter")
+                assert line_toggle.get_attribute("aria-expanded") == "true"
+                target = focused_checkouts_target(page)
+                assert target["clone"] == "Repo Clone 2"
+                assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
+                line_toggle.click()
+            else:
+                # The worktree pill sits in the bar without a branch-count pill,
+                # and opens the amber list holding the removable item.
+                assert bar_pill_texts(page) == [
+                    f"{AMBER_MARK} worktrees to clean up",
+                    f"{AMBER_MARK} 1 repository behind remote"]
+                page.locator('.checkouts-bar-pill[data-bar-pill="amber-worktrees"]').click()
+                listing = page.locator('.checkouts-attention-listbox[data-list="amber"]')
+                playwright.expect(listing).to_be_visible()
+                removable = listing.locator('li[data-code="removable"]')
+                assert "Repo Clone 2" in removable.inner_text()
+                page.locator('.checkouts-bar-pill[data-bar-pill="amber-worktrees"]').click()
+                playwright.expect(listing).to_be_hidden()
             pill = section.locator(
                 'button[data-pill="amber-worktrees"]' if case == "m"
                 else 'button[data-pill="amber-behind"]')
@@ -10721,6 +10854,17 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             else:
                 # The behind pill focuses the first behind clone's row.
                 assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
+
+    # The red total is the sum of the lines' counts: the remote line's one and
+    # the quiet line's one.
+    both = checkout_variant(
+        view_checkouts.document_topic_committed, signal_quiet_default_branch_diverged)
+    serve_checkouts(page, double, both)
+    assert repository_line(page, checkout_group(both, "remote"))["pills"][0] == \
+        f"{RED_MARK} 1 branch local only"
+    assert repository_line(page, checkout_group(both, "quiet"))["pills"] == [
+        f"{RED_MARK} 1 branch local only"]
+    assert bar_pill_texts(page)[0] == f"{RED_MARK} 2 branches local only"
 
     # A grey repository the quiet rule does not call quiet is shown with the box
     # checked; one it does call quiet is not.
@@ -10888,6 +11032,22 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
         JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_three)};
     }})()""")
 
+    # A bar pill opens its list with Enter and closes it with Space; the list is
+    # shown only while open.
+    tab_until(page, "document.activeElement.matches('.checkouts-bar-pill[data-list=red]')")
+    pill = page.locator('.checkouts-bar-pill[data-list="red"]')
+    red_list = page.locator('.checkouts-attention-listbox[data-list="red"]')
+    assert pill.get_attribute("aria-expanded") == "false"
+    assert red_list.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert pill.get_attribute("aria-expanded") == "true"
+    assert red_list.evaluate("el => el.hidden") is False
+    page.keyboard.press("Space")
+    assert pill.get_attribute("aria-expanded") == "false"
+    assert red_list.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert red_list.evaluate("el => el.hidden") is False
+
     # An attention item moves focus to the row it names.
     tab_until(page, """(() => {
       const el = document.activeElement;
@@ -10931,6 +11091,13 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
         assert all(not action for _, action, _ in checkouts_records(page))
         assert page.locator("#checkouts-action-status").inner_text() == ""
         assert page.locator("#checkout-folders-status").inner_text() == ""
+    # Pressing a bar pill announces nothing and adds no region.
+    serve_checkouts(page, double, ready)
+    open_bar_list(page, "red")
+    assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+    assert page.locator("#checkouts-action-status").inner_text() == ""
+    assert page.locator(".checkouts-bar-pill[aria-live], .checkouts-attention-listbox[aria-live]"
+                        ).count() == 0
 
 
 def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
