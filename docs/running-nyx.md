@@ -1471,17 +1471,17 @@ changes to match). A repository matches by its name, default branch, any clone
 or linked worktree name or path, any branch name, the path of any work item it
 serves and that work item's Code Status text, the availability, HEAD and tree
 words of any clone row, the HEAD words of a linked worktree, and the status
-words of a clone or linked worktree that could not be read. No other column is
-searched: the default branch against the remote, the branch and stash counts,
-cleanup, merge verdicts, remote copies, pull requests and a linked worktree's
-tree words do not make a repository match. The **Quiet repositories** row is
-searched by the repositories it holds, by the same words a repository's own group
-would be: it stays while at least one of them matches, lists only those, and
-reads how many match (for example "Quiet repositories (3, 1 matching)"). It is
-hidden when none match, and shows every repository again when you clear the
-search. **Hide empty
-rows and columns** and **Hide terminal rows** give way to **Hide quiet
-repositories**. Switching views never waits for an update: the board is
+words of a clone or linked worktree that could not be read. Search still matches
+the availability words of a clone and the word `clean` of a clone with no
+uncommitted changes, though no cell shows them any more (the Availability column
+is gone and a clean checkout reads "—"). No other column is searched: the
+default branch against the remote, the branch and stash counts, cleanup, merge
+verdicts, remote copies, pull requests and a linked worktree's tree words do not
+make a repository match. Search hides the lines that do not match and does not
+open one that does. The quiet line is counted by the same words: while a search
+is entered it counts only the quiet repositories that match, and it is hidden
+when none match. **Hide empty rows and columns** and **Hide terminal rows** give
+way to **Hide quiet repositories**. Switching views never waits for an update: the board is
 always current, and every check reads the latest served scan, which Nyx renews
 at most about once a minute.
 
@@ -1561,54 +1561,93 @@ reason it gave. Local
 values (HEAD, working tree, branch counts) carry no label of their own, because
 every one of them was read at the scan time that the line's `Local state` gives.
 
-**Needs attention** comes first and lists, under a heading for each class
-(`Work only on this machine`, `Finished, not merged`, `Ready to clean up`, `Base
-moved`, `Setup problems`), one sentence per item. Selecting an item moves focus
-to what it names. An item that names a clone and a branch opens that clone's
-**Details**, opens any folds above the branch and focuses the branch's row. An item that
-names a clone only focuses that clone's **Details** button, or its row when the
-clone could not be read. An item that names a linked worktree focuses that
-worktree's own row under its clone (the clone's row when it is the main
-worktree). An item that names a repository and a
-branch but no clone focuses the branch's row in that repository's **Work item
-branches**, and the repository's heading when no such row exists. An item that
-names work items has a **Show on board** button for each of them, which
-switches to the board and selects that card. If the work item is in a finished
-row the view says to uncheck **Hide terminal rows**, and if the board does not
-show it the view says: This work item is not on the board. The board shows catalog
-changes within ten seconds.
+Each repository is one line that opens and closes its table; repositories start
+closed. The line gives the repository's name, its default branch and clone count
+(`main · 3 clones`), pills and a short summary of how many clones are in use or
+assigned and how many live work items it serves. A coloured left edge carries the
+repository's state, and the line has no separate state mark. The edge is red when
+the scan names work that exists only on this machine (commits not on the remote,
+a branch never pushed, a default branch ahead of its remote, a stash, or
+uncommitted changes or an unfinished git operation in a checkout), amber when
+something waits on you (a finished branch not merged, something ready to clean up,
+a moved base, a setup problem, or a default branch behind its remote), green when
+work is active and safe (a clone is in use or assigned, or a live work item targets
+the repository, and nothing is red or amber), and grey when the repository has
+none of these. The edge takes the most serious state the repository has, in the
+order red, amber, green, grey. A red pill is marked ✕ and an amber pill ⚠. The
+pills count branches, never files, and each shows only when its count is above
+zero: `✕ N branches local only`, `⚠ N branches to merge or clean up`, and three
+pills without a count, `✕ changes only on this machine` (a stash, or changes on a
+checkout that is on no branch), `⚠ worktrees to clean up` (a removable linked
+worktree that names no branch) and `⚠ main behind remote`, with the repository's
+own default branch name. Pressing a pill opens the repository and moves focus to
+the first matching attention item, or for the behind pill to the first clone whose
+default branch is behind. No part of the page is a legend: the colours and marks
+are described here, and every pill and cell states its own meaning in words.
 
-Below the list each repository is a group named by its remote, with its default
-branch, the state of its remote check and pull request lookup, and its free
-clones, listed best place to start first, each with how its default branch
-compares with the remote's (the ranking is in [Inspect checkouts](#inspect-checkouts)).
-The view leaves out every work item that is finished and has nothing left to
-act on: a work item in a stage that counts as finished appears only while it
-has a Code Status, which then names a merge still to make or a branch or
-worktree still to remove. Such a work item adds no branch row, no package name
-and no search text, and does not keep its repository out of the **Quiet
-repositories** row. When the remaining work items name branches of the
-repository, a **Work item branches** table
-comes first: one row for each such branch with its remote copy, its merge
-verdict, its pull requests and the work items that name it, each with **Show on
-board**, even when no listed clone holds the branch. A group's table lists each
-clone with its availability, HEAD, default branch against the remote, working
-tree, branches, cleanup and package. A merge verdict reads `merged` with the
-proof that decided it (such as `tip is in main` or `pull request #7 merged`),
-`not merged`, or `merge state unknown` with the reason. Cleanup says
-`nothing to remove` or counts what is removable, and names each branch or
-worktree that is not removable with what blocks it, such as `not merged`,
-`merge state unknown` or `its worktree has changes`. **Details**
-opens a clone's row to show its path, branches, linked worktrees and work items;
-a branch that another branch contains is listed under **Folded branches**, which
-you open on demand. Repositories that need nothing are collected into one
-**Quiet repositories** row that you open to list them; clear **Hide quiet
-repositories** to show each as a group of its own. While **Repositories** is shown the
-view refreshes in place on every scan: the rows, folds and quiet row you opened
-stay open, and focus and scroll position stay where they were. While the board
-is shown the view is not redrawn; switching to **Repositories** draws the latest
-scan. At a narrow width the tables stack, each
-cell labelled by its column, so the page needs no sideways scroll.
+**Needs attention** comes first as a bar of pills with page totals, each shown
+only when it has items: `✕ N branches local only` (or `✕ changes only on this
+machine` when that count is zero), `⚠ N branches to merge or clean up`,
+`⚠ worktrees to clean up` and `⚠ N repositories behind remote`. Pressing a pill
+opens or closes its list below the bar. The red pill lists the `Work only on this
+machine` items; either amber branch or worktree pill lists the `Finished, not
+merged` and `Ready to clean up` items together; the behind pill lists each
+repository whose default branch is behind, and selecting one opens that
+repository and moves to its first behind clone. Items of the `Base moved` and
+`Setup problems` classes stay listed below the bar under their class headings.
+Each list has one sentence per item. Selecting an item moves focus to what it
+names. An item that names a clone and a branch opens the repository and that
+clone's **Details**, opens any folds above the branch and focuses the branch's
+row. An item that names a clone only focuses that clone's **Details** button, or
+its row when the clone could not be read. An item that names a linked worktree
+focuses that worktree's own row under its clone (the clone's row when it is the
+main worktree). An item that names a repository and a branch but no clone focuses
+the branch's row in that repository's **Work item branches**, and the line when
+no such row exists. An item that names work items has a **Show on board** button
+for each of them, which switches to the board and selects that card. If the work
+item is in a finished row the view says to uncheck **Hide terminal rows**, and if
+the board does not show it the view says: This work item is not on the board. The
+board shows catalog changes within ten seconds.
+
+Opened, a repository shows a caption line with its remote check, pull request
+lookup and free clones, listed best place to start first (the ranking is in
+[Inspect checkouts](#inspect-checkouts)), then the **Work item branches** table
+and the clone table. The view leaves out every work item that is finished and has
+nothing left to act on: a work item in a stage that counts as finished appears
+only while it has a Code Status, which then names a merge still to make or a
+branch or worktree still to remove. Such a work item adds no branch row, no
+package name and no search text, and does not make its repository quiet. When the
+remaining work items name branches of the repository, the **Work item branches**
+table has one row for each such branch with its remote copy, its merge verdict,
+its pull requests and the work items that name it, each with **Show on board**,
+even when no listed clone holds the branch. The clone table has five columns:
+**Checkout**, **HEAD**, `Local main vs remote main` (with the repository's own
+default branch name), **Uncommitted changes** and **Branches**. A cell with
+nothing to report shows a muted `—`. Coloured phrases are red for uncommitted
+changes or an unfinished operation, a default branch ahead of or diverged from its
+remote, `N local only` and `N stashes`; amber for a default branch behind its
+remote, `N awaiting merge` and `N merged, removable`; and green for `N in
+progress`, which are pushed branches of a live work item. Each branch takes one
+phrase, in that order. A merge verdict reads `merged` with the proof that decided
+it (such as `tip is in main` or `pull request #7 merged`), `not merged`, or `merge
+state unknown` with the reason. **Branches** also names each branch or worktree
+that is not removable with what blocks it, such as `not merged`, `merge state
+unknown` or `its worktree has changes`. **Details** opens a clone's row to show its
+path, branches, linked worktrees and work items; a branch that another branch
+contains is listed under **Folded branches**, which you open on demand.
+
+Repositories that need nothing are quiet: one clone that can be read and is free,
+its default branch equal to its remote, and no stash, linked worktree, other
+branch, live work item or attention item. With **Hide quiet repositories**
+checked, the quiet repositories are replaced by one line reading `N quiet
+repositories hidden` with a **Show** button, which clears **Hide quiet
+repositories**; clear it yourself to show each quiet repository as a line of its
+own. A repository that is grey but not quiet, such as one with two idle clones,
+stays shown. While **Repositories** is shown the view refreshes in place on every
+scan: the repositories, folds and rows you opened stay open, and focus and scroll
+position stay where they were. While the board is shown the view is not redrawn;
+switching to **Repositories** draws the latest scan. At a narrow width the tables
+stack, each cell labelled by its column, so the page needs no sideways scroll.
 
 When there is nothing to read, a panel explains why instead of a list: `This
 Nyx server does not serve checkout state.`; `Checkout state is unavailable:`
@@ -1687,7 +1726,7 @@ toolbar with **Board** selected.
 The fourth image is dark, 1600 × 1200, with **Repositories** selected and **Hide
 quiet repositories** checked. It shows the status line with **Check remotes now** and the closed
 **Checkout folders** control,
-the **Needs attention** list with its one item, the **Quiet repositories** row,
+the **Needs attention** list with its one item, the quiet line,
 and the repository with two clones, with the second clone's **Details** open.
 Create its fictional fixture outside the repository, beside the workspace
 fixture. Make two local bare remotes whose default branch is `trunk`,

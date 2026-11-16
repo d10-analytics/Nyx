@@ -116,7 +116,8 @@ saves them through the checkout settings `PUT` served by `application-serving`,
 never through this system. It
   takes every fact and attention item from the document; the only things it
   decides itself are presentation: which finished work items it leaves out
-  (those with no Code Status), which repositories the quiet row collects,
+  (those with no Code Status), each repository's signal (red, amber, green or
+  grey) and pill counts, which repositories the quiet line hides,
   which pull-request lookup state the status line names, where each attention
   item sends focus, and which of the words it shows the search matches. The board renders the served
   document's Code Status as a card tag, and the work item's other served facts
