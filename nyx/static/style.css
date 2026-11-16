@@ -267,6 +267,9 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
 }
 .checkouts-group[hidden] { display: none; }
+.checkouts-group-body { display: grid; gap: .6rem; min-width: 0; }
+.checkouts-group-body[hidden] { display: none; }
+.checkouts-line-toggle:focus-visible { outline-offset: 2px; }
 .checkouts-line {
   --tone: var(--control-border);
   display: flex;

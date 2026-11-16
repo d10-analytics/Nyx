@@ -624,6 +624,7 @@
   // branch lists and the opened quiet row are restored onto what is rendered,
   // and survive a failed outcome until a ready one returns.
   const openClones = new Set();
+  const openRepositories = new Set();
   const openFolds = new Set();
   let quietOpen = false;
 
@@ -3554,16 +3555,19 @@
       ? wordText("text", "lineClones", {clones})
       : wordText("text", "lineTrunkClones", {branch: defaultBranch, clones});
     const key = keyOf("head", groupKey(group));
-    const free = freeClonesHtml(document, group);
     return `<h2 class="checkouts-line" tabindex="-1" data-tone="${signals.tone}" ` +
-      `${blockAttrs(key)}>` +
-      `<button type="button" class="checkouts-line-toggle" aria-expanded="true" ` +
+      `data-key="${text(key)}" data-parts>` +
+      `<button type="button" class="checkouts-line-toggle" aria-expanded="false" ` +
       `${controlAttrs(key, "toggle")}>` +
       `<span class="checkouts-line-name">${text(remoteName(group))}</span>` +
       `<span class="checkouts-line-trunk">${trunkWords}</span></button>` +
-      `<span class="checkouts-line-pills">${pillsHtml(group, signals)}</span>` +
-      `${lineActivityHtml(signals)}</h2>` +
-      '<p class="checkouts-group-caption">' +
+      `<span class="checkouts-line-pills" data-parts>${pillsHtml(group, signals)}</span>` +
+      `${lineActivityHtml(signals)}</h2>`;
+  }
+
+  function groupCaptionHtml(document, group) {
+    const free = freeClonesHtml(document, group);
+    return '<p class="checkouts-group-caption">' +
       `<span class="checkouts-group-check">${checkWords(document, group)}</span>` +
       `<span class="checkouts-group-lookup">${groupLookupWords(document, group)}</span>` +
       (free === "" ? "" : `<span class="checkouts-group-free">` +
@@ -4466,9 +4470,11 @@
       `data-key="${text(keyOf("group", groupKey(group)))}" ` +
       `data-search="${text(groupSearchText(document, group))}">` +
       groupHeaderHtml(document, group) +
+      `<div class="checkouts-group-body" data-key="${text(keyOf("body", groupKey(group)))}" hidden>` +
+      groupCaptionHtml(document, group) +
       packageBranchesHtml(document, group) +
       cloneTableHtml(document, group) +
-      "</section>";
+      "</div></section>";
   }
 
   // ---------------------------------------------------------------------
@@ -4552,11 +4558,15 @@
   }
 
   // A destination the search hides clears the search first.
+  // A destination in a closed repository opens it.
   function revealDestination(element) {
     const group = element.closest(".checkouts-group");
-    if (group === null || !group.hidden) return;
-    filter.value = "";
-    applyFilter();
+    if (group === null) return;
+    if (group.hidden) {
+      filter.value = "";
+      applyFilter();
+    }
+    setRepositoryOpen(group, true);
   }
 
   function focusDestination(element) {
@@ -4577,6 +4587,21 @@
     setAttributeOnce(toggle, "aria-expanded", String(open));
     if (detail.hidden === open) detail.hidden = !open;
     return detail;
+  }
+
+  function paintRepositoryOpen(group, open) {
+    const toggle = group.querySelector(".checkouts-line-toggle");
+    const body = group.querySelector(".checkouts-group-body");
+    if (toggle === null || body === null) return;
+    setAttributeOnce(toggle, "aria-expanded", String(open));
+    if (body.hidden === open) body.hidden = !open;
+  }
+
+  function setRepositoryOpen(group, open) {
+    if (group.querySelector(".checkouts-group-body") === null) return;
+    if (open) openRepositories.add(group.dataset.checkoutsGroup);
+    else openRepositories.delete(group.dataset.checkoutsGroup);
+    paintRepositoryOpen(group, open);
   }
 
   function setCloneOpen(row, open) {
@@ -4688,6 +4713,7 @@
   const STATE_ATTRIBUTES = new Set(["hidden", "open", "aria-expanded"]);
 
   function isBlock(element) {
+    if (element.hasAttribute("data-parts")) return false;
     return element.hasAttribute("data-block") || element.querySelector("[data-block]") === null;
   }
 
@@ -4696,7 +4722,9 @@
   function childIdentities(parent) {
     const seen = new Map();
     return [...parent.children].map((child) => {
-      const base = child.hasAttribute("data-key") && !child.hasAttribute("data-control")
+      const base = child.hasAttribute("data-pill")
+        ? `${child.getAttribute("data-key")}|pill`
+        : child.hasAttribute("data-key") && !child.hasAttribute("data-control")
         ? child.getAttribute("data-key")
         : `~${child.tagName}.${child.getAttribute("class") || ""}`;
       const count = seen.get(base) || 0;
@@ -4750,6 +4778,15 @@
       else live.insertBefore(existing, cursor);
       const markup = element.outerHTML;
       if (existing.nyxMarkup === markup) return;
+      // The control the reader is on keeps its element, so its words and
+      // attributes change under focus instead of the focus being replaced.
+      if (existing === document.activeElement && element.hasAttribute("data-control") &&
+        isBlock(element)) {
+        syncAttributes(existing, element);
+        if (existing.innerHTML !== element.innerHTML) existing.innerHTML = element.innerHTML;
+        existing.nyxMarkup = markup;
+        return;
+      }
       if (isBlock(element)) {
         existing.replaceWith(element);
         adoptBlock(element);
@@ -4770,6 +4807,11 @@
     openClones.forEach((path) => {
       if (!clones.has(path)) openClones.delete(path);
     });
+    const repositories = new Set([...fresh.querySelectorAll(".checkouts-group")]
+      .map((group) => group.dataset.checkoutsGroup));
+    openRepositories.forEach((key) => {
+      if (!repositories.has(key)) openRepositories.delete(key);
+    });
     const folds = new Set([...fresh.querySelectorAll(".checkouts-fold-toggle")]
       .map((toggle) => foldKeyOf(toggle)));
     openFolds.forEach((key) => {
@@ -4779,6 +4821,9 @@
   }
 
   function applyCheckoutsState() {
+    checkoutsBody.querySelectorAll(".checkouts-group").forEach((group) => {
+      paintRepositoryOpen(group, openRepositories.has(group.dataset.checkoutsGroup));
+    });
     checkoutsBody.querySelectorAll("tr.checkouts-clone").forEach((row) => {
       paintCloneOpen(row, openClones.has(row.dataset.clonePath));
     });
@@ -4807,7 +4852,7 @@
     }
     const group = active.closest(".checkouts-group");
     const next = group === null ? [] : [...group.querySelectorAll("button.checkouts-toggle")]
-      .filter((toggle) => toggle !== active &&
+      .filter((toggle) => toggle !== active && toggle.closest(".checkouts-group-body").hidden === false &&
         Boolean(active.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING))
       .map((toggle) => ({key: toggle.getAttribute("data-key"),
         control: toggle.getAttribute("data-control")}));
@@ -4910,6 +4955,12 @@
     const attention = event.target.closest('[data-control="go"]');
     if (attention !== null) {
       goToAttention(attention.getAttribute("data-key"));
+      return;
+    }
+    const line = event.target.closest(".checkouts-line-toggle");
+    if (line !== null) {
+      setRepositoryOpen(line.closest(".checkouts-group"),
+        line.getAttribute("aria-expanded") !== "true");
       return;
     }
     const toggle = event.target.closest(".checkouts-toggle");
