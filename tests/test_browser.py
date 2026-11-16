@@ -8149,6 +8149,7 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     # Lookup off is status-line words with no panel item at all.
     assert "Pull request lookup off" in page.locator("#checkouts-status-line").inner_text()
@@ -8233,6 +8234,7 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     """Groups, clone rows and Work item branches render the served order."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     names = page.locator(".checkouts-line-name")
     quiet = [
         group for group in document["repositories"]
@@ -8362,6 +8364,7 @@ def test_checkouts_freshness_reads_cached_live_and_recorded(
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
+    open_repository(page, "remote")
     clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
     assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
 
@@ -8462,6 +8465,26 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     assert page.locator(".checkouts-group:not([hidden])").count() == len(
         document["repositories"])
 
+    # A matching line stays closed, and an open line the search hides is open
+    # again when the search clears.
+    toggles = page.locator(".checkouts-line-toggle")
+    assert set(toggles.evaluate_all("els => els.map(e => e.getAttribute('aria-expanded'))")) \
+        == {"false"}
+    page.fill("#filter", "topic-a")
+    assert page.locator(".checkouts-group:not([hidden]) .checkouts-line-toggle").evaluate_all(
+        "els => els.map(e => e.getAttribute('aria-expanded'))") == ["false"]
+    page.fill("#filter", "")
+    group = open_repository(page, "remote")
+    quiet_display = checkout_group(document, "quiet")["remote"]["display"]
+    page.fill("#filter", quiet_display)
+    playwright.expect(group).to_be_hidden()
+    assert page.locator(".checkouts-group:not([hidden]) .checkouts-line-toggle").evaluate_all(
+        "els => els.map(e => e.getAttribute('aria-expanded'))") == ["false"]
+    page.fill("#filter", "")
+    playwright.expect(group).to_be_visible()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+
 
 def test_checkouts_search_matches_the_repositories_in_the_quiet_row(
     open_page, view_checkouts
@@ -8554,6 +8577,7 @@ def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_check
     """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
     document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote = checkout_group(document, "remote")["remote"]["display"]
     quiet = checkout_group(document, "quiet")["remote"]["display"]
@@ -8699,6 +8723,7 @@ def test_checkouts_word_tables_show_their_served_values(
     """Every word table renders a served value's words, from captures and variants."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
 
     def clone_row(name):
@@ -8810,6 +8835,7 @@ def test_checkouts_word_tables_show_their_served_values(
     # A live lookup with served pull requests and a pull-request rung.
     serve_checkouts(
         page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    open_every_repository(page)
     shows("pull requests live")
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == (
@@ -8839,6 +8865,7 @@ def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
     with pytest.raises(models.ProtocolError):
         models.parse_checkouts(json.dumps(document))
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     assert "future_status" in body.inner_text()
     # The rest of the view still renders.
@@ -8850,6 +8877,7 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
     """Each work item's table action shows its card, or says why it cannot."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
     topic_a = remote_view.locator(
@@ -8911,6 +8939,7 @@ def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
 
     document = checkout_variant(view_checkouts.document_built, mutate)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert clone_two.locator("td.checkouts-head").inner_text() == "git did not answer in time"
     assert clone_two.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
@@ -8928,6 +8957,7 @@ def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
 
     served = checkout_raw_variant(view_checkouts.document_built, unborn)
     page, _ = open_view_checkouts(open_page, view_checkouts, served)
+    open_repository(page, "remote")
     assert page.locator(
         'tr.checkouts-worktree[data-worktree="outside"] td.checkouts-head'
     ).inner_text() == "unborn outside"
@@ -8950,6 +8980,7 @@ def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
         return checkout_variant(document, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, fetched(0))
+    open_repository(page, "remote")
     row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-freshness')
     assert row.inner_text() == "cached, fetched <1 min ago"
     for minutes, words in ((7, "7 min"), (125, "2 h"), (60 * 49, "2 d")):
@@ -8967,6 +8998,7 @@ def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkou
         return checkout_variant(view_checkouts.document_built, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, stashed(1))
+    open_repository(page, "remote")
     cell = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-branches')
     assert cell.inner_text() == "3 branches · 1 stash"
     assert "1 stashs" not in page.locator("#checkouts-body").inner_text()
@@ -8982,6 +9014,7 @@ def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkou
     """A search survives the jump unless it is what hides the card."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
 
     def show_button():
@@ -9322,8 +9355,12 @@ def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     def press(code):
         page.locator(f'li[data-code="{code}"] button').press("Enter")
 
-    press("branch_unpushed")
     clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    line = page.locator(".checkouts-group").filter(has=clone_two).locator(
+        ".checkouts-line-toggle")
+    assert line.get_attribute("aria-expanded") == "false"
+    press("branch_unpushed")
+    assert line.get_attribute("aria-expanded") == "true"
     assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
     assert page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]').is_visible()
     assert focused_checkouts_target(page)["branch"] == "topic-a"
@@ -9453,9 +9490,28 @@ def share_a_branch_between_two_checkouts(document):
     branch["checked_out_in"] = [worktree["path"] for worktree in clone_two["worktrees"]]
 
 
+def open_repository(page, suffix):
+    """Open the repository line whose display name ends with `suffix`; return its group.
+
+    A line already open is left open, so the helper may be called twice.
+    """
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(suffix) + "$")))
+    assert group.count() == 1, suffix
+    toggle = group.locator(".checkouts-line-toggle")
+    if toggle.get_attribute("aria-expanded") != "true":
+        toggle.click()
+    assert toggle.get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+    return group
+
+
 def open_clone_detail(page, name):
     """Open one clone row from its toggle and return its detail row."""
     row = page.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+    group = page.locator(".checkouts-group").filter(has=row)
+    if group.locator(".checkouts-group-body").evaluate("el => el.hidden"):
+        group.locator(".checkouts-line-toggle").click()
     row.locator(".checkouts-toggle").click()
     detail = row.locator("xpath=following-sibling::tr[1]")
     playwright.expect(detail).to_be_visible()
@@ -10041,6 +10097,50 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     assert_clone_two_state_kept(page, focus)
     assert page.locator("#checkouts-action-status").inner_text() == pushed
     assert all(not action for _, action, _, _ in records)
+
+    # A count that changes under a focused pill keeps the pill, the open line,
+    # its tone and the scroll.
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    line = group.locator(".checkouts-line")
+    red = group.locator('button[data-pill="red-branches"]')
+    assert red.inner_text().endswith("1 branch local only")
+    red.focus()
+    held = page.evaluate_handle("document.activeElement")
+    scroll = page.evaluate("window.scrollY")
+
+    def own_worktree(document):
+        _, clone = checkout_clone(document, "Repo Clone 3")
+        main = next(worktree for worktree in clone["worktrees"] if worktree["main"])
+        main["changes"]["untracked"] = 2
+
+    serve_checkouts(page, double, checkout_variant(after, own_worktree))
+    assert red.inner_text().endswith("2 branches local only")
+    assert held.evaluate("node => node === document.activeElement")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+    assert line.get_attribute("data-tone") == "red"
+    assert page.evaluate("window.scrollY") == scroll
+
+    # A tone that changes under a focused pill keeps the pill and the open line.
+    amber = group.locator('button[data-pill="amber-branches"]')
+    assert amber.inner_text().endswith("1 branch to merge or clean up")
+    amber.focus()
+    held = page.evaluate_handle("document.activeElement")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert line.get_attribute("data-tone") == "amber"
+    assert red.count() == 0
+    assert amber.inner_text().endswith("1 branch to merge or clean up")
+    assert held.evaluate("node => node === document.activeElement")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+
+    # Opening and closing a line writes no storage key.
+    keys = page.evaluate("Object.keys(localStorage)")
+    group.locator(".checkouts-line-toggle").click()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    group.locator(".checkouts-line-toggle").click()
+    assert page.evaluate("Object.keys(localStorage)") == keys
     assert_focus_sampler_clean(page)
 
 
@@ -10085,6 +10185,52 @@ def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     # With no group left the view's own heading takes it.
     serve_checkouts(page, double, view_checkouts.document_no_git)
     assert page.evaluate("document.activeElement.id") == "checkouts-heading"
+    assert_focus_sampler_clean(page)
+
+
+def test_checkouts_lines_start_closed_and_open_their_body_in_order(
+    open_page, view_checkouts
+):
+    """Every line starts closed with its body in the page; a click opens the ordered body."""
+    page, _ = open_view_checkouts(open_page, view_checkouts, view_checkouts.document_built)
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    toggles = page.locator(".checkouts-line-toggle")
+    assert toggles.count() >= 2
+    assert set(toggles.evaluate_all(
+        "els => els.map(el => el.getAttribute('aria-expanded'))")) == {"false"}
+    assert set(page.locator(".checkouts-group-body").evaluate_all(
+        "els => els.map(el => el.hidden)")) == {True}
+    # A closed body stays in the page, so its rows resolve.
+    assert page.locator("tr.checkouts-clone").count() > 0
+    group = open_repository(page, "remote")
+    assert group.locator(".checkouts-group-body").evaluate(
+        """el => [...el.children].map(child => child.tagName + '.' + child.className)""") == [
+        "P.checkouts-group-caption",
+        "TABLE.checkouts-package-branches",
+        "TABLE.checkouts-clones",
+    ]
+    group.locator(".checkouts-line-toggle").click()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    assert group.locator(".checkouts-group-body").evaluate("el => el.hidden") is True
+
+
+def test_checkouts_refresh_hands_a_closed_lines_pill_focus_to_its_toggle(
+    open_page, view_checkouts
+):
+    """A pill on a closed line that goes leaves focus on the line toggle."""
+    before = view_checkouts.document_topic_committed
+    page, double = open_view_checkouts(open_page, view_checkouts, before)
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    group.locator('button[data-pill="red-branches"]').focus()
+    arm_focus_sampler(page)
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert group.locator('button[data-pill="red-branches"]').count() == 0
+    assert page.evaluate("""() => document.activeElement.classList.contains(
+      'checkouts-line-toggle')""") is True
+    assert group.locator(".checkouts-line-toggle").evaluate(
+        "el => el === document.activeElement")
     assert_focus_sampler_clean(page)
 
 
@@ -10162,6 +10308,24 @@ def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
     assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "false"
     assert row.locator("xpath=following-sibling::tr[1]").evaluate("el => el.hidden") is True
 
+    # An open repository the document drops is forgotten and returns closed.
+    open_repository(page, "remote")
+    def renamed(document):
+        remote = checkout_group(document, "remote")["remote"]
+        remote["key"] = "renamed.example/elsewhere"
+        remote["display"] = "elsewhere"
+
+    serve_checkouts(page, double, checkout_variant(before, renamed))
+    renamed_group = page.locator(".checkouts-group").filter(has=row)
+    assert renamed_group.locator(".checkouts-line-toggle").get_attribute(
+        "aria-expanded") == "false"
+    serve_checkouts(page, double, before)
+    line = page.locator(".checkouts-group").filter(has=row).locator(".checkouts-line-toggle")
+    assert line.get_attribute("aria-expanded") == "false"
+    playwright.expect(
+        page.locator(".checkouts-group").filter(has=row).locator(".checkouts-group-body")
+    ).to_be_hidden()
+
 
 def long_name_variant(view_checkouts):
     """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
@@ -10175,8 +10339,16 @@ def long_name_variant(view_checkouts):
     return variant
 
 
+def open_every_repository(page):
+    """Open every repository line the view shows."""
+    for line in page.locator(".checkouts-line-toggle").all():
+        if line.get_attribute("aria-expanded") != "true":
+            line.click()
+
+
 def open_every_clone_row(page):
-    """Open each clone row's detail from its toggle."""
+    """Open every repository line, then each clone row's detail from its toggle."""
+    open_every_repository(page)
     for toggle in page.locator("#checkouts-body .checkouts-toggle").all():
         toggle.click()
 
@@ -10187,6 +10359,7 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     """Stacked at 360 px, tabular from 701 px, with table roles throughout."""
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     toggle_folders_editor(page)
     playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
@@ -10320,6 +10493,7 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     setup = checkout_variant(
         folded_variant(view_checkouts.document_checked), add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, cached)
+    open_repository(page, "remote")
     page.set_viewport_size({"width": 1600, "height": 1200})
     page.get_by_label("Theme", exact=True).select_option(theme)
     # An open editor with one draft folder shows every control it has.
@@ -10345,8 +10519,10 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
             ratio = contrast_ratio(color, background)
             assert ratio >= 4.5, (name, sample, color, background, ratio)
 
+    open_every_repository(page)
     rings = {
         "view switch": "#view-checkouts",
+        "line toggle": ".checkouts-line-toggle",
         "row toggle": 'tr.checkouts-clone[data-clone="Repo Clone 3"] .checkouts-toggle',
         "fold": ".checkouts-fold-toggle",
         "attention item": ".checkouts-attention-go",
@@ -10575,6 +10751,29 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
     page.keyboard.press("Enter")
     assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+
+    # A repository line opens with Enter and closes with Space, and the body
+    # it holds is shown only while it is open.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.classList.contains('checkouts-line-toggle') &&
+        el.closest('.checkouts-group').querySelector(
+          'tr.checkouts-clone[data-clone="Repo Clone 2"]') !== null;
+    })()""")
+    line = page.locator(".checkouts-line-toggle").filter(
+        has_text=checkout_group(document, "remote")["remote"]["display"])
+    body = page.locator(".checkouts-group-body").filter(
+        has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    assert line.get_attribute("aria-expanded") == "false"
+    assert body.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
+    assert body.evaluate("el => el.hidden") is False
+    page.keyboard.press("Space")
+    assert line.get_attribute("aria-expanded") == "false"
+    assert body.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
 
     # A row toggle opens with Enter and closes with Space.
     toggle_probe = f"""(() => {{
@@ -12655,6 +12854,7 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     assert gamma["finished"] is True and gamma["code_status"] is None
     assert gamma["target"]["status"] == "clone"
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     clone_name = Path(gamma["target"]["clone"]).name
     group = page.locator(".checkouts-group").filter(
