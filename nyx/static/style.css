@@ -267,23 +267,63 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
 }
 .checkouts-group[hidden] { display: none; }
-.checkouts-group-head {
+.checkouts-line {
+  --tone: var(--control-border);
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: .35rem 1rem;
   margin: 0;
+  padding: .45rem .75rem;
+  border-left: .3rem solid var(--tone);
   color: var(--heading);
   font-size: 1.05rem;
 }
-.checkouts-group-name { font-weight: 700; overflow-wrap: anywhere; }
-.checkouts-group-default,
+.checkouts-line[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-line[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-line[data-tone="green"] { --tone: var(--state-done); }
+.checkouts-line[data-tone="grey"] { --tone: var(--control-border); }
+.checkouts-line-toggle {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem 1rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.checkouts-line-name { font-weight: 700; overflow-wrap: anywhere; }
+.checkouts-line-trunk,
+.checkouts-line-activity,
 .checkouts-group-check,
 .checkouts-group-lookup,
 .checkouts-group-free {
   color: var(--muted);
   font-size: .85rem;
   font-weight: 400;
+}
+.checkouts-line-pills { display: inline-flex; flex-wrap: wrap; gap: .35rem; }
+.checkouts-pill {
+  --tone: var(--control-border);
+  padding: .15rem .55rem;
+  border: 1px solid var(--tone);
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--tone);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-pill[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-pill[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-line-inuse[data-tone="green"] { color: var(--state-done); }
+.checkouts-group-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem 1rem;
+  margin: 0;
 }
 .checkouts-group-free { overflow-wrap: anywhere; }
 .checkouts-clones,
