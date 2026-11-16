@@ -8404,10 +8404,10 @@ def test_checkouts_freshness_reads_cached_live_and_recorded(
         f"recorded {when} (remote repository not found)")
 
 
-def test_checkouts_quiet_repositories_collapse_into_one_row(
+def test_checkouts_quiet_repositories_collapse_into_one_line(
     open_page, view_checkouts
 ):
-    """A quiet repository is one row while the box is checked, a group when not."""
+    """Quiet repositories are one count line while the box is checked, lines when not."""
     document = view_checkouts.document_built
     quiet = checkout_group(document, "quiet")
     quiet_display = quiet["remote"]["display"]
@@ -8418,15 +8418,17 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
         return page.locator(".checkouts-line-name").all_inner_texts()
 
     assert groups() == [other_display]
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    playwright.expect(row).to_have_count(1)
-    assert row.locator("summary").inner_text() == "Quiet repositories (1)"
-    row.locator("summary").click()
-    assert row.locator("li").inner_text() == f"{quiet_display} Quiet Clone"
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
+    playwright.expect(line).to_have_count(1)
+    assert line.inner_text() == "1 quiet repository hidden Show"
+    assert page.locator("#checkouts-body details").count() == 0
+    # The line follows the repository lines.
+    assert line.evaluate("el => el.previousElementSibling.classList.contains('checkouts-group')")
+    assert quiet_display not in page.locator("#checkouts-body").inner_text()
 
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
     # The unchecked state survives a reload.  The reload's own catalog and
     # checkout requests must settle before a tick can answer, or the tick is
@@ -8440,12 +8442,12 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
     assert groups() == [quiet_display, other_display]
 
-    # Checked again, a stash makes the quiet clone ordinary: its own group, no row.
+    # Checked again, a stash makes the quiet clone ordinary: its own line, no count line.
     page.get_by_label("Hide quiet repositories", exact=True).check()
     assert groups() == [other_display]
     serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
     # Two null comparisons prove nothing about equality, so it is not quiet.
     def both_null(value):
@@ -8455,7 +8457,7 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     serve_checkouts(
         page, double, checkout_variant(view_checkouts.document_built, both_null))
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
 
 def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkouts):
@@ -8493,75 +8495,71 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
 
 
-def test_checkouts_search_matches_the_repositories_in_the_quiet_row(
+def test_checkouts_search_counts_the_quiet_repositories_it_matches(
     open_page, view_checkouts
 ):
-    """The quiet row stays for a held repository that matches and goes when none do."""
+    """The quiet line counts a matching quiet repository and goes when none match."""
     document = view_checkouts.document_built
     quiet = checkout_group(document, "quiet")
     quiet_display = quiet["remote"]["display"]
     other_display = checkout_group(document, "remote")["remote"]["display"]
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    summary = row.locator("summary")
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
+    count = line.locator(".checkouts-quiet-count")
     groups = page.locator(".checkouts-group:not([hidden]) .checkouts-line-name")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1)"
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
 
-    # A quiet repository's name keeps the row, counts its match and hides the
+    # A quiet repository's name keeps the line, counts its match and hides the
     # group that does not match.
     page.fill("#filter", quiet_display)
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1, 1 matching)"
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
     assert groups.all_inner_texts() == []
 
     # The clone's folder name is searched as it is for a group.
     page.fill("#filter", "quiet clone")
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
 
-    # A name no quiet repository has hides the row; the group that has it stays.
+    # A name no quiet repository has hides the line; the group that has it stays.
     page.fill("#filter", other_display)
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == [other_display]
     page.fill("#filter", "no such words anywhere")
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == []
 
     # Clearing the search restores the earlier state.
     page.fill("#filter", "")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1)"
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
     assert groups.all_inner_texts() == [other_display]
 
 
-def test_checkouts_search_can_match_a_group_and_the_quiet_row_together(
+def test_checkouts_search_can_match_a_group_and_the_quiet_line_together(
     open_page, view_checkouts
 ):
-    """A query both kinds hold keeps the group and the row; one kind alone keeps one."""
+    """A query both kinds hold keeps the group and the line; one kind alone keeps one."""
     document = view_checkouts.document_built
     quiet_group = checkout_group(document, "quiet")
     other = checkout_group(document, "remote")
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    row = page.locator("#checkouts-body .checkouts-quiet")
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
     groups = page.locator(".checkouts-group:not([hidden]) .checkouts-line-name")
     branch = quiet_group["default_branch"]["name"]
     assert other["default_branch"]["name"] == branch
 
     page.fill("#filter", branch)
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
     assert groups.all_inner_texts() == [other["remote"]["display"]]
 
-    # Words only the group holds hide the row; words only the row holds hide the group.
+    # Words only the group holds hide the line; words only the line holds hide the group.
     page.fill("#filter", "topic-a")
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == [other["remote"]["display"]]
     page.fill("#filter", quiet_group["remote"]["display"])
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
     assert groups.all_inner_texts() == []
-
-    # The row, opened and filtered, keeps its listed repository.
-    row.locator("summary").click()
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
 
 
 def mutate_searchable_words(document):
@@ -10170,12 +10168,11 @@ def checkouts_focus(page):
 
 
 def open_clone_two_state(page):
-    """Open the quiet row, Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
+    """Open Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
 
     Returns the toggle's key and control.
     """
     page.set_viewport_size({"width": 1280, "height": 600})
-    page.locator("details.checkouts-quiet > summary").click()
     detail = open_clone_detail(page, "Repo Clone 2")
     fold = detail.locator(".checkouts-fold-toggle")
     assert fold.count() == 1
@@ -10189,8 +10186,7 @@ def open_clone_two_state(page):
 
 
 def assert_clone_two_state_kept(page, focus, scroll=200):
-    """The quiet row, the row, its fold, the focus and the scroll are as they were."""
-    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    """The row, its fold, the focus and the scroll are as they were."""
     row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
     detail = row.locator("xpath=following-sibling::tr[1]")
@@ -10437,12 +10433,12 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     assert all(status for status, _, _ in checkouts_records(page))
 
     # A failed outcome shows the failed panel in place of the view; the next
-    # ready one restores the open row, its fold and the quiet row.
+    # ready one restores the open row and its fold.
     double.fail("checkouts_timeout")
     fire_checkouts_poll(page)
     playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
     assert page.locator(".checkouts-group").count() == 0
-    assert page.locator("details.checkouts-quiet").count() == 0
+    assert page.locator(".checkouts-quiet-line").count() == 0
     assert page.evaluate("document.activeElement.id") == "checkouts-heading"
     serve_checkouts(page, double, before)
     assert page.locator(".checkouts-panel").count() == 0
@@ -10452,7 +10448,7 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     assert detail.evaluate("el => el.hidden") is False
     assert detail.locator(".checkouts-fold-toggle").get_attribute("aria-expanded") == "true"
     assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
-    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    assert page.locator(".checkouts-quiet-line").count() == 1
     assert_focus_sampler_clean(page)
 
 
@@ -10503,6 +10499,30 @@ def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
     assert page.locator('.checkouts-bar-pill[data-list="red"]').first.get_attribute(
         "aria-expanded") == "false"
     playwright.expect(page.locator('.checkouts-attention-listbox[data-list="red"]')).to_be_hidden()
+
+    # An open repository that becomes quiet leaves and the quiet line counts it;
+    # Show unchecks the box, stores false, focuses the checkbox, and the
+    # repository returns closed.
+    quiet_display = checkout_group(before, "quiet")["remote"]["display"]
+    serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
+    quiet_group = open_repository(page, "quiet")
+    assert quiet_group.locator(".checkouts-line-toggle").get_attribute(
+        "aria-expanded") == "true"
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator(".checkouts-line-name").filter(
+        has_text=re.compile(re.escape(quiet_display) + "$")).count() == 0
+    quiet_line = page.locator("#checkouts-body .checkouts-quiet-line")
+    assert quiet_line.locator(".checkouts-quiet-count").inner_text() == (
+        "1 quiet repository hidden")
+    quiet_line.get_by_role("button", name="Show", exact=True).click()
+    assert page.evaluate("localStorage.getItem('spec-tracker-hide-quiet-checkouts')") == "false"
+    assert page.evaluate("document.activeElement.id") == "hide-quiet-checkouts"
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
+    returned = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(quiet_display) + "$")))
+    assert returned.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    playwright.expect(returned.locator(".checkouts-group-body")).to_be_hidden()
 
 
 def long_name_variant(view_checkouts):
@@ -10622,7 +10642,7 @@ CHECKOUTS_TEXT_SAMPLES = {
         "#checkouts-body td, #checkouts-body th[scope=row], .checkouts-basis, "
         ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
         ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
-        ".checkouts-quiet summary, .checkouts-quiet li"),
+        ".checkouts-quiet-line, .checkouts-quiet-show"),
     "toned phrases": ".checkouts-phrase, .checkouts-relation[data-tone]",
     "attention items": (
         ".checkouts-attention h2, .checkouts-attention-class, "
@@ -10733,6 +10753,7 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
         "attention item": ".checkouts-attention-go",
         "Check remotes now": "#check-remotes",
         "Show on board": ".checkouts-show-on-board",
+        "Show quiet repositories": ".checkouts-quiet-show",
         "folders summary": "#checkout-folders-editor summary",
         "folders path": "#checkout-folders-path",
         "folders Add": "#checkout-folders-add",
@@ -11234,13 +11255,21 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     playwright.expect(page.locator("#board")).to_be_visible()
     assert page.evaluate("document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
 
+    # The quiet line's Show unchecks the box with Enter and moves focus to it.
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    tab_until(page, "document.activeElement.matches('.checkouts-quiet-show')")
+    page.keyboard.press("Enter")
+    assert page.evaluate("document.activeElement.id") == "hide-quiet-checkouts"
+    assert not page.locator("#hide-quiet-checkouts").is_checked()
+    assert page.locator(".checkouts-quiet-line").count() == 0
+
 
 def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_checkouts):
     """Refreshed content is never announced; the action status is the one region."""
     ready = view_checkouts.document_topic_committed
     setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, ready)
-    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     observe_checkouts_mutations(page)
     live = """() => [...document.querySelectorAll(
       '#checkouts [aria-live], #checkouts [role=status], #checkouts [role=alert], #checkouts output')]
@@ -11264,12 +11293,18 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
     assert page.locator("#checkouts-action-status").inner_text() == ""
     assert page.locator(".checkouts-bar-pill[aria-live], .checkouts-attention-listbox[aria-live]"
                         ).count() == 0
+    # The quiet line announces nothing, and neither does pressing Show.
+    assert page.locator(".checkouts-quiet-line[aria-live], .checkouts-quiet-line [aria-live]"
+                        ).count() == 0
+    page.locator(".checkouts-quiet-show").click()
+    assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+    assert page.locator("#checkouts-action-status").inner_text() == ""
 
 
-def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
+def test_checkouts_quiet_line_counts_only_the_matching_repositories(
     open_page, view_checkouts
 ):
-    """With two quiet repositories a query lists and counts only the one it matches."""
+    """With two quiet repositories a query counts only the one it matches."""
     document = copy.deepcopy(view_checkouts.document_built)
     quiet = checkout_group(document, "quiet")
     twin = copy.deepcopy(quiet)
@@ -11281,20 +11316,14 @@ def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
             tree["path"] = tree["path"].replace("quiet", "twinclone")
     document["repositories"].append(twin)
     page, _ = open_view_checkouts(open_page, view_checkouts, redigest(document))
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    summary = row.locator("summary")
-    assert summary.inner_text() == "Quiet repositories (2)"
+    count = page.locator("#checkouts-body .checkouts-quiet-line .checkouts-quiet-count")
+    assert count.inner_text() == "2 quiet repositories hidden"
 
     page.fill("#filter", "twin-repository")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (2, 1 matching)"
-    row.locator("summary").click()
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
-    assert "twin-repository" in row.locator("li:not([hidden])").inner_text()
+    assert count.inner_text() == "1 quiet repository hidden"
 
     page.fill("#filter", "")
-    assert summary.inner_text() == "Quiet repositories (2)"
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)
+    assert count.inner_text() == "2 quiet repositories hidden"
 
 
 # ---------------------------------------------------------------------------
@@ -13301,7 +13330,7 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     playwright.expect(group).to_be_visible()
 
 
-def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
+def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_line(
     open_page, view_checkouts
 ):
     """Only a work item the view still lists makes its target's repository a group."""
@@ -13325,17 +13354,17 @@ def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
         return checkout_raw_variant(document, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, retarget(True))
-    quiet_items = page.locator("details.checkouts-quiet li")
+    quiet_line = page.locator(".checkouts-quiet-line")
     quiet_group = page.locator(".checkouts-group").filter(
         has=page.locator(f'tr.checkouts-clone[data-clone="{Path(quiet_clone).name}"]'))
     # The finished work item targets the quiet clone and changes nothing.
-    assert quiet_items.count() == 1
+    assert quiet_line.count() == 1
     assert quiet_group.count() == 0
 
     # The same work item, unfinished, gives the repository a group of its own.
     serve_checkouts(page, double, retarget(False))
     playwright.expect(quiet_group).to_have_count(1)
-    assert quiet_items.count() == 0
+    assert quiet_line.count() == 0
     assert quiet_group.locator(
         '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count() == 1
 
