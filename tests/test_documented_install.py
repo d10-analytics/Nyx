@@ -2246,3 +2246,11 @@ def test_repositories_view_documents_its_signals_columns_quiet_line_and_search()
     )
     assert "quiet row" not in board
     assert "quiet row" not in _normalized("docs/systems/checkouts/README.md")
+
+
+def test_capture_procedure_names_the_repositories_screenshot_twice():
+    guide = (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    assert guide.count("docs/images/sample-repositories.png") == 2
+    assert "sample-checkouts" not in guide
+    assert (REPOSITORY_ROOT / "docs" / "images" / "sample-repositories.png").is_file()
+    assert not (REPOSITORY_ROOT / "docs" / "images" / "sample-checkouts.png").exists()
