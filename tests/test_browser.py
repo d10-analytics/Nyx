@@ -7781,7 +7781,8 @@ def test_checkouts_words_block_names_the_view_markers_once():
     assert words["text"]["noFolders"] == (
         "No checkout folders are configured. Choose Checkout folders above to add one."
     )
-    assert words["column"]["default"] == "Default branch vs remote"
+    assert words["column"]["default"] == "Local {trunk} vs remote {trunk}"
+    assert words["column"]["tree"] == "Uncommitted changes"
     assert words["text"]["workItemBranches"] == "Work item branches"
 
 
@@ -8252,11 +8253,11 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     group = document["repositories"][remote_index]
     remote_view = page.locator(".checkouts-group").nth(remote_index)
 
-    # The eight column headers, once per group table.
+    # The five column headers, once per group table, with the trunk named.
     assert remote_view.locator(
         "table.checkouts-clones > thead th").all_inner_texts() == [
-        "Checkout", "Availability", "HEAD", "Default branch vs remote",
-        "Tree", "Branches", "Cleanup", "Package",
+        "Checkout", "HEAD", "Local trunk vs remote trunk",
+        "Uncommitted changes", "Branches",
     ]
     # Clone rows follow the group's clones, and a linked worktree sits directly
     # under the clone that owns it.
@@ -8327,15 +8328,21 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     assert "cached, never fetched" in clone_ten.inner_text()
     clone_two = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert clone_two.locator(".checkouts-head").inner_text() == "trunk"
-    assert clone_two.locator(".checkouts-tree").inner_text() == "clean"
-    assert clone_two.locator(".checkouts-branches").inner_text() == "3 branches"
-    assert clone_two.locator(".checkouts-cleanup").inner_text().startswith(
-        "1 branch, 1 worktree removable")
-    assert clone_two.locator(".checkouts-cleanup").inner_text().endswith(
-        "topic-a (not merged)")
+    assert clone_two.locator(".checkouts-tree").inner_text() == "—"
+    assert clone_two.locator(".checkouts-branches").inner_text() == (
+        "3 branches · 1 merged, removable · 1 in progress")
+    for dropped in ("availability", "cleanup", "package"):
+        assert clone_two.locator(f".checkouts-{dropped}").count() == 0
     linked = remote_view.locator('tr.checkouts-worktree[data-worktree="outside"]')
     assert linked.locator(".checkouts-head").inner_text() == "outside"
-    assert linked.locator(".checkouts-cleanup").inner_text() == "Removable"
+    assert linked.locator("td").count() == 4
+    assert linked.locator(".checkouts-cleanup").count() == 0
+    # Cleanup words stay in the clone's Details.
+    detail = open_clone_detail(page, "Repo Clone 2")
+    assert "not merged" in detail.locator('tr[data-branch="topic-a"]').inner_text()
+    assert detail.locator(
+        'tr.checkouts-detail-worktree[data-worktree="outside"] '
+        ".checkouts-worktree-cleanup").inner_text() == "Removable"
 
     # One remote check later, the same rows read the live answers: the branch
     # no clone holds states why, and the branch nothing pushed is absent.
@@ -8732,6 +8739,15 @@ def test_checkouts_word_tables_show_their_served_values(
     def shows(text):
         assert text in body.inner_text(), text
 
+    def detail_text(name):
+        return body.locator(f'tr.checkouts-detail[data-detail-for$="{name}"]').text_content()
+
+    def searched():
+        # The availability words are no cell any more but stay search words.
+        return page.locator(".checkouts-group").filter(
+            has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        ).get_attribute("data-search")
+
     # The built capture: comparison relation and basis, availability state and
     # reason, the assignment basis, status, remote copy, verdict state, the
     # branch blocker, the branch package basis and the check/lookup words.
@@ -8739,14 +8755,17 @@ def test_checkouts_word_tables_show_their_served_values(
     shows("cached")
     shows("Free")
     clone_two = clone_row("Repo Clone 2")
-    availability = clone_two.locator(".checkouts-availability").inner_text()
-    assert availability.startswith("In use")
+    assert clone_two.locator(".checkouts-availability").count() == 0
+    availability = searched()
+    assert "in use" in availability
     assert "has linked worktrees" in availability
-    assert "Assigned: Repo/Drafts/alpha (Target repo)" in availability
+    assert "assigned: repo/drafts/alpha (target repo)" in availability
     shows("unknown")
     shows("not merged")
-    shows("Repo/Drafts/alpha (Target repo)")
-    assert "topic-a (not merged)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    assert "Repo/Drafts/alpha (Target repo)" in detail_text("Repo Clone 2")
+    assert "not merged" in body.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] tr[data-branch="topic-a"]'
+    ).text_content()
     assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
     assert page.locator(".checkouts-group-lookup").first.inner_text() == (
         "pull request lookup off")
@@ -8783,8 +8802,10 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_clone_statuses))
     shows("git refused it: ownership")
     shows("more than 100 local branches; not examined")
-    assert clone_row("Repo Clone 3").locator(
-        ".checkouts-availability").inner_text() == "Unknown"
+    unreadable = clone_row("Repo Clone 3")
+    assert unreadable.locator("td").count() == 1
+    assert unreadable.locator("td.checkouts-status").get_attribute("colspan") == "4"
+    assert "unknown" in searched()
 
     # Worktree facts: a detached, dirty main worktree in a rebase, and a locked
     # linked worktree with its branch and worktree blockers.
@@ -8792,13 +8813,14 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_worktree_facts))
     clone_two = clone_row("Repo Clone 2")
     assert clone_two.locator(".checkouts-head").inner_text().startswith("detached at ")
-    shows("detached HEAD")
+    assert "detached head" in searched()
     shows("2 staged")
     shows("rebase in progress")
-    shows("git operation in progress")
-    assert "outside (locked)" in clone_two.locator(".checkouts-cleanup").inner_text()
-    linked = body.locator('tr.checkouts-worktree[data-worktree="outside"]')
-    assert linked.locator(".checkouts-cleanup").inner_text() == "locked"
+    assert "git operation in progress" in searched()
+    assert body.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] '
+        'tr.checkouts-detail-worktree[data-worktree="outside"] '
+        ".checkouts-worktree-cleanup").text_content().endswith("locked")
 
     # A prunable linked worktree: the status words and the flag word.
     serve_checkouts(
@@ -8825,11 +8847,9 @@ def test_checkouts_word_tables_show_their_served_values(
     # Another clone's assigned package and a linked worktree's, with both bases.
     serve_checkouts(
         page, double, checkout_variant(document, mutate_assignment))
-    assigned = clone_row("Repo Clone 3").locator(".checkouts-availability").inner_text()
-    assert assigned.startswith("Assigned")
-    assert "Repo/Drafts/alpha (Target repo)" in assigned
-    assert "Repo/Drafts/delta (Target repo worktree)" in clone_row(
-        "Repo Clone 2").locator(".checkouts-availability").inner_text()
+    assigned = searched()
+    assert "assigned: repo/drafts/alpha (target repo)" in assigned
+    assert "repo/drafts/delta (target repo worktree)" in assigned
     shows("same branch in another clone")
 
     # A live lookup with served pull requests and a pull-request rung.
@@ -9000,14 +9020,12 @@ def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkou
     page, double = open_view_checkouts(open_page, view_checkouts, stashed(1))
     open_repository(page, "remote")
     cell = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-branches')
-    assert cell.inner_text() == "3 branches · 1 stash"
+    assert cell.inner_text() == "3 branches · 1 merged, removable · 1 in progress · 1 stash"
+    assert cell.locator('.checkouts-phrase[data-tone="red"]').inner_text() == "1 stash"
     assert "1 stashs" not in page.locator("#checkouts-body").inner_text()
     serve_checkouts(page, double, stashed(2))
-    assert cell.inner_text() == "3 branches · 2 stashes"
+    assert cell.inner_text() == "3 branches · 1 merged, removable · 1 in progress · 2 stashes"
     assert "stashs" not in page.locator("#checkouts-body").inner_text()
-    # The singular of the cleanup counts reads the same way in the same table.
-    cleanup = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-cleanup')
-    assert cleanup.inner_text().startswith("1 branch, 1 worktree removable")
 
 
 def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkouts):
@@ -10030,6 +10048,12 @@ def signal_quiet_never_fetched(document):
     clone["cached_default"]["last_fetched_at"] = None
 
 
+def signal_quiet_index_lock(document):
+    """Quiet Clone's main worktree holds an index lock and nothing else."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    next(item for item in clone["worktrees"] if item["main"])["index_lock"] = True
+
+
 def signal_quiet_other_branch_checked_out(document):
     """Quiet Clone has a pushed ``side`` branch checked out, so it is in use."""
     _, clone = checkout_clone(document, "Quiet Clone")
@@ -10519,8 +10543,8 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
         "Current checkout folders loaded.")
     add_folder(page, "/" + "q" * 299)
-    columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
-               "Tree", "Branches", "Cleanup", "Package"]
+    columns = ["Checkout", "HEAD", "Local trunk vs remote trunk",
+               "Uncommitted changes", "Branches"]
     for theme in ("dark", "light"):
         page.get_by_label("Theme", exact=True).select_option(theme)
 
@@ -10555,9 +10579,10 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
             assert item["label"] == "cell-label" and item["display"] == "block"
             assert item["visibility"] == "visible"
             assert item["hasValue"] and item["before"] <= item["value"] + 1, item
-        for role, count in (("table", 1), ("row", 1), ("columnheader", 8), ("cell", 1)):
+        for role, count in (("table", 1), ("row", 1), ("columnheader", 5), ("cell", 1)):
             assert page.get_by_role(role).count() >= count, role
-        assert page.get_by_role("columnheader", name="Default branch vs remote").count() >= 1
+        assert page.get_by_role(
+            "columnheader", name="Local trunk vs remote trunk").count() >= 1
         assert page.get_by_role("cell").filter(has_text="3 branches").count() >= 1
 
         # The long names wrap inside their cells instead of widening the view.
@@ -10585,7 +10610,7 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
         settle_frames(page)
         for role in ("table", "row", "columnheader", "cell"):
             assert page.get_by_role(role).count() >= 1, role
-        assert page.get_by_role("columnheader", name="Cleanup").count() >= 1
+        assert page.get_by_role("columnheader", name="Uncommitted changes").count() >= 1
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
 
@@ -10598,6 +10623,7 @@ CHECKOUTS_TEXT_SAMPLES = {
         ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
         ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
         ".checkouts-quiet summary, .checkouts-quiet li"),
+    "toned phrases": ".checkouts-phrase, .checkouts-relation[data-tone]",
     "attention items": (
         ".checkouts-attention h2, .checkouts-attention-class, "
         ".checkouts-attention-item, .checkouts-attention-go, .checkouts-bar-pill"),
@@ -10731,6 +10757,81 @@ def repository_line(page, group):
     }""", group["remote"]["key"])
 
 
+def clone_rows(page, group):
+    """Each clone row's cells as the table draws them: toned phrases and the dash."""
+    return page.evaluate("""(key) => {
+      const section = [...document.querySelectorAll('.checkouts-group')]
+        .find((item) => item.dataset.checkoutsGroup === key);
+      const phrase = (node) => ({text: node.innerText, tone: node.dataset.tone,
+        branches: node.dataset.branches ? JSON.parse(node.dataset.branches) : null});
+      return Object.fromEntries([...section.querySelectorAll('tr.checkouts-clone')].map((row) => {
+        const relation = row.querySelector('.checkouts-relation');
+        return [row.dataset.clone, {
+          headers: [...section.querySelectorAll('table.checkouts-clones > thead th')]
+            .map((cell) => cell.innerText),
+          cells: [...row.children].map((cell) => cell.className),
+          relation: relation === null ? null : [relation.innerText, relation.dataset.tone || null],
+          uncommitted: (() => {
+            const cell = row.querySelector('td.checkouts-tree');
+            return cell === null ? null : [cell.textContent.slice(cell.firstElementChild.textContent.length),
+              [...cell.querySelectorAll('.checkouts-phrase')].map((node) => node.dataset.tone)];
+          })(),
+          branches: [...row.querySelectorAll('td.checkouts-branches .checkouts-phrase')].map(phrase),
+          branchesText: row.querySelector('td.checkouts-branches') === null ? null
+            : row.querySelector('td.checkouts-branches').innerText,
+        }];
+      }));
+    }""", group["remote"]["key"])
+
+
+UP_TO_DATE, CLEAN = ("up to date", None), ("—", [])
+
+
+def row_facts(relation=UP_TO_DATE, uncommitted=CLEAN, phrases=(), words=None):
+    """What one clone row draws: the relation and tone, the Uncommitted changes
+    cell with its tones, and the Branches phrases with their tones, in order."""
+    return {"relation": list(relation), "uncommitted": [uncommitted[0], uncommitted[1]],
+            "phrases": [list(phrase) for phrase in phrases], "words": words}
+
+
+def drawn_row(row):
+    return {"relation": row["relation"], "uncommitted": row["uncommitted"],
+            "phrases": [[phrase["text"], phrase["tone"]] for phrase in row["branches"]],
+            "words": row["branchesText"].split("\n", 1)[-1]}
+
+
+def assert_rows_drawn(rows, expected, case, trunk="trunk"):
+    """Every clone row of the line matches the expectation, ``row_facts`` by default."""
+    assert list(rows) == list(expected), case
+    for name, facts in expected.items():
+        drawn = drawn_row(rows[name])
+        if facts["words"] is None:
+            drawn["words"] = None
+        assert drawn == facts, (case, name, drawn)
+        assert rows[name]["headers"] == [
+            "Checkout", "HEAD", f"Local {trunk} vs remote {trunk}",
+            "Uncommitted changes", "Branches"]
+        assert rows[name]["cells"] == [
+            "checkouts-checkout", "checkouts-head", "checkouts-default",
+            "checkouts-tree", "checkouts-branches"], (case, name)
+
+
+def local_only_union(rows):
+    """The distinct branch names the rows' red ``local only`` phrases name."""
+    return {
+        name for row in rows.values() for phrase in row["branches"]
+        if phrase["text"].endswith("local only") for name in phrase["branches"]
+    }
+
+
+def red_pill_count(line):
+    """The branch count of a line's counted red pill, 0 when it has none."""
+    for pill in line["pills"]:
+        if pill.endswith("local only") and RED_MARK in pill and "changes" not in pill:
+            return int(pill.split()[1])
+    return 0
+
+
 def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts, view_checkouts):
     """Every domain case draws the tone, pills in order and activity the rules give."""
     work = " · 2 work items"
@@ -10765,12 +10866,56 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
          "1 of 1 in use · 1 work item"),
         ("k", signal_quiet_second_free_clone, "quiet", "grey", [], "0 of 2 in use"),
         ("l", None, "quiet", "grey", [], quiet_clone),
+        ("o", signal_quiet_index_lock, "quiet", "grey", [], quiet_clone),
         ("m", signal_detached_removable_worktree, "remote", "amber", [
             f"{AMBER_MARK} worktrees to clean up", f"{AMBER_MARK} trunk behind remote"], in_use),
         ("n", signal_only_behind_clones, "remote", "amber",
          [f"{AMBER_MARK} trunk behind remote"], in_use),
     ]
 
+    removable_and_progress = (
+        ("2 merged, removable", "amber"), ("1 in progress", "green"))
+    stash = ("1 stash", "red")
+    attention_rows = {
+        "a": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *removable_and_progress)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        "b": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *removable_and_progress)),
+            "Repo Clone 3": row_facts(phrases=(("2 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        # Held by the unfinished work item, topic-a reads in progress, not removable.
+        "c": {
+            "Repo Clone 2": row_facts(phrases=(("1 local only", "red"), *removable_and_progress)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+    }
+    behind = ("1 behind", "amber")
+    behind_rows = {
+        "Repo Clone 2": row_facts(relation=behind, phrases=(("1 in progress", "green"),)),
+        "Repo Clone 3": row_facts(),
+        "Repo Clone 10": row_facts(relation=behind),
+    }
+    quiet_only = {"Quiet Clone": row_facts()}
+    view_rows = {
+        "m-base": {
+            **behind_rows,
+            "Repo Clone 2": row_facts(relation=behind, phrases=(
+                ("1 merged, removable", "amber"), ("1 in progress", "green")))},
+        "d": {"Quiet Clone": row_facts(phrases=(stash,))},
+        # No branch is named, so the pill is uncounted and no phrase is red.
+        "e": {"Quiet Clone": row_facts(uncommitted=("1 untracked", ["red"]))},
+        "f": {"Quiet Clone": row_facts(
+            relation=("1 ahead, 1 behind", "red"), phrases=(("1 local only", "red"),))},
+        "g": {"Quiet Clone": row_facts(relation=behind)},
+        "h": quiet_only, "i": quiet_only, "j": quiet_only,
+        "k": {"Quiet Clone": row_facts(), "Quiet Clone 2": row_facts()},
+        # A muted dash for a clean checkout.
+        "l": quiet_only,
+        "m": behind_rows, "n": behind_rows,
+        "o": {"Quiet Clone": row_facts(uncommitted=("clean · index lock present", []))},
+    }
     # The attention world: the cases that count branches.
     base = attention_checkouts.document
     page, double = open_attention_checkouts(open_page, attention_checkouts, base)
@@ -10782,6 +10927,9 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         line = repository_line(page, remote)
         assert (line["tone"], line["pills"], line["activity"]) == (tone, pills, activity), case
         assert line["inUseTone"] is None, case
+        rows = clone_rows(page, remote)
+        assert_rows_drawn(rows, attention_rows[case], case)
+        assert len(local_only_union(rows)) == red_pill_count(line), case
         # Documented order: the repository's only line, whatever its tone.
         assert page.locator(".checkouts-line").count() == 1, case
 
@@ -10806,6 +10954,9 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             "items => items.map(item => item.dataset.checkoutsGroup)")
         assert keys == served_order, case
         assert line["name"] == group["remote"]["display"], case
+        rows = clone_rows(page, group)
+        assert_rows_drawn(rows, view_rows[case], case, "main" if case == "g" else "trunk")
+        assert len(local_only_union(rows)) == red_pill_count(line), case
         if case in ("m", "n"):
             section = page.locator(
                 f'.checkouts-group[data-checkouts-group="{group["remote"]["key"]}"]')
@@ -13105,13 +13256,11 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     clone_name = Path(gamma["target"]["clone"]).name
     group = page.locator(".checkouts-group").filter(
         has=page.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]'))
-    clone_row = group.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]')
 
     def gamma_shown():
         return {
             "branch": group.locator(
                 'table.checkouts-package-branches tr[data-branch="topic-c"]').count(),
-            "package": "Repo/Shipped/gamma" in clone_row.locator(".checkouts-package").inner_text(),
             "detail": group.locator(
                 '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count(),
             "anywhere": "Repo/Shipped/gamma" in body.inner_text(),
@@ -13119,10 +13268,11 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
         }
 
     assert gamma_shown() == {
-        "branch": 0, "package": False, "detail": 0, "anywhere": False, "search": False,
+        "branch": 0, "detail": 0, "anywhere": False, "search": False,
     }
-    # The unfinished work items of the same clone are still listed.
-    assert "Repo/Drafts/alpha" in clone_row.locator(".checkouts-package").inner_text()
+    # The unfinished work items of the same clone are still listed in its Details.
+    assert group.locator(
+        '.checkouts-clone-work-item[data-package="Repo/Drafts/alpha"]').count() == 1
     page.fill("#filter", "gamma")
     playwright.expect(group).to_be_hidden()
     page.fill("#filter", "")
@@ -13130,7 +13280,7 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     # Served as unfinished, the same work item is listed everywhere again.
     serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
     assert gamma_shown() == {
-        "branch": 1, "package": True, "detail": 1, "anywhere": True, "search": True,
+        "branch": 1, "detail": 1, "anywhere": True, "search": True,
     }
     page.fill("#filter", "gamma")
     playwright.expect(group).to_be_visible()
@@ -13171,7 +13321,8 @@ def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
     serve_checkouts(page, double, retarget(False))
     playwright.expect(quiet_group).to_have_count(1)
     assert quiet_items.count() == 0
-    assert "Repo/Shipped/gamma" in quiet_group.locator(".checkouts-package").inner_text()
+    assert quiet_group.locator(
+        '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count() == 1
 
 
 def live(relation, ahead=None, behind=None):
