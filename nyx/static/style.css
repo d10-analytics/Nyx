@@ -440,6 +440,21 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   padding-left: 1.15rem;
 }
 .checkouts-attention-item { margin: .2rem 0; overflow-wrap: anywhere; }
+.checkouts-attention-bar { display: flex; flex-wrap: wrap; gap: .35rem; margin: .2rem 0 .4rem; }
+.checkouts-bar-pill {
+  --tone: var(--control-border);
+  padding: .15rem .55rem;
+  border: 1px solid var(--tone);
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--tone);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-bar-pill[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-bar-pill[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-bar-pill[aria-expanded="true"] { text-decoration: underline; }
+.checkouts-attention-listbox[hidden] { display: none; }
 .checkouts-attention-go {
   padding: .1rem .35rem;
   font: inherit;

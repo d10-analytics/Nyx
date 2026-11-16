@@ -405,6 +405,8 @@
       "pillToMerge": "\u26A0\uFE0E {branches} to merge or clean up",
       "pillWorktrees": "\u26A0\uFE0E worktrees to clean up",
       "pillBehind": "\u26A0\uFE0E {trunk} behind remote",
+      "barBehind": "\u26A0\uFE0E {repositories} behind remote",
+      "barBehindHeading": "Repositories behind remote",
       "defaultBranchFallback": "default branch",
       "workItemBranches": "Work item branches",
       "attentionHeading": "Needs attention",
@@ -625,6 +627,7 @@
   // and survive a failed outcome until a ready one returns.
   const openClones = new Set();
   const openRepositories = new Set();
+  const openAttentionLists = new Set();
   const openFolds = new Set();
   let quietOpen = false;
 
@@ -4533,11 +4536,96 @@
       `${controlAttrs(key, "go")}>${words}</button></li>`;
   }
 
+  // The classes the bar's lists hold; every other class stays listed below the
+  // bar under its heading.
+  const BAR_LIST_CLASSES = {
+    red: ["unique_work"],
+    amber: ["awaiting_merge", "cleanup_ready"],
+  };
+
+  // The bar's pills and the repositories behind: totals are the sums of the
+  // repository lines' own counts, so the bar and the lines never disagree.
+  function attentionBarModel(document) {
+    let red = 0;
+    let amber = 0;
+    let worktrees = false;
+    const behind = [];
+    document.repositories.forEach((group) => {
+      const signals = repositorySignals(document, group);
+      red += signals.red.size;
+      amber += signals.amber.size;
+      if (signals.worktrees.length > 0) worktrees = true;
+      if (signals.behind.length > 0) behind.push(group);
+    });
+    const has = (classes) => document.attention.some((item) => classes.includes(item.class));
+    const pills = [];
+    if (red > 0) {
+      pills.push({code: "red-branches", list: "red", tone: "red",
+        words: wordText("text", "pillLocalOnly", {branches: plural(red, "branch")})});
+    } else if (has(BAR_LIST_CLASSES.red)) {
+      pills.push({code: "red-changes", list: "red", tone: "red",
+        words: wordText("text", "pillChangesOnlyHere")});
+    }
+    if (amber > 0) {
+      pills.push({code: "amber-branches", list: "amber", tone: "amber",
+        words: wordText("text", "pillToMerge", {branches: plural(amber, "branch")})});
+    }
+    if (worktrees) {
+      pills.push({code: "amber-worktrees", list: "amber", tone: "amber",
+        words: wordText("text", "pillWorktrees")});
+    }
+    if (behind.length > 0) {
+      pills.push({code: "amber-behind", list: "behind", tone: "amber",
+        words: wordText("text", "barBehind",
+          {repositories: plural(behind.length, "repository")})});
+    }
+    return {pills, behind};
+  }
+
+  function barPillHtml(pill) {
+    const key = keyOf("barpill", pill.code);
+    return `<button type="button" class="checkouts-bar-pill" data-bar-pill="${pill.code}" ` +
+      `data-list="${pill.list}" data-tone="${pill.tone}" aria-expanded="false" ` +
+      `${controlAttrs(key, "barpill")}>${pill.words}</button>`;
+  }
+
+  function attentionListHtml(name, itemsHtml, label) {
+    return `<div class="checkouts-attention-listbox" data-list="${name}" ` +
+      `data-key="${text(keyOf("attentionlist", name))}" data-parts hidden>` +
+      `<ul class="checkouts-attention-list" aria-label="${text(label)}">${itemsHtml}</ul></div>`;
+  }
+
+  function behindItemHtml(group) {
+    const key = keyOf("behind", groupKey(group));
+    return `<li class="checkouts-attention-item" data-behind="${text(groupKey(group))}" ` +
+      `${blockAttrs(key)}><button type="button" class="checkouts-attention-go" ` +
+      `${controlAttrs(key, "behind")}>${text(remoteName(group))}</button></li>`;
+  }
+
   function attentionHtml(document) {
-    if (!document.attention.length) return "";
+    const bar = attentionBarModel(document);
+    if (!document.attention.length && !bar.pills.length) return "";
     const parts = [];
+    if (bar.pills.length) {
+      parts.push('<div class="checkouts-attention-bar" data-parts>' +
+        `${bar.pills.map(barPillHtml).join("")}</div>`);
+    }
+    ["red", "amber"].forEach((name) => {
+      const items = document.attention.filter((item) =>
+        BAR_LIST_CLASSES[name].includes(item.class));
+      if (items.length) {
+        parts.push(attentionListHtml(name, items.map(attentionItemHtml).join(""),
+          codeWords("attentionClass", BAR_LIST_CLASSES[name][0])));
+      }
+    });
+    if (bar.behind.length) {
+      parts.push(attentionListHtml("behind", bar.behind.map(behindItemHtml).join(""),
+        wordText("text", "barBehindHeading")));
+    }
+    const listed = new Set([...BAR_LIST_CLASSES.red, ...BAR_LIST_CLASSES.amber]);
     let current = null;
     document.attention.forEach((item) => {
+      if (listed.has(item.class)) return;
       if (item.class !== current) {
         if (current !== null) parts.push("</ul>");
         current = item.class;
@@ -4547,9 +4635,26 @@
       }
       parts.push(attentionItemHtml(item));
     });
-    parts.push("</ul>");
+    if (current !== null) parts.push("</ul>");
     return `<section class="checkouts-attention" data-key="${text(keyOf("attention"))}">` +
       `<h2>${text(codeWords("text", "attentionHeading"))}</h2>${parts.join("")}</section>`;
+  }
+
+  function paintAttentionLists() {
+    checkoutsBody.querySelectorAll(".checkouts-attention-listbox").forEach((box) => {
+      const open = openAttentionLists.has(box.dataset.list);
+      if (box.hidden === open) box.hidden = !open;
+    });
+    checkoutsBody.querySelectorAll(".checkouts-bar-pill").forEach((pill) => {
+      setAttributeOnce(pill, "aria-expanded", String(openAttentionLists.has(pill.dataset.list)));
+    });
+  }
+
+  function toggleAttentionList(pill) {
+    const name = pill.dataset.list;
+    if (openAttentionLists.has(name)) openAttentionLists.delete(name);
+    else openAttentionLists.add(name);
+    paintAttentionLists();
   }
 
   function cloneRowFor(path) {
@@ -4718,10 +4823,26 @@
       goToAttention(destination);
       return;
     }
-    const row = cloneRowFor(destination);
+    focusBehindClone(destination);
+  }
+
+  function focusBehindClone(path) {
+    const row = cloneRowFor(path);
     if (row === null) return;
     revealDestination(row);
     focusDestination(row);
+  }
+
+  // A behind-list entry resolves its repository's first behind clone against
+  // the document current at the press.
+  function goToBehind(key) {
+    if (checkoutsOutcome.state !== "ready") return;
+    const current = checkoutsOutcome.envelope.checkouts;
+    const group = current.repositories.find((candidate) =>
+      keyOf("behind", groupKey(candidate)) === key);
+    if (group === undefined) return;
+    const destination = repositorySignals(current, group).destinations.behind;
+    if (destination !== null && destination !== undefined) focusBehindClone(destination);
   }
 
   function checkoutsGroupsHtml(document) {
@@ -4754,7 +4875,7 @@
   function childIdentities(parent) {
     const seen = new Map();
     return [...parent.children].map((child) => {
-      const base = child.hasAttribute("data-pill")
+      const base = child.hasAttribute("data-pill") || child.hasAttribute("data-bar-pill")
         ? `${child.getAttribute("data-key")}|pill`
         : child.hasAttribute("data-key") && !child.hasAttribute("data-control")
         ? child.getAttribute("data-key")
@@ -4844,6 +4965,11 @@
     openRepositories.forEach((key) => {
       if (!repositories.has(key)) openRepositories.delete(key);
     });
+    const lists = new Set([...fresh.querySelectorAll(".checkouts-bar-pill")]
+      .map((pill) => pill.dataset.list));
+    openAttentionLists.forEach((name) => {
+      if (!lists.has(name)) openAttentionLists.delete(name);
+    });
     const folds = new Set([...fresh.querySelectorAll(".checkouts-fold-toggle")]
       .map((toggle) => foldKeyOf(toggle)));
     openFolds.forEach((key) => {
@@ -4853,6 +4979,7 @@
   }
 
   function applyCheckoutsState() {
+    paintAttentionLists();
     checkoutsBody.querySelectorAll(".checkouts-group").forEach((group) => {
       paintRepositoryOpen(group, openRepositories.has(group.dataset.checkoutsGroup));
     });
@@ -4987,6 +5114,16 @@
     const attention = event.target.closest('[data-control="go"]');
     if (attention !== null) {
       goToAttention(attention.getAttribute("data-key"));
+      return;
+    }
+    const behind = event.target.closest('[data-control="behind"]');
+    if (behind !== null) {
+      goToBehind(behind.getAttribute("data-key"));
+      return;
+    }
+    const barPill = event.target.closest(".checkouts-bar-pill");
+    if (barPill !== null) {
+      toggleAttentionList(barPill);
       return;
     }
     const pill = event.target.closest(".checkouts-pill");
