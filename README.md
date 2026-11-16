@@ -1,6 +1,7 @@
 # Nyx
 
-Nyx is a work item viewer for plans, progress, and dependencies in a local
+Nyx is a development planner: it shows what to build next, what each piece depends on, and whether its code has merged.
+It shows plans, progress, and dependencies in a local
 browser view. A work item is one specification in its own directory. When work
 spans several features or repositories, Nyx helps you see where each item
 stands, which pieces depend on one another, and what needs attention next.
@@ -36,7 +37,7 @@ related specifications. Mark finished stages in **Board settings** and use
 **Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
 rows and their dependency connections.
 
-The **Checkouts** view, chosen with the switch in the header, shows the git
+The **Repositories** view, chosen with the switch in the header, shows the git
 state of your configured checkout folders beside the board: a **Needs
 attention** list, each repository's clones and branches, a **Check remotes
 now** button, and a **Checkout folders** editor that changes the active
@@ -46,8 +47,8 @@ and the availability, HEAD and tree words of clone rows (the guide lists every
 field). It reads the same state as `nyx checkouts` and changes no repository;
 its editor writes only the checkout settings, through the checkout settings
 `PUT`.
-It is described in [Use the Checkouts
-view](docs/running-nyx.md#use-the-checkouts-view).
+It is described in [Use the Repositories
+view](docs/running-nyx.md#use-the-repositories-view).
 
 Your plans stay in files you can edit, keep in version control, and use with
 other tools. On Linux, Nyx runs locally as a background service and opens in

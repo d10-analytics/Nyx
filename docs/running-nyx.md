@@ -535,9 +535,9 @@ With no folders configured it says `no checkout folders are configured` and
 exits 0.
 
 Checkout folders are set per workspace, in the account's configuration record.
-The **Checkouts** view of the board has a **Checkout folders** editor that
-changes them and the GitHub lookup; see [Use the Checkouts
-view](#use-the-checkouts-view). The same record can be edited by hand when no
+The **Repositories** view of the board has a **Checkout folders** editor that
+changes them and the GitHub lookup; see [Use the Repositories
+view](#use-the-repositories-view). The same record can be edited by hand when no
 board is running; see [Your specification
 workspace](workspaces.md#checkout-folders).
 
@@ -1362,7 +1362,7 @@ pill is green or absent. The prerequisites pill is green for `No prerequisites` 
 `Prerequisites met`, red for `Prerequisites not met in main` and `Prerequisites not
 met in checkout`, and grey for `Prerequisites unknown`; a grey pill takes the check
 mark away. The base-moved item is not a
-tag; it still shows in the work item panel and in **Checkouts**.
+tag; it still shows in the work item panel and in **Repositories**.
 
 The **work item panel** on the left shows the selected card in brief. A left or
 right click on a card fills it; a left click on the selected card clears it,
@@ -1394,7 +1394,7 @@ relationship link stays focused and so does the **All fields** summary, and
 focus otherwise returns to the panel title. **Hide details** collapses the panel
 to a strip and **Details** opens it again; the choice is remembered in this
 browser like the other display preferences. The panel belongs to the board and
-is not shown in **Checkouts**.
+is not shown in **Repositories**.
 
 Nyx checks for changed information every ten seconds, and at once when you return
 to the window. A changed catalog is installed at the next check, at most ten
@@ -1452,11 +1452,11 @@ retains the last valid displayed board and browser-local preference.
 Choose **Light**, **Dark**, or **System** from the theme menu to suit your display.
 A theme change follows other open tabs. The compact view (**Hide empty rows and
 columns**), **Hide terminal rows**, and **Click empty space to deselect** apply
-per tab until reload: another open tab keeps its current choice until it reloads. The chosen view, **Hide quiet checkouts** and whether the work item panel is open are remembered the same way.
+per tab until reload: another open tab keeps its current choice until it reloads. The chosen view, **Hide quiet repositories** and whether the work item panel is open are remembered the same way.
 
-## Use the Checkouts view
+## Use the Repositories view
 
-The board header has a **Board** and a **Checkouts** switch. **Checkouts** shows
+The board header has a **Board** and a **Repositories** switch. **Repositories** shows
 the same checkout state that `nyx checkouts` prints, read from Nyx's last
 successful checkout scan: the repositories under your configured checkout
 folders, their clones, branches and linked worktrees, and the work items whose
@@ -1465,7 +1465,7 @@ changes a repository or a specification file; its only changes are to the
 checkout folders and GitHub lookup of the active workspace, through the **Checkout
 folders** editor described below. See [Inspect checkouts](#inspect-checkouts) for what each value means,
 including the explanation of every code the view shows, which this section does
-not repeat. While **Checkouts** is shown, **Search** keeps the repositories
+not repeat. While **Repositories** is shown, **Search** keeps the repositories
 that match what you type, ignoring case, and hides the others (the field's hint
 changes to match). A repository matches by its name, default branch, any clone
 or linked worktree name or path, any branch name, the path of any work item it
@@ -1481,7 +1481,7 @@ reads how many match (for example "Quiet repositories (3, 1 matching)"). It is
 hidden when none match, and shows every repository again when you clear the
 search. **Hide empty
 rows and columns** and **Hide terminal rows** give way to **Hide quiet
-checkouts**. Switching views never waits for an update: the board is
+repositories**. Switching views never waits for an update: the board is
 always current, and every check reads the latest served scan, which Nyx renews
 at most about once a minute.
 
@@ -1603,10 +1603,10 @@ opens a clone's row to show its path, branches, linked worktrees and work items;
 a branch that another branch contains is listed under **Folded branches**, which
 you open on demand. Repositories that need nothing are collected into one
 **Quiet repositories** row that you open to list them; clear **Hide quiet
-checkouts** to show each as a group of its own. While **Checkouts** is shown the
+repositories** to show each as a group of its own. While **Repositories** is shown the
 view refreshes in place on every scan: the rows, folds and quiet row you opened
 stay open, and focus and scroll position stay where they were. While the board
-is shown the view is not redrawn; switching to **Checkouts** draws the latest
+is shown the view is not redrawn; switching to **Repositories** draws the latest
 scan. At a narrow width the tables stack, each
 cell labelled by its column, so the page needs no sideways scroll.
 
@@ -1671,7 +1671,7 @@ hidden). Keep **Board settings** closed in every image.
    and `Community_Resources` column. Save this
    expanded view as `docs/images/sample-board-expanded.png`.
 4. Check **Hide empty rows and columns** again, choose **Dark** and the
-   **Checkouts** view, and open the **Details** row of the second festival
+   **Repositories** view, and open the **Details** row of the second festival
    clone. Save this view as `docs/images/sample-checkouts.png` (see the
    checkout fixture below).
 
@@ -1681,11 +1681,11 @@ selected card and filepath. Both omit the empty dimensions. The third remains
 dark with the same selected card and filepath,
 unchecks compact view, and shows the empty Planning row and Community_Resources
 column. All three omit the finished Done row and permit card and have no issues
-panel. Each board image shows the **Board** and **Checkouts** switch in the
+panel. Each board image shows the **Board** and **Repositories** switch in the
 toolbar with **Board** selected.
 
-The fourth image is dark, 1600 × 1200, with **Checkouts** selected and **Hide
-quiet checkouts** checked. It shows the status line with **Check remotes now** and the closed
+The fourth image is dark, 1600 × 1200, with **Repositories** selected and **Hide
+quiet repositories** checked. It shows the status line with **Check remotes now** and the closed
 **Checkout folders** control,
 the **Needs attention** list with its one item, the **Quiet repositories** row,
 and the repository with two clones, with the second clone's **Details** open.
@@ -1698,9 +1698,9 @@ without pushing. Run `git fetch` once in each of the three clones before Nyx
 starts: a fresh clone writes no `FETCH_HEAD`, and Nyx would then report it as
 never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixture`
 (a path under your home directory would show your username).
-Start the isolated instance, choose **Checkouts**, and configure the clones'
-parent folder through the **Checkout folders** editor (see [Use the Checkouts
-view](#use-the-checkouts-view)): add the parent folder, leave the GitHub lookup
+Start the isolated instance, choose **Repositories**, and configure the clones'
+parent folder through the **Checkout folders** editor (see [Use the Repositories
+view](#use-the-repositories-view)): add the parent folder, leave the GitHub lookup
 unchecked, and choose **Save checkout folders**; a Board settings save keeps
 that entry. Close the editor again before the capture so only its summary shows.
 Then save the Board
@@ -1720,7 +1720,7 @@ or home directory.
 Review each file directly beside the running browser in both themes. Confirm
 that the selected card, package path, empty dimensions, saved row order, labels,
 controls, and absence of workspace or refresh issues match the browser, and that
-the Checkouts image matches the browser's status line, attention item and open
+the Repositories image matches the browser's status line, attention item and open
 clone row and shows only the fictional fixture.
 Reject a capture if the catalog is incomplete, any workspace diagnostic or issues panel
 is present, it contains a private path or value, was drawn by

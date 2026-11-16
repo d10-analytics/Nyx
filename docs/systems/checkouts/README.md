@@ -108,7 +108,7 @@ README is narrative only.
 
 ## Outside this boundary
 
-- Fetching, writing or locking a repository. The board's Checkouts view renders
+- Fetching, writing or locking a repository. The board's Repositories view renders
   the served document as it stands (the status line, the attention list, the
   groups and, for folder problems, git availability and diagnostics, a setup
   panel) and changes no repository: it shows the folders, and its folder editor

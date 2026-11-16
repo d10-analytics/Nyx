@@ -69,8 +69,8 @@ README is narrative only.
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
-- Shows the Checkouts view beside the board, chosen with a header switch whose
-  choice and **Hide quiet checkouts** are browser-local preferences. The view
+- Shows the Repositories view beside the board, chosen with a header switch whose
+  choice and **Hide quiet repositories** are browser-local preferences. The view
   renders the served checkouts document: a status line with **Check remotes
   now** (a request for a remote check through `application-serving`) and the
   **Checkout folders** editor, whose save is the view's other write (the

@@ -277,11 +277,11 @@ every host can store both spellings.
 ## Checkout folders
 
 Nyx records, per workspace, the folders whose git checkouts `nyx checkouts`
-lists. Set them in the browser: choose **Checkouts**, open **Checkout folders**,
+lists. Set them in the browser: choose **Repositories**, open **Checkout folders**,
 add or remove folders and the GitHub lookup, and choose **Save checkout
 folders**. The editor offers the parent folders that would bring a package's
 `Target repo:` checkout into view and shows what the server refused beside each
-folder; see [Use the Checkouts view](running-nyx.md#use-the-checkouts-view). It
+folder; see [Use the Repositories view](running-nyx.md#use-the-repositories-view). It
 saves the account's configuration record for the active workspace.
 
 ### Without the board
