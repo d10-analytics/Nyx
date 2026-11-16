@@ -10101,11 +10101,63 @@ def signal_quiet_assigned_alpha(document):
                     if ref["package_path"] != "Repo/Drafts/alpha"]
 
 
+def rewrite_clone_paths(clone, moved):
+    """Rewrite every path a parsed clone holds through ``moved``.
+
+    A clone's own path, its worktrees' paths and the worktree paths in its branches'
+    ``checked_out_in`` lists move together: the parser requires the main worktree at
+    the clone's path and every checkout list to name listed worktrees, so a copy stays
+    valid only when all three move as one.  Every path must carry the clone's path as a
+    prefix, as the copied clone's own paths do.  The rewrite reads the parsed facts,
+    never their JSON spelling, so it works whatever characters a path holds.
+    """
+    prefix = clone["path"]
+
+    def rewrite(path):
+        assert path.startswith(prefix), path
+        return moved(path)
+
+    clone["path"] = rewrite(clone["path"])
+    for worktree in clone["worktrees"] or []:
+        worktree["path"] = rewrite(worktree["path"])
+    for branch in clone["branches"] or []:
+        branch["checked_out_in"] = [rewrite(path) for path in branch["checked_out_in"]]
+
+
+def second_free_clone(clone):
+    """A copy of ``clone`` with `` 2`` after its path, so every path it holds differs."""
+    prefix = clone["path"]
+    second = copy.deepcopy(clone)
+    rewrite_clone_paths(second, lambda path: prefix + " 2" + path[len(prefix):])
+    return second
+
+
+WINDOWS_QUIET_CLONE = (
+    "C:\\Users\\runneradmin\\Temp\\pytest-7\\remotes\\festival-site\\clones\\Quiet Clone"
+)
+
+
+def windows_shaped_quiet_capture(document):
+    """One capture whose quiet clone and worktree paths are spelled as Windows spells them.
+
+    A posix ``Path`` reads a backslash path as one long name, so a proof over this
+    capture finds its clone by repository and position, never by that name.
+    """
+    shaped = copy.deepcopy(document)
+    clone = checkout_group(shaped, "quiet")["clones"][0]
+    prefix = clone["path"]
+    rewrite_clone_paths(clone, lambda path: WINDOWS_QUIET_CLONE + path[len(prefix):])
+    return shaped
+
+
 def signal_quiet_second_free_clone(document):
-    """The quiet repository gains a second free clone with a suffixed path."""
-    group, clone = checkout_clone(document, "Quiet Clone")
-    second = json.loads(json.dumps(clone).replace(clone["path"], clone["path"] + " 2"))
-    group["clones"].append(second)
+    """The quiet repository gains a second free clone with a suffixed path.
+
+    The clone is found by repository and position because the proof also serves these
+    paths in Windows's spelling, where a posix ``Path`` cannot read the clone's name.
+    """
+    clones = checkout_group(document, "quiet")["clones"]
+    clones.append(second_free_clone(clones[0]))
 
 
 def signal_detached_removable_worktree(document):
@@ -11111,6 +11163,37 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             }""", [quiet["remote"]["key"], token])
             assert seen[0] == tone, (theme, tone)
             assert seen[1] == seen[2], (theme, tone, token, seen)
+
+
+def test_checkouts_signal_second_free_clone_rewrites_windows_shaped_paths(view_checkouts):
+    """Case (k)'s copy moves every path of a Windows-spelled clone, not its JSON text.
+
+    ``json.dumps`` escapes each backslash, so a rewrite of the serialized text finds no
+    Windows path and leaves the copy repeating the original's paths, which the parser
+    refuses.  This capture therefore holds the mutation to the parsed facts on every
+    platform; the rendered case (k) assertions stay in the signal-rules test.
+    """
+    base = windows_shaped_quiet_capture(view_checkouts.document_checked)
+    shaped = checkout_group(base, "quiet")["clones"]
+    assert len(shaped) == 1
+    windows = shaped[0]
+    assert windows["path"].startswith("C:\\") and "\\" in windows["worktrees"][0]["path"]
+
+    variant = checkout_variant(base, signal_quiet_second_free_clone)
+    clones = checkout_group(variant, "quiet")["clones"]
+    assert sorted(clone["path"] for clone in clones) == sorted(
+        [windows["path"], windows["path"] + " 2"])
+    assert [clone["availability"]["state"] for clone in clones] == ["free", "free"]
+    second = next(clone for clone in clones if clone["path"] == windows["path"] + " 2")
+
+    # The copy's worktrees and branch checkouts moved with its own path, not the
+    # original's, so it is a second clone rather than a repeat of the first.
+    assert [worktree["path"] for worktree in second["worktrees"]] == [
+        path + " 2" for path in (worktree["path"] for worktree in windows["worktrees"])]
+    checked_out = [path for branch in second["branches"]
+                   for path in branch["checked_out_in"]]
+    assert checked_out
+    assert set(checked_out) <= {worktree["path"] for worktree in second["worktrees"]}
 
 
 def tab_until(page, probe):
