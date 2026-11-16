@@ -355,11 +355,10 @@
       "checkout": "Checkout",
       "availability": "Availability",
       "head": "HEAD",
-      "default": "Default branch vs remote",
-      "tree": "Tree",
+      "default": "Local {trunk} vs remote {trunk}",
+      "tree": "Uncommitted changes",
       "branches": "Branches",
       "cleanup": "Cleanup",
-      "package": "Package",
       "status": "Status",
       "branch": "Branch",
       "remoteCopy": "Remote copy",
@@ -404,6 +403,10 @@
       "pillChangesOnlyHere": "\u2715\uFE0E changes only on this machine",
       "pillToMerge": "\u26A0\uFE0E {branches} to merge or clean up",
       "pillWorktrees": "\u26A0\uFE0E worktrees to clean up",
+      "branchLocalOnly": "{n} local only",
+      "branchAwaitingMerge": "{n} awaiting merge",
+      "branchRemovable": "{n} merged, removable",
+      "branchInProgress": "{n} in progress",
       "pillBehind": "\u26A0\uFE0E {trunk} behind remote",
       "barBehind": "\u26A0\uFE0E {repositories} behind remote",
       "barBehindHeading": "Repositories behind remote",
@@ -449,8 +452,6 @@
       "detachedAt": "detached at {sha}",
       "unborn": "unborn {branch}",
       "assignedPrefix": "Assigned",
-      "noPackage": "—",
-      "nothingToRemove": "nothing to remove",
       "removable": "Removable",
       "foldingNotChecked": "Branches were not checked for folding: {reason}",
       "folderProblem": "{path} — {problem}",
@@ -3344,7 +3345,7 @@
   ];
   const CHANGE_KINDS = ["staged", "unstaged", "untracked", "conflicted"];
   const CLONE_COLUMNS = [
-    "checkout", "availability", "head", "default", "tree", "branches", "cleanup", "package",
+    "checkout", "head", "default", "tree", "branches",
   ];
   const PACKAGE_COLUMNS = ["branch", "remoteCopy", "verdict", "pullRequests", "workItems"];
 
@@ -3369,16 +3370,16 @@
 
   // The column name each cell carries for the stacked layout; the table's own
   // column header names it at wider widths, where the label is not shown.
-  function cellLabelHtml(key) {
-    return `<span class="cell-label">${text(codeWords("column", key))}</span>`;
+  function cellLabelHtml(key, values = {}) {
+    return `<span class="cell-label">${wordText("column", key, values)}</span>`;
   }
 
   // Every table keeps its table semantics under explicit roles: the stacked
   // layout changes how cells are displayed, and a browser drops the implicit
   // roles of a table whose display changes.
-  function tableHtml(cls, caption, columns, rows) {
+  function tableHtml(cls, caption, columns, rows, values = {}) {
     const head = columns.map((key) =>
-      `<th scope="col" role="columnheader">${text(codeWords("column", key))}</th>`).join("");
+      `<th scope="col" role="columnheader">${wordText("column", key, values)}</th>`).join("");
     return `<table class="${cls}" role="table">` +
       (caption === "" ? "" : `<caption>${caption}</caption>`) +
       `<thead role="rowgroup"><tr role="row">${head}</tr></thead>` +
@@ -3679,7 +3680,10 @@
     const behind = [];
     let trunk = group.default_branch === null ? null : group.default_branch.name;
     group.clones.forEach((clone) => {
-      const own = {red: new Set(), amber: new Set(), behind: false, tone: "grey"};
+      const own = {
+        red: new Set(), amber: new Set(), awaiting: new Set(), removable: new Set(),
+        behind: false, tone: "grey",
+      };
       perClone.set(clone.path, own);
       if (clone.status !== "ok") return;
       const distance = defaultDistance(clone);
@@ -3693,6 +3697,7 @@
         if (branch.removable !== null && branch.removable !== undefined &&
           branch.removable.removable && !held.has(branch.name)) {
           own.amber.add(branch.name);
+          own.removable.add(branch.name);
           amber.add(branch.name);
         }
       });
@@ -3701,7 +3706,10 @@
       const clone = group.clones.find((candidate) => candidate.path === item.clone);
       if (item.class === "awaiting_merge" && item.branch !== null) {
         amber.add(item.branch);
-        if (clone !== undefined) perClone.get(clone.path).amber.add(item.branch);
+        if (clone !== undefined) {
+          perClone.get(clone.path).amber.add(item.branch);
+          perClone.get(clone.path).awaiting.add(item.branch);
+        }
       }
       if (item.class !== "unique_work" || clone === undefined) return;
       let branch = null;
@@ -4078,14 +4086,41 @@
     return parts.join(" · ");
   }
 
+  function tonedHtml(tone, html) {
+    return tone === "" ? html : `<span class="checkouts-phrase" data-tone="${tone}">${html}</span>`;
+  }
+
+  // The Uncommitted changes cell: today's words, red when a change or an
+  // operation is present (an index lock alone is untoned) and a muted dash for
+  // a checkout with nothing to report.
+  function uncommittedCellHtml(worktree) {
+    if (worktree.status !== "ok") return treeCellHtml(worktree);
+    const changed = CHANGE_KINDS.some((kind) => (worktree.changes || {})[kind]) ||
+      (worktree.operations || []).length > 0;
+    if (changed) return tonedHtml("red", treeCellHtml(worktree));
+    return worktree.index_lock ? treeCellHtml(worktree) : dashHtml();
+  }
+
+  function cloneUncommittedHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "noWorkingTree"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return uncommittedCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
+  const RELATION_TONES = {ahead: "red", diverged: "red", behind: "amber"};
+
   function defaultCellHtml(document, group, clone) {
     const distance = defaultDistance(clone);
     const check = group.remote === null ? null : group.remote.check;
     const basis = distance === null ? "" : basisWords(document, distance.basis,
       check === null || check === undefined ? null : check.checked_at);
     const failed = checkFailed(check === null || check === undefined ? null : check.reason);
-    return '<td class="checkouts-default" role="cell">' + cellLabelHtml("default") +
-      `<span class="checkouts-relation">${comparisonWords(distance)}</span>` +
+    const tone = distance === null ? "" : RELATION_TONES[distance.relation] || "";
+    return '<td class="checkouts-default" role="cell">' +
+      cellLabelHtml("default", {trunk: trunkName(group, clone)}) +
+      `<span class="checkouts-relation"${tone === "" ? "" : ` data-tone="${tone}"`}>` +
+      `${comparisonWords(distance)}</span>` +
       (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`) +
       (failed ? ` <span class="checkouts-note">${wordText("text", "latestCheckFailed", {
         reason: codeWords("checkReason", check.reason),
@@ -4093,9 +4128,38 @@
       "</td>";
   }
 
-  function branchesCellHtml(clone) {
+  // Each branch of a clone takes one phrase, in the order red local only,
+  // amber awaiting merge, amber merged and removable, green in progress; the
+  // sets come from the signal rules, so a row and its line's pills agree.
+  function branchPhrases(document, group, clone) {
+    const own = repositorySignals(document, group).perClone.get(clone.path);
+    const taken = new Set();
+    const take = (names) => {
+      const fresh = [...names].filter((name) => !taken.has(name));
+      fresh.forEach((name) => taken.add(name));
+      return fresh.length;
+    };
+    const live = livePackagePaths(document);
+    const phrases = [];
+    const add = (tone, code, count) => {
+      if (count > 0) phrases.push(tonedHtml(tone, wordText("text", code, {n: count})));
+    };
+    add("red", "branchLocalOnly", take(own.red));
+    add("amber", "branchAwaitingMerge", take(own.awaiting));
+    add("amber", "branchRemovable", take(own.removable));
+    add("green", "branchInProgress", take(clone.branches.filter((branch) =>
+      (branch.packages || []).some((reference) => live.has(reference.package_path)) &&
+      branch.vs_remote !== null && branch.vs_remote !== undefined &&
+      ["equal", "behind"].includes(branch.vs_remote.relation)).map((branch) => branch.name)));
+    return phrases;
+  }
+
+  function branchesCellHtml(document, group, clone) {
     const parts = [plural(clone.branches.length, "branch")];
-    if (clone.stash_count > 0) parts.push(plural(clone.stash_count, "stash"));
+    parts.push(...branchPhrases(document, group, clone));
+    if (clone.stash_count > 0) {
+      parts.push(tonedHtml("red", plural(clone.stash_count, "stash")));
+    }
     if (clone.containment !== null && clone.containment !== undefined &&
       clone.containment !== "complete") {
       parts.push(`<span class="checkouts-caption">` +
@@ -4108,47 +4172,6 @@
 
   function blockersHtml(blockers, table) {
     return blockers.map((code) => text(codeWords(table, code))).join(", ");
-  }
-
-  function cleanupCellHtml(clone) {
-    const count = clone.removable_count || {branches: 0, worktrees: 0};
-    const parts = [];
-    if (count.branches === 0 && count.worktrees === 0) {
-      parts.push(text(codeWords("text", "nothingToRemove")));
-    } else {
-      parts.push(`${plural(count.branches, "branch")}, ` +
-        `${plural(count.worktrees, "worktree")} removable`);
-    }
-    const blocked = [];
-    clone.branches.forEach((branch) => {
-      if (branch.removable === null || branch.removable === undefined ||
-        branch.removable.removable) return;
-      blocked.push(`<span class="checkouts-blocker">${text(branch.name)} ` +
-        `(${blockersHtml(branch.removable.blockers, "branchBlocker")})</span>`);
-    });
-    clone.worktrees.forEach((worktree) => {
-      if (worktree.main || worktree.removable === null ||
-        worktree.removable === undefined || worktree.removable.removable) return;
-      blocked.push(`<span class="checkouts-blocker">${text(checkoutName(worktree.path))} ` +
-        `(${blockersHtml(worktree.removable.blockers, "worktreeBlocker")})</span>`);
-    });
-    if (blocked.length) parts.push(blocked.join(" · "));
-    return parts.join(" · ");
-  }
-
-  function packageCellHtml(document, clone, worktree) {
-    const paths = document.packages
-      .filter((item) => {
-        const target = item.target;
-        if (!isLivePackage(item) || target === null || target === undefined) return false;
-        if (worktree !== null) return target.worktree === worktree.path;
-        if (target.clone !== clone.path) return false;
-        return clone.status !== "ok" || target.worktree === null;
-      })
-      .map((item) => item.package_path);
-    return paths.length
-      ? paths.map((path) => `<span class="checkouts-package-path">${text(path)}</span>`).join(" · ")
-      : dashHtml();
   }
 
   // ---------------------------------------------------------------------
@@ -4317,16 +4340,12 @@
 
   function cloneRowHtml(document, group, clone) {
     const name = checkoutName(clone.path);
-    const cells = [checkoutCellHtml(document, clone),
-      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}` +
-      `${availabilityCellHtml(clone)}</td>`];
+    const cells = [checkoutCellHtml(document, clone)];
     if (clone.status !== "ok") {
-      // A clone that could not be read keeps its Package cell and has no
-      // toggle; one cell spans the columns its facts would have filled.
-      cells.push(`<td class="checkouts-status" colspan="5" role="cell">` +
+      // A clone that could not be read has no toggle; one cell spans the
+      // columns its facts would have filled.
+      cells.push(`<td class="checkouts-status" colspan="4" role="cell">` +
         `${cellLabelHtml("status")}${text(codeWords("status", clone.status))}</td>`);
-      cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-        `${packageCellHtml(document, clone, null)}</td>`);
       return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
         `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
         `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>`;
@@ -4335,13 +4354,9 @@
       `${cloneHeadHtml(clone)}</td>`);
     cells.push(defaultCellHtml(document, group, clone));
     cells.push(`<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
-      `${cloneTreeHtml(clone)}</td>`);
+      `${cloneUncommittedHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}` +
-      `${branchesCellHtml(clone)}</td>`);
-    cells.push(`<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
-      `${cleanupCellHtml(clone)}</td>`);
-    cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-      `${packageCellHtml(document, clone, null)}</td>`);
+      `${branchesCellHtml(document, group, clone)}</td>`);
     return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
       `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
       `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>` +
@@ -4354,7 +4369,7 @@
     return blockersHtml(worktree.removable.blockers, "worktreeBlocker");
   }
 
-  function worktreeRowHtml(document, clone, worktree) {
+  function worktreeRowHtml(document, group, clone, worktree) {
     const name = checkoutName(worktree.path);
     const flags = [];
     if (worktree.prunable) flags.push(`<span class="checkouts-flag">` +
@@ -4367,21 +4382,33 @@
         `${cellLabelHtml("checkout")}<span class="checkouts-name">${text(name)}</span>` +
         (flags.length ? `<span class="checkouts-flags">${flags.join(", ")}</span>` : "") +
         "</th>",
-      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}${dashHtml()}</td>`,
       `<td class="checkouts-head" role="cell">${cellLabelHtml("head")}` +
         `${worktree.status === "ok" ? headCellHtml(worktree) : status}</td>`,
-      `<td class="checkouts-default" role="cell">${cellLabelHtml("default")}${dashHtml()}</td>`,
+      `<td class="checkouts-default" role="cell">` +
+        `${cellLabelHtml("default", {trunk: trunkName(group, clone)})}${dashHtml()}</td>`,
       `<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
-        `${worktree.status === "ok" ? treeCellHtml(worktree) : status}</td>`,
+        `${worktree.status === "ok" ? uncommittedCellHtml(worktree) : status}</td>`,
       `<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}${dashHtml()}</td>`,
-      `<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}${worktree.status === "ok"
-        ? worktreeCleanupHtml(worktree) : dashHtml()}</td>`,
-      `<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-        `${packageCellHtml(document, clone, worktree)}</td>`,
     ];
     return `<tr class="checkouts-worktree" data-worktree="${text(name)}" ` +
       `data-worktree-path="${text(worktree.path)}" tabindex="-1" role="row" ` +
       `${blockAttrs(keyOf("worktree", worktree.path))}>${cells.join("")}</tr>`;
+  }
+
+  // The repository's default branch name, as each clone names it when the
+  // repository itself does not.
+  function trunkName(group, clone) {
+    if (group.default_branch !== null && group.default_branch.name !== null) {
+      return group.default_branch.name;
+    }
+    const own = clone === undefined ? null : defaultBranchName(clone);
+    if (own !== null) return own;
+    for (const candidate of group.clones) {
+      if (candidate.status !== "ok") continue;
+      const name = defaultBranchName(candidate);
+      if (name !== null) return name;
+    }
+    return codeWords("text", "defaultBranchFallback");
   }
 
   function cloneTableHtml(document, group) {
@@ -4390,10 +4417,11 @@
       rows.push(cloneRowHtml(document, group, clone));
       if (clone.status !== "ok") return;
       clone.worktrees.forEach((worktree) => {
-        if (!worktree.main) rows.push(worktreeRowHtml(document, clone, worktree));
+        if (!worktree.main) rows.push(worktreeRowHtml(document, group, clone, worktree));
       });
     });
-    return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""));
+    return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""),
+      {trunk: trunkName(group)});
   }
 
   // The words a cell shows, without its markup, so the search matches what the
@@ -4430,6 +4458,8 @@
     return served;
   }
 
+  // Search reads the availability words and the tree words (including `clean`)
+  // though no cell shows them any more: a clean checkout's cell is a dash.
   function groupSearchText(document, group) {
     const values = [remoteName(group)];
     if (group.default_branch !== null && group.default_branch.name !== null) {

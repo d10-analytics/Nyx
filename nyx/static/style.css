@@ -369,7 +369,6 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .checkouts-flags,
 .checkouts-freshness,
 .checkouts-caption,
-.checkouts-blocker,
 .checkouts-note,
 .checkouts-flag {
   display: block;
@@ -385,6 +384,11 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .checkouts-group-lookup time,
 .checkouts-default time { font-variant-numeric: tabular-nums; }
 .checkouts-empty { color: var(--muted); }
+.checkouts-phrase[data-tone="red"],
+.checkouts-relation[data-tone="red"] { color: var(--state-failed); }
+.checkouts-phrase[data-tone="amber"],
+.checkouts-relation[data-tone="amber"] { color: var(--state-waiting); }
+.checkouts-phrase[data-tone="green"] { color: var(--state-done); }
 /* The column header names each cell at wider widths; the stacked layout shows
    the name before the value instead. */
 .cell-label { display: none; }
