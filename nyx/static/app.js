@@ -392,8 +392,9 @@
       "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
-      "quietRow": "Quiet repositories ({count})",
-      "quietRowMatching": "Quiet repositories ({count}, {matching} matching)",
+      "quietLine": "{count} quiet repositories hidden",
+      "quietLineOne": "1 quiet repository hidden",
+      "quietShow": "Show",
       "freeClones": "Free clones: {clones}",
       "lineTrunkClones": "{branch} · {clones}",
       "lineClones": "{clones}",
@@ -624,13 +625,12 @@
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
-  // branch lists and the opened quiet row are restored onto what is rendered,
+  // branch lists are restored onto what is rendered,
   // and survive a failed outcome until a ready one returns.
   const openClones = new Set();
   const openRepositories = new Set();
   const openAttentionLists = new Set();
   const openFolds = new Set();
-  let quietOpen = false;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -1728,27 +1728,27 @@
     drawRails();
   }
 
-  // The quiet row is searched by the repositories it holds, with the same text
-  // a group of that repository would be searched by.  With a query it stays
-  // only while one of them matches, lists only those, and its summary counts
-  // them; with none it shows every repository and its plain count.
+  // The quiet line counts the quiet repositories the search matches, using
+  // the same text a line of that repository would be searched by.  With no
+  // query it counts them all; when none match it is hidden.
+  function quietLineWords(count) {
+    return count === 1
+      ? wordText("text", "quietLineOne", {})
+      : wordText("text", "quietLine", {count});
+  }
+
   function filterQuietRow(query) {
-    const row = checkoutsBody.querySelector("details.checkouts-quiet");
-    if (row === null) return;
-    const items = [...row.querySelectorAll("li")];
-    let matching = 0;
-    items.forEach((item) => {
-      const hide = Boolean(query) && !(item.dataset.search || "").includes(query);
-      if (!hide) matching += 1;
-      if (item.hidden !== hide) item.hidden = hide;
-    });
-    const hideRow = Boolean(query) && matching === 0;
-    if (row.hidden !== hideRow) row.hidden = hideRow;
-    const summary = row.querySelector("summary");
-    const words = query
-      ? wordText("text", "quietRowMatching", {count: items.length, matching})
-      : wordText("text", "quietRow", {count: items.length});
-    if (summary.textContent !== words) summary.textContent = words;
+    const line = checkoutsBody.querySelector(".checkouts-quiet-line");
+    if (line === null) return;
+    const searches = JSON.parse(line.dataset.searches);
+    const matching = query
+      ? searches.filter((search) => search.includes(query)).length
+      : searches.length;
+    const hide = matching === 0;
+    if (line.hidden !== hide) line.hidden = hide;
+    const count = line.querySelector(".checkouts-quiet-count");
+    const words = quietLineWords(matching);
+    if (count.textContent !== words) count.textContent = words;
   }
 
   // A card's tags are rewritten in place while the new facts have the same
@@ -3337,7 +3337,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // The ready view: the setup panel, the quiet row, groups and their tables
+  // The ready view: the setup panel, the repository lines, the quiet line and their tables
   // ---------------------------------------------------------------------
 
   const CHECK_FAILURE_REASONS = [
@@ -3790,18 +3790,14 @@
     return signals;
   }
 
-  function quietRowHtml(document, quiet) {
-    const items = quiet.map((group) => {
-      const clone = group.clones[0];
-      return `<li data-search="${text(groupSearchText(document, group))}">` +
-        `<span class="checkouts-quiet-display">${text(remoteName(group))}</span> ` +
-        `<span class="checkouts-quiet-checkout">${text(checkoutName(clone.path))}</span></li>`;
-    }).join("");
+  function quietLineHtml(document, quiet) {
+    const searches = JSON.stringify(quiet.map((group) => groupSearchText(document, group)));
     const key = keyOf("quiet");
-    return `<details class="checkouts-quiet" ${blockAttrs(key)}>` +
-      `<summary ${controlAttrs(key, "summary")}>` +
-      `${wordText("text", "quietRow", {count: quiet.length})}</summary>` +
-      `<ul>${items}</ul></details>`;
+    return `<p class="checkouts-quiet-line" data-searches="${text(searches)}" ` +
+      `${blockAttrs(key)}><span class="checkouts-quiet-count">` +
+      `${quietLineWords(quiet.length)}</span> ` +
+      `<button type="button" class="checkouts-quiet-show" ` +
+      `${controlAttrs(key, "show")}>${wordText("text", "quietShow", {})}</button></p>`;
   }
 
   function folderProblemWords(folder) {
@@ -4886,8 +4882,8 @@
       ? document.repositories.filter((group) => !isQuietRepository(document, group))
       : document.repositories;
     return checkoutSetupHtml(document) + attentionHtml(document) +
-      (hideQuietCheckouts && quiet.length ? quietRowHtml(document, quiet) : "") +
-      shown.map((group) => groupHtml(document, group)).join("");
+      shown.map((group) => groupHtml(document, group)).join("") +
+      (hideQuietCheckouts && quiet.length ? quietLineHtml(document, quiet) : "");
   }
 
   // ---------------------------------------------------------------------
@@ -4930,7 +4926,6 @@
   // A block that enters the view takes the state the reader left it in.
   function adoptBlock(element) {
     stampBlock(element, element.outerHTML);
-    if (element.matches("details.checkouts-quiet") && quietOpen) element.open = true;
   }
 
   function syncAttributes(live, fresh) {
@@ -5009,7 +5004,6 @@
     openFolds.forEach((key) => {
       if (!folds.has(key)) openFolds.delete(key);
     });
-    if (fresh.querySelector("details.checkouts-quiet") === null) quietOpen = false;
   }
 
   function applyCheckoutsState() {
@@ -5155,6 +5149,11 @@
       goToBehind(behind.getAttribute("data-key"));
       return;
     }
+    if (event.target.closest(".checkouts-quiet-show") !== null) {
+      setQuietCheckoutsPreference(false);
+      quietCheckoutsControl.focus();
+      return;
+    }
     const barPill = event.target.closest(".checkouts-bar-pill");
     if (barPill !== null) {
       toggleAttentionList(barPill);
@@ -5183,10 +5182,6 @@
       applyFolds(fold.closest("tr.checkouts-detail"));
     }
   });
-  // The quiet row's own toggle event is the one record of whether it is open.
-  checkoutsBody.addEventListener("toggle", (event) => {
-    if (event.target.matches("details.checkouts-quiet")) quietOpen = event.target.open;
-  }, true);
 
   // Every settle of a pressed check announces its result once, even when it is
   // the same words as the previous one: one write per settle is one text
