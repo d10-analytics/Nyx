@@ -353,7 +353,6 @@
     },
     "column": {
       "checkout": "Checkout",
-      "availability": "Availability",
       "head": "HEAD",
       "default": "Local {trunk} vs remote {trunk}",
       "tree": "Uncommitted changes",
@@ -2047,7 +2046,7 @@
   }
 
   // The checkout facts of one work item, read from the served document as the
-  // Checkouts view reads them: the visible Code section and the rows folded
+  // Repositories view reads them: the visible Code section and the rows folded
   // under All fields.  Both are empty while no document can be shown.
   function panelCodeHtml(entry) {
     const none = {section: "", folded: []};
@@ -4458,8 +4457,10 @@
     return served;
   }
 
-  // Search reads the availability words and the tree words (including `clean`)
-  // though no cell shows them any more: a clean checkout's cell is a dash.
+  // Search reads today's words: the availability words (`availabilityCellHtml`)
+  // and the tree words (`cloneTreeHtml`, including `clean`), though no cell
+  // shows them any more: the Availability column is gone and a clean
+  // checkout's Uncommitted changes cell is a dash.
   function groupSearchText(document, group) {
     const values = [remoteName(group)];
     if (group.default_branch !== null && group.default_branch.name !== null) {
