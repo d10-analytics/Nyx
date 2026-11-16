@@ -321,7 +321,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "The **Checkouts** view of the board has a **Checkout folders** editor that "
+        "The **Repositories** view of the board has a **Checkout folders** editor that "
         "changes them and the GitHub lookup",
         "The same record can be edited by hand when no board is running",
         "cannot be combined with `--setup`, `--stop` or `--status`",
@@ -1361,7 +1361,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
         ):
             assert stale not in text, (name, stale)
     assert (
-        "The **Checkouts** view of the board has a **Checkout folders** editor" in guide
+        "The **Repositories** view of the board has a **Checkout folders** editor" in guide
     )
     for text in (readme, board_web, checkouts):
         assert "checkout settings `PUT`" in text
@@ -1373,7 +1373,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "its editor writes only the checkout settings, through the checkout settings `PUT`"
     ) in readme
     assert workspaces.count(
-        "lists. Set them in the browser: choose **Checkouts**, open **Checkout folders**, "
+        "lists. Set them in the browser: choose **Repositories**, open **Checkout folders**, "
         "add or remove folders and the GitHub lookup, and choose **Save checkout folders**."
     ) == 1
     assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
@@ -1393,7 +1393,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
-    # The board-web README names both writes of the Checkouts view.
+    # The board-web README names both writes of the Repositories view.
     assert "(a request for a remote check through `application-serving`)" in board_web
     assert "whose save is the view's other write (the checkout settings `PUT`)" in board_web
     assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
@@ -2165,7 +2165,7 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         "`checkout` places the checkout itself against the same two commits.",
         "and, when the checkout can be placed, a baseline line.",
         "The base-moved item is not a tag; it still shows in the work item panel and in "
-        "**Checkouts**.",
+        "**Repositories**.",
         "The closed **All fields** disclosure ends with the baseline line's legend naming `B`, `C`, `M`",
     )
     _assert_unique_markers(guide, guide_markers, "docs/running-nyx.md")
@@ -2185,3 +2185,19 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         ),
         "docs/systems/board-web/README.md",
     )
+
+
+def test_the_view_is_named_repositories_and_nyx_is_described_by_its_purpose():
+    readme = _normalized("README.md")
+    assert readme.startswith(
+        "# Nyx Nyx is a development planner: it shows what to build next, what each "
+        "piece depends on, and whether its code has merged."
+    )
+    assert "work item viewer" not in readme.lower()
+    assert _normalized("docs/running-nyx.md").count("## Use the Repositories view") == 1
+    for name in ("README.md", "docs/running-nyx.md", "docs/workspaces.md"):
+        assert "use-the-checkouts-view" not in _normalized(name), name
+    for name in ("README.md", "docs/workspaces.md"):
+        assert "(running-nyx.md#use-the-repositories-view)" in _normalized(name) or (
+            "docs/running-nyx.md#use-the-repositories-view" in _normalized(name)
+        ), name
