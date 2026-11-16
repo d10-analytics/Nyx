@@ -763,6 +763,14 @@ body.panel-collapsed #work-item-panel-toggle {
 .panel-title { margin: 0 0 .75rem; color: var(--heading); font-size: 1.1rem; }
 .panel-title:focus { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .panel-empty { color: var(--empty); font-style: italic; }
+.panel-path-line {
+  margin: 0 0 .75rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+}
+.panel-all-fields { margin: 0 0 1rem; }
+.panel-all-fields summary { cursor: pointer; color: var(--heading); font-size: .9rem; font-weight: 600; }
 .panel-section { margin: 0 0 1rem; }
 .panel-section h3 {
   margin: 0 0 .35rem;

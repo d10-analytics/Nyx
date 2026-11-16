@@ -189,14 +189,14 @@ PREREQUISITES_PILL_MARKERS = {
         "a prerequisites pill, and, when the checkout can be placed, a baseline line",
         "whose card's prerequisites pill is green or absent",
         "a grey pill takes the check mark away",
-        "its prerequisites row (the pill and one line per prerequisite",
+        "with one line per prerequisite shown only when the pill is not green",
     ),
     "docs/systems/checkouts/README.md": (
         "Derives each unfinished package's prerequisites pill once",
     ),
     "docs/systems/board-web/README.md": (
         "its prerequisites pill (the five wordings the document carries",
-        "a prerequisites row with the pill and one line per prerequisite",
+        "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
     ),
 }
 
@@ -2166,7 +2166,7 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         "and, when the checkout can be placed, a baseline line.",
         "The base-moved item is not a tag; it still shows in the work item panel and in "
         "**Checkouts**.",
-        "then the baseline line itself with its words and a legend naming `B`, `C`, `M`",
+        "The closed **All fields** disclosure ends with the baseline line's legend naming `B`, `C`, `M`",
     )
     _assert_unique_markers(guide, guide_markers, "docs/running-nyx.md")
     assert "base moved 8" not in guide
@@ -2181,7 +2181,7 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         board,
         (
             "and a moved base, which the baseline line draws",
-            "Baseline drift and a row with the baseline line and its legend",
+            "the prerequisite lines under a green pill and the baseline line's legend",
         ),
         "docs/systems/board-web/README.md",
     )

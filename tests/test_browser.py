@@ -11529,6 +11529,14 @@ def panel_rows(page):
         " row.querySelector('dd').textContent])"))
 
 
+def panel_all_fields(page):
+    """The All fields rows as ``[(label, words)]``, read so a closed disclosure reads the same."""
+    return [tuple(pair) for pair in page.locator(
+        "#work-item-panel-body .panel-all-fields .panel-row").evaluate_all(
+        "rows => rows.map(row => [row.querySelector('dt').textContent,"
+        " row.querySelector('dd').textContent])")]
+
+
 def panel_code_rows(page):
     """The panel's Code rows as ``{label: words}``."""
     return dict(page.locator("#work-item-panel-body .panel-code .panel-row").evaluate_all(
@@ -11549,6 +11557,16 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     value["entries"][3]["declared"]["target_project"] = "Declared target"
     value["entries"][3]["declared"]["status"] = "drafting"
     value["entries"][3]["reported_fields"] = [{"name": "Owner", "value": "Robin"}]
+    program_id = "123e4567-e89b-42d3-a456-426614174099"
+    program_title = "Resolved program"
+    value["entries"][3]["relationship"]["program"] = {
+        "program_id": program_id, "title": program_title, "resolution": "resolved",
+    }
+    value["programs"] = [{
+        "program_id": program_id, "title": program_title, "member_package_ids": [LOOSE],
+    }]
+    value["entries"][0]["package_id"] = None
+    value["entries"][0]["declared"]["status"] = None
     _reseal(value)
     page = open_page(StaticClient(value))
     body = page.locator("#work-item-panel-body")
@@ -11560,15 +11578,16 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     loose.click()
     assert body.locator(".panel-title").inner_text() == XSS_TITLE
     assert body.locator("img").count() == 0
-    assert panel_rows(page) == {
-        "Stage": "Under Development",
-        "Project": "Beta",
-        "Filepath": "Beta/Under_Development/loose",
-        "Target Folder": "Declared target",
-        "Status": "drafting",
-        "Owner": "Robin",
-        "Package ID": LOOSE,
-    }
+    assert body.locator(".panel-path-line").inner_text() == "Beta/Under_Development/loose"
+    assert list(panel_rows(page).items()) == [
+        ("Target Folder", "Declared target"), ("Status", "drafting"), ("Program", program_title),
+    ]
+    assert panel_all_fields(page) == [("Owner", "Robin"), ("Package ID", LOOSE)]
+    disclosure = body.locator("details.panel-all-fields")
+    assert disclosure.locator("summary").inner_text() == "All fields (2)"
+    assert not disclosure.evaluate("node => node.open")
+    labels = body.locator(".panel-row dt").all_text_contents()
+    assert not {"Stage", "Project", "Filepath"} & set(labels)
     # The relationship an arrow draws is named here, with the other project.
     assert panel_links(page, "needs") == ["Foundation step Alpha"]
     assert body.locator('.panel-links[data-relation="blocks"]').count() == 0
@@ -11581,10 +11600,18 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     assert body.inner_text() == PANEL_EMPTY_WORDS
 
     # A right click fills it, and a second right click never clears it.
+    # Opening the disclosure is remembered across the cleared selection.
+    loose.click()
+    disclosure.locator("summary").click()
+    assert disclosure.evaluate("node => node.open")
+    loose.click()
+    assert body.inner_text() == PANEL_EMPTY_WORDS
     step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     step_two.click(button="right")
     assert step_two.get_attribute("aria-pressed") == "true"
     assert body.locator(".panel-title").inner_text() == "Dependent step"
+    assert list(panel_rows(page)) == ["Status"]
+    assert body.locator("details.panel-all-fields").evaluate("node => node.open")
     assert panel_links(page, "needs") == ["Foundation step"]
     assert panel_links(page, "blocks") == ["Gate step"]
     step_two.click(button="right")
@@ -11599,12 +11626,22 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     assert body.locator(".panel-title").inner_text() == "Foundation step"
     assert panel_links(page, "blocks") == ["Dependent step", f"{XSS_TITLE} Beta"]
     assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
+    assert body.locator("details.panel-all-fields").evaluate("node => node.open")
+
+    # A close persists the same way, and an item with nothing to fold draws no disclosure.
+    body.locator("details.panel-all-fields summary").click()
+    loose.click(button="right")
+    assert not body.locator("details.panel-all-fields").evaluate("node => node.open")
+    page.locator('.card[data-package-path="Alpha/Queue/gate"]').click()
+    assert panel_rows(page) == {}
+    assert body.locator("details").count() == 0
 
 
 def test_install_keeps_focus_in_the_work_item_panel(open_page):
     """An automatic install that rewrites the panel hands focus back inside it."""
     client = SequenceClient([
         board_payload(), board_payload(titles={"step_one": "Renamed foundation"}),
+        board_payload(titles={"step_one": "Renamed again"}),
     ])
     page = open_page(client, fake_clock=True)
     body = page.locator("#work-item-panel-body")
@@ -11618,6 +11655,16 @@ def test_install_keeps_focus_in_the_work_item_panel(open_page):
     assert page.evaluate(
         "document.activeElement.classList.contains('panel-link')"
         " && document.activeElement.textContent.includes('Renamed foundation')")
+    # A focused All fields summary is replaced by the rewrite and focus lands on the new one.
+    summary = body.locator("details.panel-all-fields summary")
+    summary.focus()
+    old_summary = summary.element_handle()
+    fire_poll(page)
+    playwright.expect(body.locator(".panel-link").first).to_contain_text("Renamed again")
+    assert not old_summary.evaluate("node => node.isConnected")
+    assert page.evaluate(
+        "document.activeElement === document.querySelector("
+        "'#work-item-panel-body details.panel-all-fields summary')")
 
 
 def test_install_moves_focus_to_the_panel_heading_when_its_link_is_gone(open_page):
@@ -11665,6 +11712,7 @@ def test_work_item_panel_collapses_and_remembers_the_choice(open_page):
     assert opened["overflow"] <= 0
 
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    body.locator("details.panel-all-fields summary").click()
     rails = page.locator(".rail").count()
     toggle.click()
     collapsed = geometry()
@@ -11686,6 +11734,8 @@ def test_work_item_panel_collapses_and_remembers_the_choice(open_page):
     toggle.click()
     assert body.locator(".panel-title").inner_text() == "Gate step"
     assert page.evaluate("window.localStorage.getItem('spec-tracker-work-item-panel')") == "open"
+    # The disclosure starts closed on every load and is stored nowhere.
+    assert not body.locator("details.panel-all-fields").evaluate("node => node.open")
 
     # The panel belongs to the board.
     page.locator("#view-checkouts").click()
@@ -11721,18 +11771,37 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     package = next(
         item for item in document["packages"] if item["package_path"] == "Repo/Drafts/alpha")
     rows = panel_code_rows(page)
-    assert list(rows) == [
-        "Code Status", "Prerequisites", "Target repo", "Branch", "Remote copy", "Verdict",
-        "Pull requests", "Baseline",
-    ]
+    assert list(rows) == ["Code Status", "Branch", "Prerequisites"]
     assert rows["Prerequisites"] == models.prerequisites_text(package["prerequisites"]["state"])
     assert rows["Code Status"] == CHECKOUTS_CODE_STATUS_TEXTS["Repo/Drafts/alpha"]
-    assert rows["Target repo"] == Path(package["target"]["clone"]).name
     assert rows["Branch"] == package["branch"]["name"]
-    assert rows["Remote copy"].startswith("on the remote (")
-    assert rows["Verdict"].startswith("not merged")
-    assert rows["Pull requests"] == "—"
+    catalog_entry = next(
+        item for item in real_checkouts.catalog["entries"]
+        if item["package_path"] == "Repo/Drafts/alpha")
+    reported = [field["name"] for field in catalog_entry["reported_fields"]]
+    folded = dict(panel_all_fields(page))
+    assert [label for label, _ in panel_all_fields(page)] == [
+        *reported, "Package ID", "Target repo", "Remote copy", "Verdict", "Pull requests",
+        "Baseline",
+    ]
+    assert folded["Target repo"] == Path(package["target"]["clone"]).name
+    assert folded["Remote copy"].startswith("on the remote (")
+    assert folded["Verdict"].startswith("not merged")
+    assert folded["Pull requests"] == "—"
+    disclosure = body.locator("details.panel-all-fields")
+    assert disclosure.locator("summary").inner_text() == f"All fields ({len(folded)})"
+    assert disclosure.evaluate(
+        "node => node === document.querySelector('#work-item-panel-body').lastElementChild"
+        " && node.previousElementSibling.classList.contains('panel-code')")
     assert panel_links(page, "blocks") == ["Beta"]
+
+    # A checkout held only elsewhere is the last Code row, and only then.
+    code_status_card(page, "Repo/Drafts/beta").click()
+    rows = panel_code_rows(page)
+    assert list(rows)[-1] == "Also checked out in"
+    assert rows["Also checked out in"] == "Repo Clone 10"
+    code_status_card(page, "Repo/Drafts/alpha").click()
+    assert "Also checked out in" not in panel_code_rows(page)
 
     # A work item with no Code Status still shows what the scan knows of it.
     code_status_card(page, "Repo/Drafts/delta").click()
@@ -11741,24 +11810,64 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     assert delta["code_status"] is None
     rows = panel_code_rows(page)
     assert "Code Status" not in rows
-    assert set(rows) >= {"Target repo", "Branch", "Baseline"}
+    assert set(rows) >= {"Branch"}
+
+    # An unmatched target shows its Target repo row in the Code section; a
+    # worktree target folds it with its words.
+    clone_path = package["target"]["clone"]
+    worktree_path = f"{clone_path}-worktree"
+
+    def retarget(variant):
+        for item in variant["packages"]:
+            if item["package_path"] == "Repo/Drafts/delta":
+                item["target"].update({"status": "missing", "clone": None, "worktree": None})
+            if item["package_path"] == "Repo/Drafts/epsilon":
+                item["target"].update({
+                    "status": "worktree", "clone": clone_path, "worktree": worktree_path})
+
+    double.serve(checkouts_envelope(checkout_raw_variant(document, retarget)))
+    fire_checkouts_poll(page)
+    playwright.expect(body.locator(".panel-target dd")).to_have_text("does not exist")
+    rows = list(panel_code_rows(page).items())
+    assert rows[:2] == [("Target repo", "does not exist"), ("Branch", rows[1][1])]
+    assert [label for label, _ in panel_all_fields(page)].count("Target repo") == 0
+    code_status_card(page, "Repo/Drafts/epsilon").click()
+    assert "Target repo" not in panel_code_rows(page)
+    assert dict(panel_all_fields(page))["Target repo"] == (
+        f"{Path(worktree_path).name}, a worktree of {Path(clone_path).name}")
+    double.serve(checkouts_envelope(document))
+    fire_checkouts_poll(page)
 
     # A tick that changes the selected work item rewrites the panel; one that
-    # changes nothing it shows leaves the same elements in place.
+    # changes nothing it shows leaves the same elements in place, even open.
     code_status_card(page, "Repo/Drafts/alpha").click()
     heading = body.locator(".panel-title").element_handle()
+    body.locator("details.panel-all-fields summary").click()
+    assert heading.evaluate("node => node.isConnected")
+    details = body.locator("details.panel-all-fields").element_handle()
     fire_checkouts_poll(page)
     settle_frames(page)
     assert heading.evaluate("node => node.isConnected")
+    assert details.evaluate("node => node.isConnected && node.open")
+    # A scan that rewrites the panel hands a focused summary to the new one.
+    summary = body.locator("details.panel-all-fields summary")
+    summary.focus()
+    old_summary = summary.element_handle()
     double.serve(checkouts_with_text(document, "Repo/Drafts/alpha", "custom words"))
     fire_checkouts_poll(page)
     playwright.expect(body.locator(".panel-code-status dd")).to_have_text("custom words")
+    assert body.locator("details.panel-all-fields").evaluate("node => node.open")
+    assert not old_summary.evaluate("node => node.isConnected")
+    assert page.evaluate(
+        "document.activeElement === document.querySelector("
+        "'#work-item-panel-body details.panel-all-fields summary')")
 
-    # A failed read removes the Code part with the card tags.
+    # A failed read removes the Code part and its folded rows with the card tags.
     double.fail("checkouts_failed")
     fire_checkouts_poll(page)
     playwright.expect(body.locator(".panel-code")).to_have_count(0)
     assert body.locator(".panel-title").inner_text() == "Alpha"
+    assert [label for label, _ in panel_all_fields(page)] == [*reported, "Package ID"]
 
 
 def with_moved_base(document, path, count):
@@ -11799,7 +11908,8 @@ def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_check
     rows = panel_code_rows(page)
     sentence = f"the base of {path} moved 3 commits past its Baseline"
     assert rows["Needs attention"] == sentence
-    assert "the base moved 3 commits past it" in rows["Baseline"]
+    assert "Baseline 3 behind main" in rows["Baseline line"]
+    assert "the base moved 3 commits past it" in dict(panel_all_fields(page))["Baseline"]
 
     # The next scan without the drift removes the panel row; the line stays off the tag.
     double.serve(checkouts_envelope(document))
@@ -12168,8 +12278,13 @@ def test_prerequisites_pill_follows_the_served_state_everywhere(open_page, real_
 
     # The panel of beta names the pill and each prerequisite with its two facts.
     code_status_card(page, beta).click()
-    row = panel_code_rows(page)["Prerequisites"]
-    assert row.splitlines()[0] == wording("met")
+    # Under the green pill the lines are folded under All fields.
+    assert panel_code_rows(page)["Prerequisites"] == wording("met")
+    assert [label for label, _ in panel_all_fields(page)] == [
+        "Branch", "Package ID", "Target repo", "Remote copy", "Verdict", "Pull requests",
+        "Baseline", "Each prerequisite", "Baseline line legend",
+    ]
+    row = dict(panel_all_fields(page))["Each prerequisite"]
     assert f"{titles[ids['alpha']]}: merged on main, in this checkout" in row
     assert "A prerequisite that cannot be read" in row
     assert "unknown" not in row.split("A prerequisite")[0]
@@ -12192,11 +12307,14 @@ def test_prerequisites_pill_follows_the_served_state_everywhere(open_page, real_
 
     # A prerequisite the catalog does not list is named by its ID.
     stranger = "123e4567-e89b-42d3-a456-426614174aff"
-    served_c = poll(served_b, {beta: "met"}, {beta: [dict(items[0], target_package_id=stranger)]})
+    # Under a red pill the lines show in the visible row and the disclosure has none.
+    served_c = poll(served_b, {beta: "not_in_main"},
+                    {beta: [dict(items[0], target_package_id=stranger)]})
     double.serve(checkouts_envelope(served_c))
     fire_checkouts_poll(page)
     code_status_card(page, beta).click()
     assert f"{stranger}: merged on main, in this checkout" in panel_code_rows(page)["Prerequisites"]
+    assert "Each prerequisite" not in dict(panel_all_fields(page))
 
     # A null pill removes the card's pill and its panel row.
     code_status_card(page, epsilon).click()
@@ -12456,14 +12574,18 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
         gamma: None,
     })
     code_status_card(page, alpha).click()
-    row = page.locator("#work-item-panel-body .panel-baseline-line")
+    row = page.locator("#work-item-panel-body .panel-code .panel-baseline-line")
     playwright.expect(row).to_have_count(1)
     card_words = baseline_line_words(page, alpha)["name"]
     assert card_words == (
         "Baseline not synced, Checkout 3 behind main, Baseline 58 behind main")
     shown = row.inner_text()
     assert card_words in shown
-    legend = row.locator(".panel-baseline-legend li").all_inner_texts()
+    assert row.locator(".panel-baseline-legend").count() == 0
+    assert page.locator("#work-item-panel-body .panel-code .panel-baseline-legend").count() == 0
+    assert "Baseline line legend" in dict(panel_all_fields(page))
+    legend = page.locator(
+        "#work-item-panel-body .panel-all-fields .panel-baseline-legend li").all_text_contents()
     assert [entry.split(" ")[0] for entry in legend] == ["B", "C", "M", "ring", "fork", "count"]
     for expected in ("Baseline", "checked out", "main head", "ring", "fork", "+N", "count by M"):
         assert expected in " ".join(legend)
@@ -12481,3 +12603,4 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     code_status_card(page, gamma).click()
     playwright.expect(page.locator("#work-item-panel-body .panel-code")).to_have_count(1)
     assert page.locator("#work-item-panel-body .panel-baseline-line").count() == 0
+    assert "Baseline line legend" not in dict(panel_all_fields(page))

@@ -1364,23 +1364,37 @@ met in checkout`, and grey for `Prerequisites unknown`; a grey pill takes the ch
 mark away. The base-moved item is not a
 tag; it still shows in the work item panel and in **Checkouts**.
 
-The **work item panel** on the left shows the selected card in full. A left or
+The **work item panel** on the left shows the selected card in brief. A left or
 right click on a card fills it; a left click on the selected card clears it,
-and a right click never does. The panel lists the work item's stage, project,
-whole filepath, target folder, status, program, every reported field and its
-Package ID; then **Needs** and **Blocks**, each relationship a link that
-selects the card it names; then, under **Code**, what the last checkout scan
-says of the work item: its Code Status, its prerequisites row (the pill and one line
-per prerequisite, named by its title, with its two facts in words), the attention items that name it, its
-target repo, branch, the branch's remote copy, merge verdict and pull requests,
-and its Baseline with how far the base has moved past it, then the baseline
-line itself with its words and a legend naming `B`, `C`, `M`, the ring, the fork
-(commits of the checkout's own, `+N`, beside a Baseline that has moved on) and the
-count beside `M` (commits the checkout is behind main). The **Code** part
-follows the same rule as the Code Status tag below and is absent while that tag
-is hidden. **Hide details** collapses the panel to a strip and **Details**
-opens it again; the choice is remembered in this browser like the other display
-preferences. The panel belongs to the board and is not shown in **Checkouts**.
+and a right click never does. Under the title the panel shows the package path
+on one line, which names the project, stage and folder. It then lists the work
+item's status, its program and, when it differs from the project, its target
+folder, each only when the specification declares it; then **Needs** and
+**Blocks**, each relationship a link that selects the card it names; then,
+under **Code**, what the last checkout scan says of the work item, each part
+only when the scan has it: its Code Status, the target repo when the target is
+not matched to a clone or worktree, its branch, its prerequisites row (the pill,
+with one line per prerequisite shown only when the pill is not green, each named
+by its title with its two facts in words), the attention items that name it,
+the baseline line with its words, and the other checkouts of the work item. The
+**Code** part follows the same rule as the Code Status tag below and is absent
+while that tag is hidden. Everything else sits in one **All fields (N)**
+disclosure after **Code**, where `N` counts the rows it opens. It is closed by
+default and holds every reported field, the Package ID and the Code rows the
+panel does not show above: the matched target repo, the branch's remote copy,
+merge verdict and pull requests, the Baseline with how far the base has moved
+past it, and the prerequisite lines under a green pill. The closed **All fields**
+disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the ring, the
+fork (commits of the checkout's own, `+N`, beside a Baseline that has moved on)
+and the count beside `M` (commits the checkout is behind main). It is not drawn
+when it would hold no row. It stays open or closed as you left it for as long as
+the page is open, across selections and scans, and is not remembered afterwards.
+Keyboard focus inside the panel is kept whenever the panel is rewritten: a
+relationship link stays focused and so does the **All fields** summary, and
+focus otherwise returns to the panel title. **Hide details** collapses the panel
+to a strip and **Details** opens it again; the choice is remembered in this
+browser like the other display preferences. The panel belongs to the board and
+is not shown in **Checkouts**.
 
 Nyx checks for changed information every ten seconds, and at once when you return
 to the window. A changed catalog is installed at the next check, at most ten
