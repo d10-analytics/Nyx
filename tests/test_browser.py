@@ -10687,12 +10687,27 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     detail.locator(".checkouts-fold-toggle").click()
     # The cached capture shows the freshness words; the setup capture its panel.
     shown = {}
-    for document in (cached, setup):
-        if document is setup:
-            serve_checkouts(page, double, setup)
+    # The committed capture draws the red phrase (`1 local only`), the one tone
+    # the other two captures never show.
+    red = view_checkouts.document_topic_committed
+    for document in (cached, setup, red):
+        if document is not cached:
+            serve_checkouts(page, double, document)
+            open_every_repository(page)
         settle_frames(page)
         for name, pairs in checkouts_text_colors(page).items():
             shown.setdefault(name, []).extend(pairs)
+    failed = page.evaluate("""() => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--state-failed)';
+      document.body.append(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    }""")
+    assert ("local only", failed) in [
+        (sample[-10:], color) for color, _, sample in shown["toned phrases"]
+    ], "no red phrase is measured"
     for name, pairs in shown.items():
         assert pairs, f"nothing is shown for {name}"
         for color, background, sample in pairs:
