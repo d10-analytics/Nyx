@@ -4692,6 +4692,38 @@
     focusDestination(toggle === null ? cloneRow : toggle);
   }
 
+  // A line pill resolves its destination against the document current at the
+  // press, so a refresh that changed the first item sends the same pill to the
+  // new one; a pill whose signal the refresh removed does nothing.
+  const PILL_DESTINATIONS = {
+    "red-branches": "red",
+    "red-changes": "red",
+    "amber-branches": "amber",
+    "amber-worktrees": "worktrees",
+    "amber-behind": "behind",
+  };
+
+  function goToPill(pill) {
+    if (checkoutsOutcome.state !== "ready" || !checkoutsBody.contains(pill)) return;
+    const section = pill.closest(".checkouts-group");
+    const name = PILL_DESTINATIONS[pill.getAttribute("data-pill")];
+    if (section === null || name === undefined) return;
+    const current = checkoutsOutcome.envelope.checkouts;
+    const group = current.repositories.find((candidate) =>
+      groupKey(candidate) === section.dataset.checkoutsGroup);
+    if (group === undefined) return;
+    const destination = repositorySignals(current, group).destinations[name];
+    if (destination === null || destination === undefined) return;
+    if (name !== "behind") {
+      goToAttention(destination);
+      return;
+    }
+    const row = cloneRowFor(destination);
+    if (row === null) return;
+    revealDestination(row);
+    focusDestination(row);
+  }
+
   function checkoutsGroupsHtml(document) {
     const quiet = document.repositories.filter((group) =>
       isQuietRepository(document, group));
@@ -4955,6 +4987,11 @@
     const attention = event.target.closest('[data-control="go"]');
     if (attention !== null) {
       goToAttention(attention.getAttribute("data-key"));
+      return;
+    }
+    const pill = event.target.closest(".checkouts-pill");
+    if (pill !== null) {
+      goToPill(pill);
       return;
     }
     const line = event.target.closest(".checkouts-line-toggle");
