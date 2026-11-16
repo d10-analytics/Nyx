@@ -9359,6 +9359,53 @@ def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     line = page.locator(".checkouts-group").filter(has=clone_two).locator(
         ".checkouts-line-toggle")
     assert line.get_attribute("aria-expanded") == "false"
+
+    # A pill on the closed line moves to the first item of its classes, and the
+    # destination is resolved when pressed, never when drawn.
+    group = page.locator(".checkouts-group").filter(has=clone_two)
+    errors = []
+    page.on("pageerror", lambda error: errors.append(error))
+    red_pill = group.locator('button[data-pill="red-branches"]').element_handle()
+    red_pill.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
+    assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "topic-a"
+    assert page.evaluate("document.activeElement.closest('tr.checkouts-detail').dataset.detailFor"
+                         ).endswith("Repo Clone 2")
+    assert "checkouts-clone-branch" in target["cls"]
+    group.locator('button[data-pill="amber-branches"]').press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["branch"], target["cls"]) == ("topic-g", "checkouts-branch")
+
+    # topic-a now level with its remote: the first red item is Repo Clone 3's
+    # local-only branch, and the held pill keeps its element and goes there.
+    red_pill.focus()
+    serve_checkouts(page, double, checkout_variant(
+        document, signal_topic_a_level_with_its_remote))
+    assert red_pill.evaluate("el => el.isConnected") is True
+    assert red_pill.inner_text() == f"{RED_MARK} 2 branches local only"
+    red_pill.press("Enter")
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "local-only"
+    assert page.evaluate("document.activeElement.closest('tr.checkouts-detail').dataset.detailFor"
+                         ).endswith("Repo Clone 3")
+    assert "checkouts-clone-branch" in target["cls"]
+    assert page.locator(
+        'tr.checkouts-clone-branch[data-branch="local-only"]').evaluate(
+        "row => row.closest('tr.checkouts-detail').hidden") is False
+    assert page.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] '
+        'tr.checkouts-clone-branch[data-branch="topic-a"]').count() == 1
+    assert errors == []
+    serve_checkouts(page, double, document)
+
+    # Leave every line and clone closed for the item presses below.
+    for row in (clone_two, page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]')):
+        if row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true":
+            row.locator(".checkouts-toggle").click()
+    line.click()
+    assert line.get_attribute("aria-expanded") == "false"
     press("branch_unpushed")
     assert line.get_attribute("aria-expanded") == "true"
     assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
@@ -9869,6 +9916,13 @@ def signal_topic_a_merged_and_held(document):
         MERGED_VERDICT)
 
 
+def signal_topic_a_level_with_its_remote(document):
+    """``topic-a`` is level with its remote, so its unique work moves to Repo Clone 3."""
+    _, clone = checkout_clone(document, "Repo Clone 2")
+    next(b for b in clone["branches"] if b["name"] == "topic-a")["vs_remote"].update(
+        relation="equal", ahead=0, behind=0)
+
+
 def signal_quiet_changes_on_a_detached_checkout(document):
     """Quiet Clone's checkout is detached with one untracked file."""
     _, clone = checkout_clone(document, "Quiet Clone")
@@ -10224,9 +10278,17 @@ def test_checkouts_refresh_hands_a_closed_lines_pill_focus_to_its_toggle(
         'tr.checkouts-clone[data-clone="Repo Clone 2"]'))
     assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
     group.locator('button[data-pill="red-branches"]').focus()
+    held = group.locator('button[data-pill="red-branches"]').element_handle()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(error))
     arm_focus_sampler(page)
     serve_checkouts(page, double, view_checkouts.document_topic_deleted)
     assert group.locator('button[data-pill="red-branches"]').count() == 0
+    # A press on the pill the refresh removed moves and opens nothing.
+    held.dispatch_event("click")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    assert page.locator('tr.checkouts-clone .checkouts-toggle[aria-expanded="true"]').count() == 0
+    assert errors == []
     assert page.evaluate("""() => document.activeElement.classList.contains(
       'checkouts-line-toggle')""") is True
     assert group.locator(".checkouts-line-toggle").evaluate(
@@ -10642,6 +10704,23 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             "items => items.map(item => item.dataset.checkoutsGroup)")
         assert keys == served_order, case
         assert line["name"] == group["remote"]["display"], case
+        if case in ("m", "n"):
+            section = page.locator(
+                f'.checkouts-group[data-checkouts-group="{group["remote"]["key"]}"]')
+            pill = section.locator(
+                'button[data-pill="amber-worktrees"]' if case == "m"
+                else 'button[data-pill="amber-behind"]')
+            pill.press("Enter")
+            assert section.locator(".checkouts-line-toggle").get_attribute(
+                "aria-expanded") == "true", case
+            target = focused_checkouts_target(page)
+            assert target["clone"] == "Repo Clone 2", case
+            if case == "m":
+                # The worktree pill goes to that clone's toggle, as its list item does.
+                assert (target["cls"], target["expanded"]) == ("checkouts-toggle", "false")
+            else:
+                # The behind pill focuses the first behind clone's row.
+                assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
 
     # A grey repository the quiet rule does not call quiet is shown with the box
     # checked; one it does call quiet is not.
