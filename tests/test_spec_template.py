@@ -48,13 +48,14 @@ class SpecificationTemplateTests(unittest.TestCase):
     def test_current_template_is_minimal_deversioned_scaffold(self) -> None:
         template = read_template()
         self.assertNotIn("Critique contract", template)
-        self.assertIn("Package ID: <lowercase UUIDv4>", template)
-        self.assertIn("| Task | File | Access and purpose |", template)
-        self.assertIn("## Closure preflight", template)
+        lines = template.splitlines()
+        header = template.split("\n## ", 1)[0]
+        self.assertIn("Package ID: <lowercase UUIDv4>", header.splitlines())
+        self.assertIn("| Task | File | Access and purpose |", lines)
+        self.assertIn("## Closure preflight", lines)
         self.assertNotIn("## Closure matrix", template)
         self.assertNotIn("- Objective:", template)
         self.assertNotIn("- Atomicity:", template)
-        header = template.split("\n## ", 1)[0]
         self.assertEqual(1, len(metadata_values(header.splitlines(), "Branch")))
         self.assertIn("Branch: spec/<feature-name>", header.splitlines())
         self.assertNotIn("Proposed branch", header)
