@@ -31,7 +31,9 @@ README is narrative only.
   `validate_package_attachments` takes the package folder, the already-read
   specification lines and the lifecycle name, and no root.
 - `validate_package` returns the specification and lifecycle-folder errors
-  only; it does not read a retrospective or merge summary for content.
+  only. It does not validate the content of a retrospective or a merge
+  summary. Of `retrospective.md` it reads only the `Status:` line: a Done
+  package needs `Status: READY`.
 - The validator reads no environment variable and never writes. It imports
   only the standard library and the two sibling parsers of this system.
 - Depends only on the standard library and holds no state.
