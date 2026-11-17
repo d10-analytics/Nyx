@@ -1164,6 +1164,34 @@ class PackageHead:
 
 
 @dataclass(frozen=True)
+class PackageScanRecord:
+    """The header facts of one package the catalog lists, never its contents.
+
+    ``package_path`` is relative to the specification root; ``stage`` is the raw
+    stage folder name.  ``read_diagnostic`` is the catalog's read diagnostic for
+    the specification (``None`` when it was read).  ``relationship`` is the
+    parsed relationship (``None`` when the header was not readable), whose
+    ``prerequisites`` rows include rows of kind ``completion``.  A consumer that
+    needs the specification text reads ``package_path`` under the root itself.
+    """
+
+    package_path: str
+    stage: str
+    read_diagnostic: str | None
+    relationship: dict[str, object] | None
+    candidate_ids: frozenset[str]
+    package_id: str | None
+
+
+@dataclass(frozen=True)
+class PackageScan:
+    """Package records of one scan; ``status`` is the scan's identity coverage."""
+
+    status: Literal["complete", "incomplete"]
+    records: tuple[PackageScanRecord, ...]
+
+
+@dataclass(frozen=True)
 class PackageHeads:
     """Package heads of one scan; ``status`` is the scan's identity coverage."""
 
@@ -1244,6 +1272,31 @@ def _completion_heads(
             )
         )
     return tuple(heads)
+
+
+def scan_packages(spec_root: Path) -> PackageScan:
+    """Return one record per package the catalog lists under one root.
+
+    Wraps the one scan the catalog renders from; it walks the tree once and
+    reads no file again.  Records are ordered by package path.  An unreadable
+    root raises the catalog's ``ValueError``.
+    """
+    scan = _scan_specification_root(Path(spec_root))
+    records = tuple(
+        PackageScanRecord(
+            package_path=str(record["package_path"]),
+            stage=str(record["stage"]),
+            read_diagnostic=record["read_diagnostic"],
+            relationship=record["relationship"],
+            candidate_ids=frozenset(record["candidate_ids"]),
+            package_id=record["package_id"],
+        )
+        for record in sorted(scan.records, key=lambda item: str(item["package_path"]))
+    )
+    return PackageScan(
+        status="incomplete" if scan.identity_diagnostics else "complete",
+        records=records,
+    )
 
 
 def scan_package_heads(
