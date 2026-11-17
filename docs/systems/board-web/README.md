@@ -103,8 +103,7 @@ README is narrative only.
   categories are shown as their raw `checkouts_*` code. The view itself decides
   which repositories are quiet, each repository's colour and pill counts, which pull-request lookup state the status line
   names (the most serious one any repository reached), and composes counts with
-  their plural nouns, the cleanup count sentence and fetch ages (`min`, `h`,
-  `d`) outside the words block. The view is drawn only while it is shown, and once on
+  their plural nouns and fetch ages (`min`, `h`, `d`) outside the words block. The view is drawn only while it is shown, and once on
   switching to it with the latest outcome, so a scan that settles while the board
   is shown does not touch the board; a refresh replaces only the blocks that
   changed, so what the reader opened and focused stays. A panel

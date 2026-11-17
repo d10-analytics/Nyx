@@ -1578,7 +1578,8 @@ order red, amber, green, grey. A red pill is marked ✕ and an amber pill ⚠. T
 pills count branches, never files, and each shows only when its count is above
 zero: `✕ N branches local only`, `⚠ N branches to merge or clean up`, and three
 pills without a count, `✕ changes only on this machine` (a stash, or changes on a
-checkout that is on no branch), `⚠ worktrees to clean up` (a removable linked
+checkout that is on no branch, shown only when the line has no `✕ N branches local
+only` pill), `⚠ worktrees to clean up` (a removable linked
 worktree that names no branch) and `⚠ main behind remote`, with the repository's
 own default branch name. Pressing a pill opens the repository and moves focus to
 the first matching attention item, or for the behind pill to the first clone whose
@@ -1627,8 +1628,10 @@ nothing to report shows a muted `—`. Coloured phrases are red for uncommitted
 changes or an unfinished operation, a default branch ahead of or diverged from its
 remote, `N local only` and `N stashes`; amber for a default branch behind its
 remote, `N awaiting merge` and `N merged, removable`; and green for `N in
-progress`, which are pushed branches of a live work item. Each branch takes one
-phrase, in that order. A merge verdict reads `merged` with the proof that decided
+progress`, which are pushed branches of a work item that is still unfinished. Each
+branch takes at most one phrase, in that order. A branch of a finished work item is
+never green. Without a red or amber phrase it takes no phrase, and the **Cleanup**
+column in **Details** names what blocks its removal. A merge verdict reads `merged` with the proof that decided
 it (such as `tip is in main` or `pull request #7 merged`), `not merged`, or `merge
 state unknown` with the reason. **Details** opens a clone's row to show its
 path, branches, linked worktrees and work items. The branch and linked-worktree
