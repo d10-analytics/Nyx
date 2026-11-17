@@ -3,9 +3,13 @@
 Validates one specification, or one package folder, against the specification
 format: required sections, the stage gates, the closure ledger and matrix,
 verification authorities, task contracts and the package lifecycle folder
-rules.  Every public function takes the specification root explicitly.  The
-module reads no environment variable, never writes, and depends only on the
-standard library and the two sibling parsers.
+rules.  The functions that determine a package's stage folder
+(``package_lifecycle``, ``validate_spec`` and ``validate_package``) take the
+specification root explicitly and have no default root;
+``validate_package_attachments`` takes the package folder, the already-read
+specification lines and the lifecycle name.  The module reads no environment
+variable, never writes, and depends only on the standard library and the two
+sibling parsers.
 """
 from __future__ import annotations
 

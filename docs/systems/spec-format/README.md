@@ -23,15 +23,17 @@ README is narrative only.
   `not applicable — <reason>` grammar, then `branch_name_is_lexical`) and the
   lifecycle-folder rules. Its public names are `validate_spec`,
   `validate_package`, `validate_package_attachments` and `package_lifecycle`.
-- Every public validator function takes the specification root explicitly and
-  has no default root. `package_lifecycle`, `validate_spec` and
-  `validate_package` also take `non_package_folders`, the names of top-level
-  folders of the root that are not product folders (empty by default), so a
-  caller supplies its own.
+- `package_lifecycle`, `validate_spec` and `validate_package`, the functions
+  that determine a package's stage folder, take the specification root
+  (`spec_root`) explicitly and have no default root. They also take
+  `non_package_folders`, the names of top-level folders of the root that are
+  not product folders (empty by default), so a caller supplies its own.
+  `validate_package_attachments` takes the package folder, the already-read
+  specification lines and the lifecycle name, and no root.
 - `validate_package` returns the specification and lifecycle-folder errors
   only; it does not read a retrospective or merge summary for content.
-- The validator reads no environment variable, never writes, and imports only
-  the standard library.
+- The validator reads no environment variable and never writes. It imports
+  only the standard library and the two sibling parsers of this system.
 - Depends only on the standard library and holds no state.
 
 ## Outside this boundary
