@@ -75,7 +75,7 @@ class SpecificationStorageTests(unittest.TestCase):
         )
 
     def test_nested_queue_requires_human_approval_and_closure(self) -> None:
-        for owner in ("Aurora", "Minotaur"):
+        for owner in ("Aurora", "Quartz"):
             package = self.package("Queue", owner)
             self.assertEqual([], self.check(package))
             spec = package / "spec.md"
