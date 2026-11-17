@@ -1,0 +1,5 @@
+schema_version = 1
+name = "spec-format"
+files = [
+    "nyx/spec_header.py",
+]

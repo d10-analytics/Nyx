@@ -20,7 +20,8 @@ README is narrative only.
 
 ## Collaborators
 
-- Depends on `protocols` (schema constants, field limits, and text helpers) and
+- Depends on `spec-format` (the header cut, header reader and parser, metadata
+  readers, and the branch-name lexical rule), `protocols` (schema constants, field limits, and text helpers) and
   `account-state` (completed-stage validation).
 - Used by `checkouts` and `application-serving`.
 
