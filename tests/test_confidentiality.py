@@ -140,3 +140,110 @@ def test_no_environment_redirects_catalog_state_into_the_checkout():
     assert not (REPOSITORY_ROOT / ".nyx").exists()
     assert os.environ.get("XDG_CONFIG_HOME") != str(REPOSITORY_ROOT / ".config")
     assert os.environ.get("XDG_STATE_HOME") != str(REPOSITORY_ROOT / ".local" / "state")
+
+
+def _generic_markers() -> dict[str, tuple[str, ...]]:
+    """Private path and workspace markers, assembled so this source holds none."""
+    return {
+        "absolute home path": (
+            "/".join(("", "home", "")),
+            "/".join(("", "Users", "")),
+            "\\".join(("C:", "Users")),
+        ),
+        "synced folder": ("".join(("Drop", "box")),),
+        "company folder": (" ".join(("D10", "Analytics")),),
+        "specification store": ("_".join(("Repository", "Code", "Specifications")),),
+        "documentation store": (
+            "_".join(("Product", "Software", "and", "Documentation")),
+        ),
+        "workspace tooling": ("".join((".", "agent", "-", "workflow")),),
+    }
+
+
+def _marker_categories(text: str) -> set[str]:
+    return {
+        category
+        for category, markers in _generic_markers().items()
+        if any(marker in text for marker in markers)
+    }
+
+
+def _scan_for_generic_markers(paths: list[Path]) -> dict[Path, set[str]]:
+    hits: dict[Path, set[str]] = {}
+    for path in paths:
+        categories = _marker_categories(path.read_text(encoding="utf-8"))
+        if categories:
+            hits[path] = categories
+    return hits
+
+
+_PACKAGE_FILE_PATTERNS = (
+    "nyx/spec_*.py",
+    "tests/test_spec_*.py",
+    "tests/spec_fixtures.py",
+    "docs/template_spec.md",
+    "docs/systems/spec-format/*",
+)
+_PACKAGE_ADDED_FILES = frozenset(
+    {
+        "nyx/spec_header.py",
+        "nyx/spec_body.py",
+        "nyx/spec_validation.py",
+        "tests/spec_fixtures.py",
+        "tests/test_spec_header.py",
+        "tests/test_spec_validation.py",
+        "tests/test_spec_closure_ledger.py",
+        "tests/test_spec_packages.py",
+        "tests/test_spec_isolation.py",
+        "tests/test_spec_template.py",
+        "docs/template_spec.md",
+        "docs/systems/spec-format/README.md",
+        "docs/systems/spec-format/system.toml",
+    }
+)
+
+
+def _scanned_files(patterns: tuple[str, ...] = _PACKAGE_FILE_PATTERNS) -> set[str]:
+    return {
+        path.relative_to(REPOSITORY_ROOT).as_posix()
+        for pattern in patterns
+        for path in REPOSITORY_ROOT.glob(pattern)
+        if path.is_file()
+    }
+
+
+def _assert_scan_covers_the_added_files(scanned: set[str]) -> None:
+    assert _PACKAGE_ADDED_FILES <= scanned, sorted(_PACKAGE_ADDED_FILES - scanned)
+    assert scanned <= _PACKAGE_ADDED_FILES, sorted(scanned - _PACKAGE_ADDED_FILES)
+
+
+def test_generic_marker_scan_covers_exactly_the_files_the_package_added():
+    _assert_scan_covers_the_added_files(_scanned_files())
+
+
+def test_generic_marker_scan_fails_when_an_added_file_is_dropped_from_the_set():
+    without_fixtures = _scanned_files(
+        tuple(
+            pattern
+            for pattern in _PACKAGE_FILE_PATTERNS
+            if pattern != "tests/spec_fixtures.py"
+        )
+    )
+    with pytest.raises(AssertionError):
+        _assert_scan_covers_the_added_files(without_fixtures)
+
+
+def test_added_files_contain_no_generic_private_markers():
+    paths = [REPOSITORY_ROOT / name for name in sorted(_PACKAGE_ADDED_FILES)]
+    assert _scan_for_generic_markers(paths) == {}
+
+
+@pytest.mark.parametrize("category", sorted(_generic_markers()))
+def test_generic_marker_scan_fails_on_each_planted_category(category: str, tmp_path: Path):
+    for index, marker in enumerate(_generic_markers()[category]):
+        planted = tmp_path / f"planted_{index}.txt"
+        planted.write_text(f"neutral text {marker}example neutral text\n", encoding="utf-8")
+        assert _scan_for_generic_markers([planted]) == {planted: {category}}
+    clean = tmp_path / "clean.txt"
+    clean.write_text("neutral text with no marker\n", encoding="utf-8")
+    assert _scan_for_generic_markers([clean]) == {}
