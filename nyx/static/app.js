@@ -4132,7 +4132,10 @@
 
   // Each branch of a clone takes one phrase, in the order red local only,
   // amber awaiting merge, amber merged and removable, green in progress; the
-  // sets come from the signal rules, so a row and its line's pills agree.
+  // sets come from the signal rules, so a row and its line's pills agree.  Only
+  // a branch of a work item still being worked on is in progress: a finished
+  // one takes an amber phrase when the rules give it one, and otherwise names
+  // no phrase, its cleanup blocker sitting in the clone's Details.
   function branchPhrases(document, group, clone) {
     const own = repositorySignals(document, group).perClone.get(clone.path);
     const taken = new Set();
@@ -4141,7 +4144,8 @@
       fresh.forEach((name) => taken.add(name));
       return fresh;
     };
-    const live = livePackagePaths(document);
+    const unfinished = new Set(document.packages
+      .filter((item) => !item.finished).map((item) => item.package_path));
     const phrases = [];
     const add = (tone, code, names) => {
       if (names.length > 0) {
@@ -4152,7 +4156,7 @@
     add("amber", "branchAwaitingMerge", take(own.awaiting));
     add("amber", "branchRemovable", take(own.removable));
     add("green", "branchInProgress", take(clone.branches.filter((branch) =>
-      (branch.packages || []).some((reference) => live.has(reference.package_path)) &&
+      (branch.packages || []).some((reference) => unfinished.has(reference.package_path)) &&
       branch.vs_remote !== null && branch.vs_remote !== undefined &&
       ["equal", "behind"].includes(branch.vs_remote.relation)).map((branch) => branch.name)));
     return phrases;
