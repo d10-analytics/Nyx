@@ -353,13 +353,11 @@
     },
     "column": {
       "checkout": "Checkout",
-      "availability": "Availability",
       "head": "HEAD",
-      "default": "Default branch vs remote",
-      "tree": "Tree",
+      "default": "Local {trunk} vs remote {trunk}",
+      "tree": "Uncommitted changes",
       "branches": "Branches",
       "cleanup": "Cleanup",
-      "package": "Package",
       "status": "Status",
       "branch": "Branch",
       "remoteCopy": "Remote copy",
@@ -393,9 +391,26 @@
       "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
-      "quietRow": "Quiet repositories ({count})",
-      "quietRowMatching": "Quiet repositories ({count}, {matching} matching)",
+      "quietLine": "{count} quiet repositories hidden",
+      "quietLineOne": "1 quiet repository hidden",
+      "quietShow": "Show",
       "freeClones": "Free clones: {clones}",
+      "lineTrunkClones": "{branch} · {clones}",
+      "lineClones": "{clones}",
+      "lineInUse": "{n} of {m} in use",
+      "lineWorkItems": " · {items}",
+      "pillLocalOnly": "\u2715\uFE0E {branches} local only",
+      "pillChangesOnlyHere": "\u2715\uFE0E changes only on this machine",
+      "pillToMerge": "\u26A0\uFE0E {branches} to merge or clean up",
+      "pillWorktrees": "\u26A0\uFE0E worktrees to clean up",
+      "branchLocalOnly": "{n} local only",
+      "branchAwaitingMerge": "{n} awaiting merge",
+      "branchRemovable": "{n} merged, removable",
+      "branchInProgress": "{n} in progress",
+      "pillBehind": "\u26A0\uFE0E {trunk} behind remote",
+      "barBehind": "\u26A0\uFE0E {repositories} behind remote",
+      "barBehindHeading": "Repositories behind remote",
+      "defaultBranchFallback": "default branch",
       "workItemBranches": "Work item branches",
       "attentionHeading": "Needs attention",
       "detailsToggle": "Details",
@@ -437,8 +452,6 @@
       "detachedAt": "detached at {sha}",
       "unborn": "unborn {branch}",
       "assignedPrefix": "Assigned",
-      "noPackage": "—",
-      "nothingToRemove": "nothing to remove",
       "removable": "Removable",
       "foldingNotChecked": "Branches were not checked for folding: {reason}",
       "folderProblem": "{path} — {problem}",
@@ -611,11 +624,12 @@
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
-  // branch lists and the opened quiet row are restored onto what is rendered,
+  // branch lists are restored onto what is rendered,
   // and survive a failed outcome until a ready one returns.
   const openClones = new Set();
+  const openRepositories = new Set();
+  const openAttentionLists = new Set();
   const openFolds = new Set();
-  let quietOpen = false;
 
   function text(value) {
     const raw = value === null || value === undefined || value === "" ? "Unknown" : String(value);
@@ -1713,27 +1727,27 @@
     drawRails();
   }
 
-  // The quiet row is searched by the repositories it holds, with the same text
-  // a group of that repository would be searched by.  With a query it stays
-  // only while one of them matches, lists only those, and its summary counts
-  // them; with none it shows every repository and its plain count.
+  // The quiet line counts the quiet repositories the search matches, using
+  // the same text a line of that repository would be searched by.  With no
+  // query it counts them all; when none match it is hidden.
+  function quietLineWords(count) {
+    return count === 1
+      ? wordText("text", "quietLineOne", {})
+      : wordText("text", "quietLine", {count});
+  }
+
   function filterQuietRow(query) {
-    const row = checkoutsBody.querySelector("details.checkouts-quiet");
-    if (row === null) return;
-    const items = [...row.querySelectorAll("li")];
-    let matching = 0;
-    items.forEach((item) => {
-      const hide = Boolean(query) && !(item.dataset.search || "").includes(query);
-      if (!hide) matching += 1;
-      if (item.hidden !== hide) item.hidden = hide;
-    });
-    const hideRow = Boolean(query) && matching === 0;
-    if (row.hidden !== hideRow) row.hidden = hideRow;
-    const summary = row.querySelector("summary");
-    const words = query
-      ? wordText("text", "quietRowMatching", {count: items.length, matching})
-      : wordText("text", "quietRow", {count: items.length});
-    if (summary.textContent !== words) summary.textContent = words;
+    const line = checkoutsBody.querySelector(".checkouts-quiet-line");
+    if (line === null) return;
+    const searches = JSON.parse(line.dataset.searches);
+    const matching = query
+      ? searches.filter((search) => search.includes(query)).length
+      : searches.length;
+    const hide = matching === 0;
+    if (line.hidden !== hide) line.hidden = hide;
+    const count = line.querySelector(".checkouts-quiet-count");
+    const words = quietLineWords(matching);
+    if (count.textContent !== words) count.textContent = words;
   }
 
   // A card's tags are rewritten in place while the new facts have the same
@@ -2032,7 +2046,7 @@
   }
 
   // The checkout facts of one work item, read from the served document as the
-  // Checkouts view reads them: the visible Code section and the rows folded
+  // Repositories view reads them: the visible Code section and the rows folded
   // under All fields.  Both are empty while no document can be shown.
   function panelCodeHtml(entry) {
     const none = {section: "", folded: []};
@@ -2470,7 +2484,7 @@
     terminalControl.closest("label").hidden = checkoutsShown;
     quietCheckoutsLabel.hidden = !checkoutsShown;
     filter.placeholder = checkoutsShown
-      ? "Find a checkout, branch, or work item…"
+      ? "Find a repository, checkout, branch, or work item…"
       : "Find a work item, project, or program…";
     syncViewLabels();
     applyWorkItemPanel();
@@ -3322,7 +3336,7 @@
   }
 
   // ---------------------------------------------------------------------
-  // The ready view: the setup panel, the quiet row, groups and their tables
+  // The ready view: the setup panel, the repository lines, the quiet line and their tables
   // ---------------------------------------------------------------------
 
   const CHECK_FAILURE_REASONS = [
@@ -3330,7 +3344,7 @@
   ];
   const CHANGE_KINDS = ["staged", "unstaged", "untracked", "conflicted"];
   const CLONE_COLUMNS = [
-    "checkout", "availability", "head", "default", "tree", "branches", "cleanup", "package",
+    "checkout", "head", "default", "tree", "branches",
   ];
   const PACKAGE_COLUMNS = ["branch", "remoteCopy", "verdict", "pullRequests", "workItems"];
 
@@ -3355,16 +3369,16 @@
 
   // The column name each cell carries for the stacked layout; the table's own
   // column header names it at wider widths, where the label is not shown.
-  function cellLabelHtml(key) {
-    return `<span class="cell-label">${text(codeWords("column", key))}</span>`;
+  function cellLabelHtml(key, values = {}) {
+    return `<span class="cell-label">${wordText("column", key, values)}</span>`;
   }
 
   // Every table keeps its table semantics under explicit roles: the stacked
   // layout changes how cells are displayed, and a browser drops the implicit
   // roles of a table whose display changes.
-  function tableHtml(cls, caption, columns, rows) {
+  function tableHtml(cls, caption, columns, rows, values = {}) {
     const head = columns.map((key) =>
-      `<th scope="col" role="columnheader">${text(codeWords("column", key))}</th>`).join("");
+      `<th scope="col" role="columnheader">${wordText("column", key, values)}</th>`).join("");
     return `<table class="${cls}" role="table">` +
       (caption === "" ? "" : `<caption>${caption}</caption>`) +
       `<thead role="rowgroup"><tr role="row">${head}</tr></thead>` +
@@ -3492,19 +3506,76 @@
     return parts.join('<span class="checkouts-separator"> · </span>');
   }
 
+  // The repository line: the name, its default branch and clone count, the
+  // pills, and the activity summary.  The tone is an attribute a refresh
+  // updates, never part of a key.  Its caption (remote check, pull request
+  // lookup, free clones) sits beneath it.
+  function pillHtml(group, code, tone, words) {
+    const key = keyOf("pill", groupKey(group), code);
+    return `<button type="button" class="checkouts-pill" data-pill="${code}" ` +
+      `data-tone="${tone}" ${controlAttrs(key, "pill")}>${words}</button>`;
+  }
+
+  function pillsHtml(group, signals) {
+    const pills = [];
+    if (signals.red.size > 0) {
+      pills.push(pillHtml(group, "red-branches", "red", wordText("text", "pillLocalOnly",
+        {branches: plural(signals.red.size, "branch")})));
+    } else if (signals.uncountedRed) {
+      pills.push(pillHtml(group, "red-changes", "red",
+        wordText("text", "pillChangesOnlyHere")));
+    }
+    if (signals.amber.size > 0) {
+      pills.push(pillHtml(group, "amber-branches", "amber", wordText("text", "pillToMerge",
+        {branches: plural(signals.amber.size, "branch")})));
+    }
+    if (signals.worktrees.length > 0) {
+      pills.push(pillHtml(group, "amber-worktrees", "amber",
+        wordText("text", "pillWorktrees")));
+    }
+    if (signals.behind.length > 0) {
+      pills.push(pillHtml(group, "amber-behind", "amber", wordText("text", "pillBehind",
+        {trunk: signals.trunk === null ? codeWords("text", "defaultBranchFallback")
+          : signals.trunk})));
+    }
+    return pills.join("");
+  }
+
+  function lineActivityHtml(signals) {
+    const inUse = wordText("text", "lineInUse", {n: signals.inUse, m: signals.cloneCount});
+    const items = signals.workItems > 0
+      ? wordText("text", "lineWorkItems", {items: plural(signals.workItems, "work item")}) : "";
+    return '<span class="checkouts-line-activity">' +
+      `<span class="checkouts-line-inuse"${signals.tone === "green" ? ' data-tone="green"' : ""}>` +
+      `${inUse}</span>${items}</span>`;
+  }
+
   function groupHeaderHtml(document, group) {
+    const signals = repositorySignals(document, group);
     const defaultBranch = group.default_branch === null ? null : group.default_branch.name;
+    const clones = plural(group.clones.length, "clone");
+    const trunkWords = defaultBranch === null
+      ? wordText("text", "lineClones", {clones})
+      : wordText("text", "lineTrunkClones", {branch: defaultBranch, clones});
+    const key = keyOf("head", groupKey(group));
+    return `<h2 class="checkouts-line" tabindex="-1" data-tone="${signals.tone}" ` +
+      `data-key="${text(key)}" data-parts>` +
+      `<button type="button" class="checkouts-line-toggle" aria-expanded="false" ` +
+      `${controlAttrs(key, "toggle")}>` +
+      `<span class="checkouts-line-name">${text(remoteName(group))}</span>` +
+      `<span class="checkouts-line-trunk">${trunkWords}</span></button>` +
+      `<span class="checkouts-line-pills" data-parts>${pillsHtml(group, signals)}</span>` +
+      `${lineActivityHtml(signals)}</h2>`;
+  }
+
+  function groupCaptionHtml(document, group) {
     const free = freeClonesHtml(document, group);
-    return '<h2 class="checkouts-group-head" tabindex="-1" ' +
-      `${blockAttrs(keyOf("head", groupKey(group)))}>` +
-      `<span class="checkouts-group-name">${text(remoteName(group))}</span>` +
-      (defaultBranch === null ? "" :
-        `<span class="checkouts-group-default">${text(defaultBranch)}</span>`) +
+    return '<p class="checkouts-group-caption">' +
       `<span class="checkouts-group-check">${checkWords(document, group)}</span>` +
       `<span class="checkouts-group-lookup">${groupLookupWords(document, group)}</span>` +
       (free === "" ? "" : `<span class="checkouts-group-free">` +
         `${wordHtml("text", "freeClones", {clones: free})}</span>`) +
-      "</h2>";
+      "</p>";
   }
 
   // A work item the view still has something to say about: one that is not
@@ -3560,18 +3631,177 @@
       (key !== null && item.repository === key));
   }
 
-  function quietRowHtml(document, quiet) {
-    const items = quiet.map((group) => {
-      const clone = group.clones[0];
-      return `<li data-search="${text(groupSearchText(document, group))}">` +
-        `<span class="checkouts-quiet-display">${text(remoteName(group))}</span> ` +
-        `<span class="checkouts-quiet-checkout">${text(checkoutName(clone.path))}</span></li>`;
-    }).join("");
+  // ---------------------------------------------------------------------
+  // The signal rules: the one owner of every repository's tone, pill and
+  // activity figure, read from the served document alone
+  // ---------------------------------------------------------------------
+
+  const UNIQUE_WORK_BRANCH_CODES = new Set(
+    ["branch_unpushed", "branch_not_pushed", "default_branch_ahead"]);
+  const AMBER_CLASSES = new Set(["awaiting_merge", "cleanup_ready", "base_moved", "configuration"]);
+  const signalsByDocument = new WeakMap();
+
+  // The branch a worktree is on: its own head's when readable (null when
+  // detached), else the one that lists it as checked out there.  Mirrors the
+  // collector's own reading.
+  function worktreeBranch(clone, worktree) {
+    if (worktree.status === "ok") return worktree.head.branch;
+    const listed = clone.branches.find((branch) => branch.checked_out_in.includes(worktree.path));
+    return listed === undefined ? null : listed.name;
+  }
+
+  // The branches an unfinished work item holds in one clone, so removing them
+  // is not offered.  Mirrors the collector's own count.
+  function heldBranches(document, clone) {
+    const unfinished = new Set(document.packages
+      .filter((item) => !item.finished).map((item) => item.package_path));
+    return new Set(clone.branches.filter((branch) => (branch.packages || []).some((reference) =>
+      (reference.basis === "target_clone" || reference.basis === "sibling_clone") &&
+      unfinished.has(reference.package_path))).map((branch) => branch.name));
+  }
+
+  function cloneIsInUse(clone) {
+    const availability = clone.availability;
+    return availability !== null && availability !== undefined &&
+      (availability.state === "occupied" || availability.state === "assigned");
+  }
+
+  function computeSignals(document, group) {
+    const key = group.remote === null ? null : group.remote.key;
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    const items = document.attention.filter((item) =>
+      (item.clone !== null && item.clone !== undefined && clonePaths.has(item.clone)) ||
+      (key !== null && item.repository === key));
+    const red = new Set();
+    const amber = new Set();
+    const perClone = new Map();
+    const worktrees = [];
+    const behind = [];
+    let trunk = group.default_branch === null ? null : group.default_branch.name;
+    group.clones.forEach((clone) => {
+      const own = {
+        red: new Set(), amber: new Set(), awaiting: new Set(), removable: new Set(),
+        behind: false, tone: "grey",
+      };
+      perClone.set(clone.path, own);
+      if (clone.status !== "ok") return;
+      const distance = defaultDistance(clone);
+      own.behind = distance !== null && distance.relation === "behind";
+      if (own.behind) {
+        behind.push(clone.path);
+        if (trunk === null) trunk = defaultBranchName(clone);
+      }
+      const held = heldBranches(document, clone);
+      clone.branches.forEach((branch) => {
+        if (branch.removable !== null && branch.removable !== undefined &&
+          branch.removable.removable && !held.has(branch.name)) {
+          own.amber.add(branch.name);
+          own.removable.add(branch.name);
+          amber.add(branch.name);
+        }
+      });
+    });
+    items.forEach((item) => {
+      const clone = group.clones.find((candidate) => candidate.path === item.clone);
+      if (item.class === "awaiting_merge" && item.branch !== null) {
+        // The item names a branch of the repository and no clone: the line
+        // counts the branch once, and every readable clone holding a branch of
+        // that name takes the phrase, so it is taken before the green one.
+        amber.add(item.branch);
+        group.clones.forEach((candidate) => {
+          if (candidate.status !== "ok" ||
+            !candidate.branches.some((entry) => entry.name === item.branch)) return;
+          perClone.get(candidate.path).amber.add(item.branch);
+          perClone.get(candidate.path).awaiting.add(item.branch);
+        });
+      }
+      if (item.class !== "unique_work" || clone === undefined) return;
+      let branch = null;
+      if (UNIQUE_WORK_BRANCH_CODES.has(item.code)) {
+        branch = item.branch;
+      } else if (item.code === "uncommitted_changes") {
+        const path = item.worktree === null || item.worktree === undefined
+          ? clone.path : item.worktree;
+        const worktree = (clone.worktrees || []).find((candidate) => candidate.path === path);
+        branch = worktree === undefined ? null : worktreeBranch(clone, worktree);
+      }
+      if (branch !== null) {
+        red.add(branch);
+        perClone.get(clone.path).red.add(branch);
+      }
+    });
+    group.clones.forEach((clone) => {
+      if (clone.status !== "ok") return;
+      const held = heldBranches(document, clone);
+      (clone.worktrees || []).forEach((worktree) => {
+        if (worktree.main || worktree.removable === null || worktree.removable === undefined ||
+          !worktree.removable.removable) return;
+        const branch = worktreeBranch(clone, worktree);
+        if (branch !== null && (held.has(branch) || amber.has(branch))) return;
+        worktrees.push({clone: clone.path, path: worktree.path});
+      });
+    });
+    const unique = items.filter((item) => item.class === "unique_work");
+    const served = servedWorkItems(document, group);
+    const inUse = group.clones.filter(cloneIsInUse).length;
+    let tone = "grey";
+    if (unique.length) tone = "red";
+    else if (items.some((item) => AMBER_CLASSES.has(item.class)) || behind.length) tone = "amber";
+    else if (inUse > 0 || served.size > 0) tone = "green";
+    group.clones.forEach((clone) => {
+      const own = perClone.get(clone.path);
+      const mine = items.filter((item) => item.clone === clone.path);
+      if (mine.some((item) => item.class === "unique_work")) own.tone = "red";
+      else if (own.behind || mine.some((item) => AMBER_CLASSES.has(item.class))) own.tone = "amber";
+      else if (cloneIsInUse(clone)) own.tone = "green";
+    });
+    const first = (classes) => items.find((item) => classes.includes(item.class));
+    const keyOfItem = (item) => item === undefined ? null : attentionKey(item);
+    return {
+      tone,
+      red,
+      amber,
+      uncountedRed: unique.length > 0 && red.size === 0,
+      worktrees,
+      behind,
+      trunk,
+      perClone,
+      inUse,
+      cloneCount: group.clones.length,
+      workItems: served.size,
+      destinations: {
+        red: keyOfItem(first(["unique_work"])),
+        amber: keyOfItem(first(["awaiting_merge", "cleanup_ready"])),
+        worktrees: keyOfItem(first(["cleanup_ready"])),
+        behind: behind.length ? behind[0] : null,
+      },
+    };
+  }
+
+  // Cached per document and repository, as the live work item paths are.
+  function repositorySignals(document, group) {
+    let byGroup = signalsByDocument.get(document);
+    if (byGroup === undefined) {
+      byGroup = new Map();
+      signalsByDocument.set(document, byGroup);
+    }
+    const id = groupKey(group);
+    let signals = byGroup.get(id);
+    if (signals === undefined) {
+      signals = computeSignals(document, group);
+      byGroup.set(id, signals);
+    }
+    return signals;
+  }
+
+  function quietLineHtml(document, quiet) {
+    const searches = JSON.stringify(quiet.map((group) => groupSearchText(document, group)));
     const key = keyOf("quiet");
-    return `<details class="checkouts-quiet" ${blockAttrs(key)}>` +
-      `<summary ${controlAttrs(key, "summary")}>` +
-      `${wordText("text", "quietRow", {count: quiet.length})}</summary>` +
-      `<ul>${items}</ul></details>`;
+    return `<p class="checkouts-quiet-line" data-searches="${text(searches)}" ` +
+      `${blockAttrs(key)}><span class="checkouts-quiet-count">` +
+      `${quietLineWords(quiet.length)}</span> ` +
+      `<button type="button" class="checkouts-quiet-show" ` +
+      `${controlAttrs(key, "show")}>${wordText("text", "quietShow", {})}</button></p>`;
   }
 
   function folderProblemWords(folder) {
@@ -3856,14 +4086,43 @@
     return parts.join(" · ");
   }
 
+  function tonedHtml(tone, html, names = null) {
+    return tone === "" ? html : `<span class="checkouts-phrase" data-tone="${tone}"` +
+      (names === null ? "" : ` data-branches="${text(JSON.stringify(names))}"`) +
+      `>${html}</span>`;
+  }
+
+  // The Uncommitted changes cell: today's words, red when a change or an
+  // operation is present (an index lock alone is untoned) and a muted dash for
+  // a checkout with nothing to report.
+  function uncommittedCellHtml(worktree) {
+    if (worktree.status !== "ok") return treeCellHtml(worktree);
+    const changed = CHANGE_KINDS.some((kind) => (worktree.changes || {})[kind]) ||
+      (worktree.operations || []).length > 0;
+    if (changed) return tonedHtml("red", treeCellHtml(worktree));
+    return worktree.index_lock ? treeCellHtml(worktree) : dashHtml();
+  }
+
+  function cloneUncommittedHtml(clone) {
+    if (clone.bare) return text(codeWords("text", "noWorkingTree"));
+    const main = cloneMainWorktree(clone);
+    if (main !== null && main.status === "ok") return uncommittedCellHtml(main);
+    return main === null ? "" : text(codeWords("status", main.status));
+  }
+
+  const RELATION_TONES = {ahead: "red", diverged: "red", behind: "amber"};
+
   function defaultCellHtml(document, group, clone) {
     const distance = defaultDistance(clone);
     const check = group.remote === null ? null : group.remote.check;
     const basis = distance === null ? "" : basisWords(document, distance.basis,
       check === null || check === undefined ? null : check.checked_at);
     const failed = checkFailed(check === null || check === undefined ? null : check.reason);
-    return '<td class="checkouts-default" role="cell">' + cellLabelHtml("default") +
-      `<span class="checkouts-relation">${comparisonWords(distance)}</span>` +
+    const tone = distance === null ? "" : RELATION_TONES[distance.relation] || "";
+    return '<td class="checkouts-default" role="cell">' +
+      cellLabelHtml("default", {trunk: trunkName(group, clone)}) +
+      `<span class="checkouts-relation"${tone === "" ? "" : ` data-tone="${tone}"`}>` +
+      `${comparisonWords(distance)}</span>` +
       (basis === "" ? "" : ` <span class="checkouts-basis">${basis}</span>`) +
       (failed ? ` <span class="checkouts-note">${wordText("text", "latestCheckFailed", {
         reason: codeWords("checkReason", check.reason),
@@ -3871,9 +4130,44 @@
       "</td>";
   }
 
-  function branchesCellHtml(clone) {
+  // Each branch of a clone takes one phrase, in the order red local only,
+  // amber awaiting merge, amber merged and removable, green in progress; the
+  // sets come from the signal rules, so a row and its line's pills agree.  Only
+  // a branch of a work item still being worked on is in progress: a finished
+  // one takes an amber phrase when the rules give it one, and otherwise names
+  // no phrase, its cleanup blocker sitting in the clone's Details.
+  function branchPhrases(document, group, clone) {
+    const own = repositorySignals(document, group).perClone.get(clone.path);
+    const taken = new Set();
+    const take = (names) => {
+      const fresh = [...names].filter((name) => !taken.has(name));
+      fresh.forEach((name) => taken.add(name));
+      return fresh;
+    };
+    const unfinished = new Set(document.packages
+      .filter((item) => !item.finished).map((item) => item.package_path));
+    const phrases = [];
+    const add = (tone, code, names) => {
+      if (names.length > 0) {
+        phrases.push(tonedHtml(tone, wordText("text", code, {n: names.length}), names));
+      }
+    };
+    add("red", "branchLocalOnly", take(own.red));
+    add("amber", "branchAwaitingMerge", take(own.awaiting));
+    add("amber", "branchRemovable", take(own.removable));
+    add("green", "branchInProgress", take(clone.branches.filter((branch) =>
+      (branch.packages || []).some((reference) => unfinished.has(reference.package_path)) &&
+      branch.vs_remote !== null && branch.vs_remote !== undefined &&
+      ["equal", "behind"].includes(branch.vs_remote.relation)).map((branch) => branch.name)));
+    return phrases;
+  }
+
+  function branchesCellHtml(document, group, clone) {
     const parts = [plural(clone.branches.length, "branch")];
-    if (clone.stash_count > 0) parts.push(plural(clone.stash_count, "stash"));
+    parts.push(...branchPhrases(document, group, clone));
+    if (clone.stash_count > 0) {
+      parts.push(tonedHtml("red", plural(clone.stash_count, "stash")));
+    }
     if (clone.containment !== null && clone.containment !== undefined &&
       clone.containment !== "complete") {
       parts.push(`<span class="checkouts-caption">` +
@@ -3886,47 +4180,6 @@
 
   function blockersHtml(blockers, table) {
     return blockers.map((code) => text(codeWords(table, code))).join(", ");
-  }
-
-  function cleanupCellHtml(clone) {
-    const count = clone.removable_count || {branches: 0, worktrees: 0};
-    const parts = [];
-    if (count.branches === 0 && count.worktrees === 0) {
-      parts.push(text(codeWords("text", "nothingToRemove")));
-    } else {
-      parts.push(`${plural(count.branches, "branch")}, ` +
-        `${plural(count.worktrees, "worktree")} removable`);
-    }
-    const blocked = [];
-    clone.branches.forEach((branch) => {
-      if (branch.removable === null || branch.removable === undefined ||
-        branch.removable.removable) return;
-      blocked.push(`<span class="checkouts-blocker">${text(branch.name)} ` +
-        `(${blockersHtml(branch.removable.blockers, "branchBlocker")})</span>`);
-    });
-    clone.worktrees.forEach((worktree) => {
-      if (worktree.main || worktree.removable === null ||
-        worktree.removable === undefined || worktree.removable.removable) return;
-      blocked.push(`<span class="checkouts-blocker">${text(checkoutName(worktree.path))} ` +
-        `(${blockersHtml(worktree.removable.blockers, "worktreeBlocker")})</span>`);
-    });
-    if (blocked.length) parts.push(blocked.join(" · "));
-    return parts.join(" · ");
-  }
-
-  function packageCellHtml(document, clone, worktree) {
-    const paths = document.packages
-      .filter((item) => {
-        const target = item.target;
-        if (!isLivePackage(item) || target === null || target === undefined) return false;
-        if (worktree !== null) return target.worktree === worktree.path;
-        if (target.clone !== clone.path) return false;
-        return clone.status !== "ok" || target.worktree === null;
-      })
-      .map((item) => item.package_path);
-    return paths.length
-      ? paths.map((path) => `<span class="checkouts-package-path">${text(path)}</span>`).join(" · ")
-      : dashHtml();
   }
 
   // ---------------------------------------------------------------------
@@ -4095,16 +4348,12 @@
 
   function cloneRowHtml(document, group, clone) {
     const name = checkoutName(clone.path);
-    const cells = [checkoutCellHtml(document, clone),
-      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}` +
-      `${availabilityCellHtml(clone)}</td>`];
+    const cells = [checkoutCellHtml(document, clone)];
     if (clone.status !== "ok") {
-      // A clone that could not be read keeps its Package cell and has no
-      // toggle; one cell spans the columns its facts would have filled.
-      cells.push(`<td class="checkouts-status" colspan="5" role="cell">` +
+      // A clone that could not be read has no toggle; one cell spans the
+      // columns its facts would have filled.
+      cells.push(`<td class="checkouts-status" colspan="4" role="cell">` +
         `${cellLabelHtml("status")}${text(codeWords("status", clone.status))}</td>`);
-      cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-        `${packageCellHtml(document, clone, null)}</td>`);
       return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
         `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
         `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>`;
@@ -4113,13 +4362,9 @@
       `${cloneHeadHtml(clone)}</td>`);
     cells.push(defaultCellHtml(document, group, clone));
     cells.push(`<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
-      `${cloneTreeHtml(clone)}</td>`);
+      `${cloneUncommittedHtml(clone)}</td>`);
     cells.push(`<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}` +
-      `${branchesCellHtml(clone)}</td>`);
-    cells.push(`<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}` +
-      `${cleanupCellHtml(clone)}</td>`);
-    cells.push(`<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-      `${packageCellHtml(document, clone, null)}</td>`);
+      `${branchesCellHtml(document, group, clone)}</td>`);
     return `<tr class="checkouts-clone" data-clone="${text(name)}" ` +
       `data-clone-path="${text(clone.path)}" tabindex="-1" role="row" ` +
       `${blockAttrs(keyOf("clone", clone.path))}>${cells.join("")}</tr>` +
@@ -4132,7 +4377,7 @@
     return blockersHtml(worktree.removable.blockers, "worktreeBlocker");
   }
 
-  function worktreeRowHtml(document, clone, worktree) {
+  function worktreeRowHtml(document, group, clone, worktree) {
     const name = checkoutName(worktree.path);
     const flags = [];
     if (worktree.prunable) flags.push(`<span class="checkouts-flag">` +
@@ -4145,21 +4390,33 @@
         `${cellLabelHtml("checkout")}<span class="checkouts-name">${text(name)}</span>` +
         (flags.length ? `<span class="checkouts-flags">${flags.join(", ")}</span>` : "") +
         "</th>",
-      `<td class="checkouts-availability" role="cell">${cellLabelHtml("availability")}${dashHtml()}</td>`,
       `<td class="checkouts-head" role="cell">${cellLabelHtml("head")}` +
         `${worktree.status === "ok" ? headCellHtml(worktree) : status}</td>`,
-      `<td class="checkouts-default" role="cell">${cellLabelHtml("default")}${dashHtml()}</td>`,
+      `<td class="checkouts-default" role="cell">` +
+        `${cellLabelHtml("default", {trunk: trunkName(group, clone)})}${dashHtml()}</td>`,
       `<td class="checkouts-tree" role="cell">${cellLabelHtml("tree")}` +
-        `${worktree.status === "ok" ? treeCellHtml(worktree) : status}</td>`,
+        `${worktree.status === "ok" ? uncommittedCellHtml(worktree) : status}</td>`,
       `<td class="checkouts-branches" role="cell">${cellLabelHtml("branches")}${dashHtml()}</td>`,
-      `<td class="checkouts-cleanup" role="cell">${cellLabelHtml("cleanup")}${worktree.status === "ok"
-        ? worktreeCleanupHtml(worktree) : dashHtml()}</td>`,
-      `<td class="checkouts-package" role="cell">${cellLabelHtml("package")}` +
-        `${packageCellHtml(document, clone, worktree)}</td>`,
     ];
     return `<tr class="checkouts-worktree" data-worktree="${text(name)}" ` +
       `data-worktree-path="${text(worktree.path)}" tabindex="-1" role="row" ` +
       `${blockAttrs(keyOf("worktree", worktree.path))}>${cells.join("")}</tr>`;
+  }
+
+  // The repository's default branch name, as each clone names it when the
+  // repository itself does not.
+  function trunkName(group, clone) {
+    if (group.default_branch !== null && group.default_branch.name !== null) {
+      return group.default_branch.name;
+    }
+    const own = clone === undefined ? null : defaultBranchName(clone);
+    if (own !== null) return own;
+    for (const candidate of group.clones) {
+      if (candidate.status !== "ok") continue;
+      const name = defaultBranchName(candidate);
+      if (name !== null) return name;
+    }
+    return codeWords("text", "defaultBranchFallback");
   }
 
   function cloneTableHtml(document, group) {
@@ -4168,10 +4425,11 @@
       rows.push(cloneRowHtml(document, group, clone));
       if (clone.status !== "ok") return;
       clone.worktrees.forEach((worktree) => {
-        if (!worktree.main) rows.push(worktreeRowHtml(document, clone, worktree));
+        if (!worktree.main) rows.push(worktreeRowHtml(document, group, clone, worktree));
       });
     });
-    return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""));
+    return tableHtml("checkouts-clones", "", CLONE_COLUMNS, rows.join(""),
+      {trunk: trunkName(group)});
   }
 
   // The words a cell shows, without its markup, so the search matches what the
@@ -4182,19 +4440,47 @@
     return holder.content.textContent;
   }
 
+  // Every live work item a repository serves, by path: those its clones' branches
+  // name, those targeting its clones, and those its work item branches name.
+  // Search and the signal rules read the one set.
+  function servedWorkItems(document, group) {
+    const served = new Map();
+    const notePackage = (item) => served.set(item.package_path, item);
+    group.clones.forEach((clone) => {
+      if (clone.status === "ok") {
+        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
+      }
+    });
+    const clonePaths = new Set(group.clones.map((clone) => clone.path));
+    document.packages.forEach((item) => {
+      if (isLivePackage(item) && item.target !== null && item.target !== undefined &&
+        clonePaths.has(item.target.clone)) notePackage(item);
+    });
+    const live = livePackagePaths(document);
+    livePackageBranches(document, group).forEach((entry) => {
+      entry.packages.filter((path) => live.has(path)).forEach((path) => {
+        const item = document.packages.find((candidate) => candidate.package_path === path);
+        if (item !== undefined) notePackage(item);
+      });
+    });
+    return served;
+  }
+
+  // Search reads today's words: the availability words (`availabilityCellHtml`)
+  // and the tree words (`cloneTreeHtml`, including `clean`), though no cell
+  // shows them any more: the Availability column is gone and a clean
+  // checkout's Uncommitted changes cell is a dash.
   function groupSearchText(document, group) {
     const values = [remoteName(group)];
     if (group.default_branch !== null && group.default_branch.name !== null) {
       values.push(group.default_branch.name);
     }
-    const served = new Map();
-    const notePackage = (item) => served.set(item.package_path, item);
+    const served = servedWorkItems(document, group);
     group.clones.forEach((clone) => {
       values.push(checkoutName(clone.path), clone.path);
       values.push(wordsOf(availabilityCellHtml(clone)));
       if (clone.status === "ok") {
         values.push(wordsOf(cloneHeadHtml(clone)), wordsOf(cloneTreeHtml(clone)));
-        cloneWorkItems(document, clone).forEach(({item}) => notePackage(item));
       } else {
         values.push(wordsOf(text(codeWords("status", clone.status))));
       }
@@ -4205,19 +4491,7 @@
       });
       (clone.branches || []).forEach((branch) => values.push(branch.name));
     });
-    const clonePaths = new Set(group.clones.map((clone) => clone.path));
-    document.packages.forEach((item) => {
-      if (isLivePackage(item) && item.target !== null && item.target !== undefined &&
-        clonePaths.has(item.target.clone)) notePackage(item);
-    });
-    const live = livePackagePaths(document);
-    livePackageBranches(document, group).forEach((entry) => {
-      values.push(entry.name);
-      entry.packages.filter((path) => live.has(path)).forEach((path) => {
-        const item = document.packages.find((candidate) => candidate.package_path === path);
-        if (item !== undefined) notePackage(item);
-      });
-    });
+    livePackageBranches(document, group).forEach((entry) => values.push(entry.name));
     served.forEach((item, path) => {
       values.push(path);
       if (item.code_status !== null && item.code_status !== undefined) {
@@ -4239,9 +4513,11 @@
       `data-key="${text(keyOf("group", groupKey(group)))}" ` +
       `data-search="${text(groupSearchText(document, group))}">` +
       groupHeaderHtml(document, group) +
+      `<div class="checkouts-group-body" data-key="${text(keyOf("body", groupKey(group)))}" hidden>` +
+      groupCaptionHtml(document, group) +
       packageBranchesHtml(document, group) +
       cloneTableHtml(document, group) +
-      "</section>";
+      "</div></section>";
   }
 
   // ---------------------------------------------------------------------
@@ -4300,11 +4576,96 @@
       `${controlAttrs(key, "go")}>${words}</button></li>`;
   }
 
+  // The classes the bar's lists hold; every other class stays listed below the
+  // bar under its heading.
+  const BAR_LIST_CLASSES = {
+    red: ["unique_work"],
+    amber: ["awaiting_merge", "cleanup_ready"],
+  };
+
+  // The bar's pills and the repositories behind: totals are the sums of the
+  // repository lines' own counts, so the bar and the lines never disagree.
+  function attentionBarModel(document) {
+    let red = 0;
+    let amber = 0;
+    let worktrees = false;
+    const behind = [];
+    document.repositories.forEach((group) => {
+      const signals = repositorySignals(document, group);
+      red += signals.red.size;
+      amber += signals.amber.size;
+      if (signals.worktrees.length > 0) worktrees = true;
+      if (signals.behind.length > 0) behind.push(group);
+    });
+    const has = (classes) => document.attention.some((item) => classes.includes(item.class));
+    const pills = [];
+    if (red > 0) {
+      pills.push({code: "red-branches", list: "red", tone: "red",
+        words: wordText("text", "pillLocalOnly", {branches: plural(red, "branch")})});
+    } else if (has(BAR_LIST_CLASSES.red)) {
+      pills.push({code: "red-changes", list: "red", tone: "red",
+        words: wordText("text", "pillChangesOnlyHere")});
+    }
+    if (amber > 0) {
+      pills.push({code: "amber-branches", list: "amber", tone: "amber",
+        words: wordText("text", "pillToMerge", {branches: plural(amber, "branch")})});
+    }
+    if (worktrees) {
+      pills.push({code: "amber-worktrees", list: "amber", tone: "amber",
+        words: wordText("text", "pillWorktrees")});
+    }
+    if (behind.length > 0) {
+      pills.push({code: "amber-behind", list: "behind", tone: "amber",
+        words: wordText("text", "barBehind",
+          {repositories: plural(behind.length, "repository")})});
+    }
+    return {pills, behind};
+  }
+
+  function barPillHtml(pill) {
+    const key = keyOf("barpill", pill.code);
+    return `<button type="button" class="checkouts-bar-pill" data-bar-pill="${pill.code}" ` +
+      `data-list="${pill.list}" data-tone="${pill.tone}" aria-expanded="false" ` +
+      `${controlAttrs(key, "barpill")}>${pill.words}</button>`;
+  }
+
+  function attentionListHtml(name, itemsHtml, label) {
+    return `<div class="checkouts-attention-listbox" data-list="${name}" ` +
+      `data-key="${text(keyOf("attentionlist", name))}" data-parts hidden>` +
+      `<ul class="checkouts-attention-list" aria-label="${text(label)}">${itemsHtml}</ul></div>`;
+  }
+
+  function behindItemHtml(group) {
+    const key = keyOf("behind", groupKey(group));
+    return `<li class="checkouts-attention-item" data-behind="${text(groupKey(group))}" ` +
+      `${blockAttrs(key)}><button type="button" class="checkouts-attention-go" ` +
+      `${controlAttrs(key, "behind")}>${text(remoteName(group))}</button></li>`;
+  }
+
   function attentionHtml(document) {
-    if (!document.attention.length) return "";
+    const bar = attentionBarModel(document);
+    if (!document.attention.length && !bar.pills.length) return "";
     const parts = [];
+    if (bar.pills.length) {
+      parts.push('<div class="checkouts-attention-bar" data-parts>' +
+        `${bar.pills.map(barPillHtml).join("")}</div>`);
+    }
+    ["red", "amber"].forEach((name) => {
+      const items = document.attention.filter((item) =>
+        BAR_LIST_CLASSES[name].includes(item.class));
+      if (items.length) {
+        parts.push(attentionListHtml(name, items.map(attentionItemHtml).join(""),
+          codeWords("attentionClass", BAR_LIST_CLASSES[name][0])));
+      }
+    });
+    if (bar.behind.length) {
+      parts.push(attentionListHtml("behind", bar.behind.map(behindItemHtml).join(""),
+        wordText("text", "barBehindHeading")));
+    }
+    const listed = new Set([...BAR_LIST_CLASSES.red, ...BAR_LIST_CLASSES.amber]);
     let current = null;
     document.attention.forEach((item) => {
+      if (listed.has(item.class)) return;
       if (item.class !== current) {
         if (current !== null) parts.push("</ul>");
         current = item.class;
@@ -4314,9 +4675,26 @@
       }
       parts.push(attentionItemHtml(item));
     });
-    parts.push("</ul>");
+    if (current !== null) parts.push("</ul>");
     return `<section class="checkouts-attention" data-key="${text(keyOf("attention"))}">` +
       `<h2>${text(codeWords("text", "attentionHeading"))}</h2>${parts.join("")}</section>`;
+  }
+
+  function paintAttentionLists() {
+    checkoutsBody.querySelectorAll(".checkouts-attention-listbox").forEach((box) => {
+      const open = openAttentionLists.has(box.dataset.list);
+      if (box.hidden === open) box.hidden = !open;
+    });
+    checkoutsBody.querySelectorAll(".checkouts-bar-pill").forEach((pill) => {
+      setAttributeOnce(pill, "aria-expanded", String(openAttentionLists.has(pill.dataset.list)));
+    });
+  }
+
+  function toggleAttentionList(pill) {
+    const name = pill.dataset.list;
+    if (openAttentionLists.has(name)) openAttentionLists.delete(name);
+    else openAttentionLists.add(name);
+    paintAttentionLists();
   }
 
   function cloneRowFor(path) {
@@ -4325,11 +4703,15 @@
   }
 
   // A destination the search hides clears the search first.
+  // A destination in a closed repository opens it.
   function revealDestination(element) {
     const group = element.closest(".checkouts-group");
-    if (group === null || !group.hidden) return;
-    filter.value = "";
-    applyFilter();
+    if (group === null) return;
+    if (group.hidden) {
+      filter.value = "";
+      applyFilter();
+    }
+    setRepositoryOpen(group, true);
   }
 
   function focusDestination(element) {
@@ -4350,6 +4732,21 @@
     setAttributeOnce(toggle, "aria-expanded", String(open));
     if (detail.hidden === open) detail.hidden = !open;
     return detail;
+  }
+
+  function paintRepositoryOpen(group, open) {
+    const toggle = group.querySelector(".checkouts-line-toggle");
+    const body = group.querySelector(".checkouts-group-body");
+    if (toggle === null || body === null) return;
+    setAttributeOnce(toggle, "aria-expanded", String(open));
+    if (body.hidden === open) body.hidden = !open;
+  }
+
+  function setRepositoryOpen(group, open) {
+    if (group.querySelector(".checkouts-group-body") === null) return;
+    if (open) openRepositories.add(group.dataset.checkoutsGroup);
+    else openRepositories.delete(group.dataset.checkoutsGroup);
+    paintRepositoryOpen(group, open);
   }
 
   function setCloneOpen(row, open) {
@@ -4405,7 +4802,7 @@
       revealDestination(group);
       const row = [...group.querySelectorAll("table.checkouts-package-branches tr[data-branch]")]
         .find((candidate) => candidate.dataset.branch === item.branch);
-      focusDestination(row === undefined ? group.querySelector(".checkouts-group-head") : row);
+      focusDestination(row === undefined ? group.querySelector(".checkouts-line-toggle") : row);
       return;
     }
     const cloneRow = cloneRowFor(item.clone);
@@ -4440,6 +4837,54 @@
     focusDestination(toggle === null ? cloneRow : toggle);
   }
 
+  // A line pill resolves its destination against the document current at the
+  // press, so a refresh that changed the first item sends the same pill to the
+  // new one; a pill whose signal the refresh removed does nothing.
+  const PILL_DESTINATIONS = {
+    "red-branches": "red",
+    "red-changes": "red",
+    "amber-branches": "amber",
+    "amber-worktrees": "worktrees",
+    "amber-behind": "behind",
+  };
+
+  function goToPill(pill) {
+    if (checkoutsOutcome.state !== "ready" || !checkoutsBody.contains(pill)) return;
+    const section = pill.closest(".checkouts-group");
+    const name = PILL_DESTINATIONS[pill.getAttribute("data-pill")];
+    if (section === null || name === undefined) return;
+    const current = checkoutsOutcome.envelope.checkouts;
+    const group = current.repositories.find((candidate) =>
+      groupKey(candidate) === section.dataset.checkoutsGroup);
+    if (group === undefined) return;
+    const destination = repositorySignals(current, group).destinations[name];
+    if (destination === null || destination === undefined) return;
+    if (name !== "behind") {
+      goToAttention(destination);
+      return;
+    }
+    focusBehindClone(destination);
+  }
+
+  function focusBehindClone(path) {
+    const row = cloneRowFor(path);
+    if (row === null) return;
+    revealDestination(row);
+    focusDestination(row);
+  }
+
+  // A behind-list entry resolves its repository's first behind clone against
+  // the document current at the press.
+  function goToBehind(key) {
+    if (checkoutsOutcome.state !== "ready") return;
+    const current = checkoutsOutcome.envelope.checkouts;
+    const group = current.repositories.find((candidate) =>
+      keyOf("behind", groupKey(candidate)) === key);
+    if (group === undefined) return;
+    const destination = repositorySignals(current, group).destinations.behind;
+    if (destination !== null && destination !== undefined) focusBehindClone(destination);
+  }
+
   function checkoutsGroupsHtml(document) {
     const quiet = document.repositories.filter((group) =>
       isQuietRepository(document, group));
@@ -4447,8 +4892,8 @@
       ? document.repositories.filter((group) => !isQuietRepository(document, group))
       : document.repositories;
     return checkoutSetupHtml(document) + attentionHtml(document) +
-      (hideQuietCheckouts && quiet.length ? quietRowHtml(document, quiet) : "") +
-      shown.map((group) => groupHtml(document, group)).join("");
+      shown.map((group) => groupHtml(document, group)).join("") +
+      (hideQuietCheckouts && quiet.length ? quietLineHtml(document, quiet) : "");
   }
 
   // ---------------------------------------------------------------------
@@ -4461,6 +4906,7 @@
   const STATE_ATTRIBUTES = new Set(["hidden", "open", "aria-expanded"]);
 
   function isBlock(element) {
+    if (element.hasAttribute("data-parts")) return false;
     return element.hasAttribute("data-block") || element.querySelector("[data-block]") === null;
   }
 
@@ -4469,7 +4915,9 @@
   function childIdentities(parent) {
     const seen = new Map();
     return [...parent.children].map((child) => {
-      const base = child.hasAttribute("data-key") && !child.hasAttribute("data-control")
+      const base = child.hasAttribute("data-pill") || child.hasAttribute("data-bar-pill")
+        ? `${child.getAttribute("data-key")}|pill`
+        : child.hasAttribute("data-key") && !child.hasAttribute("data-control")
         ? child.getAttribute("data-key")
         : `~${child.tagName}.${child.getAttribute("class") || ""}`;
       const count = seen.get(base) || 0;
@@ -4488,7 +4936,6 @@
   // A block that enters the view takes the state the reader left it in.
   function adoptBlock(element) {
     stampBlock(element, element.outerHTML);
-    if (element.matches("details.checkouts-quiet") && quietOpen) element.open = true;
   }
 
   function syncAttributes(live, fresh) {
@@ -4523,6 +4970,15 @@
       else live.insertBefore(existing, cursor);
       const markup = element.outerHTML;
       if (existing.nyxMarkup === markup) return;
+      // The control the reader is on keeps its element, so its words and
+      // attributes change under focus instead of the focus being replaced.
+      if (existing === document.activeElement && element.hasAttribute("data-control") &&
+        isBlock(element)) {
+        syncAttributes(existing, element);
+        if (existing.innerHTML !== element.innerHTML) existing.innerHTML = element.innerHTML;
+        existing.nyxMarkup = markup;
+        return;
+      }
       if (isBlock(element)) {
         existing.replaceWith(element);
         adoptBlock(element);
@@ -4543,15 +4999,28 @@
     openClones.forEach((path) => {
       if (!clones.has(path)) openClones.delete(path);
     });
+    const repositories = new Set([...fresh.querySelectorAll(".checkouts-group")]
+      .map((group) => group.dataset.checkoutsGroup));
+    openRepositories.forEach((key) => {
+      if (!repositories.has(key)) openRepositories.delete(key);
+    });
+    const lists = new Set([...fresh.querySelectorAll(".checkouts-bar-pill")]
+      .map((pill) => pill.dataset.list));
+    openAttentionLists.forEach((name) => {
+      if (!lists.has(name)) openAttentionLists.delete(name);
+    });
     const folds = new Set([...fresh.querySelectorAll(".checkouts-fold-toggle")]
       .map((toggle) => foldKeyOf(toggle)));
     openFolds.forEach((key) => {
       if (!folds.has(key)) openFolds.delete(key);
     });
-    if (fresh.querySelector("details.checkouts-quiet") === null) quietOpen = false;
   }
 
   function applyCheckoutsState() {
+    paintAttentionLists();
+    checkoutsBody.querySelectorAll(".checkouts-group").forEach((group) => {
+      paintRepositoryOpen(group, openRepositories.has(group.dataset.checkoutsGroup));
+    });
     checkoutsBody.querySelectorAll("tr.checkouts-clone").forEach((row) => {
       paintCloneOpen(row, openClones.has(row.dataset.clonePath));
     });
@@ -4580,7 +5049,7 @@
     }
     const group = active.closest(".checkouts-group");
     const next = group === null ? [] : [...group.querySelectorAll("button.checkouts-toggle")]
-      .filter((toggle) => toggle !== active &&
+      .filter((toggle) => toggle !== active && toggle.closest(".checkouts-group-body").hidden === false &&
         Boolean(active.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING))
       .map((toggle) => ({key: toggle.getAttribute("data-key"),
         control: toggle.getAttribute("data-control")}));
@@ -4594,7 +5063,7 @@
   }
 
   // The control it was on, else its block, else the next row's toggle in its
-  // group, else the group's heading, else the view's heading.
+  // group, else the repository line's toggle, else the view's heading.
   function restoreCheckoutsFocus(focus) {
     if (focus === null || document.activeElement === focus.element) return;
     let target = findByKey(checkoutsBody, focus.key, focus.control);
@@ -4606,7 +5075,7 @@
     }
     if (target === null && focus.group !== null) {
       const group = findByKey(checkoutsBody, focus.group, null);
-      target = group === null ? null : group.querySelector(".checkouts-group-head");
+      target = group === null ? null : group.querySelector(".checkouts-line-toggle");
     }
     if (target === null) target = checkoutsHeading;
     target.focus({preventScroll: true});
@@ -4685,6 +5154,32 @@
       goToAttention(attention.getAttribute("data-key"));
       return;
     }
+    const behind = event.target.closest('[data-control="behind"]');
+    if (behind !== null) {
+      goToBehind(behind.getAttribute("data-key"));
+      return;
+    }
+    if (event.target.closest(".checkouts-quiet-show") !== null) {
+      setQuietCheckoutsPreference(false);
+      quietCheckoutsControl.focus();
+      return;
+    }
+    const barPill = event.target.closest(".checkouts-bar-pill");
+    if (barPill !== null) {
+      toggleAttentionList(barPill);
+      return;
+    }
+    const pill = event.target.closest(".checkouts-pill");
+    if (pill !== null) {
+      goToPill(pill);
+      return;
+    }
+    const line = event.target.closest(".checkouts-line-toggle");
+    if (line !== null) {
+      setRepositoryOpen(line.closest(".checkouts-group"),
+        line.getAttribute("aria-expanded") !== "true");
+      return;
+    }
     const toggle = event.target.closest(".checkouts-toggle");
     if (toggle !== null) {
       const row = toggle.closest("tr.checkouts-clone");
@@ -4697,10 +5192,6 @@
       applyFolds(fold.closest("tr.checkouts-detail"));
     }
   });
-  // The quiet row's own toggle event is the one record of whether it is open.
-  checkoutsBody.addEventListener("toggle", (event) => {
-    if (event.target.matches("details.checkouts-quiet")) quietOpen = event.target.open;
-  }, true);
 
   // Every settle of a pressed check announces its result once, even when it is
   // the same words as the previous one: one write per settle is one text

@@ -6576,7 +6576,7 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
 # The checkouts view: view switch, status line, remote checks and panels
 # ---------------------------------------------------------------------------
 
-CHECKOUTS_VIEW_PLACEHOLDER = "Find a checkout, branch, or work item…"
+CHECKOUTS_VIEW_PLACEHOLDER = "Find a repository, checkout, branch, or work item…"
 BOARD_SEARCH_PLACEHOLDER = "Find a work item, project, or program…"
 
 
@@ -6646,7 +6646,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.locator("#board").is_visible()
     assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
     assert page.get_by_label("Hide empty rows and columns", exact=True).is_visible()
-    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.get_by_label("Hide quiet repositories", exact=True).is_hidden()
     assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
     # The existing preference keys keep their unset defaults; the view choice is
     # its own key.
@@ -6665,11 +6665,14 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.evaluate("document.activeElement.id") == "view-checkouts"
     assert page.get_by_label("Hide terminal rows", exact=True).is_hidden()
     assert page.get_by_label("Hide empty rows and columns", exact=True).is_hidden()
-    quiet = page.get_by_label("Hide quiet checkouts", exact=True)
+    quiet = page.get_by_label("Hide quiet repositories", exact=True)
     assert quiet.is_visible()
     assert quiet.is_checked()
     assert page.locator("#filter").get_attribute("placeholder") == CHECKOUTS_VIEW_PLACEHOLDER
     assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "checkouts"
+    assert checkouts_switch.inner_text() == "Repositories"
+    assert page.locator("#checkouts-heading").inner_text() == "Repositories"
+    assert page.title() == "Nyx"
     # The checkouts preference is its own key and does not disturb the others.
     assert page.evaluate(
         "() => ['spec-tracker-compact-view', 'spec-tracker-hide-terminal-rows',"
@@ -6685,7 +6688,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     playwright.expect(page.locator("#board")).to_be_hidden()
     assert page.locator("#view-checkouts").get_attribute("aria-pressed") == "true"
-    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
 
     page.locator("#view-board").click()
     playwright.expect(page.locator("#board")).to_be_visible()
@@ -6693,7 +6696,7 @@ def test_checkouts_view_switch_remembers_the_view_and_keeps_preferences(
     assert page.locator("#view-board").get_attribute("aria-pressed") == "true"
     assert page.evaluate("localStorage.getItem('spec-tracker-view')") == "board"
     assert page.get_by_label("Hide terminal rows", exact=True).is_visible()
-    assert page.get_by_label("Hide quiet checkouts", exact=True).is_hidden()
+    assert page.get_by_label("Hide quiet repositories", exact=True).is_hidden()
     assert page.locator("#filter").get_attribute("placeholder") == BOARD_SEARCH_PLACEHOLDER
 
 
@@ -7778,7 +7781,8 @@ def test_checkouts_words_block_names_the_view_markers_once():
     assert words["text"]["noFolders"] == (
         "No checkout folders are configured. Choose Checkout folders above to add one."
     )
-    assert words["column"]["default"] == "Default branch vs remote"
+    assert words["column"]["default"] == "Local {trunk} vs remote {trunk}"
+    assert words["column"]["tree"] == "Uncommitted changes"
     assert words["text"]["workItemBranches"] == "Work item branches"
 
 
@@ -8146,6 +8150,7 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     # Lookup off is status-line words with no panel item at all.
     assert "Pull request lookup off" in page.locator("#checkouts-status-line").inner_text()
@@ -8173,7 +8178,7 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     # readable keeps rendering its clones.
     shown = body.locator(".checkouts-group")
     assert shown.count() == 1
-    assert shown.locator(".checkouts-group-name").inner_text() == "example/example"
+    assert shown.locator(".checkouts-line-name").inner_text() == "example/example"
     assert shown.locator("tr.checkouts-clone").count() == len(
         checkout_group(document, "example/example")["clones"])
     # The panel is not a live region, has no control, and never takes focus.
@@ -8230,7 +8235,8 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     """Groups, clone rows and Work item branches render the served order."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    names = page.locator(".checkouts-group-name")
+    open_repository(page, "remote")
+    names = page.locator(".checkouts-line-name")
     quiet = [
         group for group in document["repositories"]
         if str(group["remote"]["display"]).endswith("quiet")
@@ -8240,18 +8246,18 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     assert names.all_inner_texts() == [
         group["remote"]["display"] for group in document["repositories"] if group not in quiet]
 
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert names.all_inner_texts() == [
         group["remote"]["display"] for group in document["repositories"]]
     remote_index = group_index(document, "remote")
     group = document["repositories"][remote_index]
     remote_view = page.locator(".checkouts-group").nth(remote_index)
 
-    # The eight column headers, once per group table.
+    # The five column headers, once per group table, with the trunk named.
     assert remote_view.locator(
         "table.checkouts-clones > thead th").all_inner_texts() == [
-        "Checkout", "Availability", "HEAD", "Default branch vs remote",
-        "Tree", "Branches", "Cleanup", "Package",
+        "Checkout", "HEAD", "Local trunk vs remote trunk",
+        "Uncommitted changes", "Branches",
     ]
     # Clone rows follow the group's clones, and a linked worktree sits directly
     # under the clone that owns it.
@@ -8322,15 +8328,21 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
     assert "cached, never fetched" in clone_ten.inner_text()
     clone_two = remote_view.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert clone_two.locator(".checkouts-head").inner_text() == "trunk"
-    assert clone_two.locator(".checkouts-tree").inner_text() == "clean"
-    assert clone_two.locator(".checkouts-branches").inner_text() == "3 branches"
-    assert clone_two.locator(".checkouts-cleanup").inner_text().startswith(
-        "1 branch, 1 worktree removable")
-    assert clone_two.locator(".checkouts-cleanup").inner_text().endswith(
-        "topic-a (not merged)")
+    assert clone_two.locator(".checkouts-tree").inner_text() == "—"
+    assert clone_two.locator(".checkouts-branches").inner_text() == (
+        "3 branches · 1 merged, removable · 1 in progress")
+    for dropped in ("availability", "cleanup", "package"):
+        assert clone_two.locator(f".checkouts-{dropped}").count() == 0
     linked = remote_view.locator('tr.checkouts-worktree[data-worktree="outside"]')
     assert linked.locator(".checkouts-head").inner_text() == "outside"
-    assert linked.locator(".checkouts-cleanup").inner_text() == "Removable"
+    assert linked.locator("td").count() == 4
+    assert linked.locator(".checkouts-cleanup").count() == 0
+    # Cleanup words stay in the clone's Details.
+    detail = open_clone_detail(page, "Repo Clone 2")
+    assert "not merged" in detail.locator('tr[data-branch="topic-a"]').inner_text()
+    assert detail.locator(
+        'tr.checkouts-detail-worktree[data-worktree="outside"] '
+        ".checkouts-worktree-cleanup").inner_text() == "Removable"
 
     # One remote check later, the same rows read the live answers: the branch
     # no clone holds states why, and the branch nothing pushed is absent.
@@ -8359,6 +8371,7 @@ def test_checkouts_freshness_reads_cached_live_and_recorded(
     page, double = open_view_checkouts(
         open_page, view_checkouts, view_checkouts.document_built
     )
+    open_repository(page, "remote")
     clone_ten = page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]')
     assert clone_ten.locator(".checkouts-default .checkouts-basis").inner_text() == "cached"
 
@@ -8391,10 +8404,10 @@ def test_checkouts_freshness_reads_cached_live_and_recorded(
         f"recorded {when} (remote repository not found)")
 
 
-def test_checkouts_quiet_repositories_collapse_into_one_row(
+def test_checkouts_quiet_repositories_collapse_into_one_line(
     open_page, view_checkouts
 ):
-    """A quiet repository is one row while the box is checked, a group when not."""
+    """Quiet repositories are one count line while the box is checked, lines when not."""
     document = view_checkouts.document_built
     quiet = checkout_group(document, "quiet")
     quiet_display = quiet["remote"]["display"]
@@ -8402,18 +8415,20 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     page, double = open_view_checkouts(open_page, view_checkouts, document)
 
     def groups():
-        return page.locator(".checkouts-group-name").all_inner_texts()
+        return page.locator(".checkouts-line-name").all_inner_texts()
 
     assert groups() == [other_display]
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    playwright.expect(row).to_have_count(1)
-    assert row.locator("summary").inner_text() == "Quiet repositories (1)"
-    row.locator("summary").click()
-    assert row.locator("li").inner_text() == f"{quiet_display} Quiet Clone"
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
+    playwright.expect(line).to_have_count(1)
+    assert line.inner_text() == "1 quiet repository hidden Show"
+    assert page.locator("#checkouts-body details").count() == 0
+    # The line follows the repository lines.
+    assert line.evaluate("el => el.previousElementSibling.classList.contains('checkouts-group')")
+    assert quiet_display not in page.locator("#checkouts-body").inner_text()
 
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
     # The unchecked state survives a reload.  The reload's own catalog and
     # checkout requests must settle before a tick can answer, or the tick is
@@ -8424,15 +8439,15 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     settle_frames(page)
     page.wait_for_function(
         "() => document.querySelectorAll('#checkouts-body .checkouts-group').length === 2")
-    assert not page.get_by_label("Hide quiet checkouts", exact=True).is_checked()
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
     assert groups() == [quiet_display, other_display]
 
-    # Checked again, a stash makes the quiet clone ordinary: its own group, no row.
-    page.get_by_label("Hide quiet checkouts", exact=True).check()
+    # Checked again, a stash makes the quiet clone ordinary: its own line, no count line.
+    page.get_by_label("Hide quiet repositories", exact=True).check()
     assert groups() == [other_display]
     serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
     # Two null comparisons prove nothing about equality, so it is not quiet.
     def both_null(value):
@@ -8442,93 +8457,109 @@ def test_checkouts_quiet_repositories_collapse_into_one_row(
     serve_checkouts(
         page, double, checkout_variant(view_checkouts.document_built, both_null))
     assert groups() == [quiet_display, other_display]
-    assert page.locator("#checkouts-body .checkouts-quiet").count() == 0
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
 
 
 def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkouts):
     """The shared search hides every group whose served names do not match."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     assert page.locator(".checkouts-group").count() == len(document["repositories"])
     page.fill("#filter", "topic-a")
-    visible = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    visible = page.locator(".checkouts-group:not([hidden]) .checkouts-line-name")
     assert visible.all_inner_texts() == [
         checkout_group(document, "remote")["remote"]["display"]]
     page.fill("#filter", "")
     assert page.locator(".checkouts-group:not([hidden])").count() == len(
         document["repositories"])
 
+    # A matching line stays closed, and an open line the search hides is open
+    # again when the search clears.
+    toggles = page.locator(".checkouts-line-toggle")
+    assert set(toggles.evaluate_all("els => els.map(e => e.getAttribute('aria-expanded'))")) \
+        == {"false"}
+    page.fill("#filter", "topic-a")
+    assert page.locator(".checkouts-group:not([hidden]) .checkouts-line-toggle").evaluate_all(
+        "els => els.map(e => e.getAttribute('aria-expanded'))") == ["false"]
+    page.fill("#filter", "")
+    group = open_repository(page, "remote")
+    quiet_display = checkout_group(document, "quiet")["remote"]["display"]
+    page.fill("#filter", quiet_display)
+    playwright.expect(group).to_be_hidden()
+    assert page.locator(".checkouts-group:not([hidden]) .checkouts-line-toggle").evaluate_all(
+        "els => els.map(e => e.getAttribute('aria-expanded'))") == ["false"]
+    page.fill("#filter", "")
+    playwright.expect(group).to_be_visible()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
 
-def test_checkouts_search_matches_the_repositories_in_the_quiet_row(
+
+def test_checkouts_search_counts_the_quiet_repositories_it_matches(
     open_page, view_checkouts
 ):
-    """The quiet row stays for a held repository that matches and goes when none do."""
+    """The quiet line counts a matching quiet repository and goes when none match."""
     document = view_checkouts.document_built
     quiet = checkout_group(document, "quiet")
     quiet_display = quiet["remote"]["display"]
     other_display = checkout_group(document, "remote")["remote"]["display"]
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    summary = row.locator("summary")
-    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1)"
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
+    count = line.locator(".checkouts-quiet-count")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-line-name")
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
 
-    # A quiet repository's name keeps the row, counts its match and hides the
+    # A quiet repository's name keeps the line, counts its match and hides the
     # group that does not match.
     page.fill("#filter", quiet_display)
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1, 1 matching)"
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
     assert groups.all_inner_texts() == []
 
     # The clone's folder name is searched as it is for a group.
     page.fill("#filter", "quiet clone")
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
 
-    # A name no quiet repository has hides the row; the group that has it stays.
+    # A name no quiet repository has hides the line; the group that has it stays.
     page.fill("#filter", other_display)
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == [other_display]
     page.fill("#filter", "no such words anywhere")
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == []
 
     # Clearing the search restores the earlier state.
     page.fill("#filter", "")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (1)"
+    playwright.expect(line).to_be_visible()
+    assert count.inner_text() == "1 quiet repository hidden"
     assert groups.all_inner_texts() == [other_display]
 
 
-def test_checkouts_search_can_match_a_group_and_the_quiet_row_together(
+def test_checkouts_search_can_match_a_group_and_the_quiet_line_together(
     open_page, view_checkouts
 ):
-    """A query both kinds hold keeps the group and the row; one kind alone keeps one."""
+    """A query both kinds hold keeps the group and the line; one kind alone keeps one."""
     document = view_checkouts.document_built
     quiet_group = checkout_group(document, "quiet")
     other = checkout_group(document, "remote")
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-group-name")
+    line = page.locator("#checkouts-body .checkouts-quiet-line")
+    groups = page.locator(".checkouts-group:not([hidden]) .checkouts-line-name")
     branch = quiet_group["default_branch"]["name"]
     assert other["default_branch"]["name"] == branch
 
     page.fill("#filter", branch)
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
     assert groups.all_inner_texts() == [other["remote"]["display"]]
 
-    # Words only the group holds hide the row; words only the row holds hide the group.
+    # Words only the group holds hide the line; words only the line holds hide the group.
     page.fill("#filter", "topic-a")
-    playwright.expect(row).to_be_hidden()
+    playwright.expect(line).to_be_hidden()
     assert groups.all_inner_texts() == [other["remote"]["display"]]
     page.fill("#filter", quiet_group["remote"]["display"])
-    playwright.expect(row).to_be_visible()
+    playwright.expect(line).to_be_visible()
     assert groups.all_inner_texts() == []
-
-    # The row, opened and filtered, keeps its listed repository.
-    row.locator("summary").click()
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
 
 
 def mutate_searchable_words(document):
@@ -8548,23 +8579,66 @@ def mutate_searchable_words(document):
 
 
 def test_checkouts_search_matches_the_words_each_row_shows(open_page, view_checkouts):
-    """A Code Status phrase, availability, HEAD and tree word or a worktree's HEAD finds its group."""
+    """Search keeps today's words, including availability words and `clean` that no cell shows.
+
+    A Code Status phrase, HEAD and tree word or a worktree's HEAD finds its
+    group by the words its cells show. The availability words of a clone and
+    the tree word `clean` still find their group though the Availability column
+    is gone and a clean checkout's Uncommitted changes cell reads a dash.  Every
+    line also starts closed with its body in the page, and a click opens that
+    ordered body.
+    """
     document = checkout_variant(view_checkouts.document_built, mutate_searchable_words)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    toggles = page.locator(".checkouts-line-toggle")
+    assert toggles.count() >= 2
+    assert set(toggles.evaluate_all(
+        "els => els.map(el => el.getAttribute('aria-expanded'))")) == {"false"}
+    assert set(page.locator(".checkouts-group-body").evaluate_all(
+        "els => els.map(el => el.hidden)")) == {True}
+    # A closed body stays in the page, so its rows resolve.
+    assert page.locator("tr.checkouts-clone").count() > 0
+    group = open_repository(page, "remote")
+    assert group.locator(".checkouts-group-body").evaluate(
+        """el => [...el.children].map(child => child.tagName + '.' + child.className)""") == [
+        "P.checkouts-group-caption",
+        "TABLE.checkouts-package-branches",
+        "TABLE.checkouts-clones",
+    ]
+    group.locator(".checkouts-line-toggle").click()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    assert group.locator(".checkouts-group-body").evaluate("el => el.hidden") is True
+    open_repository(page, "remote")
     remote = checkout_group(document, "remote")["remote"]["display"]
     quiet = checkout_group(document, "quiet")["remote"]["display"]
 
     def shown(query):
         page.fill("#filter", query)
         return page.locator(
-            ".checkouts-group:not([hidden]) .checkouts-group-name").all_inner_texts()
+            ".checkouts-group:not([hidden]) .checkouts-line-name").all_inner_texts()
 
     assert sorted(shown("")) == sorted([remote, quiet])
     # The served Code Status text of a work item the group serves.
     assert shown("pushed") == [remote]
-    # The availability words of a clone row.
+    # The availability words of a clone row still match, though no visible
+    # cell of the opened clone rows shows them.
     assert shown("has linked worktrees") == [remote]
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(remote) + "$")))
+    clones = group.locator("table.checkouts-clones > tbody > tr.checkouts-clone")
+    assert clones.count() == 3
+    cells = group.locator(
+        "table.checkouts-clones > tbody > tr.checkouts-clone > :is(td, th)"
+    ).evaluate_all("cells => cells.map(cell => cell.innerText.toLowerCase())")
+    assert cells and not any("has linked worktrees" in cell for cell in cells)
+    # The tree word `clean` finds the repository whose clones are clean, though
+    # every Uncommitted changes cell of its clone rows reads a dash.
+    assert shown("clean") == [remote]
+    page.fill("#filter", "")
+    assert clones.evaluate_all(
+        "rows => rows.map(row => row.children[3].innerText.trim())") == ["—"] * 3
+    assert not any("clean" in cell for cell in cells)
     # The HEAD words of the quiet clone's main worktree, and its tree words.
     assert shown("detached at abc1234") == [quiet]
     assert shown("3 unstaged") == [quiet]
@@ -8696,6 +8770,7 @@ def test_checkouts_word_tables_show_their_served_values(
     """Every word table renders a served value's words, from captures and variants."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
 
     def clone_row(name):
@@ -8704,6 +8779,15 @@ def test_checkouts_word_tables_show_their_served_values(
     def shows(text):
         assert text in body.inner_text(), text
 
+    def detail_text(name):
+        return body.locator(f'tr.checkouts-detail[data-detail-for$="{name}"]').text_content()
+
+    def searched():
+        # The availability words are no cell any more but stay search words.
+        return page.locator(".checkouts-group").filter(
+            has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        ).get_attribute("data-search")
+
     # The built capture: comparison relation and basis, availability state and
     # reason, the assignment basis, status, remote copy, verdict state, the
     # branch blocker, the branch package basis and the check/lookup words.
@@ -8711,19 +8795,24 @@ def test_checkouts_word_tables_show_their_served_values(
     shows("cached")
     shows("Free")
     clone_two = clone_row("Repo Clone 2")
-    availability = clone_two.locator(".checkouts-availability").inner_text()
-    assert availability.startswith("In use")
+    assert clone_two.locator(".checkouts-availability").count() == 0
+    availability = searched()
+    assert "in use" in availability
     assert "has linked worktrees" in availability
-    assert "Assigned: Repo/Drafts/alpha (Target repo)" in availability
+    assert "assigned: repo/drafts/alpha (target repo)" in availability
     shows("unknown")
     shows("not merged")
-    shows("Repo/Drafts/alpha (Target repo)")
-    assert "topic-a (not merged)" in clone_two.locator(".checkouts-cleanup").inner_text()
+    assert "Repo/Drafts/alpha (Target repo)" in detail_text("Repo Clone 2")
+    assert "not merged" in body.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] tr[data-branch="topic-a"]'
+    ).text_content()
     assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
     assert page.locator(".checkouts-group-lookup").first.inner_text() == (
         "pull request lookup off")
-    # The default branch is named in the header as it is served.
-    assert body.locator(".checkouts-group-default").last.inner_text() == "trunk"
+    # The default branch and the clone count are named on the line as served.
+    remote_group = checkout_group(document, "remote")
+    assert body.locator(".checkouts-line-trunk").last.inner_text() == (
+        f"trunk · {len(remote_group['clones'])} clones")
 
     # One remote check later: the live basis and the present and absent copies.
     checked = view_checkouts.document_checked
@@ -8753,8 +8842,10 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_clone_statuses))
     shows("git refused it: ownership")
     shows("more than 100 local branches; not examined")
-    assert clone_row("Repo Clone 3").locator(
-        ".checkouts-availability").inner_text() == "Unknown"
+    unreadable = clone_row("Repo Clone 3")
+    assert unreadable.locator("td").count() == 1
+    assert unreadable.locator("td.checkouts-status").get_attribute("colspan") == "4"
+    assert "unknown" in searched()
 
     # Worktree facts: a detached, dirty main worktree in a rebase, and a locked
     # linked worktree with its branch and worktree blockers.
@@ -8762,13 +8853,14 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_worktree_facts))
     clone_two = clone_row("Repo Clone 2")
     assert clone_two.locator(".checkouts-head").inner_text().startswith("detached at ")
-    shows("detached HEAD")
+    assert "detached head" in searched()
     shows("2 staged")
     shows("rebase in progress")
-    shows("git operation in progress")
-    assert "outside (locked)" in clone_two.locator(".checkouts-cleanup").inner_text()
-    linked = body.locator('tr.checkouts-worktree[data-worktree="outside"]')
-    assert linked.locator(".checkouts-cleanup").inner_text() == "locked"
+    assert "git operation in progress" in searched()
+    assert body.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] '
+        'tr.checkouts-detail-worktree[data-worktree="outside"] '
+        ".checkouts-worktree-cleanup").text_content().endswith("locked")
 
     # A prunable linked worktree: the status words and the flag word.
     serve_checkouts(
@@ -8795,16 +8887,15 @@ def test_checkouts_word_tables_show_their_served_values(
     # Another clone's assigned package and a linked worktree's, with both bases.
     serve_checkouts(
         page, double, checkout_variant(document, mutate_assignment))
-    assigned = clone_row("Repo Clone 3").locator(".checkouts-availability").inner_text()
-    assert assigned.startswith("Assigned")
-    assert "Repo/Drafts/alpha (Target repo)" in assigned
-    assert "Repo/Drafts/delta (Target repo worktree)" in clone_row(
-        "Repo Clone 2").locator(".checkouts-availability").inner_text()
+    assigned = searched()
+    assert "assigned: repo/drafts/alpha (target repo)" in assigned
+    assert "repo/drafts/delta (target repo worktree)" in assigned
     shows("same branch in another clone")
 
     # A live lookup with served pull requests and a pull-request rung.
     serve_checkouts(
         page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    open_every_repository(page)
     shows("pull requests live")
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == (
@@ -8834,6 +8925,7 @@ def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
     with pytest.raises(models.ProtocolError):
         models.parse_checkouts(json.dumps(document))
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     assert "future_status" in body.inner_text()
     # The rest of the view still renders.
@@ -8845,7 +8937,8 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
     """Each work item's table action shows its card, or says why it cannot."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    open_repository(page, "remote")
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
     topic_a = remote_view.locator(
         'table.checkouts-package-branches tr[data-branch="topic-a"]')
@@ -8906,6 +8999,7 @@ def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
 
     document = checkout_variant(view_checkouts.document_built, mutate)
     page, _ = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert clone_two.locator("td.checkouts-head").inner_text() == "git did not answer in time"
     assert clone_two.locator("td.checkouts-tree").inner_text() == "git did not answer in time"
@@ -8923,6 +9017,7 @@ def test_checkouts_timed_out_worktrees_and_unborn_heads_show_their_words(
 
     served = checkout_raw_variant(view_checkouts.document_built, unborn)
     page, _ = open_view_checkouts(open_page, view_checkouts, served)
+    open_repository(page, "remote")
     assert page.locator(
         'tr.checkouts-worktree[data-worktree="outside"] td.checkouts-head'
     ).inner_text() == "unborn outside"
@@ -8945,6 +9040,7 @@ def test_checkouts_cached_fetch_age_rounds_down_against_the_observation(
         return checkout_variant(document, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, fetched(0))
+    open_repository(page, "remote")
     row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-freshness')
     assert row.inner_text() == "cached, fetched <1 min ago"
     for minutes, words in ((7, "7 min"), (125, "2 h"), (60 * 49, "2 d")):
@@ -8962,22 +9058,22 @@ def test_checkouts_branches_cell_counts_stashes_in_words(open_page, view_checkou
         return checkout_variant(view_checkouts.document_built, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, stashed(1))
+    open_repository(page, "remote")
     cell = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-branches')
-    assert cell.inner_text() == "3 branches · 1 stash"
+    assert cell.inner_text() == "3 branches · 1 merged, removable · 1 in progress · 1 stash"
+    assert cell.locator('.checkouts-phrase[data-tone="red"]').inner_text() == "1 stash"
     assert "1 stashs" not in page.locator("#checkouts-body").inner_text()
     serve_checkouts(page, double, stashed(2))
-    assert cell.inner_text() == "3 branches · 2 stashes"
+    assert cell.inner_text() == "3 branches · 1 merged, removable · 1 in progress · 2 stashes"
     assert "stashs" not in page.locator("#checkouts-body").inner_text()
-    # The singular of the cleanup counts reads the same way in the same table.
-    cleanup = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"] .checkouts-cleanup')
-    assert cleanup.inner_text().startswith("1 branch, 1 worktree removable")
 
 
 def test_checkouts_show_on_board_keeps_a_matching_search(open_page, view_checkouts):
     """A search survives the jump unless it is what hides the card."""
     document = view_checkouts.document_built
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    open_repository(page, "remote")
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
 
     def show_button():
         remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
@@ -9162,6 +9258,46 @@ def open_attention_checkouts(launch, attention_checkouts, document, *, catalog=N
     return page, double
 
 
+def bar_pill_texts(page):
+    """The pills of the attention bar, in the order the page draws them."""
+    return page.locator("#checkouts-body .checkouts-bar-pill").all_inner_texts()
+
+
+def open_bar_list(page, name):
+    """Open one bar list by pressing its pill (a list already open is left open)."""
+    pill = page.locator(f'#checkouts-body .checkouts-bar-pill[data-list="{name}"]').first
+    if pill.get_attribute("aria-expanded") != "true":
+        pill.click()
+    assert pill.get_attribute("aria-expanded") == "true"
+    box = page.locator(f'#checkouts-body .checkouts-attention-listbox[data-list="{name}"]')
+    playwright.expect(box).to_be_visible()
+    return box
+
+
+def open_every_bar_list(page):
+    """Open every list the bar's pills control."""
+    for name in page.locator("#checkouts-body .checkouts-bar-pill").evaluate_all(
+        "pills => [...new Set(pills.map(pill => pill.dataset.list))]"
+    ):
+        open_bar_list(page, name)
+
+
+def attention_item(page, code):
+    """The attention item with ``code``, its bar list opened first when it sits in one."""
+    item = page.locator(f'#checkouts-body li[data-code="{code}"]').first
+    name = item.evaluate(
+        "el => { const box = el.closest('.checkouts-attention-listbox');"
+        " return box === null ? null : box.dataset.list; }")
+    if name is not None:
+        open_bar_list(page, name)
+    return item
+
+
+def press_attention_item(page, code):
+    """Open the item's list, then press the control the item holds."""
+    attention_item(page, code).locator("button").press("Enter")
+
+
 def attention_words(item):
     """The words one attention item must read, built from the view's own block."""
     words = checkout_words()
@@ -9214,22 +9350,48 @@ def focused_inside_viewport(page):
 
 
 def test_checkouts_attention_list_follows_the_document(open_page, attention_checkouts):
-    """Items equal the served array in order, with class headings and served counts."""
+    """The bar totals the lines' counts; its lists and the headed classes hold every item."""
     document = attention_checkouts.document
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
+    red_classes, amber_classes = ["unique_work"], ["awaiting_merge", "cleanup_ready"]
+    listed = red_classes + amber_classes
+    codes = lambda classes: [  # noqa: E731
+        item["code"] for item in document["attention"] if item["class"] in classes]
+    # Three branches are local only and three to merge or clean up; no clone is
+    # behind and no worktree stands alone, so the bar holds the two pills.
+    assert bar_pill_texts(page) == [f"{RED_MARK} 3 branches local only",
+                                    f"{AMBER_MARK} 3 branches to merge or clean up"]
+    # A closed list stays in the page, hidden; a press opens it and a second closes it.
     items = page.locator("#checkouts-body .checkouts-attention li[data-code]")
-    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
-        item["code"] for item in document["attention"]]
-    # A class heading appears exactly where the class changes in document order.
+    assert items.count() == len(document["attention"])
+    boxes = page.locator("#checkouts-body .checkouts-attention-listbox")
+    assert boxes.evaluate_all("nodes => nodes.map(node => node.hidden)") == [True, True]
+    red = open_bar_list(page, "red")
+    assert red.locator("li[data-code]").evaluate_all(
+        "rows => rows.map(row => row.dataset.code)") == codes(red_classes)
+    page.locator('.checkouts-bar-pill[data-list="red"]').click()
+    playwright.expect(red).to_be_hidden()
+    assert red.locator("li[data-code]").count() == len(codes(red_classes))
+    open_bar_list(page, "red")
+    amber = open_bar_list(page, "amber")
+    assert amber.locator("li[data-code]").evaluate_all(
+        "rows => rows.map(row => row.dataset.code)") == codes(amber_classes)
+    # base_moved and configuration items stay listed below the bar under headings.
     classes = []
     for item in document["attention"]:
-        if not classes or classes[-1] != item["class"]:
+        if item["class"] not in listed and (not classes or classes[-1] != item["class"]):
             classes.append(item["class"])
-    headings = page.locator("#checkouts-body .checkouts-attention .checkouts-attention-class")
+    assert classes
+    headings = page.locator("#checkouts-body .checkouts-attention > .checkouts-attention-class")
     assert headings.evaluate_all("nodes => nodes.map(node => node.dataset.class)") == classes
     assert headings.all_inner_texts() == [
         checkout_words()["attentionClass"][name] for name in classes]
+    below = page.locator("#checkouts-body .checkouts-attention > ul li[data-code]")
+    assert below.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"] if item["class"] not in listed]
     assert page.locator(".checkouts-attention h2").inner_text() == "Needs attention"
+    assert items.evaluate_all("rows => rows.map(row => row.dataset.code)") == [
+        item["code"] for item in document["attention"]]
     # Each item reads its words with the served count.
     texts = items.evaluate_all(
         "rows => rows.map(row => row.querySelector("
@@ -9279,10 +9441,10 @@ def test_checkouts_attention_counts_read_singular_at_one_and_plural_otherwise(
             item["count"] = count
             variant["attention"].append(item)
         serve_checkouts(page, double, redigest(variant))
+        open_every_bar_list(page)
         for code, (template, noun) in expected.items():
             phrase = f"1 {noun}" if count == 1 else f"{count} {plurals[noun]}"
-            sentence = page.locator(
-                f'li[data-code="{code}"]').first.inner_text()
+            sentence = attention_item(page, code).inner_text()
             assert sentence == template.format(phrase), (code, count)
 
 
@@ -9301,7 +9463,7 @@ def test_checkouts_attention_pull_request_joins_the_awaiting_merge_words(
 
     document = checkout_variant(attention_checkouts.document, open_pull_request)
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    sentence = page.locator('li[data-code="awaiting_merge"] button').inner_text()
+    sentence = attention_item(page, "awaiting_merge").locator("button").inner_text()
     assert sentence == "topic-g is finished but not merged (pull request #7)"
     assert sentence == attention_words(
         next(item for item in document["attention"] if item["code"] == "awaiting_merge"))
@@ -9315,10 +9477,61 @@ def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     page, double = open_attention_checkouts(open_page, attention_checkouts, document)
 
     def press(code):
-        page.locator(f'li[data-code="{code}"] button').press("Enter")
+        press_attention_item(page, code)
 
-    press("branch_unpushed")
     clone_two = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+    line = page.locator(".checkouts-group").filter(has=clone_two).locator(
+        ".checkouts-line-toggle")
+    assert line.get_attribute("aria-expanded") == "false"
+
+    # A pill on the closed line moves to the first item of its classes, and the
+    # destination is resolved when pressed, never when drawn.
+    group = page.locator(".checkouts-group").filter(has=clone_two)
+    errors = []
+    page.on("pageerror", lambda error: errors.append(error))
+    red_pill = group.locator('button[data-pill="red-branches"]').element_handle()
+    red_pill.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
+    assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "topic-a"
+    assert page.evaluate("document.activeElement.closest('tr.checkouts-detail').dataset.detailFor"
+                         ).endswith("Repo Clone 2")
+    assert "checkouts-clone-branch" in target["cls"]
+    group.locator('button[data-pill="amber-branches"]').press("Enter")
+    target = focused_checkouts_target(page)
+    assert (target["branch"], target["cls"]) == ("topic-g", "checkouts-branch")
+
+    # topic-a now level with its remote: the first red item is Repo Clone 3's
+    # local-only branch, and the held pill keeps its element and goes there.
+    red_pill.focus()
+    serve_checkouts(page, double, checkout_variant(
+        document, signal_topic_a_level_with_its_remote))
+    assert red_pill.evaluate("el => el.isConnected") is True
+    assert red_pill.inner_text() == f"{RED_MARK} 2 branches local only"
+    red_pill.press("Enter")
+    target = focused_checkouts_target(page)
+    assert target["branch"] == "local-only"
+    assert page.evaluate("document.activeElement.closest('tr.checkouts-detail').dataset.detailFor"
+                         ).endswith("Repo Clone 3")
+    assert "checkouts-clone-branch" in target["cls"]
+    assert page.locator(
+        'tr.checkouts-clone-branch[data-branch="local-only"]').evaluate(
+        "row => row.closest('tr.checkouts-detail').hidden") is False
+    assert page.locator(
+        'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] '
+        'tr.checkouts-clone-branch[data-branch="topic-a"]').count() == 1
+    assert errors == []
+    serve_checkouts(page, double, document)
+
+    # Leave every line and clone closed for the item presses below.
+    for row in (clone_two, page.locator('tr.checkouts-clone[data-clone="Repo Clone 3"]')):
+        if row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true":
+            row.locator(".checkouts-toggle").click()
+    line.click()
+    assert line.get_attribute("aria-expanded") == "false"
+    press("branch_unpushed")
+    assert line.get_attribute("aria-expanded") == "true"
     assert clone_two.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
     assert page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]').is_visible()
     assert focused_checkouts_target(page)["branch"] == "topic-a"
@@ -9378,7 +9591,7 @@ def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
         set_clone_status(clone, "failed")
 
     serve_checkouts(page, double, checkout_variant(attention_checkouts.document, unreadable))
-    page.locator('li[data-code="checkout_unavailable"] button').press("Enter")
+    press_attention_item(page, "checkout_unavailable")
     target = focused_checkouts_target(page)
     assert (target["clone"], target["cls"]) == ("Repo Clone 10", "checkouts-clone")
     assert page.locator(
@@ -9391,6 +9604,7 @@ def test_checkouts_attention_reaches_unreadable_clones_and_main_worktrees(
 
     variant = checkout_variant(attention_checkouts.document, own_worktree)
     serve_checkouts(page, double, variant)
+    open_bar_list(page, "red")
     page.locator('li[data-code="uncommitted_changes"]').filter(
         has_text="Repo Clone 3 has 2 uncommitted changes").locator("button").press("Enter")
     target = focused_checkouts_target(page)
@@ -9408,7 +9622,7 @@ def test_checkouts_attention_unfolds_a_folded_branch_before_focusing_it(
 
     document = checkout_variant(attention_checkouts.document, mismatch)
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    page.locator('li[data-code="upstream_mismatch"] button').press("Enter")
+    press_attention_item(page, "upstream_mismatch")
     target = focused_checkouts_target(page)
     assert target["branch"] == "topic-a-part"
     assert page.locator('tr.checkouts-clone-branch[data-branch="topic-a"] '
@@ -9427,13 +9641,19 @@ def test_checkouts_attention_ignores_search_and_a_hidden_destination_clears_it(
     assert items.count() == len(document["attention"])
     assert page.locator(".checkouts-group").evaluate_all(
         "groups => groups.map(group => group.hidden)") == [True]
+    # The bar and its lists ignore the search: both open while every line is hidden.
+    assert bar_pill_texts(page) == [f"{RED_MARK} 3 branches local only",
+                                    f"{AMBER_MARK} 3 branches to merge or clean up"]
+    open_bar_list(page, "red")
+    open_bar_list(page, "amber")
+    assert page.locator("#filter").input_value() == "zzz"
     page.locator('li[data-code="branch_unpushed"] button').press("Enter")
     assert page.locator("#filter").input_value() == ""
     assert page.locator(".checkouts-group").evaluate_all(
         "groups => groups.map(group => group.hidden)") == [False]
     assert focused_checkouts_target(page)["branch"] == "topic-a"
 
-    # The package-branch destination clears it the same way.
+    # The package-branch destination in the amber list clears it the same way.
     page.fill("#filter", "zzz")
     page.locator('li[data-code="awaiting_merge"] button').press("Enter")
     assert page.locator("#filter").input_value() == ""
@@ -9448,9 +9668,28 @@ def share_a_branch_between_two_checkouts(document):
     branch["checked_out_in"] = [worktree["path"] for worktree in clone_two["worktrees"]]
 
 
+def open_repository(page, suffix):
+    """Open the repository line whose display name ends with `suffix`; return its group.
+
+    A line already open is left open, so the helper may be called twice.
+    """
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(suffix) + "$")))
+    assert group.count() == 1, suffix
+    toggle = group.locator(".checkouts-line-toggle")
+    if toggle.get_attribute("aria-expanded") != "true":
+        toggle.click()
+    assert toggle.get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+    return group
+
+
 def open_clone_detail(page, name):
     """Open one clone row from its toggle and return its detail row."""
     row = page.locator(f'tr.checkouts-clone[data-clone="{name}"]')
+    group = page.locator(".checkouts-group").filter(has=row)
+    if group.locator(".checkouts-group-body").evaluate("el => el.hidden"):
+        group.locator(".checkouts-line-toggle").click()
     row.locator(".checkouts-toggle").click()
     detail = row.locator("xpath=following-sibling::tr[1]")
     playwright.expect(detail).to_be_visible()
@@ -9787,6 +10026,234 @@ def folded_variant(document):
     return checkout_variant(document, fold)
 
 
+MERGED_VERDICT = {"pull_request": None, "reason": None, "rung": "ancestor", "state": "merged"}
+NOT_MERGED_VERDICT = {"pull_request": None, "reason": None, "rung": "none", "state": "not_merged"}
+
+
+def signal_topic_a_in_two_clones(document):
+    """Repo Clone 3 holds a second copy of ``topic-a``: unpushed in both clones."""
+    _, source = checkout_clone(document, "Repo Clone 2")
+    _, target = checkout_clone(document, "Repo Clone 3")
+    copied = copy.deepcopy(next(b for b in source["branches"] if b["name"] == "topic-a"))
+    copied["checked_out_in"] = []
+    copied["packages"] = []
+    target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
+
+
+def signal_topic_g_in_two_clones(document):
+    """Repo Clone 3 holds a second copy of the finished, pushed ``topic-g``."""
+    _, source = checkout_clone(document, "Repo Clone 2")
+    _, target = checkout_clone(document, "Repo Clone 3")
+    copied = copy.deepcopy(next(b for b in source["branches"] if b["name"] == "topic-g"))
+    copied["checked_out_in"] = []
+    copied["packages"] = []
+    target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
+
+
+def signal_topic_g_merged_and_held_in_a_main_worktree(document):
+    """``gamma`` is merged and Repo Clone 3 holds its branch in its main worktree.
+
+    Clone 2's copy is merged too, so it is removable.  Clone 3 is not the work
+    item's target, so its copy names the package as a sibling; that copy is held
+    by the main worktree, so its only blocker is that checkout.  Nothing is
+    finished and unmerged, so the document raises no awaiting-merge item.
+    """
+    _, source = checkout_clone(document, "Repo Clone 2")
+    _, target = checkout_clone(document, "Repo Clone 3")
+    branch = next(item for item in source["branches"] if item["name"] == "topic-g")
+    branch["verdict"] = dict(MERGED_VERDICT)
+    copied = copy.deepcopy(branch)
+    copied["checked_out_in"] = [target["path"]]
+    copied["packages"] = [{"basis": "sibling_clone", "package_path": "Repo/Shipped/gamma"}]
+    target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
+    main = next(worktree for worktree in target["worktrees"] if worktree["main"])
+    main["head"] = {"branch": copied["name"], "sha": copied["sha"]}
+    package = next(item for item in document["packages"]
+                   if item["package_path"] == "Repo/Shipped/gamma")
+    status = package["code_status"]
+    status.update({
+        "checked_out_elsewhere": [target["path"]],
+        "cleanup": {"worktrees": 1, "branches": 0},
+        "pull_request": None,
+        "push": None,
+        "state": "merged",
+        "unpushed": None,
+    })
+    status["text"] = models.code_status_text(status)
+
+
+def signal_topic_a_merged_and_held(document):
+    """``topic-a`` is merged, so removable, but the unfinished alpha holds it."""
+    _, clone = checkout_clone(document, "Repo Clone 2")
+    next(b for b in clone["branches"] if b["name"] == "topic-a")["verdict"] = dict(
+        MERGED_VERDICT)
+
+
+def signal_topic_a_level_with_its_remote(document):
+    """``topic-a`` is level with its remote, so its unique work moves to Repo Clone 3."""
+    _, clone = checkout_clone(document, "Repo Clone 2")
+    next(b for b in clone["branches"] if b["name"] == "topic-a")["vs_remote"].update(
+        relation="equal", ahead=0, behind=0)
+
+
+def signal_quiet_changes_on_a_detached_checkout(document):
+    """Quiet Clone's checkout is detached with one untracked file."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    worktree = clone["worktrees"][0]
+    worktree["head"]["branch"] = None
+    worktree["verdict"] = dict(NOT_MERGED_VERDICT)
+    worktree["changes"]["untracked"] = 1
+    next(b for b in clone["branches"] if b["name"] == "trunk")["checked_out_in"] = []
+
+
+def signal_quiet_default_branch_diverged(document):
+    """Quiet Clone's default branch is one ahead and one behind its remote."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    clone["local_default"]["vs_remote"].update(relation="diverged", ahead=1, behind=1)
+
+
+def signal_quiet_default_branch_main_behind(document):
+    """The quiet repository's default branch is ``main`` and one behind its remote."""
+    group = checkout_group(document, "quiet")
+    index = document["repositories"].index(group)
+    rendered = json.dumps(group).replace('"origin/trunk"', '"origin/main"').replace(
+        '"trunk"', '"main"')
+    renamed = json.loads(rendered)
+    renamed["clones"][0]["local_default"]["vs_remote"].update(relation="behind", behind=1)
+    document["repositories"][index] = renamed
+
+
+def signal_quiet_never_fetched(document):
+    """Quiet Clone has never fetched."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    clone["cached_default"]["fetched_since_clone"] = False
+    clone["cached_default"]["last_fetched_at"] = None
+
+
+def signal_quiet_index_lock(document):
+    """Quiet Clone's main worktree holds an index lock and nothing else."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    next(item for item in clone["worktrees"] if item["main"])["index_lock"] = True
+
+
+def signal_quiet_other_branch_checked_out(document):
+    """Quiet Clone has a pushed ``side`` branch checked out, so it is in use."""
+    _, clone = checkout_clone(document, "Quiet Clone")
+    trunk = next(b for b in clone["branches"] if b["name"] == "trunk")
+    side = copy.deepcopy(trunk)
+    side.update(name="side", upstream="origin/side", verdict=dict(NOT_MERGED_VERDICT))
+    trunk["checked_out_in"] = []
+    clone["branches"].insert(clone["branches"].index(trunk), side)
+    clone["worktrees"][0]["head"]["branch"] = "side"
+
+
+def signal_quiet_assigned_alpha(document):
+    """The work item alpha targets Quiet Clone, which it assigns without occupying."""
+    group, clone = checkout_clone(document, "Quiet Clone")
+    alpha = next(p for p in document["packages"] if p["package_path"] == "Repo/Drafts/alpha")
+    alpha["target"]["clone"] = clone["path"]
+    for other in document["repositories"]:
+        other["package_branches"] = [
+            entry for entry in other["package_branches"]
+            if "Repo/Drafts/alpha" not in entry["packages"]]
+        for item in other["clones"]:
+            for branch in item["branches"] or []:
+                branch["packages"] = [
+                    ref for ref in branch["packages"]
+                    if ref["package_path"] != "Repo/Drafts/alpha"]
+
+
+def rewrite_clone_paths(clone, moved):
+    """Rewrite every path a parsed clone holds through ``moved``.
+
+    A clone's own path, its worktrees' paths and the worktree paths in its branches'
+    ``checked_out_in`` lists move together: the parser requires the main worktree at
+    the clone's path and every checkout list to name listed worktrees, so a copy stays
+    valid only when all three move as one.  Every path must carry the clone's path as a
+    prefix, as the copied clone's own paths do.  The rewrite reads the parsed facts,
+    never their JSON spelling, so it works whatever characters a path holds.
+    """
+    prefix = clone["path"]
+
+    def rewrite(path):
+        assert path.startswith(prefix), path
+        return moved(path)
+
+    clone["path"] = rewrite(clone["path"])
+    for worktree in clone["worktrees"] or []:
+        worktree["path"] = rewrite(worktree["path"])
+    for branch in clone["branches"] or []:
+        branch["checked_out_in"] = [rewrite(path) for path in branch["checked_out_in"]]
+
+
+def second_free_clone(clone):
+    """A copy of ``clone`` with `` 2`` after its path, so every path it holds differs."""
+    prefix = clone["path"]
+    second = copy.deepcopy(clone)
+    rewrite_clone_paths(second, lambda path: prefix + " 2" + path[len(prefix):])
+    return second
+
+
+WINDOWS_QUIET_CLONE = (
+    "C:\\Users\\runneradmin\\Temp\\pytest-7\\remotes\\festival-site\\clones\\Quiet Clone"
+)
+
+
+def windows_shaped_quiet_capture(document):
+    """One capture whose quiet clone and worktree paths are spelled as Windows spells them.
+
+    A posix ``Path`` reads a backslash path as one long name, so a proof over this
+    capture finds its clone by repository and position, never by that name.
+    """
+    shaped = copy.deepcopy(document)
+    clone = checkout_group(shaped, "quiet")["clones"][0]
+    prefix = clone["path"]
+    rewrite_clone_paths(clone, lambda path: WINDOWS_QUIET_CLONE + path[len(prefix):])
+    return shaped
+
+
+def signal_quiet_second_free_clone(document):
+    """The quiet repository gains a second free clone with a suffixed path.
+
+    The clone is found by repository and position because the proof also serves these
+    paths in Windows's spelling, where a posix ``Path`` cannot read the clone's name.
+    """
+    clones = checkout_group(document, "quiet")["clones"]
+    clones.append(second_free_clone(clones[0]))
+
+
+def signal_detached_removable_worktree(document):
+    """Repo Clone 2's linked worktree is detached and merged; its branch is gone."""
+    _, clone = checkout_clone(document, "Repo Clone 2")
+    worktree = checkout_worktree(clone, "outside")
+    worktree["head"]["branch"] = None
+    worktree["verdict"] = dict(MERGED_VERDICT)
+    clone["branches"] = [b for b in clone["branches"] if b["name"] != "outside"]
+
+
+def signal_only_behind_clones(document):
+    """Nothing is removable or unfetched; Repo Clone 2 and Repo Clone 10 are behind."""
+    _, clone = checkout_clone(document, "Repo Clone 2")
+    clone["branches"] = [b for b in clone["branches"] if b["name"] != "outside"]
+    clone["worktrees"] = [w for w in clone["worktrees"] if w["main"]]
+    _, ten = checkout_clone(document, "Repo Clone 10")
+    ten["cached_default"] = copy.deepcopy(
+        checkout_clone(document, "Repo Clone 3")[1]["cached_default"])
+
+
+WINDOWS_SHAPED_REMOTE_KEY = r"file:C:\Users\runneradmin\Temp\pytest-7\remotes\festival-site"
+
+
+def signal_windows_shaped_remote_key(document):
+    """The remote repository served under the key Windows spells for it.
+
+    A ``file:`` path there carries backslashes, which CSS reads as escapes
+    (``\\U``, ``\\r``, ``\\t``), so a lookup that interpolates the key into a
+    selector matches nothing.
+    """
+    checkout_group(document, "remote")["remote"]["key"] = WINDOWS_SHAPED_REMOTE_KEY
+
+
 def with_observed_at(document, observed_at):
     """The same capture with one observation time; the digest does not cover it."""
     changed = copy.deepcopy(document)
@@ -9850,12 +10317,11 @@ def checkouts_focus(page):
 
 
 def open_clone_two_state(page):
-    """Open the quiet row, Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
+    """Open Repo Clone 2 and its fold; focus the row toggle; scroll 200 px.
 
     Returns the toggle's key and control.
     """
     page.set_viewport_size({"width": 1280, "height": 600})
-    page.locator("details.checkouts-quiet > summary").click()
     detail = open_clone_detail(page, "Repo Clone 2")
     fold = detail.locator(".checkouts-fold-toggle")
     assert fold.count() == 1
@@ -9869,8 +10335,7 @@ def open_clone_two_state(page):
 
 
 def assert_clone_two_state_kept(page, focus, scroll=200):
-    """The quiet row, the row, its fold, the focus and the scroll are as they were."""
-    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    """The row, its fold, the focus and the scroll are as they were."""
     row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
     assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "true"
     detail = row.locator("xpath=following-sibling::tr[1]")
@@ -9928,15 +10393,95 @@ def test_checkouts_refresh_keeps_open_state_focus_and_scroll_in_keyed_blocks(
     assert_clone_two_state_kept(page, focus)
     assert page.locator("#checkouts-action-status").inner_text() == pushed
     assert all(not action for _, action, _, _ in records)
+
+    # A count that changes under a focused pill keeps the pill, the open line,
+    # its tone and the scroll.
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    line = group.locator(".checkouts-line")
+    red = group.locator('button[data-pill="red-branches"]')
+    assert red.inner_text().endswith("1 branch local only")
+    red.focus()
+    held = page.evaluate_handle("document.activeElement")
+    scroll = page.evaluate("window.scrollY")
+
+    def own_worktree(document):
+        _, clone = checkout_clone(document, "Repo Clone 3")
+        main = next(worktree for worktree in clone["worktrees"] if worktree["main"])
+        main["changes"]["untracked"] = 2
+
+    serve_checkouts(page, double, checkout_variant(after, own_worktree))
+    assert red.inner_text().endswith("2 branches local only")
+    assert held.evaluate("node => node === document.activeElement")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+    assert line.get_attribute("data-tone") == "red"
+    assert page.evaluate("window.scrollY") == scroll
+
+    # A tone that changes under a focused pill keeps the pill and the open line.
+    amber = group.locator('button[data-pill="amber-branches"]')
+    assert amber.inner_text().endswith("1 branch to merge or clean up")
+    amber.focus()
+    held = page.evaluate_handle("document.activeElement")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert line.get_attribute("data-tone") == "amber"
+    assert red.count() == 0
+    assert amber.inner_text().endswith("1 branch to merge or clean up")
+    assert held.evaluate("node => node === document.activeElement")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
+    playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+
+    # Opening and closing a line writes no storage key.
+    keys = page.evaluate("Object.keys(localStorage)")
+    group.locator(".checkouts-line-toggle").click()
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    group.locator(".checkouts-line-toggle").click()
+    assert page.evaluate("Object.keys(localStorage)") == keys
     assert_focus_sampler_clean(page)
+
+    # An open bar list stays open across a delivered refresh, with its pill.
+    box = open_bar_list(page, "amber")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    playwright.expect(box).to_be_visible()
+    assert page.locator('.checkouts-bar-pill[data-list="amber"]').first.get_attribute(
+        "aria-expanded") == "true"
+    serve_checkouts(page, double, before)
+    playwright.expect(box).to_be_visible()
 
 
 def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     open_page, view_checkouts
 ):
-    """A removed row hands focus to the next row toggle, else the group heading."""
+    """A removed row hands focus to the next row toggle, else the group heading.
+
+    A pill on a closed line that the refresh removes leaves focus on the line
+    toggle, and a press on the removed pill moves and opens nothing.
+    """
     before = view_checkouts.document_topic_committed
     page, double = open_view_checkouts(open_page, view_checkouts, before)
+    group = page.locator(".checkouts-group").filter(has=page.locator(
+        'tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    group.locator('button[data-pill="red-branches"]').focus()
+    held = group.locator('button[data-pill="red-branches"]').element_handle()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(error))
+    arm_focus_sampler(page)
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert group.locator('button[data-pill="red-branches"]').count() == 0
+    # A press on the pill the refresh removed moves and opens nothing.
+    held.dispatch_event("click")
+    assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    assert page.locator('tr.checkouts-clone .checkouts-toggle[aria-expanded="true"]').count() == 0
+    assert errors == []
+    assert page.evaluate("""() => document.activeElement.classList.contains(
+      'checkouts-line-toggle')""") is True
+    assert group.locator(".checkouts-line-toggle").evaluate(
+        "el => el === document.activeElement")
+    assert_focus_sampler_clean(page)
+    # The row-removal steps below need the earlier capture's rows again.
+    serve_checkouts(page, double, before)
+
     detail = open_clone_detail(page, "Repo Clone 2")
     detail.locator('tr[data-branch="topic-a"]').focus()
     arm_focus_sampler(page)
@@ -9950,7 +10495,7 @@ def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     assert json.loads(focus["key"]) == ["clone", checkout_clone(before, "Repo Clone 3")[1]["path"]]
     assert_focus_sampler_clean(page)
 
-    # The tick that removes the group's last row moves it to the group heading.
+    # The tick that removes the group's last row moves it to the line toggle.
     page.locator(
         'tr.checkouts-clone[data-clone="Repo Clone 10"] .checkouts-toggle').focus()
 
@@ -9962,7 +10507,7 @@ def test_checkouts_refresh_moves_focus_to_the_next_row_when_its_row_goes(
     serve_checkouts(page, double, checkout_variant(before, without_last_clone))
     assert page.locator('tr.checkouts-clone[data-clone="Repo Clone 10"]').count() == 0
     focus = page.evaluate("""() => ({
-      head: document.activeElement.classList.contains('checkouts-group-head'),
+      head: document.activeElement.classList.contains('checkouts-line-toggle'),
       group: document.activeElement.closest('.checkouts-group').dataset.checkoutsGroup,
     })""")
     assert focus["head"] is True
@@ -10010,12 +10555,12 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     assert all(status for status, _, _ in checkouts_records(page))
 
     # A failed outcome shows the failed panel in place of the view; the next
-    # ready one restores the open row, its fold and the quiet row.
+    # ready one restores the open row and its fold.
     double.fail("checkouts_timeout")
     fire_checkouts_poll(page)
     playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
     assert page.locator(".checkouts-group").count() == 0
-    assert page.locator("details.checkouts-quiet").count() == 0
+    assert page.locator(".checkouts-quiet-line").count() == 0
     assert page.evaluate("document.activeElement.id") == "checkouts-heading"
     serve_checkouts(page, double, before)
     assert page.locator(".checkouts-panel").count() == 0
@@ -10025,7 +10570,7 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     assert detail.evaluate("el => el.hidden") is False
     assert detail.locator(".checkouts-fold-toggle").get_attribute("aria-expanded") == "true"
     assert detail.locator('tr[data-branch="outside"]').evaluate("el => el.hidden") is False
-    assert page.locator("details.checkouts-quiet").evaluate("el => el.open") is True
+    assert page.locator(".checkouts-quiet-line").count() == 1
     assert_focus_sampler_clean(page)
 
 
@@ -10049,6 +10594,58 @@ def test_checkouts_refresh_forgets_what_the_document_no_longer_has(
     assert row.locator(".checkouts-toggle").get_attribute("aria-expanded") == "false"
     assert row.locator("xpath=following-sibling::tr[1]").evaluate("el => el.hidden") is True
 
+    # An open repository the document drops is forgotten and returns closed.
+    open_repository(page, "remote")
+    def renamed(document):
+        remote = checkout_group(document, "remote")["remote"]
+        remote["key"] = "renamed.example/elsewhere"
+        remote["display"] = "elsewhere"
+
+    serve_checkouts(page, double, checkout_variant(before, renamed))
+    renamed_group = page.locator(".checkouts-group").filter(has=row)
+    assert renamed_group.locator(".checkouts-line-toggle").get_attribute(
+        "aria-expanded") == "false"
+    serve_checkouts(page, double, before)
+    line = page.locator(".checkouts-group").filter(has=row).locator(".checkouts-line-toggle")
+    assert line.get_attribute("aria-expanded") == "false"
+    playwright.expect(
+        page.locator(".checkouts-group").filter(has=row).locator(".checkouts-group-body")
+    ).to_be_hidden()
+
+    # A bar list none of whose pills remains is forgotten and returns closed.
+    open_bar_list(page, "red")
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator('.checkouts-bar-pill[data-list="red"]').count() == 0
+    assert page.locator('.checkouts-attention-listbox[data-list="red"]').count() == 0
+    serve_checkouts(page, double, before)
+    assert page.locator('.checkouts-bar-pill[data-list="red"]').first.get_attribute(
+        "aria-expanded") == "false"
+    playwright.expect(page.locator('.checkouts-attention-listbox[data-list="red"]')).to_be_hidden()
+
+    # An open repository that becomes quiet leaves and the quiet line counts it;
+    # Show unchecks the box, stores false, focuses the checkbox, and the
+    # repository returns closed.
+    quiet_display = checkout_group(before, "quiet")["remote"]["display"]
+    serve_checkouts(page, double, view_checkouts.document_quiet_stashed)
+    quiet_group = open_repository(page, "quiet")
+    assert quiet_group.locator(".checkouts-line-toggle").get_attribute(
+        "aria-expanded") == "true"
+    serve_checkouts(page, double, view_checkouts.document_topic_deleted)
+    assert page.locator(".checkouts-line-name").filter(
+        has_text=re.compile(re.escape(quiet_display) + "$")).count() == 0
+    quiet_line = page.locator("#checkouts-body .checkouts-quiet-line")
+    assert quiet_line.locator(".checkouts-quiet-count").inner_text() == (
+        "1 quiet repository hidden")
+    quiet_line.get_by_role("button", name="Show", exact=True).click()
+    assert page.evaluate("localStorage.getItem('spec-tracker-hide-quiet-checkouts')") == "false"
+    assert page.evaluate("document.activeElement.id") == "hide-quiet-checkouts"
+    assert not page.get_by_label("Hide quiet repositories", exact=True).is_checked()
+    assert page.locator("#checkouts-body .checkouts-quiet-line").count() == 0
+    returned = page.locator(".checkouts-group").filter(has=page.locator(
+        ".checkouts-line-name", has_text=re.compile(re.escape(quiet_display) + "$")))
+    assert returned.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "false"
+    playwright.expect(returned.locator(".checkouts-group-body")).to_be_hidden()
+
 
 def long_name_variant(view_checkouts):
     """A capture whose Repo Clone 10 path and ``topic-a`` branch are 300 unbroken characters."""
@@ -10062,8 +10659,16 @@ def long_name_variant(view_checkouts):
     return variant
 
 
+def open_every_repository(page):
+    """Open every repository line the view shows."""
+    for line in page.locator(".checkouts-line-toggle").all():
+        if line.get_attribute("aria-expanded") != "true":
+            line.click()
+
+
 def open_every_clone_row(page):
-    """Open each clone row's detail from its toggle."""
+    """Open every repository line, then each clone row's detail from its toggle."""
+    open_every_repository(page)
     for toggle in page.locator("#checkouts-body .checkouts-toggle").all():
         toggle.click()
 
@@ -10074,13 +10679,14 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
     """Stacked at 360 px, tabular from 701 px, with table roles throughout."""
     document = long_name_variant(view_checkouts)
     page, double = open_view_checkouts(open_page, view_checkouts, document)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
+    open_repository(page, "remote")
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     toggle_folders_editor(page)
     playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
         "Current checkout folders loaded.")
     add_folder(page, "/" + "q" * 299)
-    columns = ["Checkout", "Availability", "HEAD", "Default branch vs remote",
-               "Tree", "Branches", "Cleanup", "Package"]
+    columns = ["Checkout", "HEAD", "Local trunk vs remote trunk",
+               "Uncommitted changes", "Branches"]
     for theme in ("dark", "light"):
         page.get_by_label("Theme", exact=True).select_option(theme)
 
@@ -10115,9 +10721,10 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
             assert item["label"] == "cell-label" and item["display"] == "block"
             assert item["visibility"] == "visible"
             assert item["hasValue"] and item["before"] <= item["value"] + 1, item
-        for role, count in (("table", 1), ("row", 1), ("columnheader", 8), ("cell", 1)):
+        for role, count in (("table", 1), ("row", 1), ("columnheader", 5), ("cell", 1)):
             assert page.get_by_role(role).count() >= count, role
-        assert page.get_by_role("columnheader", name="Default branch vs remote").count() >= 1
+        assert page.get_by_role(
+            "columnheader", name="Local trunk vs remote trunk").count() >= 1
         assert page.get_by_role("cell").filter(has_text="3 branches").count() >= 1
 
         # The long names wrap inside their cells instead of widening the view.
@@ -10145,7 +10752,7 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
         settle_frames(page)
         for role in ("table", "row", "columnheader", "cell"):
             assert page.get_by_role(role).count() >= 1, role
-        assert page.get_by_role("columnheader", name="Cleanup").count() >= 1
+        assert page.get_by_role("columnheader", name="Uncommitted changes").count() >= 1
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth") is True
 
@@ -10155,12 +10762,16 @@ CHECKOUTS_TEXT_SAMPLES = {
     "column headers": "#checkouts th[scope=col]",
     "cell values": (
         "#checkouts-body td, #checkouts-body th[scope=row], .checkouts-basis, "
-        ".checkouts-empty, .checkouts-caption, .checkouts-note, .checkouts-blocker, "
+        ".checkouts-empty, .checkouts-caption, .checkouts-note, "
         ".checkouts-code-status, .checkouts-package-path, .checkouts-flag, "
-        ".checkouts-quiet summary, .checkouts-quiet li"),
+        ".checkouts-quiet-line, .checkouts-quiet-show"),
+    "toned phrases": ".checkouts-phrase, .checkouts-relation[data-tone]",
     "attention items": (
         ".checkouts-attention h2, .checkouts-attention-class, "
-        ".checkouts-attention-item, .checkouts-attention-go"),
+        ".checkouts-attention-item, .checkouts-attention-go, .checkouts-bar-pill"),
+    "repository lines": (
+        ".checkouts-line-name, .checkouts-line-trunk, .checkouts-line-activity, "
+        ".checkouts-line-inuse, .checkouts-pill"),
     "freshness words": ".checkouts-freshness",
     "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
     "folders editor": (
@@ -10204,6 +10815,7 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     setup = checkout_variant(
         folded_variant(view_checkouts.document_checked), add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, cached)
+    open_repository(page, "remote")
     page.set_viewport_size({"width": 1600, "height": 1200})
     page.get_by_label("Theme", exact=True).select_option(theme)
     # An open editor with one draft folder shows every control it has.
@@ -10217,25 +10829,56 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
     detail.locator(".checkouts-fold-toggle").click()
     # The cached capture shows the freshness words; the setup capture its panel.
     shown = {}
-    for document in (cached, setup):
-        if document is setup:
-            serve_checkouts(page, double, setup)
+    # The committed capture draws the red phrase (`1 local only`), the one tone
+    # the other two captures never show.  It is served folded so that the fold
+    # control the ring check below focuses stays drawn; the unfolded capture
+    # leaves that control absent, and focusing it would wait for a poll
+    # re-render instead of measuring the ring.
+    red = folded_variant(view_checkouts.document_topic_committed)
+    for document in (cached, setup, red):
+        if document is not cached:
+            serve_checkouts(page, double, document)
+            open_every_repository(page)
         settle_frames(page)
         for name, pairs in checkouts_text_colors(page).items():
             shown.setdefault(name, []).extend(pairs)
+    failed = page.evaluate("""() => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--state-failed)';
+      document.body.append(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    }""")
+    assert ("local only", failed) in [
+        (sample[-10:], color) for color, _, sample in shown["toned phrases"]
+    ], "no red phrase is measured"
     for name, pairs in shown.items():
         assert pairs, f"nothing is shown for {name}"
         for color, background, sample in pairs:
             ratio = contrast_ratio(color, background)
             assert ratio >= 4.5, (name, sample, color, background, ratio)
 
+    open_every_repository(page)
+    open_every_bar_list(page)
+    settle_frames(page)
+    for name, pairs in checkouts_text_colors(page).items():
+        if name != "attention items":
+            continue
+        assert pairs
+        for color, background, sample in pairs:
+            ratio = contrast_ratio(color, background)
+            assert ratio >= 4.5, (name, sample, color, background, ratio)
     rings = {
         "view switch": "#view-checkouts",
+        "line toggle": ".checkouts-line-toggle",
         "row toggle": 'tr.checkouts-clone[data-clone="Repo Clone 3"] .checkouts-toggle',
         "fold": ".checkouts-fold-toggle",
+        "bar pill": ".checkouts-bar-pill",
         "attention item": ".checkouts-attention-go",
         "Check remotes now": "#check-remotes",
         "Show on board": ".checkouts-show-on-board",
+        "Show quiet repositories": ".checkouts-quiet-show",
         "folders summary": "#checkout-folders-editor summary",
         "folders path": "#checkout-folders-path",
         "folders Add": "#checkout-folders-add",
@@ -10248,6 +10891,448 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
         # A key press makes the next script focus show as keyboard focus.
         page.keyboard.press("Shift")
         assert_focus_indicator(page.locator(selector).first), name
+
+
+RED_MARK, AMBER_MARK = "\u2715\ufe0e", "\u26a0\ufe0e"
+LINE_TONE_TOKENS = {
+    "red": "--state-failed", "amber": "--state-waiting",
+    "green": "--state-done", "grey": "--control-border",
+}
+
+
+def repository_section_indexes(page, key):
+    """Where the sections a served repository key draws sit, in the served order.
+
+    The key is a remote URL, which Windows spells as a ``file:`` path with
+    backslashes; CSS reads ``\\U``, ``\\r`` and ``\\t`` there as escapes, so the
+    sections are compared as data instead of being interpolated into a selector.
+    """
+    return page.locator(".checkouts-group").evaluate_all(
+        """(items, key) => items.flatMap(
+          (item, index) => item.dataset.checkoutsGroup === key ? [index] : [])""", key)
+
+
+def repository_line(page, group):
+    """The line a served group draws: tone, pill texts in order, activity and name words."""
+    return page.evaluate("""(key) => {
+      const section = [...document.querySelectorAll('.checkouts-group')]
+        .find((item) => item.dataset.checkoutsGroup === key);
+      if (section === undefined) return null;
+      const line = section.querySelector('.checkouts-line');
+      return {
+        tone: line.dataset.tone,
+        pills: [...line.querySelectorAll('.checkouts-pill')].map((pill) => pill.innerText),
+        activity: line.querySelector('.checkouts-line-activity').innerText,
+        name: line.querySelector('.checkouts-line-name').innerText,
+        trunk: line.querySelector('.checkouts-line-trunk').innerText,
+        inUseTone: line.querySelector('.checkouts-line-inuse').dataset.tone || null,
+      };
+    }""", group["remote"]["key"])
+
+
+def clone_rows(page, group):
+    """Each clone row's cells as the table draws them: toned phrases and the dash."""
+    return page.evaluate("""(key) => {
+      const section = [...document.querySelectorAll('.checkouts-group')]
+        .find((item) => item.dataset.checkoutsGroup === key);
+      const phrase = (node) => ({text: node.innerText, tone: node.dataset.tone,
+        branches: node.dataset.branches ? JSON.parse(node.dataset.branches) : null});
+      return Object.fromEntries([...section.querySelectorAll('tr.checkouts-clone')].map((row) => {
+        const relation = row.querySelector('.checkouts-relation');
+        return [row.dataset.clone, {
+          headers: [...section.querySelectorAll('table.checkouts-clones > thead th')]
+            .map((cell) => cell.innerText),
+          cells: [...row.children].map((cell) => cell.className),
+          relation: relation === null ? null : [relation.innerText, relation.dataset.tone || null],
+          uncommitted: (() => {
+            const cell = row.querySelector('td.checkouts-tree');
+            return cell === null ? null : [cell.textContent.slice(cell.firstElementChild.textContent.length),
+              [...cell.querySelectorAll('.checkouts-phrase')].map((node) => node.dataset.tone)];
+          })(),
+          branches: [...row.querySelectorAll('td.checkouts-branches .checkouts-phrase')].map(phrase),
+          branchesText: row.querySelector('td.checkouts-branches') === null ? null
+            : row.querySelector('td.checkouts-branches').innerText,
+        }];
+      }));
+    }""", group["remote"]["key"])
+
+
+UP_TO_DATE, CLEAN = ("up to date", None), ("—", [])
+
+
+def row_facts(relation=UP_TO_DATE, uncommitted=CLEAN, phrases=(), words=None):
+    """What one clone row draws: the relation and tone, the Uncommitted changes
+    cell with its tones, and the Branches phrases with their tones, in order."""
+    return {"relation": list(relation), "uncommitted": [uncommitted[0], uncommitted[1]],
+            "phrases": [list(phrase) for phrase in phrases], "words": words}
+
+
+def drawn_row(row):
+    return {"relation": row["relation"], "uncommitted": row["uncommitted"],
+            "phrases": [[phrase["text"], phrase["tone"]] for phrase in row["branches"]],
+            "words": row["branchesText"].split("\n", 1)[-1]}
+
+
+def assert_rows_drawn(rows, expected, case, trunk="trunk"):
+    """Every clone row of the line matches the expectation, ``row_facts`` by default."""
+    assert list(rows) == list(expected), case
+    for name, facts in expected.items():
+        drawn = drawn_row(rows[name])
+        if facts["words"] is None:
+            drawn["words"] = None
+        assert drawn == facts, (case, name, drawn)
+        assert rows[name]["headers"] == [
+            "Checkout", "HEAD", f"Local {trunk} vs remote {trunk}",
+            "Uncommitted changes", "Branches"]
+        assert rows[name]["cells"] == [
+            "checkouts-checkout", "checkouts-head", "checkouts-default",
+            "checkouts-tree", "checkouts-branches"], (case, name)
+
+
+def local_only_union(rows):
+    """The distinct branch names the rows' red ``local only`` phrases name."""
+    return {
+        name for row in rows.values() for phrase in row["branches"]
+        if phrase["text"].endswith("local only") for name in phrase["branches"]
+    }
+
+
+def assert_one_phrase_per_branch(rows, case):
+    """A branch a row names takes exactly one phrase, whatever its state."""
+    for name, row in rows.items():
+        named = []
+        for phrase in row["branches"]:
+            branches = phrase["branches"] or []
+            if branches:
+                assert len(branches) == int(phrase["text"].split()[0]), (case, name, phrase)
+            named += branches
+        assert len(named) == len(set(named)), (case, name, named)
+
+
+def red_pill_count(line):
+    """The branch count of a line's counted red pill, 0 when it has none."""
+    for pill in line["pills"]:
+        if pill.endswith("local only") and RED_MARK in pill and "changes" not in pill:
+            return int(pill.split()[1])
+    return 0
+
+
+def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts, view_checkouts):
+    """Every domain case draws the tone, pills in order and activity the rules give."""
+    work = " · 2 work items"
+    in_use = "1 of 3 in use" + work
+    quiet_clone = "0 of 1 in use"
+    attention_cases = [
+        # id, mutation, tone, pills, activity
+        ("a", None, "red", [f"{RED_MARK} 3 branches local only",
+                            f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        ("b", signal_topic_a_in_two_clones, "red", [
+            f"{RED_MARK} 3 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        ("c", signal_topic_a_merged_and_held, "red", [
+            f"{RED_MARK} 2 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        # Both clones that hold the finished, unmerged branch take its phrase,
+        # while the line still counts the branch once.
+        ("r", signal_topic_g_in_two_clones, "red", [
+            f"{RED_MARK} 3 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        # The finished work item is merged and held in a main worktree, so its
+        # branch names no phrase at all; the holder counts as one more clone in
+        # use, while the finished work item still counts as a served one.
+        ("s", signal_topic_g_merged_and_held_in_a_main_worktree, "red", [
+            f"{RED_MARK} 3 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], "2 of 3 in use" + work),
+    ]
+    view_cases = [
+        ("m-base", None, "remote", "amber", [
+            f"{AMBER_MARK} 1 branch to merge or clean up",
+            f"{AMBER_MARK} trunk behind remote"], in_use),
+        ("d", "stashed", "quiet", "red", [f"{RED_MARK} changes only on this machine"],
+         quiet_clone),
+        ("e", signal_quiet_changes_on_a_detached_checkout, "quiet", "red",
+         [f"{RED_MARK} changes only on this machine"], "1 of 1 in use"),
+        ("f", signal_quiet_default_branch_diverged, "quiet", "red",
+         [f"{RED_MARK} 1 branch local only"], quiet_clone),
+        ("g", signal_quiet_default_branch_main_behind, "quiet", "amber",
+         [f"{AMBER_MARK} main behind remote"], quiet_clone),
+        ("h", signal_quiet_never_fetched, "quiet", "amber", [], quiet_clone),
+        ("i", signal_quiet_other_branch_checked_out, "quiet", "green", [], "1 of 1 in use"),
+        ("j", signal_quiet_assigned_alpha, "quiet", "green", [],
+         "1 of 1 in use · 1 work item"),
+        ("k", signal_quiet_second_free_clone, "quiet", "grey", [], "0 of 2 in use"),
+        ("l", None, "quiet", "grey", [], quiet_clone),
+        ("o", signal_quiet_index_lock, "quiet", "grey", [], quiet_clone),
+        ("m", signal_detached_removable_worktree, "remote", "amber", [
+            f"{AMBER_MARK} worktrees to clean up", f"{AMBER_MARK} trunk behind remote"], in_use),
+        ("n", signal_only_behind_clones, "remote", "amber",
+         [f"{AMBER_MARK} trunk behind remote"], in_use),
+        # A free clone that only serves a live work item is green, not grey: the
+        # finished work item still shows a Code Status, so it counts as served.
+        ("q", signal_quiet_serves_a_finished_work_item_with_code_status, "quiet", "green",
+         [], "0 of 1 in use · 1 work item"),
+    ]
+
+    # ``topic-g`` is finished and unmerged, so its row takes the awaiting-merge
+    # phrase, which the green one cannot also take.
+    awaiting_and_removable = (
+        ("1 awaiting merge", "amber"), ("2 merged, removable", "amber"))
+    stash = ("1 stash", "red")
+    attention_rows = {
+        "a": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        "b": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
+            "Repo Clone 3": row_facts(phrases=(("2 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        # Held by the unfinished work item, topic-a is not removable.
+        "c": {
+            "Repo Clone 2": row_facts(phrases=(("1 local only", "red"), *awaiting_and_removable)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        # The second clone holding the same branch takes its phrase too.
+        "r": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"),
+                                               ("1 awaiting merge", "amber"), stash)),
+            "Repo Clone 10": row_facts()},
+        # The merged branch is removable where no main worktree holds it, and
+        # the finished work item's branch names no phrase at all where one does.
+        "s": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"),
+                                               ("3 merged, removable", "amber"))),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+    }
+    behind = ("1 behind", "amber")
+    behind_rows = {
+        "Repo Clone 2": row_facts(relation=behind, phrases=(("1 in progress", "green"),)),
+        "Repo Clone 3": row_facts(),
+        "Repo Clone 10": row_facts(relation=behind),
+    }
+    quiet_only = {"Quiet Clone": row_facts()}
+    view_rows = {
+        "m-base": {
+            **behind_rows,
+            "Repo Clone 2": row_facts(relation=behind, phrases=(
+                ("1 merged, removable", "amber"), ("1 in progress", "green")))},
+        "d": {"Quiet Clone": row_facts(phrases=(stash,))},
+        # No branch is named, so the pill is uncounted and no phrase is red.
+        "e": {"Quiet Clone": row_facts(uncommitted=("1 untracked", ["red"]))},
+        "f": {"Quiet Clone": row_facts(
+            relation=("1 ahead, 1 behind", "red"), phrases=(("1 local only", "red"),))},
+        "g": {"Quiet Clone": row_facts(relation=behind)},
+        "h": quiet_only, "i": quiet_only, "j": quiet_only,
+        "k": {"Quiet Clone": row_facts(), "Quiet Clone 2": row_facts()},
+        "q": quiet_only,
+        # A muted dash for a clean checkout.
+        "l": quiet_only,
+        "m": behind_rows, "n": behind_rows,
+        "o": {"Quiet Clone": row_facts(uncommitted=("clean · index lock present", []))},
+    }
+    # The attention world: the cases that count branches.
+    base = attention_checkouts.document
+    page, double = open_attention_checkouts(open_page, attention_checkouts, base)
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    remote = checkout_group(base, "remote")
+    for case, mutation, tone, pills, activity in attention_cases:
+        served = base if mutation is None else checkout_variant(base, mutation)
+        serve_checkouts(page, double, served)
+        line = repository_line(page, remote)
+        assert (line["tone"], line["pills"], line["activity"]) == (tone, pills, activity), case
+        assert line["inUseTone"] is None, case
+        rows = clone_rows(page, remote)
+        assert_rows_drawn(rows, attention_rows[case], case)
+        assert_one_phrase_per_branch(rows, case)
+        assert len(local_only_union(rows)) == red_pill_count(line), case
+        if case == "s":
+            # The finished work item is merged, so nothing waits on its merge,
+            # and the clone that holds its branch in a main worktree is blocked
+            # by that checkout alone: the branch no longer reads in progress.
+            assert [item for item in served["attention"]
+                    if item["class"] == "awaiting_merge"] == []
+            _, holder = checkout_clone(served, "Repo Clone 3")
+            held = next(item for item in holder["branches"] if item["name"] == "topic-g")
+            assert held["removable"] == {
+                "removable": False, "blockers": ["checked_out_in_main_worktree"]}
+            green = [name for row in rows.values() for phrase in row["branches"]
+                     if phrase["tone"] == "green" for name in phrase["branches"]]
+            assert "topic-g" not in green
+        # Documented order: the repository's only line, whatever its tone.
+        assert page.locator(".checkouts-line").count() == 1, case
+
+    # The view world: the cases that read one repository each.
+    base = view_checkouts.document_checked
+    page, double = open_view_checkouts(open_page, view_checkouts, base)
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+    served_order = [group["remote"]["key"] for group in base["repositories"]]
+    for case, mutation, display, tone, pills, activity in view_cases:
+        if mutation == "stashed":
+            document = view_checkouts.document_quiet_stashed
+        else:
+            document = base if mutation is None else checkout_variant(base, mutation)
+        serve_checkouts(page, double, document)
+        group = checkout_group(document, display)
+        line = repository_line(page, group)
+        assert (line["tone"], line["pills"], line["activity"]) == (tone, pills, activity), case
+        # Green words take the green tone only on a green line.
+        assert line["inUseTone"] == ("green" if tone == "green" else None), case
+        # Lines keep the served repository order whatever their tones.
+        keys = page.locator(".checkouts-group").evaluate_all(
+            "items => items.map(item => item.dataset.checkoutsGroup)")
+        assert keys == served_order, case
+        assert line["name"] == group["remote"]["display"], case
+        rows = clone_rows(page, group)
+        assert_rows_drawn(rows, view_rows[case], case, "main" if case == "g" else "trunk")
+        assert_one_phrase_per_branch(rows, case)
+        assert len(local_only_union(rows)) == red_pill_count(line), case
+        if case in ("m", "n"):
+            indexes = repository_section_indexes(page, group["remote"]["key"])
+            assert len(indexes) == 1, (case, indexes)
+            section = page.locator(".checkouts-group").nth(indexes[0])
+            line_toggle = section.locator(".checkouts-line-toggle")
+            if line_toggle.get_attribute("aria-expanded") == "true":
+                line_toggle.click()
+            if case == "n":
+                # The attention array is empty, yet the bar holds the behind pill,
+                # its list names the repository, and pressing it clears a search
+                # that hides every repository, then opens the line and focuses
+                # the first behind clone's row.
+                assert document["attention"] == []
+                assert bar_pill_texts(page) == [f"{AMBER_MARK} 1 repository behind remote"]
+                behind = open_bar_list(page, "behind")
+                assert behind.locator("li").all_inner_texts() == [
+                    group["remote"]["display"]]
+                page.fill("#filter", "zzz")
+                assert page.locator(".checkouts-group").evaluate_all(
+                    "groups => groups.map(group => group.hidden)") == [True] * 2
+                behind = open_bar_list(page, "behind")
+                behind.locator("li button").press("Enter")
+                assert page.locator("#filter").input_value() == ""
+                assert line_toggle.get_attribute("aria-expanded") == "true"
+                target = focused_checkouts_target(page)
+                assert target["clone"] == "Repo Clone 2"
+                assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
+                line_toggle.click()
+            else:
+                # The worktree pill sits in the bar without a branch-count pill,
+                # and opens the amber list holding the removable item.
+                assert bar_pill_texts(page) == [
+                    f"{AMBER_MARK} worktrees to clean up",
+                    f"{AMBER_MARK} 1 repository behind remote"]
+                page.locator('.checkouts-bar-pill[data-bar-pill="amber-worktrees"]').click()
+                listing = page.locator('.checkouts-attention-listbox[data-list="amber"]')
+                playwright.expect(listing).to_be_visible()
+                removable = listing.locator('li[data-code="removable"]')
+                assert "Repo Clone 2" in removable.inner_text()
+                page.locator('.checkouts-bar-pill[data-bar-pill="amber-worktrees"]').click()
+                playwright.expect(listing).to_be_hidden()
+            pill = section.locator(
+                'button[data-pill="amber-worktrees"]' if case == "m"
+                else 'button[data-pill="amber-behind"]')
+            pill.press("Enter")
+            assert section.locator(".checkouts-line-toggle").get_attribute(
+                "aria-expanded") == "true", case
+            target = focused_checkouts_target(page)
+            assert target["clone"] == "Repo Clone 2", case
+            if case == "m":
+                # The worktree pill goes to that clone's toggle, as its list item does.
+                assert (target["cls"], target["expanded"]) == ("checkouts-toggle", "false")
+            else:
+                # The behind pill focuses the first behind clone's row.
+                assert target["tag"] == "TR" and "checkouts-clone" in target["cls"]
+
+    # The red total is the sum of the lines' counts: the remote line's one and
+    # the quiet line's one.
+    both = checkout_variant(
+        view_checkouts.document_topic_committed, signal_quiet_default_branch_diverged)
+    serve_checkouts(page, double, both)
+    assert repository_line(page, checkout_group(both, "remote"))["pills"][0] == \
+        f"{RED_MARK} 1 branch local only"
+    assert repository_line(page, checkout_group(both, "quiet"))["pills"] == [
+        f"{RED_MARK} 1 branch local only"]
+    assert bar_pill_texts(page)[0] == f"{RED_MARK} 2 branches local only"
+
+    # Windows spells a ``file:`` remote key with backslashes, which CSS reads as
+    # escapes: the line and its toggle must still be found and read as data.
+    serve_checkouts(page, double, checkout_variant(base, signal_windows_shaped_remote_key))
+    indexes = repository_section_indexes(page, WINDOWS_SHAPED_REMOTE_KEY)
+    assert len(indexes) == 1, indexes
+    toggle = page.locator(".checkouts-group").nth(indexes[0]).locator(
+        ".checkouts-line-toggle")
+    assert toggle.get_attribute("aria-expanded") == "false"
+    toggle.press("Enter")
+    assert toggle.get_attribute("aria-expanded") == "true"
+
+    # A grey repository the quiet rule does not call quiet is shown with the box
+    # checked; one it does call quiet is not.
+    serve_checkouts(page, double, checkout_variant(base, signal_quiet_second_free_clone))
+    quiet_key = checkout_group(base, "quiet")["remote"]["key"]
+    page.get_by_label("Hide quiet repositories", exact=True).check()
+    assert repository_line(page, checkout_group(base, "quiet"))["tone"] == "grey"
+    serve_checkouts(page, double, base)
+    assert repository_line(page, checkout_group(base, "quiet")) is None
+    assert repository_section_indexes(page, quiet_key) == []
+    page.get_by_label("Hide quiet repositories", exact=True).uncheck()
+
+    # Each tone's edge is its existing token, in both themes.
+    for theme in ("dark", "light"):
+        page.get_by_label("Theme", exact=True).select_option(theme)
+        for tone, token in LINE_TONE_TOKENS.items():
+            document = {
+                "red": view_checkouts.document_quiet_stashed,
+                "amber": checkout_variant(base, signal_quiet_default_branch_main_behind),
+                "green": checkout_variant(base, signal_quiet_other_branch_checked_out),
+                "grey": base,
+            }[tone]
+            serve_checkouts(page, double, document)
+            quiet = checkout_group(document, "quiet")
+            seen = page.evaluate("""([key, token]) => {
+              const section = [...document.querySelectorAll('.checkouts-group')]
+                .find((item) => item.dataset.checkoutsGroup === key);
+              const probe = document.createElement('span');
+              probe.style.color = `var(${token})`;
+              document.body.append(probe);
+              const expected = getComputedStyle(probe).color;
+              probe.remove();
+              const line = section.querySelector('.checkouts-line');
+              return [line.dataset.tone, getComputedStyle(line).borderLeftColor, expected];
+            }""", [quiet["remote"]["key"], token])
+            assert seen[0] == tone, (theme, tone)
+            assert seen[1] == seen[2], (theme, tone, token, seen)
+
+
+def test_checkouts_signal_second_free_clone_rewrites_windows_shaped_paths(view_checkouts):
+    """Case (k)'s copy moves every path of a Windows-spelled clone, not its JSON text.
+
+    ``json.dumps`` escapes each backslash, so a rewrite of the serialized text finds no
+    Windows path and leaves the copy repeating the original's paths, which the parser
+    refuses.  This capture therefore holds the mutation to the parsed facts on every
+    platform; the rendered case (k) assertions stay in the signal-rules test.
+    """
+    base = windows_shaped_quiet_capture(view_checkouts.document_checked)
+    shaped = checkout_group(base, "quiet")["clones"]
+    assert len(shaped) == 1
+    windows = shaped[0]
+    assert windows["path"].startswith("C:\\") and "\\" in windows["worktrees"][0]["path"]
+
+    variant = checkout_variant(base, signal_quiet_second_free_clone)
+    clones = checkout_group(variant, "quiet")["clones"]
+    assert sorted(clone["path"] for clone in clones) == sorted(
+        [windows["path"], windows["path"] + " 2"])
+    assert [clone["availability"]["state"] for clone in clones] == ["free", "free"]
+    second = next(clone for clone in clones if clone["path"] == windows["path"] + " 2")
+
+    # The copy's worktrees and branch checkouts moved with its own path, not the
+    # original's, so it is a second clone rather than a repeat of the first.
+    assert [worktree["path"] for worktree in second["worktrees"]] == [
+        path + " 2" for path in (worktree["path"] for worktree in windows["worktrees"])]
+    checked_out = [path for branch in second["branches"]
+                   for path in branch["checked_out_in"]]
+    assert checked_out
+    assert set(checked_out) <= {worktree["path"] for worktree in second["worktrees"]}
 
 
 def tab_until(page, probe):
@@ -10321,6 +11406,29 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     page.keyboard.press("Enter")
     assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
 
+    # A repository line opens with Enter and closes with Space, and the body
+    # it holds is shown only while it is open.
+    tab_until(page, """(() => {
+      const el = document.activeElement;
+      return el.classList.contains('checkouts-line-toggle') &&
+        el.closest('.checkouts-group').querySelector(
+          'tr.checkouts-clone[data-clone="Repo Clone 2"]') !== null;
+    })()""")
+    line = page.locator(".checkouts-line-toggle").filter(
+        has_text=checkout_group(document, "remote")["remote"]["display"])
+    body = page.locator(".checkouts-group-body").filter(
+        has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]'))
+    assert line.get_attribute("aria-expanded") == "false"
+    assert body.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
+    assert body.evaluate("el => el.hidden") is False
+    page.keyboard.press("Space")
+    assert line.get_attribute("aria-expanded") == "false"
+    assert body.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert line.get_attribute("aria-expanded") == "true"
+
     # A row toggle opens with Enter and closes with Space.
     toggle_probe = f"""(() => {{
       const el = document.activeElement;
@@ -10355,6 +11463,22 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
         JSON.parse(el.getAttribute('data-key'))[1] === {json.dumps(clone_three)};
     }})()""")
 
+    # A bar pill opens its list with Enter and closes it with Space; the list is
+    # shown only while open.
+    tab_until(page, "document.activeElement.matches('.checkouts-bar-pill[data-list=red]')")
+    pill = page.locator('.checkouts-bar-pill[data-list="red"]')
+    red_list = page.locator('.checkouts-attention-listbox[data-list="red"]')
+    assert pill.get_attribute("aria-expanded") == "false"
+    assert red_list.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert pill.get_attribute("aria-expanded") == "true"
+    assert red_list.evaluate("el => el.hidden") is False
+    page.keyboard.press("Space")
+    assert pill.get_attribute("aria-expanded") == "false"
+    assert red_list.evaluate("el => el.hidden") is True
+    page.keyboard.press("Enter")
+    assert red_list.evaluate("el => el.hidden") is False
+
     # An attention item moves focus to the row it names.
     tab_until(page, """(() => {
       const el = document.activeElement;
@@ -10375,13 +11499,21 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     playwright.expect(page.locator("#board")).to_be_visible()
     assert page.evaluate("document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
 
+    # The quiet line's Show unchecks the box with Enter and moves focus to it.
+    page.locator("#view-checkouts").click()
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    tab_until(page, "document.activeElement.matches('.checkouts-quiet-show')")
+    page.keyboard.press("Enter")
+    assert page.evaluate("document.activeElement.id") == "hide-quiet-checkouts"
+    assert not page.locator("#hide-quiet-checkouts").is_checked()
+    assert page.locator(".checkouts-quiet-line").count() == 0
+
 
 def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_checkouts):
     """Refreshed content is never announced; the action status is the one region."""
     ready = view_checkouts.document_topic_committed
     setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, ready)
-    page.get_by_label("Hide quiet checkouts", exact=True).uncheck()
     observe_checkouts_mutations(page)
     live = """() => [...document.querySelectorAll(
       '#checkouts [aria-live], #checkouts [role=status], #checkouts [role=alert], #checkouts output')]
@@ -10398,12 +11530,25 @@ def test_checkouts_only_the_action_status_is_a_live_region(open_page, view_check
         assert all(not action for _, action, _ in checkouts_records(page))
         assert page.locator("#checkouts-action-status").inner_text() == ""
         assert page.locator("#checkout-folders-status").inner_text() == ""
+    # Pressing a bar pill announces nothing and adds no region.
+    serve_checkouts(page, double, ready)
+    open_bar_list(page, "red")
+    assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+    assert page.locator("#checkouts-action-status").inner_text() == ""
+    assert page.locator(".checkouts-bar-pill[aria-live], .checkouts-attention-listbox[aria-live]"
+                        ).count() == 0
+    # The quiet line announces nothing, and neither does pressing Show.
+    assert page.locator(".checkouts-quiet-line[aria-live], .checkouts-quiet-line [aria-live]"
+                        ).count() == 0
+    page.locator(".checkouts-quiet-show").click()
+    assert page.evaluate(live) == ["checkouts-action-status", "checkout-folders-status"]
+    assert page.locator("#checkouts-action-status").inner_text() == ""
 
 
-def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
+def test_checkouts_quiet_line_counts_only_the_matching_repositories(
     open_page, view_checkouts
 ):
-    """With two quiet repositories a query lists and counts only the one it matches."""
+    """With two quiet repositories a query counts only the one it matches."""
     document = copy.deepcopy(view_checkouts.document_built)
     quiet = checkout_group(document, "quiet")
     twin = copy.deepcopy(quiet)
@@ -10415,20 +11560,14 @@ def test_checkouts_quiet_row_lists_and_counts_only_the_matching_repositories(
             tree["path"] = tree["path"].replace("quiet", "twinclone")
     document["repositories"].append(twin)
     page, _ = open_view_checkouts(open_page, view_checkouts, redigest(document))
-    row = page.locator("#checkouts-body .checkouts-quiet")
-    summary = row.locator("summary")
-    assert summary.inner_text() == "Quiet repositories (2)"
+    count = page.locator("#checkouts-body .checkouts-quiet-line .checkouts-quiet-count")
+    assert count.inner_text() == "2 quiet repositories hidden"
 
     page.fill("#filter", "twin-repository")
-    playwright.expect(row).to_be_visible()
-    assert summary.inner_text() == "Quiet repositories (2, 1 matching)"
-    row.locator("summary").click()
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(1)
-    assert "twin-repository" in row.locator("li:not([hidden])").inner_text()
+    assert count.inner_text() == "1 quiet repository hidden"
 
     page.fill("#filter", "")
-    assert summary.inner_text() == "Quiet repositories (2)"
-    playwright.expect(row.locator("li:not([hidden])")).to_have_count(2)
+    assert count.inner_text() == "2 quiet repositories hidden"
 
 
 # ---------------------------------------------------------------------------
@@ -12400,17 +13539,16 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     assert gamma["finished"] is True and gamma["code_status"] is None
     assert gamma["target"]["status"] == "clone"
     page, double = open_view_checkouts(open_page, view_checkouts, document)
+    open_repository(page, "remote")
     body = page.locator("#checkouts-body")
     clone_name = Path(gamma["target"]["clone"]).name
     group = page.locator(".checkouts-group").filter(
         has=page.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]'))
-    clone_row = group.locator(f'tr.checkouts-clone[data-clone="{clone_name}"]')
 
     def gamma_shown():
         return {
             "branch": group.locator(
                 'table.checkouts-package-branches tr[data-branch="topic-c"]').count(),
-            "package": "Repo/Shipped/gamma" in clone_row.locator(".checkouts-package").inner_text(),
             "detail": group.locator(
                 '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count(),
             "anywhere": "Repo/Shipped/gamma" in body.inner_text(),
@@ -12418,10 +13556,11 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
         }
 
     assert gamma_shown() == {
-        "branch": 0, "package": False, "detail": 0, "anywhere": False, "search": False,
+        "branch": 0, "detail": 0, "anywhere": False, "search": False,
     }
-    # The unfinished work items of the same clone are still listed.
-    assert "Repo/Drafts/alpha" in clone_row.locator(".checkouts-package").inner_text()
+    # The unfinished work items of the same clone are still listed in its Details.
+    assert group.locator(
+        '.checkouts-clone-work-item[data-package="Repo/Drafts/alpha"]').count() == 1
     page.fill("#filter", "gamma")
     playwright.expect(group).to_be_hidden()
     page.fill("#filter", "")
@@ -12429,13 +13568,13 @@ def test_checkouts_view_leaves_out_finished_work_items_with_nothing_to_act_on(
     # Served as unfinished, the same work item is listed everywhere again.
     serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
     assert gamma_shown() == {
-        "branch": 1, "package": True, "detail": 1, "anywhere": True, "search": True,
+        "branch": 1, "detail": 1, "anywhere": True, "search": True,
     }
     page.fill("#filter", "gamma")
     playwright.expect(group).to_be_visible()
 
 
-def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
+def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_line(
     open_page, view_checkouts
 ):
     """Only a work item the view still lists makes its target's repository a group."""
@@ -12459,18 +13598,19 @@ def test_finished_work_item_does_not_keep_a_repository_out_of_the_quiet_row(
         return checkout_raw_variant(document, mutate)
 
     page, double = open_view_checkouts(open_page, view_checkouts, retarget(True))
-    quiet_items = page.locator("details.checkouts-quiet li")
+    quiet_line = page.locator(".checkouts-quiet-line")
     quiet_group = page.locator(".checkouts-group").filter(
         has=page.locator(f'tr.checkouts-clone[data-clone="{Path(quiet_clone).name}"]'))
     # The finished work item targets the quiet clone and changes nothing.
-    assert quiet_items.count() == 1
+    assert quiet_line.count() == 1
     assert quiet_group.count() == 0
 
     # The same work item, unfinished, gives the repository a group of its own.
     serve_checkouts(page, double, retarget(False))
     playwright.expect(quiet_group).to_have_count(1)
-    assert quiet_items.count() == 0
-    assert "Repo/Shipped/gamma" in quiet_group.locator(".checkouts-package").inner_text()
+    assert quiet_line.count() == 0
+    assert quiet_group.locator(
+        '.checkouts-clone-work-item[data-package="Repo/Shipped/gamma"]').count() == 1
 
 
 def live(relation, ahead=None, behind=None):
@@ -12604,3 +13744,14 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     playwright.expect(page.locator("#work-item-panel-body .panel-code")).to_have_count(1)
     assert page.locator("#work-item-panel-body .panel-baseline-line").count() == 0
     assert "Baseline line legend" not in dict(panel_all_fields(page))
+
+
+def signal_quiet_serves_a_finished_work_item_with_code_status(document):
+    """Alpha is finished yet shows a Code Status; it targets Quiet Clone, which it leaves free."""
+    signal_quiet_assigned_alpha(document)
+    alpha = next(p for p in document["packages"] if p["package_path"] == "Repo/Drafts/alpha")
+    alpha["finished"] = True
+    alpha["code_status"] = {
+        "state": "merged", "text": "merged", "pull_request": None, "push": None,
+        "unpushed": None, "cleanup": {"worktrees": 0, "branches": 0},
+        "checked_out_elsewhere": []}

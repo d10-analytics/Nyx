@@ -69,31 +69,41 @@ README is narrative only.
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
-- Shows the Checkouts view beside the board, chosen with a header switch whose
-  choice and **Hide quiet checkouts** are browser-local preferences. The view
+- Shows the Repositories view beside the board, chosen with a header switch whose
+  choice and **Hide quiet repositories** are browser-local preferences. The view
   renders the served checkouts document: a status line with **Check remotes
   now** (a request for a remote check through `application-serving`) and the
   **Checkout folders** editor, whose save is the view's other write (the
-  checkout settings `PUT`), a **Needs attention** list whose items focus the
-  branch, clone, worktree or **Work item branches** row they name (a branch item
-  opens the clone's **Details** first) or select a work item's card, one group
-  per repository with openable clone **Details**, and a quiet row. The shared
-  search keeps a repository when its names, clone and worktree paths, branch
-  names, work item paths and Code Status text, the availability, HEAD and tree
-  words of its clone rows, the HEAD words of its linked worktrees, or the status
-  words of an unreadable clone or worktree match; no other column is searched,
-  and the quiet row is searched by the repositories it holds with the same text:
-  it stays while one matches, listing and counting only those, and is hidden when
-  none do. A finished work item with no Code Status is not shown: it adds no
+  checkout settings `PUT`), a **Needs attention** bar of pills with page totals
+  whose lists open below it and whose items focus the branch, clone, worktree or
+  **Work item branches** row they name (a branch item opens the clone's
+  **Details** first) or select a work item's card, and one line per repository
+  that opens and closes its tables. A line has a coloured left edge, red for work
+  only on this machine, amber for something waiting on the owner, green for active
+  and safe work and grey for nothing to report, and no separate state mark; it
+  carries ✕ red and ⚠ amber pills that count branches (`N branches local only`,
+  `N branches to merge or clean up`) and the uncounted `changes only on this
+  machine`, `worktrees to clean up` and `‹trunk› behind remote`. The clone table
+  has five columns (Checkout, HEAD, local against remote trunk, Uncommitted
+  changes, Branches), with toned phrases and a muted `—` for nothing to report.
+  With **Hide quiet repositories** checked the quiet repositories become one
+  `N quiet repositories hidden` line whose **Show** button unchecks the
+  preference. The page holds no legend. The shared search keeps a repository when
+  its names, clone and worktree paths, branch names, work item paths and Code
+  Status text, the availability, HEAD and tree words of its clone rows (including
+  `clean`, which no cell shows), the HEAD words of its linked worktrees, or the
+  status words of an unreadable clone or worktree match; no other column is
+  searched, it hides the lines that do not match without opening a matching line,
+  and the quiet line counts only the quiet repositories that match and is hidden
+  when none do. A finished work item with no Code Status is not shown: it adds no
   **Work item branches** row, Package or Details entry, or search text, and
-  never keeps a repository out of the quiet row.
+  never makes a repository count as not quiet.
   Every enumerated code the view shows and the sentence built around it come
   from one words block, so an unknown code renders raw; served failure
   categories are shown as their raw `checkouts_*` code. The view itself decides
-  which repositories are quiet, which pull-request lookup state the status line
+  which repositories are quiet, each repository's colour and pill counts, which pull-request lookup state the status line
   names (the most serious one any repository reached), and composes counts with
-  their plural nouns, the cleanup count sentence and fetch ages (`min`, `h`,
-  `d`) outside the words block. The view is drawn only while it is shown, and once on
+  their plural nouns and fetch ages (`min`, `h`, `d`) outside the words block. The view is drawn only while it is shown, and once on
   switching to it with the latest outcome, so a scan that settles while the board
   is shown does not touch the board; a refresh replaces only the blocks that
   changed, so what the reader opened and focused stays. A panel

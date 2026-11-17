@@ -267,23 +267,66 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
 }
 .checkouts-group[hidden] { display: none; }
-.checkouts-group-head {
+.checkouts-group-body { display: grid; gap: .6rem; min-width: 0; }
+.checkouts-group-body[hidden] { display: none; }
+.checkouts-line-toggle:focus-visible { outline-offset: 2px; }
+.checkouts-line {
+  --tone: var(--control-border);
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: .35rem 1rem;
   margin: 0;
+  padding: .45rem .75rem;
+  border-left: .3rem solid var(--tone);
   color: var(--heading);
   font-size: 1.05rem;
 }
-.checkouts-group-name { font-weight: 700; overflow-wrap: anywhere; }
-.checkouts-group-default,
+.checkouts-line[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-line[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-line[data-tone="green"] { --tone: var(--state-done); }
+.checkouts-line[data-tone="grey"] { --tone: var(--control-border); }
+.checkouts-line-toggle {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem 1rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.checkouts-line-name { font-weight: 700; overflow-wrap: anywhere; }
+.checkouts-line-trunk,
+.checkouts-line-activity,
 .checkouts-group-check,
 .checkouts-group-lookup,
 .checkouts-group-free {
   color: var(--muted);
   font-size: .85rem;
   font-weight: 400;
+}
+.checkouts-line-pills { display: inline-flex; flex-wrap: wrap; gap: .35rem; }
+.checkouts-pill {
+  --tone: var(--control-border);
+  padding: .15rem .55rem;
+  border: 1px solid var(--tone);
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--tone);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-pill[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-pill[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-line-inuse[data-tone="green"] { color: var(--state-done); }
+.checkouts-group-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem 1rem;
+  margin: 0;
 }
 .checkouts-group-free { overflow-wrap: anywhere; }
 .checkouts-clones,
@@ -326,7 +369,6 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .checkouts-flags,
 .checkouts-freshness,
 .checkouts-caption,
-.checkouts-blocker,
 .checkouts-note,
 .checkouts-flag {
   display: block;
@@ -342,6 +384,11 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .checkouts-group-lookup time,
 .checkouts-default time { font-variant-numeric: tabular-nums; }
 .checkouts-empty { color: var(--muted); }
+.checkouts-phrase[data-tone="red"],
+.checkouts-relation[data-tone="red"] { color: var(--state-failed); }
+.checkouts-phrase[data-tone="amber"],
+.checkouts-relation[data-tone="amber"] { color: var(--state-waiting); }
+.checkouts-phrase[data-tone="green"] { color: var(--state-done); }
 /* The column header names each cell at wider widths; the stacked layout shows
    the name before the value instead. */
 .cell-label { display: none; }
@@ -352,22 +399,15 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 #checkouts-body { grid-template-columns: minmax(0, 1fr); }
 .checkouts-group { min-width: 0; grid-template-columns: minmax(0, 1fr); }
 .checkouts-package-path { overflow-wrap: anywhere; }
-.checkouts-quiet {
-  padding: .6rem .9rem;
-  border: 1px solid var(--border);
-  border-radius: .45rem;
-  background: var(--surface);
+.checkouts-quiet-line {
+  margin: 0;
+  color: var(--muted);
 }
-.checkouts-quiet summary {
+.checkouts-quiet-show {
+  margin-left: .5rem;
+  font: inherit;
   cursor: pointer;
-  font-weight: 700;
 }
-.checkouts-quiet ul {
-  margin: .5rem 0 0;
-  padding-left: 1.15rem;
-}
-.checkouts-quiet-display { overflow-wrap: anywhere; }
-.checkouts-quiet-checkout { color: var(--muted); }
 .checkouts-work-item {
   display: inline-flex;
   flex-wrap: wrap;
@@ -397,6 +437,21 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   padding-left: 1.15rem;
 }
 .checkouts-attention-item { margin: .2rem 0; overflow-wrap: anywhere; }
+.checkouts-attention-bar { display: flex; flex-wrap: wrap; gap: .35rem; margin: .2rem 0 .4rem; }
+.checkouts-bar-pill {
+  --tone: var(--control-border);
+  padding: .15rem .55rem;
+  border: 1px solid var(--tone);
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--tone);
+  font-size: .85rem;
+  font-weight: 700;
+}
+.checkouts-bar-pill[data-tone="red"] { --tone: var(--state-failed); }
+.checkouts-bar-pill[data-tone="amber"] { --tone: var(--state-waiting); }
+.checkouts-bar-pill[aria-expanded="true"] { text-decoration: underline; }
+.checkouts-attention-listbox[hidden] { display: none; }
 .checkouts-attention-go {
   padding: .1rem .35rem;
   font: inherit;
