@@ -10040,6 +10040,16 @@ def signal_topic_a_in_two_clones(document):
     target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
 
 
+def signal_topic_g_in_two_clones(document):
+    """Repo Clone 3 holds a second copy of the finished, pushed ``topic-g``."""
+    _, source = checkout_clone(document, "Repo Clone 2")
+    _, target = checkout_clone(document, "Repo Clone 3")
+    copied = copy.deepcopy(next(b for b in source["branches"] if b["name"] == "topic-g"))
+    copied["checked_out_in"] = []
+    copied["packages"] = []
+    target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
+
+
 def signal_topic_a_merged_and_held(document):
     """``topic-a`` is merged, so removable, but the unfinished alpha holds it."""
     _, clone = checkout_clone(document, "Repo Clone 2")
@@ -10955,6 +10965,18 @@ def local_only_union(rows):
     }
 
 
+def assert_one_phrase_per_branch(rows, case):
+    """A branch a row names takes exactly one phrase, whatever its state."""
+    for name, row in rows.items():
+        named = []
+        for phrase in row["branches"]:
+            branches = phrase["branches"] or []
+            if branches:
+                assert len(branches) == int(phrase["text"].split()[0]), (case, name, phrase)
+            named += branches
+        assert len(named) == len(set(named)), (case, name, named)
+
+
 def red_pill_count(line):
     """The branch count of a line's counted red pill, 0 when it has none."""
     for pill in line["pills"]:
@@ -10977,6 +10999,11 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
         ("c", signal_topic_a_merged_and_held, "red", [
             f"{RED_MARK} 2 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        # Both clones that hold the finished, unmerged branch take its phrase,
+        # while the line still counts the branch once.
+        ("r", signal_topic_g_in_two_clones, "red", [
+            f"{RED_MARK} 3 branches local only",
             f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
     ]
     view_cases = [
@@ -11008,22 +11035,30 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
          [], "0 of 1 in use · 1 work item"),
     ]
 
-    removable_and_progress = (
-        ("2 merged, removable", "amber"), ("1 in progress", "green"))
+    # ``topic-g`` is finished and unmerged, so its row takes the awaiting-merge
+    # phrase, which the green one cannot also take.
+    awaiting_and_removable = (
+        ("1 awaiting merge", "amber"), ("2 merged, removable", "amber"))
     stash = ("1 stash", "red")
     attention_rows = {
         "a": {
-            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *removable_and_progress)),
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
             "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
             "Repo Clone 10": row_facts()},
         "b": {
-            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *removable_and_progress)),
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
             "Repo Clone 3": row_facts(phrases=(("2 local only", "red"), stash)),
             "Repo Clone 10": row_facts()},
-        # Held by the unfinished work item, topic-a reads in progress, not removable.
+        # Held by the unfinished work item, topic-a is not removable.
         "c": {
-            "Repo Clone 2": row_facts(phrases=(("1 local only", "red"), *removable_and_progress)),
+            "Repo Clone 2": row_facts(phrases=(("1 local only", "red"), *awaiting_and_removable)),
             "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
+        # The second clone holding the same branch takes its phrase too.
+        "r": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"), *awaiting_and_removable)),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"),
+                                               ("1 awaiting merge", "amber"), stash)),
             "Repo Clone 10": row_facts()},
     }
     behind = ("1 behind", "amber")
@@ -11065,6 +11100,7 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         assert line["inUseTone"] is None, case
         rows = clone_rows(page, remote)
         assert_rows_drawn(rows, attention_rows[case], case)
+        assert_one_phrase_per_branch(rows, case)
         assert len(local_only_union(rows)) == red_pill_count(line), case
         # Documented order: the repository's only line, whatever its tone.
         assert page.locator(".checkouts-line").count() == 1, case
@@ -11092,6 +11128,7 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         assert line["name"] == group["remote"]["display"], case
         rows = clone_rows(page, group)
         assert_rows_drawn(rows, view_rows[case], case, "main" if case == "g" else "trunk")
+        assert_one_phrase_per_branch(rows, case)
         assert len(local_only_union(rows)) == red_pill_count(line), case
         if case in ("m", "n"):
             indexes = repository_section_indexes(page, group["remote"]["key"])
