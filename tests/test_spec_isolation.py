@@ -181,31 +181,50 @@ class ValidatorIsolationTests(unittest.TestCase):
         self.assertFalse(probe.exists())
 
     def test_modules_import_only_standard_library_and_each_other(self) -> None:
+        # The guards patch attributes of os, io and builtins, so a name bound at
+        # import time would escape them. The imports are therefore a closed
+        # list: plain, unaliased imports of modules that neither read the
+        # environment nor write, and an exact list of from-imports.
         internal = {f"nyx.{name}" for name in MODULES} | set(MODULES)
+        plain = {"re", "uuid", "json"}
+        from_imports = {
+            ("__future__", "annotations"),
+            ("dataclasses", "dataclass"),
+            ("dataclasses", "field"),
+            ("pathlib", "Path"),
+            ("collections", "Counter"),
+        }
         for name in MODULES:
             path = Path(spec_validation.__file__).with_name(f"{name}.py")
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    self.assertNotIn(node.id, {"__import__", "eval", "exec"}, name)
                 if isinstance(node, ast.Import):
-                    imported = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    if node.level:
-                        imported = [node.module] if node.module else [
-                            alias.name for alias in node.names
-                        ]
+                    for alias in node.names:
+                        self.assertIsNone(alias.asname, (name, alias.name))
                         self.assertTrue(
-                            all(item in internal for item in imported),
-                            (name, imported),
+                            alias.name in plain or alias.name in internal,
+                            (name, alias.name),
+                        )
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    if node.level or module in internal:
+                        # Internal imports: relative or nyx-qualified.
+                        self.assertTrue(
+                            module in internal
+                            or (
+                                node.level
+                                and not module
+                                and all(a.name in internal for a in node.names)
+                            ),
+                            (name, module),
                         )
                         continue
-                    imported = [node.module or ""]
-                else:
-                    continue
-                for item in imported:
-                    self.assertTrue(
-                        item in internal or item.split(".")[0] in sys.stdlib_module_names,
-                        (name, item),
-                    )
+                    for alias in node.names:
+                        self.assertIsNone(alias.asname, (name, alias.name))
+                        self.assertIn((module, alias.name), from_imports, name)
+                        self.assertIn(module.split(".")[0], sys.stdlib_module_names)
 
     def test_non_package_folders_reject_a_package_only_when_named(self) -> None:
         for function, target in (
