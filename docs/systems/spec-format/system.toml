@@ -1,5 +1,7 @@
 schema_version = 1
 name = "spec-format"
 files = [
+    "nyx/spec_body.py",
     "nyx/spec_header.py",
+    "nyx/spec_validation.py",
 ]
