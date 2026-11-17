@@ -25,6 +25,8 @@ files = ["nyx/checkouts.py"]
 ## Systems
 
 - `catalog`: scans a specification root into the canonical catalog document.
+- `spec-format`: the specification header parser, the branch-name lexical
+  rule, the section and task parser, and the package validator.
 - `protocols`: the typed catalog and checkout document protocols.
 - `checkouts`: read-only git state of the configured checkout folders.
 - `account-state`: the per-account `~/.nyx` configuration and its admission.
@@ -74,7 +76,11 @@ These rules have no owner system.
   wording in the user documents; change them together.
 - **Specification format.** A change to the specification format the catalog
   reads updates `docs/specification-reference.md`;
-  `tests/test_documented_install.py` pins its header limits to `nyx/catalog.py`.
+  `tests/test_documented_install.py` pins its header limits to `nyx/catalog.py`,
+  which re-binds them from `nyx/spec_header.py`. The package validator
+  (`nyx/spec_validation.py`) and the specification template
+  (`docs/template_spec.md`) belong to the `spec-format` system; a change to
+  what the validator requires updates the template in the same change.
 - **CI contract.** `tests/test_workflow.py` holds the commands, extras,
   environment, and time limits of `.github/workflows/tests.yml` as a closed
   contract; change the workflow and that test together.

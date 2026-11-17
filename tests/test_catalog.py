@@ -2656,3 +2656,118 @@ def test_package_heads_match_edges_when_identity_coverage_is_incomplete(tmp_path
         assert row.reason == "identity_coverage_incomplete"
         assert row.target_path is None
         assert edges[row.target_package_id]["reason"] == row.reason
+
+
+SCAN_ID_A = "20000000-0000-4000-8000-00000000000a"
+SCAN_ID_B = "20000000-0000-4000-8000-00000000000b"
+SCAN_ID_C = "20000000-0000-4000-8000-00000000000c"
+
+
+def _scan_root(base: Path) -> Path:
+    """A root with a nested package, a linked spec and completion rows."""
+    root = base / "specs"
+    outer = package(root, "Shelf", "outer", f"# Outer\nPackage ID: {SCAN_ID_A}\n")
+    inner = outer / "inner"
+    inner.mkdir()
+    inner.joinpath("spec.md").write_text(f"# Inner\nPackage ID: {SCAN_ID_C}\n", encoding="utf-8")
+    package(
+        root, "Drafts", "rows",
+        f"# Rows\nPackage ID: {SCAN_ID_B}\n"
+        f"Completion Prerequisite: {SCAN_ID_A}\n"
+        "Completion Prerequisite: not-an-id\n",
+    )
+    real = base / "real-spec.md"
+    real.write_text(f"# Linked\nPackage ID: {SCAN_ID_C}\n", encoding="utf-8")
+    linked = root / "Fictional" / "Drafts" / "linked"
+    linked.mkdir()
+    linked.joinpath("spec.md").symlink_to(real)
+    return root
+
+
+def test_scan_packages_records_match_the_catalog_listing(tmp_path) -> None:
+    root = _scan_root(tmp_path)
+    listed = [
+        entry["package_path"] for entry in json.loads(catalog.build_catalog(root))["entries"]
+    ]
+    scan = catalog.scan_packages(root)
+
+    assert sorted(listed) == [record.package_path for record in scan.records]
+    assert "Fictional/Shelf/outer/inner" not in listed
+    by_name = {record.package_path.rsplit("/", 1)[1]: record for record in scan.records}
+    assert set(by_name) == {"outer", "rows", "linked"}
+    rows = by_name["rows"]
+    assert rows.stage == "Drafts"
+    assert rows.package_id == SCAN_ID_B
+    assert rows.candidate_ids == frozenset({SCAN_ID_B})
+    assert rows.read_diagnostic is None
+    prerequisites = rows.relationship["prerequisites"]
+    assert [row["kind"] for row in prerequisites] == ["completion", "completion"]
+    assert [row["target_package_id"] for row in prerequisites] == [SCAN_ID_A, None]
+    assert [row["valid"] for row in prerequisites] == [True, False]
+    linked = by_name["linked"]
+    assert linked.read_diagnostic == "nonregular_anchor"
+    assert linked.package_id is None
+    assert linked.relationship is None
+
+
+def test_scan_packages_status_follows_identity_coverage(tmp_path) -> None:
+    root = _scan_root(tmp_path)
+    coverage = json.loads(catalog.build_catalog(root))["identity_coverage"]["state"]
+    assert coverage == "incomplete"
+    assert catalog.scan_packages(root).status == coverage
+
+    clean = tmp_path / "clean"
+    package(clean, "Drafts", "one", f"# One\nPackage ID: {SCAN_ID_A}\n")
+    assert json.loads(catalog.build_catalog(clean))["identity_coverage"]["state"] == "complete"
+    assert catalog.scan_packages(clean).status == "complete"
+
+
+def test_scan_package_record_fields_are_exactly_the_header_facts() -> None:
+    fields = {field.name for field in dataclasses.fields(catalog.PackageScanRecord)}
+    assert fields == {
+        "package_path", "stage", "read_diagnostic", "relationship", "candidate_ids", "package_id",
+    }
+    assert {field.name for field in dataclasses.fields(catalog.PackageScan)} == {"status", "records"}
+
+
+def test_scan_package_records_are_frozen(tmp_path) -> None:
+    scan = catalog.scan_packages(_scan_root(tmp_path))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        scan.records[0].package_path = "other"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        scan.status = "incomplete"
+
+
+def test_scan_package_record_path_reads_back_a_section_past_the_header_limit(tmp_path) -> None:
+    root = tmp_path / "specs"
+    filler = "x" * (catalog._HEADER_BYTE_LIMIT + 100)
+    package(
+        root, "Queue", "long",
+        f"# Long\nPackage ID: {SCAN_ID_A}\nStatus: ready\n\n## Notes\n{filler}\n\n"
+        "## File boundaries\n\n| Task | File |\n| --- | --- |\n| T1 | `a.py` |\n",
+    )
+    (record,) = catalog.scan_packages(root).records
+    text = (root / record.package_path / "spec.md").read_text(encoding="utf-8")
+    assert text.index("## File boundaries") > catalog._HEADER_BYTE_LIMIT
+    assert text.endswith("| T1 | `a.py` |\n")
+    assert record.package_id == SCAN_ID_A
+
+
+def _scandir_calls(root: Path, function) -> int:
+    with patch.object(catalog, "_catalog_scandir", wraps=catalog._catalog_scandir) as scans:
+        function(root)
+    return scans.call_count
+
+
+def test_scan_packages_walks_the_tree_exactly_as_often_as_one_catalog_build(tmp_path) -> None:
+    root = _scan_root(tmp_path)
+    expected = _scandir_calls(root, catalog.build_catalog)
+    assert expected > 0
+    assert _scandir_calls(root, catalog.scan_packages) == expected
+
+
+def test_scan_packages_does_not_change_the_catalog_bytes(tmp_path) -> None:
+    root = _scan_root(tmp_path)
+    before = catalog.build_catalog(root)
+    catalog.scan_packages(root)
+    assert catalog.build_catalog(root) == before

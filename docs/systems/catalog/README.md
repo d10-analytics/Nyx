@@ -13,6 +13,13 @@ README is narrative only.
   superseded flag, and each `Completion Prerequisite:` row's target ID,
   target package path and the catalog's unresolved reason, resolved by the same
   helper as the rendered edges), without adding them to the catalog document.
+- Exposes `scan_packages`, the one scan the catalog renders from, as frozen
+  records: each listed package's path, raw stage folder name, read diagnostic,
+  relationship (including `completion` rows), candidate IDs and package ID,
+  plus whether identity coverage is complete. A record holds no file contents:
+  the catalog reads only a bounded prefix of each specification, so a consumer
+  that needs the text reads the file at the record's path. It adds no directory
+  walk and changes neither the catalog document nor the package heads.
 
 ## Outside this boundary
 
@@ -20,7 +27,8 @@ README is narrative only.
 
 ## Collaborators
 
-- Depends on `protocols` (schema constants, field limits, and text helpers) and
+- Depends on `spec-format` (the header cut, header reader and parser, metadata
+  readers, and the branch-name lexical rule), `protocols` (schema constants, field limits, and text helpers) and
   `account-state` (completed-stage validation).
 - Used by `checkouts` and `application-serving`.
 
