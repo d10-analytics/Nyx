@@ -5,6 +5,10 @@
 For a first workspace, start with the [workspace guide](workspaces.md). This
 reference describes the metadata used when you need more than a title and stage.
 
+A new specification can start from the [specification template](template_spec.md).
+The package validator and the template live in this repository: the validator is
+`nyx/spec_validation.py`, described under `docs/systems/spec-format`.
+
 ## Work item header
 
 Nyx reads a work item's `spec.md` header up to the first line starting with `## `.
