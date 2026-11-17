@@ -131,6 +131,69 @@ def test_header_label_literals_have_one_owner() -> None:
     assert stray == {}
 
 
+RE_PATTERN_FUNCTIONS = frozenset(
+    {"match", "search", "compile", "findall", "fullmatch", "finditer", "sub", "split"}
+)
+BOLD_MARKER = r"\*{0,2}"
+LABEL_COLON = r"\s*:"
+
+
+def _literal_text(node: ast.expr) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_literal_text(part) for part in node.values)
+    return ""
+
+
+def _header_label_patterns(tree: ast.Module) -> list[int]:
+    """Return the lines of re calls whose pattern reads a ``Label:`` header line."""
+    assigned: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(node.value)
+    found = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "re"
+            and node.func.attr in RE_PATTERN_FUNCTIONS
+            and node.args
+        ):
+            continue
+        pattern = node.args[0]
+        candidates = (
+            assigned.get(pattern.id, []) if isinstance(pattern, ast.Name) else [pattern]
+        )
+        for candidate in candidates:
+            text = _literal_text(candidate)
+            if BOLD_MARKER in text and LABEL_COLON in text:
+                found.append(node.lineno)
+    return found
+
+
+def test_validator_builds_no_header_label_pattern() -> None:
+    assert _header_label_patterns(_modules()["spec_validation.py"]) == []
+
+
+def test_header_label_pattern_guard_detects_a_private_label_regex() -> None:
+    source = (
+        "import re\n"
+        "def f(label, line):\n"
+        "    pattern = rf'^\\s*\\*{{0,2}}{re.escape(label)}\\*{{0,2}}\\s*:'\n"
+        "    return re.match(pattern, line, re.IGNORECASE)\n"
+        "def g(line):\n"
+        "    return re.search(r'^\\s*\\*{0,2}Status\\*{0,2}\\s*:', line)\n"
+        "def h(line):\n"
+        "    return re.match(r'^- `([^`]+)`', line)\n"
+    )
+    assert _header_label_patterns(ast.parse(source)) == [4, 6]
+
+
 def test_catalog_branch_classifier_calls_the_shared_lexical_rule() -> None:
     tree = _modules()["catalog.py"]
     classifier = next(
