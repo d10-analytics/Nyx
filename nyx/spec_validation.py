@@ -237,14 +237,8 @@ def _find_cycle(tasks: dict[str, Task]) -> list[str] | None:
 
 def _validate_closure_ledger(lines: list[str], *, required: bool = False) -> list[str]:
     """Check recorded review transitions; evidence truth remains independently reviewed."""
-    metadata = lines[
-        : next(
-            (i for i, line in enumerate(lines) if line.startswith("## ")), len(lines)
-        )
-    ]
     for label in ("Closure ledger", "Closure"):
-        pattern = rf"^\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:"
-        if sum(bool(re.match(pattern, line, re.IGNORECASE)) for line in metadata) > 1:
+        if len(metadata_values(lines, label)) > 1:
             return [f"duplicate closure metadata: {label}"]
     version = metadata_value(lines, "Closure ledger")
     if version is None:
