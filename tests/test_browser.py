@@ -10050,6 +10050,38 @@ def signal_topic_g_in_two_clones(document):
     target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
 
 
+def signal_topic_g_merged_and_held_in_a_main_worktree(document):
+    """``gamma`` is merged and Repo Clone 3 holds its branch in its main worktree.
+
+    Clone 2's copy is merged too, so it is removable.  Clone 3 is not the work
+    item's target, so its copy names the package as a sibling; that copy is held
+    by the main worktree, so its only blocker is that checkout.  Nothing is
+    finished and unmerged, so the document raises no awaiting-merge item.
+    """
+    _, source = checkout_clone(document, "Repo Clone 2")
+    _, target = checkout_clone(document, "Repo Clone 3")
+    branch = next(item for item in source["branches"] if item["name"] == "topic-g")
+    branch["verdict"] = dict(MERGED_VERDICT)
+    copied = copy.deepcopy(branch)
+    copied["checked_out_in"] = [target["path"]]
+    copied["packages"] = [{"basis": "sibling_clone", "package_path": "Repo/Shipped/gamma"}]
+    target["branches"] = sorted([*target["branches"], copied], key=lambda b: b["name"])
+    main = next(worktree for worktree in target["worktrees"] if worktree["main"])
+    main["head"] = {"branch": copied["name"], "sha": copied["sha"]}
+    package = next(item for item in document["packages"]
+                   if item["package_path"] == "Repo/Shipped/gamma")
+    status = package["code_status"]
+    status.update({
+        "checked_out_elsewhere": [target["path"]],
+        "cleanup": {"worktrees": 1, "branches": 0},
+        "pull_request": None,
+        "push": None,
+        "state": "merged",
+        "unpushed": None,
+    })
+    status["text"] = models.code_status_text(status)
+
+
 def signal_topic_a_merged_and_held(document):
     """``topic-a`` is merged, so removable, but the unfinished alpha holds it."""
     _, clone = checkout_clone(document, "Repo Clone 2")
@@ -11005,6 +11037,12 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         ("r", signal_topic_g_in_two_clones, "red", [
             f"{RED_MARK} 3 branches local only",
             f"{AMBER_MARK} 3 branches to merge or clean up"], in_use),
+        # The finished work item is merged and held in a main worktree, so its
+        # branch names no phrase at all; the holder counts as one more clone in
+        # use, while the finished work item still counts as a served one.
+        ("s", signal_topic_g_merged_and_held_in_a_main_worktree, "red", [
+            f"{RED_MARK} 3 branches local only",
+            f"{AMBER_MARK} 3 branches to merge or clean up"], "2 of 3 in use" + work),
     ]
     view_cases = [
         ("m-base", None, "remote", "amber", [
@@ -11060,6 +11098,13 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
             "Repo Clone 3": row_facts(phrases=(("1 local only", "red"),
                                                ("1 awaiting merge", "amber"), stash)),
             "Repo Clone 10": row_facts()},
+        # The merged branch is removable where no main worktree holds it, and
+        # the finished work item's branch names no phrase at all where one does.
+        "s": {
+            "Repo Clone 2": row_facts(phrases=(("2 local only", "red"),
+                                               ("3 merged, removable", "amber"))),
+            "Repo Clone 3": row_facts(phrases=(("1 local only", "red"), stash)),
+            "Repo Clone 10": row_facts()},
     }
     behind = ("1 behind", "amber")
     behind_rows = {
@@ -11093,8 +11138,8 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote = checkout_group(base, "remote")
     for case, mutation, tone, pills, activity in attention_cases:
-        serve_checkouts(page, double, base if mutation is None
-                        else checkout_variant(base, mutation))
+        served = base if mutation is None else checkout_variant(base, mutation)
+        serve_checkouts(page, double, served)
         line = repository_line(page, remote)
         assert (line["tone"], line["pills"], line["activity"]) == (tone, pills, activity), case
         assert line["inUseTone"] is None, case
@@ -11102,6 +11147,19 @@ def test_checkouts_lines_follow_the_signal_rules(open_page, attention_checkouts,
         assert_rows_drawn(rows, attention_rows[case], case)
         assert_one_phrase_per_branch(rows, case)
         assert len(local_only_union(rows)) == red_pill_count(line), case
+        if case == "s":
+            # The finished work item is merged, so nothing waits on its merge,
+            # and the clone that holds its branch in a main worktree is blocked
+            # by that checkout alone: the branch no longer reads in progress.
+            assert [item for item in served["attention"]
+                    if item["class"] == "awaiting_merge"] == []
+            _, holder = checkout_clone(served, "Repo Clone 3")
+            held = next(item for item in holder["branches"] if item["name"] == "topic-g")
+            assert held["removable"] == {
+                "removable": False, "blockers": ["checked_out_in_main_worktree"]}
+            green = [name for row in rows.values() for phrase in row["branches"]
+                     if phrase["tone"] == "green" for name in phrase["branches"]]
+            assert "topic-g" not in green
         # Documented order: the repository's only line, whatever its tone.
         assert page.locator(".checkouts-line").count() == 1, case
 
