@@ -3704,11 +3704,16 @@
     items.forEach((item) => {
       const clone = group.clones.find((candidate) => candidate.path === item.clone);
       if (item.class === "awaiting_merge" && item.branch !== null) {
+        // The item names a branch of the repository and no clone: the line
+        // counts the branch once, and every readable clone holding a branch of
+        // that name takes the phrase, so it is taken before the green one.
         amber.add(item.branch);
-        if (clone !== undefined) {
-          perClone.get(clone.path).amber.add(item.branch);
-          perClone.get(clone.path).awaiting.add(item.branch);
-        }
+        group.clones.forEach((candidate) => {
+          if (candidate.status !== "ok" ||
+            !candidate.branches.some((entry) => entry.name === item.branch)) return;
+          perClone.get(candidate.path).amber.add(item.branch);
+          perClone.get(candidate.path).awaiting.add(item.branch);
+        });
       }
       if (item.class !== "unique_work" || clone === undefined) return;
       let branch = null;
