@@ -735,7 +735,7 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .card-baseline[data-case="newer"] { --ring: 72%; }
 .card-baseline[data-case="newer-at-main"] { --ring: var(--m); --ring-r: .6rem; }
 .card-baseline[data-case="beyond"] { --m: 72%; --ring: 94%; --line-to: var(--ring); }
-.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) { --ring: var(--f); }
+.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) { --ring: var(--f); --ring-r: .2rem; }
 .baseline-point, .baseline-link, .baseline-count { position: absolute; }
 .baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
 .baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
@@ -773,7 +773,7 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   margin: -.7rem 0 0 -.7rem;
 }
 .card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) .baseline-point[data-point="B"] {
-  top: 1.775rem;
+  top: 1.875rem;
   border-style: dotted;
 }
 .baseline-point[data-point="C"] { left: var(--f); }
@@ -809,7 +809,7 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .baseline-link[data-link="tether"] {
   left: var(--f);
   width: 0;
-  height: .575rem;
+  height: .475rem;
   margin-left: -1px;
   border-top: 0;
   border-left: 2px dotted var(--tone);
