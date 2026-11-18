@@ -55,7 +55,9 @@ README is narrative only.
   while the pill is green or absent), one tag per attention item naming the card (all but an
   awaiting merge, which the Code Status states, and a moved base, which the baseline
   line draws) and a baseline line of three points, the Baseline, the checkout
-  and main: the text `nyx checkouts --json` gives and the line's words, searchable
+  and main, joined by the fork on main's line, an arm to the checkout, the main
+  count and a ring for the Baseline's place, with `?` and `≠` for what cannot be
+  read or counted and an underline for a cached main: the text `nyx checkouts --json` gives and the line's words, searchable
   with the card's other text and rewritten in place on each scan. The text is Nyx's last successful checkout scan, and Nyx rescans
   about once a minute while a board page is open.
 - Shows a line only while the served document was scanned under the configuration

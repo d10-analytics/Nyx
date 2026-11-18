@@ -2072,9 +2072,15 @@
     ["B", "the Baseline"],
     ["C", "the commit checked out in the target"],
     ["M", "the remote main head"],
-    ["ring", "the checkout is at the Baseline"],
-    ["fork", "the checkout has commits of its own (+N) beside a Baseline that has moved on"],
-    ["count by M", "commits the checkout is behind main"],
+    ["fork", "the dot on main's line where the checkout left main"],
+    ["arm", "the checkout's own commits, counted, from the fork up to C"],
+    ["main", "main's commits since the fork, counted along main's line to M"],
+    ["ring", "the Baseline's place: around the fork when it is there, left of the fork when " +
+      "older, right of it when newer, past M when beyond main, and dotted below the fork " +
+      "when it is off main's history or its place cannot be worked out"],
+    ["?", "a count or place that cannot be read"],
+    ["≠", "a count that was not taken, or a Baseline that is not on main's history"],
+    ["cached", "an underlined count or mark comes from main's cached copy"],
   ];
 
   // The baseline line of one work item as the card draws it, with its words;
