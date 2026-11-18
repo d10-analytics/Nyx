@@ -702,14 +702,24 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .card-prerequisites[data-tone="green"] { --tone: var(--state-done); }
 .card-prerequisites[data-tone="red"] { --tone: var(--state-failed); }
 .card-prerequisites[data-tone="grey"] { --tone: var(--control-border); --ink: var(--text); }
-/* The baseline line: three markers on one horizontal line, drawn on the tag
-   surface so it reads the same on a plain card and on a brand-teal one. Places
-   are ordinal; a count is printed beside M and never sets a distance. */
+/* The baseline line: the fork dot, the arm up to C, main's line to M and the
+   Baseline ring on one strip, drawn on the tag surface so it reads the same on a
+   plain card and on a brand-teal one.  Every place is an ordinal slot in percent
+   of the strip, 22% apart, and a count never moves one.  The counts sit below
+   main's line, each centred between the edges of the two points that bound its
+   segment; the arm's count sits above the line, left of the fork. */
 .card-baseline {
   --tone: var(--control-border);
-  --b: 24%;
-  --c: 24%;
-  --c-top: 1.3rem;
+  --f: 50%;
+  --m: 94%;
+  --ring: 28%;
+  --ring-r: .3rem;
+  --fc: .25rem;
+  --fo: 0rem;
+  --fr: max(var(--fc), var(--fo));
+  --mr: .4rem;
+  --line-from: var(--f);
+  --line-to: var(--m);
   position: relative;
   flex: 1 1 100%;
   height: 2.2rem;
@@ -718,17 +728,21 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
   color: var(--text);
 }
-.card-baseline[data-place="right"] { --b: 12%; --c: 40%; }
-.card-baseline[data-place="left"] { --b: 40%; --c: 12%; }
-.card-baseline[data-place="off"], .card-baseline[data-place="unplaced"] { --b: 40%; --c: 12%; --c-top: .55rem; }
-.card-baseline:has(.baseline-point[data-fork]) { --c-top: .5rem; }
-.baseline-point, .baseline-link, .baseline-added, .baseline-behind { position: absolute; }
+.card-baseline:has(.baseline-point[data-at="fork"]) { --fc: .4rem; }
+.card-baseline:has(.baseline-point[data-at="fork"] .baseline-check) { --fc: .55rem; }
+.card-baseline[data-case="same"] { --fo: .7rem; --ring: var(--f); }
+.card-baseline[data-case="older"] { --line-from: var(--ring); }
+.card-baseline[data-case="newer"] { --ring: 72%; }
+.card-baseline[data-case="newer-at-main"] { --ring: var(--m); --ring-r: .6rem; }
+.card-baseline[data-case="beyond"] { --m: 72%; --ring: 94%; --line-to: var(--ring); }
+.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) { --ring: var(--f); }
+.baseline-point, .baseline-link, .baseline-count { position: absolute; }
 .baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
 .baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
 .baseline-point[data-tone="red"], .baseline-link[data-tone="red"] { --tone: var(--state-failed); }
 .baseline-point[data-tone="grey"], .baseline-link[data-tone="grey"] { --tone: var(--control-border); }
 .baseline-point {
-  top: 1.3rem;
+  top: 1.2rem;
   width: .8rem;
   height: .8rem;
   margin: -.4rem 0 0 -.4rem;
@@ -738,36 +752,52 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   align-items: center;
   justify-content: center;
 }
-.baseline-point[data-point="B"] { left: var(--b); width: .6rem; height: .6rem; margin: -.3rem 0 0 -.3rem; }
-.baseline-point[data-point="C"] { left: var(--c); top: var(--c-top); }
-.baseline-point[data-point="M"] { left: 70%; }
-.baseline-point[data-form="ring"] { box-shadow: 0 0 0 2px var(--surface), 0 0 0 3.5px var(--tone); }
-.baseline-point[data-form="dotted"] {
-  background: var(--surface);
-  border: 2px dotted var(--tone);
+.baseline-point[data-point="fork"] {
+  left: var(--f);
+  width: .5rem;
+  height: .5rem;
+  margin: -.25rem 0 0 -.25rem;
+  background: var(--text);
 }
+.baseline-point[data-point="B"] {
+  left: var(--ring);
+  width: calc(var(--ring-r) * 2);
+  height: calc(var(--ring-r) * 2);
+  margin: calc(var(--ring-r) * -1) 0 0 calc(var(--ring-r) * -1);
+  background: var(--surface);
+  border: 2px solid var(--tone);
+}
+.card-baseline[data-case="same"] .baseline-point[data-point="B"] {
+  width: 1.4rem;
+  height: 1.4rem;
+  margin: -.7rem 0 0 -.7rem;
+}
+.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) .baseline-point[data-point="B"] {
+  top: 1.775rem;
+  border-style: dotted;
+}
+.baseline-point[data-point="C"] { left: var(--f); }
+.baseline-point[data-point="C"][data-at="arm"] { left: 61%; top: .55rem; }
+.baseline-point[data-point="M"] { left: var(--m); }
 .baseline-point[data-point="C"]:has(.baseline-check) { width: 1.1rem; height: 1.1rem; margin: -.55rem 0 0 -.55rem; }
 .baseline-check { color: var(--check-ink); font-size: .75rem; font-weight: 700; line-height: 1; }
 .baseline-link {
-  top: 1.3rem;
+  top: 1.2rem;
   height: 0;
   border-top: 2px solid var(--tone);
 }
 .baseline-link[data-line="dashed"] { border-top-style: dashed; }
-.baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
-.card-baseline[data-place="right"] .baseline-link[data-link="main"] { left: var(--c); width: calc(70% - var(--c)); }
-.card-baseline[data-place="right"]:has(.baseline-point[data-fork]) .baseline-link[data-link="main"] { left: var(--b); width: calc(70% - var(--b)); }
-.baseline-link[data-link="checkout"] { left: min(var(--b), var(--c)); width: 28%; }
-.baseline-link[data-link="fork"] {
-  /* The box spans B (bottom left) to the raised C (top right), so its
-     diagonal runs centre to centre; an SVG stroke paints it anti-aliased. */
-  left: var(--b);
-  top: var(--c-top);
-  width: calc(var(--c) - var(--b));
-  height: calc(1.3rem - var(--c-top));
+.baseline-link[data-link="main"] { left: var(--line-from); right: calc(100% - var(--line-to)); }
+.baseline-link[data-link="arm"] {
+  /* The box spans the fork dot (bottom left) to the raised C (top right), so
+     its diagonal runs centre to centre; an SVG stroke paints it anti-aliased. */
+  left: var(--f);
+  top: .55rem;
+  width: 11%;
+  height: .65rem;
   border-top: 0;
 }
-.baseline-link[data-link="fork"] svg {
+.baseline-link[data-link="arm"] svg {
   display: block;
   width: 100%;
   height: 100%;
@@ -776,15 +806,43 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   stroke-width: 2px;
   stroke-linecap: round;
 }
-.baseline-added, .baseline-behind {
-  top: .35rem;
+.baseline-link[data-link="tether"] {
+  left: var(--f);
+  width: 0;
+  height: .575rem;
+  margin-left: -1px;
+  border-top: 0;
+  border-left: 2px dotted var(--tone);
+}
+.baseline-count {
+  top: 1.33rem;
+  left: calc((var(--a) + var(--b)) / 2 + (var(--ra) - var(--rb)) / 2);
+  transform: translateX(-50%);
   font-size: .72rem;
   font-weight: 700;
-  line-height: 1.2;
+  line-height: 1;
+  white-space: nowrap;
   color: var(--text);
 }
-.baseline-added { left: calc(var(--c) + .7rem); }
-.baseline-behind { left: calc(70% + .7rem); top: 1.3rem; margin-top: -.45rem; }
+.baseline-count[data-slot="main"] { --a: var(--f); --b: var(--m); --ra: var(--fr); --rb: var(--mr); }
+.baseline-count[data-slot="gap"] { --a: var(--ring); --b: var(--f); --ra: .3rem; --rb: var(--fr); }
+.baseline-count[data-slot="first"] { --a: var(--f); --b: var(--ring); --ra: var(--fr); --rb: var(--ring-r); }
+.baseline-count[data-slot="second"] { --a: var(--ring); --b: var(--m); --ra: .3rem; --rb: var(--mr); }
+.baseline-count[data-slot="beyond"] { --a: var(--m); --b: var(--ring); --ra: var(--mr); --rb: .3rem; }
+.baseline-count[data-slot="arm"] {
+  top: .25rem;
+  left: auto;
+  right: calc(100% - var(--f) + var(--fr) + .1rem);
+  transform: none;
+}
+.baseline-count[data-slot="ring"] { left: calc(var(--f) + .5rem); transform: none; }
+.baseline-count[data-mark] { color: var(--muted); }
+.card.no-incoming-arrow .baseline-count[data-mark] { color: var(--text); }
+.baseline-count[data-cached] {
+  text-decoration: underline dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: .12rem;
+}
 .panel-baseline-line .card-baseline { flex: none; display: block; width: 100%; max-width: 14rem; }
 .panel-baseline-words { display: block; margin-top: .3rem; }
 .panel-prerequisite-items { margin: .3rem 0 0; padding-left: 1.1rem; font-size: .85rem; }
