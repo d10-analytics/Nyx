@@ -13140,6 +13140,7 @@ BASELINE_LINE_READ = """card => {
   };
   const point = (name) => {
     const node = line.querySelector(`.baseline-point[data-point="${name}"]`);
+    if (node === null) return null;
     const style = getComputedStyle(node);
     const check = node.querySelector('.baseline-check');
     return {
@@ -13173,9 +13174,6 @@ BASELINE_LINE_READ = """card => {
            style: getComputedStyle(link).borderTopStyle},
     linkBox: rect(link),
     arm: arm ? rect(arm) : null,
-    tether: line.querySelector('.baseline-link[data-link="tether"]') !== null,
-    tetherBox: line.querySelector('.baseline-link[data-link="tether"]')
-      ? rect(line.querySelector('.baseline-link[data-link="tether"]')) : null,
     hit: {C: hit('C'), M: hit('M')},
     counts: [...line.querySelectorAll('.baseline-count')].map((node) => {
       const look = getComputedStyle(node);
@@ -13264,7 +13262,9 @@ def test_baseline_line_tones_follow_the_one_rule(
         assert line["link"]["tone"] == tone and line["link"]["line"] is None
     drift_cases = [((drift, EQUAL, EQUAL), tone) for _, drift, tone in BASELINE_VS_MAIN_CASES]
     for (state, tone), line in baseline_line_cases(page, double, drift_cases):
-        assert line["B"]["tone"] == tone, (state[0], line["B"])
+        # A drift that places no ring (off main's history or unknown) draws none to colour.
+        if line["B"] is not None:
+            assert line["B"]["tone"] == tone, (state[0], line["B"])
     # The same tone in the 3-behind and 58-behind cases: no count sets a colour.
     assert BASELINE_VS_MAIN_CASES[2][2] == BASELINE_VS_MAIN_CASES[3][2] == "yellow"
     # Main unknown is the one red M, and the line to it is dashed grey.
@@ -13307,7 +13307,7 @@ def box_meets(first, second):
 def baseline_strip_faults(line, digits=None):
     """What is wrong with the drawn strip, read from rendered boxes alone.
 
-    Every count and ``?``/``≠`` box lies inside the strip and clear of every
+    Every count and ``?`` box lies inside the strip and clear of every
     other count and of every point, ring and fork-dot box; a count on main's
     line lies between the centres of its segment's two points; the arm's count
     lies above main's line and left of the fork's centre; the box is ``2.2rem``
@@ -13315,18 +13315,11 @@ def baseline_strip_faults(line, digits=None):
     """
     faults = []
     unit, inner, counts = line["unit"], line["inner"], line["counts"]
-    if line["tether"]:
-        # The dotted tether must show between the fork dot's box and the ring's box.
-        fork, ring, tether = line["F"], line["B"], line["tetherBox"]
-        if ring["top"] - fork["bottom"] < 0.2 * unit - 0.5:
-            faults.append(f"tether shows {(ring['top'] - fork['bottom']) / unit}rem")
-        if tether["top"] > fork["bottom"] + 0.5 or tether["bottom"] < ring["top"] - 0.5:
-            faults.append(f"tether does not span the gap: {tether}")
     if abs(line["box"]["height"] / unit - 2.2) > 0.01:
         faults.append(f"strip height {line['box']['height'] / unit}rem")
     if line["scrollWidth"] > line["clientWidth"]:
         faults.append("something is drawn outside the strip's width")
-    points = {name: line[name] for name in ("B", "F", "C", "M")}
+    points = {name: line[name] for name in ("B", "F", "C", "M") if line[name] is not None}
     for index, count in enumerate(counts):
         name = f"{count['slot']} {count['text']}"
         if not (inner["left"] <= count["left"] and count["right"] <= inner["right"]
@@ -13345,8 +13338,6 @@ def baseline_strip_faults(line, digits=None):
         if count["slot"] == "arm":
             if count["bottom"] > line["linkBox"]["top"] or count["right"] > points["F"]["cx"]:
                 faults.append(f"{name} is not above the line and left of the fork")
-        if count["slot"] == "ring" and count["left"] < points["B"]["right"]:
-            faults.append(f"{name} is not to the right of the ring")
     return faults
 
 
@@ -13369,25 +13360,25 @@ BASELINE_DRAWN_ROWS = [
     ("same", "fork", 94, ["main:+58!"]),
     ("beyond", "arm", 72, ["arm:+3!", "beyond:+1!"]),
     ("beyond", "arm", 72, ["arm:+3", "beyond:+3"]),
-    ("off", "arm", 94, ["arm:+4", "ring:\u2260"]),
-    ("off", "arm", 94, ["arm:+4", "ring:\u2260"]),
-    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:+10!", "main:+15!", "ring:?!"]),
-    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:?", "main:?", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:?!", "main:?!", "ring:?!"]),
-    ("unknown", "arm", 94, ["arm:\u2260", "main:\u2260", "ring:?"]),
-    ("unknown", "arm", 94, ["arm:\u2260!", "main:\u2260!", "ring:?!"]),
-    ("no-main", "arm", 94, ["arm:?", "ring:?"]),
+    ("off", "arm", 94, ["arm:+4"]),
+    ("off", "arm", 94, ["arm:+4"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15"]),
+    ("unknown", "arm", 94, ["arm:+10!", "main:+15!"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15"]),
+    ("unknown", "arm", 94, ["arm:?", "main:?"]),
+    ("unknown", "arm", 94, ["arm:?!", "main:?!"]),
+    ("unknown", "arm", 94, ["arm:?", "main:?"]),
+    ("unknown", "arm", 94, ["arm:?!", "main:?!"]),
+    ("no-main", "arm", 94, ["arm:?"]),
     ("same", "arm", 94, ["arm:+1", "main:+12"]),
     ("same", "fork", 94, []),
     ("older", "fork", 94, ["gap:+5"]),
     ("newer-at-main", "fork", 94, ["first:+5"]),
     ("beyond", "fork", 72, ["main:+3!", "beyond:+2!"]),
     ("newer", "arm", 94, ["arm:?", "first:+2", "second:+13"]),
-    ("beyond", "arm", 72, ["arm:\u2260", "main:\u2260", "beyond:+1"]),
+    ("beyond", "arm", 72, ["arm:?", "main:?", "beyond:+1"]),
 ]
 # The rows whose C must stay visible beside M (rows 23, 6, 17, 18 and 22).
 BASELINE_HIT_ROWS = {7, 8, 22, 23, 27}
@@ -13422,7 +13413,8 @@ def test_baseline_line_draws_the_fork_arm_ring_and_counts_for_every_worked_examp
         assert all(count["hidden"] == "true" for count in line["counts"]), where
         assert (line["arm"] is not None) is (at == "arm"), where
         assert line["C"]["at"] == at, where
-        assert line["tether"] is (kind in ("off", "unknown", "no-main")), where
+        # A Baseline off main's history, or one whose place cannot be worked out, draws no ring.
+        assert (line["B"] is None) is (kind in ("off", "unknown", "no-main")), where
         # C is a solid dot, at the fork or at the tip of the arm, half a step right of it.
         assert line["C"]["border"] == "none" and line["C"]["background"] != line["surface"], where
         if at == "arm":
@@ -13439,22 +13431,24 @@ def test_baseline_line_draws_the_fork_arm_ring_and_counts_for_every_worked_examp
         step = 0.22 * (line["inner"]["right"] - line["inner"]["left"])
         if kind == "same":
             assert ring["cx"] == pytest.approx(fork["cx"], abs=0.5), where
-            assert ring["width"] >= 1.4 * line["unit"] - 0.5, where
         elif kind == "older":
-            assert ring["cx"] == pytest.approx(fork["cx"] - step, abs=0.5), where
+            # As far left of the fork as main's head is to its right.
+            assert ring["cx"] == pytest.approx(fork["cx"] - 2 * step, abs=0.5), where
+            assert fork["cx"] - ring["cx"] == pytest.approx(head["cx"] - fork["cx"], abs=0.5), where
         elif kind == "newer":
             assert ring["cx"] == pytest.approx(fork["cx"] + step, abs=0.5), where
         elif kind == "newer-at-main":
             assert ring["cx"] == pytest.approx(head["cx"], abs=0.5), where
-            assert ring["width"] >= 1.2 * line["unit"] - 0.5, where
         elif kind == "beyond":
             assert ring["cx"] > head["cx"] + 0.5 * line["unit"], where
             assert baseline_slot_percent(line, "B") == pytest.approx(94, abs=0.3), where
-        else:
-            assert ring["cx"] == pytest.approx(fork["cx"], abs=0.5), where
-            assert ring["cy"] > fork["cy"] + 0.4 * line["unit"], where
-            assert ring["border"] == "dotted", where
+        # Every solid dot is one size and every ring is one size, wherever they sit.
+        for dot in (fork, head, line["C"]):
+            assert dot["width"] == pytest.approx(0.6 * line["unit"], abs=0.5), where
+            assert dot["height"] == pytest.approx(0.6 * line["unit"], abs=0.5), where
         if kind not in ("off", "unknown", "no-main"):
+            assert ring["width"] == pytest.approx(0.9 * line["unit"], abs=0.5), where
+            assert ring["height"] == pytest.approx(0.9 * line["unit"], abs=0.5), where
             assert ring["cy"] == pytest.approx(fork["cy"], abs=0.5), where
             assert ring["border"] == "solid", where
         # Colours follow the line, never a count: figures take its text colour, only a
@@ -13473,10 +13467,10 @@ def test_baseline_line_draws_the_fork_arm_ring_and_counts_for_every_worked_examp
         if row in BASELINE_HIT_ROWS:
             assert line["hit"] == {"C": "C", "M": "M"}, where
             assert not box_meets(line["C"], line["M"]), where
-    # A ring left of the fork and a ring right of it stand the same distance from it.
-    left, right = lines[1], lines[2]
+    # An older ring stands as far left of the fork as main's head stands right of it.
+    left = lines[1]
     assert abs(left["F"]["cx"] - left["B"]["cx"]) == pytest.approx(
-        abs(right["B"]["cx"] - right["F"]["cx"]), abs=0.5)
+        abs(left["M"]["cx"] - left["F"]["cx"]), abs=0.5)
     assert not box_meets(lines[2]["C"], lines[2]["B"])
     # The same row of counts 3 and 58 puts every point and every slot in the same place.
     equal = live("equal", 0, 0)
@@ -13520,12 +13514,13 @@ def test_baseline_line_counts_fit_the_strip_at_every_width(open_page, real_check
             if kind == "older":
                 # The arm's count is also clear of the left ring above it, not only beside it.
                 arm = next(count for count in line["counts"] if count["slot"] == "arm")
-                assert arm["bottom"] + 0.3 <= line["B"]["top"], label
+                assert (arm["bottom"] + 0.3 <= line["B"]["top"]
+                        or arm["left"] >= line["B"]["right"] + 0.3), label
             assert drawn["arm"] == f"+{digits}", label
             assert all(count["color"] == line["color"] for count in line["counts"]
                        if not count["mark"]), label
             assert [text for text in drawn.values() if text.startswith("+")] == [
-                f"+{digits}"] * (len(drawn) - (kind == "unknown")), label
+                f"+{digits}"] * len(drawn), label
 
     def set_card_width(width):
         page.evaluate(
@@ -13729,7 +13724,8 @@ def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_ch
     })
     line = baseline_line(page, BASELINE_LINE_CARDS[0])
     assert line["count"] == 1
-    assert [line[name]["tone"] for name in "BCM"] == ["grey"] * 3
+    assert line["B"] is None
+    assert [line[name]["tone"] for name in "CM"] == ["grey"] * 2
     assert line["C"]["check"] is False
     assert baseline_line(page, BASELINE_LINE_CARDS[1])["C"]["check"] is True
     for path in (BASELINE_LINE_CARDS[2], BASELINE_LINE_CARDS[3], gamma):
@@ -13826,7 +13822,7 @@ def test_baseline_line_poll_updates_the_count_and_keeps_the_other_tags(open_page
     now = shown()
     # Main alone moved past the Baseline's drift, so its place is unknown: the main
     # count shows the new number and the ring a mark.
-    assert now["counts"] == [["main", "+16"], ["ring", "?"]]
+    assert now["counts"] == [["main", "+16"]]
     assert "main 16 ahead of the fork" in now["words"]
     assert visible_card_paths(page, "main 16 ahead of the fork") == [alpha]
     assert visible_card_paths(page, "main 15 ahead of the fork") == []
@@ -13845,7 +13841,7 @@ def test_baseline_line_poll_updates_the_count_and_keeps_the_other_tags(open_page
     serve_baseline_states(page, double, {alpha: None})
     assert card.locator(".card-baseline, .baseline-count").count() == 0
     serve_baseline_states(page, double, {alpha: against(16)})
-    assert shown()["counts"] == [["main", "+16"], ["ring", "?"]]
+    assert shown()["counts"] == [["main", "+16"]]
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -14156,10 +14152,10 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     legend = page.locator(
         "#work-item-panel-body .panel-all-fields .panel-baseline-legend li").all_text_contents()
     assert [entry.split(" ")[0] for entry in legend] == [
-        "B", "C", "M", "fork", "arm", "main", "ring", "?", "≠", "cached"]
+        "B", "C", "M", "fork", "arm", "main", "ring", "?", "cached"]
     joined = " ".join(legend)
     for expected in ("the Baseline", "checked out", "main head", "left of the fork",
-                     "dotted below the fork", "cannot be read", "not on main's history",
+                     "no ring is drawn", "cannot be read", "off main's history",
                      "cached copy"):
         assert expected in joined
     for removed in ("count by M", "+N", "behind main"):
