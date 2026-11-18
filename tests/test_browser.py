@@ -13174,6 +13174,8 @@ BASELINE_LINE_READ = """card => {
     linkBox: rect(link),
     arm: arm ? rect(arm) : null,
     tether: line.querySelector('.baseline-link[data-link="tether"]') !== null,
+    tetherBox: line.querySelector('.baseline-link[data-link="tether"]')
+      ? rect(line.querySelector('.baseline-link[data-link="tether"]')) : null,
     hit: {C: hit('C'), M: hit('M')},
     counts: [...line.querySelectorAll('.baseline-count')].map((node) => {
       const look = getComputedStyle(node);
@@ -13313,6 +13315,13 @@ def baseline_strip_faults(line, digits=None):
     """
     faults = []
     unit, inner, counts = line["unit"], line["inner"], line["counts"]
+    if line["tether"]:
+        # The dotted tether must show between the fork dot's box and the ring's box.
+        fork, ring, tether = line["F"], line["B"], line["tetherBox"]
+        if ring["top"] - fork["bottom"] < 0.2 * unit - 0.5:
+            faults.append(f"tether shows {(ring['top'] - fork['bottom']) / unit}rem")
+        if tether["top"] > fork["bottom"] + 0.5 or tether["bottom"] < ring["top"] - 0.5:
+            faults.append(f"tether does not span the gap: {tether}")
     if abs(line["box"]["height"] / unit - 2.2) > 0.01:
         faults.append(f"strip height {line['box']['height'] / unit}rem")
     if line["scrollWidth"] > line["clientWidth"]:
@@ -13449,12 +13458,12 @@ def test_baseline_line_draws_the_fork_arm_ring_and_counts_for_every_worked_examp
             assert ring["cy"] == pytest.approx(fork["cy"], abs=0.5), where
             assert ring["border"] == "solid", where
         # Colours follow the line, never a count: figures take its text colour, only a
-        # mark takes the muted one (on the teal card, legibility on the strip decides).
+        # mark takes the muted one.  The one exception is the teal card, where the muted
+        # token is unreadable on the strip, so its marks take the text colour instead.
         for count in line["counts"]:
             if count["mark"]:
                 assert contrast_ratio(count["color"], line["surface"]) >= 4.5, (where, count)
-                if not line["teal"]:
-                    assert count["color"] == muted, (where, count)
+                assert count["color"] == (line["color"] if line["teal"] else muted), (where, count)
             else:
                 assert count["color"] == line["color"], (where, count)
             assert count["decoration"] == ("underline" if count["cached"] else "none"), (where, count)
@@ -13520,23 +13529,21 @@ def test_baseline_line_counts_fit_the_strip_at_every_width(open_page, real_check
             width)
         settle_frames(page)
 
-    # The 18rem card (a 16.275rem strip) and the panel's 14rem line, four digits.
+    # The 18rem card (a 16.275rem strip), four digits.
     serve_baseline_states(page, double, served(1234, 2468))
     set_card_width("18rem")
     prove(lambda path: baseline_line(page, path), 1234, 16.275, "18rem card")
+    # The panel strip at the width its layout gives it, never set here: two digits.
+    serve_baseline_states(page, double, served(99, 198))
     for path in kinds:
         code_status_card(page, path).click()
         row = page.locator("#work-item-panel-body .panel-code .panel-baseline-line")
         playwright.expect(row).to_have_count(1)
         panel = row.evaluate(BASELINE_LINE_READ)
-        # The strip is capped at 14rem; the cap is the widest it ever draws.
-        row.evaluate("row => { row.querySelector('.card-baseline').style.width = '14rem'; }")
-        panel = row.evaluate(BASELINE_LINE_READ)
-        assert panel["box"]["width"] / panel["unit"] == pytest.approx(14, abs=0.02), path
+        assert panel["box"]["width"] / panel["unit"] == pytest.approx(11.94, abs=0.1), path
         assert panel["kind"] == kinds[path] and baseline_strip_faults(panel) == [], path
-        assert [count["text"] for count in panel["counts"]].count("+1234") >= 2, path
+        assert [count["text"] for count in panel["counts"]].count("+99") >= 2, path
     # The 12rem card under a viewport of at most 700px (a 10.275rem strip), two digits.
-    serve_baseline_states(page, double, served(99, 198))
     page.set_viewport_size({"width": 640, "height": 900})
     set_card_width("12rem")
     prove(lambda path: baseline_line(page, path), 99, 10.275, "12rem card")
