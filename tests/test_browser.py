@@ -13124,47 +13124,69 @@ def serve_baseline_states(page, double, states, pills=None):
 
 
 BASELINE_LINE_READ = """card => {
-  const rect = (node) => {
-    const box = node.getBoundingClientRect();
-    return {x: box.x, y: box.y, width: box.width, height: box.height,
-            cx: box.x + box.width / 2, cy: box.y + box.height / 2, right: box.right};
-  };
+  const unit = parseFloat(getComputedStyle(document.documentElement).fontSize);
   const lines = card.querySelectorAll('.card-baseline');
   const line = lines[0];
   if (!line) return {count: 0};
-  const base = rect(line);
+  line.scrollIntoView({block: 'center', inline: 'center'});
+  const origin = line.getBoundingClientRect();
+  const rect = (node) => {
+    const box = node.getBoundingClientRect();
+    return {left: box.left - origin.x, top: box.top - origin.y,
+            right: box.right - origin.x, bottom: box.bottom - origin.y,
+            x: box.left - origin.x, y: box.top - origin.y,
+            width: box.width, height: box.height,
+            cx: box.left + box.width / 2 - origin.x, cy: box.top + box.height / 2 - origin.y};
+  };
   const point = (name) => {
     const node = line.querySelector(`.baseline-point[data-point="${name}"]`);
-    const box = rect(node);
     const style = getComputedStyle(node);
+    const check = node.querySelector('.baseline-check');
     return {
-      tone: node.dataset.tone, form: node.dataset.form || null, fork: 'fork' in node.dataset,
-      check: node.querySelector('.baseline-check') !== null,
-      cx: box.cx - base.x, cy: box.cy - base.y, width: box.width, height: box.height,
-      right: box.right - base.x, background: style.backgroundColor,
-      color: node.querySelector('.baseline-check')
-        ? getComputedStyle(node.querySelector('.baseline-check')).color : null,
+      ...rect(node), tone: node.dataset.tone || null, at: node.dataset.at || null,
+      border: style.borderTopStyle, check: check !== null,
+      background: style.backgroundColor,
+      color: check ? getComputedStyle(check).color : null,
     };
   };
   const link = line.querySelector('.baseline-link[data-link="main"]');
-  const added = line.querySelector('.baseline-added');
-  const behind = line.querySelector('.baseline-behind');
+  const arm = line.querySelector('.baseline-link[data-link="arm"]');
+  const hit = (name) => {
+    const box = line.querySelector(`.baseline-point[data-point="${name}"]`)
+      .getBoundingClientRect();
+    const node = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    const owner = node && node.closest('.baseline-point');
+    return owner ? owner.dataset.point : (node ? node.className : null);
+  };
+  const style = getComputedStyle(line);
+  const inner = {left: line.clientLeft, top: line.clientTop,
+                 right: line.clientLeft + line.clientWidth,
+                 bottom: line.clientTop + line.clientHeight};
   return {
-    count: lines.length, surface: getComputedStyle(line).backgroundColor,
-    B: point('B'), C: point('C'), M: point('M'),
+    count: lines.length, unit, surface: style.backgroundColor, color: style.color,
+    kind: line.dataset.case, role: line.getAttribute('role'),
+    teal: line.closest('.card.no-incoming-arrow') !== null,
+    box: {width: origin.width, height: origin.height}, inner,
+    scrollWidth: line.scrollWidth, clientWidth: line.clientWidth,
+    B: point('B'), C: point('C'), M: point('M'), F: point('fork'),
     link: {tone: link.dataset.tone, line: link.dataset.line || null,
            style: getComputedStyle(link).borderTopStyle},
-    fork: line.querySelector('.baseline-link[data-link="fork"]') !== null,
-    forkBox: (() => {
-      const node = line.querySelector('.baseline-link[data-link="fork"]');
-      if (!node) return null;
-      const box = rect(node);
-      return {left: box.x - base.x, bottom: box.y + box.height - base.y,
-              right: box.right - base.x, top: box.y - base.y};
-    })(),
-    added: added ? added.textContent : null,
-    behind: behind ? behind.textContent : null,
-    behindLeft: behind ? rect(behind).x - base.x : null,
+    linkBox: rect(link),
+    arm: arm ? rect(arm) : null,
+    tether: line.querySelector('.baseline-link[data-link="tether"]') !== null,
+    hit: {C: hit('C'), M: hit('M')},
+    counts: [...line.querySelectorAll('.baseline-count')].map((node) => {
+      const look = getComputedStyle(node);
+      return {
+        slot: node.dataset.slot, text: node.textContent, mark: 'mark' in node.dataset,
+        cached: 'cached' in node.dataset, hidden: node.getAttribute('aria-hidden'),
+        decoration: look.textDecorationLine, decorationStyle: look.textDecorationStyle,
+        color: look.color, ...rect(node),
+      };
+    }),
+    old: line.querySelectorAll('.baseline-added, .baseline-behind').length,
+    oldAttributes: line.hasAttribute('data-place') || line.hasAttribute('data-form') ||
+      line.querySelectorAll('[data-place], [data-form]').length > 0,
   };
 }"""
 
@@ -13267,56 +13289,257 @@ def test_baseline_line_tones_follow_the_one_rule(
         assert line["M"]["background"] == expected, (tone, line["M"])
 
 
-def test_baseline_line_markers_place_the_checkout_by_order_alone(
+# Where each count sits: the points whose centres bound its segment on main's line.
+BASELINE_SEGMENT_ENDS = {
+    "main": ("F", "M"), "gap": ("B", "F"), "first": ("F", "B"), "second": ("B", "M"),
+    "beyond": ("M", "B"),
+}
+
+
+def box_meets(first, second):
+    """Whether two rendered boxes share any area."""
+    return (first["left"] < second["right"] and second["left"] < first["right"]
+            and first["top"] < second["bottom"] and second["top"] < first["bottom"])
+
+
+def baseline_strip_faults(line, digits=None):
+    """What is wrong with the drawn strip, read from rendered boxes alone.
+
+    Every count and ``?``/``≠`` box lies inside the strip and clear of every
+    other count and of every point, ring and fork-dot box; a count on main's
+    line lies between the centres of its segment's two points; the arm's count
+    lies above main's line and left of the fork's centre; the box is ``2.2rem``
+    high and nothing sticks out of it.  Returns one sentence per fault.
+    """
+    faults = []
+    unit, inner, counts = line["unit"], line["inner"], line["counts"]
+    if abs(line["box"]["height"] / unit - 2.2) > 0.01:
+        faults.append(f"strip height {line['box']['height'] / unit}rem")
+    if line["scrollWidth"] > line["clientWidth"]:
+        faults.append("something is drawn outside the strip's width")
+    points = {name: line[name] for name in ("B", "F", "C", "M")}
+    for index, count in enumerate(counts):
+        name = f"{count['slot']} {count['text']}"
+        if not (inner["left"] <= count["left"] and count["right"] <= inner["right"]
+                and inner["top"] <= count["top"] and count["bottom"] <= inner["bottom"]):
+            faults.append(f"{name} is outside the strip: {count}")
+        for point, box in points.items():
+            if box_meets(count, box):
+                faults.append(f"{name} meets point {point}")
+        for other in counts[index + 1:]:
+            if box_meets(count, other):
+                faults.append(f"{name} meets count {other['slot']} {other['text']}")
+        if count["slot"] in BASELINE_SEGMENT_ENDS:
+            ends = [points[end]["cx"] for end in BASELINE_SEGMENT_ENDS[count["slot"]]]
+            if not min(ends) <= count["cx"] <= max(ends):
+                faults.append(f"{name} leaves its segment {ends}: {count['cx']}")
+        if count["slot"] == "arm":
+            if count["bottom"] > line["linkBox"]["top"] or count["right"] > points["F"]["cx"]:
+                faults.append(f"{name} is not above the line and left of the fork")
+        if count["slot"] == "ring" and count["left"] < points["B"]["right"]:
+            faults.append(f"{name} is not to the right of the ring")
+    return faults
+
+
+def baseline_slot_percent(line, name):
+    """A point's centre as a percentage of the strip's width."""
+    inner = line["inner"]
+    return 100 * (line[name]["cx"] - inner["left"]) / (inner["right"] - inner["left"])
+
+
+# Worked rows of the card baseline deltas, in the order of ``baseline_line_words_cases``:
+# the case, where C stands, the slot of M, and each count as ``slot:text`` with a
+# trailing ``!`` when it is underlined as cached.
+BASELINE_DRAWN_ROWS = [
+    ("same", "arm", 94, ["arm:+3", "main:+12"]),
+    ("older", "arm", 94, ["arm:+10", "gap:+7", "main:+15"]),
+    ("newer", "arm", 94, ["arm:+10", "first:+2", "second:+13"]),
+    ("newer", "arm", 94, ["arm:+10", "first:+2", "second:+13"]),
+    ("newer", "arm", 94, ["arm:+10!", "first:+2", "second:+13!"]),
+    ("newer", "arm", 94, ["arm:+10", "first:+4", "second:+13"]),
+    ("same", "fork", 94, ["main:+58!"]),
+    ("beyond", "arm", 72, ["arm:+3!", "beyond:+1!"]),
+    ("beyond", "arm", 72, ["arm:+3", "beyond:+3"]),
+    ("off", "arm", 94, ["arm:+4", "ring:\u2260"]),
+    ("off", "arm", 94, ["arm:+4", "ring:\u2260"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:+10!", "main:+15!", "ring:?!"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:+10", "main:+15", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:?", "main:?", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:?!", "main:?!", "ring:?!"]),
+    ("unknown", "arm", 94, ["arm:\u2260", "main:\u2260", "ring:?"]),
+    ("unknown", "arm", 94, ["arm:\u2260!", "main:\u2260!", "ring:?!"]),
+    ("no-main", "arm", 94, ["arm:?", "ring:?"]),
+    ("same", "arm", 94, ["arm:+1", "main:+12"]),
+    ("same", "fork", 94, []),
+    ("older", "fork", 94, ["gap:+5"]),
+    ("newer-at-main", "fork", 94, ["first:+5"]),
+    ("beyond", "fork", 72, ["main:+3!", "beyond:+2!"]),
+    ("newer", "arm", 94, ["arm:?", "first:+2", "second:+13"]),
+    ("beyond", "arm", 72, ["arm:\u2260", "main:\u2260", "beyond:+1"]),
+]
+# The rows whose C must stay visible beside M (rows 23, 6, 17, 18 and 22).
+BASELINE_HIT_ROWS = {7, 8, 22, 23, 27}
+
+
+def test_baseline_line_draws_the_fork_arm_ring_and_counts_for_every_worked_example(
     open_page, real_checkouts
 ):
-    """Ring, plus count, fork, side, dotted form and the count beside M, never a distance."""
+    """Each served row draws its case, its slots and exactly its counts, never a distance."""
     page, double = baseline_line_page(open_page, real_checkouts)
-    behind = comparison("behind", 0, 3)
-    cases = [
-        ((EQUAL, EQUAL, EQUAL), "equal"),
-        ((behind, comparison("ahead", 5, 0), EQUAL), "forked"),
-        ((EQUAL, comparison("ahead", 5, 0), EQUAL), "plain"),
-        ((EQUAL, comparison("behind", 0, 2), EQUAL), "left"),
-        ((EQUAL, comparison("diverged", 1, 2), EQUAL), "diverged"),
-        ((EQUAL, comparison("differs"), EQUAL), "differs"),
-        ((EQUAL, comparison("unknown"), EQUAL), "unknown"),
-        ((EQUAL, EQUAL, behind), "behind3"),
-        ((EQUAL, EQUAL, comparison("behind", 0, 58)), "behind58"),
-    ]
-    lines = {tag: line for (_, tag), line in baseline_line_cases(page, double, cases)}
-    assert lines["equal"]["C"]["form"] == "ring"
-    assert abs(lines["equal"]["C"]["cx"] - lines["equal"]["B"]["cx"]) < 1
-    assert lines["equal"]["added"] is None and lines["equal"]["C"]["check"] is True
-    for tag in ("forked", "plain"):
-        assert lines[tag]["added"] == "+5"
-        assert lines[tag]["C"]["cx"] > lines[tag]["B"]["cx"] + 4
-        assert lines[tag]["C"]["check"] is False
-    assert lines["forked"]["fork"] and lines["forked"]["C"]["fork"]
-    assert lines["forked"]["C"]["cy"] < lines["forked"]["B"]["cy"] - 3
-    # The fork line runs from the centre of B to the centre of C.
-    box, point_b, point_c = lines["forked"]["forkBox"], lines["forked"]["B"], lines["forked"]["C"]
-    assert abs(box["left"] - point_b["cx"]) < 1 and abs(box["bottom"] - point_b["cy"]) < 1
-    assert abs(box["right"] - point_c["cx"]) < 1 and abs(box["top"] - point_c["cy"]) < 1
-    assert not lines["plain"]["fork"] and not lines["plain"]["C"]["fork"]
-    assert abs(lines["plain"]["C"]["cy"] - lines["plain"]["B"]["cy"]) < 1
-    assert lines["left"]["C"]["cx"] < lines["left"]["B"]["cx"] - 4
-    assert lines["left"]["added"] is None
-    for tag in ("diverged", "differs", "unknown"):
-        assert lines[tag]["C"]["form"] == "dotted"
-        assert lines[tag]["C"]["cy"] < lines[tag]["B"]["cy"] - 3
-    assert lines["behind3"]["behind"] == "3" and lines["behind58"]["behind"] == "58"
-    for tag in ("behind3", "behind58"):
-        assert lines[tag]["behindLeft"] >= lines[tag]["M"]["right"] - 1
-    assert lines["equal"]["behind"] is None
-    for name in ("B", "C", "M"):
-        three, fifty_eight = lines["behind3"][name], lines["behind58"][name]
+    served = baseline_line_words_cases()
+    assert len(served) == len(BASELINE_DRAWN_ROWS)
+    muted = baseline_token_color(page, "--muted")
+    lines = {}
+    for start in range(0, len(served), len(BASELINE_LINE_CARDS)):
+        chunk = list(range(start, min(start + len(BASELINE_LINE_CARDS), len(served))))
+        padded = chunk + [chunk[0]] * (len(BASELINE_LINE_CARDS) - len(chunk))
+        serve_baseline_states(
+            page, double, {path: served[row][0] for path, row in zip(BASELINE_LINE_CARDS, padded)})
+        for path, row in zip(BASELINE_LINE_CARDS, chunk):
+            lines[row] = baseline_line(page, path)
+    for row, (kind, at, m_slot, expected) in enumerate(BASELINE_DRAWN_ROWS):
+        line = lines[row]
+        where = f"row {row}"
+        assert line["count"] == 1 and line["old"] == 0 and not line["oldAttributes"], where
+        assert line["kind"] == kind, where
+        assert baseline_strip_faults(line) == [], where
+        drawn = [(count["slot"], count["text"], count["cached"]) for count in line["counts"]]
+        assert drawn == [
+            (entry.split(":")[0], entry.split(":", 1)[1].rstrip("!"), entry.endswith("!"))
+            for entry in expected], where
+        assert all(count["hidden"] == "true" for count in line["counts"]), where
+        assert (line["arm"] is not None) is (at == "arm"), where
+        assert line["C"]["at"] == at, where
+        assert line["tether"] is (kind in ("off", "unknown", "no-main")), where
+        # C is a solid dot, at the fork or at the tip of the arm, half a step right of it.
+        assert line["C"]["border"] == "none" and line["C"]["background"] != line["surface"], where
+        if at == "arm":
+            assert baseline_slot_percent(line, "C") == pytest.approx(61, abs=0.3), where
+            assert line["C"]["cy"] < line["F"]["cy"] - 0.4 * line["unit"], where
+        else:
+            assert line["C"]["cx"] == pytest.approx(line["F"]["cx"], abs=0.5), where
+            assert line["C"]["cy"] == pytest.approx(line["F"]["cy"], abs=0.5), where
+        # M keeps its own slot, never on the fork, whatever main's count.
+        assert baseline_slot_percent(line, "F") == pytest.approx(50, abs=0.3), where
+        assert baseline_slot_percent(line, "M") == pytest.approx(m_slot, abs=0.3), where
+        assert abs(line["M"]["cx"] - line["F"]["cx"]) > 2 * line["unit"] * 0.4, where
+        ring, fork, head = line["B"], line["F"], line["M"]
+        step = 0.22 * (line["inner"]["right"] - line["inner"]["left"])
+        if kind == "same":
+            assert ring["cx"] == pytest.approx(fork["cx"], abs=0.5), where
+            assert ring["width"] >= 1.4 * line["unit"] - 0.5, where
+        elif kind == "older":
+            assert ring["cx"] == pytest.approx(fork["cx"] - step, abs=0.5), where
+        elif kind == "newer":
+            assert ring["cx"] == pytest.approx(fork["cx"] + step, abs=0.5), where
+        elif kind == "newer-at-main":
+            assert ring["cx"] == pytest.approx(head["cx"], abs=0.5), where
+            assert ring["width"] >= 1.2 * line["unit"] - 0.5, where
+        elif kind == "beyond":
+            assert ring["cx"] > head["cx"] + 0.5 * line["unit"], where
+            assert baseline_slot_percent(line, "B") == pytest.approx(94, abs=0.3), where
+        else:
+            assert ring["cx"] == pytest.approx(fork["cx"], abs=0.5), where
+            assert ring["cy"] > fork["cy"] + 0.4 * line["unit"], where
+            assert ring["border"] == "dotted", where
+        if kind not in ("off", "unknown", "no-main"):
+            assert ring["cy"] == pytest.approx(fork["cy"], abs=0.5), where
+            assert ring["border"] == "solid", where
+        # Colours follow the line, never a count: figures take its text colour, only a
+        # mark takes the muted one (on the teal card, legibility on the strip decides).
+        for count in line["counts"]:
+            if count["mark"]:
+                assert contrast_ratio(count["color"], line["surface"]) >= 4.5, (where, count)
+                if not line["teal"]:
+                    assert count["color"] == muted, (where, count)
+            else:
+                assert count["color"] == line["color"], (where, count)
+            assert count["decoration"] == ("underline" if count["cached"] else "none"), (where, count)
+            if count["cached"]:
+                assert count["decorationStyle"] == "dotted", (where, count)
+        # C and M stay visible and apart, and nothing paints over them.
+        if row in BASELINE_HIT_ROWS:
+            assert line["hit"] == {"C": "C", "M": "M"}, where
+            assert not box_meets(line["C"], line["M"]), where
+    # A ring left of the fork and a ring right of it stand the same distance from it.
+    left, right = lines[1], lines[2]
+    assert abs(left["F"]["cx"] - left["B"]["cx"]) == pytest.approx(
+        abs(right["B"]["cx"] - right["F"]["cx"]), abs=0.5)
+    assert not box_meets(lines[2]["C"], lines[2]["B"])
+    # The same row of counts 3 and 58 puts every point and every slot in the same place.
+    equal = live("equal", 0, 0)
+    pair = {}
+    for count in (3, 58):
+        serve_baseline_states(page, double, {BASELINE_LINE_CARDS[0]: (
+            live("behind", 0, count), equal, live("behind", 0, count))})
+        pair[count] = baseline_line(page, BASELINE_LINE_CARDS[0])
+    assert [count["text"] for count in pair[3]["counts"]] == ["+3"]
+    assert [count["text"] for count in pair[58]["counts"]] == ["+58"]
+    for name in ("B", "F", "C", "M"):
         for key in ("cx", "cy", "width", "height"):
-            assert three[key] == pytest.approx(fifty_eight[key], abs=0.5), (name, key)
-    # The check mark needs three green tones.
-    assert lines["equal"]["C"]["check"] and lines["equal"]["M"]["tone"] == "green"
-    for tag in ("behind3", "forked", "left", "diverged", "unknown"):
-        assert lines[tag]["C"]["check"] is False
+            assert pair[3][name][key] == pytest.approx(pair[58][name][key], abs=0.5), (name, key)
+    assert pair[3]["counts"][0]["cx"] == pytest.approx(pair[58]["counts"][0]["cx"], abs=0.5)
+
+
+def test_baseline_line_counts_fit_the_strip_at_every_width(open_page, real_checkouts):
+    """Four digits fit at 18rem and 14rem, two at 12rem: every box is clear and the strip stays 2.2rem."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta, epsilon = BASELINE_LINE_CARDS
+
+    def served(count, drift_behind):
+        both = live("diverged", count, count)
+        return {
+            alpha: (live("behind", 0, drift_behind), live("ahead", drift_behind, 0), both),
+            beta: (live("behind", 0, count), live("diverged", count, count), both),
+            delta: (live("ahead", count, 0), live("ahead", count, 0), both),
+            epsilon: (live("behind", 0, count), comparison("unknown"), both),
+        }
+
+    kinds = {alpha: "older", beta: "newer", delta: "beyond", epsilon: "unknown"}
+
+    def prove(read, digits, strip_rem, where):
+        for path, kind in kinds.items():
+            line = read(path)
+            label = f"{where} {kind}"
+            assert line["kind"] == kind, label
+            assert line["box"]["width"] / line["unit"] == pytest.approx(strip_rem, abs=0.02), label
+            assert baseline_strip_faults(line) == [], label
+            drawn = {count["slot"]: count["text"] for count in line["counts"]}
+            assert drawn["arm"] == f"+{digits}", label
+            assert all(count["color"] == line["color"] for count in line["counts"]
+                       if not count["mark"]), label
+            assert [text for text in drawn.values() if text.startswith("+")] == [
+                f"+{digits}"] * (len(drawn) - (kind == "unknown")), label
+
+    def set_card_width(width):
+        page.evaluate(
+            "width => document.querySelectorAll('.card').forEach(card => { card.style.width = width; })",
+            width)
+        settle_frames(page)
+
+    # The 18rem card (a 16.275rem strip) and the panel's 14rem line, four digits.
+    serve_baseline_states(page, double, served(1234, 2468))
+    set_card_width("18rem")
+    prove(lambda path: baseline_line(page, path), 1234, 16.275, "18rem card")
+    for path in kinds:
+        code_status_card(page, path).click()
+        row = page.locator("#work-item-panel-body .panel-code .panel-baseline-line")
+        playwright.expect(row).to_have_count(1)
+        panel = row.evaluate(BASELINE_LINE_READ)
+        # The strip is capped at 14rem; the cap is the widest it ever draws.
+        row.evaluate("row => { row.querySelector('.card-baseline').style.width = '14rem'; }")
+        panel = row.evaluate(BASELINE_LINE_READ)
+        assert panel["box"]["width"] / panel["unit"] == pytest.approx(14, abs=0.02), path
+        assert panel["kind"] == kinds[path] and baseline_strip_faults(panel) == [], path
+        assert [count["text"] for count in panel["counts"]].count("+1234") >= 2, path
+    # The 12rem card under a viewport of at most 700px (a 10.275rem strip), two digits.
+    serve_baseline_states(page, double, served(99, 198))
+    page.set_viewport_size({"width": 640, "height": 900})
+    set_card_width("12rem")
+    prove(lambda path: baseline_line(page, path), 99, 10.275, "12rem card")
 
 
 def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
@@ -13486,6 +13709,7 @@ def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_ch
     assert baseline_line(page, BASELINE_LINE_CARDS[1])["C"]["check"] is True
     for path in (BASELINE_LINE_CARDS[2], BASELINE_LINE_CARDS[3], gamma):
         assert baseline_line(page, path)["count"] == 0, path
+        assert code_status_card(page, path).locator(".baseline-count").count() == 0, path
     # Several polls changing the facts in place still leave one line per card.
     for state in [(EQUAL, comparison("ahead", 5, 0), comparison("behind", 0, 3)),
                   (comparison("absent"), EQUAL, comparison("absent")), (EQUAL, EQUAL, EQUAL)]:
@@ -13497,11 +13721,106 @@ def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_ch
     serve_baseline_states(page, double, {
         BASELINE_LINE_CARDS[0]: None, BASELINE_LINE_CARDS[1]: (EQUAL, EQUAL, EQUAL)})
     assert baseline_line(page, BASELINE_LINE_CARDS[0])["count"] == 0
+    assert code_status_card(page, BASELINE_LINE_CARDS[0]).locator(".baseline-count").count() == 0
     assert page.locator(".card-baseline").count() == 1
     double.fail("checkouts_failed")
     fire_checkouts_poll(page)
     settle_frames(page)
     assert page.locator(".card-baseline").count() == 0
+
+
+def test_baseline_line_underlines_counts_by_the_basis_of_main_only(open_page, real_checkouts):
+    """A cached main marks its counts, a live one none, and a Baseline's first count never."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha, beta, delta, epsilon = BASELINE_LINE_CARDS
+
+    def case_c(basis):
+        drift = {**comparison("behind", 0, 13), "basis": basis}
+        against = {**comparison("diverged", 10, 15), "basis": basis}
+        return (drift, comparison("diverged", 10, 2), against)
+
+    def underlined():
+        return {path: [count["slot"] for count in baseline_line(page, path)["counts"]
+                       if count["cached"]] for path in BASELINE_LINE_CARDS}
+
+    no_base = (comparison("absent"), EQUAL, comparison("absent"))
+    # One poll serves a live, a cached, a recorded main and no verdict base.
+    serve_baseline_states(page, double, {
+        alpha: case_c("live"), beta: case_c("cached"), delta: case_c("recorded"),
+        epsilon: no_base})
+    assert underlined() == {alpha: [], beta: ["arm", "second"], delta: [], epsilon: []}
+    # The same cards in the next poll: main's basis, not the card, decides.
+    serve_baseline_states(page, double, {
+        alpha: case_c("cached"), beta: case_c("live"), delta: case_c("cached"),
+        epsilon: no_base})
+    assert underlined() == {alpha: ["arm", "second"], beta: [], delta: ["arm", "second"],
+                            epsilon: []}
+    serve_baseline_states(page, double, {path: case_c("live") for path in BASELINE_LINE_CARDS})
+    assert underlined() == {path: [] for path in BASELINE_LINE_CARDS}
+
+
+def test_baseline_line_poll_updates_the_count_and_keeps_the_other_tags(open_page, real_checkouts):
+    """A poll changing main's count redraws it with the words; a case change keeps the other tags."""
+    page, double = baseline_line_page(open_page, real_checkouts)
+    alpha = BASELINE_LINE_CARDS[0]
+    equal = live("equal", 0, 0)
+    card = code_status_card(page, alpha)
+
+    def shown():
+        return card.locator(".card-baseline").evaluate(
+            "line => ({kind: line.dataset.case, className: line.className, "
+            "words: line.getAttribute('aria-label'), "
+            "counts: [...line.querySelectorAll('.baseline-count')].map("
+            "count => [count.dataset.slot, count.textContent])})")
+
+    def against(count):
+        return (live("behind", 0, 15), equal, live("behind", 0, count))
+
+    serve_baseline_states(page, double, {alpha: against(15)})
+    assert shown()["counts"] == [["main", "+15"]] and shown()["kind"] == "same"
+    assert visible_card_paths(page, "main 15 ahead of the fork") == [alpha]
+    page.fill("#filter", "")
+    # Record the card's other tags, then change nothing but the count of vs_base.behind.
+    page.evaluate(
+        """path => {
+          const card = document.querySelector(`.card[data-package-path="${path}"]`);
+          window.otherTags = [...card.querySelectorAll('.card-facts > :not(.card-baseline)')];
+        }""", alpha)
+    assert page.evaluate("window.otherTags.length") >= 2
+
+    def other_tags_kept():
+        return page.evaluate(
+            """path => {
+              const card = document.querySelector(`.card[data-package-path="${path}"]`);
+              const now = [...card.querySelectorAll('.card-facts > :not(.card-baseline)')];
+              return now.length === window.otherTags.length &&
+                now.every((tag, index) => tag === window.otherTags[index] && tag.isConnected);
+            }""", alpha)
+
+    serve_baseline_states(page, double, {alpha: against(16)})
+    now = shown()
+    # Main alone moved past the Baseline's drift, so its place is unknown: the main
+    # count shows the new number and the ring a mark.
+    assert now["counts"] == [["main", "+16"], ["ring", "?"]]
+    assert "main 16 ahead of the fork" in now["words"]
+    assert visible_card_paths(page, "main 16 ahead of the fork") == [alpha]
+    assert visible_card_paths(page, "main 15 ahead of the fork") == []
+    page.fill("#filter", "")
+    assert other_tags_kept()
+    # Case A to case C: the line is redrawn with the class list unchanged and no row rebuilt.
+    before = shown()
+    serve_baseline_states(page, double, {alpha: (
+        live("behind", 0, 13), live("diverged", 10, 2), live("diverged", 10, 15))})
+    after = shown()
+    assert after["kind"] != before["kind"] == "unknown"
+    assert after["kind"] == "newer" and after["className"] == before["className"]
+    assert after["counts"] == [["arm", "+10"], ["first", "+2"], ["second", "+13"]]
+    assert other_tags_kept()
+    # The line goes with its checkout and comes back with it.
+    serve_baseline_states(page, double, {alpha: None})
+    assert card.locator(".card-baseline, .baseline-count").count() == 0
+    serve_baseline_states(page, double, {alpha: against(16)})
+    assert shown()["counts"] == [["main", "+16"], ["ring", "?"]]
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -13815,7 +14134,12 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     for expected in ("Baseline", "checked out", "main head", "ring", "fork", "+N", "count by M"):
         assert expected in " ".join(legend)
     assert row.locator(".card-baseline").count() == 1
-    assert row.locator(".baseline-added").inner_text() == "+5"
+    # The checkout has no commits of its own, so no arm count is drawn; the strip
+    # shows the Baseline's gap and main's count, and no old number.
+    assert row.locator(".baseline-count").evaluate_all(
+        "counts => counts.map(count => [count.dataset.slot, count.textContent])"
+    ) == [["gap", "+55"], ["main", "+3"]]
+    assert row.locator(".baseline-added, .baseline-behind").count() == 0
 
     # A poll that changes the facts rewrites the row.
     serve_baseline_states(page, double, {alpha: (equal, equal, equal), gamma: None})
