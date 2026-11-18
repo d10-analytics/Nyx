@@ -14137,9 +14137,15 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     assert "Baseline line legend" in dict(panel_all_fields(page))
     legend = page.locator(
         "#work-item-panel-body .panel-all-fields .panel-baseline-legend li").all_text_contents()
-    assert [entry.split(" ")[0] for entry in legend] == ["B", "C", "M", "ring", "fork", "count"]
-    for expected in ("Baseline", "checked out", "main head", "ring", "fork", "+N", "count by M"):
-        assert expected in " ".join(legend)
+    assert [entry.split(" ")[0] for entry in legend] == [
+        "B", "C", "M", "fork", "arm", "main", "ring", "?", "≠", "cached"]
+    joined = " ".join(legend)
+    for expected in ("the Baseline", "checked out", "main head", "left of the fork",
+                     "dotted below the fork", "cannot be read", "not on main's history",
+                     "cached copy"):
+        assert expected in joined
+    for removed in ("count by M", "+N", "behind main"):
+        assert removed not in joined
     assert row.locator(".card-baseline").count() == 1
     # The checkout has no commits of its own, so no arm count is drawn; the strip
     # shows the Baseline's gap and main's count, and no old number.
