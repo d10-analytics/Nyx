@@ -830,7 +830,7 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .baseline-count[data-slot="second"] { --a: var(--ring); --b: var(--m); --ra: .3rem; --rb: var(--mr); }
 .baseline-count[data-slot="beyond"] { --a: var(--m); --b: var(--ring); --ra: var(--mr); --rb: .3rem; }
 .baseline-count[data-slot="arm"] {
-  top: .25rem;
+  top: .12rem;
   left: auto;
   right: calc(100% - var(--f) + var(--fr) + .1rem);
   transform: none;
@@ -952,6 +952,9 @@ body.panel-collapsed #work-item-panel-toggle {
   #checkouts .checkouts-detail > td { padding-left: .5rem; }
   #checkouts .checkouts-group { padding: .75rem; }
   #checkouts [hidden] { display: none; }
+  /* On the narrowest card the shortest segment (ring to M) is about 1.5rem
+     wide, so its two-digit count is set smaller to fit in a wide fallback font. */
+  .baseline-count { font-size: .64rem; }
   #board {
     --card-min-width: 12rem;
     --label-min-width: 9rem;
