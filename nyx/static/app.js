@@ -1095,19 +1095,46 @@
     const place = {
       equal: "equal", ahead: "right", behind: "left", diverged: "off", differs: "off",
     }[versus.relation] || "unplaced";
-    // The same facts in words, decided from the tones above so that the words,
-    // the colours and the search can never disagree.  A cached basis is named.
-    const counted = (comparison, tone, subject) => {
-      const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
-      return (tone === "grey"
-        ? `${subject} unknown against main`
-        : `${subject} ${comparison.behind} behind main`) + named;
-    };
-    const words = [
-      {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
-        grey: "Baseline unknown"}[baselineTone],
-      mainUnknown ? "Main unknown" : counted(against, tones.main, "Checkout"),
-      counted(drift, tones.baseline, "Baseline"),
+    // The same facts in words, decided from the served relations alone (the
+    // case of the Baseline's place, tested in order) so that the card, the
+    // tooltip, the panel and the search can never disagree.  A cached main
+    // basis, that of vs_base and drift, ends every phrase they feed; only a
+    // line with no verdict base is never marked.
+    const counted = (comparison) => ["equal", "ahead", "behind", "diverged"].includes(comparison.relation);
+    const named = against.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
+    const mark = (phrase) => phrase + named;
+    const commits = (count, subject) => count === 0 ? `${subject} has no commits of its own`
+      : `${subject} ${count} ${count === 1 ? "commit" : "commits"} of its own`;
+    const own = counted(against) ? against.ahead : null;
+    const main = counted(against) ? against.behind : null;
+    const gap = counted(against) && counted(drift) ? drift.behind - against.behind : null;
+    const sideOfMain = drift.relation === "equal" || drift.relation === "behind";
+    let baselineWords;
+    if (sideOfMain && counted(versus) && counted(against) && versus.behind === 0 && gap === 0) {
+      baselineWords = "Baseline at the fork";
+    } else if (sideOfMain && counted(versus) && counted(against) && versus.behind === 0 && gap > 0) {
+      baselineWords = `Baseline ${gap} behind the fork`;
+    } else if (sideOfMain && counted(versus) && versus.behind > 0) {
+      baselineWords = drift.behind === 0
+        ? `Baseline ${versus.behind} ahead of the fork, at main`
+        : `Baseline ${versus.behind} ahead of the fork and ${drift.behind} behind main`;
+    } else if (drift.relation === "ahead") {
+      baselineWords = `Baseline ${drift.ahead} ahead of main`;
+    } else if (drift.relation === "diverged") {
+      baselineWords = "Baseline not on main's history";
+    } else if (drift.relation === "differs") {
+      baselineWords = "Baseline differs from main (not counted)";
+    } else {
+      baselineWords = sideOfMain ? `Baseline ${drift.behind} behind main, place unknown`
+        : "Baseline place unknown";
+    }
+    const words = mainUnknown ? ["Main unknown"] : [
+      mark(counted(against) ? commits(own, "Checkout")
+        : against.relation === "differs" ? "Checkout differs from main (not counted)"
+          : "Checkout unknown against main"),
+      mark(counted(against) ? (main === 0 ? "main at the fork" : `main ${main} ahead of the fork`)
+        : "Main unknown"),
+      mark(baselineWords),
     ];
     return {
       tones,
