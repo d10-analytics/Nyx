@@ -1345,18 +1345,23 @@ already name its project and stage; hover for the whole filepath) and, as tags,
 a target folder that differs from its project, its Code Status, one tag for
 each **Needs attention** item that names it (except an item awaiting its merge,
 which the Code Status states, and a moved base, which the baseline line draws),
-a prerequisites pill, and, when the checkout can be placed, a baseline line. The line is a small strip of three
-points: `B`, the Baseline; `C`, the commit checked out in the target; and `M`,
-the remote main head. Colour carries the meaning and no count decides it. `C` takes its colour from the
+a prerequisites pill, and, when the checkout can be placed, a baseline line. The line is a small strip: `B`, the Baseline;
+`C`, the commit checked out in the target; and `M`, the remote main head. Main's line
+runs from the fork, the dot where the checkout left main, to `M`. An arm rises from
+the fork to `C` and is counted by the checkout's own commits, and main's commits
+since the fork are counted along main's line. The Baseline is a ring on main's line
+at its place: around the fork when it is there, left of it when older, right of it
+when newer and past `M` when beyond main; counts beside it say how far. No ring is drawn
+when the Baseline is off main's history or its place cannot be worked out; the line's words say so.
+A count that cannot be read or was not taken shows `?`, and an underlined
+count comes from main's cached copy. Colour carries the meaning and no count decides it. `C` takes its colour from the
 checkout against its Baseline alone: green when it is at the Baseline, yellow when it
 holds commits of its own, red when it lacks the Baseline and grey when that cannot be
-computed; the link between `B` and `C` carries the same colour. `M` and the line to it
+computed; the arm carries the same colour. `M` and the line to it
 take their colour from the checkout against main: green when it is none behind, yellow when it is behind and grey
-when that cannot be computed. `B` takes its colour from the Baseline against main in
+when that cannot be computed. The ring takes its colour from the Baseline against main in
 the same way: green, yellow or grey, never red. With no base, main is unknown: `M` is
-red and its link a dashed grey line. A ring on `C` marks a checkout at the Baseline,
-a dotted `C` one that has diverged from the Baseline, differs from it or cannot be
-placed against it, and a check
+red and its line a dashed grey line. `C` is always a solid dot, and a check
 mark in `C` a line whose `C`, `M` and `B` are all green and whose card's prerequisites
 pill is green or absent. The prerequisites pill is green for `No prerequisites` and
 `Prerequisites met`, red for `Prerequisites not met in main` and `Prerequisites not
@@ -1384,9 +1389,8 @@ default and holds every reported field, the Package ID and the Code rows the
 panel does not show above: the matched target repo, the branch's remote copy,
 merge verdict and pull requests, the Baseline with how far the base has moved
 past it, and the prerequisite lines under a green pill. The closed **All fields**
-disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the ring, the
-fork (commits of the checkout's own, `+N`, beside a Baseline that has moved on)
-and the count beside `M` (commits the checkout is behind main). It is not drawn
+disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the fork, the
+arm, the main count, the ring and its places, `?` and the cached underline. It is not drawn
 when it would hold no row. It stays open or closed as you left it for as long as
 the page is open, across selections and scans, and is not remembered afterwards.
 Keyboard focus inside the panel is kept whenever the panel is rewritten: a

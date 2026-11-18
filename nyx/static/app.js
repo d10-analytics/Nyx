@@ -1071,9 +1071,9 @@
   // Baseline and grey when that cannot be told.  The checkout and the Baseline
   // against main are green at none behind, yellow behind and grey when
   // unknown, never red; with main unknown M is red and the line to it dashed
-  // grey.  Positions are ordinal: the count printed beside M is never a distance.
-  // The check mark also needs the card's prerequisites pill, when it has one, to
-  // be green.
+  // grey.  Positions are ordinal slots of the strip and no count ever moves a
+  // point.  The check mark also needs the card's prerequisites pill, when it has
+  // one, to be green.
   function baselineLineModel(baseline, pill) {
     const checkout = baseline && baseline.checkout;
     if (!checkout) return null;
@@ -1092,64 +1092,126 @@
       main: mainUnknown ? "red" : mainTone(against),
       baseline: mainTone(drift),
     };
-    const place = {
-      equal: "equal", ahead: "right", behind: "left", diverged: "off", differs: "off",
-    }[versus.relation] || "unplaced";
-    // The same facts in words, decided from the tones above so that the words,
-    // the colours and the search can never disagree.  A cached basis is named.
-    const counted = (comparison, tone, subject) => {
-      const named = comparison.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
-      return (tone === "grey"
-        ? `${subject} unknown against main`
-        : `${subject} ${comparison.behind} behind main`) + named;
-    };
-    const words = [
-      {green: "Baseline synced", yellow: "Baseline not synced", red: "Baseline not synced",
-        grey: "Baseline unknown"}[baselineTone],
-      mainUnknown ? "Main unknown" : counted(against, tones.main, "Checkout"),
-      counted(drift, tones.baseline, "Baseline"),
+    // The same facts in words, decided from the served relations alone (the
+    // case of the Baseline's place, tested in order) so that the card, the
+    // tooltip, the panel and the search can never disagree.  A cached main
+    // basis, that of vs_base and drift, ends every phrase they feed; only a
+    // line with no verdict base is never marked.
+    const counted = (comparison) => ["equal", "ahead", "behind", "diverged"].includes(comparison.relation);
+    const named = against.basis === "cached" ? ` (${basisWords(null, "cached")})` : "";
+    const mark = (phrase) => phrase + named;
+    const commits = (count, subject) => count === 0 ? `${subject} has no commits of its own`
+      : `${subject} ${count} ${count === 1 ? "commit" : "commits"} of its own`;
+    const own = counted(against) ? against.ahead : null;
+    const main = counted(against) ? against.behind : null;
+    const gap = counted(against) && counted(drift) ? drift.behind - against.behind : null;
+    const sideOfMain = drift.relation === "equal" || drift.relation === "behind";
+    let baselineWords;
+    let kind;
+    if (sideOfMain && counted(versus) && counted(against) && versus.behind === 0 && gap === 0) {
+      baselineWords = "Baseline at the fork";
+      kind = "same";
+    } else if (sideOfMain && counted(versus) && counted(against) && versus.behind === 0 && gap > 0) {
+      baselineWords = `Baseline ${gap} behind the fork`;
+      kind = "older";
+    } else if (sideOfMain && counted(versus) && versus.behind > 0) {
+      baselineWords = drift.behind === 0
+        ? `Baseline ${versus.behind} ahead of the fork, at main`
+        : `Baseline ${versus.behind} ahead of the fork and ${drift.behind} behind main`;
+      kind = drift.behind === 0 ? "newer-at-main" : "newer";
+    } else if (drift.relation === "ahead") {
+      baselineWords = `Baseline ${drift.ahead} ahead of main`;
+      kind = "beyond";
+    } else if (drift.relation === "diverged") {
+      baselineWords = "Baseline not on main's history";
+      kind = "off";
+    } else if (drift.relation === "differs") {
+      baselineWords = "Baseline differs from main (not counted)";
+      kind = "off";
+    } else {
+      baselineWords = sideOfMain ? `Baseline ${drift.behind} behind main, place unknown`
+        : "Baseline place unknown";
+      kind = "unknown";
+    }
+    const words = mainUnknown ? ["Main unknown"] : [
+      mark(counted(against) ? commits(own, "Checkout")
+        : against.relation === "differs" ? "Checkout differs from main (not counted)"
+          : "Checkout unknown against main"),
+      mark(counted(against) ? (main === 0 ? "main at the fork" : `main ${main} ahead of the fork`)
+        : "Main unknown"),
+      mark(baselineWords),
     ];
+    // What the strip draws, from the same served relations: every count is read
+    // from the one comparison D-03 names, and a count that cannot be read draws
+    // a mark.  A cached main basis marks the counts taken against main, never
+    // the first count of a Baseline ahead of the fork, and nothing without a base.
+    const cached = !mainUnknown && against.basis === "cached";
+    const count = (slot, value, underlined) => ({
+      slot, text: `+${value}`, mark: false, cached: underlined,
+    });
+    const unread = (slot, underlined) => ({slot, text: "?", mark: true, cached: underlined});
+    const mainCount = !counted(against) ? unread("main", cached)
+      : main > 0 ? count("main", main, cached) : null;
+    const counts = [];
+    if (own !== 0) counts.push(own === null ? unread("arm", cached) : count("arm", own, cached));
+    if (mainUnknown) {
+      kind = "no-main";
+    } else if (kind === "older") {
+      counts.push(count("gap", gap, cached), mainCount);
+    } else if (kind === "newer" || kind === "newer-at-main") {
+      counts.push(count("first", versus.behind, false));
+      if (drift.behind > 0) counts.push(count("second", drift.behind, cached));
+    } else if (kind === "beyond") {
+      counts.push(mainCount, count("beyond", drift.ahead, cached));
+    } else if (kind === "off" || kind === "unknown") {
+      counts.push(mainCount);
+    } else {
+      counts.push(mainCount);
+    }
     return {
       tones,
       words,
-      place,
-      forked: place === "right" && drift.relation === "behind",
-      added: place === "right" ? versus.ahead : null,
-      behind: against.behind > 0 ? against.behind : null,
+      layout: {kind, arm: own !== 0, counts: counts.filter((entry) => entry !== null)},
       link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
       check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green" &&
         (pill === null || pill === undefined || prerequisitesTone(pill) === "green"),
     };
   }
 
+  // The strip is drawn from custom properties in CSS: the model names the case
+  // and each count's segment, and CSS holds every slot, radius and offset.  The
+  // case rides on a data attribute so a poll that changes it never changes the
+  // tag's class list.  Painting order is the order below: lines, rings, the fork
+  // dot, M, then C, so C and its check mark are never covered; the counts are
+  // for the eye only, the words are the image's name.
   function baselineLineHtml(baseline, pill) {
     const model = baselineLineModel(baseline, pill);
     if (model === null) return "";
+    const {layout} = model;
     const point = (name, tone, extra, inner) =>
       `<span class="baseline-point" data-point="${name}" data-tone="${tone}"${extra}>${inner}</span>`;
     const link = (name, tone, extra) =>
       `<span class="baseline-link" data-link="${name}" data-tone="${tone}"${extra}></span>`;
-    // The fork runs corner to corner of its box as an anti-aliased stroke.
-    const forkLink = (tone) =>
-      `<span class="baseline-link" data-link="fork" data-tone="${tone}">` +
+    // The arm runs from the fork dot up to C as an anti-aliased stroke.
+    const arm = `<span class="baseline-link" data-link="arm" data-tone="${model.tones.checkout}">` +
       '<svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' +
       '<line x1="0" y1="100" x2="100" y2="0" vector-effect="non-scaling-stroke"/></svg></span>';
-    const form = model.place === "equal" ? "ring"
-      : model.place === "off" || model.place === "unplaced" ? "dotted" : "solid";
+    const countHtml = (entry) =>
+      `<span class="baseline-count" data-slot="${entry.slot}"` +
+      `${entry.mark ? " data-mark" : ""}${entry.cached ? " data-cached" : ""} ` +
+      `aria-hidden="true">${text(entry.text)}</span>`;
+    const offLine = ["off", "unknown", "no-main"].includes(layout.kind);
     const words = text(model.words.join(", "));
-    return `<span class="card-baseline" data-place="${model.place}" role="img" ` +
+    return `<span class="card-baseline" data-case="${layout.kind}" role="img" ` +
       `aria-label="${words}" title="${words}">` +
-      (model.forked || (model.place !== "left" && model.place !== "right")
-        ? "" : link("checkout", model.tones.checkout, "")) +
       link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
-      (model.forked ? forkLink(model.tones.checkout) : "") +
-      point("B", model.tones.baseline, "", "") +
-      point("C", model.tones.checkout,
-        ` data-form="${form}"${model.forked ? " data-fork" : ""}`,
-        model.check ? '<span class="baseline-check">&#10003;</span>' : "") +
-      (model.added === null ? "" : `<span class="baseline-added" data-tone="${model.tones.checkout}">+${model.added}</span>`) +
+      (layout.arm ? arm : "") +
+      layout.counts.map(countHtml).join("") +
+      (offLine ? "" : point("B", model.tones.baseline, "", "")) +
+      '<span class="baseline-point" data-point="fork"></span>' +
       point("M", model.tones.main, "", "") +
-      (model.behind === null ? "" : `<span class="baseline-behind">${model.behind}</span>`) +
+      point("C", model.tones.checkout, ` data-at="${layout.arm ? "arm" : "fork"}"`,
+        model.check ? '<span class="baseline-check">&#10003;</span>' : "") +
       "</span>";
   }
 
@@ -2005,9 +2067,14 @@
     ["B", "the Baseline"],
     ["C", "the commit checked out in the target"],
     ["M", "the remote main head"],
-    ["ring", "the checkout is at the Baseline"],
-    ["fork", "the checkout has commits of its own (+N) beside a Baseline that has moved on"],
-    ["count by M", "commits the checkout is behind main"],
+    ["fork", "the dot on main's line where the checkout left main"],
+    ["arm", "the checkout's own commits, counted, from the fork up to C"],
+    ["main", "main's commits since the fork, counted along main's line to M"],
+    ["ring", "the Baseline's place: around the fork when it is there, left of the fork when " +
+      "older, right of it when newer and past M when beyond main; no ring is drawn when " +
+      "it is off main's history or its place cannot be worked out"],
+    ["?", "a count or place that cannot be read"],
+    ["cached", "an underlined count or mark comes from main's cached copy"],
   ];
 
   // The baseline line of one work item as the card draws it, with its words;
