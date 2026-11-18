@@ -13517,6 +13517,10 @@ def test_baseline_line_counts_fit_the_strip_at_every_width(open_page, real_check
             assert line["box"]["width"] / line["unit"] == pytest.approx(strip_rem, abs=0.02), label
             assert baseline_strip_faults(line) == [], label
             drawn = {count["slot"]: count["text"] for count in line["counts"]}
+            if kind == "older":
+                # The arm's count is also clear of the left ring above it, not only beside it.
+                arm = next(count for count in line["counts"] if count["slot"] == "arm")
+                assert arm["bottom"] + 0.3 <= line["B"]["top"], label
             assert drawn["arm"] == f"+{digits}", label
             assert all(count["color"] == line["color"] for count in line["counts"]
                        if not count["mark"]), label
@@ -13547,6 +13551,20 @@ def test_baseline_line_counts_fit_the_strip_at_every_width(open_page, real_check
     page.set_viewport_size({"width": 640, "height": 900})
     set_card_width("12rem")
     prove(lambda path: baseline_line(page, path), 99, 10.275, "12rem card")
+    # The same card in the widest sans-serif a Linux runner may fall back to.  Each
+    # count is widened with letter spacing to the width DejaVu Sans Bold gives its
+    # text (a plus sign is .838em and a digit .696em), so the proof does not depend
+    # on which fonts the machine has installed.
+    page.evaluate(
+        """() => document.querySelectorAll('.baseline-count').forEach(count => {
+            const size = parseFloat(getComputedStyle(count).fontSize);
+            const text = count.textContent;
+            const widest = [...text].reduce((sum, ch) => sum + (ch === '+' ? .838 : .696), 0) * size;
+            const gap = (widest - count.getBoundingClientRect().width) / text.length;
+            count.style.letterSpacing = Math.max(0, gap) + 'px';
+        })""")
+    settle_frames(page)
+    prove(lambda path: baseline_line(page, path), 99, 10.275, "12rem card, widest font")
 
 
 def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
