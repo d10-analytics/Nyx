@@ -1351,9 +1351,9 @@ runs from the fork, the dot where the checkout left main, to `M`. An arm rises f
 the fork to `C` and is counted by the checkout's own commits, and main's commits
 since the fork are counted along main's line. The Baseline is a ring on main's line
 at its place: around the fork when it is there, left of it when older, right of it
-when newer and past `M` when beyond main; counts beside it say how far. A ring dotted
-below the fork means the Baseline is off main's history or its place cannot be worked out.
-A count that cannot be read shows `?`, one that was not taken `≠`, and an underlined
+when newer and past `M` when beyond main; counts beside it say how far. No ring is drawn
+when the Baseline is off main's history or its place cannot be worked out; the line's words say so.
+A count that cannot be read or was not taken shows `?`, and an underlined
 count comes from main's cached copy. Colour carries the meaning and no count decides it. `C` takes its colour from the
 checkout against its Baseline alone: green when it is at the Baseline, yellow when it
 holds commits of its own, red when it lacks the Baseline and grey when that cannot be
@@ -1390,7 +1390,7 @@ panel does not show above: the matched target repo, the branch's remote copy,
 merge verdict and pull requests, the Baseline with how far the base has moved
 past it, and the prerequisite lines under a green pill. The closed **All fields**
 disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the fork, the
-arm, the main count, the ring and its places, `?`, `≠` and the cached underline. It is not drawn
+arm, the main count, the ring and its places, `?` and the cached underline. It is not drawn
 when it would hold no row. It stays open or closed as you left it for as long as
 the page is open, across selections and scans, and is not remembered afterwards.
 Keyboard focus inside the panel is kept whenever the panel is rewritten: a

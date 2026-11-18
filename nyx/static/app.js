@@ -1146,18 +1146,16 @@
     // a mark.  A cached main basis marks the counts taken against main, never
     // the first count of a Baseline ahead of the fork, and nothing without a base.
     const cached = !mainUnknown && against.basis === "cached";
-    const unreadMark = against.relation === "differs" ? "\u2260" : "?";
     const count = (slot, value, underlined) => ({
       slot, text: `+${value}`, mark: false, cached: underlined,
     });
-    const unread = (slot, underlined) => ({slot, text: unreadMark, mark: true, cached: underlined});
+    const unread = (slot, underlined) => ({slot, text: "?", mark: true, cached: underlined});
     const mainCount = !counted(against) ? unread("main", cached)
       : main > 0 ? count("main", main, cached) : null;
     const counts = [];
     if (own !== 0) counts.push(own === null ? unread("arm", cached) : count("arm", own, cached));
     if (mainUnknown) {
       kind = "no-main";
-      counts.push({slot: "ring", text: "?", mark: true, cached: false});
     } else if (kind === "older") {
       counts.push(count("gap", gap, cached), mainCount);
     } else if (kind === "newer" || kind === "newer-at-main") {
@@ -1165,10 +1163,8 @@
       if (drift.behind > 0) counts.push(count("second", drift.behind, cached));
     } else if (kind === "beyond") {
       counts.push(mainCount, count("beyond", drift.ahead, cached));
-    } else if (kind === "off") {
-      counts.push(mainCount, {slot: "ring", text: "\u2260", mark: true, cached});
-    } else if (kind === "unknown") {
-      counts.push(mainCount, {slot: "ring", text: "?", mark: true, cached});
+    } else if (kind === "off" || kind === "unknown") {
+      counts.push(mainCount);
     } else {
       counts.push(mainCount);
     }
@@ -1210,9 +1206,8 @@
       `aria-label="${words}" title="${words}">` +
       link("main", model.link.tone, model.link.dashed ? ' data-line="dashed"' : "") +
       (layout.arm ? arm : "") +
-      (offLine ? link("tether", model.tones.baseline, "") : "") +
       layout.counts.map(countHtml).join("") +
-      point("B", model.tones.baseline, "", "") +
+      (offLine ? "" : point("B", model.tones.baseline, "", "")) +
       '<span class="baseline-point" data-point="fork"></span>' +
       point("M", model.tones.main, "", "") +
       point("C", model.tones.checkout, ` data-at="${layout.arm ? "arm" : "fork"}"`,
@@ -2076,10 +2071,9 @@
     ["arm", "the checkout's own commits, counted, from the fork up to C"],
     ["main", "main's commits since the fork, counted along main's line to M"],
     ["ring", "the Baseline's place: around the fork when it is there, left of the fork when " +
-      "older, right of it when newer, past M when beyond main, and dotted below the fork " +
-      "when it is off main's history or its place cannot be worked out"],
+      "older, right of it when newer and past M when beyond main; no ring is drawn when " +
+      "it is off main's history or its place cannot be worked out"],
     ["?", "a count or place that cannot be read"],
-    ["≠", "a count that was not taken, or a Baseline that is not on main's history"],
     ["cached", "an underlined count or mark comes from main's cached copy"],
   ];
 

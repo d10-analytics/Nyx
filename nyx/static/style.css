@@ -704,20 +704,21 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .card-prerequisites[data-tone="grey"] { --tone: var(--control-border); --ink: var(--text); }
 /* The baseline line: the fork dot, the arm up to C, main's line to M and the
    Baseline ring on one strip, drawn on the tag surface so it reads the same on a
-   plain card and on a brand-teal one.  Every place is an ordinal slot in percent
-   of the strip, 22% apart, and a count never moves one.  The counts sit below
+   plain card and on a brand-teal one.  Every place is a fixed slot in percent
+   of the strip (an older Baseline sits as far left of the fork as main's head is
+   to its right), and a count never moves one.  The counts sit below
    main's line, each centred between the edges of the two points that bound its
    segment; the arm's count sits above the line, left of the fork. */
 .card-baseline {
   --tone: var(--control-border);
   --f: 50%;
   --m: 94%;
-  --ring: 28%;
-  --ring-r: .3rem;
-  --fc: .25rem;
+  --ring: 6%;
+  --ring-r: .45rem;
+  --fc: .3rem;
   --fo: 0rem;
   --fr: max(var(--fc), var(--fo));
-  --mr: .4rem;
+  --mr: .3rem;
   --line-from: var(--f);
   --line-to: var(--m);
   position: relative;
@@ -728,14 +729,11 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
   color: var(--text);
 }
-.card-baseline:has(.baseline-point[data-at="fork"]) { --fc: .4rem; }
-.card-baseline:has(.baseline-point[data-at="fork"] .baseline-check) { --fc: .55rem; }
-.card-baseline[data-case="same"] { --fo: .7rem; --ring: var(--f); }
+.card-baseline[data-case="same"] { --fo: var(--ring-r); --ring: var(--f); }
 .card-baseline[data-case="older"] { --line-from: var(--ring); }
 .card-baseline[data-case="newer"] { --ring: 72%; }
-.card-baseline[data-case="newer-at-main"] { --ring: var(--m); --ring-r: .6rem; }
+.card-baseline[data-case="newer-at-main"] { --ring: var(--m); }
 .card-baseline[data-case="beyond"] { --m: 72%; --ring: 94%; --line-to: var(--ring); }
-.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) { --ring: var(--f); --ring-r: .2rem; }
 .baseline-point, .baseline-link, .baseline-count { position: absolute; }
 .baseline-point[data-tone="green"], .baseline-link[data-tone="green"] { --tone: var(--state-done); }
 .baseline-point[data-tone="yellow"], .baseline-link[data-tone="yellow"] { --tone: var(--state-waiting); }
@@ -743,9 +741,9 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .baseline-point[data-tone="grey"], .baseline-link[data-tone="grey"] { --tone: var(--control-border); }
 .baseline-point {
   top: 1.2rem;
-  width: .8rem;
-  height: .8rem;
-  margin: -.4rem 0 0 -.4rem;
+  width: .6rem;
+  height: .6rem;
+  margin: -.3rem 0 0 -.3rem;
   border-radius: 50%;
   background: var(--tone);
   display: flex;
@@ -754,9 +752,6 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 }
 .baseline-point[data-point="fork"] {
   left: var(--f);
-  width: .5rem;
-  height: .5rem;
-  margin: -.25rem 0 0 -.25rem;
   background: var(--text);
 }
 .baseline-point[data-point="B"] {
@@ -767,20 +762,10 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   background: var(--surface);
   border: 2px solid var(--tone);
 }
-.card-baseline[data-case="same"] .baseline-point[data-point="B"] {
-  width: 1.4rem;
-  height: 1.4rem;
-  margin: -.7rem 0 0 -.7rem;
-}
-.card-baseline:is([data-case="off"], [data-case="unknown"], [data-case="no-main"]) .baseline-point[data-point="B"] {
-  top: 1.875rem;
-  border-style: dotted;
-}
 .baseline-point[data-point="C"] { left: var(--f); }
 .baseline-point[data-point="C"][data-at="arm"] { left: 61%; top: .55rem; }
 .baseline-point[data-point="M"] { left: var(--m); }
-.baseline-point[data-point="C"]:has(.baseline-check) { width: 1.1rem; height: 1.1rem; margin: -.55rem 0 0 -.55rem; }
-.baseline-check { color: var(--check-ink); font-size: .75rem; font-weight: 700; line-height: 1; }
+.baseline-check { color: var(--check-ink); font-size: .5rem; font-weight: 700; line-height: 1; }
 .baseline-link {
   top: 1.2rem;
   height: 0;
@@ -806,14 +791,6 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   stroke-width: 2px;
   stroke-linecap: round;
 }
-.baseline-link[data-link="tether"] {
-  left: var(--f);
-  width: 0;
-  height: .475rem;
-  margin-left: -1px;
-  border-top: 0;
-  border-left: 2px dotted var(--tone);
-}
 .baseline-count {
   top: 1.33rem;
   left: calc((var(--a) + var(--b)) / 2 + (var(--ra) - var(--rb)) / 2);
@@ -825,17 +802,16 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
   color: var(--text);
 }
 .baseline-count[data-slot="main"] { --a: var(--f); --b: var(--m); --ra: var(--fr); --rb: var(--mr); }
-.baseline-count[data-slot="gap"] { --a: var(--ring); --b: var(--f); --ra: .3rem; --rb: var(--fr); }
+.baseline-count[data-slot="gap"] { --a: var(--ring); --b: var(--f); --ra: var(--ring-r); --rb: var(--fr); }
 .baseline-count[data-slot="first"] { --a: var(--f); --b: var(--ring); --ra: var(--fr); --rb: var(--ring-r); }
-.baseline-count[data-slot="second"] { --a: var(--ring); --b: var(--m); --ra: .3rem; --rb: var(--mr); }
-.baseline-count[data-slot="beyond"] { --a: var(--m); --b: var(--ring); --ra: var(--mr); --rb: .3rem; }
+.baseline-count[data-slot="second"] { --a: var(--ring); --b: var(--m); --ra: var(--ring-r); --rb: var(--mr); }
+.baseline-count[data-slot="beyond"] { --a: var(--m); --b: var(--ring); --ra: var(--mr); --rb: var(--ring-r); }
 .baseline-count[data-slot="arm"] {
   top: .12rem;
   left: auto;
   right: calc(100% - var(--f) + var(--fr) + .1rem);
   transform: none;
 }
-.baseline-count[data-slot="ring"] { left: calc(var(--f) + .5rem); transform: none; }
 .baseline-count[data-mark] { color: var(--muted); }
 .card.no-incoming-arrow .baseline-count[data-mark] { color: var(--text); }
 .baseline-count[data-cached] {
