@@ -13047,7 +13047,7 @@ def test_card_tags_name_the_attention_items_of_a_work_item(open_page, real_check
     rows = panel_code_rows(page)
     sentence = f"the base of {path} moved 3 commits past its Baseline"
     assert rows["Needs attention"] == sentence
-    assert "Baseline 3 behind main" in rows["Baseline line"]
+    assert "Baseline 3 behind the fork (cached)" in rows["Baseline line"]
     assert "the base moved 3 commits past it" in dict(panel_all_fields(page))["Baseline"]
 
     # The next scan without the drift removes the panel row; the line stays off the tag.
@@ -13626,34 +13626,114 @@ def baseline_line_words(page, path):
 
 
 def baseline_line_words_cases():
-    """(drift, vs_baseline, vs_base) with the phrases each must give."""
-    equal = live("equal", 0, 0)
-    return [
-        ((equal, equal, equal),
-         "Baseline synced, Checkout 0 behind main, Baseline 0 behind main"),
-        ((live("behind", 0, 3), live("ahead", 2, 0), live("behind", 0, 3)),
-         "Baseline not synced, Checkout 3 behind main, Baseline 3 behind main"),
-        ((live("behind", 0, 58), live("behind", 0, 2), live("behind", 0, 58)),
-         "Baseline not synced, Checkout 58 behind main, Baseline 58 behind main"),
-        ((equal, live("diverged", 1, 2), live("diverged", 1, 4)),
-         "Baseline not synced, Checkout 4 behind main, Baseline 0 behind main"),
-        ((live("ahead", 1, 0), live("differs"), live("differs")),
-         "Baseline not synced, Checkout unknown against main, Baseline 0 behind main"),
-        ((live("unknown"), live("unknown"), live("unknown")),
-         "Baseline unknown, Checkout unknown against main, Baseline unknown against main"),
-        ((live("absent"), equal, live("absent")),
-         "Baseline synced, Main unknown, Baseline unknown against main"),
-        ((comparison("behind", 0, 3), equal, equal),
-         "Baseline synced, Checkout 0 behind main, Baseline 3 behind main (cached)"),
-        ((equal, equal, comparison("behind", 0, 3)),
-         "Baseline synced, Checkout 3 behind main (cached), Baseline 0 behind main"),
+    """(drift, vs_baseline, vs_base) with the whole words each must give.
+
+    Each case is ``(drift, vs_baseline, vs_base)`` as ``(relation, ahead, behind)``
+    plus main's basis, which drift and vs_base share; vs_baseline is always cached.
+    """
+    def served(basis, drift, versus, against):
+        def one(spec, spec_basis):
+            return {**comparison(*spec), "basis": spec_basis}
+        return (one(drift, basis), one(versus, "cached"), one(against, basis))
+
+    equal = ("equal", 0, 0)
+    rows = [
+        # Row 1, case A: the Baseline is at the fork.
+        (served("live", ("behind", 0, 12), ("ahead", 3, 0), ("diverged", 3, 12)),
+         "Checkout 3 commits of its own, main 12 ahead of the fork, Baseline at the fork"),
+        # Row 2, case B: the arm counts vs_base, never vs_baseline.ahead (17).
+        (served("live", ("behind", 0, 22), ("ahead", 17, 0), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 7 behind the fork"),
+        # Row 3, case C, under a live and under a recorded main.
+        (served("live", ("behind", 0, 13), ("diverged", 10, 2), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 2 ahead of the fork and 13 behind main"),
+        (served("recorded", ("behind", 0, 13), ("diverged", 10, 2), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 2 ahead of the fork and 13 behind main"),
+        # Row 3c: a cached main marks every phrase, even case C's first count.
+        (served("cached", ("behind", 0, 13), ("diverged", 10, 2), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own (cached), main 15 ahead of the fork (cached), "
+         "Baseline 2 ahead of the fork and 13 behind main (cached)"),
+        # Row 4.
+        (served("live", ("behind", 0, 13), ("diverged", 10, 4), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 4 ahead of the fork and 13 behind main"),
+        # Row 5: no commits of its own, cached.
+        (served("cached", ("behind", 0, 58), equal, ("behind", 0, 58)),
+         "Checkout has no commits of its own (cached), main 58 ahead of the fork (cached), "
+         "Baseline at the fork (cached)"),
+        # Row 6 and 23, case E.
+        (served("cached", ("ahead", 1, 0), ("ahead", 2, 0), ("ahead", 3, 0)),
+         "Checkout 3 commits of its own (cached), main at the fork (cached), "
+         "Baseline 1 ahead of main (cached)"),
+        (served("live", ("ahead", 3, 0), equal, ("ahead", 3, 0)),
+         "Checkout 3 commits of its own, main at the fork, Baseline 3 ahead of main"),
+        # Row 7 and 8, case D.
+        (served("live", ("diverged", 2, 12), ("diverged", 16, 2), ("ahead", 4, 0)),
+         "Checkout 4 commits of its own, main at the fork, Baseline not on main's history"),
+        (served("live", ("differs", None, None), ("differs", None, None), ("ahead", 4, 0)),
+         "Checkout 4 commits of its own, main at the fork, "
+         "Baseline differs from main (not counted)"),
+        # Rows 9 to 12, place unknown.
+        (served("live", ("behind", 0, 22), ("unknown", None, None), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 22 behind main, place unknown"),
+        (served("live", ("unknown", None, None), ("ahead", 17, 0), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, Baseline place unknown"),
+        (served("cached", ("unknown", None, None), ("ahead", 17, 0), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own (cached), main 15 ahead of the fork (cached), "
+         "Baseline place unknown (cached)"),
+        (served("live", ("behind", 0, 10), ("ahead", 10, 0), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 10 behind main, place unknown"),
+        (served("live", ("behind", 0, 22), ("differs", None, None), ("diverged", 10, 15)),
+         "Checkout 10 commits of its own, main 15 ahead of the fork, "
+         "Baseline 22 behind main, place unknown"),
+        # Rows 13 and 14: an unknown or not-counted checkout and an unknown main.
+        (served("live", ("behind", 0, 22), ("unknown", None, None), ("unknown", None, None)),
+         "Checkout unknown against main, Main unknown, Baseline 22 behind main, place unknown"),
+        (served("cached", ("behind", 0, 22), ("unknown", None, None), ("unknown", None, None)),
+         "Checkout unknown against main (cached), Main unknown (cached), "
+         "Baseline 22 behind main, place unknown (cached)"),
+        (served("live", ("behind", 0, 22), ("ahead", 17, 0), ("differs", None, None)),
+         "Checkout differs from main (not counted), Main unknown, "
+         "Baseline 22 behind main, place unknown"),
+        (served("cached", ("behind", 0, 22), ("ahead", 17, 0), ("differs", None, None)),
+         "Checkout differs from main (not counted) (cached), Main unknown (cached), "
+         "Baseline 22 behind main, place unknown (cached)"),
+        # Row 15: no verdict base, never marked.
+        (served("cached", ("absent", None, None), equal, ("absent", None, None)),
+         "Main unknown"),
+        # Row 16: a count of one is singular.
+        (served("live", ("behind", 0, 12), ("ahead", 1, 0), ("diverged", 1, 12)),
+         "Checkout 1 commit of its own, main 12 ahead of the fork, Baseline at the fork"),
+        (served("live", equal, equal, equal),
+         "Checkout has no commits of its own, main at the fork, Baseline at the fork"),
+        (served("live", ("behind", 0, 5), ("ahead", 5, 0), equal),
+         "Checkout has no commits of its own, main at the fork, Baseline 5 behind the fork"),
+        # Row 19: case C at drift.behind = 0 is worded at main, never 0 behind main.
+        (served("live", equal, ("behind", 0, 5), ("behind", 0, 5)),
+         "Checkout has no commits of its own, main 5 ahead of the fork, "
+         "Baseline 5 ahead of the fork, at main"),
+        # Row 20: case E keeps main's own count, read from vs_base.
+        (served("cached", ("ahead", 2, 0), ("behind", 0, 5), ("behind", 0, 3)),
+         "Checkout has no commits of its own (cached), main 3 ahead of the fork (cached), "
+         "Baseline 2 ahead of main (cached)"),
+        (served("live", ("behind", 0, 13), ("diverged", 10, 2), ("unknown", None, None)),
+         "Checkout unknown against main, Main unknown, "
+         "Baseline 2 ahead of the fork and 13 behind main"),
+        (served("live", ("ahead", 1, 0), ("ahead", 2, 0), ("differs", None, None)),
+         "Checkout differs from main (not counted), Main unknown, Baseline 1 ahead of main"),
     ]
+    return rows
 
 
 def test_baseline_line_words_state_every_fact_in_the_approved_phrases(
     open_page, real_checkouts
 ):
-    """The line's name and tooltip are the same words, built from the tone rule's facts."""
+    """The line's name and tooltip are the same whole string, built from the served relations."""
     page, double = baseline_line_page(open_page, real_checkouts)
     cases = baseline_line_words_cases()
     for start in range(0, len(cases), len(BASELINE_LINE_CARDS)):
@@ -13674,16 +13754,17 @@ def test_baseline_line_words_search_follows_the_facts_after_a_poll(open_page, re
     equal = live("equal", 0, 0)
 
     def against(count):
-        return (equal, equal, live("behind", 0, count))
+        return (live("behind", 0, count), equal, live("behind", 0, count))
 
     serve_baseline_states(page, double, {
-        alpha: against(3), beta: against(58), delta: against(3)})
-    query = "Checkout 3 behind main"
+        alpha: against(15), beta: against(58), delta: against(15)})
+    query = "main 15 ahead of the fork"
     assert sorted(visible_card_paths(page, query)) == [alpha, delta]
-    assert sorted(visible_card_paths(page, "baseline synced")) == [alpha, beta, delta]
+    assert sorted(visible_card_paths(page, "baseline at the fork")) == [alpha, beta, delta]
     serve_baseline_states(page, double, {
-        alpha: against(3), beta: against(3), delta: against(4)})
+        alpha: against(15), beta: against(15), delta: against(16)})
     assert sorted(visible_card_paths(page, query)) == [alpha, beta]
+    assert sorted(visible_card_paths(page, "main 16 ahead of the fork")) == [delta]
     # The refreshed search text is the first render's: a reload of the same facts agrees.
     page.fill("#filter", "")
     assert page.locator(".card[hidden]").count() == 0
@@ -13694,14 +13775,17 @@ def test_baseline_line_words_search_survives_a_full_render(open_page, real_check
     page, double = baseline_line_page(open_page, real_checkouts)
     alpha, beta, delta = BASELINE_LINE_CARDS[:3]
     equal = live("equal", 0, 0)
+
+    def against(count):
+        return (live("behind", 0, count), equal, live("behind", 0, count))
+
     serve_baseline_states(page, double, {
-        alpha: (equal, equal, live("behind", 0, 3)), beta: (equal, equal, live("behind", 0, 58)),
-        delta: (equal, equal, live("behind", 0, 3))})
+        alpha: against(15), beta: against(58), delta: against(15)})
     # Unchecking a display preference rebuilds every card through the first-render path.
     page.get_by_label("Hide terminal rows", exact=True).check()
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
     settle_frames(page)
-    assert sorted(visible_card_paths(page, "Checkout 3 behind main")) == [alpha, delta]
+    assert sorted(visible_card_paths(page, "main 15 ahead of the fork")) == [alpha, delta]
 
 
 def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real_checkouts):
@@ -13718,7 +13802,8 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     playwright.expect(row).to_have_count(1)
     card_words = baseline_line_words(page, alpha)["name"]
     assert card_words == (
-        "Baseline not synced, Checkout 3 behind main, Baseline 58 behind main")
+        "Checkout has no commits of its own, main 3 ahead of the fork, "
+        "Baseline 55 behind the fork")
     shown = row.inner_text()
     assert card_words in shown
     assert row.locator(".panel-baseline-legend").count() == 0
@@ -13735,9 +13820,9 @@ def test_baseline_line_panel_lists_the_card_facts_and_the_legend(open_page, real
     # A poll that changes the facts rewrites the row.
     serve_baseline_states(page, double, {alpha: (equal, equal, equal), gamma: None})
     playwright.expect(row.locator(".panel-baseline-words")).to_have_text(
-        "Baseline synced, Checkout 0 behind main, Baseline 0 behind main")
-    assert "Baseline synced" in row.inner_text()
-    assert "Checkout 0 behind main" in row.inner_text()
+        "Checkout has no commits of its own, main at the fork, Baseline at the fork")
+    assert "Baseline at the fork" in row.inner_text()
+    assert "main at the fork" in row.inner_text()
 
     # A work item with no placeable checkout shows no such row.
     code_status_card(page, gamma).click()
