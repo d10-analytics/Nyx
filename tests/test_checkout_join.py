@@ -7770,7 +7770,7 @@ def g_branch_names(document: dict[str, Any], w: PrerequisiteWorld) -> list[str]:
 def prerequisite_world(tmp_path_factory):
     with shared_world_build(tmp_path_factory, "prerequisites") as (directory, home, patch):
         w = build_prerequisite_world(directory)
-        w.cache = nyx_home(home)
+        nyx_home(home)
         fake = install_fake_gh(directory, patch)
         w.c0 = collect_packages(
             [w.folder], w.root, PW_STAGES, remote_checks=True, github_lookup=False
