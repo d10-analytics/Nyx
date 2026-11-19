@@ -7,10 +7,11 @@ README is narrative only.
 
 - Scans a specification root into the canonical catalog document.
 - Reads the workspace and never writes it.
-- Reports, from the same scan, the package heads `checkouts` reads (each
-  package's `Target repo:`, optional `Branch:`, optional `Baseline:` as a
-  declared, invalid or absent full commit ID, finished stage and superseded
-  flag), without adding them to the catalog document.
+- Reports, from the same scan, the package heads `checkouts` reads. Each head
+  carries the package's `Target repo:`, optional `Branch:` and optional
+  `Baseline:`, plus its finished stage and superseded flag. The Baseline is a
+  declared, invalid or absent full commit ID. The heads stay out of the catalog
+  document.
 - Exposes `scan_packages`, the one scan the catalog renders from, as frozen
   records: each listed package's path, raw stage folder name, read diagnostic,
   relationship (including `completion` rows), candidate IDs and package ID,

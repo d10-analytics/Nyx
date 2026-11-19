@@ -85,13 +85,15 @@ README is narrative only.
   that is missing or not a git checkout also records `within_folders`, true when
   its path lies in or under a configured checkout folder.
 - Serves each listed package's merge fact on main, `merged_on_main`, once, from
-  that package's own Code Status: `merged` is `merged`, `in_progress`, `pr_open`,
-  `awaiting_merge`, `no_commits_yet` and `superseded` are `not_merged`, and
-  `unknown` is `unknown`. A package with no Code Status whose branch is declared on
-  a clone or worktree is merged when the highest-numbered merged request into its
-  repository's base names that branch, and unknown otherwise. A finished package
-  and a package whose target is not a clone or a worktree carry the fact too, and
-  it is recomputed on every run and never saved.
+  that package's own Code Status. `merged` is `merged`, and `in_progress`,
+  `pr_open`, `awaiting_merge`, `no_commits_yet` and `superseded` are
+  `not_merged`. `unknown` is `unknown`.
+- Without a Code Status, a package reads `merged` when the highest-numbered
+  merged request into its repository's base names its declared branch. It reads
+  `unknown` otherwise, and when the package declares no branch on a clone or
+  worktree target.
+- A finished package and a package whose target is not a clone or a worktree carry
+  the fact too. Nyx recomputes it on every run and never saves it.
 - Calls `derive_attention` after the join and stores the clone availability,
   each repository's free clones and the attention list it returns.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no

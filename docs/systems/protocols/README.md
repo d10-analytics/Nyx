@@ -39,13 +39,14 @@ README is narrative only.
   document's own facts and refuses any inequality, so no consumer needs its own
   rules for what needs attention.
 - `prerequisite_main_fact` is the single mapping from a package's Code Status state
-  to its merge fact on main: `merged` is `merged`, `unknown` is `unknown`, and every
+  to its merge fact on main. `merged` is `merged`, `unknown` is `unknown`, and every
   other state is `not_merged`. Every listed package of the checkout document carries
-  that fact once, as `merged_on_main`, and `parse_checkouts` refuses a fact its own
-  package's Code Status contradicts, a `not_merged` without a Code Status, and a
-  `merged` without a Code Status whose branch is not declared on a clone or worktree
-  target. An `unknown` fact stands whatever the Code Status. No consumer needs its
-  own rule for whether a package has reached main.
+  that fact once, as `merged_on_main`.
+- `parse_checkouts` refuses a fact its own package's Code Status contradicts and a
+  `not_merged` without a Code Status. It also refuses a `merged` without a Code
+  Status whose branch is not declared on a clone or worktree target. An `unknown`
+  fact stands whatever the Code Status. No consumer needs its own rule for whether a
+  package has reached main.
 - `code_status_text` is the single text of a package's Code Status.
   `checkouts` calls it when it builds the document and `parse_checkouts`
   recomputes it from the stored fields, so a document whose text disagrees with
