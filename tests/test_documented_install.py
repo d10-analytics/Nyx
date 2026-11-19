@@ -1191,7 +1191,8 @@ def test_board_relationship_text_matches_the_outstanding_filter():
         "read every declared prerequisite.",
         "Selecting a card emphasises its drawn and dashed outstanding arrows and "
         "marks only the cards at the other end of those connections.",
-        "Selecting a provider whose dependents are all merged marks nothing.",
+        "Selecting a provider that is merged on `main` marks no dependent, because "
+        "its merge satisfies every connection to its dependents.",
         "A card with no outstanding prerequisite turns teal and says \"No outstanding "
         "prerequisite.\" as its start text for a screen reader.",
         "Neither signal depends on what the board displays or on what the search hides.",
@@ -1214,6 +1215,8 @@ def test_board_relationship_text_matches_the_outstanding_filter():
         "declares no prerequisite is teal.",
     ):
         assert marker in guide, marker
+    # The marking reads the provider's merge fact, never the dependents' state.
+    assert "whose dependents are all merged" not in guide
     # A prerequisite whose branch is gone reads an unknown merge fact, and GitHub
     # lookup is the documented remedy that can clear the word.
     assert ("A prerequisite whose branch was deleted reads \"merge state unknown\" "
