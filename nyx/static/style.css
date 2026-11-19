@@ -880,10 +880,10 @@ body.panel-collapsed #work-item-panel-toggle {
   text-decoration: underline;
 }
 .panel-link-project, .work-item-panel .link.unresolved { color: var(--warning); }
-.card-links { display: block; margin-top: .4rem; color: var(--link); font-size: .82rem; }
-.card-links .link { display: inline; }
-.card-links .link.cross em { font-style: normal; color: var(--warning); }
-.card-links .link.unresolved { color: var(--warning); }
+/* A prerequisite the board does not display cannot be selected, so its Needs
+   entry is plain text, and every entry ends with its reason words. */
+.panel-needs-title, .panel-needs-reason { color: var(--muted); }
+.panel-needs-reason { font-size: .82rem; }
 /* An outstanding prerequisite the board cannot draw leaves one small visible
    marker in the card's corner, so a dependent never looks unblocked.  It takes
    no room in the card's flow, so a scan that clears it moves no card, and it
