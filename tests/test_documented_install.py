@@ -191,9 +191,6 @@ PREREQUISITES_PILL_MARKERS = {
         "a grey pill takes the check mark away",
         "with one line per prerequisite shown only when the pill is not green",
     ),
-    "docs/systems/checkouts/README.md": (
-        "Derives each unfinished package's prerequisites pill once",
-    ),
     "docs/systems/board-web/README.md": (
         "its prerequisites pill (the five wordings the document carries",
         "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
@@ -861,6 +858,15 @@ def test_documents_publish_the_prerequisites_pill_sentences_once():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
         for marker in markers:
             assert document.count(marker) == 1, (name, marker)
+    # The checkouts README no longer derives a pill: it serves one merge fact per package.
+    checkouts = re.sub(
+        r"\s+",
+        " ",
+        (REPOSITORY_ROOT / "docs" / "systems" / "checkouts" / "README.md").read_text(
+            encoding="utf-8"
+        ),
+    )
+    assert "Derives each unfinished package's prerequisites pill once" not in checkouts
 
 
 def test_checkout_documentation_drops_the_cached_only_wording():
@@ -1490,14 +1496,14 @@ def test_checkout_system_readme_states_the_folder_rule_and_the_suggestion_rule()
 def test_protocols_readme_states_the_checkout_schema_and_its_two_fields():
     readme = _normalized("docs/systems/protocols/README.md")
     for marker in (
-        "The checkout document is schema 11, and its two whole-document fields are part of "
+        "The checkout document is schema 12, and its two whole-document fields are part of "
         "the digest",
         "`configuration_revision` is `null` or one lowercase 64-character SHA-256 digest",
         "`folder_suggestions` holds entries of exactly `{path, package_count}`",
         "strictly increasing in natural path order, never a configured folder",
         "the list is empty while the package scan is unavailable",
-        "`derive_prerequisites` is the single derivation of every prerequisites pill's state",
-        "`parse_checkouts` recomputes them from the pill's own items",
+        "`prerequisite_main_fact` is the single mapping from a package's Code Status state",
+        "`parse_checkouts` refuses a fact its own package's Code Status contradicts",
     ):
         assert marker in readme, marker
 

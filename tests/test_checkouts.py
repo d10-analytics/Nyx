@@ -1536,8 +1536,8 @@ def doc_copy(document: dict[str, Any]) -> dict[str, Any]:
 
 def rederive(document: dict[str, Any]) -> dict[str, Any]:
     """Give every ``ok`` clone the Removable fields its present facts derive, every package
-    the prerequisites pill they derive, then the availability, free clones and attention
-    list the whole document derives.
+    the merge fact its own Code Status gives, then the availability, free clones and
+    attention list the whole document derives.
 
     A clone whose facts the derivation cannot read (a mutation that broke their
     shape) keeps its fields: the structural checks refuse it before they matter.
@@ -1555,7 +1555,7 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
             worktree["removable"] = verdict
         item["removable_count"] = derived["removable_count"]
     try:
-        repill(document)
+        refresh_merge_facts(document)
         derived = models.derive_attention(document)
     except (KeyError, TypeError):
         return document
@@ -1567,49 +1567,17 @@ def rederive(document: dict[str, Any]) -> dict[str, Any]:
     return document
 
 
-def target_head_of(document: dict[str, Any], package: dict[str, Any]) -> str | None:
-    """The head commit of the worktree a package targets (the clone's main worktree for a
-    clone target), ``None`` when the document lists no readable head for it."""
-    target = package["target"]
-    for item in all_clones(document):
-        if item["path"] != target["clone"]:
-            continue
-        for listed in item["worktrees"] or []:
-            found = (
-                listed["path"] == target["worktree"]
-                if target["worktree"] is not None
-                else listed["main"]
-            )
-            if found:
-                head = listed["head"]
-                return head["sha"] if listed["status"] == "ok" and head is not None else None
-    return None
+def refresh_merge_facts(document: dict[str, Any]) -> dict[str, Any]:
+    """Give every package the merge fact its own Code Status gives.
 
-
-def repill(document: dict[str, Any]) -> dict[str, Any]:
-    """Give every package the prerequisites pill its present facts derive.
-
-    A package that is finished or whose target is not a clone or worktree gets none, an
-    eligible one keeps its items (an empty list when it had none) with ``checkout_sha`` the
-    target worktree's head, ``in_checkout`` unknown wherever the facts allow no more, and the
-    state and text the models functions give.
+    A package with no Code Status reads ``unknown``: the merged-request fallback needs a
+    pull-request listing, which a mutated document does not re-derive.
     """
     for package in document["packages"]:
-        if package["finished"] or package["target"]["status"] not in ("clone", "worktree"):
-            package["prerequisites"] = None
-            continue
-        pill = package["prerequisites"] or {"items": []}
-        sha = target_head_of(document, package)
-        for item in pill["items"]:
-            if item["merged_on_main"] != "merged" or sha is None:
-                item["in_checkout"] = "unknown"
-        state = models.derive_prerequisites(pill["items"])
-        package["prerequisites"] = {
-            "state": state,
-            "text": models.prerequisites_text(state),
-            "checkout_sha": sha,
-            "items": pill["items"],
-        }
+        status = package["code_status"]
+        package["merged_on_main"] = (
+            "unknown" if status is None else models.prerequisite_main_fact(status["state"])
+        )
     return document
 
 
@@ -3057,7 +3025,7 @@ def test_live_values_and_comparisons_without_changing_any_clone(tmp_path):
 
     assert {path: fingerprint(path) for path in clones} == before
     group = group_of(document, main)
-    assert document["schema_version"] == 11
+    assert document["schema_version"] == 12
     assert group["remote"]["check"] == {"status": "live", "reason": None}
     assert group["default_branch"] == {"name": "trunk", "sha": pushed}
     assert set(group["default_branch"]) == {"name", "sha"}
@@ -3654,7 +3622,7 @@ def test_live_documents_parse_and_keep_a_stable_digest(tmp_path):
     second_text, second, _ = collect_text([folder], remote_checks=True)
     off = collect_text([folder])[1]
 
-    assert first["schema_version"] == 11
+    assert first["schema_version"] == 12
     borrowed = find_clone(first, lagging)["local_default"]["vs_remote"]
     assert borrowed["objects_from"] == real(holder)
     assert group_of(first, gone)["remote"]["check"]["reason"] == "not_found"
@@ -7453,7 +7421,7 @@ def test_parser_rejects_a_containment_invariant_violation_under_a_valid_digest(s
 
 def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sample):
     document, _folder = sample
-    assert document["schema_version"] == 11 == models.CHECKOUTS_SCHEMA_VERSION
+    assert document["schema_version"] == 12 == models.CHECKOUTS_SCHEMA_VERSION
     previous = doc_copy(document)
     previous["schema_version"] = 2
     for clone_item in all_clones(previous):
@@ -7464,9 +7432,10 @@ def test_parser_refuses_a_schema_2_document_and_reads_only_the_current_schema(sa
         models.parse_checkouts(redigest(previous))
     # The immediately previous schema is refused too: no reader for it remains.
     stale = doc_copy(document)
-    stale["schema_version"] = 10
+    stale["schema_version"] = 11
     for package in stale["packages"]:
-        del package["prerequisites"]
+        package["prerequisites"] = None
+        del package["merged_on_main"]
     with pytest.raises(models.ProtocolError, match="unsupported schema version"):
         models.parse_checkouts(redigest(stale))
 
@@ -8351,35 +8320,19 @@ PR_NODE = {
     "headRefOid": "a" * 40,
     "baseRefName": "trunk",
     "isCrossRepository": False,
-    "mergeCommit": {"oid": "b" * 40},
 }
 
 
-@pytest.mark.parametrize(
-    ("merge_commit", "expected"),
-    [
-        ({"oid": "b" * 40}, "b" * 40),
-        (None, None),
-        ("absent", None),
-        ({"oid": None}, None),
-        ({"oid": "not-an-object"}, None),
-        ({"oid": ["b" * 40]}, None),
-        ("b" * 40, None),
-    ],
-)
-def test_a_listed_requests_merge_commit_is_kept_only_when_it_is_an_object_id(
-    merge_commit, expected
-):
-    node = dict(PR_NODE)
-    if merge_commit == "absent":
-        del node["mergeCommit"]
-    else:
-        node["mergeCommit"] = merge_commit
+def test_a_valid_node_is_kept_as_the_request_facts_it_names():
+    assert checkouts._valid_pull_request(dict(PR_NODE))
+    (pull,) = checkouts._pull_requests_of([dict(PR_NODE)])
 
-    assert checkouts._valid_pull_request(node)
-    (pull,) = checkouts._pull_requests_of([node])
-    assert pull.merge == expected
-    assert pull.head == "a" * 40
+    assert (pull.number, pull.state, pull.head, pull.base) == (
+        7,
+        "merged",
+        "a" * 40,
+        "trunk",
+    )
 
 
 def github_answer(count: int, node: dict[str, Any] | None = PR_NODE) -> dict[str, Any]:
@@ -8576,7 +8529,7 @@ def test_one_gh_call_per_repository_carries_every_distinct_branch_name_in_a_body
         assert (
             f"b{index}: pullRequests(headRefName: $h{index}, first: 10, "
             "orderBy: {field: CREATED_AT, direction: DESC}) "
-            "{ nodes { number state headRefOid baseRefName isCrossRepository mergeCommit { oid } } }"
+            "{ nodes { number state headRefOid baseRefName isCrossRepository } }"
         ) in query
     assert not Path(call.input_path).exists()
     assert not Path(call.input_path).parent.exists()
@@ -9151,16 +9104,14 @@ def pr_node(
     head: str,
     base: str = "trunk",
     cross: bool = False,
-    merge: str | None = None,
 ) -> dict[str, Any]:
-    """One answered pull request; ``merge`` is the commit GitHub made on the base."""
+    """One answered pull request."""
     return {
         "number": number,
         "state": state.upper(),
         "headRefOid": head,
         "baseRefName": base,
         "isCrossRepository": cross,
-        "mergeCommit": None if merge is None else {"oid": merge},
     }
 
 
