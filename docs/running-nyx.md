@@ -682,64 +682,27 @@ Neither comparison has an `objects_from`. Each count is one read-only
 call per distinct commit and Baseline, or commit and base, and is recomputed on every run
 and never saved.
 
-### Prerequisites of a work item
+### The merge fact of a work item
 
-Each package in `--json` carries `prerequisites`, the answer to whether the work
-items it names in `Completion Prerequisite:` rows are in main and in its checkout.
-`prerequisites` is null for a finished package and for a package whose target is
-not a clone or a worktree. Otherwise it is `{state, text, checkout_sha, items}`:
-`checkout_sha` is the commit C (see `checkout` above) and is null when it cannot
-be read, and `items` holds one entry per distinct prerequisite, ordered by its
-Package ID with the entries that name no Package ID last. Each entry has
-`target_package_id`, `merged_on_main` and `in_checkout`. C is read for every
-eligible package here, with or without a declared Baseline.
+Each package in `--json` carries `merged_on_main`, the answer to whether that
+package's own branch has reached the default branch. Every listed package carries
+it, a finished package and a package whose target is not a clone or a worktree
+included. The collection computes it on every run and never saves it.
 
-The `state` is the worst definite problem among the items, and `text` is its
-wording. The five states, in the order they are decided:
+`merged_on_main` takes one of these three values:
 
-- `none`: `No prerequisites`, when the package has no prerequisite.
-- `not_in_main`: `Prerequisites not met in main`, when any prerequisite is not
-  merged on main.
-- `not_in_checkout`: `Prerequisites not met in checkout`, when every
-  prerequisite is merged on main or unknown and any merged one is known to be
-  missing from C.
-- `unknown`: `Prerequisites unknown`, when nothing is definitely wrong and any
-  fact is unknown.
-- `met`: `Prerequisites met`, when every prerequisite is merged on main and in C.
+- `merged`: the package's Code Status is `merged`. Without a Code Status, it reads
+  `merged` when a merged request into the repository's base names its branch on a
+  clone or worktree target.
+- `not_merged`: the package's Code Status is `in_progress`, `pr_open`,
+  `awaiting_merge`, `no_commits_yet` or `superseded`.
+- `unknown`: the package's Code Status is `unknown`, or its branch is not usable.
+  A package with no Code Status and a usable branch reads `merged` only through a
+  merged request, and `unknown` otherwise.
 
-- `merged_on_main` takes `merged`, `not_merged` or `unknown`: the prerequisite's
-  Code Status `merged` is `merged`; `in_progress`, `pr_open`, `awaiting_merge`,
-  `no_commits_yet` and `superseded` are `not_merged`; `unknown` is `unknown`, as is
-  a prerequisite with no usable branch (the default branch, no branch that applies,
-  or none declared) or a row that did not resolve to one package. A prerequisite
-  with no Code Status because its branch is deleted everywhere is `merged` when
-  the highest-numbered merged request into the repository's base names that branch,
-  and `unknown` otherwise.
-- `in_checkout` takes `yes`, `no` or `unknown`: it is `unknown` unless the
-  prerequisite is `merged` and C is known. Its evidence is every branch tip Code
-  Status counted for the prerequisite; a tip decided through a pull request, or the
-  prerequisite's merged request when no Code Status exists, is evidenced by the
-  branch or request tip and that request's merge commit, the commit GitHub made on
-  the base, together. A squash or rebase merge never lands the tip, and a checkout
-  stacked on the branch holds the tip but not the merge commit. It is `yes` when
-  each evidence commit is an ancestor of C, or, for a pull-request tip, when either
-  its tip or its merge commit is, with one read-only `merge-base --is-ancestor`
-  call per commit and C. It is `no` when an evidence commit is not in C and the
-  merge verdict came from ancestry; for a pull-request tip it is `no` only when
-  the merge commit is in the clone and not in C and the tip is also in the clone
-  and not in C. It is `unknown` when the verdict came from a patch, squash or tree
-  equivalence, when a pull-request tip is in neither C nor known absent from it
-  because GitHub named no merge commit, the merge commit or the tip is not in the
-  clone, or the answer was saved by an earlier run (which keeps no merge commit,
-  so only the tip can show `yes`), when the clone is shallow, partial or
-  unreadable, when a call failed or ran out of time, and when the prerequisite
-  belongs to another repository.
-
-A call is made only for a merged prerequisite, and none is made for any other.
-The pill is recomputed on every run and never saved; when time runs short, the
-`in_checkout` fact of a merged prerequisite reads `unknown` first while its
-`merged_on_main` can still read `merged`, and a prerequisite already known not
-merged still reads `not_merged`.
+A branch is not usable when it is the default branch, when it does not apply, or
+when the package declares none. Nothing here reads a stage or follows a successor.
+A package that declares neither `Target repo:` nor `Branch:` is not listed at all.
 
 ### Availability
 

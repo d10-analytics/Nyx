@@ -9,10 +9,8 @@ README is narrative only.
 - Reads the workspace and never writes it.
 - Reports, from the same scan, the package heads `checkouts` reads (each
   package's `Target repo:`, optional `Branch:`, optional `Baseline:` as a
-  declared, invalid or absent full commit ID, finished stage and
-  superseded flag, and each `Completion Prerequisite:` row's target ID,
-  target package path and the catalog's unresolved reason, resolved by the same
-  helper as the rendered edges), without adding them to the catalog document.
+  declared, invalid or absent full commit ID, finished stage and superseded
+  flag), without adding them to the catalog document.
 - Exposes `scan_packages`, the one scan the catalog renders from, as frozen
   records: each listed package's path, raw stage folder name, read diagnostic,
   relationship (including `completion` rows), candidate IDs and package ID,
