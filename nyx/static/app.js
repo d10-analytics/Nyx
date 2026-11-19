@@ -541,6 +541,9 @@
   // relationship lists.
   let boardById = new Map();
   let boardDependents = new Map();
+  // Every displayed entry, with the finished rows Hide terminal rows removes,
+  // so a prerequisite in one of them still resolves to its own merge fact.
+  let catalogById = new Map();
   // The prerequisite and dependent pairs the board can draw as arrows.
   let railPairs = new Set();
   let cardAttention = new Map();
@@ -554,7 +557,6 @@
   let railPlan = new Map();
   let railColumns = [];
   let railEdges = [];
-  let cardPrerequisites = new Map();
   let compactView = true;
   let hideTerminalRows = true;
   let deselectOnEmptyClick = false;
@@ -605,6 +607,9 @@
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
+  // The served merge fact of every package, by path; null while no document is
+  // served, when every declared prerequisite counts as outstanding.
+  let cardMergedOnMain = null;
   // The baseline of each rendered card whose served package has a checkout.
   let cardBaseline = new Map();
   let renderedEntries = new Map();
@@ -684,6 +689,12 @@
     return index;
   }
 
+  // Every declared prerequisite of one card, as the edge and its target entry,
+  // or an unresolved target.  Resolution reads the reason alone: an edge is
+  // unresolved exactly when its reason is one of the unresolved ones, whatever
+  // its row kind, claim or completion state says.  The target is looked up in
+  // the index the caller passes, so the readiness pass reads the full catalog
+  // and the shown relationships read the displayed cards.
   function prerequisiteTargets(entry, byId) {
     const targets = new Map();
     (entry.relationship.prerequisites || []).forEach((edge) => {
@@ -1017,6 +1028,29 @@
     return lines;
   }
 
+  // The served merge fact of every package, by work item path, as Code Status
+  // is read.  It belongs to the prerequisite alone, so the board looks up each
+  // prerequisite's own fact; null means no document is served, and then every
+  // declared prerequisite is outstanding.
+  function mergedOnMainMap() {
+    const document = servedCheckoutsDocument();
+    if (document === null) return null;
+    const facts = new Map();
+    document.packages.forEach((item) => facts.set(item.package_path, item.merged_on_main));
+    return facts;
+  }
+
+  // Whether two merge-fact maps say the same thing for every package, so a
+  // settled document that rewrites no fact leaves the board alone.
+  function sameMergeFacts(first, second) {
+    if (first === null || second === null) return first === second;
+    if (first.size !== second.size) return false;
+    for (const [path, fact] of first) {
+      if (second.get(path) !== fact) return false;
+    }
+    return true;
+  }
+
   // The served baseline of every work item whose checkout can be placed.
   function baselineMap() {
     const baselines = new Map();
@@ -1308,6 +1342,10 @@
       entry.declared.target_project !== entry.project ? entry.declared.target_project : "";
   }
 
+  // The card's start text names the ready signal for a screen reader and its
+  // marker names an outstanding prerequisite the board cannot draw; the
+  // readiness pass shows or hides the marker in place, so the card structure
+  // the Code Status line and its tests pin never changes.
   function cardHtml(entry, byId, dependentsOf) {
     const selected = selectedPath === entry.package_path;
     const changed = changeMarks.has(markKeyInDisplayed(entry));
@@ -1328,6 +1366,7 @@
         `aria-label="${text(`Target Folder: ${targetProject}`)}">${text(targetProject)}</span>` : "") +
       `<span class="card-facts">${facts}</span></span>` +
       '<span class="visually-hidden card-start-text"></span>' +
+      '<span class="card-not-drawn" hidden>Prerequisite not drawn</span>' +
       needsHtml(entry, byId) + blocksHtml(entry, dependentsOf) + "</button>";
   }
 
@@ -1584,10 +1623,13 @@
     // (not just from the axes) so dependency edges, rail planning, and column
     // depths treat them as absent, exactly like an entry outside the board.
     const gatedStages = gatedTerminalStages();
-    const entries = displayed
-      ? displayed.entries.filter((entry) => !gatedStages.has(entry.stage))
-      : [];
+    const catalogEntries = displayed ? displayed.entries : [];
+    const entries = catalogEntries.filter((entry) => !gatedStages.has(entry.stage));
     const byId = indexByPackageId(entries);
+    // The board's own index holds the unique displayed cards the arrows and the
+    // panel read; the catalog's holds every displayed entry, so the readiness
+    // pass still resolves a prerequisite in a hidden finished row.
+    catalogById = indexByPackageId(catalogEntries);
     const dependentsOf = indexDependents(entries, byId);
     boardById = byId;
     boardDependents = dependentsOf;
@@ -1597,14 +1639,8 @@
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
+    cardMergedOnMain = mergedOnMainMap();
     cardFactsMarkup = new Map();
-    // Keyed by path so cards sharing a package identity keep their own relationships.
-    cardPrerequisites = new Map(entries.map((entry) => [
-      entry.package_path,
-      prerequisiteTargets(entry, byId)
-        .filter(({target}) => target && target.package_id !== entry.package_id)
-        .map(({target}) => target.package_id),
-    ]));
     const axes = inventoryAxes(entries);
     const issues = board.querySelector("#board-issues");
     issues?.remove();
@@ -1802,9 +1838,15 @@
   // each card's checkout facts (its Code Status and attention badges) and
   // search text change, so keyboard focus, selection, the issues panel's open
   // state and the scroll position stay, and one filter pass redraws the rails.
-  // Rebuilding the board here would lose all four, and a fact that no card's
-  // path holds is simply absent.  The work item panel follows the same outcome.
+  // A changed merge fact is its own reason for that pass: a prerequisite that
+  // merges in a hidden row rewrites no displayed card, so nothing else would
+  // redraw the arrows and the ready signal.  Rebuilding the board here would
+  // lose all four, and a fact that no card's path holds is simply absent.  The
+  // work item panel follows the same outcome.
   function updateCardCodeStatus() {
+    const mergeFacts = mergedOnMainMap();
+    const mergeFactsChanged = !sameMergeFacts(cardMergedOnMain, mergeFacts);
+    cardMergedOnMain = mergeFacts;
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
     cardAttention = cardAttentionMap();
@@ -1826,7 +1868,7 @@
         }
       }
     });
-    if (changed) applyFilter();
+    if (changed || mergeFactsChanged) applyFilter();
     renderWorkItemPanel();
   }
 
@@ -1839,21 +1881,53 @@
     board.querySelectorAll(".card[data-package-id]").forEach((card) => {
       if (!card.hidden) cards.set(card.dataset.packageId, card);
     });
+    // The one readiness pass, run after the visible-card map and before any
+    // connection is chosen: a prerequisite is outstanding unless its own served
+    // merge fact says it merged, read through the full catalog, so neither the
+    // search box nor Hide terminal rows decides that.  While no document is
+    // served every declared prerequisite is outstanding.  The outstanding pairs
+    // are the only connections the board draws, and they decide the ready
+    // signal and the marker of every rendered card below.
+    const mergeFacts = cardMergedOnMain;
+    const merged = (target) => mergeFacts !== null &&
+      mergeFacts.get(target.package_path) === "merged";
+    const open = new Map();
+    const outstandingPairs = new Set();
+    board.querySelectorAll(".card[data-package-path]").forEach((card) => {
+      const entry = renderedEntries.get(card.dataset.packagePath);
+      const outstanding = entry === undefined ? [] :
+        prerequisiteTargets(entry, catalogById)
+          .filter(({target}) => !(target && merged(target)));
+      open.set(card, {entry, outstanding});
+      outstanding.forEach(({target}) => {
+        if (target) outstandingPairs.add(`${target.package_id}>${entry.package_id}`);
+      });
+    });
     const visibleEdges = railEdges.filter((edge) =>
-      cards.has(edge.source) && cards.has(edge.dependent));
-    // A prerequisite counts while its card is visible, whether it is shown by
-    // an arrow or only as relationship text.
-    board.querySelectorAll(".card").forEach((card) => {
-      const prerequisites = cardPrerequisites.get(card.dataset.packagePath) || [];
-      const noIncoming = !card.hidden && !prerequisites.some((id) => cards.has(id));
-      card.classList.toggle("no-incoming-arrow", noIncoming);
-      card.querySelector(".card-start-text").textContent = noIncoming ? "No prerequisite shown." : "";
+      cards.has(edge.source) && cards.has(edge.dependent) &&
+      outstandingPairs.has(`${edge.source}>${edge.dependent}`));
+    const drawnPairs = new Set(visibleEdges.filter((edge) => edge.drawn)
+      .map((edge) => `${edge.source}>${edge.dependent}`));
+    open.forEach(({entry, outstanding}, card) => {
+      const ready = outstanding.length === 0;
+      card.classList.toggle("no-incoming-arrow", ready);
+      card.querySelector(".card-start-text").textContent =
+        ready ? "No outstanding prerequisite." : "";
+      // One marker for the outstanding prerequisite the board does not draw,
+      // whether the target did not resolve, its card is not displayed, its
+      // edge found no lane or the card shares its Package ID.  No merge facts
+      // means no markers: the failed read is already reported once.
+      const id = entry === undefined ? undefined : entry.package_id;
+      card.querySelector(".card-not-drawn").hidden = mergeFacts === null ||
+        !outstanding.some(({target}) => !(target &&
+          drawnPairs.has(`${target.package_id}>${id}`)));
     });
     const selected = [...cards.values()].find((card) => card.dataset.packagePath === selectedPath);
     const selectedId = selected?.dataset.packageId;
     const related = (edge) => edge.source === selectedId || edge.dependent === selectedId;
-    // The cards at the other end of the selected card's connections are marked,
-    // whether or not a lane was free to draw the connection.
+    // The cards at the other end of the selected card's outstanding
+    // connections are marked, whether or not a lane was free to draw one;
+    // nothing waits on a merged prerequisite, so its card is not marked.
     const relatedIds = new Set();
     if (selectedId) {
       visibleEdges.filter(related).forEach((edge) =>
@@ -1864,7 +1938,7 @@
     });
     // A connection that found no free lane is drawn only while one of its cards
     // is selected, over the lanes the gutter already has, so the selected card
-    // always shows every connection it has.
+    // always shows every outstanding connection it has.
     const overflowEdges = selectedId
       ? visibleEdges.filter((edge) => !edge.drawn && related(edge)) : [];
     const drawnEdges = [...visibleEdges.filter((edge) => edge.drawn), ...overflowEdges];
