@@ -61,7 +61,7 @@
   // The card reads the checkout facts document at exactly this schema, and the
   // digest covers every top-level key except the digest and its observation
   // instant, so a document the collector wrote authenticates unchanged.
-  const CHECKOUTS_SCHEMA_VERSION = 11;
+  const CHECKOUTS_SCHEMA_VERSION = 12;
   const CHECKOUTS_DIGEST_OMITTED = ["checkouts_digest", "observed_at"];
   const CHECKOUTS_KEYS = [
     "schema_version", "checkouts_digest", "observed_at", "configuration_revision",
@@ -70,13 +70,9 @@
   ];
   const CHECKOUTS_PACKAGE_KEYS = [
     "package_path", "package_id", "finished", "superseded", "target", "branch",
-    "baseline", "code_status", "prerequisites",
+    "baseline", "code_status", "merged_on_main",
   ];
-  const CHECKOUTS_PREREQUISITES_KEYS = ["state", "text", "checkout_sha", "items"];
-  const CHECKOUTS_PREREQUISITE_ITEM_KEYS = ["target_package_id", "merged_on_main", "in_checkout"];
-  const PREREQUISITE_STATES = ["none", "not_in_main", "not_in_checkout", "unknown", "met"];
   const PREREQUISITE_MAIN_FACTS = ["merged", "not_merged", "unknown"];
-  const PREREQUISITE_CHECKOUT_FACTS = ["yes", "no", "unknown"];
   const CHECKOUTS_CODE_STATUS_KEYS = [
     "state", "text", "pull_request", "push", "unpushed", "cleanup",
     "checked_out_elsewhere",
@@ -425,11 +421,8 @@
       "panelAttention": "Needs attention",
       "panelTarget": "Target repo",
       "panelBaseline": "Baseline",
-      "panelPrerequisites": "Prerequisites",
-      "prerequisiteUnreadable": "A prerequisite that cannot be read",
       "panelBaselineLine": "Baseline line",
       "panelBaselineLegend": "Baseline line legend",
-      "panelEachPrerequisite": "Each prerequisite",
       "panelAllFields": "All fields ({count})",
       "panelPackageId": "Package ID",
       "panelElsewhere": "Also checked out in",
@@ -476,11 +469,6 @@
       "merged": "merged on main",
       "not_merged": "not merged on main",
       "unknown": "merge on main unknown"
-    },
-    "prerequisiteCheckout": {
-      "yes": "in this checkout",
-      "no": "not in this checkout",
-      "unknown": "checkout unknown"
     },
     "folderReason": {
       "invalid_path": "This is not a usable path.",
@@ -619,8 +607,6 @@
   let cardCodeStatus = new Map();
   // The baseline of each rendered card whose served package has a checkout.
   let cardBaseline = new Map();
-  // The prerequisites pill of each rendered card whose served package has one.
-  let cardPill = new Map();
   let renderedEntries = new Map();
   // What the reader opened in the checkouts view.  It lives here rather than in
   // the markup because a refresh replaces blocks: opened clone rows, unfolded
@@ -1042,29 +1028,6 @@
     return baselines;
   }
 
-  // The prerequisites pill every card reads, by work item path.
-  function prerequisitesPillMap() {
-    const pills = new Map();
-    const document = servedCheckoutsDocument();
-    if (document === null) return pills;
-    document.packages.forEach((item) => {
-      if (item.prerequisites) pills.set(item.package_path, item.prerequisites);
-    });
-    return pills;
-  }
-
-  // The one colour of a pill, decided from its state alone.
-  function prerequisitesTone(pill) {
-    return {none: "green", met: "green", not_in_main: "red", not_in_checkout: "red"}[pill.state] ||
-      "grey";
-  }
-
-  function prerequisitesPillHtml(pill) {
-    return `<span class="card-prerequisites" data-state="${text(pill.state)}" ` +
-      `data-tone="${prerequisitesTone(pill)}" aria-label="${text(pill.text)}">` +
-      `${text(pill.text)}</span>`;
-  }
-
   // The one place the colours of the baseline line are decided, and no commit
   // count decides any of them.  The checkout against its Baseline is green when
   // equal, yellow when it holds commits of its own, red when it lacks the
@@ -1072,9 +1035,8 @@
   // against main are green at none behind, yellow behind and grey when
   // unknown, never red; with main unknown M is red and the line to it dashed
   // grey.  Positions are ordinal slots of the strip and no count ever moves a
-  // point.  The check mark also needs the card's prerequisites pill, when it has
-  // one, to be green.
-  function baselineLineModel(baseline, pill) {
+  // point.  The check mark is the three tones alone.
+  function baselineLineModel(baseline) {
     const checkout = baseline && baseline.checkout;
     if (!checkout) return null;
     const versus = checkout.vs_baseline;
@@ -1173,8 +1135,7 @@
       words,
       layout: {kind, arm: own !== 0, counts: counts.filter((entry) => entry !== null)},
       link: mainUnknown ? {tone: "grey", dashed: true} : {tone: tones.main, dashed: false},
-      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green" &&
-        (pill === null || pill === undefined || prerequisitesTone(pill) === "green"),
+      check: tones.checkout === "green" && tones.main === "green" && tones.baseline === "green",
     };
   }
 
@@ -1184,8 +1145,8 @@
   // tag's class list.  Painting order is the order below: lines, rings, the fork
   // dot, M, then C, so C and its check mark are never covered; the counts are
   // for the eye only, the words are the image's name.
-  function baselineLineHtml(baseline, pill) {
-    const model = baselineLineModel(baseline, pill);
+  function baselineLineHtml(baseline) {
+    const model = baselineLineModel(baseline);
     if (model === null) return "";
     const {layout} = model;
     const point = (name, tone, extra, inner) =>
@@ -1245,25 +1206,21 @@
       `title="${attentionWords(item)}">${words}</span>`;
   }
 
-  // The checkout facts a card carries: its Code Status, its prerequisites pill
-  // and one badge per attention item that names it.
+  // The checkout facts a card carries: its Code Status and one badge per
+  // attention item that names it.
   function cardFactsHtml(path) {
     const status = cardCodeStatus.get(path);
-    const pill = cardPill.get(path);
     return (status === undefined ? "" : codeStatusPillHtml(status)) +
-      (pill === undefined ? "" : prerequisitesPillHtml(pill)) +
       (cardAttention.get(path) || []).map(attentionBadgeHtml).join("") +
-      baselineLineHtml(cardBaseline.get(path), pill);
+      baselineLineHtml(cardBaseline.get(path));
   }
 
   // The one search text of a card: its work item's fields, its Code Status and
-  // its prerequisites pill and the words of its baseline line.  Both render
-  // paths read it from here.
+  // the words of its baseline line.  Both render paths read it from here.
   function cardSearchText(entry) {
-    const pill = cardPill.get(entry.package_path);
-    const model = baselineLineModel(cardBaseline.get(entry.package_path), pill);
+    const model = baselineLineModel(cardBaseline.get(entry.package_path));
     return searchText(entry, [
-      cardCodeStatus.get(entry.package_path)?.text, pill?.text,
+      cardCodeStatus.get(entry.package_path)?.text,
       ...(model === null ? [] : model.words),
     ].filter((value) => value !== null && value !== undefined).join(" "));
   }
@@ -1639,7 +1596,6 @@
     renderedEntries = new Map(entries.map((entry) => [entry.package_path, entry]));
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
-    cardPill = prerequisitesPillMap();
     cardAttention = cardAttentionMap();
     cardFactsMarkup = new Map();
     // Keyed by path so cards sharing a package identity keep their own relationships.
@@ -1851,7 +1807,6 @@
   function updateCardCodeStatus() {
     cardCodeStatus = codeStatusLineMap();
     cardBaseline = baselineMap();
-    cardPill = prerequisitesPillMap();
     cardAttention = cardAttentionMap();
     let changed = false;
     board.querySelectorAll(".card[data-package-path]").forEach((card) => {
@@ -2080,36 +2035,19 @@
   // The baseline line of one work item as the card draws it, with its words;
   // nothing when the checkout cannot be placed.
   function panelBaselineLineHtml(item) {
-    const model = baselineLineModel(item.baseline, item.prerequisites);
+    const model = baselineLineModel(item.baseline);
     if (model === null) return "";
-    return `${baselineLineHtml(item.baseline, item.prerequisites)}` +
+    return `${baselineLineHtml(item.baseline)}` +
       `<span class="panel-baseline-words">${text(model.words.join(", "))}</span>`;
   }
 
   // The legend of the baseline line, one entry per convention the strip uses;
   // nothing when the checkout cannot be placed.
   function panelBaselineLegendHtml(item) {
-    if (baselineLineModel(item.baseline, item.prerequisites) === null) return "";
+    if (baselineLineModel(item.baseline) === null) return "";
     const legend = BASELINE_LEGEND.map(([name, meaning]) =>
       `<li><b>${text(name)}</b> ${text(meaning)}</li>`).join("");
     return `<ul class="panel-baseline-legend">${legend}</ul>`;
-  }
-
-  // One line per prerequisite: the title of the one catalog entry with its
-  // Package ID, else the ID, then its two facts in words.
-  function panelPrerequisiteItemsHtml(pill) {
-    if (!pill.items.length) return "";
-    const lines = pill.items.map((item) => {
-      const id = item.target_package_id;
-      if (id === null) {
-        return `<li>${text(codeWords("text", "prerequisiteUnreadable"))}</li>`;
-      }
-      const named = displayed.entries.filter((candidate) => candidate.package_id === id);
-      const name = named.length === 1 ? titleOf(named[0]) : id;
-      return `<li>${text(name)}: ${text(codeWords("prerequisiteMain", item.merged_on_main))}, ` +
-        `${text(codeWords("prerequisiteCheckout", item.in_checkout))}</li>`;
-    });
-    return `<ul class="panel-prerequisite-items">${lines.join("")}</ul>`;
   }
 
   // The checkout facts of one work item, read from the served document as the
@@ -2137,18 +2075,6 @@
     }
     rows.push(panelRowHtml(codeWords("column", "branch"),
       wordText("packageBranchStatus", item.branch.status, {name: item.branch.name}), "panel-branch"));
-    let foldedPrerequisites = "";
-    if (item.prerequisites !== null && item.prerequisites !== undefined) {
-      const itemsHtml = panelPrerequisiteItemsHtml(item.prerequisites);
-      const green = prerequisitesTone(item.prerequisites) === "green";
-      rows.push(panelRowHtml(codeWords("text", "panelPrerequisites"),
-        prerequisitesPillHtml(item.prerequisites) + (green ? "" : itemsHtml),
-        "panel-prerequisites"));
-      if (green && itemsHtml !== "") {
-        foldedPrerequisites = panelRowHtml(codeWords("text", "panelEachPrerequisite"), itemsHtml,
-          "panel-each-prerequisite");
-      }
-    }
     const attention = document.attention.filter((candidate) =>
       candidate.packages.includes(entry.package_path));
     if (attention.length) {
@@ -2180,7 +2106,6 @@
     }
     folded.push(panelRowHtml(codeWords("text", "panelBaseline"),
       baselineWords(document, item), "panel-baseline"));
-    if (foldedPrerequisites !== "") folded.push(foldedPrerequisites);
     const legendHtml = panelBaselineLegendHtml(item);
     if (legendHtml !== "") {
       folded.push(panelRowHtml(codeWords("text", "panelBaselineLegend"), legendHtml,
@@ -3236,9 +3161,9 @@
   }
 
   // The view reads the envelope shape, the document's identity, the package
-  // paths and Code Status text, and the remote-check schedule; every other
-  // subtree stays the server's, which parsed the whole document before
-  // serving it.
+  // paths, Code Status text and merge fact, and the remote-check schedule;
+  // every other subtree stays the server's, which parsed the whole document
+  // before serving it.
   async function validateCheckouts(payload) {
     protocol(exactKeys(payload, ["checkouts", "remote_checks"]));
     validateRemoteChecks(payload.remote_checks);
@@ -3258,14 +3183,7 @@
       const status = item.code_status;
       protocol(status === null ||
         (exactKeys(status, CHECKOUTS_CODE_STATUS_KEYS) && safeText(status.text)));
-      const pill = item.prerequisites;
-      protocol(pill === null ||
-        (exactKeys(pill, CHECKOUTS_PREREQUISITES_KEYS) &&
-          PREREQUISITE_STATES.includes(pill.state) && safeText(pill.text) &&
-          Array.isArray(pill.items) &&
-          pill.items.every((entry) => exactKeys(entry, CHECKOUTS_PREREQUISITE_ITEM_KEYS) &&
-            PREREQUISITE_MAIN_FACTS.includes(entry.merged_on_main) &&
-            PREREQUISITE_CHECKOUT_FACTS.includes(entry.in_checkout))));
+      protocol(PREREQUISITE_MAIN_FACTS.includes(item.merged_on_main));
     });
     await authenticate(document, "checkouts_digest", CHECKOUTS_DIGEST_OMITTED);
     return payload;

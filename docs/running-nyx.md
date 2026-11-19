@@ -1308,7 +1308,7 @@ already name its project and stage; hover for the whole filepath) and, as tags,
 a target folder that differs from its project, its Code Status, one tag for
 each **Needs attention** item that names it (except an item awaiting its merge,
 which the Code Status states, and a moved base, which the baseline line draws),
-a prerequisites pill, and, when the checkout can be placed, a baseline line. The line is a small strip: `B`, the Baseline;
+and, when the checkout can be placed, a baseline line. The line is a small strip: `B`, the Baseline;
 `C`, the commit checked out in the target; and `M`, the remote main head. Main's line
 runs from the fork, the dot where the checkout left main, to `M`. An arm rises from
 the fork to `C` and is counted by the checkout's own commits, and main's commits
@@ -1325,11 +1325,7 @@ take their colour from the checkout against main: green when it is none behind, 
 when that cannot be computed. The ring takes its colour from the Baseline against main in
 the same way: green, yellow or grey, never red. With no base, main is unknown: `M` is
 red and its line a dashed grey line. `C` is always a solid dot, and a check
-mark in `C` a line whose `C`, `M` and `B` are all green and whose card's prerequisites
-pill is green or absent. The prerequisites pill is green for `No prerequisites` and
-`Prerequisites met`, red for `Prerequisites not met in main` and `Prerequisites not
-met in checkout`, and grey for `Prerequisites unknown`; a grey pill takes the check
-mark away. The base-moved item is not a
+mark in `C` a line whose `C`, `M` and `B` are all green. The base-moved item is not a
 tag; it still shows in the work item panel and in **Repositories**.
 
 The **work item panel** on the left shows the selected card in brief. A left or
@@ -1341,17 +1337,15 @@ folder, each only when the specification declares it; then **Needs** and
 **Blocks**, each relationship a link that selects the card it names; then,
 under **Code**, what the last checkout scan says of the work item, each part
 only when the scan has it: its Code Status, the target repo when the target is
-not matched to a clone or worktree, its branch, its prerequisites row (the pill,
-with one line per prerequisite shown only when the pill is not green, each named
-by its title with its two facts in words), the attention items that name it,
+not matched to a clone or worktree, its branch, the attention items that name it,
 the baseline line with its words, and the other checkouts of the work item. The
 **Code** part follows the same rule as the Code Status tag below and is absent
 while that tag is hidden. Everything else sits in one **All fields (N)**
 disclosure after **Code**, where `N` counts the rows it opens. It is closed by
 default and holds every reported field, the Package ID and the Code rows the
 panel does not show above: the matched target repo, the branch's remote copy,
-merge verdict and pull requests, the Baseline with how far the base has moved
-past it, and the prerequisite lines under a green pill. The closed **All fields**
+merge verdict and pull requests, and the Baseline with how far the base has moved
+past it. The closed **All fields**
 disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the fork, the
 arm, the main count, the ring and its places, `?` and the cached underline. It is not drawn
 when it would hold no row. It stays open or closed as you left it for as long as

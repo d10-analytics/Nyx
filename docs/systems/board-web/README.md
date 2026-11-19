@@ -35,14 +35,12 @@ README is narrative only.
   project, each only when declared), the relationships as links that select the
   card they name, and, from the served checkout document, a Code section of
   Code Status, the target repo only when it is not matched to a clone or
-  worktree, the branch, a prerequisites row with the pill and its
-  per-prerequisite lines only when the pill is not green, the attention items
-  that name the work item, the baseline line with its words, and where it
-  applies the other checkouts. Everything else sits in one closed **All fields
+  worktree, the branch, the attention items that name the work item, the
+  baseline line with its words, and where it applies the other checkouts.
+  Everything else sits in one closed **All fields
   (N)** disclosure after the Code section: every reported field, the Package ID
-  and the other Code rows (remote copy, verdict, pull requests, Baseline drift,
-  the prerequisite lines under a green pill and the baseline line's legend),
-  not drawn when it would hold no row. Its open state is a page variable, read
+  and the other Code rows (remote copy, verdict, pull requests, Baseline drift
+  and the baseline line's legend), not drawn when it would hold no row. Its open state is a page variable, read
   from the live element when the panel is rewritten and kept across rewrites
   and selections for the life of the page; it is not stored. The Code section
   and its rows are absent whenever the card's Code Status tag is hidden. The
@@ -50,9 +48,8 @@ README is narrative only.
   disclosure never rewrites it, and whether the panel is open is a
   browser-local preference.
 - Reads the checkouts document those routes serve, and shows each card's
-  Code Status tag, its prerequisites pill (the five wordings the document carries,
-  green, red or grey by state alone, and the check mark of the baseline line only
-  while the pill is green or absent), one tag per attention item naming the card (all but an
+  Code Status tag, the check mark of a baseline line whose `C`, `M` and `B` are
+  all green, one tag per attention item naming the card (all but an
   awaiting merge, which the Code Status states, and a moved base, which the baseline
   line draws) and a baseline line of three points, the Baseline, the checkout
   and main, joined by the fork on main's line, an arm to the checkout, the main
