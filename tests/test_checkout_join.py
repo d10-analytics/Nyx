@@ -8003,6 +8003,27 @@ def test_the_parser_refuses_a_merge_fact_the_collected_facts_contradict(
 
 
 @posix_only
+def test_the_parser_refuses_not_merged_for_a_declared_branch_with_no_code_status(
+    prerequisite_world,
+):
+    """The not_merged refusal is its own rule: a branch declared on a clone with no Code
+    Status passes the declared-branch rule, so only this rule refuses not_merged there."""
+    w = prerequisite_world
+    document = doc_copy(w.c0)
+    package = pw_package(document, "pre-deleted")
+    assert package["code_status"] is None
+    assert package["branch"]["status"] == "declared"
+    assert package["target"]["status"] in ("clone", "worktree")
+    package["merged_on_main"] = "merged"
+    assert models.parse_checkouts(redigest(doc_copy(document))), "control: merged is accepted here"
+
+    package["merged_on_main"] = "not_merged"
+
+    message = refusal_of(document)
+    assert message.endswith("merged_on_main is not_merged for a package with no Code Status"), message
+
+
+@posix_only
 def test_the_parser_accepts_each_collected_document_and_refuses_schema_11(
     prerequisite_world,
 ):
